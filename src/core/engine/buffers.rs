@@ -76,30 +76,26 @@ impl Engine {
     pub fn start_undo_group_at(&mut self, cursor: Cursor) {
         // Save line state before modification (for U command)
         self.save_line_for_undo();
-        // Record the "before" state in the timeline on first edit
-        if self.active_buffer_state().undo_timeline.is_empty() {
-            self.active_buffer_state_mut()
-                .record_timeline_snapshot(cursor);
-        }
         self.active_buffer_state_mut().start_undo_group(cursor);
     }
 
-    /// Finish the current undo group for the active buffer.
-    ///
-    /// Only records a g-/g+ timeline snapshot when the group was actually
-    /// non-empty (#804). `record_timeline_snapshot` clones the *entire*
-    /// buffer text (`Vec::remove(0)`-capped, so also O(n) to prune) — cheap
-    /// as a once-per-command cost, but `split_insert_undo_group` calls this
-    /// on every insert-mode cursor movement (arrows/Home/End), which is one
-    /// of the most frequent insert-mode interactions. Gating on "did this
-    /// group actually record an edit" keeps pure cursor movement from paying
-    /// for a full-buffer clone every keystroke.
+    /// Finish the current undo group for the active buffer, committing it
+    /// as a new undo-tree node (see [`BufferState::finish_undo_group`]) if
+    /// it actually changed anything (#804: a no-op call — e.g.
+    /// `split_insert_undo_group` firing on every insert-mode cursor
+    /// movement — must not touch the tree at all).
     pub fn finish_undo_group(&mut self) {
-        let committed = self.active_buffer_state_mut().finish_undo_group();
-        if committed {
-            let cursor = self.view().cursor;
-            self.active_buffer_state_mut()
-                .record_timeline_snapshot(cursor);
+        let cursor = self.view().cursor;
+        let committed = self.active_buffer_state_mut().finish_undo_group(cursor);
+        // `:undojoin` (#1156): fold the group that just committed back into
+        // whatever undo step preceded it. Consumed unconditionally — even a
+        // no-op `finish_undo_group` call means "the change `:undojoin` was
+        // waiting for already happened, or never will", so the mark
+        // shouldn't linger and silently join some *later*, unrelated change.
+        if let Some(mark) = self.pending_undojoin.take() {
+            if committed {
+                self.active_buffer_state_mut().merge_undo_since(mark);
+            }
         }
     }
 
@@ -335,9 +331,6 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
-            // Record state in timeline for g-/g+
-            let cur = self.view().cursor;
-            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -355,9 +348,6 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
-            // Record state in timeline for g-/g+
-            let cur = self.view().cursor;
-            self.active_buffer_state_mut().record_timeline_snapshot(cur);
             true
         } else {
             self.message = "Already at newest change".to_string();
@@ -365,75 +355,109 @@ impl Engine {
         }
     }
 
-    /// Navigate to an earlier buffer state chronologically (`g-`).
-    pub fn g_earlier(&mut self) -> bool {
-        let bs = self.active_buffer_state_mut();
-        if bs.undo_timeline.is_empty() {
-            return false;
-        }
-        // current_pos points to the timeline entry matching current buffer state.
-        // None means "at latest" = last index.
-        let current_pos = bs
-            .undo_timeline_pos
-            .unwrap_or(bs.undo_timeline.len().saturating_sub(1));
-        if current_pos == 0 {
-            return false; // already at earliest
-        }
-        let target = current_pos - 1;
-        let (ref text, cursor) = bs.undo_timeline[target];
-        let text_clone = text.clone();
-        let char_len = bs.buffer.len_chars();
-        bs.buffer.delete_range(0, char_len);
-        if !text_clone.is_empty() {
-            bs.buffer.insert(0, &text_clone);
-        }
-        bs.undo_timeline_pos = Some(target);
-        bs.update_syntax();
+    /// Apply the side effects common to every undo-tree navigation that
+    /// lands the buffer on a specific state: move the view cursor, mark
+    /// dirty, flag LSP/swap, and report `#position/total` the way Vim's
+    /// `g-`/`g+`/`:undolist` do. `label` is `"g-"`/`"g+"`/`"earlier"`/`"later"`.
+    fn report_undo_nav(&mut self, cursor: Cursor, label: &str) {
         self.view_mut().cursor = cursor;
         self.clamp_cursor_col();
         self.set_dirty(true);
         let active_id = self.active_buffer_id();
         self.lsp_dirty_buffers.insert(active_id, true);
         self.swap_mark_dirty();
-        let total = self.active_buffer_state().undo_timeline.len();
-        self.message = format!("{} change(s); g- #{}/{}", total, target + 1, total);
-        true
+        let (pos, total) = self.active_buffer_state().undo_position();
+        self.message = format!("{total} change(s); {label} #{pos}/{total}");
+    }
+
+    /// Navigate to an earlier buffer state chronologically (`g-`) — unlike
+    /// plain `u`, this crosses into a branch a prior `u` + new edit
+    /// abandoned (#1156).
+    pub fn g_earlier(&mut self) -> bool {
+        match self.active_buffer_state_mut().undo_older() {
+            Some(cursor) => {
+                self.report_undo_nav(cursor, "g-");
+                true
+            }
+            None => false,
+        }
     }
 
     /// Navigate to a later buffer state chronologically (`g+`).
     pub fn g_later(&mut self) -> bool {
-        let bs = self.active_buffer_state_mut();
-        if bs.undo_timeline.is_empty() {
-            return false;
+        match self.active_buffer_state_mut().undo_newer() {
+            Some(cursor) => {
+                self.report_undo_nav(cursor, "g+");
+                true
+            }
+            None => false,
         }
-        let last = bs.undo_timeline.len() - 1;
-        let current_pos = bs.undo_timeline_pos.unwrap_or(last);
-        if current_pos >= last {
-            return false; // already at latest
+    }
+
+    /// `:earlier {count}` / `:earlier {N}[smhd]` (#1156). `spec` is either a
+    /// plain count (steps, like `count` repeated `g-` presses) or a
+    /// `{N}[smhd]` time offset (seconds/minutes/hours/days) — see `:h
+    /// :earlier`. Returns an error message for a malformed `spec`.
+    pub fn ex_earlier(&mut self, spec: &str) -> Result<(), String> {
+        self.ex_earlier_later(spec, true)
+    }
+
+    /// `:later {count}` / `:later {N}[smhd]` — see [`Self::ex_earlier`].
+    pub fn ex_later(&mut self, spec: &str) -> Result<(), String> {
+        self.ex_earlier_later(spec, false)
+    }
+
+    fn ex_earlier_later(&mut self, spec: &str, earlier: bool) -> Result<(), String> {
+        let spec = spec.trim();
+        let label = if earlier { "earlier" } else { "later" };
+        if let Some(cutoff) = parse_undo_time_spec(spec) {
+            let bs = self.active_buffer_state_mut();
+            let result = if earlier {
+                bs.undo_at_or_before(cutoff)
+            } else {
+                bs.undo_at_or_after(cutoff)
+            };
+            match result {
+                Some(cursor) => self.report_undo_nav(cursor, label),
+                None => self.message = "Already at oldest change".to_string(),
+            }
+            return Ok(());
         }
-        let target = current_pos + 1;
-        let (ref text, cursor) = bs.undo_timeline[target];
-        let text_clone = text.clone();
-        let char_len = bs.buffer.len_chars();
-        bs.buffer.delete_range(0, char_len);
-        if !text_clone.is_empty() {
-            bs.buffer.insert(0, &text_clone);
-        }
-        if target == last {
-            bs.undo_timeline_pos = None; // back at latest
+        let count: usize = if spec.is_empty() {
+            1
         } else {
-            bs.undo_timeline_pos = Some(target);
+            spec.parse()
+                .map_err(|_| format!("E475: Invalid argument: {spec}"))?
+        };
+        // Step directly via `undo_older`/`undo_newer` rather than delegating
+        // to `g_earlier`/`g_later` — those hardcode the `"g-"`/`"g+"` label
+        // in their own `report_undo_nav` call, which would make `:earlier`/
+        // `:later` print a `g-`/`g+` status message instead of using
+        // `label` (computed above from the ex command actually invoked).
+        let mut last_cursor = None;
+        for _ in 0..count {
+            let bs = self.active_buffer_state_mut();
+            let stepped = if earlier {
+                bs.undo_older()
+            } else {
+                bs.undo_newer()
+            };
+            match stepped {
+                Some(cursor) => last_cursor = Some(cursor),
+                None => break,
+            }
         }
-        bs.update_syntax();
-        self.view_mut().cursor = cursor;
-        self.clamp_cursor_col();
-        self.set_dirty(true);
-        let active_id = self.active_buffer_id();
-        self.lsp_dirty_buffers.insert(active_id, true);
-        self.swap_mark_dirty();
-        let total = self.active_buffer_state().undo_timeline.len();
-        self.message = format!("{} change(s); g+ #{}/{}", total, target + 1, total);
-        true
+        match last_cursor {
+            Some(cursor) => self.report_undo_nav(cursor, label),
+            None => {
+                self.message = if earlier {
+                    "Already at oldest change".to_string()
+                } else {
+                    "Already at newest change".to_string()
+                };
+            }
+        }
+        Ok(())
     }
 
     /// Check if undo is available.
@@ -486,6 +510,16 @@ impl Engine {
         if self.active_buffer_state().is_registries_buf {
             return self.save_registries_buffer();
         }
+        // Provider document buffer (#524): push title/body back through
+        // the bound provider's write command instead of disk.
+        if self.active_buffer_state().tool_document.is_some() {
+            return self.save_tool_document_buffer();
+        }
+        // Review verdict composer buffer (#526): report the verdict
+        // through the bound provider's verdict command instead of disk.
+        if self.active_buffer_state().review_verdict.is_some() {
+            return self.save_review_verdict_buffer();
+        }
 
         // Promote preview on save
         let active_id = self.active_buffer_id();
@@ -518,6 +552,43 @@ impl Engine {
             self.message = "No file name".to_string();
             Err(self.message.clone())
         }
+    }
+
+    /// Save `buffer_id`'s current content back to its file path, refreshing
+    /// the same secondary state a normal `:w` on the active buffer does
+    /// (git diff, LSP `didSave`, swap-file cleanup, `save`/`BufWrite`
+    /// plugin events) — but parameterized by buffer id instead of assuming
+    /// the active buffer/window, so a background write can drive it without
+    /// switching windows first. Used by ACP's `fs/write_text_file` (#954,
+    /// ACP-3), which must persist to disk on a buffer that may not even be
+    /// the one currently shown.
+    ///
+    /// Deliberately a thin sibling of [`Self::save`] rather than a
+    /// refactor of it: `save()` also handles the keymaps/registries scratch
+    /// buffers and writes into `self.message`, neither of which apply to a
+    /// background write a caller wants to report through its own channel
+    /// (a JSON-RPC error reply, here) instead.
+    pub(crate) fn save_buffer_by_id(&mut self, buffer_id: BufferId) -> Result<(), String> {
+        let path = self
+            .buffer_manager
+            .get(buffer_id)
+            .and_then(|s| s.file_path.clone())
+            .ok_or_else(|| "no file name".to_string())?;
+        let state = self
+            .buffer_manager
+            .get_mut(buffer_id)
+            .ok_or_else(|| "buffer no longer exists".to_string())?;
+        state
+            .save()
+            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        self.refresh_git_diff(buffer_id);
+        self.lsp_did_save(buffer_id);
+        self.swap_delete_for_buffer(buffer_id);
+        self.swap_write_needed.remove(&buffer_id);
+        let path_str = path.to_string_lossy().into_owned();
+        self.plugin_event("save", &path_str);
+        self.plugin_event("BufWrite", &path_str);
+        Ok(())
     }
 
     /// Check all open buffers for external file modifications.
@@ -1039,6 +1110,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.forget_closed_panel_window(left_win);
                 self.prune_jump_list_windows(&[left_win]);
                 // Remove from layout.
                 let tab = self.active_tab_mut();
@@ -1059,7 +1131,7 @@ impl Engine {
                 .contains(&self.active_tab().active_window)
             {
                 if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
-                    self.active_tab_mut().active_window = first;
+                    self.active_tab_mut().focus_window(first);
                 }
             }
         }
@@ -1131,7 +1203,7 @@ impl Engine {
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
-        tab.active_window = right_win;
+        tab.focus_window(right_win);
 
         // Bind scroll and set up diff.
         self.scroll_bind_pairs.push((left_win, right_win));
@@ -1211,6 +1283,7 @@ impl Engine {
             if self.windows.contains_key(&left_win) {
                 let left_buf = self.windows[&left_win].buffer_id;
                 self.windows.remove(&left_win);
+                self.forget_closed_panel_window(left_win);
                 self.prune_jump_list_windows(&[left_win]);
                 let tab = self.active_tab_mut();
                 if let Some(new_layout) = tab.layout.remove(left_win) {
@@ -1228,7 +1301,7 @@ impl Engine {
                 .contains(&self.active_tab().active_window)
             {
                 if let Some(first) = self.active_tab().layout.window_ids().first().copied() {
-                    self.active_tab_mut().active_window = first;
+                    self.active_tab_mut().focus_window(first);
                 }
             }
         }
@@ -1251,7 +1324,7 @@ impl Engine {
         if let Some((gid, ti)) = target {
             self.active_group = gid;
             self.active_group_mut().active_tab = ti;
-            self.active_tab_mut().active_window = right_win;
+            self.active_tab_mut().focus_window(right_win);
         }
 
         // Create scratch buffer with HEAD content.
@@ -1283,7 +1356,7 @@ impl Engine {
 
         // Focus the right (working copy) window.
         let tab = self.active_tab_mut();
-        tab.active_window = right_win;
+        tab.focus_window(right_win);
 
         // Bind scroll and set up diff.
         self.scroll_bind_pairs.push((left_win, right_win));
@@ -1373,7 +1446,7 @@ impl Engine {
         }
 
         // Focus the right (after) window
-        self.active_tab_mut().active_window = right_win;
+        self.active_tab_mut().focus_window(right_win);
 
         // Bind scroll and compute diff
         self.scroll_bind_pairs.push((left_win, right_win));
@@ -2062,6 +2135,25 @@ impl Engine {
                 } else {
                     summary
                 };
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
+    /// Finalize review edits: commit + push (`:GFinalize [message]`, #528).
+    /// See `Engine::finalize_review_edits` for the actual git work and its
+    /// safety semantics; this wrapper just supplies the default commit
+    /// message and turns the result into a status message + `EngineAction`,
+    /// the same shape every other `cmd_git_*` wrapper in this file uses.
+    pub(crate) fn cmd_git_finalize_review(&mut self, message: Option<&str>) -> EngineAction {
+        let message = message.filter(|m| !m.is_empty()).unwrap_or("Review edits");
+        match self.finalize_review_edits(message) {
+            Ok(summary) => {
+                self.message = summary;
                 EngineAction::None
             }
             Err(e) => {
@@ -3287,27 +3379,85 @@ impl Engine {
     /// - `Permanent`: Opens the file as a normal, persistent buffer.
     ///
     /// If the file is already open as a permanent buffer, just switches to it regardless of mode.
+    ///
+    /// Neovim treats landing on a different buffer this way as jump-worthy
+    /// regardless of line (#1158) — records a jumplist entry for the
+    /// pre-switch position. See [`Engine::open_file_for_jump_recovery`] for
+    /// the one caller (jumplist navigation's own recovery fallback) that
+    /// must NOT record another jump while replaying one.
     pub fn open_file_with_mode(&mut self, path: &Path, mode: OpenMode) -> Result<(), String> {
+        self.open_file_with_mode_impl(path, mode, true)
+    }
+
+    /// [`Engine::apply_jump_list_entry`]'s fallback when the recorded pane no
+    /// longer exists: opens `path` into the current window without pushing a
+    /// new jumplist entry (#1158). This call *is* jumplist navigation, not a
+    /// jump-worthy event in its own right — recording here would corrupt the
+    /// list a `<C-o>`/`<C-i>` walk is trying to replay.
+    pub(crate) fn open_file_for_jump_recovery(&mut self, path: &Path) -> Result<(), String> {
+        self.open_file_with_mode_impl(path, OpenMode::Permanent, false)
+    }
+
+    fn open_file_with_mode_impl(
+        &mut self,
+        path: &Path,
+        mode: OpenMode,
+        record_jump: bool,
+    ) -> Result<(), String> {
         // Check which buffers exist before opening (to detect reuse vs creation)
         let existing_ids: Vec<_> = self.buffer_manager.list();
+        let current = self.active_buffer_id();
 
-        let buffer_id = self
-            .buffer_manager
-            .open_file(path)
-            .map_err(|e| format!("Error: {}", e))?;
+        // Neovim's `:edit` (and anything else routed through this fn — gf,
+        // jumplist navigation, panel/git/DAP opens, CLI startup) renames the
+        // still-pristine startup scratch buffer in place instead of leaving
+        // it behind as a numbered phantom (#1298) -- but only when this
+        // would otherwise *create* a brand-new buffer. If `path` is already
+        // open under a different id, switching to that existing buffer wins
+        // and the pristine buffer is left untouched (verified against real
+        // Neovim: `:new` then `:edit <already-open-file>` leaves the fresh
+        // scratch buffer behind as an orphaned "[No Name]").
+        let reuse_pristine =
+            self.is_pristine_scratch_buffer(current) && !self.buffer_manager.is_path_open(path);
+
+        let buffer_id = if reuse_pristine {
+            self.buffer_manager
+                .reopen_buffer(current, path)
+                .map_err(|e| format!("Error: {}", e))?;
+            current
+        } else {
+            self.buffer_manager
+                .open_file(path)
+                .map_err(|e| format!("Error: {}", e))?
+        };
         self.buffer_manager
             .apply_language_map(buffer_id, &self.settings.language_map);
 
-        let already_existed = existing_ids.contains(&buffer_id);
+        let already_existed = !reuse_pristine && existing_ids.contains(&buffer_id);
         let is_already_permanent = already_existed
             && self
                 .buffer_manager
                 .get(buffer_id)
                 .is_some_and(|s| !s.preview);
 
+        // Record the pre-switch position before anything below moves the
+        // active buffer out from under it — only when this call actually
+        // lands on a different buffer, since a same-file `:e` reload is not
+        // "another file" (and would otherwise dedupe away via
+        // `append_jump_list_entry`'s top-entry check anyway, but not before
+        // stamping a possibly-stale `''` mark). Also skip when leaving a
+        // still-pristine scratch buffer -- real Neovim doesn't record that
+        // either (`is_pristine_scratch_buffer`'s doc comment). `reuse_pristine`
+        // implies `current == buffer_id`, so this condition is already false
+        // in that case; spelled out via `is_pristine_scratch_buffer` (not
+        // `reuse_pristine`) so the jump-skip still applies when `path` was
+        // already open elsewhere and we didn't reuse.
+        if record_jump && current != buffer_id && !self.is_pristine_scratch_buffer(current) {
+            self.push_jump_location();
+        }
+
         // If buffer already exists as permanent, just switch to it
         if is_already_permanent && !self.preview_tab.is_preview(&buffer_id.to_string()) {
-            let current = self.active_buffer_id();
             if current != buffer_id {
                 self.buffer_manager.alternate_buffer = Some(current);
             }
@@ -3351,7 +3501,6 @@ impl Engine {
             }
         }
 
-        let current = self.active_buffer_id();
         if current != buffer_id {
             self.buffer_manager.alternate_buffer = Some(current);
         }
@@ -3951,4 +4100,23 @@ impl Engine {
             }
         }
     }
+}
+
+/// Parse a `:earlier`/`:later` time-offset argument (`:h :earlier`):
+/// `{count}[smhd]` for seconds/minutes/hours/days ago, e.g. `5m` = 5 minutes
+/// ago, `2d` = 2 days ago. Returns `None` for a plain count (no unit suffix)
+/// or a malformed spec — callers fall back to (or error on) the plain-count
+/// form in that case.
+fn parse_undo_time_spec(spec: &str) -> Option<std::time::SystemTime> {
+    let last = spec.chars().last()?;
+    let unit_secs: u64 = match last {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => return None,
+    };
+    let count: u64 = spec[..spec.len() - 1].parse().ok()?;
+    let ago = std::time::Duration::from_secs(count * unit_secs);
+    Some(std::time::SystemTime::now() - ago)
 }

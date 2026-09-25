@@ -147,13 +147,29 @@ impl Engine {
     }
 
     /// Find the flat index of an item by its ID within a specific section.
-    /// Returns `None` if the panel, section, or item is not found.
+    ///
+    /// Match precedence:
+    ///   1. An exact `id` match (empty ids never match — a query is never empty
+    ///      either, so this alone rules out the empty-id separator/header rows
+    ///      that `git_log_panel.lua` emits).
+    ///   2. Failing that, a single unambiguous hash-prefix match against a
+    ///      top-level row (`parent_id` empty, not a separator) whose `id`
+    ///      starts with `item_id`. A `<hash>:<path>` child row never qualifies
+    ///      here even if its id happens to share the prefix, and if more than
+    ///      one top-level row matches the prefix the result is ambiguous and
+    ///      treated as no match — guessing would silently select the wrong
+    ///      commit.
+    ///
+    /// Returns `None` if the panel, section, or a unique match is not found.
     pub fn ext_panel_find_flat_index(
         &self,
         panel_name: &str,
         section_name: &str,
         item_id: &str,
     ) -> Option<usize> {
+        if item_id.is_empty() {
+            return None;
+        }
         let reg = self.ext_panels.get(panel_name)?;
         let expanded = self.ext_panel_sections_expanded.get(panel_name);
         let mut pos = 0;
@@ -165,12 +181,24 @@ impl Engine {
                 if let Some(items) = self.ext_panel_items.get(&key) {
                     let visible = self.ext_panel_visible_indices(panel_name, items);
                     if section == section_name {
-                        for &vi in &visible {
-                            if items[vi].id == item_id
-                                || items[vi].id.starts_with(item_id)
-                                || item_id.starts_with(&items[vi].id)
-                            {
-                                return Some(pos + visible.iter().position(|&x| x == vi).unwrap());
+                        // Pass 1: exact id match (any visible row).
+                        if let Some(offset) = visible
+                            .iter()
+                            .position(|&vi| !items[vi].id.is_empty() && items[vi].id == item_id)
+                        {
+                            return Some(pos + offset);
+                        }
+                        // Pass 2: unambiguous hash-prefix match against a
+                        // top-level (commit) row only.
+                        let mut prefix_matches = visible.iter().enumerate().filter(|&(_, &vi)| {
+                            !items[vi].id.is_empty()
+                                && !items[vi].is_separator
+                                && items[vi].parent_id.is_empty()
+                                && items[vi].id.starts_with(item_id)
+                        });
+                        if let Some((offset, _)) = prefix_matches.next() {
+                            if prefix_matches.next().is_none() {
+                                return Some(pos + offset);
                             }
                         }
                     }
@@ -200,10 +228,19 @@ impl Engine {
             }
         }
         // Find the flat index and set selection
-        if let Some(flat_idx) = self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
-            self.ext_panel_selected = flat_idx;
-            // Center the item in the viewport
-            self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+        match self.ext_panel_find_flat_index(panel_name, section_name, item_id) {
+            Some(flat_idx) => {
+                self.ext_panel_selected = flat_idx;
+                // Center the item in the viewport
+                self.ext_panel_scroll_top = flat_idx.saturating_sub(5);
+            }
+            None => {
+                // A reveal that quietly lands on the wrong row is worse than one that
+                // reports it couldn't find a unique match — leave the selection as-is
+                // and say so instead of silently falling back to row 0.
+                self.message =
+                    format!("Could not find \"{item_id}\" in {section_name} — selection unchanged");
+            }
         }
     }
 
@@ -249,7 +286,7 @@ impl Engine {
                     .position(|n| self.ext_panel_active.as_deref() == Some(n.as_str()))
                     .unwrap_or(0);
                 self.ext_panel_has_focus = false;
-                self.activity_bar_focus_in_at(8 + idx as u16);
+                self.activity_bar_focus_in_at(sidebar::TOOLBAR_IDX_EXT_BASE + idx as u16);
             }
             "j" | "Down" => {
                 let max = self.ext_panel_flat_len();
@@ -928,7 +965,7 @@ impl Engine {
 
     #[allow(dead_code)]
     pub fn has_diagnostic_on_line(&self, line: usize) -> bool {
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 return diags.iter().any(|d| {
                     let sl = d.range.start.line as usize;
@@ -944,7 +981,7 @@ impl Engine {
     /// Shows ALL diagnostics that touch this line, regardless of column.
     pub fn trigger_editor_hover_for_line(&mut self, line: usize) {
         let mut sections: Vec<String> = Vec::new();
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let start_line = diag.range.start.line as usize;
@@ -1009,7 +1046,7 @@ impl Engine {
         let mut sections: Vec<(EditorHoverSource, String)> = Vec::new();
 
         // 1. Diagnostics at this position
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let start_line = diag.range.start.line as usize;
@@ -1547,7 +1584,7 @@ impl Engine {
     /// Check if there's a diagnostic at the given position.
     #[allow(dead_code)]
     pub(crate) fn has_diagnostic_at(&self, line: usize, col: usize) -> bool {
-        if let Some(path) = self.active_buffer_path() {
+        if let Some(path) = self.active_buffer_diagnostics_key() {
             if let Some(diags) = self.lsp_diagnostics.get(&path) {
                 for diag in diags {
                     let sl = diag.range.start.line as usize;
@@ -1570,30 +1607,18 @@ impl Engine {
         false
     }
 
-    /// Open a URL in the default browser.
-    pub(crate) fn open_url(&self, url: &str) {
+    /// Open a URL in the default browser. Validates the URL scheme via
+    /// `is_safe_url` and, if safe, queues a
+    /// [`PendingPlatformAction::OpenUrl`] for the runner to carry out
+    /// through `PlatformServices` (#1134) — see
+    /// `Engine::pending_platform_actions`'s doc for why this can't shell
+    /// out directly from here.
+    pub(crate) fn open_url(&mut self, url: &str) {
         if !is_safe_url(url) {
             return;
         }
-        #[cfg(not(test))]
-        {
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn();
-            }
-        }
+        self.pending_platform_actions
+            .push(PendingPlatformAction::OpenUrl(url.to_string()));
     }
 
     /// Get the file path of the active buffer (if it has one).
@@ -1601,6 +1626,33 @@ impl Engine {
         self.buffer_manager
             .get(self.active_window().buffer_id)
             .and_then(|bs| bs.file_path.clone())
+    }
+
+    /// The key [`Engine::lsp_diagnostics`] is stored under for the active
+    /// buffer.
+    ///
+    /// That map is keyed by the **canonical** absolute path (#208: the LSP
+    /// flush derives its key from the server's `file://` URI, and
+    /// `panels.rs` re-keys notifications through `canonical_path`), and
+    /// `build_rendered_window` looks the gutter up through
+    /// `BufferState::canonical_path` for the same reason. Every diagnostics
+    /// lookup on this side must use the same key or it silently misses
+    /// whenever the buffer was opened through a path that is not already
+    /// canonical — a symlinked directory, or any path carrying a `.`/`..`
+    /// segment. On macOS that is the *common* case, not an exotic one:
+    /// `std::env::temp_dir()` hands back `/var/folders/…`, a symlink to
+    /// `/private/var/folders/…`, so the diagnostic gutter painted a marker
+    /// that, when clicked, opened no hover at all.
+    ///
+    /// Falls back to the raw `file_path` for a buffer whose file does not
+    /// exist on disk yet (`canonical_path` is `None` until the first
+    /// successful `canonicalize`).
+    pub(crate) fn active_buffer_diagnostics_key(&self) -> Option<PathBuf> {
+        let state = self.buffer_manager.get(self.active_window().buffer_id)?;
+        state
+            .canonical_path
+            .clone()
+            .or_else(|| state.file_path.clone())
     }
 
     /// Handle LSP hover response by updating the editor hover popup.
@@ -1615,7 +1667,7 @@ impl Engine {
             let mut sections: Vec<String> = Vec::new();
 
             // Re-collect diagnostics for this anchor position
-            if let Some(path) = self.active_buffer_path() {
+            if let Some(path) = self.active_buffer_diagnostics_key() {
                 if let Some(diags) = self.lsp_diagnostics.get(&path) {
                     for diag in diags {
                         let sl = diag.range.start.line as usize;
@@ -1968,7 +2020,11 @@ impl Engine {
                         "Down" => Some(Key::Named(NamedKey::Down)),
                         "Up" => Some(Key::Named(NamedKey::Up)),
                         "Tab" => Some(Key::Named(NamedKey::Tab)),
-                        "BackTab" => Some(Key::Named(NamedKey::BackTab)),
+                        // "ISO_Left_Tab" is TUI's (and, since #1060, GTK's
+                        // own) `render::engine_key_from_ui` spelling for
+                        // Shift+Tab; "BackTab" is kept for any caller still
+                        // on the pre-#1060 name.
+                        "BackTab" | "ISO_Left_Tab" => Some(Key::Named(NamedKey::BackTab)),
                         "Home" => Some(Key::Named(NamedKey::Home)),
                         "End" => Some(Key::Named(NamedKey::End)),
                         "Page_Up" => Some(Key::Named(NamedKey::PageUp)),
@@ -2315,7 +2371,7 @@ impl Engine {
             };
             if !is_enum {
                 self.settings_has_focus = false;
-                self.activity_bar_focus_in_at(7);
+                self.activity_bar_focus_in_at(sidebar::TOOLBAR_IDX_SETTINGS);
                 return;
             }
             // is_enum == true: fall through so the existing match arm cycles the value.
@@ -2534,19 +2590,30 @@ impl Engine {
         // Build content: header comment + one keymap per line
         let mut content = String::from(
             "# User keymaps — one per line.  :w to save.\n\
-             # Format: mode keys :command\n\
-             # Modes: n (normal), v (visual), i (insert), c (command)\n\
-             # Keys:  single char (x), modifier (<C-x>, <A-x>), sequence (gcc)\n\
+             # Format: mode[!] keys rhs\n\
+             # Modes: n (normal) v (visual) x (visual-only) o (operator-pending)\n\
+             #        i (insert) c (command) s (select, unused)\n\
+             # A trailing '!' on mode is noremap (rhs is not re-expanded).\n\
+             # Keys:  single char (x), modifier (<C-x>), sequence (gcc), vim\n\
+             #        notation (<Esc> <CR> <Tab> <leader> <Plug>...)\n\
+             # Rhs:   an ex command prefixed with ':' (:Commentary), or a raw\n\
+             #        key sequence fed back through the normal key path (<Esc>)\n\
+             #\n\
+             # This buffer is edited directly in vimcode's storage format; day\n\
+             # to day, prefer the vim ex commands instead — :nnoremap, :imap,\n\
+             # :vnoremap, :onoremap, :unmap, :mapclear, etc. — which write to\n\
+             # this same list.\n\
              #\n\
              # In VSCode mode, \"n\" keymaps apply (use modifiers like <C-x>, <A-x>).\n\
              # Run :Keybindings to see all built-in keybindings and command names.\n\
              #\n\
              # Examples:\n\
-             # n <C-/> :Commentary\n\
-             # v <C-/> :Commentary\n\
-             # n gcc   :Commentary\n\
-             # n <A-j> :move +1\n\
-             # n <A-k> :move -1\n\
+             # n <C-/>  :Commentary\n\
+             # v <C-/>  :Commentary\n\
+             # n gcc    :Commentary\n\
+             # n <A-j>  :move +1\n\
+             # n <A-k>  :move -1\n\
+             # i! jk    <Esc>\n\
              #\n",
         );
         for km in &self.settings.keymaps {
@@ -2570,7 +2637,7 @@ impl Engine {
         self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
 
         self.settings_has_focus = false;
-        self.message = "Edit keymaps (one per line: mode keys :command). :w to save.".to_string();
+        self.message = "Edit keymaps (one per line: mode[!] keys rhs). :w to save.".to_string();
     }
 
     /// Save keymaps buffer content back to settings.
@@ -2587,7 +2654,7 @@ impl Engine {
             // Validate the keymap definition
             if parse_keymap_def(trimmed).is_none() {
                 return Err(format!(
-                    "Invalid keymap on line {}: \"{}\" (expected: mode keys :command)",
+                    "Invalid keymap on line {}: \"{}\" (expected: mode[!] keys rhs)",
                     line_idx + 1,
                     trimmed
                 ));
@@ -2638,13 +2705,26 @@ impl Engine {
             });
         }
 
+        // Neovim opens the command-line window as a horizontal split in the
+        // *current* tabpage (`:h cmdwin`), not a new tab (#1297) — push a
+        // new window into the active tab's layout instead of a new `Tab`.
+        // Per `:h cmdwin`, the window is "always ... positioned just above
+        // the command-line" — i.e. always at the bottom, unlike an ordinary
+        // horizontal split, which honors 'splitbelow'. `new_first: false`
+        // pins it there unconditionally (confirmed against a live,
+        // UI-attached `nvim` — `winlayout()` puts the cmdwin leaf second).
+        let current_window_id = self.active_window_id();
         let window_id = self.new_window_id();
         let window = Window::new(window_id, buf_id);
         self.windows.insert(window_id, window);
-        let tab_id = self.new_tab_id();
-        let tab = Tab::new(tab_id, window_id);
-        self.active_group_mut().tabs.push(tab);
-        self.active_group_mut().active_tab = self.active_group().tabs.len() - 1;
+        let tab = self.active_tab_mut();
+        tab.layout.split_at(
+            current_window_id,
+            SplitDirection::Horizontal,
+            window_id,
+            false,
+        );
+        tab.focus_window(window_id);
 
         // Move cursor to last line (the empty line for new entry)
         let total = self.buffer().len_lines();
@@ -2673,8 +2753,9 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Close the cmdline window
-        self.close_tab();
+        // Close the cmdline window — it's a split in the current tab
+        // (#1297), not a whole tab, so close just the window.
+        self.close_window();
 
         if is_search {
             // Execute as a forward search
@@ -2856,15 +2937,36 @@ impl Engine {
 
     // ── AI assistant panel ─────────────────────────────────────────────────────
 
-    /// Send `text` as a user message; spawns the background request thread.
-    /// Callers (`ChatControllerEvent::Submit` dispatch, the `:AI` command,
-    /// the palette's `chat_send:` action) own clearing whatever input widget
-    /// held the text — this only mutates the conversation/request state.
+    /// Send `text` as a user message. Callers (`ChatControllerEvent::Submit`
+    /// dispatch, the `:AI` command, the palette's `chat_send:` action) own
+    /// clearing whatever input widget held the text — this only mutates the
+    /// conversation/request state.
+    ///
+    /// Transport is picked by whether any ACP agent is configured (#952,
+    /// ACP-1; #958, ACP-7): a non-empty `settings.acp_agents` registry or a
+    /// non-empty legacy `settings.acp_agent_command` both route through a
+    /// live ACP agent subprocess (`ai_send_message_via_acp`); neither
+    /// configured keeps the original direct-provider `curl` transport
+    /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
+    /// no-agent-binary escape hatch per #952's "Decide in this slice"
+    /// through ACP-7.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
             return;
         }
+        let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
+            || !self.settings.acp_agents.is_empty();
+        if acp_configured {
+            self.ai_send_message_via_acp(text);
+        } else {
+            self.ai_send_message_via_curl(text);
+        }
+    }
+
+    /// Direct-provider transport: spawns the blocking `curl` background
+    /// thread (`crate::core::ai::send_chat`), polled by `poll_ai`.
+    fn ai_send_message_via_curl(&mut self, text: String) {
         self.ai_messages.push(AiMessage {
             role: "user".to_string(),
             content: text,
@@ -2875,7 +2977,7 @@ impl Engine {
         let api_key = self.settings.ai_api_key.clone();
         let base_url = self.settings.ai_base_url.clone();
         let model = self.settings.ai_model.clone();
-        let messages = self.ai_messages.clone();
+        let messages = curl_transport_history(&self.ai_messages);
         let system = String::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2887,6 +2989,62 @@ impl Engine {
             );
             let _ = tx.send(result);
         });
+    }
+
+    /// ACP transport (#952, ACP-1): spawns (or reuses) a live ACP agent
+    /// subprocess and drives it through `initialize` -> `session/new` ->
+    /// `session/prompt`. All of the session-update chunk streaming and
+    /// prompt-stop handling lives in `Engine::poll_acp`
+    /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
+    /// `AcpClient::poll` — nothing here blocks the tick.
+    fn ai_send_message_via_acp(&mut self, text: String) {
+        self.ai_messages.push(AiMessage {
+            role: "user".to_string(),
+            content: text.clone(),
+        });
+        self.ai_streaming = true;
+        self.acp_streaming_turn = None;
+
+        if let Some(client) = self.acp_client.as_mut() {
+            if let Some(session_id) = self.acp_session_id.clone() {
+                client.prompt(
+                    &session_id,
+                    vec![serde_json::json!({"type": "text", "text": text})],
+                );
+            } else {
+                // The initialize -> session/new handshake from a previous
+                // message is still in flight; `poll_acp`'s `SessionCreated`
+                // handler sends this the moment the session id lands.
+                self.acp_pending_prompt = Some(text);
+            }
+            return;
+        }
+
+        // #958 (ACP-7): the registry (if configured) or the legacy
+        // single-string setting — see `acp_resolve_agent_launch`'s doc for
+        // why this is the one call site that knows the registry exists.
+        let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
+            Ok(mut client) => {
+                client.initialize();
+                self.acp_client = Some(client);
+                self.acp_pending_prompt = Some(text);
+            }
+            Err(e) => {
+                // Acceptance (#952): agent binary missing from PATH must be
+                // a clear, actionable panel message, not a crash or a
+                // silently empty panel — so this lands in the transcript
+                // itself, not just the status line.
+                self.ai_streaming = false;
+                self.message = format!("ACP agent failed to start: {e}");
+                self.ai_messages.push(AiMessage {
+                    role: "assistant-thought".to_string(),
+                    content: format!("\u{26a0} Could not start ACP agent \"{agent_label}\": {e}"),
+                });
+            }
+        }
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -2916,12 +3074,133 @@ impl Engine {
     }
 
     /// Clear the AI conversation history and cancel any in-flight request.
+    ///
+    /// When the panel is on the ACP transport, this also drops the live
+    /// agent (`AcpClient::drop` kills the subprocess) rather than just
+    /// clearing the local transcript — matching the curl transport's
+    /// "conversation cleared" semantics: the next message starts a fresh
+    /// `initialize` -> `session/new` handshake, not a continuation of
+    /// whatever context the old agent process held.
     pub fn ai_clear(&mut self) {
+        // #953 (ACP-2): a parked permission prompt must get its one reply
+        // before the client (and its stdin) goes away below — the agent is
+        // still alive at this point, only about to be killed.
+        self.acp_cancel_pending_permission();
+        self.acp_remembered_decisions.clear();
+        // #957 (ACP-6): the auth-choice dialog holds no reply to send (unlike
+        // `acp_pending_permission`, it isn't a parked agent request — see
+        // `"acp_auth_choice"`'s `process_dialog_result` arm), so it just
+        // needs closing before `acp_auth_methods` (which it reads by id)
+        // clears below, same as any other dialog referencing state this
+        // function is about to drop.
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_auth_choice")
+        {
+            self.dialog = None;
+        }
         self.ai_messages.clear();
         self.ai_rx = None;
         self.ai_streaming = false;
+        self.acp_client = None;
+        self.acp_session_id = None;
+        self.acp_pending_prompt = None;
+        self.acp_streaming_turn = None;
+        // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
+        // clearing the conversation ends the session, so none of it should
+        // survive into whatever session starts next (same reasoning as
+        // `acp_remembered_decisions.clear()` above).
+        self.acp_plan.clear();
+        self.acp_available_commands.clear();
+        self.acp_command_completion_idx = 0;
+        self.acp_modes.clear();
+        self.acp_current_mode_id = None;
+        self.acp_usage = None;
+        // #957 (ACP-6): session-scoped, same as the rest above.
+        self.acp_auth_methods.clear();
+        self.acp_authenticated = false;
+        // #955 (ACP-4): tool calls and any open change-review surface are
+        // session-scoped too — closing the conversation without deciding
+        // still discards the surface itself (same "closing the session
+        // ends it" reasoning as everything else in this block).
+        self.acp_tool_calls.clear();
+        self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
+    }
+
+    /// Slash-command completions matching the AI panel input's current
+    /// text, if the agent has declared any via `available_commands_update`
+    /// and the input looks like a command still being typed (#956, ACP-5).
+    ///
+    /// `None` — never an empty popup — when the input doesn't start with
+    /// `/`, already has a space after the command name (the user is past
+    /// the command name into its arguments/body), or nothing matches.
+    /// Reuses `render::CompletionMenu` — the same shape the editor's own
+    /// word-completion popup uses — per the issue's "prefer vimcode's
+    /// existing completion machinery" guidance; there is no bespoke widget
+    /// here, only a different feeder for one that already exists.
+    pub fn ai_command_completions(&self) -> Option<crate::render::CompletionMenu> {
+        if self.acp_available_commands.is_empty() {
+            return None;
+        }
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let prefix = input.strip_prefix('/')?;
+        if prefix.contains(char::is_whitespace) {
+            return None;
+        }
+        let prefix_lower = prefix.to_lowercase();
+        let mut candidates: Vec<String> = self
+            .acp_available_commands
+            .iter()
+            .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
+            .map(|c| format!("/{}", c.name))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        candidates.sort();
+        let max_width = candidates
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0);
+        let selected_idx = self.acp_command_completion_idx.min(candidates.len() - 1);
+        Some(crate::render::CompletionMenu {
+            candidates,
+            selected_idx,
+            max_width,
+        })
+    }
+
+    /// Advance the slash-command completion selection to the next
+    /// candidate (wrapping), if the popup is currently showing. Returns
+    /// `false` (a no-op) when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_completion_cycle(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        self.acp_command_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        true
+    }
+
+    /// Accept the currently-selected slash-command completion: replace the
+    /// AI panel input's whole text with `"/name "` (trailing space, ready
+    /// for arguments). Invoking the command afterward is nothing more than
+    /// submitting that text normally — the ACP v1 spec has no separate RPC
+    /// for it (`ai_send_message` already sends the input verbatim as
+    /// prompt content, slash prefix and all). Returns `false` (a no-op)
+    /// when [`Self::ai_command_completions`] is `None`.
+    pub fn ai_command_accept_selected(&mut self) -> bool {
+        let Some(menu) = self.ai_command_completions() else {
+            return false;
+        };
+        let chosen = menu.candidates[menu.selected_idx].clone();
+        let mut chat = self.ai_chat.borrow_mut();
+        chat.clear_input();
+        chat.input_insert_str(&format!("{chosen} "));
+        true
     }
 
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
@@ -2950,8 +3229,19 @@ impl Engine {
             // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled
             // internally), so it falls to this app-hotkey escape hatch,
             // exactly as its own doc comment recommends.
+            //
+            // #953 (ACP-2): while an ACP turn is actually in flight, Ctrl+C
+            // aborts *that turn* (`session/cancel`) instead of nuking the
+            // whole session — "the user must be able to abort a running
+            // turn from the panel" without losing the agent process and
+            // conversation history the way a full `ai_clear` would. Idle
+            // (not streaming) keeps the existing full-clear behaviour.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
-                self.ai_clear();
+                if self.acp_client.is_some() && self.ai_streaming {
+                    self.acp_cancel_turn();
+                } else {
+                    self.ai_clear();
+                }
                 true
             }
             _ => true,
@@ -3295,5 +3585,78 @@ impl Engine {
             self.swap_recheck_open_buffers();
         }
         EngineAction::None
+    }
+}
+
+/// Filter an AI panel transcript down to the turns valid as conversation
+/// history for the direct-provider (`curl`) transport — only `"user"` and
+/// `"assistant"` roles.
+///
+/// Review regression (#952): if the panel previously talked over ACP
+/// (`Engine::ai_send_message_via_acp`), `self.ai_messages` can also contain
+/// ACP-only roles like `"assistant-thought"` (real `agent_thought_chunk`
+/// reasoning, and the system/error notices `Engine::poll_acp` appends — see
+/// `acp_ops.rs`). A user who switches transports mid-session by clearing
+/// `acp_agent_command` without running `:AiClear` would otherwise have
+/// those roles sent verbatim in the request body
+/// (`crate::core::ai::send_chat`'s `messages_to_json`/`send_ollama`), which
+/// none of Anthropic/OpenAI/Ollama recognise and will reject.
+fn curl_transport_history(messages: &[AiMessage]) -> Vec<AiMessage> {
+    messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod curl_transport_history_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_user_and_assistant_turns_unchanged() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
+    }
+
+    /// RED verified: removing the `.filter(...)` call (sending
+    /// `self.ai_messages.clone()` straight through) makes this fail — the
+    /// stray `"assistant-thought"` turn survives into the direct-provider
+    /// request body.
+    #[test]
+    fn drops_acp_only_assistant_thought_role() {
+        let messages = vec![
+            AiMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            AiMessage {
+                role: "assistant-thought".to_string(),
+                content: "\u{26a0} session/prompt failed: boom".to_string(),
+            },
+            AiMessage {
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let filtered = curl_transport_history(&messages);
+        let roles: Vec<&str> = filtered.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant"],
+            "the ACP-only assistant-thought turn must not reach a \
+             direct-provider request body: {filtered:?}"
+        );
     }
 }

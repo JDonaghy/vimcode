@@ -16,13 +16,20 @@
     "EVERY pull request. tests/branch_protection.rs asserts the two lists are",
     "equal so a job rename fails the test suite instead of wedging the queue.",
     "",
+    "Adding a CI job? Add its `name:` here too (and bump the job count in",
+    "tests/branch_protection.rs::required_contexts_match_ci_job_names), or the",
+    "new lane is advisory and gates nothing. #1042 added the native macOS lane",
+    "for exactly that reason: src/macos/ is compiled by no other job.",
+    "",
     "Apply with:  scripts/apply-branch-protection.sh",
     "Audit with:  scripts/apply-branch-protection.sh --check"
   ],
 
   "required_contexts": [
     "Test (Linux, headless)",
-    "Test (Linux, headless, GUI feature on)"
+    "Test (Linux, headless, GUI feature on)",
+    "Test (macOS native, AppKit)",
+    "Build (Windows TUI, vcd.exe)"
   ],
 
   "branches": {

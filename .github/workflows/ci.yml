@@ -158,3 +158,120 @@ jobs:
         # Guard the lane's whole point: this must be a headless run.
         test -z "${DISPLAY:-}" && test -z "${WAYLAND_DISPLAY:-}"
         cargo test
+
+  # #1042: the two jobs above are both Linux, so `src/macos/mod.rs` — gated
+  # `#[cfg(all(feature = "macos", target_os = "macos"))]` in src/lib.rs, and
+  # likewise in quadraui itself — is never compiled by either of them and its
+  # `mac_driver_tests` (18 `#[test]`s) never run anywhere. This job is a real
+  # `macos-latest` runner, not a cross-target `cargo check`: that route was
+  # tried and abandoned in #859 (see src/macos/mod.rs's own module doc,
+  # "Verifying this file without a Mac") because vimcode depends on
+  # tree-sitter, whose build.rs compiles `lib.c` for the *target* — `cc-rs`
+  # dies on `-arch` long before rustc would ever see this file.
+  #
+  # Scoped to `--lib` deliberately: tests/nvim_conformance.rs is a default
+  # integration test that hard-fails (not skips) when `nvim` is missing, and
+  # this job installs no oracle. `--lib` compiles and runs only the crate's
+  # unit tests — which is where `mac_driver_tests` lives — without pulling in
+  # the integration targets that need it.
+  test-macos:
+    name: Test (macOS native, AppKit)
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # #691: quadraui fetched by Cargo itself, same as the Linux jobs — see
+    # the comment on the `test` job above.
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from the Linux jobs — the target dirs diverge (macOS
+        # toolchain, AppKit/Core Graphics/Core Text deps).
+        key: ${{ runner.os }}-cargo-build-target-macos-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Check formatting
+      run: cargo fmt -- --check
+
+    - name: Run clippy
+      run: cargo clippy --no-default-features --features macos -- -D warnings
+
+    - name: Run tests
+      run: |
+        # `cargo test --lib --no-default-features --features macos` (issue
+        # #1042's own minimum) runs the *whole* portable lib suite, not just
+        # `mac_driver_tests` — on Linux with the equivalent
+        # `--no-default-features` flags it's ~2,845 tests. That means a bare
+        # "did the overall run report zero tests" check would NOT catch the
+        # #645 vacuous-green trap this job exists to close: if some cfg
+        # mismatch silently dropped `src/macos/mod.rs::mac_driver_tests`
+        # (double-gated on `feature = "macos"` AND `target_os = "macos"`)
+        # while the shared portable suite still ran fine, the overall count
+        # would stay in the thousands and the job would report green having
+        # exercised zero macOS-specific code — exactly the failure mode this
+        # issue is about. So: run the full command as specified, but assert
+        # specifically on how many `macos::mac_driver_tests::*` cases ran.
+        set -euo pipefail
+        cargo test --lib --no-default-features --features macos 2>&1 | tee /tmp/macos-test-output.txt
+        TOTAL_LINE=$(grep -E '^test result: ' /tmp/macos-test-output.txt | tail -1)
+        echo "Overall lib suite: $TOTAL_LINE"
+        MAC_PASSED=$(grep -cE '^test macos::mac_driver_tests::.* \.\.\. ok$' /tmp/macos-test-output.txt || true)
+        echo "macos::mac_driver_tests cases passed: $MAC_PASSED"
+        if [ -z "$MAC_PASSED" ] || [ "$MAC_PASSED" -eq 0 ]; then
+          echo "::error::macos::mac_driver_tests ran zero tests — src/macos/ may have compiled but its own suite never executed. This is the #645 vacuous-green trap, not a pass."
+          exit 1
+        fi
+
+  # The release ships `vcd-windows-x86_64.exe` (release.yml's `build-windows`
+  # job), but no other job compiles for Windows at all — without this, the
+  # first Windows build a change ever saw was the release run itself, after
+  # the Linux release had already been published. Build-only: the same
+  # command release.yml uses, so a red here means a red release.
+  build-windows-tui:
+    name: Build (Windows TUI, vcd.exe)
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-windows-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build vcd.exe (release, no GTK)
+      run: cargo build --release --bin vcd --no-default-features
+
+    - name: Smoke --version
+      run: target\release\vcd.exe --version

@@ -191,12 +191,18 @@ fn test_zf_paragraph_create_fold() {
 
 #[test]
 fn test_zf_big_create_fold_n_lines() {
+    // #1280: `3zF` folds 3 *total* lines (the count includes the header),
+    // not 4 — verified against the real oracle (`fold:zF folds a count of
+    // lines` in `tests/nvim_conformance.rs`). This test used to pin the
+    // off-by-one (`fold.end == 3`, i.e. lines 0-3 = 4 lines): `end` is the
+    // last *hidden* line, so a 3-line fold from line 0 hides lines 1-2 only
+    // — `end == 2`.
     let mut e = engine_with("line 0\nline 1\nline 2\nline 3\n");
     type_chars(&mut e, "3zF");
     assert!(e.view().fold_at(0).is_some());
     let fold = e.view().fold_at(0).unwrap();
-    assert_eq!(fold.end, 3);
-    assert_msg_contains(&e, "3 lines folded");
+    assert_eq!(fold.end, 2);
+    assert_msg_contains(&e, "2 lines folded");
 }
 
 // ── zv: open folds to make cursor visible ───────────────────────────────────

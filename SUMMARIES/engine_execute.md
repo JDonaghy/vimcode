@@ -1,10 +1,12 @@
-# src/core/engine/execute.rs — 4,536 lines
+# src/core/engine/execute.rs — 6,670 lines
 
 Ex-command dispatcher. Parses and executes all `:` commands entered in command mode.
+(Line count last verified 2026-09-20, #1156 — earlier counts in this file predate
+several unrelated sessions' worth of growth, not just this one.)
 
 ## Key Methods
 - `execute_command(cmd)` — main dispatcher; giant match over ~100+ command names
-- Handles: `:w`, `:q`, `:e`, `:sp`, `:vs`, `:bn`, `:bp`, `:bd`, `:tabnew`, `:tabclose`, `:set`, `:colorscheme`, `:norm`, `:grep`, `:vimgrep`, `:copen`, `:cn`, `:cp`, `:Gdiff`, `:Gblame`, `:Gstatus`, `:Gpush`, `:Gpull`, `:Gfetch`, `:Gbranches`, `:term`, `:LspInfo`, `:LspRestart`, `:LspInstall`, `:DapInstall`, `:Plugin`, `:Settings`, `:Keymaps`, `:AI`, `:ExtRemove`, `:ExtRefresh`, `:map`/`:nmap`/`:imap`/`:vmap`, `:retab`, `:saveas`, `:windo`/`:bufdo`/`:tabdo`, `:fold`, `:Rename`, `:Lformat`, `:CodeAction`, `:hover`, `:DiffPeek`, `:Explore`, etc.
+- Handles: `:w`, `:q`, `:e`, `:sp`, `:vs`, `:bn`, `:bp`, `:bd`, `:tabnew`, `:tabclose`, `:set`, `:colorscheme`, `:norm`, `:grep`/`:vimgrep`/`:lgrep`/`:lvimgrep`, `:copen`/`:cclose`/`:cwindow`/`:cn`/`:cp`/`:cc`/`:cfirst`/`:clast`/`:clist`/`:colder`/`:cnewer`/`:cdo`/`:cfdo`, `:lopen`/`:lclose`/`:lwindow`/`:lnext`/`:lprevious`/`:lfirst`/`:llast`/`:ll`/`:llist`/`:ldo`/`:lfdo` (the location-list mirror of the `:c*` family, #1155 — dispatch here just resolves `Option<WindowId>` and delegates to the shared `qf_*` methods in `engine/picker.rs`), `:Gdiff`, `:Gblame`, `:Gstatus`, `:Gpush`, `:Gpull`, `:Gfetch`, `:Gbranches`, `:term`, `:LspInfo`, `:LspRestart`, `:LspInstall`, `:DapInstall`, `:Plugin`, `:Settings`, `:Keymaps`, `:AI`, `:ExtRemove`, `:ExtRefresh`, `:map`/`:nmap`/`:imap`/`:vmap`, `:retab`, `:saveas`, `:windo`/`:bufdo`/`:tabdo`, `:fold`, `:Rename`, `:Lformat`, `:CodeAction`, `:hover`, `:DiffPeek`, `:Explore`, etc.
 - `handle_status_action(action) -> Option<EngineAction>` — handles clickable status bar segment actions; returns `Some(EngineAction::ToggleSidebar)` for sidebar toggle (backend must dispatch), handles panel/menu toggle directly
 - `parse_ex_address(chars, i, current) -> Option<isize>` / `parse_ex_range(chars) -> (Option<(isize,isize)>, usize)` — the full ex address grammar (`N . $ % 'm /pat/ ?pat? \\/ +N -N a,b a;b`); `-1` is Vim's line 0
 - `try_execute_ranged_command(cmd)` — `:[range]` for `:d`, `:y`, `:j`, `:>`, `:<`, `:t`/`:co`, `:m`, and a bare range that moves the cursor
@@ -15,4 +17,5 @@ Ex-command dispatcher. Parses and executes all `:` commands entered in command m
 - `run_search()`, `search_next()`, `search_prev()`, `submit_search(raw, count)` — `/` and `?`, with `:h search-offset` support
 - `splice_buffer_text(new_text)` — replace the buffer's text as one undo step, touching only the differing region
 - `ex_copy_move(start, end, dest, is_move)` — shared `:t` / `:co` / `:m`
+- `try_execute_undo_command(cmd)` (#1156) — `:undolist`, `:earlier`/`:later` (count or `{N}[smhd]`, delegates to `engine::buffers::ex_earlier`/`ex_later`), `:undojoin`
 - Falls through to plugin command dispatch if no built-in match

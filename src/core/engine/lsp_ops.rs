@@ -1,5 +1,57 @@
 use super::*;
 
+/// Which half of a manifest's install (`[lsp]` or `[dap]`) a background
+/// `tool_acquire` task is acquiring — carries what `finalize_tool_acquire`
+/// needs to register the result (#1345).
+pub(crate) enum ToolAcquireLeg {
+    Lsp {
+        lang_ids: Vec<String>,
+        args: Vec<String>,
+    },
+    Dap,
+}
+
+/// Result of a completed background `tool_acquire::acquire_and_install`
+/// call, sent back to the main thread over `Engine::tool_acquire_tasks`.
+pub(crate) struct ToolAcquireOutcome {
+    pub ext_name: String,
+    pub install_key: String,
+    pub leg: ToolAcquireLeg,
+    pub tool_name: String,
+    pub result: Result<std::path::PathBuf, String>,
+    /// The specific notification this outcome must resolve — never marked
+    /// done "by kind" (review finding on #1345): a manifest with both
+    /// `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent native
+    /// acquisitions, both using `NotificationKind::LspInstall`, so
+    /// `notify_done_by_kind` would mark *both* notifications done the moment
+    /// either leg finishes — a still-downloading DAP adapter would flip to
+    /// "done" in the UI the instant the LSP leg completes (or vice versa).
+    pub notification_id: u64,
+}
+
+/// Per-extension aggregation state for the native acquisitions one
+/// `:ExtInstall` kicked off (#1345 review follow-up).
+///
+/// A manifest with both `[lsp.acquire]` and `[dap.acquire]` spawns two
+/// background threads that finish **whenever they finish** — the same
+/// `poll_tool_acquire` tick if both are fast, different ticks otherwise
+/// (a big download next to a small one, or just scheduler luck). Joining
+/// only the outcomes that happen to land in the *same* tick therefore
+/// fixes nothing on its own: the later tick's `self.message = …` still
+/// erases the earlier tick's text, which is exactly the "DAP outcome
+/// clobbering LSP success" bug (#1344) in slow motion. Carrying the
+/// finished legs' text here, across ticks, until the last leg of that
+/// extension reports, makes the final status line contain every leg's
+/// outcome regardless of completion order or tick boundaries.
+#[derive(Default)]
+pub(crate) struct ToolAcquireGroup {
+    /// Legs spawned for this extension that have not reported yet.
+    pub pending: usize,
+    /// Status text produced by each leg that has already reported, in
+    /// completion order.
+    pub messages: Vec<String>,
+}
+
 impl Engine {
     // =======================================================================
     // LSP integration
@@ -89,9 +141,26 @@ impl Engine {
             {
                 self.prompted_extensions.insert(name.to_string());
                 self.ext_hint_pending_name = Some(name.to_string());
-                self.message = format!(
-                    "No {} extension — :ExtInstall {}  (N to dismiss)",
-                    manifest.display_name, name
+                // #1397: the offer is a non-modal, actionable toast (never
+                // auto-expires — see `EngineToast::sticky`'s doc) rather
+                // than the old status-line-only hint, which any later
+                // status message silently overwrote before the user ever
+                // saw it. `:ExtInstall <name>` and `N` (handled in
+                // `keys.rs`, gated on `ext_hint_pending_name`) remain the
+                // keyboard-only equivalents of the toast's action button
+                // and dismiss "×", so a mouse-less user loses nothing.
+                self.push_sticky_action_toast(
+                    &format!("Install {}?", manifest.display_name),
+                    // "N: don't ask again" leads (not `:ExtInstall {name}`,
+                    // which can run long for a verbose extension name) —
+                    // the toast box is narrow enough on a typical terminal
+                    // width that the tail of a long body line clips before
+                    // "?", and this half is the one with no other on-screen
+                    // affordance (the action button already shows
+                    // "Install").
+                    &format!("N: don't ask again  ·  :ExtInstall {name}"),
+                    quadraui::ToastSeverity::Info,
+                    ToastActionKind::InstallExtension(name.clone()),
                 );
             } else if let Some(err) = no_server {
                 // #436: extension is installed but the LSP didn't start
@@ -271,10 +340,21 @@ impl Engine {
 
         let mut status_parts: Vec<String> = Vec::new();
         let mut install_commands: Vec<String> = Vec::new();
+        // #1345: true once any leg has kicked off a native acquisition
+        // (download/verify/unpack, no terminal). Tracked separately from
+        // `has_install` below because both can never involve the same leg —
+        // a leg does the shared-resolver check, then EITHER native
+        // acquisition OR the terminal install script, never both — but a
+        // manifest with an LSP `acquire` and a DAP `install_*` (or vice
+        // versa) can set both flags in the same call.
+        let mut has_native_acquire = false;
 
         // ── LSP ──────────────────────────────────────────────────────────────
-        // Check if any LSP binary is already on PATH (idempotent: skip install
-        // if the server is already available, e.g. via `rustup component add`).
+        // Resolution order (#1345): (1) already resolvable via the shared
+        // tool lookup (`binary_on_path`, which now probes the vimcode-managed
+        // tools dir first) → done; (2) manifest declares `[lsp.acquire]` →
+        // native acquisition, no terminal, no shell; (3) else the legacy
+        // `install_*` shell string in the visible terminal, unchanged.
         if !manifest.lsp.binary.is_empty() {
             let all_lsp: Vec<&str> = std::iter::once(manifest.lsp.binary.as_str())
                 .chain(manifest.lsp.fallback_binaries.iter().map(|s| s.as_str()))
@@ -283,6 +363,26 @@ impl Engine {
             let found_bin = all_lsp.iter().copied().find(|b| binary_on_path(b));
             if let Some(bin) = found_bin {
                 status_parts.push(format!("LSP: {bin} ✓"));
+            } else if let Some(acquire) = manifest.lsp.acquire.clone() {
+                let lsp_key = format!("ext:{ext_name}:lsp");
+                self.lsp_installing.insert(lsp_key.clone());
+                let notification_id = self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Acquiring {}…", manifest.lsp.binary),
+                );
+                self.spawn_tool_acquire(
+                    ext_name.clone(),
+                    lsp_key,
+                    ToolAcquireLeg::Lsp {
+                        lang_ids: manifest.language_ids.clone(),
+                        args: manifest.lsp.args.clone(),
+                    },
+                    manifest.lsp.binary.clone(),
+                    acquire,
+                    notification_id,
+                );
+                has_native_acquire = true;
+                status_parts.push(format!("LSP: acquiring {}…", manifest.lsp.binary));
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
                 self.lsp_installing.insert(lsp_key.clone());
@@ -304,17 +404,36 @@ impl Engine {
         let available_manifests = self.ext_available_manifests();
 
         // ── DAP ──────────────────────────────────────────────────────────────
-        // Check PATH first (idempotent), then consult the unified resolver
-        // that knows about both manifest-declared installs AND the built-in
-        // multi-step installers (codelldb, debugpy venv, netcoredbg archive
-        // unpack). Previously this branch read `manifest.dap.install` only,
-        // which is empty for adapters with hardcoded installers — sending
-        // the user into a `:DapInstall <lang>` loop that resolved back here.
+        // Check PATH first (idempotent), then prefer native acquisition
+        // (#1345) when the manifest declares `[dap.acquire]`, then fall back
+        // to the unified resolver that knows about both manifest-declared
+        // installs AND the built-in multi-step installers (codelldb, debugpy
+        // venv, netcoredbg archive unpack). Previously this branch read
+        // `manifest.dap.install` only, which is empty for adapters with
+        // hardcoded installers — sending the user into a `:DapInstall <lang>`
+        // loop that resolved back here.
         if !manifest.dap.adapter.is_empty() {
             let dap_binary = manifest.dap.binary.as_str();
             let already_on_path = !dap_binary.is_empty() && binary_on_path(dap_binary);
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
+            } else if let Some(acquire) = manifest.dap.acquire.clone() {
+                let dap_key = format!("dap:{}", manifest.dap.adapter);
+                self.lsp_installing.insert(dap_key.clone());
+                let notification_id = self.notify(
+                    NotificationKind::LspInstall,
+                    &format!("Acquiring {}…", manifest.dap.adapter),
+                );
+                self.spawn_tool_acquire(
+                    ext_name.clone(),
+                    dap_key,
+                    ToolAcquireLeg::Dap,
+                    manifest.dap.binary.clone(),
+                    acquire,
+                    notification_id,
+                );
+                has_native_acquire = true;
+                status_parts.push(format!("DAP: acquiring {}…", manifest.dap.adapter));
             } else {
                 let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
                     manifest.dap.adapter.as_str(),
@@ -364,9 +483,10 @@ impl Engine {
 
         // Kick-start LSP for the current buffer if it matches this extension's languages.
         // Without this, the user would have to re-open the file to get LSP support.
-        // Skip if an install is pending — the binary isn't available yet; LSP will be
-        // started when the install terminal completes.
-        if !has_install {
+        // Skip if an install/acquisition is pending — the binary isn't available yet;
+        // LSP will be started when the install terminal (or `finalize_tool_acquire`,
+        // #1345) completes.
+        if !has_install && !has_native_acquire {
             let active_bid = self.active_buffer_id();
             if let Some(state) = self.buffer_manager.get(active_bid) {
                 let buf_lang = state.lsp_language_id.clone().or_else(|| {
@@ -392,6 +512,198 @@ impl Engine {
                 status_parts.join(", ")
             )
         };
+    }
+
+    /// Spawn a background thread that downloads, verifies and unpacks
+    /// `tool_name` per `acquire` (#1345), off the UI thread. The result
+    /// arrives via `tool_acquire_tasks`, drained by `poll_tool_acquire` —
+    /// same shape as `Engine::ext_refresh`'s background registry fetch and
+    /// `plugins.rs`'s `async_shell_tasks`.
+    fn spawn_tool_acquire(
+        &mut self,
+        ext_name: String,
+        install_key: String,
+        leg: ToolAcquireLeg,
+        tool_name: String,
+        acquire: crate::core::tool_acquire::AcquireConfig,
+        notification_id: u64,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bg_tool_name = tool_name.clone();
+        let bg_install_key = install_key.clone();
+        // Register the leg before it can possibly report, so a finalize
+        // that lands in the very next tick sees a non-zero `pending` and
+        // keeps its sibling's text (see `ToolAcquireGroup`).
+        self.tool_acquire_groups
+            .entry(ext_name.clone())
+            .or_default()
+            .pending += 1;
+        std::thread::spawn(move || {
+            let result = crate::core::tool_acquire::acquire_and_install(&bg_tool_name, &acquire)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(ToolAcquireOutcome {
+                ext_name,
+                install_key: bg_install_key,
+                leg,
+                tool_name: bg_tool_name,
+                result,
+                notification_id,
+            });
+        });
+        self.tool_acquire_tasks.insert(install_key, rx);
+    }
+
+    /// Non-blocking check for completed background tool acquisitions.
+    /// Call this from `poll_idle`. Returns `true` if a redraw is needed.
+    pub fn poll_tool_acquire(&mut self) -> bool {
+        let mut completed: Vec<(String, ToolAcquireOutcome)> = Vec::new();
+        for (key, rx) in &self.tool_acquire_tasks {
+            if let Ok(outcome) = rx.try_recv() {
+                completed.push((key.clone(), outcome));
+            }
+        }
+        if completed.is_empty() {
+            return false;
+        }
+        for (key, _) in &completed {
+            self.tool_acquire_tasks.remove(key);
+        }
+
+        // Group by extension (review finding on #1345): a manifest with
+        // both `[lsp.acquire]` and `[dap.acquire]` spawns two concurrent
+        // background acquisitions, and if both land in the same poll tick,
+        // finalizing them one at a time straight into `self.message` would
+        // let the second overwrite the first's success/failure text —
+        // exactly the "DAP outcome clobbering LSP success" class fixed for
+        // the terminal-install path in `finalize_install_from_terminal`
+        // (#1344). Outcomes for the same extension are collected and joined
+        // into one status line instead — and, because two legs need not
+        // land in the same tick at all, that join is carried across ticks
+        // in `Engine::tool_acquire_groups` (see `ToolAcquireGroup`);
+        // outcomes for different extensions
+        // still each get their own call (and so the last one to finalize
+        // wins `self.message` — a pre-existing, unrelated property of a
+        // single-line status bar shared across all engine operations).
+        let mut order: Vec<String> = Vec::new();
+        let mut by_ext: std::collections::HashMap<String, Vec<ToolAcquireOutcome>> =
+            std::collections::HashMap::new();
+        for (_, outcome) in completed {
+            if !by_ext.contains_key(&outcome.ext_name) {
+                order.push(outcome.ext_name.clone());
+            }
+            by_ext
+                .entry(outcome.ext_name.clone())
+                .or_default()
+                .push(outcome);
+        }
+        for ext_name in order {
+            if let Some(outcomes) = by_ext.remove(&ext_name) {
+                self.finalize_tool_acquire_group(outcomes);
+            }
+        }
+        true
+    }
+
+    /// Apply the results of one or more completed background acquisitions
+    /// belonging to the same extension: on success, register + start the
+    /// LSP server (mirrors `terminal_ops::finalize_install_from_terminal`'s
+    /// LSP branch) or, for a DAP leg, just report success — there is no
+    /// long-lived adapter process to start here; `DapManager::start_adapter`
+    /// resolves the adapter binary at debug-start time via
+    /// `dap_manager::resolve_binary`, which (since this issue) delegates to
+    /// the same `lsp_manager::resolve_command` that probes the
+    /// vimcode-managed tools dir this acquisition just populated, so the
+    /// success message painted here and the F5 launch agree. On failure,
+    /// delete nothing further (`tool_acquire::acquire_and_install` already
+    /// cleaned up its own partial state) and surface the error. Each
+    /// outcome resolves its own notification by ID (never "by kind" — see
+    /// `ToolAcquireOutcome::notification_id`'s doc comment), and the
+    /// per-leg messages are accumulated in that extension's
+    /// [`ToolAcquireGroup`] and re-joined into one status line on every
+    /// finalize — mirroring `finalize_install_from_terminal`'s
+    /// collect-then-join pattern, but *across ticks* so a second leg that
+    /// finishes a tick later can never silently erase the first's text
+    /// either (see `ToolAcquireGroup`'s doc comment).
+    fn finalize_tool_acquire_group(&mut self, outcomes: Vec<ToolAcquireOutcome>) {
+        let mut affected: Vec<String> = Vec::new();
+        for outcome in outcomes {
+            let mut messages: Vec<String> = Vec::new();
+            self.lsp_installing.remove(&outcome.install_key);
+            self.notify_done(outcome.notification_id, None);
+
+            let ext_name = outcome.ext_name.clone();
+            match outcome.result {
+                Ok(bin_path) => {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-install] '{ext_name}' acquired {} -> {}",
+                        outcome.tool_name,
+                        bin_path.display()
+                    ));
+                    match outcome.leg {
+                        ToolAcquireLeg::Lsp { lang_ids, args } => {
+                            self.ensure_lsp_manager();
+                            for lsp_lang in &lang_ids {
+                                let config = lsp::LspServerConfig {
+                                    command: outcome.tool_name.clone(),
+                                    args: args.clone(),
+                                    languages: vec![lsp_lang.clone()],
+                                    ..Default::default()
+                                };
+                                if let Some(mgr) = &mut self.lsp_manager {
+                                    mgr.add_registry_entry(config);
+                                    mgr.ensure_server_for_language(lsp_lang);
+                                }
+                                self.lsp_reopen_buffers_for_language(lsp_lang);
+                            }
+                            messages.push(format!(
+                                "LSP server for '{ext_name}' installed and started ({})",
+                                outcome.tool_name
+                            ));
+                        }
+                        ToolAcquireLeg::Dap => {
+                            messages.push(format!(
+                                "DAP adapter for '{ext_name}' installed — press F5 to debug"
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::core::lsp_manager::install_log(&format!(
+                        "[ext-install] '{ext_name}' acquisition of {} failed: {e}",
+                        outcome.tool_name
+                    ));
+                    messages.push(format!(
+                        "Install for '{ext_name}' failed to acquire {}: {e}",
+                        outcome.tool_name
+                    ));
+                }
+            }
+
+            let group = self
+                .tool_acquire_groups
+                .entry(ext_name.clone())
+                .or_default();
+            group.pending = group.pending.saturating_sub(1);
+            group.messages.append(&mut messages);
+            if !affected.contains(&ext_name) {
+                affected.push(ext_name);
+            }
+        }
+
+        for ext_name in affected {
+            let Some(group) = self.tool_acquire_groups.get(&ext_name) else {
+                continue;
+            };
+            if !group.messages.is_empty() {
+                self.message = group.messages.join(" | ");
+            }
+            // Last leg of this extension reported — drop the accumulator so
+            // a later re-install of the same extension starts from a clean
+            // slate rather than re-painting the previous run's outcomes.
+            if group.pending == 0 {
+                self.tool_acquire_groups.remove(&ext_name);
+            }
+        }
     }
 
     /// Open the README for the currently selected extension in the sidebar.
@@ -572,6 +884,36 @@ impl Engine {
         }
 
         for bin_name in &bins {
+            // #1345 (review): every path below is built by joining this
+            // manifest-supplied name onto a directory vimcode then *deletes
+            // from* (`remove_dir_all` for the managed tool dir and the
+            // `~/.local/share/<name>` data dir, `remove_file` in the safe
+            // dirs). `binary` is free-form text out of a community-submitted
+            // registry manifest and `PathBuf::join` resolves nothing, so
+            // `binary = "../.."` would otherwise make `:ExtUninstall` with
+            // "remove tools" recursively delete an *ancestor* of
+            // `~/.local/share/vimcode/tools` — with enough segments, the
+            // user's home directory. Gate on the same predicate
+            // `tool_acquire::install_resolved_asset` already applies to this
+            // identical value on the way in.
+            if !crate::core::tool_acquire::is_safe_single_segment_name(bin_name) {
+                crate::core::lsp_manager::install_log(&format!(
+                    "[ext-remove] Refusing to remove tools for unsafe binary \
+                     name {bin_name:?} declared by '{name}' — not a plain \
+                     file name"
+                ));
+                continue;
+            }
+            // #1345: delete the vimcode-managed acquisition dir outright —
+            // unlike the shared `safe_dirs` above (system directories other
+            // tools might also use), `tools/<bin_name>/` is exclusively
+            // populated by `tool_acquire::acquire_and_install`, so removing
+            // the whole directory (every version, not just `current`) can
+            // never delete anything vimcode doesn't own.
+            let managed_dir = paths::managed_tool_dir(bin_name);
+            if managed_dir.is_dir() && std::fs::remove_dir_all(&managed_dir).is_ok() {
+                removed.push(format!("{}", managed_dir.display()));
+            }
             // Remove binary from safe dirs.
             for dir in &safe_dirs {
                 let path = dir.join(bin_name);
@@ -908,4 +1250,338 @@ fn is_rustup_proxy(path: &Path) -> bool {
     let proxy_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let rustup_len = std::fs::metadata(&rustup_exe).map(|m| m.len()).unwrap_or(0);
     proxy_len != 0 && proxy_len == rustup_len
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a finished-leg outcome without running a real acquisition.
+    fn outcome(
+        ext: &str,
+        install_key: &str,
+        leg: ToolAcquireLeg,
+        tool: &str,
+        result: Result<std::path::PathBuf, String>,
+    ) -> ToolAcquireOutcome {
+        ToolAcquireOutcome {
+            ext_name: ext.to_string(),
+            install_key: install_key.to_string(),
+            leg,
+            tool_name: tool.to_string(),
+            result,
+            notification_id: 0,
+        }
+    }
+
+    /// #1345 review follow-up, deterministic half: two legs of the same
+    /// `:ExtInstall` that report in **different** `poll_tool_acquire`
+    /// ticks must both survive in the status line. The driver-tier test
+    /// `tui_main::shell_app::tests::extension_install_lsp_acquire_success_
+    /// survives_dap_acquire_failure_via_shell_app` covers the same rule on
+    /// painted output, but it cannot *force* the two-tick ordering — the
+    /// background threads decide that — so it reproduced the bug only
+    /// intermittently (2 of 4 full `--lib` runs). Calling finalize twice
+    /// here pins it.
+    ///
+    /// Verified RED against the same-tick-only join (`let mut messages`
+    /// local to `finalize_tool_acquire_group`, assigned straight into
+    /// `self.message`): the second call overwrites the first's text and
+    /// the DAP assertion below fails.
+    ///
+    /// The DAP leg succeeds and the LSP leg fails (rather than the other
+    /// way round) purely so neither call reaches `ensure_lsp_manager` /
+    /// `ensure_server_for_language` — no process spawn, no PATH probing,
+    /// nothing environment-dependent in a unit test.
+    #[test]
+    fn tool_acquire_outcomes_in_separate_ticks_keep_both_messages() {
+        let mut e = Engine::new();
+        let ext = "vc-unit-acq-ext-1345";
+
+        // Two legs in flight, as `spawn_tool_acquire` would have left it.
+        e.tool_acquire_groups
+            .entry(ext.to_string())
+            .or_default()
+            .pending = 2;
+
+        // Tick 1: the DAP leg lands on its own.
+        e.finalize_tool_acquire_group(vec![outcome(
+            ext,
+            &format!("dap:{ext}"),
+            ToolAcquireLeg::Dap,
+            "vc-unit-acq-dap-1345",
+            Ok(std::path::PathBuf::from(
+                "/nonexistent/vc-unit-acq-dap-1345",
+            )),
+        )]);
+        assert!(
+            e.message.contains("DAP adapter") && e.message.contains(ext),
+            "first leg must paint its own outcome; got: {}",
+            e.message
+        );
+        assert_eq!(
+            e.tool_acquire_groups.get(ext).map(|g| g.pending),
+            Some(1),
+            "the still-running LSP leg must keep the accumulator alive"
+        );
+
+        // Tick 2 (a separate `poll_tool_acquire` call): the LSP leg fails.
+        e.finalize_tool_acquire_group(vec![outcome(
+            ext,
+            &format!("ext:{ext}:lsp"),
+            ToolAcquireLeg::Lsp {
+                lang_ids: vec![],
+                args: vec![],
+            },
+            "vc-unit-acq-lsp-1345",
+            Err("boom".to_string()),
+        )]);
+        assert!(
+            e.message.contains("failed to acquire"),
+            "second leg's outcome must reach the status line; got: {}",
+            e.message
+        );
+        assert!(
+            e.message.contains("DAP adapter"),
+            "a leg finishing a tick later must not erase the earlier leg's \
+             text; got: {}",
+            e.message
+        );
+
+        // Last leg reported — accumulator dropped so a re-install starts clean.
+        assert!(
+            !e.tool_acquire_groups.contains_key(ext),
+            "accumulator must be cleared once every leg has reported"
+        );
+    }
+
+    /// #1345 blocking review finding: `ext_remove_tools` joins
+    /// `manifest.lsp.binary` / `manifest.dap.binary` — free-form text from a
+    /// community-submitted registry manifest — straight onto directories it
+    /// then `remove_dir_all`s. `PathBuf::join` resolves nothing, so a
+    /// manifest declaring `binary = "../.."` used to turn ":ExtUninstall,
+    /// remove tools" into a recursive delete of an *ancestor* of
+    /// `~/.local/share/vimcode/tools`.
+    ///
+    /// The sentinel here sits two levels above the managed tools dir — i.e.
+    /// exactly where `managed_tool_dir("../../<sentinel>")` lands once the
+    /// OS resolves the join — and must survive the removal. The traversal
+    /// deliberately cannot reach anything real through the `$HOME`-based
+    /// legs of that same loop either: `~/.local/bin/../../<sentinel>` and
+    /// `~/.local/share/../../<sentinel>` resolve to a pid-unique name
+    /// directly under `$HOME`'s parent that no machine has, so an unguarded
+    /// (RED) run of this test deletes the throwaway sentinel and nothing
+    /// else.
+    ///
+    /// **Verified RED without the guard:** removing the
+    /// `is_safe_single_segment_name` check from `ext_remove_tools` makes the
+    /// sentinel directory (and the file inside it) gone by the time the
+    /// assertions run.
+    ///
+    /// Unit- rather than driver-tier on purpose: the guard changes no
+    /// painted output at all — `ext_remove` reports the same "Extension 'x'
+    /// and its tools removed" message either way — so what has to be
+    /// asserted is the filesystem effect, which no screen can show.
+    #[test]
+    fn ext_remove_tools_refuses_path_traversal_binary_names() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+
+        let _lock = crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let unique = format!(
+            "vimcode-test-1345-traversal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )
+        .replace(['(', ')', ' '], "");
+        let base = std::env::temp_dir().join(&unique);
+        let data_home = base.join("data");
+        let sentinel = base.join("sentinel");
+        std::fs::create_dir_all(&sentinel).unwrap();
+        std::fs::write(sentinel.join("keep-me.txt"), b"keep").unwrap();
+        // `<data_home>/tools/<binary>` with `binary = "../../sentinel"`
+        // resolves to `<base>/sentinel`.
+        std::fs::create_dir_all(data_home.join("tools")).unwrap();
+
+        let old_data_home = std::env::var_os("VIMCODE_TEST_DATA_HOME");
+        std::env::set_var("VIMCODE_TEST_DATA_HOME", &data_home);
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-traversal-ext-1345";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "Hostile manifest (1345 traversal test)".to_string(),
+            language_ids: vec!["vc-unit-traversal-lang-1345".to_string()],
+            lsp: LspConfig {
+                // `..`-escape: `remove_dir_all` of the whole sentinel dir.
+                binary: "../../sentinel".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vc-unit-traversal-adapter-1345".to_string(),
+                // Nested-name escape: reaches a single file inside it.
+                binary: "../../sentinel/keep-me.txt".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_remove_tools(ext_name);
+
+        match old_data_home {
+            Some(v) => std::env::set_var("VIMCODE_TEST_DATA_HOME", v),
+            None => std::env::remove_var("VIMCODE_TEST_DATA_HOME"),
+        }
+
+        assert!(
+            sentinel.is_dir(),
+            "a manifest binary name containing `..` must never make tool \
+             removal delete a directory outside the managed tools tree; \
+             {} is gone",
+            sentinel.display()
+        );
+        assert!(
+            sentinel.join("keep-me.txt").is_file(),
+            "the sentinel directory survived but its contents did not — \
+             the traversal still reached inside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The predicate the guard above delegates to, spelled out: a plain
+    /// file name is the only accepted shape. `is_safe_relative_path` alone
+    /// (which `tool_acquire`'s archive-entry checks use) accepts `a/b`, and
+    /// a nested name is just as much an escape as `..` when it is joined
+    /// onto a directory that is about to be deleted.
+    #[test]
+    fn is_safe_single_segment_name_accepts_only_plain_file_names() {
+        use crate::core::tool_acquire::is_safe_single_segment_name;
+        for good in ["rust-analyzer", "clangd", "terraform-ls", "gopls.exe"] {
+            assert!(
+                is_safe_single_segment_name(good),
+                "{good:?} must be accepted"
+            );
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "../..",
+            "../../../../",
+            "a/b",
+            "a\\b",
+            "/etc",
+            "./x",
+            "sub/../..",
+        ] {
+            assert!(
+                !is_safe_single_segment_name(bad),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// #1386 core acceptance: opening several files of a language whose
+    /// server resolves to a broken proxy (present on disk, fails its
+    /// `--version` probe — the rustup-uninstalled-component shape) must not
+    /// re-run that probe for every open. `Engine::open_file_with_mode`
+    /// calls `lsp_did_open`, which calls `ensure_server_for_language`
+    /// *twice* per open (did-open + `lsp_request_semantic_tokens`), so
+    /// without the negative cache this reads N×2 (or N×4, counting
+    /// `resolve_command`'s own internal duplicate probe) instead of 1.
+    ///
+    /// Also proves the file still opens successfully (buffer content
+    /// present, no error `Result`) despite the unresolvable server — the
+    /// bug this issue reports was a UI-thread stall on open, not a hard
+    /// failure, so a passing `open_file_with_mode` call on its own wouldn't
+    /// be new coverage; the probe count is the actual regression guard.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the
+    /// `failed_language_resolutions` cache (`lsp_manager.rs`) makes
+    /// `probe_count` below grow with each open instead of staying at 1.
+    #[test]
+    #[cfg(unix)]
+    fn opening_multiple_files_with_unresolvable_lsp_server_probes_only_once() {
+        let binary_name = "vimcode-test-1386-engine-proxy";
+        let unique = format!(
+            "vimcode_test_1386_engine_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(&unique);
+        let home = base.join("home");
+        let cargo_bin = home.join(".cargo").join("bin");
+        let files_dir = base.join("files");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let counter_file = base.join("probes.log");
+
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\necho probe >> {}\nexit 1\n",
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Thread-local, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
+        // version corrupts concurrently-running tests (#957 smoke).
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-test-1386-engine-ext";
+        // Reuse the built-in `.java` → "java" mapping (`lsp::language_id_
+        // from_path`) so this test needs no change to that table — only the
+        // manifest's `lsp.binary` needs to be unresolvable.
+        let mut e = Engine::new();
+        e.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: ext_name.to_string(),
+            language_ids: vec!["java".to_string()],
+            file_extensions: vec![".java".to_string()],
+            lsp: crate::core::extensions::LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        e.extension_state.mark_installed(ext_name);
+
+        for i in 0..3 {
+            let file = files_dir.join(format!("File{i}.java"));
+            std::fs::write(&file, format!("class File{i} {{}}\n")).unwrap();
+            e.open_file_with_mode(&file, OpenMode::Permanent)
+                .unwrap_or_else(|e| panic!("open must succeed despite unresolvable LSP: {e}"));
+        }
+
+        // The buffer actually opened — the bug was a UI stall, not a
+        // failure to open.
+        assert!(
+            e.active_buffer_state().buffer.to_string().contains("File2"),
+            "the third file's content must be present in the active buffer"
+        );
+
+        let probes = std::fs::read_to_string(&counter_file).unwrap_or_default();
+        let probe_count = probes.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            probe_count, 1,
+            "opening 3 files of a language whose server can't be resolved \
+             must probe the broken proxy at most once total, not once per \
+             open; got {probe_count} probes; log:\n{probes}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

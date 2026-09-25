@@ -79,7 +79,7 @@ impl Engine {
         let layout_wids = self.active_tab().layout.window_ids();
         for candidate in &layout_wids {
             if self.windows.contains_key(candidate) {
-                self.active_tab_mut().active_window = *candidate;
+                self.active_tab_mut().focus_window(*candidate);
                 return;
             }
         }
@@ -92,7 +92,81 @@ impl Engine {
         self.windows.insert(new_wid, window);
         let tab = self.active_tab_mut();
         tab.layout = crate::core::window::WindowLayout::leaf(new_wid);
-        tab.active_window = new_wid;
+        tab.focus_window(new_wid);
+    }
+
+    /// Which (group, tab index) currently has `window_id` somewhere in its
+    /// layout — searched across *every* editor group/tab, not just the
+    /// active one. Needed by any window-removal path that can be driven from
+    /// a tab other than the currently active one (`qf_close_panel_window`,
+    /// #1307 review): `qf_panel_windows` is a single engine-wide map with no
+    /// per-tab scoping, so the panel window named by a `:cclose`/`:copen`
+    /// call may live in a tab the user isn't currently looking at.
+    pub(crate) fn find_window_tab(&self, window_id: WindowId) -> Option<(GroupId, usize)> {
+        for (&group_id, group) in self.editor_groups.iter() {
+            for (tab_idx, tab) in group.tabs.iter().enumerate() {
+                if tab.contains_window(window_id) {
+                    return Some((group_id, tab_idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// Like [`Self::repair_active_window`], but for an arbitrary `(group,
+    /// tab_idx)` pair rather than always the currently active one. Every
+    /// other window-removal path in this codebase derives the tab to repair
+    /// from `active_tab_mut()`, which silently does nothing for a *different*
+    /// tab's now-dangling `active_window` — leaving it to panic the next time
+    /// that tab becomes active and [`Self::active_window`] is called
+    /// (#1307 review: `:copen` in tab 1, `:tabnew`, `:cclose` from tab 2).
+    /// A no-op if `(group_id, tab_idx)` no longer exists.
+    pub(crate) fn repair_window_in_tab(&mut self, group_id: GroupId, tab_idx: usize) {
+        let Some(wid) = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_idx))
+            .map(|t| t.active_window)
+        else {
+            return;
+        };
+        if self.windows.contains_key(&wid) {
+            return; // already valid
+        }
+
+        let layout_wids = self
+            .editor_groups
+            .get(&group_id)
+            .and_then(|g| g.tabs.get(tab_idx))
+            .map(|t| t.layout.window_ids())
+            .unwrap_or_default();
+        for candidate in &layout_wids {
+            if self.windows.contains_key(candidate) {
+                if let Some(tab) = self
+                    .editor_groups
+                    .get_mut(&group_id)
+                    .and_then(|g| g.tabs.get_mut(tab_idx))
+                {
+                    tab.focus_window(*candidate);
+                }
+                return;
+            }
+        }
+
+        // No valid windows left in this tab — create a scratch window.
+        let buf_id = self.buffer_manager.create();
+        let new_wid = crate::core::window::WindowId(self.next_window_id);
+        self.next_window_id += 1;
+        let window = crate::core::window::Window::new(new_wid, buf_id);
+        self.windows.insert(new_wid, window);
+        if let Some(tab) = self
+            .editor_groups
+            .get_mut(&group_id)
+            .and_then(|g| g.tabs.get_mut(tab_idx))
+        {
+            tab.layout = crate::core::window::WindowLayout::leaf(new_wid);
+            tab.focus_window(new_wid);
+        }
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -183,6 +257,42 @@ impl Engine {
         self.active_buffer_state().dirty
     }
 
+    /// Text for Vim's `'showcmd'` (#1190): the partially-typed Normal-mode
+    /// command so far — register prefix, counts, pending operator/
+    /// find-operator/text-object modifier, and the single pending key for
+    /// two-key sequences like `gg`/`dd` (`:h 'showcmd'`). Reconstructed
+    /// from engine state rather than an exact keystroke echo — good enough
+    /// to show *that* a command is pending and roughly what it is, which is
+    /// what the option is for. Empty when nothing is pending; callers
+    /// should render nothing in that case.
+    pub fn showcmd_text(&self) -> String {
+        let mut s = String::new();
+        if let Some(r) = self.selected_register {
+            s.push('"');
+            s.push(r);
+        }
+        if let Some(n) = self.operator_count {
+            s.push_str(&n.to_string());
+        }
+        if let Some(op) = self.pending_operator {
+            s.push(op);
+        }
+        if let Some((op, find_type)) = self.pending_find_operator {
+            s.push(op);
+            s.push(find_type);
+        }
+        if let Some(to) = self.pending_text_object {
+            s.push(to);
+        }
+        if let Some(n) = self.count {
+            s.push_str(&n.to_string());
+        }
+        if let Some(k) = self.pending_key {
+            s.push(k);
+        }
+        s
+    }
+
     /// True if ANY open buffer has unsaved changes.
     pub fn has_any_unsaved(&self) -> bool {
         self.buffer_manager
@@ -191,9 +301,67 @@ impl Engine {
             .any(|id| self.buffer_manager.get(id).is_some_and(|s| s.dirty))
     }
 
+    /// True if some window other than `except_win` still displays `buf_id`.
+    ///
+    /// A dirty buffer can be abandoned in one window/tab as long as another
+    /// window still shows it — the buffer itself isn't going anywhere, so
+    /// there's nothing to lose (`:h E37`). Only when `except_win` is the
+    /// *last* window showing `buf_id` is closing it a real "discard my only
+    /// copy" decision that deserves a confirmation prompt.
+    ///
+    /// This predicate used to be duplicated: the `:q` path
+    /// (`execute.rs`) got it right, but the tab-bar close path
+    /// (`handle_tab_bar_click`'s `CloseTab` arm) never applied it and
+    /// prompted on every view of a dirty buffer, not just the last one
+    /// (#1038). `:q` only ever closes a single window, so a single
+    /// `except_win` is enough for it; see `buffer_has_views_outside` for
+    /// the multi-window case (closing a whole tab).
+    pub fn buffer_has_other_views(&self, buf_id: BufferId, except_win: WindowId) -> bool {
+        self.buffer_has_views_outside(buf_id, std::slice::from_ref(&except_win))
+    }
+
+    /// True if some window outside `excluded` still displays `buf_id`.
+    ///
+    /// Closing an entire tab (`CloseTab`) can destroy more than one window
+    /// at once: an ordinary in-tab split (`split_window`/
+    /// `split_window_with_new_first`) puts a second `Window` on the *same*
+    /// buffer inside the *same* tab, and `close_tab` removes every window
+    /// the tab owns, not just the currently-focused one. Excluding only the
+    /// active window (as `buffer_has_other_views` does) would find that
+    /// sibling split and wrongly conclude another view survives, even
+    /// though it's being destroyed in the very same operation — silently
+    /// discarding the only copy of the dirty buffer (#1038). Callers that
+    /// close more than one window at a time must exclude the *whole* set of
+    /// windows about to disappear.
+    pub fn buffer_has_views_outside(&self, buf_id: BufferId, excluded: &[WindowId]) -> bool {
+        self.windows
+            .values()
+            .any(|w| w.buffer_id == buf_id && !excluded.contains(&w.id))
+    }
+
+    /// Vim's `'hidden'` gate (#1190) for abandoning the active buffer via
+    /// `:edit`, `:bnext`/`:bprevious`/`:bfirst`/`:blast`, `:buffer` and
+    /// `:enew`. Mirrors the `:quit` guard (`execute.rs`'s `"quit"` arm):
+    /// a dirty buffer may always be abandoned when another window still
+    /// shows it (nothing is lost), or when `force` (a trailing `!`) or
+    /// `'hidden'` says so. Otherwise returns the same `E37`-style message
+    /// `:quit`/`:bdelete` already use, for the caller to surface via
+    /// `self.message` + `EngineAction::Error`.
+    pub(crate) fn check_buffer_abandon(&self, force: bool) -> Result<(), String> {
+        if force || self.settings.hidden || !self.dirty() {
+            return Ok(());
+        }
+        let buf_id = self.active_buffer_id();
+        let win_id = self.active_window_id();
+        if self.buffer_has_other_views(buf_id, win_id) {
+            return Ok(());
+        }
+        Err("No write since last change (add ! to override)".to_string())
+    }
+
     /// Compute explorer tree indicators: git status + deduplicated diagnostic counts.
     /// Returns (git_statuses, diag_counts) where:
-    /// - git_statuses: canonical path → git status char (M, A, D, R, ?)
+    /// - git_statuses: canonical path → git status char (M, A, D, R, U)
     /// - diag_counts: canonical path → (error_lines, warning_lines) deduplicated by line number
     ///
     /// Result is cached in `explorer_indicators_cache`; call
@@ -290,14 +458,19 @@ impl Engine {
 
         // Propagate git statuses up to parent directories so that a folder
         // shows modified/added color when any descendant file has that status.
-        // Priority: M > D > R > A > ?
+        // Priority: M > D > R > A > U
+        //
+        // #1051: this reads `StatusKind::label()`'s own output (populated
+        // into `git_statuses` above), so it must track that mapping — 'U'
+        // is the display label for `StatusKind::Untracked`, not git's `?`
+        // porcelain notation.
         fn git_priority(c: char) -> u8 {
             match c {
                 'M' => 5,
                 'D' => 4,
                 'R' => 3,
                 'A' => 2,
-                '?' => 1,
+                'U' => 1,
                 _ => 0,
             }
         }

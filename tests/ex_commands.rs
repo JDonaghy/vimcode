@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 use vimcode_core::EngineAction;
+use vimcode_core::Mode;
 use vimcode_core::RegType;
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -25,7 +26,10 @@ fn normalizer_colo_to_colorscheme() {
 fn normalizer_di_to_display() {
     let mut e = engine_with("hello\n");
     exec(&mut e, "di");
-    assert_msg_contains(&e, "Registers");
+    // `:di` abbreviates to `:display`, which since #1299 prints Neovim's real
+    // `Type Name Content` table header rather than vimcode's old invented
+    // `--- Registers ---` banner.
+    assert_msg_contains(&e, "Type Name Content");
 }
 
 #[test]
@@ -194,8 +198,84 @@ fn normalizer_sp_to_split() {
 #[test]
 fn cmd_display_shows_registers() {
     let mut e = engine_with("hello\n");
+    exec(&mut e, "yank a");
     exec(&mut e, "display");
-    assert_msg_contains(&e, "Registers");
+    // #1299: Neovim's real header + `  {type}  "{name}   {content}` columns,
+    // with embedded newlines shown as `^J`, replacing vimcode's old invented
+    // `--- Registers ---` / `"a  l  hello\n` layout.
+    assert_msg_contains(&e, "Type Name Content");
+    assert_msg_contains(&e, "  l  \"a   hello^J");
+}
+
+#[test]
+fn cmd_registers_argument_filters_listing() {
+    let mut e = engine_with("alpha\nbravo\n");
+    exec(&mut e, "yank a");
+    press(&mut e, 'j');
+    exec(&mut e, "yank b");
+    exec(&mut e, "registers a");
+    assert_msg_contains(&e, "Type Name Content");
+    assert_msg_contains(&e, "  l  \"a   alpha^J");
+    assert!(
+        !e.message.contains("bravo"),
+        ":registers a must not list register b, got {:?}",
+        e.message
+    );
+    assert!(
+        !e.message.contains("\"\""),
+        ":registers a must not list the unnamed register, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn cmd_reg_multi_char_argument_lists_each_register() {
+    let mut e = engine_with("alpha\nbravo\n");
+    exec(&mut e, "yank a");
+    press(&mut e, 'j');
+    exec(&mut e, "yank b");
+    // `:reg ba` — each non-space character is its own register name, and the
+    // listing stays in canonical order (a before b), not argument order.
+    exec(&mut e, "reg ba");
+    let a_at = e.message.find("\"a   alpha^J").expect("register a listed");
+    let b_at = e.message.find("\"b   bravo^J").expect("register b listed");
+    assert!(
+        a_at < b_at,
+        ":reg ba lists in canonical order, got {:?}",
+        e.message
+    );
+}
+
+// #1300: Neovim's `:marks` always lists the three automatic marks (`'`
+// previous-context, `"` last-position-before-leaving-buffer, `.`
+// last-change) alongside any user-set ones — vimcode's `"marks"` arm used to
+// iterate only `self.marks` (user marks), silently dropping all three.
+// `maG:marks` is the exact key sequence the oracle-backed
+// `msg:ex::marks lists a set mark` case in `tests/nvim_conformance.rs` drives
+// against a live `nvim --headless`; this is its engine-tier twin so the
+// listing stays covered even where the oracle isn't installed.
+//
+// Verified RED against unfixed `develop`: the pre-#1300 arm only emitted
+// `" a      2    0"` (the user mark, no `file/text` column and none of the
+// three auto marks), so every assertion below failed.
+#[test]
+fn cmd_marks_lists_auto_marks_alongside_user_marks() {
+    let mut e = engine_with("one\ntwo\nthree\n");
+    press(&mut e, 'j'); // cursor -> ("two", col 0)
+    press(&mut e, 'm');
+    press(&mut e, 'a'); // mark a := ("two", col 0)
+    press(&mut e, 'G'); // jump to "three"; sets the '' pcmark to the pre-jump position
+    exec(&mut e, "marks");
+    assert_msg_contains(&e, "mark line  col file/text");
+    // `'` — previous context (pcmark), set by the `G` jump above.
+    assert_msg_contains(&e, "'      2    0 two");
+    // The user mark itself.
+    assert_msg_contains(&e, "a      2    0 two");
+    // `"` and `.` — vimcode does not track buffer-enter/leave transitions or
+    // a change list yet, so both default to the buffer start, matching
+    // Neovim's own default when neither has happened.
+    assert_msg_contains(&e, "\"      1    0 one");
+    assert_msg_contains(&e, ".      1    0 one");
 }
 
 #[test]
@@ -637,4 +717,199 @@ fn abbrev_h_help() {
     exec(&mut e, "h");
     // Help opens a split with help content
     assert!(!e.message.starts_with("Not an editor command"));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Group N: Vim abbreviations — :abbreviate / :iabbrev / :cabbrev (#1152)
+//
+//  Oracle cases named by the issue: full-id expansion, end-id expansion,
+//  <C-v> suppression, :cabbrev on the command line, and "does not fire
+//  mid-word" — each has a matching case here (fast, no `nvim` dependency)
+//  and in `tests/nvim_conformance.rs`'s `CASES_ABBREV` (the actual oracle).
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn vim_abbrev_iabbrev_full_id_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+    assert_cursor(&e, 0, 4);
+}
+
+#[test]
+fn vim_abbrev_iabbrev_end_id_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev #i #include");
+    press(&mut e, 'i');
+    type_chars(&mut e, "#i ");
+    assert_buf(&mut e, "#include ");
+}
+
+#[test]
+fn vim_abbrev_ctrl_v_suppresses_expansion() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    ctrl(&mut e, 'v');
+    press(&mut e, ' ');
+    // <C-v> before the trigger character inserts it literally and never
+    // reaches the abbreviation check — "teh" must stay unexpanded.
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_does_not_fire_mid_word() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "ateh ");
+    // "teh" is preceded by the word character 'a', so it is not a whole
+    // word and must not expand (full-id abbreviations only fire on a
+    // complete word boundary).
+    assert_buf(&mut e, "ateh ");
+}
+
+#[test]
+fn vim_abbrev_expands_on_escape() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    press_key(&mut e, "Escape");
+    assert_buf(&mut e, "the");
+    assert_mode(&e, Mode::Normal);
+}
+
+#[test]
+fn vim_abbrev_expands_on_return() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["the".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_cabbrev_expands_on_trigger_char() {
+    let mut e = engine_with("");
+    exec(&mut e, "cabbrev H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    assert_eq!(e.command_buffer, "help ");
+}
+
+#[test]
+fn vim_abbrev_cabbrev_expands_and_runs_on_return() {
+    let mut e = engine_with("foo\n");
+    exec(&mut e, "cabbrev X %s/foo/bar/");
+    press(&mut e, ':');
+    type_chars(&mut e, "X");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["bar".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_noreabbrev_variants_expand_like_their_plain_forms() {
+    let mut e = engine_with("");
+    exec(&mut e, "inoreabbrev teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+
+    let mut e2 = engine_with("foo\n");
+    exec(&mut e2, "cnoreabbrev X %s/foo/bar/");
+    press(&mut e2, ':');
+    type_chars(&mut e2, "X");
+    press_key(&mut e2, "Return");
+    assert_eq!(get_lines(&e2), vec!["bar".to_string()]);
+}
+
+#[test]
+fn vim_abbrev_iabbrev_only_applies_in_insert_not_command() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    // `:iabbrev` is Insert-mode only — the command line must not expand it.
+    assert_eq!(e.command_buffer, "H ");
+}
+
+#[test]
+fn vim_abbrev_lister_shows_defined_abbreviations() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "iabbrev");
+    assert_msg_contains(&e, "teh");
+    assert_msg_contains(&e, "the");
+}
+
+#[test]
+fn vim_abbrev_unabbreviate_removes_it() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "unabbreviate teh");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_abclear_removes_all() {
+    let mut e = engine_with("");
+    exec(&mut e, "iabbrev teh the");
+    exec(&mut e, "cabbrev H help");
+    exec(&mut e, "abclear");
+    assert!(e.settings.abbreviations.is_empty());
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "teh ");
+}
+
+#[test]
+fn vim_abbrev_abbreviate_applies_to_both_insert_and_command() {
+    let mut e = engine_with("foo\n");
+    exec(&mut e, "abbreviate X %s/foo/bar/");
+    press(&mut e, ':');
+    type_chars(&mut e, "X");
+    press_key(&mut e, "Return");
+    assert_eq!(get_lines(&e), vec!["bar".to_string()]);
+
+    let mut e2 = engine_with("");
+    exec(&mut e2, "abbreviate teh the");
+    press(&mut e2, 'i');
+    type_chars(&mut e2, "teh ");
+    assert_buf(&mut e2, "the ");
+}
+
+#[test]
+fn normalizer_ab_to_abbreviate() {
+    let mut e = engine_with("");
+    exec(&mut e, "ab teh the");
+    exec(&mut e, "iabbrev");
+    assert_msg_contains(&e, "teh");
+}
+
+#[test]
+fn normalizer_iab_to_iabbrev() {
+    let mut e = engine_with("");
+    exec(&mut e, "iab teh the");
+    press(&mut e, 'i');
+    type_chars(&mut e, "teh ");
+    assert_buf(&mut e, "the ");
+}
+
+#[test]
+fn normalizer_cab_to_cabbrev() {
+    let mut e = engine_with("");
+    exec(&mut e, "cab H help");
+    press(&mut e, ':');
+    type_chars(&mut e, "H");
+    press(&mut e, ' ');
+    assert_eq!(e.command_buffer, "help ");
 }

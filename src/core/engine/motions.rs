@@ -14,11 +14,11 @@ impl Engine {
         }
 
         let first = self.buffer().content.char(pos);
-        if is_word_char(first) {
-            let wide = is_wide_word_char(first);
+        if self.is_word_char(first) {
+            let wide = self.is_wide_word_char(first);
             while pos < total_chars {
                 let ch = self.buffer().content.char(pos);
-                if !is_word_char(ch) || is_wide_word_char(ch) != wide {
+                if !self.is_word_char(ch) || self.is_wide_word_char(ch) != wide {
                     break;
                 }
                 pos += 1;
@@ -26,7 +26,7 @@ impl Engine {
         } else if !first.is_whitespace() {
             while pos < total_chars {
                 let ch = self.buffer().content.char(pos);
-                if is_word_char(ch) || ch.is_whitespace() {
+                if self.is_word_char(ch) || ch.is_whitespace() {
                     break;
                 }
                 pos += 1;
@@ -115,11 +115,11 @@ impl Engine {
         if ch == '\n' {
             // Landed exactly on a blank line, which Vim counts as its own
             // word — nothing more to extend backward into.
-        } else if is_word_char(ch) {
-            let wide = is_wide_word_char(ch);
+        } else if self.is_word_char(ch) {
+            let wide = self.is_wide_word_char(ch);
             while pos > 0 {
                 let prev = self.buffer().content.char(pos - 1);
-                if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                if !self.is_word_char(prev) || self.is_wide_word_char(prev) != wide {
                     break;
                 }
                 pos -= 1;
@@ -127,7 +127,7 @@ impl Engine {
         } else {
             while pos > 0 {
                 let prev = self.buffer().content.char(pos - 1);
-                if is_word_char(prev) || prev.is_whitespace() {
+                if self.is_word_char(prev) || prev.is_whitespace() {
                     break;
                 }
                 pos -= 1;
@@ -155,12 +155,12 @@ impl Engine {
         // Check if we're already at the end of a word
         let at_word_end = if pos + 1 < total_chars {
             let next_char = self.buffer().content.char(pos + 1);
-            (is_word_char(current_char)
-                && (!is_word_char(next_char)
-                    || is_wide_word_char(next_char) != is_wide_word_char(current_char)))
-                || (!is_word_char(current_char)
+            (self.is_word_char(current_char)
+                && (!self.is_word_char(next_char)
+                    || self.is_wide_word_char(next_char) != self.is_wide_word_char(current_char)))
+                || (!self.is_word_char(current_char)
                     && !current_char.is_whitespace()
-                    && (is_word_char(next_char) || next_char.is_whitespace()))
+                    && (self.is_word_char(next_char) || next_char.is_whitespace()))
         } else {
             false
         };
@@ -183,11 +183,11 @@ impl Engine {
         }
 
         let ch = self.buffer().content.char(pos);
-        if is_word_char(ch) {
-            let wide = is_wide_word_char(ch);
+        if self.is_word_char(ch) {
+            let wide = self.is_wide_word_char(ch);
             while pos + 1 < total_chars {
                 let next = self.buffer().content.char(pos + 1);
-                if !is_word_char(next) || is_wide_word_char(next) != wide {
+                if !self.is_word_char(next) || self.is_wide_word_char(next) != wide {
                     break;
                 }
                 pos += 1;
@@ -195,7 +195,7 @@ impl Engine {
         } else if !ch.is_whitespace() {
             while pos + 1 < total_chars {
                 let next = self.buffer().content.char(pos + 1);
-                if is_word_char(next) || next.is_whitespace() {
+                if self.is_word_char(next) || next.is_whitespace() {
                     break;
                 }
                 pos += 1;
@@ -222,11 +222,11 @@ impl Engine {
         // Step 1: If on a non-whitespace char, go to the start of the current word.
         // If on whitespace, just move back one to begin searching.
         if !ch.is_whitespace() {
-            if is_word_char(ch) {
-                let wide = is_wide_word_char(ch);
+            if self.is_word_char(ch) {
+                let wide = self.is_wide_word_char(ch);
                 while pos > 0 {
                     let prev = self.buffer().content.char(pos - 1);
-                    if !is_word_char(prev) || is_wide_word_char(prev) != wide {
+                    if !self.is_word_char(prev) || self.is_wide_word_char(prev) != wide {
                         break;
                     }
                     pos -= 1;
@@ -234,7 +234,7 @@ impl Engine {
             } else {
                 while pos > 0 {
                     let prev = self.buffer().content.char(pos - 1);
-                    if is_word_char(prev) || prev.is_whitespace() {
+                    if self.is_word_char(prev) || prev.is_whitespace() {
                         break;
                     }
                     pos -= 1;
@@ -445,6 +445,49 @@ impl Engine {
             }
         }
         last
+    }
+
+    /// Resolve global (`A`-`Z`) mark `ch` for a `` ` ``/`g'`/`` g` `` jump,
+    /// switching the active window to the mark's file first when it names a
+    /// *different* file than the one currently open. Uppercase marks are
+    /// Vim's cross-*file* marks (`:h mark-motions`) — before #1281 this
+    /// never happened: every call site destructured `global_marks`' file
+    /// component with `_` and only ever moved the cursor within whatever
+    /// buffer was already active, so `` `A ``/`g'A`/`` g`A `` were silent
+    /// no-ops across files (finding, not by design — nothing in `:h` or
+    /// `VIM_COMPATIBILITY.md` describes that as intentional).
+    ///
+    /// `record_jump` mirrors `open_file_with_mode`'s own jump recording:
+    /// `true` for `` ` `` (which appends to the jumplist — the file switch
+    /// itself becomes that jump, so callers must NOT also call
+    /// `record_jump_from`/`push_jump_location` when this returns
+    /// `Some((_, true))`); `false` for `g'`/`` g` ``, documented to leave the
+    /// jumplist untouched (`open_file_for_jump_recovery` skips the push).
+    ///
+    /// Returns `((line, col), switched_file)`, `line`/`col` already clamped
+    /// to whichever buffer ends up active, or `None` when the mark isn't set
+    /// or its file could not be opened.
+    pub(crate) fn resolve_global_mark(
+        &mut self,
+        ch: char,
+        record_jump: bool,
+    ) -> Option<((usize, usize), bool)> {
+        let (file, line, col) = self.global_marks.get(&ch)?.clone();
+        let mut switched = false;
+        if let Some(path) = &file {
+            let same_file = self.active_buffer_state().file_path.as_deref() == Some(path.as_path());
+            if !same_file {
+                let opened = if record_jump {
+                    self.open_file_with_mode(path, super::OpenMode::Permanent)
+                } else {
+                    self.open_file_for_jump_recovery(path)
+                };
+                opened.ok()?;
+                switched = true;
+            }
+        }
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        Some(((line.min(max_line), col), switched))
     }
 
     // --- Sentence motions ---
@@ -1341,8 +1384,8 @@ impl Engine {
                     None => self.move_left(),
                 }
             }
-            "Left" => self.move_left(),
-            "Right" => self.move_right(),
+            "Left" => self.move_left_insert_whichwrap('['),
+            "Right" => self.move_right_insert_whichwrap(']'),
             "Up" => {
                 if self.view().cursor.line > 0 {
                     self.view_mut().cursor.line -= 1;
@@ -1902,7 +1945,7 @@ impl Engine {
         cursor_pos: usize,
         count: usize,
     ) -> Option<(usize, usize)> {
-        self.find_word_object_classed(modifier, cursor_pos, count, char_class)
+        self.find_word_object_classed(modifier, cursor_pos, count, |c| self.char_class(c))
     }
 
     /// `iW`/`aW`: identical to [`Engine::find_word_object`] except that
@@ -1921,7 +1964,7 @@ impl Engine {
         modifier: char,
         cursor_pos: usize,
         count: usize,
-        class: fn(char) -> u8,
+        class: impl Fn(char) -> u8,
     ) -> Option<(usize, usize)> {
         let total = self.buffer().len_chars();
         if cursor_pos >= total {
@@ -3410,6 +3453,112 @@ impl Engine {
         }
     }
 
+    /// Is `token` present in `'whichwrap'` (#1206, `:h 'whichwrap'`)? `token`
+    /// is one of that option's per-key letters (`b`, `s`, `h`, `l`, `<`,
+    /// `>`, `[`, `]`) identifying which motion is asking.
+    pub(crate) fn whichwrap_allows(&self, token: char) -> bool {
+        self.settings.whichwrap.split(',').any(|t| {
+            let t = t.trim();
+            t.chars().count() == 1 && t.starts_with(token)
+        })
+    }
+
+    /// Is the current mode a Visual variant that gets one extra column of
+    /// rightward slack before Normal mode's clamp would kick in (`Visual`,
+    /// `VisualBlock` — not `VisualLine`, where individual-column clamping
+    /// isn't meaningful)? Verified against real Neovim 0.12.5: from the
+    /// last real character of a line, in Visual mode, a single rightward
+    /// press (`<Space>`/`l`/`<Right>`) lands one column *past* it — still
+    /// the same line — and only a second press actually crosses into the
+    /// next line. `move_right_whichwrap`/`move_left_whichwrap` are the only
+    /// two whichwrap entry points, so this is handled locally in both
+    /// rather than in the shared `move_right`/`move_left` primitives other,
+    /// Normal-mode-only call sites rely on (#1206 review).
+    fn visual_wrap_slack(&self) -> usize {
+        usize::from(matches!(self.mode, Mode::Visual | Mode::VisualBlock))
+    }
+
+    /// Normal/Visual-mode "move left", wrapping to the end of the previous
+    /// line when at column 0 and `'whichwrap'` includes `token` (#1206).
+    /// Shared by `h` (`token = 'h'`), `<BS>` (`token = 'b'`), and `<Left>`
+    /// (`token = '<'`) — real Vim gates all three on `'whichwrap'`, just
+    /// with different letters.
+    pub(crate) fn move_left_whichwrap(&mut self, token: char) {
+        if self.view().cursor.col == 0 {
+            let line = self.view().cursor.line;
+            if line > 0 && self.whichwrap_allows(token) {
+                let prev = line - 1;
+                let landing = self.get_max_cursor_col(prev) + self.visual_wrap_slack();
+                self.view_mut().cursor.line = prev;
+                self.view_mut().cursor.col = landing;
+            }
+            return;
+        }
+        self.move_left();
+    }
+
+    /// Normal/Visual-mode "move right", wrapping to the start of the next
+    /// line when at the last column and `'whichwrap'` includes `token`
+    /// (#1206). Shared by `l` (`token = 'l'`), `<Space>` (`token = 's'`), and
+    /// `<Right>` (`token = '>'`) — see [`Self::move_left_whichwrap`].
+    pub(crate) fn move_right_whichwrap(&mut self, token: char) {
+        let line = self.view().cursor.line;
+        let normal_max =
+            self.get_max_cursor_col(line) + usize::from(self.settings.virtualedit_allows_onemore());
+        let max_col = normal_max + self.visual_wrap_slack();
+        let col = self.view().cursor.col;
+        if col >= max_col {
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            if line < max_line && self.whichwrap_allows(token) {
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+            }
+            return;
+        }
+        if col >= normal_max {
+            // The Visual-only extra column: `move_right()` itself won't
+            // step past `normal_max` (its own clamp is Normal-mode-only),
+            // so advance directly onto it.
+            self.view_mut().cursor.col = col + 1;
+            return;
+        }
+        self.move_right();
+    }
+
+    /// Insert/Replace-mode "move left", wrapping to the end (one past the
+    /// last character — the Insert-mode landing column, not Normal mode's)
+    /// of the previous line when at column 0 and `'whichwrap'` includes
+    /// `token` (`token = '['`, #1206).
+    pub(crate) fn move_left_insert_whichwrap(&mut self, token: char) {
+        if self.view().cursor.col == 0 {
+            let line = self.view().cursor.line;
+            if line > 0 && self.whichwrap_allows(token) {
+                let prev = line - 1;
+                self.view_mut().cursor.line = prev;
+                self.view_mut().cursor.col = self.get_line_len_for_insert(prev);
+            }
+            return;
+        }
+        self.move_left();
+    }
+
+    /// Insert/Replace-mode "move right", wrapping to the start of the next
+    /// line when at the end of the line and `'whichwrap'` includes `token`
+    /// (`token = ']'`, #1206). See [`Self::move_left_insert_whichwrap`].
+    pub(crate) fn move_right_insert_whichwrap(&mut self, token: char) {
+        let line = self.view().cursor.line;
+        let max = self.get_line_len_for_insert(line);
+        if self.view().cursor.col >= max {
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            if line < max_line && self.whichwrap_allows(token) {
+                self.view_mut().cursor.line = line + 1;
+                self.view_mut().cursor.col = 0;
+            }
+            return;
+        }
+        self.move_right_insert();
+    }
+
     /// Returns `false` when already on the last visible line (no-op) — used
     /// by the `j` handler to detect a failed move for macro-abort purposes
     /// (#806).
@@ -3629,10 +3778,24 @@ impl Engine {
     /// Compute the indent string for a new line inserted after `line_idx`.
     /// When `auto_indent` is on this copies the previous line's indent *and*
     /// adds an extra indent level when the line ends with an indent-trigger
-    /// (language-aware via `line_triggers_indent`).
+    /// (language-aware via `line_triggers_indent`) — real Vim only does the
+    /// trigger-based extra indent with `'smartindent'` (or a filetype indent
+    /// plugin) on top of `'autoindent'`, but this repo's `auto_indent` has
+    /// carried that behaviour unconditionally since before #1207, so it's
+    /// left as-is here rather than reshaped as part of this issue; #1207
+    /// only *widens* the gate so `'smartindent'` alone (without
+    /// `'autoindent'`) also reaches this same logic, matching real Vim
+    /// (`:h 'smartindent'` works independently of `'autoindent'`).
+    ///
+    /// `'cindent'` (also #1207) supersedes this entirely when set — see
+    /// [`Self::cindent_indent_for_newline`] and `:h 'cindent'`: "'cindent'
+    /// ... overrules 'smartindent'".
     pub(crate) fn smart_indent_for_newline(&self, line_idx: usize) -> String {
-        if !self.settings.auto_indent {
+        if !(self.settings.auto_indent || self.settings.smartindent || self.settings.cindent) {
             return String::new();
+        }
+        if self.settings.cindent {
+            return self.cindent_indent_for_newline(line_idx);
         }
         let base = self.get_line_indent_str(line_idx);
         let line_text: String = self.buffer().content.line(line_idx).chars().collect();
@@ -3651,13 +3814,44 @@ impl Engine {
         }
     }
 
+    /// `'cindent'`'s (#1207) counterpart to [`Self::smart_indent_for_newline`]
+    /// — a deliberately simple C-aware subset, not the much richer rule set
+    /// `:h 'cindent'` describes: indent one `'shiftwidth'` further after a
+    /// line ending in `{`, otherwise copy the previous line's indent
+    /// verbatim. Unlike `'smartindent'`, this does **not** consult
+    /// `line_triggers_indent`'s language-aware triggers (Python `:`,
+    /// Lua/Ruby/Shell `do`/`then`, ...) — those are `'smartindent'`'s
+    /// behaviour, and `'cindent'` replaces it rather than layering on top,
+    /// per `:h 'cindent'`.
+    fn cindent_indent_for_newline(&self, line_idx: usize) -> String {
+        let base = self.get_line_indent_str(line_idx);
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+        if trimmed.trim_end().ends_with('{') {
+            let sw = self.effective_shift_width();
+            let extra = if self.settings.expand_tab {
+                " ".repeat(sw)
+            } else {
+                "\t".to_string()
+            };
+            format!("{}{}", base, extra)
+        } else {
+            base
+        }
+    }
+
     /// Check whether a closing character (`}`, `)`, `]`) just typed on a
     /// line that was previously only whitespace should auto-outdent (reduce
     /// indent by one `shift_width`).  Called *after* the character has been
     /// inserted.  Returns the new indent string if outdenting is appropriate,
     /// or `None` to leave indent unchanged.
+    ///
+    /// Shared verbatim by `'autoindent'`, `'smartindent'` and `'cindent'`
+    /// (#1207 widened the gate from `auto_indent` alone) — the outdent-by-
+    /// one-shiftwidth rule for a lone closing bracket doesn't differ between
+    /// them the way the newline-indent rule does.
     pub(crate) fn auto_outdent_for_closing(&self, line_idx: usize) -> Option<String> {
-        if !self.settings.auto_indent {
+        if !(self.settings.auto_indent || self.settings.smartindent || self.settings.cindent) {
             return None;
         }
         let line_text: String = self.buffer().content.line(line_idx).chars().collect();
@@ -3681,6 +3875,30 @@ impl Engine {
         } else {
             Some(String::new())
         }
+    }
+
+    /// `'smartindent'`/`'cindent'` (#1207): typing `#` as the first non-
+    /// blank character on a line unconditionally removes that line's
+    /// indent — Vim's preprocessor-directive special case (`:h
+    /// 'smartindent'`: "make typing # a bit better"), shared by both
+    /// options. Plain `'autoindent'` (with neither `'smartindent'` nor
+    /// `'cindent'` set) does **not** do this, matching real Vim. Called
+    /// *after* the `#` has been inserted, mirroring
+    /// [`Self::auto_outdent_for_closing`]'s shape.
+    pub(crate) fn auto_outdent_for_hash(&self, line_idx: usize) -> Option<String> {
+        if !(self.settings.smartindent || self.settings.cindent) {
+            return None;
+        }
+        let line_text: String = self.buffer().content.line(line_idx).chars().collect();
+        let trimmed = line_text.trim_end_matches(['\n', '\r']);
+        let before = trimmed.trim_end_matches('#');
+        if !before.chars().all(|c| c == ' ' || c == '\t') {
+            return None;
+        }
+        if self.get_line_indent_str(line_idx).is_empty() {
+            return None;
+        }
+        Some(String::new())
     }
 
     /// Return the leading whitespace string (spaces/tabs) of the given buffer line.
@@ -3708,9 +3926,40 @@ impl Engine {
             .unwrap_or(self.settings.shift_width as usize)
     }
 
-    /// True for word characters: [a-zA-Z0-9_].
-    pub(crate) fn is_word_char(c: char) -> bool {
-        c.is_alphanumeric() || c == '_'
+    /// Does `'backspace'` allow BackSpace to delete the character just
+    /// before `(line, col)`? Only ever restrictive when `(line, col)` is at
+    /// or before `insert_enter_line`/`insert_enter_col` — the `"start"`
+    /// token (`:h 'backspace'`, #1206). That anchor is not fixed at Insert
+    /// entry: `split_insert_undo_group` re-anchors it to the cursor's
+    /// position on every arrow/Home/End keypress (mirroring Vim's
+    /// `stop_arrow()`), so navigating onto a pre-existing line — even one
+    /// this Insert session never typed on — blocks BackSpace there just
+    /// like real Vim, while freely-typed text (including across a `<CR>`
+    /// the session itself inserted) stays deletable up to the last place
+    /// the cursor was moved to non-destructively.
+    pub(crate) fn backspace_may_delete_before(&self, line: usize, col: usize) -> bool {
+        self.settings.backspace_allows("start")
+            || line != self.insert_enter_line
+            || col > self.insert_enter_col
+    }
+
+    /// Return the effective `'softtabstop'` — the Insert-mode Tab/BS "feels
+    /// like this width" setting, independent of `'tabstop'`. `0` means
+    /// "disabled, use 'tabstop'"; a negative `'softtabstop'` is Vim's
+    /// documented idiom for "use 'shiftwidth' instead" (`:h 'softtabstop'`,
+    /// #1153).
+    pub(crate) fn effective_softtabstop(&self) -> usize {
+        match self.settings.softtabstop {
+            0 => 0,
+            n if n < 0 => self.effective_shift_width().max(1),
+            n => n as usize,
+        }
+    }
+
+    /// True for word characters per `'iskeyword'` (#1191) — drives
+    /// `w`/`b`/`e`/`ge`, `*`/`#`, and `iw`/`aw`.
+    pub(crate) fn is_word_char(&self, c: char) -> bool {
+        self.settings.is_keyword_char(c)
     }
 
     /// Walk left from cursor to find the current word prefix.
@@ -3724,7 +3973,7 @@ impl Engine {
         // on lines shorter than expected (e.g. trailing newline excluded).
         let col = col.min(chars.len());
         let mut start = col;
-        while start > 0 && Self::is_word_char(chars[start - 1]) {
+        while start > 0 && self.is_word_char(chars[start - 1]) {
             start -= 1;
         }
         let prefix: String = chars[start..col].iter().collect();
@@ -3746,9 +3995,9 @@ impl Engine {
             let len = chars.len();
             let mut i = 0usize;
             while i < len {
-                if Self::is_word_char(chars[i]) {
+                if self.is_word_char(chars[i]) {
                     let word_start = i;
-                    while i < len && Self::is_word_char(chars[i]) {
+                    while i < len && self.is_word_char(chars[i]) {
                         i += 1;
                     }
                     let word: String = chars[word_start..i].iter().collect();
@@ -3788,9 +4037,9 @@ impl Engine {
             let len = chars.len();
             let mut i = 0usize;
             while i < len {
-                if Self::is_word_char(chars[i]) {
+                if self.is_word_char(chars[i]) {
                     let start = i;
-                    while i < len && Self::is_word_char(chars[i]) {
+                    while i < len && self.is_word_char(chars[i]) {
                         i += 1;
                     }
                     let word: String = chars[start..i].iter().collect();
@@ -3830,6 +4079,163 @@ impl Engine {
         let candidate = self.completion_candidates[idx].clone();
         self.insert_with_undo(line_char + start, &candidate);
         self.view_mut().cursor.col = start + candidate.len();
+    }
+
+    // ─── <C-x> completion submode (`:h i_CTRL-X`, #1160) ───────────────────
+
+    /// Shared "start a fresh completion popup, or cycle to the next/previous
+    /// candidate if one is already active" logic used by every `<C-x>`
+    /// sub-mode. `candidates`/`start_col` are only consulted when starting a
+    /// fresh popup — repeating the same `<C-x><C-?>` chord on an already-open
+    /// popup just cycles it (`:h popupmenu-completion`).
+    pub(crate) fn ctrl_x_cycle_or_start(
+        &mut self,
+        candidates: Vec<String>,
+        start_col: usize,
+        next: bool,
+        changed: &mut bool,
+    ) {
+        if self.completion_idx.is_some() {
+            let len = self.completion_candidates.len();
+            let cur = self.completion_idx.unwrap();
+            let new_idx = if next {
+                (cur + 1) % len
+            } else {
+                (cur + len - 1) % len
+            };
+            self.completion_idx = Some(new_idx);
+            self.apply_completion_candidate(new_idx);
+            *changed = true;
+            return;
+        }
+        if candidates.is_empty() {
+            self.message = "No completions".to_string();
+            return;
+        }
+        self.completion_start_col = start_col;
+        self.completion_candidates = candidates;
+        let idx = if next {
+            0
+        } else {
+            self.completion_candidates.len() - 1
+        };
+        self.completion_idx = Some(idx);
+        self.apply_completion_candidate(idx);
+        *changed = true;
+    }
+
+    /// `<C-x><C-n>` / `<C-x><C-p>`: keyword completion restricted to the
+    /// current buffer (`:h i_CTRL-X_CTRL-N`/`:h i_CTRL-X_CTRL-P`).
+    /// `word_completions_for_prefix` already only scans `self.buffer()`
+    /// (the active buffer), which is exactly this sub-mode's scope.
+    pub(crate) fn ctrl_x_keyword_completion(&mut self, next: bool, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        let candidates = self.word_completions_for_prefix(&prefix);
+        self.ctrl_x_cycle_or_start(candidates, start_col, next, changed);
+    }
+
+    /// `<C-x><C-l>`: whole-line completion (`:h i_CTRL-X_CTRL-L`) — matches
+    /// other lines in the buffer that start with the text already typed on
+    /// the current line, completing to the rest of the matched line.
+    pub(crate) fn ctrl_x_line_completion(&mut self, changed: &mut bool) {
+        let cur_line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(cur_line).chars().collect();
+        let col = col.min(chars.len());
+        let prefix: String = chars[..col].iter().collect();
+        let mut candidates: Vec<String> = Vec::new();
+        for i in 0..self.buffer().len_lines() {
+            if i == cur_line {
+                continue;
+            }
+            let text: String = self
+                .buffer()
+                .content
+                .line(i)
+                .chars()
+                .filter(|c| *c != '\n')
+                .collect();
+            if !text.is_empty() && text.starts_with(&prefix) && !candidates.contains(&text) {
+                candidates.push(text);
+            }
+        }
+        self.ctrl_x_cycle_or_start(candidates, 0, true, changed);
+    }
+
+    /// Characters allowed in a filesystem path for `<C-x><C-f>` prefix
+    /// detection — word characters plus the punctuation paths commonly use.
+    fn is_path_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '~')
+    }
+
+    /// `<C-x><C-f>`: filename completion (`:h i_CTRL-X_CTRL-F`) against the
+    /// directory containing the path fragment typed before the cursor,
+    /// relative to `self.cwd` when the fragment isn't absolute.
+    pub(crate) fn ctrl_x_filename_completion(&mut self, changed: &mut bool) {
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        let chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        let col = col.min(chars.len());
+        let mut start = col;
+        while start > 0 && Self::is_path_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let prefix: String = chars[start..col].iter().collect();
+        let (dir_part, file_prefix) = match prefix.rfind('/') {
+            Some(idx) => (&prefix[..=idx], &prefix[idx + 1..]),
+            None => ("", prefix.as_str()),
+        };
+        let dir = if dir_part.is_empty() {
+            self.cwd.clone()
+        } else if Path::new(dir_part).is_absolute() {
+            PathBuf::from(dir_part)
+        } else {
+            self.cwd.join(dir_part)
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(file_prefix) && name != file_prefix {
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let suffix = if is_dir { "/" } else { "" };
+                    candidates.push(format!("{dir_part}{name}{suffix}"));
+                }
+            }
+        }
+        candidates.sort();
+        self.ctrl_x_cycle_or_start(candidates, start, true, changed);
+    }
+
+    /// `<C-x><C-k>`: dictionary completion (`:h i_CTRL-X_CTRL-K`) against
+    /// the bundled word list (`dictionaries/en_US.dic`, also used by
+    /// `src/core/spell.rs`'s spell checker).
+    pub(crate) fn ctrl_x_dictionary_completion(&mut self, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        let candidates = crate::core::spell::dictionary_words_with_prefix(&prefix);
+        self.ctrl_x_cycle_or_start(candidates, start_col, true, changed);
+    }
+
+    /// `<C-x><C-s>`: spelling-suggestion completion (`:h i_CTRL-X_CTRL-S`)
+    /// for the word before the cursor, reusing the same spell-checker
+    /// suggestions `z=` shows in Normal mode. Requires `'spell'` to be set,
+    /// same as real Vim.
+    pub(crate) fn ctrl_x_spell_completion(&mut self, changed: &mut bool) {
+        let (prefix, start_col) = self.completion_prefix_at_cursor();
+        if prefix.is_empty() {
+            self.message = "No word to check".to_string();
+            return;
+        }
+        if !self.settings.spell {
+            self.message = "Spell checking is off (use :set spell)".to_string();
+            return;
+        }
+        self.ensure_spell_checker();
+        let candidates = match &self.spell_checker {
+            Some(checker) => checker.suggest(&prefix),
+            None => Vec::new(),
+        };
+        self.ctrl_x_cycle_or_start(candidates, start_col, true, changed);
     }
 
     /// Handle a mouse click on the completion popup.
@@ -4036,23 +4442,30 @@ impl Engine {
     /// Compute the full nested indent-fold hierarchy: every foldable
     /// region, with its 1-based nesting depth (1 = outermost). See the
     /// module comment above for why this doesn't reuse `detect_fold_range`.
+    /// Nesting is capped at `'foldnestmax'` (#1159; matches Vim — deeper
+    /// levels are absorbed into their `foldnestmax` ancestor rather than
+    /// becoming their own closeable fold, verified against `nvim
+    /// --headless`).
     pub(crate) fn compute_indent_folds(&self) -> Vec<(usize, usize, usize)> {
         let total = self.buffer().len_lines();
         let levels: Vec<usize> = (0..total).map(|i| self.indent_fold_level(i)).collect();
         let mut out = Vec::new();
-        Self::collect_level_folds(&levels, 0, total, 1, &mut out);
+        let nestmax = self.settings.foldnestmax.max(1);
+        Self::collect_level_folds(&levels, 0, total, 1, nestmax, &mut out);
         out
     }
 
     /// Recursive helper for `compute_indent_folds`: within `[from, to)`,
     /// find every maximal run of >= 2 consecutive lines at `level` or
-    /// deeper, record it, then recurse one level deeper over that same
-    /// sub-range to find the folds nested inside it.
+    /// deeper, record it, then — as long as `level` hasn't reached
+    /// `nestmax` — recurse one level deeper over that same sub-range to find
+    /// the folds nested inside it.
     fn collect_level_folds(
         levels: &[usize],
         from: usize,
         to: usize,
         level: usize,
+        nestmax: usize,
         out: &mut Vec<(usize, usize, usize)>,
     ) {
         let mut i = from;
@@ -4065,7 +4478,9 @@ impl Engine {
                 }
                 if end > start {
                     out.push((start, end, level));
-                    Self::collect_level_folds(levels, start, end + 1, level + 1, out);
+                    if level < nestmax {
+                        Self::collect_level_folds(levels, start, end + 1, level + 1, nestmax, out);
+                    }
                 }
                 i = end + 1;
             } else {
@@ -4074,50 +4489,141 @@ impl Engine {
         }
     }
 
-    /// The innermost indent-computed fold containing `line`, if any.
-    fn indent_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
-        self.compute_indent_folds()
+    /// Parse `'foldmarker'` into its `(open, close)` tokens. `set_value_option`
+    /// already rejects anything that isn't `"open,close"` with both halves
+    /// non-empty, so this only needs the default fallback for the
+    /// unreachable-in-practice case of a value that got in some other way
+    /// (e.g. a hand-edited `settings.json`).
+    fn foldmarker_tokens(&self) -> (&str, &str) {
+        self.settings
+            .foldmarker
+            .split_once(',')
+            .filter(|(open, close)| !open.is_empty() && !close.is_empty())
+            .unwrap_or(("{{{", "}}}"))
+    }
+
+    /// Compute the full nested marker-fold hierarchy for `'foldmethod'`
+    /// `"marker"` (#1159): a left-to-right literal-text scan for the
+    /// `'foldmarker'` open/close pair, alternating between whichever marker
+    /// comes first at each position (not "count all opens then all
+    /// closes" — matters when open/close share a line). Nesting depth is
+    /// the marker stack depth, 1-based. Vim's real algorithm additionally
+    /// lets a marker end in a digit to set an explicit fold level; that
+    /// refinement is deliberately out of scope (marker folding's core value
+    /// is "a scan for a literal pair" — see the issue). An unmatched close
+    /// marker is ignored; an unmatched open marker folds to the end of the
+    /// buffer — both verified against `nvim --headless`. `'foldnestmax'`
+    /// does **not** apply here, matching Vim (verified against `nvim
+    /// --headless`; see the field doc on `Settings::foldnestmax`).
+    pub(crate) fn compute_marker_folds(&self) -> Vec<(usize, usize, usize)> {
+        let (open_tok, close_tok) = self.foldmarker_tokens();
+        let total = self.buffer().len_lines();
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // (start_line, level)
+        let mut out: Vec<(usize, usize, usize)> = Vec::new();
+        for line_idx in 0..total {
+            let text: String = self.buffer().content.line(line_idx).chars().collect();
+            let mut pos = 0usize;
+            while pos < text.len() {
+                let next_open = text[pos..].find(open_tok);
+                let next_close = text[pos..].find(close_tok);
+                let is_open = match (next_open, next_close) {
+                    (Some(o), Some(cl)) => o <= cl,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                if is_open {
+                    // Safe: `is_open` only takes this branch when `next_open`
+                    // matched.
+                    let o = next_open.unwrap();
+                    stack.push((line_idx, stack.len() + 1));
+                    pos += o + open_tok.len();
+                } else {
+                    let cl = next_close.unwrap();
+                    if let Some((start, level)) = stack.pop() {
+                        if line_idx > start {
+                            out.push((start, line_idx, level));
+                        }
+                    }
+                    pos += cl + close_tok.len();
+                }
+            }
+        }
+        // Any still-open markers fold to the end of the buffer.
+        let last_line = total.saturating_sub(1);
+        for (start, level) in stack {
+            if last_line > start {
+                out.push((start, last_line, level));
+            }
+        }
+        out
+    }
+
+    /// Does the current `'foldmethod'` compute its fold hierarchy
+    /// automatically (`"indent"`/`"marker"`, #1159), rather than requiring
+    /// the user to build it explicitly with `zf`/`:fold` (`"manual"`)?
+    pub(crate) fn folds_are_computed(&self) -> bool {
+        matches!(self.settings.foldmethod.as_str(), "indent" | "marker")
+    }
+
+    /// The full fold hierarchy under the current `'foldmethod'` — computed
+    /// automatically for `"indent"`/`"marker"` (#1159), empty for
+    /// `"manual"` (there, folds only exist once `zf`/`:fold` puts them in
+    /// `fold_defs`/`folds`, which this function deliberately doesn't read —
+    /// callers needing manual folds too already merge in `fold_defs`
+    /// separately).
+    pub(crate) fn compute_configured_folds(&self) -> Vec<(usize, usize, usize)> {
+        match self.settings.foldmethod.as_str() {
+            "indent" => self.compute_indent_folds(),
+            "marker" => self.compute_marker_folds(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The innermost computed fold containing `line`, if any.
+    fn configured_fold_containing(&self, line: usize) -> Option<(usize, usize)> {
+        self.compute_configured_folds()
             .into_iter()
             .filter(|(start, end, _)| *start <= line && line <= *end)
             .min_by_key(|(start, end, _)| end - start)
             .map(|(start, end, _)| (start, end))
     }
 
-    /// The nearest indent-fold header strictly after `line`, skipping
+    /// The nearest computed-fold header strictly after `line`, skipping
     /// headers already hidden inside another closed fold.
-    fn indent_fold_after(&self, line: usize) -> Option<usize> {
-        self.compute_indent_folds()
+    fn configured_fold_after(&self, line: usize) -> Option<usize> {
+        self.compute_configured_folds()
             .into_iter()
             .map(|(start, _, _)| start)
             .filter(|&start| start > line && !self.view().is_line_hidden(start))
             .min()
     }
 
-    /// The *end* of the nearest indent fold strictly before `line` — `zk`
+    /// The *end* of the nearest computed fold strictly before `line` — `zk`
     /// moves to the end of the previous fold, not its start (`:h zk`;
     /// verified against `nvim --headless`, #1006), unlike `zj`'s `:h zj`
     /// "start of the next fold". Skips folds already hidden inside another
     /// closed fold.
-    fn indent_fold_end_before(&self, line: usize) -> Option<usize> {
-        self.compute_indent_folds()
+    fn configured_fold_end_before(&self, line: usize) -> Option<usize> {
+        self.compute_configured_folds()
             .into_iter()
             .filter(|(start, end, _)| *end < line && !self.view().is_line_hidden(*start))
             .map(|(_, end, _)| end)
             .max()
     }
 
-    /// Apply `'foldlevel'` under `'foldmethod'` `"indent"`: compute the
-    /// nested indent-fold hierarchy and close every fold nested deeper than
-    /// `level`, processing deepest-first. Deepest-first matters when both a
-    /// fold and its child need closing (`level` 0 with 2+ nesting levels):
-    /// closing the child first and the parent second lets `close_fold`'s
-    /// "drop folds fully contained in the new one" rule fold the child's
-    /// closed entry into the parent's, leaving one clean closed range
-    /// instead of two overlapping ones. Folds at or above `level` are still
-    /// recorded via `define_fold` (not closed) so a later `zo`/`zc` on them
-    /// works from a real definition.
+    /// Apply `'foldlevel'` under a computed `'foldmethod'` (`"indent"` or
+    /// `"marker"`, #1159): compute the nested fold hierarchy and close every
+    /// fold nested deeper than `level`, processing deepest-first.
+    /// Deepest-first matters when both a fold and its child need closing
+    /// (`level` 0 with 2+ nesting levels): closing the child first and the
+    /// parent second lets `close_fold`'s "drop folds fully contained in the
+    /// new one" rule fold the child's closed entry into the parent's,
+    /// leaving one clean closed range instead of two overlapping ones.
+    /// Folds at or above `level` are still recorded via `define_fold` (not
+    /// closed) so a later `zo`/`zc` on them works from a real definition.
     pub fn apply_foldlevel(&mut self, level: usize) {
-        let mut ranges = self.compute_indent_folds();
+        let mut ranges = self.compute_configured_folds();
         ranges.sort_by_key(|(_, _, level)| std::cmp::Reverse(*level));
         for (start, end, fold_level) in ranges {
             if fold_level > level {
@@ -4165,14 +4671,14 @@ impl Engine {
     /// Prefers an already-*defined* fold (`fold_defs`, however it was
     /// created and whether currently open or closed) so a manual `zf` fold
     /// round-trips through `zo`/`zc` back to the same region (#1006) rather
-    /// than trying to rediscover it. With `'foldmethod'` `"indent"` and
-    /// nothing defined yet at the cursor, falls back to the real indent-fold
-    /// computation (`compute_indent_folds`) — Vim computes that method's
-    /// hierarchy automatically, without a `zf`. In `"manual"` mode with
-    /// nothing defined, matches Vim: nothing happens (`E490`), verified
-    /// against `nvim --headless` (#1006) — vimcode used to invent a fold
-    /// from indentation here even in the default manual method, which real
-    /// Vim never does.
+    /// than trying to rediscover it. With `'foldmethod'` `"indent"`/
+    /// `"marker"` (#1159) and nothing defined yet at the cursor, falls back
+    /// to the real computed-fold hierarchy (`compute_configured_folds`) —
+    /// Vim computes those methods' hierarchy automatically, without a `zf`.
+    /// In `"manual"` mode with nothing defined, matches Vim: nothing happens
+    /// (`E490`), verified against `nvim --headless` (#1006) — vimcode used
+    /// to invent a fold from indentation here even in the default manual
+    /// method, which real Vim never does.
     pub(crate) fn cmd_fold_close(&mut self) {
         let line = self.view().cursor.line;
         if let Some(range) = self.view().enclosing_fold_def(line) {
@@ -4180,13 +4686,226 @@ impl Engine {
             self.close_fold_and_clamp(start, end);
             return;
         }
-        if self.settings.foldmethod == "indent" {
-            if let Some((start, end)) = self.indent_fold_containing(line) {
+        if self.folds_are_computed() {
+            if let Some((start, end)) = self.configured_fold_containing(line) {
                 self.close_fold_and_clamp(start, end);
                 return;
             }
         }
         self.message = "E490: No fold found".to_string();
+    }
+
+    // ── `:fold*` ex commands (#1159) ────────────────────────────────────────
+    //
+    // Unlike the z-commands above (which always act on the cursor line, and
+    // for which the header of a closed fold is always the reachable line —
+    // normal-mode movement can't land the cursor on a hidden body line), an
+    // ex-command `[range]` can name any line by number, hidden or not, and
+    // can span several lines that resolve to *different* folds. Both facts
+    // ruled out reusing the cursor-only z-command bodies:
+    //
+    //  - `:{n}foldopen` where line `n` is nested two marker-fold levels deep
+    //    still opens the outermost one, not the fold whose header happens to
+    //    be exactly `n` (verified against `nvim --headless`) — so resolution
+    //    is outermost/innermost-aware per line, not `fold_at`'s exact-header
+    //    match.
+    //  - a multi-line non-bang `[range]` resolves *every* line first, then
+    //    acts once per **maximal** (outermost, for close; the only kind
+    //    open's resolution ever produces) result — not once per line as it's
+    //    resolved. Mutating between lines breaks both directions differently,
+    //    each verified against `nvim --headless`:
+    //      - open: closing... er, *opening* the outer level for an earlier
+    //        line changes what "the outermost closed fold" means for a later
+    //        line still in the range, incorrectly cascading into a nested
+    //        fold that should have stayed closed (`:2,5foldopen` over nested
+    //        2-5/3-4 opens only the outer).
+    //      - close: two different lines in the same range can each resolve
+    //        to their own genuinely-innermost fold (that part matches `zc`)
+    //        — but the range command keeps only the widest result, discarding
+    //        one properly contained in another (`:1,2foldclose` over nested
+    //        1-6/2-4 closes only the outer, even though the single-address
+    //        `:2foldclose` alone closes the inner).
+    //    The recursive (`!`) variants don't have this problem: "act on every
+    //    level, at every line" is idempotent to processing order, so a plain
+    //    per-line sweep already lands on the same end state either way.
+
+    /// `:foldo[pen] [range]` (no `!`) — resolve every line in `[start, end]`
+    /// to the outermost *closed* fold containing it (already the maximal
+    /// answer by construction, so no extra collapsing step is needed the way
+    /// `resolve_close_targets` needs one), dedup, then open each exactly
+    /// once. An already-open fold at a line contributes no target but still
+    /// counts toward `found_any` — Vim's `:foldopen` on an already-open fold
+    /// is a silent no-op, not `E490` (verified against `nvim --headless`).
+    fn resolve_open_targets(&self, start: usize, end: usize) -> (Vec<(usize, usize)>, bool) {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        let mut found_any = false;
+        for line in start..=end {
+            if let Some(f) = self.view().enclosing_closed_fold(line) {
+                found_any = true;
+                let t = (f.start, f.end);
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            } else if self.view().enclosing_fold_def(line).is_some()
+                || (self.folds_are_computed() && self.configured_fold_containing(line).is_some())
+            {
+                found_any = true;
+            }
+        }
+        (targets, found_any)
+    }
+
+    /// `:foldc[lose] [range]` (no `!`) — resolve every line in `[start, end]`
+    /// to its *innermost* enclosing fold (same rule as `zc`/`cmd_fold_close`,
+    /// just per-line instead of cursor-only), dedup, then drop any result
+    /// that's a proper subset of another result also in the set — see the
+    /// module comment above for why that collapsing step is needed here but
+    /// not for open.
+    fn resolve_close_targets(&self, start: usize, end: usize) -> Vec<(usize, usize)> {
+        let mut targets: Vec<(usize, usize)> = Vec::new();
+        for line in start..=end {
+            let resolved = self
+                .view()
+                .enclosing_fold_def(line)
+                .map(|f| (f.start, f.end))
+                .or_else(|| {
+                    if self.folds_are_computed() {
+                        self.configured_fold_containing(line)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(t) = resolved {
+                if !targets.contains(&t) {
+                    targets.push(t);
+                }
+            }
+        }
+        let snapshot = targets.clone();
+        targets.retain(|&(s, e)| {
+            !snapshot
+                .iter()
+                .any(|&(os, oe)| (os, oe) != (s, e) && os <= s && e <= oe)
+        });
+        targets
+    }
+
+    /// `:foldopen! [range]` / `:foldclose! [range]` at a single `line`: act
+    /// on every fold level containing it, not just one. For open, finding
+    /// the outermost *closed* fold and calling `open_folds_in_range` over
+    /// its span does this in one step — that removes every fold definition
+    /// whose header falls inside the span, regardless of nesting depth,
+    /// matching Vim's "all folds are opened". For close, every level must be
+    /// recorded separately (unlike opening, where opening the outer level
+    /// already reveals everything nested inside, so one call suffices,
+    /// closing the outer alone would NOT also mark the inner as closed) —
+    /// otherwise a later `zo`/`:foldopen` on the outer fold would incorrectly
+    /// reveal the inner one too. Both verified against `nvim --headless`.
+    fn recursive_fold_toggle_at(&mut self, line: usize, open: bool) -> bool {
+        if open {
+            if let Some((start, end)) = self
+                .view()
+                .enclosing_closed_fold(line)
+                .map(|f| (f.start, f.end))
+            {
+                self.view_mut().open_folds_in_range(start, end);
+                return true;
+            }
+            return self.view().enclosing_fold_def(line).is_some()
+                || (self.folds_are_computed() && self.configured_fold_containing(line).is_some());
+        }
+        let mut ranges: Vec<(usize, usize)> = self
+            .view()
+            .fold_defs
+            .iter()
+            .filter(|f| f.start <= line && line <= f.end)
+            .map(|f| (f.start, f.end))
+            .collect();
+        if self.folds_are_computed() {
+            for (start, end, _) in self.compute_configured_folds() {
+                if start <= line && line <= end && !ranges.contains(&(start, end)) {
+                    ranges.push((start, end));
+                }
+            }
+        }
+        let found = !ranges.is_empty();
+        for (start, end) in ranges {
+            self.view_mut().close_fold(start, end);
+        }
+        found
+    }
+
+    /// `:{range}fold` — create a manual fold for `[range]` (default: the
+    /// cursor line alone, which — like a `1`-line `zf` — defines nothing
+    /// visible, since there's no body left to hide; verified against `nvim
+    /// --headless`). This is Vim's *only* way to create a fold when
+    /// `'foldmethod'` isn't `"manual"` (`:h :fold`); vimcode's `close_fold`
+    /// doesn't care what `'foldmethod'` is either, so no gating is needed
+    /// here.
+    pub(crate) fn ex_fold_create(&mut self, range: Option<(isize, isize)>) -> EngineAction {
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+        let (start, end) = match range {
+            Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+            None => {
+                let c = self.view().cursor.line;
+                (c, c)
+            }
+        };
+        self.view_mut().close_fold(start, end);
+        self.message = if end > start {
+            format!("{} lines folded", end - start + 1)
+        } else {
+            String::new()
+        };
+        EngineAction::None
+    }
+
+    /// `:foldo[pen][!] [range]` / `:foldc[lose][!] [range]` (#1159) — shared
+    /// body. `open` selects which; `bang` selects one-level vs recursive;
+    /// `range` defaults to the cursor line alone. Verified against `nvim
+    /// --headless`: neither command moves the cursor to the range's last
+    /// address the way most ranged ex commands do — it stays exactly where
+    /// it was, even if that line ends up hidden inside a newly-closed fold.
+    pub(crate) fn ex_fold_open_close(
+        &mut self,
+        range: Option<(isize, isize)>,
+        bang: bool,
+        open: bool,
+    ) -> EngineAction {
+        let last_line = self.buffer().len_lines().saturating_sub(1);
+        let (start, end) = match range {
+            Some((a, b)) => (a.max(0) as usize, (b.max(0) as usize).min(last_line)),
+            None => {
+                let c = self.view().cursor.line;
+                (c, c)
+            }
+        };
+        let found_any = if bang {
+            let mut found_any = false;
+            for line in start..=end {
+                found_any |= self.recursive_fold_toggle_at(line, open);
+            }
+            found_any
+        } else if open {
+            let (targets, found_any) = self.resolve_open_targets(start, end);
+            for (s, _e) in targets {
+                self.view_mut().open_fold(s);
+            }
+            found_any
+        } else {
+            let targets = self.resolve_close_targets(start, end);
+            let found_any = !targets.is_empty();
+            for (s, e) in targets {
+                self.view_mut().close_fold(s, e);
+            }
+            found_any
+        };
+        if !found_any {
+            self.message = "E490: No fold found".to_string();
+            return EngineAction::Error;
+        }
+        self.message = String::new();
+        EngineAction::None
     }
 
     /// Find the enclosing foldable block for `line` by walking upward to find
@@ -4279,15 +4998,15 @@ impl Engine {
 
     /// zM — close every fold in the buffer.
     ///
-    /// With `'foldmethod'` `"indent"` this first computes the whole
-    /// indent-fold hierarchy (Vim derives that method's folds automatically,
-    /// there's no `zf` step) and closes it down to `'foldlevel'` 0 — i.e.
-    /// closes everything (`apply_foldlevel(0)`). Otherwise (`"manual"`) it
-    /// only closes folds that already exist via `zf`; matching Vim, `zM`
-    /// never invents a manual fold (#1006, verified against `nvim
-    /// --headless`).
+    /// With `'foldmethod'` `"indent"`/`"marker"` (#1159) this first computes
+    /// the whole fold hierarchy (Vim derives those methods' folds
+    /// automatically, there's no `zf` step) and closes it down to
+    /// `'foldlevel'` 0 — i.e. closes everything (`apply_foldlevel(0)`).
+    /// Otherwise (`"manual"`) it only closes folds that already exist via
+    /// `zf`; matching Vim, `zM` never invents a manual fold (#1006, verified
+    /// against `nvim --headless`).
     pub(crate) fn cmd_fold_close_all(&mut self) {
-        if self.settings.foldmethod == "indent" {
+        if self.folds_are_computed() {
             self.apply_foldlevel(0);
         } else {
             let mut defs: Vec<(usize, usize)> = self
@@ -4424,17 +5143,29 @@ impl Engine {
         }
     }
 
-    /// zx — recompute folds: open all, then close all.
+    /// zx — recompute folds: open all, re-apply 'foldlevel' (closing them
+    /// again), then `zv` — Neovim's own doc for `zx` is literally "re-apply
+    /// 'foldlevel', then do zv: View cursor line" (`:h zx`). #1280: this used
+    /// to skip the `zv` step, so a cursor left inside the range that just got
+    /// reclosed stayed clamped to the fold's header — Neovim leaves the
+    /// cursor's line number untouched and only *displays* the header, exactly
+    /// like the plain `zM` case. `cmd_fold_close_all` clamps (correct for
+    /// `zM`, which has no trailing `zv`), so `zx` has to capture the cursor's
+    /// line first and hand it back to `cmd_fold_open_cursor_visible` rather
+    /// than trust whatever `cmd_fold_close_all` left it at.
     pub(crate) fn cmd_fold_recompute(&mut self) {
+        let cursor_line = self.view().cursor.line;
         self.view_mut().open_all_folds();
         self.cmd_fold_close_all();
+        self.view_mut().cursor.line = cursor_line;
+        self.cmd_fold_open_cursor_visible();
     }
 
     /// zj — move to the start of the next fold (open or closed — any
-    /// defined fold, not just closed ones, matches Vim). With
-    /// `'foldmethod'` `"indent"`, also considers folds not yet materialized
-    /// in `fold_defs` (Vim computes that method's hierarchy on demand, not
-    /// just from prior `zf`/`zc`/`zM` calls).
+    /// defined fold, not just closed ones, matches Vim). With `'foldmethod'`
+    /// `"indent"`/`"marker"` (#1159), also considers folds not yet
+    /// materialized in `fold_defs` (Vim computes those methods' hierarchy on
+    /// demand, not just from prior `zf`/`zc`/`zM` calls).
     pub(crate) fn cmd_fold_move_next(&mut self) {
         let cursor_line = self.view().cursor.line;
         let next_fold = self
@@ -4444,8 +5175,8 @@ impl Engine {
             .filter(|f| f.start > cursor_line)
             .map(|f| f.start)
             .min();
-        let next_detectable = if self.settings.foldmethod == "indent" {
-            self.indent_fold_after(cursor_line)
+        let next_detectable = if self.folds_are_computed() {
+            self.configured_fold_after(cursor_line)
         } else {
             None
         };
@@ -4473,8 +5204,8 @@ impl Engine {
             .filter(|f| f.end < cursor_line)
             .map(|f| f.end)
             .max();
-        let prev_detectable = if self.settings.foldmethod == "indent" {
-            self.indent_fold_end_before(cursor_line)
+        let prev_detectable = if self.folds_are_computed() {
+            self.configured_fold_end_before(cursor_line)
         } else {
             None
         };
@@ -4576,7 +5307,11 @@ impl Engine {
 
     pub(crate) fn move_right(&mut self) {
         let line = self.view().cursor.line;
-        let max_valid_col = self.get_max_cursor_col(line);
+        // `:h 'virtualedit'`: `"all"`/`"onemore"` let the cursor sit one
+        // column past the last character — only this narrow subset is
+        // modeled, see the `virtualedit` field doc (#1153).
+        let max_valid_col =
+            self.get_max_cursor_col(line) + usize::from(self.settings.virtualedit_allows_onemore());
         if self.view().cursor.col < max_valid_col {
             self.view_mut().cursor.col += 1;
         }
@@ -4803,6 +5538,38 @@ impl Engine {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 Some((name, RegType::Charwise))
+            }
+            '#' => {
+                // Alternate filename (read-only) — the same buffer `<C-^>`
+                // (`Engine::alternate_buffer`) switches to (`:h quote_#`).
+                // Empty when there is no alternate buffer, or it has no
+                // backing file (e.g. an unnamed scratch buffer).
+                let name = self
+                    .buffer_manager
+                    .alternate_buffer
+                    .and_then(|id| self.buffer_manager.get(id))
+                    .and_then(|state| state.file_path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '=' => {
+                // Expression register: real Vim evaluates a Vimscript
+                // expression here. VimCode has no such evaluator (the
+                // arithmetic-only shortcut in `eval_expr_register` covers
+                // the `"=`/`<C-r>=` *entry* prompt, not a stored general
+                // expression), so reading `"=` outside that prompt reports
+                // itself as unimplemented rather than silently pasting
+                // nothing (#1161).
+                match self.registers.get(&reg).cloned() {
+                    Some(pair) => Some(pair),
+                    None => {
+                        self.message =
+                            "\"=\" register (expression evaluation) is not implemented".to_string();
+                        None
+                    }
+                }
             }
             '/' => {
                 // Last search pattern (read-only)
@@ -6297,6 +7064,21 @@ impl Engine {
         self.append_jump_list_entry();
     }
 
+    /// True when `id` is a still-pristine "scratch" buffer — unnamed,
+    /// unmodified, and empty — the state a freshly-started editor's initial
+    /// buffer is in. Verified against real Neovim (#1158): leaving such a
+    /// buffer via `:edit`/`:tabnew`/`:split` does NOT record a jumplist
+    /// entry (`nvim --headless -u NONE -i NONE -c 'edit a.txt' -c 'edit
+    /// b.txt' -c jumps` shows only one entry, for a.txt — the unnamed
+    /// startup buffer never appears); once the buffer has a name, content,
+    /// or unsaved changes, leaving it becomes jump-worthy like any other
+    /// file switch.
+    pub(crate) fn is_pristine_scratch_buffer(&self, id: BufferId) -> bool {
+        self.buffer_manager
+            .get(id)
+            .is_some_and(|s| s.file_path.is_none() && !s.dirty && s.buffer.content.len_chars() == 0)
+    }
+
     /// The jumplist-only half of `push_jump_location` — appends the current
     /// cursor position, deduped against the top entry and truncating any
     /// forward (redo) history. Split out so `record_jump_from` can update
@@ -6462,7 +7244,7 @@ impl Engine {
             let current_file = self.active_buffer_state().file_path.clone();
             if entry.file != current_file {
                 if let Some(path) = &entry.file {
-                    let _ = self.open_file_with_mode(path, OpenMode::Permanent);
+                    let _ = self.open_file_for_jump_recovery(path);
                 }
             }
         }
@@ -6611,7 +7393,15 @@ impl Engine {
                 }
             }
 
-            let new_cols = cols + sw;
+            // `:h 'shiftround'`: land on the next multiple of 'shiftwidth'
+            // (verified against `nvim --headless`: `(cols/sw + 1) * sw`,
+            // e.g. cols=5,sw=4 → 8, not the plain 5+4=9) instead of always
+            // adding exactly one shiftwidth (#1153).
+            let new_cols = if self.settings.shiftround && sw > 0 {
+                (cols / sw + 1) * sw
+            } else {
+                cols + sw
+            };
             // `noet` only uses a tab where a *whole* tabstop fits, so with
             // ts=8 / sw=4 Vim indents with four spaces, not a tab.
             let new_indent = if expand {
@@ -6750,7 +7540,21 @@ impl Engine {
             // converted to spaces under 'expandtab' instead of surviving
             // untouched just because it wasn't the character actually
             // removed (#883).
-            let new_cols = cols.saturating_sub(remove_cols);
+            // `:h 'shiftround'`: round down to the previous multiple of
+            // 'shiftwidth', computed from this line's own current indent
+            // (#1153) — verified against `nvim --headless`: cols=5,sw=4 →
+            // 4 — NOT this function's own group-capped `remove_cols`
+            // rounded further, which would over-remove (5 → 1 → round to 0
+            // instead of the real-Vim answer, 4).
+            let new_cols = if self.settings.shiftround && sw > 0 {
+                if cols == 0 {
+                    0
+                } else {
+                    ((cols - 1) / sw) * sw
+                }
+            } else {
+                cols.saturating_sub(remove_cols)
+            };
             let new_indent = if expand {
                 " ".repeat(new_cols)
             } else {
@@ -6982,44 +7786,56 @@ const CLASS_WORD: u8 = 2;
 const CLASS_PUNCT: u8 = 3;
 const CLASS_WIDE: u8 = 4;
 
-/// True for "wide" (double display-cell) word characters — CJK ideographs,
-/// Hiragana, Katakana, Hangul syllables and similar East-Asian-Wide
-/// alphanumerics.
-///
-/// `is_word_char` alone (Rust's `is_alphanumeric`) does not distinguish
-/// these from ASCII/Latin/Cyrillic letters, but Vim does: verified against
-/// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even though
-/// nothing separates them, while `w` on `helloжworld` (Cyrillic embedded in
-/// ASCII, both narrow) does not stop there at all — the whole thing is one
-/// word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text objects treat a transition
-/// between narrow-word and wide-word as a boundary the same way they treat a
-/// word/punctuation transition. (#1005)
-///
-/// Reuses `quadraui::text_util::is_wide_char` (unconditionally compiled, no
-/// feature gate) rather than re-deriving East Asian Width locally — see the
-/// Platform-Neutrality Rule in CLAUDE.md.
-pub(crate) fn is_wide_word_char(c: char) -> bool {
-    is_word_char(c) && quadraui::text_util::is_wide_char(c)
+impl Engine {
+    /// True for "wide" (double display-cell) word characters — CJK
+    /// ideographs, Hiragana, Katakana, Hangul syllables and similar
+    /// East-Asian-Wide alphanumerics.
+    ///
+    /// `is_word_char` alone (per `'iskeyword'`) does not distinguish these
+    /// from ASCII/Latin/Cyrillic letters, but Vim does: verified against
+    /// `nvim`, `w` on `foo日本語bar` stops between `foo` and `日本語` even
+    /// though nothing separates them, while `w` on `helloжworld` (Cyrillic
+    /// embedded in ASCII, both narrow) does not stop there at all — the
+    /// whole thing is one word. `w`/`e`/`b`/`ge` and the `iw`/`aw` text
+    /// objects treat a transition between narrow-word and wide-word as a
+    /// boundary the same way they treat a word/punctuation transition.
+    /// (#1005)
+    ///
+    /// Reuses `quadraui::text_util::is_wide_char` (unconditionally
+    /// compiled, no feature gate) rather than re-deriving East Asian Width
+    /// locally — see the Platform-Neutrality Rule in CLAUDE.md.
+    pub(crate) fn is_wide_word_char(&self, c: char) -> bool {
+        self.is_word_char(c) && quadraui::text_util::is_wide_char(c)
+    }
+
+    /// Small-word (`w`/`b`/`e`, `iw`/`aw`) character class — depends on
+    /// `'iskeyword'` via [`Engine::is_word_char`].
+    fn char_class(&self, c: char) -> u8 {
+        if c == '\n' {
+            CLASS_NL
+        } else if c.is_whitespace() {
+            CLASS_BLANK
+        } else if self.is_wide_word_char(c) {
+            CLASS_WIDE
+        } else if self.is_word_char(c) {
+            CLASS_WORD
+        } else {
+            CLASS_PUNCT
+        }
+    }
 }
 
-fn char_class(c: char) -> u8 {
+/// `W`/`B`/`E` (WORD) boundaries are whitespace-only (`:h WORD`) — unlike
+/// small-word [`Engine::char_class`], this does *not* depend on
+/// `'iskeyword'`, so it stays a plain free function with no `Engine`
+/// access.
+fn bigword_class(c: char) -> u8 {
     if c == '\n' {
         CLASS_NL
     } else if c.is_whitespace() {
         CLASS_BLANK
-    } else if is_wide_word_char(c) {
-        CLASS_WIDE
-    } else if is_word_char(c) {
-        CLASS_WORD
     } else {
-        CLASS_PUNCT
-    }
-}
-
-fn bigword_class(c: char) -> u8 {
-    match char_class(c) {
-        CLASS_PUNCT | CLASS_WIDE => CLASS_WORD,
-        other => other,
+        CLASS_WORD
     }
 }
 

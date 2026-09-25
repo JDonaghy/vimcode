@@ -183,6 +183,23 @@ impl Engine {
                 }
                 true
             }
+            // #1027 (fix for #984): a chevron-zone click resolves to
+            // `RowToggleExpand`, a distinct variant from the `RowActivated`
+            // a label-zone double-click (or Enter) produces. Before this
+            // arm existed, `RowToggleExpand` fell through the catch-all
+            // below and was silently swallowed — reported as consumed with
+            // no effect — so the chevron needed a second click to fold
+            // through `DoubleClickDetector` into a `RowActivated` it *did*
+            // handle. `explorer_toggle_dir` already flips expanded ->
+            // collapsed and back, so one click here toggles either
+            // direction, matching the label's one-click arity both ways.
+            quadraui::TreeControllerEvent::RowToggleExpand { ref path } => {
+                let idx = path[0] as usize;
+                if idx < self.explorer_rows.len() && self.explorer_rows[idx].is_dir {
+                    self.explorer_toggle_dir(idx);
+                }
+                true
+            }
             quadraui::TreeControllerEvent::EditConfirmed {
                 ref path,
                 ref new_text,
@@ -196,7 +213,21 @@ impl Engine {
             }
             quadraui::TreeControllerEvent::RowSelected { .. } => true,
             quadraui::TreeControllerEvent::Ignored => false,
-            _ => true,
+            // #1027 audit (per issue): the rest of `TreeControllerEvent`'s
+            // variants enumerated explicitly rather than behind a `_ => true`
+            // catch-all -- that catch-all is exactly what hid the missing
+            // `RowToggleExpand` arm above for two issues (#984 reported it,
+            // #1027 fixes it). Each of these is a legitimate no-op-beyond-
+            // redraw today (scrollbar interaction, drag/hover, a same-frame
+            // edit-buffer keystroke, and a context menu that
+            // `render::route_explorer_tree_event` already fully resolves
+            // before this function ever sees it) -- but naming them means a
+            // *new* quadraui variant is a compile error here, not another
+            // silent swallow.
+            quadraui::TreeControllerEvent::ScrollChanged
+            | quadraui::TreeControllerEvent::Consumed
+            | quadraui::TreeControllerEvent::EditChanged { .. }
+            | quadraui::TreeControllerEvent::ContextMenuRequested { .. } => true,
         }
     }
 

@@ -1,6 +1,1110 @@
 # VimCode Project State
 
-**Last updated:** September 14, 2026 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531). Prior revisions: September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **2 open** (#901, #902 — 2026-09-11 macOS native-menu audit). **#47 is reopened, in milestone #5** — its blocker (quadraui#699/#704) closed 2026-09-03, and #811 already ported the TUI side onto the new API. See `GOALS.md` for the full correction history.
+**Last updated:** September 24, 2026 (#523, Track A Phase 0b — wire Board
+actions to provider-declared commands, on top of #521/#522's generic Board
+host and #524's document buffers). Makes the board actionable: right-click
+(or a provider-declared stage keybinding) runs a provider-declared named
+action against a card, with confirmation for irreversible/metered actions
+and results surfaced to the status line — all through the #522 seam, with
+**no coordinator vocabulary anywhere in `src/core/`**
+(`tests/no_coord_vocabulary_in_core.rs` still passes).
+
+`src/core/extensions.rs`: `BoardProviderConfig::actions` changed from
+`HashMap<String, Vec<String>>` (unused in production — #521/#522 shipped it
+as the seam, #523 is the first consumer) to `Vec<BoardActionDef>` — each
+entry names an action, an argv `command` (`{id}` substituted), the `stages`
+(column ids) it's valid in (empty = every stage), an optional single-key
+`key` binding, and a `confirm` flag. New `BoardProviderConfig::action_by_
+name`/`actions_for_stage`/`action_for_key` lookups replace the old
+`action_argv`. Also gained opt-in freshness: `tick_command`/
+`tick_interval_secs` — a fire-and-forget nudge for a daemon-less provider's
+pipeline, run only when `Settings::board_tick_enabled` (new, **default
+off** — a passive viewer must not silently dispatch metered work) is set.
+
+`src/core/engine/board_ops.rs`: `open_board_context_menu(card_id, x, y)`
+lists the provider's declared actions valid for the card's current stage
+(its column) through the *existing* generic `Engine::context_menu`/
+`ContextMenuState` machinery already used by Explorer/Tab/Editor — a new
+`ContextMenuTarget::Board { card_id }` variant, no bespoke menu widget.
+`run_board_action_by_name(name, card_id)` resolves the argv and either
+dispatches immediately (`dispatch_board_action_command` — background
+thread via the same `ToolClient` seam `board_refresh` uses,
+`poll_board_action` surfaces exit status/stdout to `Engine::message` and
+triggers a fresh `board_refresh`) or, when the provider marked the action
+`confirm`, opens a Yes/No dialog first via the existing generic
+`show_dialog`/`process_dialog_result` machinery (new `"confirm_board_
+action"` tag, new `PendingBoardAction` engine field) — reusing established
+infra end-to-end rather than building a parallel one, per the Platform-
+Neutrality Rule. `dispatch_board_key_unified` checks a provider-declared
+stage keybinding (the coord-tui-parity `P`/`S`/`F` style) *before* falling
+to `quadraui::BoardModel::handle_key`'s generic nav, so a provider is free
+to bind letters `handle_key` doesn't already claim. `OpenIssue`/
+`OpenReview` (`quadraui::BoardAction` variants) now fall back to a
+provider-declared action of the same name when no more specific handling
+applies (a `[document]` provider still wins for `OpenIssue`, #524) —
+`apply_board_action`'s `ContextMenu` arm stays a no-op, since nothing in
+quadraui's `Board` primitive constructs that variant itself (no mouse
+handler on `BoardModel`, unlike `TreeController`); right-click resolves the
+card straight from the cached `BoardLayout` at the click site instead.
+`tick_board_provider_freshness` (new, called unconditionally from
+`poll_idle`, *not* gated on the Board panel being visible — the opposite of
+`tick_board`'s read-refresh cadence) fires `tick_command` on its own
+interval when enabled.
+
+**Backends** — GTK's `App::route_board_sidebar_event` and TUI's
+`mouse::handle_mouse` (`SidebarOwner::Board` right-click arm) both do the
+same 1-3 lines: resolve the right-clicked card via new `render::
+board_right_click_card` (mirrors `route_board_click`'s hit-test), convert
+pixel→cell (GTK only — TUI's board paints in cell units already, same
+asymmetry `handle_tab_right_click`/`handle_editor_right_click` already
+have), call `Engine::open_board_context_menu`. Confirming a menu item
+(Enter, or a click) reuses the *existing* generic `route_modal_key`/
+`ContextMenuRoute` machinery unchanged — no new backend wiring needed for
+that half, since `ContextMenuTarget::Board`'s dispatch is entirely engine-
+side (`context_menu_confirm`'s new match arm in `windows.rs`).
+
+**Settings**: new `board_tick_enabled: bool` (`Settings`, default off, no
+vim-abbreviation precedent) wired through `get_value_str`/`set_value_str`
+and a new `SettingDef` (Workspace category, "Board Auto-Tick") so it's
+toggleable from the Settings sidebar or `:set board_tick_enabled=true`.
+
+**Tests**: extensive `board_ops.rs` unit coverage (context-menu contents
+filtered by stage, dispatch + confirm + cancel + result-surfacing, stage
+keybinding dispatch falling back to nav on an unbound key, `OpenIssue`/
+`OpenReview` provider-action fallback, freshness-tick default-off/enabled/
+interval-respecting/no-tick-command cases) using the new `RecordingToolClient`-
+based assertions (argv sent, not just "something ran"). Driver-tier black-
+box coverage on both backends — TUI (`tui_main/shell_app.rs`, `TuiDriver`:
+`board_right_click_opens_context_menu_with_provider_actions_via_shell_app`,
+`board_context_menu_action_dispatches_provider_command_via_shell_app`, the
+latter using `driver.tick()`/`poll_until_screen` to reach `Engine::poll_
+board_action` exactly as the live loop does) and GTK (`gtk/testing.rs`,
+`GtkDriver`: same two scenarios, polling `Engine::poll_board_action`
+directly since the harness keeps a live `Rc<RefCell<Engine>>`) — a real
+right-click through the actual event-dispatch pipeline opens the menu
+(asserted on painted text, not `Engine::context_menu.is_some()`,
+#587/#592's lesson) and a real Enter-confirm dispatches the provider's argv
+end-to-end with a mock provider, proving no coordinator is needed to
+exercise the path (#523's acceptance bar). All four new driver tests
+RED-verified (temporarily short-circuited `open_board_context_menu`,
+confirmed both fail, restored). `cargo build`/`clippy -D warnings`/`fmt`
+clean on both feature lanes.
+
+Out of scope (per the issue): the coordinator extension bundle itself (the
+parity-matrix mapping of `assign`/`test`/`pr`/`merge`/`backlog` to real
+`coord` argv) — this ships the generic dispatch mechanism only, provable
+end-to-end with a mock provider.
+
+Rebased onto #525/#528/#530 (Track A Phases 2/3/5 landed on `develop` while
+this branch was open and rewrote `board_ops.rs` around the same
+`"OpenReview"` action name). Both features survive, with one deliberate
+precedence rule now pinned by tests: **`"OpenReview"` is the one
+provider-declared action that does *not* go through #523's generic
+fire-and-forget dispatcher.** Its command's stdout is a review *target* to
+resolve into a local diff (`Engine::open_review_card` ->
+`fetch_branch_review_target` -> `open_branch_review`), so routing it through
+`run_board_action_by_name` would silently downgrade "open the review" to
+"print that JSON on the status line". For the same reason the host's `R`
+keybinding is checked *before* provider-declared stage keybindings, so a
+provider cannot rebind `R` out from under the review. #525's
+`action_argv(name, id)` helper folded into #523's richer
+`action_by_name(name)` + `BoardActionDef::resolve_argv(id)` (the `actions`
+field is a `Vec<BoardActionDef>` now, not a `HashMap<String, Vec<String>>`).
+RED-verified: reinstating the generic dispatch for `OpenReview` turns
+`board_review_key_paints_branch_diff_via_shell_app` (driver-tier),
+`apply_open_review_resolves_a_target_instead_of_dispatching_the_action` and
+two of #525's engine tests red; restored, all green.
+
+**Last updated:** September 24, 2026 (#530, Track A Phase 5 — the fleet
+review seat). "vimcode-over-ssh" needs **no vimcode-side ssh/transport
+code at all** — the moat is that vimcode already works correctly when it
+is the process running (via a plain `ssh <host>`) on a worker's box, in
+that worktree's own checkout, so #525's `Engine::open_branch_review`
+already handles the "review-where-the-code-is" mode unmodified: both it
+and "pull-local" (#525's original default) resolve `target.branch`/
+`.base` as local git revisions either way. The only real gap was
+**provenance** — "which worktree" (already shown by the #528 footer) stops
+uniquely identifying "which checkout" once vimcode itself can *be* the
+process on a different machine. `src/core/tool_client.rs::
+BranchReviewTarget` gained `host: Option<String>` (`#[serde(default)]` —
+every #525-era provider response still parses unchanged), a purely
+descriptive label a fleet provider's roster fills in per card/assignment
+(picking which machine+assignment to review is just picking a board card,
+same as #525 — no new selection UI needed, since the provider already
+decides what `host` a given card resolves to). `render::
+branch_review_provenance_segment` now paints `"reviewing branch 'X' on
+'<host>' in <root>"` when `target.host` is `Some`, falling back to the
+pre-#530 `"reviewing branch 'X' in <root>"` line when it's `None` (a
+single-checkout provider, or a locally-pulled branch). New
+`board_review_footer_paints_host_provenance_via_shell_app` in
+`src/tui_main/shell_app.rs` (`TuiDriver`, real temp git repo, mock
+provider returning `{"branch", "base", "host"}`), RED-verified by
+temporarily reverting the segment to its single pre-#530 format string and
+confirming the assertion fails, then restoring it. New
+`mock_client_fetch_branch_review_target_parses_host_when_present` in
+`tool_client.rs` covers the parse side, plus a same-module assertion that
+a host-less fixture still parses `host: None` (the `#[serde(default)]`
+compatibility guarantee). `finalize_review_edits` (#528) needed **no
+change** — a plain `git push` from wherever the worktree physically is
+already *is* "the provider's existing remote path" the acceptance bar
+asks for, regardless of mode. No ACP/Node dependency anywhere in this
+diff (Track B stays untouched, per the issue's explicit warning). `cargo
+build`/`clippy -D warnings`/`fmt` clean on both feature lanes;
+`no_coord_vocabulary_in_core` still passes (an early doc-comment draft
+that named `coord pull` was caught by it and reworded to "an external
+'pull the branch locally first' flow" — the mechanism this issue's core
+code has no business knowing the name of).
+
+**Last updated:** September 24, 2026 (#528, Track A Phase 3 — push human
+review edits back to the branch). A review worktree opened via `Engine::
+open_branch_review` (#525) is a real checkout: nothing in this scope was
+needed to make editing its files work (the editor already edits any file
+on disk), so this issue's actual gap was making that safe and legible.
+New `Engine::review_target: Option<BranchReviewTarget>` (`mod.rs`) records
+which branch/base a branch review resolved, set by `open_branch_review`
+and left in place after the diff surface itself closes — the human keeps
+editing files after `Esc`, and that's exactly when "which branch is this"
+matters most. New `Engine::finalize_review_edits(message)`
+(`review_ops.rs`), reachable as `:GFinalize [message]` (`execute.rs` ->
+`cmd_git_finalize_review`, `buffers.rs`, following the existing `:Gcommit`/
+`:Gpush` pattern): stages+commits any working-tree changes, then a plain
+(non-force) `git push` — modelled on coordinator's remote-fix `finalize`,
+so a rejected push (real non-fast-forward tested against a bare remote)
+never loses the commit or the worktree, just returns an `Err` the human
+can retry after resolving. Safety check: refuses to finalize if the
+worktree has since been `git checkout`ed off `review_target.branch` (the
+"must know which branch you're editing" footgun the issue names as the
+main risk) — verified with real `git worktree`-adjacent temp repos, not
+mocked git calls. Provenance in the UI: `render::paint_change_review_rung`
+now paints a right-aligned "reviewing branch '<branch>' in <root>" footer
+segment (shared `render.rs`, both backends, `None` for an ACP-fed review
+with no `review_target`) — new `board_review_footer_paints_branch_
+provenance_via_shell_app` in `src/tui_main/shell_app.rs`, RED-verified by
+reverting the segment to `right_segments: vec![]` and confirming the
+assertion fails before restoring it. Three new real-git tests in
+`review_ops.rs` (happy path against a bare remote, wrong-branch refusal,
+rejected-push commit preservation) plus a `:GFinalize` wiring test
+asserting the typed commit message lands at the pushed remote ref, not
+just "some push happened". `cargo build`/`clippy -D warnings`/`fmt` clean
+on both feature lanes; `no_coord_vocabulary_in_core` still passes (the
+git plumbing this issue adds — commit/push/branch-refusal — is exactly as
+generic as the `:G*` commands it's modelled on, no coordinator vocabulary
+anywhere in `src/core/` or `src/render.rs`).
+
+**Last updated:** September 24, 2026 (#526, Track A Phase 2 — review verdict
+round-trip through a provider command). Closes the loop #525 opened: from an
+open change-review surface, `A`/`C`/`M` report Approve/Request-changes/
+Comment-only verdicts through a provider-declared command, with **no
+coordinator vocabulary anywhere in `src/core/`** —
+`tests/no_coord_vocabulary_in_core.rs` still passes.
+`src/core/extensions.rs`'s `BoardProviderConfig` gained
+`verdict_commands: HashMap<String, Vec<String>>` (keyed by the new
+`crate::core::review::ReviewVerdict::token()` — `"approve"`/
+`"request-changes"`/`"comment"`, generic code-review vocabulary, not any
+specific pipeline tool's) plus `verdict_argv`, substituting `{id}` *and*
+`{body_file}` — the body is **never** inline, matching `DocumentProviderConfig
+::write_command`'s existing stdin-not-argv precedent for the same "review
+bodies contain newlines/code fences/quotes" reason. New
+`crate::core::tool_client::write_review_body_temp_file` writes the composed
+body to a fresh temp file before the provider command runs, so a failing
+command still leaves the body on disk *and* untouched in the still-open
+buffer — `save_review_verdict_buffer`'s own tests exercise exactly that
+"a failed verdict command preserves the composed body" acceptance bar.
+Composing a verdict reuses #524's own "open a real markdown scratch buffer,
+`:w` pushes it through a provider command" shape verbatim (new
+`crate::core::buffer_manager::ReviewVerdictBinding`, new
+`src/core/engine/review_verdict_ops.rs` mirroring `document_ops.rs`
+structurally) rather than a bespoke text-input widget — the same vim editing
+(undo, search, paste) authoring an issue already gets is now available for
+composing a review. New `Engine::review_card_id` tracks which board card
+(if any) the currently-open `change_review` surface was opened for — always
+reset to `None` inside `open_change_review` and set back by
+`Engine::open_review_card` (`board_ops.rs`) right after a successful
+`open_branch_review`, so an ACP tool-call diff never inherits a stale id
+from an earlier board review and has nothing to report a verdict against.
+New keys on the change-review surface (`handle_change_review_key`,
+`review_ops.rs`): `A` (Approve), `C` (Request changes), `M` (Comment-only) —
+each hands off to `Engine::start_review_verdict`, which closes the diff
+surface and opens the composer buffer; a verdict with no reviewed card
+behind the surface, no board provider configured, or no command declared
+for that verdict degrades to a status message rather than a panic, the same
+precedent `board_ops.rs`'s `open_review_card` already set for #525. Driver
+coverage: `change_review_shift_a_paints_a_verdict_composer_tab_via_shell_app`
+in `src/tui_main/shell_app.rs` (`#[cfg(test)]`, `TuiDriver` via
+`driver_with_shell`) drives the real `A` keypress against a mock `[board]`
+provider's `verdict_commands`, asserting on the *rendered* screen (the diff
+content disappearing, the new tab's name painting) — RED-verified by
+temporarily disabling the `'A'` match arm and confirming the test failed,
+then restored. No GTK-specific driver test: the whole feature is core key
+handling + the same generic scratch-buffer/tab rendering `document_ops.rs`'s
+buffers already exercise on GTK, zero backend-specific code added or
+changed (mirrors #525's own review-accepted precedent of a TUI-only driver
+test for its analogous `OpenReview`-key coverage). `cargo build`/
+`clippy -D warnings`/`fmt` clean on both feature lanes; `review_ops::`/
+`review_verdict_ops::`/`board_ops::`/`document_ops::`/`extensions::`/
+`tool_client::`/`buffer_manager::`/the new shell_app driver test/
+`no_coord_vocabulary_in_core` all pass.
+
+**Last updated:** September 24, 2026 (#525 review fixes, iteration 1).
+Addressed the review's blocking + non-blocking findings on top of the
+Track A Phase 2 work below:
+
+- **Blocking — driver-tier black-box test.** New
+  `board_review_key_paints_branch_diff_via_shell_app` in
+  `src/tui_main/shell_app.rs` (`#[cfg(test)]`, `TuiDriver` via
+  `driver_with_shell`) drives the real end-to-end path a user triggers:
+  types `R` on a selected board card with a mock `[board]` provider's
+  `"OpenReview"` action configured, against a **real temp git repo** with
+  a `base` commit and a `feature` branch, and asserts the reviewed
+  branch's new file name is painted on the rendered screen — not on
+  `Engine::change_review` being `Some`. RED-verified by temporarily
+  disabling the `R` key match in `dispatch_board_key_unified` and
+  confirming the test fails, then restoring it. This is the one touch to
+  `src/tui_main/` the original PR said it made none of — it is test-only,
+  the shared change-review rendering itself is still #955's, and no new
+  per-backend diff-drawing code was added.
+- **Non-blocking — flag-smuggling guard.** `git::changed_files_between`
+  now rejects a `base`/`head` starting with `-` before joining them into
+  the single `base...head` positional git argv token, since both values
+  originate from an external provider's JSON. New
+  `test_changed_files_between_rejects_flag_like_revisions`.
+- **Non-blocking — "no changes" vs. "git failure".**
+  `changed_files_between` now returns `Option<Vec<String>>`: `None` for
+  any git failure (unknown ref, no repo, or the flag-smuggling guard
+  above), `Some(vec![])` for a genuine empty diff. `Engine::
+  open_branch_review` reports a distinct "could not diff ... check the
+  branch/base names the provider returned" message for the `None` case
+  instead of reusing the "no changes between X and Y" message a
+  misconfigured provider would otherwise share with a real no-op review.
+  Existing `test_changed_files_between_unknown_ref_is_empty_not_error`
+  renamed/updated to assert `None`.
+- **Nit — test helper duplication.** `board_ops.rs`'s
+  `install_mock_provider_with_review_action` now builds on
+  `install_mock_provider` (layering the `OpenReview` action + response
+  swap) instead of re-deriving the manifest/`extension_state`/
+  `ext_registry` wiring from scratch.
+
+`cargo build`/`clippy -D warnings`/`fmt` clean on both feature lanes;
+`board_ops::`/`review_ops::`/`git::tests::test_changed_files_between*`/the
+new shell_app driver test/`no_coord_vocabulary_in_core` all pass.
+
+**Last updated:** September 24, 2026 (#525, Track A Phase 2 — in-editor
+diff review of a work branch, consuming the change-review surface #955
+built rather than building a second one). `BoardAction::OpenReview` on a
+board card now resolves "card -> branch -> changed files" and opens a real
+multi-file diff, entirely through generic seams — no coordinator
+vocabulary anywhere, `tests/no_coord_vocabulary_in_core.rs` still passes.
+New `src/core/tool_client.rs::BranchReviewTarget{branch, base}` +
+`fetch_branch_review_target` — same "generic contract, provider supplies
+the JSON" pattern as `ToolDocument`/`BoardModel`: any provider whose
+`"OpenReview"` board action (`BoardProviderConfig::actions`, already
+generic since #522) emits `{"branch", "base"}` on stdout gets a review.
+New `src/core/git.rs::changed_files_between(dir, base, head)` — `git diff
+--name-only base...head` (three-dot, so a commit landing on `base` after
+`head` diverged never shows up as a spurious change). New
+`Engine::open_branch_review` (`review_ops.rs`) is the git feeder for
+#955's `core::review::ChangeReviewState`: turns `changed_files_between`'s
+paths into `ProposedChange{path, old_text, new_text}` via
+`git::show_file_at_ref` at both revisions (`old_text: None` when the path
+doesn't exist at `base` — a new file, matching `ProposedChange`'s existing
+"pure addition" convention) and calls the same `open_change_review` #955's
+ACP feeder calls — proof the surface really is source-agnostic, one layer
+up from `core::review`'s own non-ACP unit test. `board_ops.rs`'s
+`apply_board_action` now resolves `OpenReview(id)` the same way `OpenIssue`
+already resolves to a pending action outside the `board_model` borrow,
+dispatching to new `Engine::open_review_card` (blocking, one-shot, same
+tradeoff `open_tool_document` already made) which runs the provider's
+`"OpenReview"` action via the existing `board_client` `ToolClient`,
+degrading to a status-line message (no provider / no review command
+configured / provider failed) rather than a panic on every failure path.
+New host-level `R` keybinding in `dispatch_board_key_unified` opens the
+review for the selected card — dispatched here rather than added to
+quadraui's generic `BoardModel::handle_key` keymap, since that method's
+own doc explicitly calls "review" out as a workflow-specific verb hosts
+should handle themselves. Everything downstream (hunk nav `]`/`[`, file
+nav `n`/`p`/Tab, click/Return-to-jump opening a real buffer with real LSP
+diagnostics and git blame, accept/reject) is reused verbatim from #955 —
+no new per-backend diff drawing, no touches to `src/gtk/` or
+`src/tui_main/` at all. Tests: two real-git-repo tests for
+`changed_files_between` (including the three-dot-semantics case), two for
+`fetch_branch_review_target`, three `open_branch_review` tests against a
+real temp repo (happy path, no-changes error, no-workspace error), and six
+`board_ops.rs` tests covering the full `OpenReview` wiring (happy path
+through a mock provider + real repo, no provider, no review command
+configured, failing provider, and the `R` keybinding with/without a
+selection). `cargo build`/`clippy -D warnings`/`fmt` clean on both feature
+lanes.
+
+**Last updated:** September 24, 2026 (#524, Track A Phase 1 — provider
+document buffers, on top of #521/#522's generic Board host). Author/refine
+a provider's documents (e.g. a GitHub issue) as real markdown buffers,
+push edits back on `:w`, with **no coordinator vocabulary anywhere in
+`src/core/`** — `tests/no_coord_vocabulary_in_core.rs` still passes.
+`src/core/extensions.rs` gained `ExtensionManifest::document:
+Option<DocumentProviderConfig>` — `read_command`/`write_command`/
+`write_follow_up` argv templates (same `{id}` substitution convention as
+`BoardProviderConfig::actions`), with `write_command` doing double duty as
+"create" when `{id}` substitutes to the empty string (the new-document
+flow — no separate create command). `src/core/tool_client.rs` (#522's
+seam) grew a second half: `ToolClient::run_with_stdin`/`run` (a payload
+*into* the process, discarding stdout — `push_tool_document` feeds
+`{"title", "body"}` JSON on stdin; `run` is the fire-and-forget follow-up
+call), `ToolDocument{title, body, labels, status}` (the read contract,
+mirroring `BoardModel`'s role for the Board panel), and
+`RecordingToolClient` (a test client that logs every argv+stdin it was
+asked to run, so a test can assert *what* was pushed, not just that
+something succeeded — `MockToolClient` alone can't do that since it only
+returns a canned result). New `src/core/engine/document_ops.rs`:
+`Engine::document_provider()` (mirrors `board_provider()`),
+`open_tool_document(id)` (blocking — a deliberate one-shot action, unlike
+the Board panel's background poll) opens a scratch buffer whose text is
+`# <title>\n\n<body>`, preceded by a read-only `<!-- status: ... labels:
+... -->` comment when the provider supplied either (labels/status are
+shown, never parsed back — editing them is lifecycle-specific, the
+bundle's job, not this generic seam's), `new_tool_document()` for the
+blank-buffer flow, and `save_tool_document_buffer()` (wired into
+`Engine::save()` ahead of the on-disk path, same slot as the keymaps/
+registries scratch buffers) which pushes title/body then the
+`write_follow_up` command — but only when the document already had an id;
+the create path has nothing to transition from. `BufferState` gained
+`tool_document: Option<ToolDocumentBinding>` (id + the write/follow-up
+argv captured at open time, so `:w` doesn't need to re-resolve a provider
+that may have changed) — `file_path` stays `None` throughout, so a
+document buffer is never written to disk. `board_ops.rs`'s
+`BoardAction::OpenIssue` now opens the card as a document buffer when a
+`[document]` provider is configured (falls back to Phase 0's status-line
+echo otherwise) — the "from a board card" half of the issue's scope; the
+"provider-declared command" half (`:CoordRefine 42` naming a specific
+command) is explicitly the coordinator bundle's job, not built here.
+Tests: unit coverage in all four touched modules, including an explicit
+"round-trips through a mock provider" test asserting the exact argv+JSON
+payload sent to `write_command` and `write_follow_up` via
+`RecordingToolClient`, a new-document-flow test asserting the empty-`{id}`
+substitution and no follow-up call, and a `board_ops.rs` test proving
+`OpenIssue` actually opens a buffer (not just a state flag) when a
+document provider is installed.
+
+**Review fix-up (iteration 1):** the original "no driver-tier test — this
+reuses the existing generic buffer/tab/`:w` rendering path with no new
+paint or click surface" justification was wrong to treat as an exemption:
+"reuses existing rendering machinery" isn't "internal-only", and writing
+the actual driver test surfaced two real, previously-undetected bugs it
+would have caught immediately:
+- `quadraui::BoardModel::handle_key` matches the literal `"Enter"`, but
+  both backends' own key-name convention (`engine_key_from_ui`/
+  `map_gtk_key_name`) emits `"Return"`/`"KP_Enter"` for that key — so a
+  real Enter keypress on a selected board card has *never* triggered
+  `OpenIssue` on either backend. Fixed in `Engine::dispatch_board_key_
+  unified` (host-side translation, not a quadraui change).
+- TUI's `handle_focus_owner_key` (`shell_app.rs`) had no `FocusKeyRoute::
+  Board` arm at all — every other panel route has one, but Board's was
+  missing since #521, so *any* keyboard navigation on the Board panel
+  (j/k/h/l/g/G/Enter) fell through to the Explorer-fallback key dispatch
+  on TUI specifically (GTK was fine — its key routing already calls the
+  shared `render::dispatch_sidebar_panel_key` unconditionally for every
+  route). Fixed by adding the missing arm, reusing the same shared
+  function GTK already calls — no new per-backend logic.
+
+New driver-tier coverage added: `tui_main::shell_app::tests::
+board_open_issue_paints_document_buffer_tab_via_shell_app` (a real `Enter`
+keypress through `TuiDriver`, asserting the seeded title paints) and
+`gtk::testing::sidebar_panel_clicks::board_double_click_opens_issue_as_a_
+document_buffer` (a real double-click through `GtkDriver`, same
+assertion) — both installing a `[document]` provider on the same mock
+manifest the existing `[board]` provider tests already use (#522: one
+manifest can declare both), so both backends' `OpenIssue` -> new-tab path
+is now exercised end-to-end through the real event-dispatch pipeline, not
+just at the engine level.
+
+Also addressed from review (non-blocking): (1) the create-path
+`ToolClient::run_with_stdin` now returns the provider's stdout (was
+discarded) and `push_tool_document` opportunistically parses a
+provider-echoed `{"id": "..."}` back out of it — `save_tool_document_
+buffer` binds the buffer to that id on a successful create, so a *second*
+`:w` on the same still-open buffer updates the now-existing document
+instead of silently re-running "create" with an empty id again; (2)
+`open_tool_document_buffer` now switches to an already-open buffer/tab for
+the same document id instead of always opening a new one (mirrors
+`open_keymaps_editor`'s precedent), closing the "two buffers racing to
+`:w` the same id" risk; (3) a doc comment now flags `parse_tool_document_
+buffer`'s `<!--`-prefix detection as unambiguous only for buffers this
+module itself produced; (4) `save_tool_document_buffer`'s doc now flags
+the blocking-write tradeoff forward for a real (non-mock, network-backed)
+provider.
+
+`cargo build`/`clippy -D warnings`/`fmt` clean on both feature lanes (GUI
+build compiles `src/gtk/` too, exercising the new `GtkDriver` test). Out
+of scope (per the issue): the coordinator extension bundle itself
+(`:CoordRefine`/`:CoordReview` command names, `coord` argv, the
+`status:refining -> ready` semantics) and #523's provider-dispatch board
+actions.
+
+**Last updated:** September 24, 2026 (#955, ACP-4 — tool-call rendering
+plus a source-agnostic change-review surface, on top of ACP-1's #952
+transport; shares its review surface with the future #525 git-branch-diff
+slice, whichever lands second consumes it). `src/core/acp.rs` gained
+`AcpToolCall`/`AcpToolCallStatus`/`AcpToolCallContentBlock` plus
+`parse_tool_call`/`parse_tool_call_update`/`tool_call_summary_line` —
+`tool_call` is a full announcement, `tool_call_update` is a *patch*
+(status replaces, `content` **appends**, never replaces) keyed by
+`toolCallId`. New `Engine::acp_tool_calls: Vec<AcpToolCall>`
+(`src/core/engine/acp_ops.rs`'s `acp_upsert_tool_call`/
+`acp_apply_tool_call_update`) is upserted by id, not append-only, and
+renders as one collapsed one-line summary turn per call (status glyph +
+kind + title, `render::populate_ai_chat_controller`) appended after the
+real conversation — same "synthetic turn" treatment #956 gave the plan
+checklist. New module `src/core/review.rs` (deliberately free of any
+`Engine`/buffer/backend knowledge): `ProposedChange{path, old_text,
+new_text}` is the source-agnostic unit both this slice and #525 build
+from; `ChangeReviewState`/`ChangeReviewEntry` wrap a real
+`quadraui::DiffView` per file (built via `quadraui::compute_hunks`, with a
+hand-rolled `pure_addition_hunks` for `old_text: None` — `"".split('\n')`
+yields one line, not zero, so routing a new file through `compute_hunks`
+directly can wrongly mark a trailing blank line `Same` instead of every
+row being a clean `Added`) plus hunk/file navigation and accept/reject.
+`src/core/engine/review_ops.rs` bridges it to the engine: `Engine::
+open_change_review`/`change_review_diff_rect` (paint-to-hit-test contract,
+same as `command_line_rect`), `handle_change_review_key` (Esc/q close,
+j/k/Down/Up scroll, `]`/`[` hunk nav, n/p/Tab file nav, a/r accept/reject,
+Return jumps to the current row's file+line), and `change_review_accept_
+current` reuses `Engine::acp_write_text_file` (#954) rather than
+duplicating the buffer-write path. New `FrameOp::ChangeReview` rung
+(`render::paint_change_review_rung`, shared verbatim by both backends) —
+painted as a full-viewport modal, so `render::route_modal_key` now also
+routes to `Engine::handle_key` whenever `change_review.is_some()` (without
+this, the AI panel's own focus route sends keys straight to
+`route_ai_chat_event`, bypassing `Engine::handle_key` entirely — exactly
+when a tool-call diff would arrive). Mouse click-to-jump
+(`render::route_change_review_click`, `ChangeReviewClickRoute`) resolves a
+click against the painted `DiffView`'s own row geometry and is wired on
+both backends the same way `route_folder_picker_click` is — checked before
+`route_modal_overlay_click`'s ladder, not folded into it, since this
+surface swallows every click while open. Extended the shared `tests/
+fixtures/fake_acp_agent.sh`: `$ACP_FAKE_TOOL_CALL_STATUS_ONLY` (status
+transitions with no diff, so the transcript stays visible to assert
+against) and `$ACP_FAKE_TOOL_CALL` (+ `$ACP_FAKE_TOOL_CALL_PATH`, the diff
+scenario that opens the review surface and exercises accept-writes-to-disk).
+Black-box coverage: three TUI `TuiDriver` tests and three GTK `GtkDriver`
+tests (status-transition, diff-review-plus-accept, and — review fix,
+same day — a real-mouse click-to-jump test per backend), each
+RED-verified against its specific regression before being confirmed
+GREEN — plus unit tests for every new parser in `core::acp`, the full
+`core::review` module (including the acceptance bar's own explicit
+non-ACP-feed test and the `oldText: null` pure-addition test), and
+`core::engine::review_ops`. Known gap, stated rather than silently
+shipped: `locations[{path, line}]` in the *transcript* (as opposed to the
+change-review surface, which does support click-to-jump) has no
+click-to-jump — `quadraui::ChatTurn`/`StyledText` carry no clickable-span
+concept yet, which is a quadraui infra gap, not a vimcode backend one; the
+keyboard path (`Return` in the review surface) exercises the same
+resolution function so the gap is "no mouse entry point yet" for that
+specific spot, not "unbuilt or untested". `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; full `cargo test --lib`
+(3675 tests, both backends compiled in) and `--no-default-features --lib`
+(3435 tests) both green.
+
+**Review fix (same day):** the driver-tier click test the review
+demanded caught a real bug the keyboard-only unit test couldn't —
+clicking a diff row landing where chrome (menu bar/CSD title bar,
+activity bar, sidebar) sits underneath the full-viewport overlay was
+silently swallowed *before* `route_and_apply_change_review_click`/
+`mouse::handle_mouse`'s change-review branch ever saw it: three separate
+chrome intercepts (quadraui's `ShellAdapter::handle` activity-bar/sidebar
+hit-test, `App::handle_dispatch`'s always-on GTK menu-bar intercept, and
+its CSD-titlebar drag-to-move check) all hit-test purely on screen
+position with no notion that an open overlay was painted on top. Fixed
+with new `render::reconcile_change_review_modal_stack` (paint-time, not
+click-time — pushes/pops the surface's full-viewport bounds on
+`quadraui::ModalStack` every frame, since the surface can open from an
+async ACP event with no correlated mouse motion to piggyback a
+handle-time reconcile on, unlike the editor-hover popup) plus three
+narrow `change_review.is_some()` guards in GTK's `App::handle_dispatch`/
+`try_route_sidebar_mouse_event`. Also: `change_review_jump_to_hit` now
+closes the surface on a successful jump (mirroring `Return`'s explicit
+close — a click that didn't close it just painted the diff right back
+over the buffer it switched to), and `ChangeReviewState::extend` skips a
+byte-identical duplicate `ProposedChange` (guards a replaying/buggy agent
+re-announcing the same `toolCallId`+diff from appending a second entry).
+
+**Review fix round 2 (same day):** the modal-stack reconcile above was
+initially popped from an `else` arm inside the frame walk's
+`FrameOp::ChangeReview` match — **dead code**, since
+`FramePresence::change_review` is the exact gate `render::compose_frame`
+uses to drop that rung from the op list the moment the surface closes, so
+the arm can never run on the frame that needs the pop. The full-viewport
+entry therefore stayed registered forever, and since `ShellAdapter::
+handle` hit-tests `ModalStack` *before* any chrome dispatch, every mouse
+event for the rest of the session was routed past `AppShell`'s own
+handling (activity-bar panel switching, sidebar/bottom-panel resize) —
+session-bricking, and invisible to the click-to-jump tests, which never
+click chrome afterwards. Same shape as #1117's `explorer_tree_rect` bug
+and the warning `render.rs` carries above `compose_frame`. Fixed by
+calling `reconcile_change_review_modal_stack(backend, presence.
+change_review, viewport)` **unconditionally, once, before the walk** on
+both backends (the `reconcile_editor_hover_modal` shape), leaving the
+rung's arm paint-only; `paint_change_review_rung` also pops rather than
+pushes when the state is open-but-entry-less, so it never registers a
+surface nothing painted. Covered by a new RED-verified driver test per
+backend (`change_review_close_restores_chrome_clicks_via_shell_app` /
+`…_via_gtk_driver`): open the surface from a plain non-ACP
+`ChangeReviewState::new(vec![ProposedChange{..}])`, close it via the real
+click-to-jump, then click the activity bar's Search icon and assert the
+Search panel actually opens. Also folds in the round's non-blocking note:
+the reconcile now calls `ModalStack::mark_painted` on the open path,
+since no quadraui rasteriser marks this surface (upstream wires
+`mark_painted` only for `draw_palette`/`draw_menu`/`draw_dialog`, and
+this surface is a `DiffView` + `StatusBar`), which was making a correctly
+painted overlay show up in `unpainted_ids()` and emit the #455
+"registered but invisible" diagnostic every frame it was open.
+
+Prior update: September 24, 2026 (#956, ACP-5 —
+plan, slash commands,
+modes and usage from the `session/update` stream, on top of ACP-1's #952
+transport; independent of ACP-3/ACP-4). `src/core/acp.rs` gained pure
+parsers for the four remaining `session/update` variants this track cared
+about: `parse_plan_update` (`AcpPlanEntry`/`AcpPlanEntryStatus`,
+`plan_to_checklist_text`), `parse_available_commands_update`
+(`AcpAvailableCommand`), `parse_session_modes`/`parse_current_mode_update`
+(`AcpSessionMode`), and `parse_usage_update`/`format_usage_summary`
+(`AcpUsage`, deliberately tolerant of a couple of plausible field-naming
+variants since usage telemetry is the least-stable corner of the v1
+schema). `AcpClient::set_mode` sends `session/set_mode`. New `Engine`
+fields (`acp_plan`, `acp_available_commands`, `acp_command_completion_idx`,
+`acp_modes`, `acp_current_mode_id`, `acp_usage`), all session-scoped
+(cleared on `ai_clear`/`AgentExited`, matching `acp_remembered_decisions`).
+`Engine::acp_handle_session_update` (`src/core/engine/acp_ops.rs`) now
+dispatches every recognized `session/update` kind; **`plan` is a full
+overwrite (`self.acp_plan = entries`), never `.extend`** — the #956
+acceptance bar ("two successive `plan` updates leave exactly one plan
+rendered") is a regression a worker could reintroduce by "fixing" this into
+an accumulator, so it's called out explicitly at every layer (doc comments,
+a dedicated `parse_plan_update` unit test, and a RED-verified TUI black-box
+test). `render::populate_ai_chat_controller` renders the current plan as
+one synthetic checklist turn appended after the real conversation (never
+mixed into `ai_messages`) and folds mode + usage into the existing AI-panel
+status header (no new widget, so #956's "no layout churn, no focus steal"
+criterion holds by construction). Slash commands surface as completions via
+`Engine::ai_command_completions`, reusing `render::CompletionMenu` /
+`quadraui::Completions` — the *same* machinery the editor's own word-
+completion popup uses, fed differently, per the issue's explicit steer away
+from a bespoke widget; `render::route_ai_chat_event` intercepts Tab (cycle)
+and Enter (accept) ahead of `ChatController::handle` when the popup is
+showing, and `render::paint_ai_command_completions` paints it anchored to
+the bottom of the panel's own rect (no exact input-box geometry needed —
+`Completions::layout`'s own "flip above on overflow" placement logic does
+that). Accepting a completion is nothing more than filling the input with
+`"/name "`; submitting it is `ai_send_message`'s existing plain-text path,
+unchanged — there is no separate slash-command RPC per the ACP v1 spec.
+New ex command `:AiMode [target]` (`src/core/engine/execute.rs`): no
+argument shows the agent's declared modes and which is current
+(`Engine::acp_mode_status_line`); an argument sends `session/set_mode`
+(`Engine::acp_set_mode`) matched by mode id or name — the displayed mode
+changes only once the agent's own `current_mode_update` notification lands,
+never optimistically on the request succeeding, which is the round-trip
+#956 asks for. `config_option_update`/`session/set_config_option` were
+explicitly left out of this slice per the issue's own "lower value...
+otherwise split it out" guidance — no follow-up issue filed yet. Extended
+the shared `tests/fixtures/fake_acp_agent.sh` (owned by the whole ACP
+track): `$ACP_FAKE_SESSION_MODES` adds a `modes` field to the `session/new`
+result; `$ACP_FAKE_PLAN` scripts two successive `plan` updates (the second
+a full replacement of the first) plus an `available_commands_update` and a
+`usage_update` in one `session/prompt` turn; a new top-level
+`session/set_mode` case replies empty and then emits a `current_mode_update`
+notification carrying back the requested mode id. Black-box coverage: two
+new TUI `TuiDriver` tests (`ai_panel_plan_update_fully_replaces_not_
+accumulates_via_shell_app`, `ai_panel_slash_command_completions_via_
+shell_app`) and one new GTK `GtkDriver` test
+(`ai_panel_mode_switch_round_trips_via_session_set_mode`), each RED-verified
+against its specific regression (the plan test against reverting to
+`.extend`; the slash-completion test against disabling the Tab/Enter
+intercept *and separately* against disabling the popup's paint call; the
+mode test against deleting the `current_mode_update` dispatch arm) before
+being confirmed GREEN — plus pure unit tests for every new parser in
+`core::acp` and two engine-level tests for `:AiMode`'s no-argument listing
+and its no-session rejection message. `cargo build`/`clippy -D warnings`/
+`fmt` clean on both feature lanes; targeted `cargo test` runs (acp/
+ai_panel/ai_mode/settings-snapshot, both lanes) all green.). Prior update:
+September 24, 2026 (#952, ACP-1 — hosted a live ACP session
+behind the existing AI panel, retiring `curl` as the *only* transport. The
+panel was already backend-neutral and already existed (`quadraui::
+ChatController`/`Engine::ai_chat`/`PANEL_AI`/`ai_send_message`/`poll_ai`/
+`dispatch_ai_chat_event`/`render::route_ai_chat_event`) — this slice was a
+transport swap plus a stream mapping, not new UI, exactly as the issue
+predicted. New setting `acp_agent_command` (`src/core/settings.rs`, parsed
+via `core::acp::parse_agent_command`): empty (default) keeps the original
+direct-provider `curl` transport (`crate::core::ai`, kept as a no-agent-
+binary escape hatch through ACP-7 per the issue's own recommendation);
+non-empty spawns that command as a live ACP agent. `Engine::ai_send_message`
+(`src/core/engine/ext_panel.rs`) now forks into `ai_send_message_via_curl`/
+`ai_send_message_via_acp`. `Engine::poll_acp` (`src/core/engine/acp_ops.rs`)
+now drives the whole session lifecycle — `initialize` -> `session/new` ->
+`session/prompt` — and maps `session/update` chunks onto `ai_messages`:
+`agent_message_chunk`/`agent_thought_chunk`/`user_message_chunk` merge
+consecutive same-kind chunks into one streamed turn rather than one turn per
+chunk. Thought chunks render under a new AiMessage role
+(`"assistant-thought"`) that `render::populate_ai_chat_controller` maps to
+`quadraui::ChatRole::System` — a different role-header label ("System" vs
+"AI") and colour, which is what makes them visually distinct from message
+chunks per the issue's acceptance criterion, with zero quadraui changes
+needed (the existing `ChatRole::System` styling already does this).
+`tool_call`/`tool_call_update`/`plan` updates and agent->client requests
+(`fs/*`, `session/request_permission`) are left unhandled — parked/ignored
+without breaking the stream — per the issue's scope (ACP-2 fs bridge,
+ACP-4/5 tool-call+plan rendering are later slices). Agent-binary-missing is
+a clear message pushed into the transcript itself (not just the status
+line), verified RED/GREEN. Extended the shared `tests/fixtures/
+fake_acp_agent.sh` (owned by the whole ACP track) to emit the real ACP v1
+`session/update` wire shape (`sessionUpdate` tag + `content.text`, replacing
+ACP-0's placeholder `kind`/`text` shape that nothing had read the values of
+yet) and added `$ACP_FAKE_NO_TOOL_REQUEST` so streaming-focused tests don't
+need the fs/* bridge. Caught and fixed a real bug while writing the first
+black-box test: `AcpEvent::SessionUpdate.update` is the *whole* notification
+`params` object (`{"sessionId":..., "update": {...}}`), not the inner
+tagged-union payload — `Engine::poll_acp` was reading `sessionUpdate`/
+`content.text` off the wrong JSON level, so every chunk silently vanished
+while the turn still completed normally (the "looks done, panel just never
+grew" failure shape). Black-box coverage: TUI (`TuiDriver`, `src/tui_main/
+shell_app.rs`) and GTK (`GtkDriver`, `src/gtk/testing.rs`) tests drive a
+real submit through a pre-spawned fixture agent and assert on rendered
+screen text (`"Hello world"` merged from two chunks, `"pondering the
+question"` thought text, and the `"System"` role label), both independently
+verified RED against the bug above before the fix and GREEN after; a third
+TUI test covers the missing-agent-binary message. `cargo build`/`clippy -D
+warnings`/`fmt` clean on both feature lanes; targeted `cargo test` runs
+(acp/acp_ops/ai_panel/settings round-trip, both lanes) all green.). Prior
+update: September 20, 2026 (#1102 — deleted GTK's `gdk_pixbuf`
+app-icon pre-rasteriser now that quadraui#1014's `draw_image` decode cache is
+already on the pinned rev (`d907a06`, an ancestor of the current pin
+`0dc8381`). `src/gtk/util.rs`: removed `app_icon_image`/`cached_app_icon_png`/
+`rasterise_app_icon_png`/`APP_ICON_RASTER_PX` — the once-per-run PNG
+pre-rasterisation that dodged librsvg re-decoding the 1024² SVG every repaint
+(+16.5 ms/frame) is now redundant, since `GtkBackend::draw_image` caches the
+decoded/scaled `Pixbuf` itself. `src/app.rs`'s `app_icon_image_for_paint` no
+longer forks on `#[cfg(feature = "gui")]` — every backend now hands
+`crate::render::app_icon_image()` (the raw SVG) straight to
+`Backend::draw_image` unchanged. Kept (out of scope for #1102, and the reason
+`src/gtk/util.rs` still names `gdk_pixbuf`): `install_icon_and_desktop_at`'s
+own, unrelated `gdk_pixbuf` use to render the on-disk XDG hicolor-theme PNG
+icons (a completely different feature — files an external WM/compositor
+reads, not anything `Backend::draw_image` touches) and a small
+`#[cfg(test)]` `host_has_svg_loader()` probe that replaced
+`cached_app_icon_png` as the "does this host have an SVG loader" skip-gate
+for three installer tests and the #720 GTK pixel probe
+(`app_icon_paints_left_of_the_file_menu` in `src/gtk/testing.rs`), which
+still passes and still asserts on **pixels**, not state. Deleted the now-
+inverted `painted_app_icon_is_the_rasterised_png_not_the_raw_svg` unit test,
+whose entire premise (raw SVG must never reach `draw_image`) is exactly what
+#1102 now does on purpose. macOS still does not decode SVG at all (that's
+quadraui#1014's explicitly-deferred follow-up, not part of this pin) — so
+macOS still paints no app icon, unchanged from before #1102; only the GTK
+code path and its toolkit-typed workaround were in scope here. No dedicated
+automated "paint-cost" timing guard exists elsewhere in the suite to re-check
+— the one mentioned as a guard in the issue text was the just-deleted test
+itself. `cargo build`/`clippy -D warnings`/`fmt` all clean, both feature
+lanes; `gtk::util`, `gtk::testing::app_icon` and `render::tests` (app-icon
+subset) test modules green.). Prior update: September 19, 2026 (#1155 — built the location list: a
+per-window twin of the global quickfix list, plus the rest of the quickfix
+family. Refactored the 4 flat `quickfix_items`/`quickfix_selected`/
+`quickfix_open`/`quickfix_has_focus` engine fields into one
+`QuickfixList { items, selected, open, has_focus }` struct
+(`src/core/project_search.rs`) so `Engine.quickfix: QuickfixList` (global) and
+`Engine.location_lists: HashMap<WindowId, QuickfixList>` (per-window) share
+one implementation: `src/core/engine/picker.rs`'s `qf_*` methods all take
+`win: Option<WindowId>` (`None` = quickfix, `Some(id)` = that window's list)
+rather than existing as two parallel code paths. New ex commands: `:cwindow`,
+`:clist`, `:colder`/`:cnewer` (10-deep stack, `quickfix_stack` +
+`quickfix_stack_pos`, truncate-on-branch like an undo tree), `:cdo`/`:cfdo`
+(run a command per-entry or per-distinct-file), and the entire `:l*` family
+(`:lopen`/`:lclose`/`:lwindow`/`:lnext`/`:lprevious`/`:lfirst`/`:llast`/`:ll`/
+`:llist`/`:ldo`/`:lfdo`/`:lgrep`/`:lvimgrep`). `:cfirst`/`:clast` already
+existed (#1154) but were never added to `VIM_COMPATIBILITY.md` — fixed
+alongside. CTRL-W window-close (`close_window`/`close_other_windows`/
+`remove_tab_raw` in `src/core/engine/windows.rs`) now drops the closed
+window's location list, same spot `prune_jump_list_windows` already runs.
+Rendering: added `Engine::open_file_in_window` (replace a *specific*
+window's buffer in place, no new tab) because location-list jumps must stay
+in the window that owns the list — reusing quickfix's `open_file_in_tab`
+(new tab per entry) made `self.active_window_id()` drift across a sequence
+of `:lnext` calls, caught by a failing test before it shipped. The location
+list shares the quickfix panel's one bottom "list rung" rather than adding a
+second one (`render::QuickfixPanel` gained a `title` field, `"QUICKFIX"` or
+`"LOCATION LIST"`, quickfix winning when both are open) — deliberately not
+touching `BOTTOM_Z_ORDER`'s fixed 5-slot band stack, which exists because
+upstream quadraui has no generic multi-drawer support yet. Coverage: 20 new
+engine unit tests plus 3 new `TuiDriver` tests in `src/tui_main/shell_app.rs`
+(`render_content_paints_location_list_panel_via_shell_app`,
+`quickfix_panel_takes_priority_over_location_list_via_shell_app`, both
+RED-verified against a temporarily-reverted population site) proving the
+location-list panel actually paints — not just that `engine.location_lists`
+got populated. `VIM_COMPATIBILITY.md`: moved 16 `❌` ids to `✅`, added 5 more
+brand-new `✅` ids with no prior row, added a new `❌` row for `:lolder`/
+`:lnewer` (per-window `:colder`/`:cnewer` — genuinely out of scope here, no
+row ever claimed it). `tests/nvim_conformance.rs`'s coverage ratchet: gave
+every new id a `COMMAND_PROBES` entry and, since no oracle case exercises any
+of them yet, a matching `COVERAGE_EXEMPT` entry — same measured-gap pattern
+the "Core Vim ex commands 84/111 uncovered" comment already documents for
+this section. `cargo build`/`clippy -D warnings`/`fmt` all clean, both
+feature lanes.). Prior update: September 18, 2026 (#234 — investigated "TUI menu-bar dropdown: mouse hover doesn't change active menu or highlight entries"; could not reproduce against current `develop`. The suspected gap named in the issue — a per-backend TUI mouse-motion handler that never calls something like `engine.set_menu_selected` for the menu-bar dropdown specifically — doesn't exist as described: TUI's menu bar goes through `TuiShellApp::handle`'s `MenuSystem` intercept (`menu_bar_visible || menu_system.borrow().is_open()`), which forwards the raw `UiEvent` (including a bare `MouseMoved`, no button held) straight to quadraui's `MenuSystem::handle`. That function's own `UiEvent::MouseMoved` arm (`compose/menu_system.rs`) already switches the open top-level menu on hover and moves the dropdown's `dropdown_selected` to whichever item the pointer is over, unconditionally — there is no TUI-specific hover code to be missing. Confirmed empirically with two new `TuiDriver` tests in `src/tui_main/shell_app.rs`, `menu_bar_hover_switches_menu_and_highlight_234` (Alt-letter open) and `menu_bar_click_then_hover_switches_and_highlights_234` (mouse-click open, sidebar visible, non-trivial column offsets) — both assert on rendered output (dropdown text appearing/disappearing, `style_at` swapping which row carries the selected-row colours) and pass on unmodified `develop`. RED-verified: temporarily gating the `MenuSystem` intercept off (`if false && (...)`) in `TuiShellApp::handle` turns both red — the dropdown doesn't even open, let alone track hover — restored before committing. Also checked and ruled out the raw-terminal layer: crossterm 0.29's `EnableMouseCapture` sends `?1000h?1002h?1003h` unconditionally, so any-motion hover reports (no button held) are already enabled regardless of vimcode's own code. **Keep #234 open** — a `TuiDriver`-passing test cannot exercise real SGR mouse input end-to-end (the quadraui#302 blind spot noted in this file's testing guidance), so this only proves the *application-logic* path is correct; a human should confirm against a live terminal before closing, and if it still reproduces there the next step is almost certainly a quadraui-side terminal/tracking-mode question, not a vimcode one (Platform-Neutrality Rule — no per-backend fix was written here because none was needed). No production code change — investigation + regression-guard coverage only.). Prior update: September 18, 2026 (#231 — investigated "TUI rename dialog: tree rows under the dialog show stale tinting after dialog closes"; could not reproduce against current `develop`. Root cause turned out moot: #231's own repro used the pre-#223 `Dialog`-based rename-input prompt, but rename today is inline `TreeController` row editing (`explorer_ops.rs`'s `TreeControllerEvent::EditConfirmed`) and never opens `engine.dialog` at all — `ExplorerRenameState`/`start_explorer_rename` is `#[allow(dead_code)] // used by win-gui backend` on this backend. Substituted a `Dialog` still live today (`Engine::show_quit_confirm`, which `paint_dialog_rung` centers over the full window viewport and does overlap the sidebar tree on an 80×24 screen) and added `explorer_tree_rows_repaint_clean_after_dialog_closes_231` in `src/tui_main/shell_app.rs`: opens the dialog before the driver's first frame, confirms via `style_at` that it painted over at least one seeded explorer row, closes it with Escape (`Engine::handle_dialog_key`'s "Escape" arm), and asserts the row's rendered style returns exactly to a dialog-free reference driver's baseline. Green — ratatui's `terminal.draw` resets its buffer and `quadraui`'s `AppLogic::render` repaints the whole frame every pass (`quadraui/src/tui/run.rs::paint_frame`), so no residue persists across the dialog's open/close transition for this scenario. **Keep #231 open** — this doesn't prove the pre-#223 Dialog-based rename-prompt scenario the issue screenshot shows never had the bug, only that the mechanism it no longer exists in isn't reproducible via the paths that replaced it; a human should confirm against the actual current TUI (inline rename edit, `r` key on an explorer row) before closing. No production code change — investigation + regression-guard coverage only.). Prior update: September 18, 2026 (#499 — confirmed already fixed: #1086's row-derivation fix, already on `develop`, was the single root cause behind both #484 and #499's "only the top section header toggles" report — its commit message names #499 explicitly. Added `tui_ext_panel_click_toggles_the_log_and_stash_headers_499`, a 3-section (Branches/Log/Stash) black-box regression test in `src/tui_main/shell_app.rs` pinning #499's exact repro directly, since #1086's own coverage only exercised 2 sections. RED-verified by temporarily reverting the `mouse.rs` click arm to the pre-#1086 `sidebar_row - content_start` formula — both Log and Stash failed to toggle, reproducing the report; restored before committing. No production code change — the fix already shipped under #1086.). Prior update: September 18, 2026 (#58 — investigated the "intermittent stale TUI characters" issue and found its Session-244 mitigation, `Terminal::clear()` on resize/popup-dismiss, no longer exists: #634 moved TUI onto `quadraui::tui::run_with_shell`, which owns the `Terminal` internally and calls `clear()` once at startup only, with no `Reaction`/`Backend` hook an app can use to ask for it again. `render::is_force_redraw_key` (Ctrl+L) and `TuiShellApp::had_popup_overlay` already document this as a dead-in-practice gap in code comments; drafted the quadraui-side ask in `docs/PENDING_QUADRAUI_ISSUES.md` rather than adding per-backend code, per the Platform-Neutrality Rule — no fix is possible from `src/tui_main/` alone. **Keep #58 open** until that quadraui issue is filed. No code change this session (investigation + docs only).). Prior update: September 18, 2026 (#934 — the three GTK pixel probes documented as Darwin-known-red since #926/#933/#970 are now robust to Core Text's rasterisation instead of skipped: `painted_divider_x` tolerance-matches colour, the minimap ink probe samples 3 rows instead of 1, and the window-control contrast floor drops 40.0→25.0. Verified green on Linux at this SHA — all 5 prior + 2 sibling driver tests pass — settling the "is this fleet-wide" question the #3298 config comment left open: **it is not**, confirming Darwin-rasteriser-artifact, not ordinary bug. RED-verified all three against reintroduced real regressions on Linux; could not verify on an actual Darwin host from this session (WSL2/Linux only) — flagged for macmini confirmation before the operator drops `coordinator.yml`'s `uname` guard). Prior revisions: September 17 (#1066 — product decision: TUI's editor wheel now scrolls the hovered pane, converged onto GTK's `hovered_window_id` behaviour; `mouse.rs` rewired onto `render::find_window_at` + `Engine::scroll_viewport_with_cursor_for_window`, GOALS.md item 14 closed), September 16 (#1031 — `:s///c` confirm loop built, #801 Phase 2 / #986 fix: `Engine::confirm_sub` + `handle_confirm_sub_key` in `execute.rs`), September 14 (#951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle, foundation of the ACP track, epic #531), September 14 (#522 — Track A foundation: generic external-tool JSON seam, `src/core/tool_client.rs`, no coordinator vocabulary in core), September 14 (#970 — confirmed the two "failing GTK click-geometry tests" are the already-known/already-documented Darwin font-rasteriser divergence from #926/#933, not a new bug; no code change), September 14 (#950 review fix round — driver-tier pixel test added for the SEARCH_COD→SEARCH glyph change, self-contradictory pure-refactor claim corrected), September 14 (#950 — ShellApp convergence decomposition + cheap wins), September 14 (#949 review fix round — driver-tier test added, macOS/Win-GUI claim corrected), September 14 (#949 — GTK-only settings-reload watcher deleted), September 11 (macOS native-menu audit — #901/#902 filed, milestone #7 reopened), September 10 (#862 — `src/app.rs` no longer needs the `gui` feature to compile), September 5 (#827 correction pass), September 4 (#801), September 3 (platform-neutrality chain drained). Milestone #7 is **15 open** (re-counted 2026-09-19 by #1168; #901, #902 and #1044 are all closed, and the remaining work is almost entirely `src/tui_main/`, tracked by epic #1169 — the GUI side is down to #1100/#1102/#1104, all consume-side against already-pinned quadraui APIs). **#47 is open, in milestone #5, now scoped to Stage 2** (`src/macos/mod.rs` wrapper + the `macos` feature); Stage 1's extraction is merged. See `GOALS.md` for the full correction history.
+
+## #234 — could not reproduce; regression-guard coverage added, kept open
+
+#234 reported that in TUI, hovering the mouse over the menu bar does nothing:
+moving over a different top-level label ("File" → "Edit") doesn't switch the
+open dropdown, and moving over an entry inside an open dropdown doesn't move
+the highlight. The issue's own theory was a TUI-specific gap in
+`src/tui_main/mouse.rs` — some mouse-motion handler that updates
+`ContextMenu.selected_idx` for other context menus (explorer right-click, tab
+action menu) but was never wired up the same way for the menu bar.
+
+That gap doesn't exist. TUI's menu bar is not routed through
+`mouse.rs`/`ContextMenu` at all — it's a separate quadraui primitive,
+`quadraui::MenuSystem`, owned by `Engine::menu_system` and driven from
+`TuiShellApp::handle`'s `MenuSystem` intercept (`shell_app.rs`, gated on
+`menu_bar_visible || menu_system.borrow().is_open()`). That intercept hands
+the *raw* `UiEvent` — including a bare `MouseMoved` with no button held —
+straight to `quadraui::MenuSystem::handle`, and that function's own
+`UiEvent::MouseMoved` arm (`quadraui/src/compose/menu_system.rs`) already:
+
+1. Hit-tests the menu-bar labels and, if the pointer is over a different
+   enabled top-level item than the one currently open, closes the old
+   dropdown and opens the new one — the "switch active menu" behaviour.
+2. Walks the open dropdown's (and any open submenu's) visible items and, on
+   a match, updates `dropdown_selected` (or the matching `submenu_selected`
+   entry) to that item — the "highlight moves" behaviour.
+
+Both are unconditional — no button-held gate, no TUI/GTK split — so there is
+no per-backend hover code for TUI to be missing, and per the
+Platform-Neutrality Rule there is nothing to build in `src/tui_main/` for
+this: the shared infrastructure already exists and TUI already calls it.
+
+Confirmed empirically rather than by code-reading alone, with two new
+`TuiDriver` tests added to `src/tui_main/shell_app.rs`:
+
+- `menu_bar_hover_switches_menu_and_highlight_234` — opens File via the
+  Alt+F shim, hovers "Edit" (asserts the screen now shows "Undo" and no
+  longer shows "New Tab"), then hovers "Redo" inside the now-open Edit
+  dropdown and asserts via `style_at` that the selected-row style moved from
+  "Undo"'s row onto "Redo"'s.
+- `menu_bar_click_then_hover_switches_and_highlights_234` — the same two
+  assertions through the actual user-facing path: a real mouse click on
+  "File" (not the Alt-letter shim) with the explorer sidebar visible, so
+  every hit-test below reads non-trivial activity-bar/sidebar column
+  offsets instead of the degenerate zero-offset case the first test uses.
+
+Both pass against unmodified `develop`. **RED-verified**: temporarily
+changing the `MenuSystem` intercept's guard in `TuiShellApp::handle` to
+`if false && (...)` — so the event never reaches `MenuSystem::handle` at
+all — turns both tests red (the dropdown doesn't even open in response to
+the opening click/Alt-letter, let alone track hover); reverted before
+committing.
+
+Also checked and ruled out the raw-terminal layer, since the issue's
+symptom could in principle be "hover events never arrive from the terminal
+at all": crossterm 0.29's `EnableMouseCapture` command writes `CSI ?1000h`,
+`?1002h`, **and** `?1003h` (any-motion tracking) unconditionally
+(`crossterm-0.29.0/src/event.rs`), so bare pointer movement with no button
+held is already requested from the terminal regardless of anything in this
+repo.
+
+**Keep #234 open, not closed** — a `TuiDriver` test dispatches synthetic
+`UiEvent`s directly into the same `App::handle` a real terminal's crossterm
+event eventually reaches, but it cannot exercise the actual SGR-mouse
+byte-parsing / terminal-emulator-compatibility path in between (the
+quadraui#302 blind spot this repo's own testing guidance calls out — "raw
+mode, SGR mouse ... that TuiDriver cannot reach"). This investigation only
+proves the *application-logic* half of the pipeline is already correct. A
+human should confirm against a live terminal before closing; if the symptom
+still reproduces there, the next step is almost certainly a
+terminal-compatibility or quadraui-tracking-mode question, not a vimcode
+one — no vimcode code change was needed or made here (investigation +
+regression-guard coverage only).
+
+## #231 — could not reproduce; regression-guard coverage added, kept open
+
+#231 reported that after opening + closing the TUI rename dialog over the file
+explorer, rows under where the dialog was painted retained a faint grey tint
+distinct from both the normal row bg and the selected-row bg — pointing at
+either `quadraui::tui::dialog::draw_dialog` spilling outside `layout.bounds`
+or `quadraui::tui::tree::draw_tree` skipping a full per-row repaint.
+
+**Investigation found the named repro path no longer exists.** At the time
+#231 was filed (Session 332, the #223 Dialog-primitive pilot), TUI file
+rename used a `quadraui::Dialog` with a text input (the "rename-input
+prompt" the pilot's session log names alongside quit-confirm/close-tab-
+confirm). Since then, rename moved to inline `TreeController` row editing —
+`src/core/engine/explorer_ops.rs`'s `dispatch_explorer_key` routes to
+`explorer_tree.borrow().is_editing()` and `TreeControllerEvent::EditConfirmed`
+calls `handle_explorer_edit_confirmed`, never touching `engine.dialog`. The
+old path, `ExplorerRenameState`/`Engine::start_explorer_rename`, is still in
+the tree but `#[allow(dead_code)] // used by win-gui backend` — dead on this
+backend today.
+
+To still exercise the paint mechanism the issue is actually worried about
+(does *any* `Dialog` leave residue on the tree after closing), this session
+substituted `Engine::show_quit_confirm` — a `Dialog` still live today, and
+one `paint_dialog_rung` centers over the *window* viewport (not just the
+content area), so it does overlap the sidebar tree on an 80×24 screen.
+
+Added `explorer_tree_rows_repaint_clean_after_dialog_closes_231` in
+`src/tui_main/shell_app.rs`: seeds an expanded explorer with 18 files,
+records each row's baseline rendered `style_at` on a dialog-free reference
+driver, opens the quit-confirm dialog on a *second* identically-seeded
+driver (before its first `render()`, since `TuiDriver` keeps its wrapped app
+crate-private post-construction), confirms via `style_at` that the dialog
+actually painted over at least one seeded row, closes it with Escape
+(`Engine::handle_dialog_key`'s `"Escape"` arm — proven to route through
+`handle_key_pressed`'s dialog-intercept tier by the existing
+`handle_key_pressed_dialog_intercepts_all_keys` test), and asserts the
+covered row's style is back to the reference driver's baseline exactly.
+
+**Result: green.** `quadraui::tui::run::paint_frame` calls
+`terminal.draw(|frame| { app.render(...) })` every frame — ratatui resets
+its internal `Buffer` before the closure runs, and `app.render` repaints the
+whole screen unconditionally (TUI has no partial/dirty-region redraw), so
+nothing from a previous frame's dialog paint can survive into a frame where
+the dialog is gone. No stale-tint residue reproduces for this scenario.
+
+**Keep #231 open, not closed** — a green test against a *substitute* dialog
+scenario doesn't retire the issue; it only shows the mechanism the bug would
+need doesn't reproduce via the paths that replaced the original repro. A
+human should confirm against the live TUI (`r` on an explorer row, or
+whatever key now triggers inline rename) that the *current* rename UI has no
+analogous artifact before this is closed. No production code change this
+session — investigation + regression-guard coverage only, same shape as
+#499 below.
+
+## #499 — already fixed by #1086; added issue-specific 3-section coverage
+
+#499 reported that after the #484 fix, single-click on ext-panel section headers
+toggled only the *top* section — `git_insights`'s Log and Stash headers stayed
+unresponsive. Investigation found this had already been root-caused and fixed by
+#1086 (`Fix #1086: TUI ext panel click routing lands one row low`, already an
+ancestor of both `develop` and this branch): the ext-panel click arm in
+`mouse.rs` derived its content-row from `sidebar_row - content_start`, a formula
+that never budgeted for `AppShellLayout`'s own one-row sidebar header above
+`sidebar_content_bounds` — every click landed exactly one row low, independent
+of which section was clicked. #1086's fix replaced that hand-rolled arithmetic
+with `render::SidebarBodyGeometry::content_row` against the exact rect
+`render_ext_panel` painted (`Engine::ext_panel_content_rect`), the same
+"paint and click share one geometry" pattern already used elsewhere. Its commit
+message explicitly names both #484 and #499 as the two symptoms of this one
+root cause.
+
+**This session's work:** confirmed the fix is present and green
+(`tui_ext_panel_click_on_a_section_header_toggles_it`, a 2-section
+Branches/Log fixture #1086 already shipped, passes). Since that coverage
+doesn't exercise a *third* section, added
+`tui_ext_panel_click_toggles_the_log_and_stash_headers_499` — a black-box
+`TuiDriver` test with the issue's exact repro shape (Branches/Log/Stash, one
+item each) that clicks both the middle (Log) and last (Stash) headers and
+asserts each collapses then re-expands. RED-verified by temporarily reverting
+the `mouse.rs` click arm to the pre-#1086 `sidebar_row - content_start`
+formula: the new test failed exactly as #499 described (Log's item stayed
+painted after the click — wrong row); reverted before committing.
+
+No production code change — this is coverage-only, closing out #499 against
+the fix #1086 already shipped.
+
+## #58 — blocked on an unfiled quadraui gap (drafted, not yet submitted)
+
+Issue #58 (intermittent stale TUI characters) said it was "mitigated in
+Session 244" by calling `ratatui::Terminal::clear()` on resize events and on
+popup-dismiss transitions from the legacy `src/tui_main/mod.rs` event loop —
+`clear()` resets ratatui's incremental-diff cache so the *next* frame
+unconditionally repaints every cell, working around cases where ratatui's
+diff misses cells because the physical terminal's real state has diverged
+from what its `Buffer` thinks it painted.
+
+**That mitigation is gone, not just dormant.** #634 (closed well before this
+session, part of the TUI → `ShellApp`/`run_with_shell` wave) deleted the
+legacy event loop and moved vimcode's TUI onto
+`quadraui::tui::shell_runner::run_with_shell`, which now owns the
+`ratatui::Terminal` internally. Read the pinned rev (`7a77602`,
+`quadraui/src/tui/run.rs`): `terminal.clear()` is called exactly once, at
+startup, and never again — the runner's `Reaction` enum
+(`quadraui/src/runner.rs`) has only `Continue`/`Redraw`/`RedrawAfter`/`Exit`,
+none of which maps to "clear before the next draw," and neither `Backend`
+nor `AppLogic` exposes a `request_full_repaint`-shaped method. vimcode's own
+code already flags this as a known-but-inert gap rather than silently
+regressing: `render::is_force_redraw_key`'s doc comment (Ctrl+L) and
+`TuiShellApp::render_content`'s `had_popup_overlay` comment
+(`src/tui_main/shell_app.rs`) both say so in as many words — Ctrl+L today
+only returns an ordinary `Reaction::Redraw`, which re-runs the very diff
+that missed the cells, so pressing it does not actually fix what a user
+hits it for; `had_popup_overlay` is computed and stored every frame but has
+had no reader since the call site it used to drive was deleted.
+
+**Per the Platform-Neutrality Rule, this is not fixable from
+`src/tui_main/` alone** — there is no host-facing hook in quadraui's TUI
+runner to force the underlying `Terminal::clear()` a second time, and
+adding one by reaching into `quadraui`'s internals (or reintroducing a
+vimcode-owned `Terminal`, duplicating the runner) would be exactly the kind
+of per-backend workaround the rule exists to prevent. The upstream gap is
+fully drafted, ready to file on `JDonaghy/quadraui`, in
+[`docs/PENDING_QUADRAUI_ISSUES.md`](docs/PENDING_QUADRAUI_ISSUES.md) —
+filing it needs `gh` access this worker session doesn't have. **Keep #58
+open until that issue is filed**, then until its fix lands and vimcode
+wires `is_force_redraw_key`/`had_popup_overlay` onto the new hook (per
+`GOALS.md`'s milestone-discipline rule); once filed, delete the drafted
+entry and link the real issue number here.
+
+No code change this session — investigation + two docs updates
+(`docs/PENDING_QUADRAUI_ISSUES.md`, this file). GTK is unaffected (Cairo
+repaints its `DrawingArea` in full every frame, confirmed against
+`gtk::backend`'s existing "full repaint after a skipped frame / modal
+closed / theme change" tests), so no GTK-side investigation was needed.
+
+## #1375 — `minimap_click_at_the_middle_scrolls_to_half_the_file` rewritten off pixel colour
+
+Follow-up to #934: #934's widened chroma tolerance (TOL=12, summed across 3 rows) was
+never actually verified on a Darwin host (its own PROJECT_STATE entry said so). #1375
+reports that a real `macmini` run at a post-#934 SHA still fails this exact test —
+confirming the tolerance-tuning approach had hit its limit, not that a slightly bigger
+number would have closed it.
+
+Root cause: the probe was asserting a property of the **rasteriser**, not of vimcode's
+behaviour. GTK's pangocairo backend composites glyph ink via Core Text on macOS and
+FreeType on Linux; Core Text's gamma-correct AA can blend a syntax-colored stroke's
+antialiased pixels arbitrarily far towards the background, past any single-pixel chroma
+threshold chosen without access to the real rasteriser to measure against. This is a
+test/fixture problem (docs/RELEASING.md §1.3b already documented the category), not a
+product bug — nothing in `apply_minimap_click`/`build_rendered_window` differs by
+platform.
+
+Fix: discovered (by probing `GtkDriver::painted_texts()` directly) that quadraui's one
+`show_layout` paint choke point records each editor line's **whole** Pango-layout text
+verbatim, regardless of the per-run colour attributes painted within it — so the exact
+buffer line on screen (`fn item_N() { let x = N; }`) is readable back with zero
+dependency on pixel colour or which rasteriser drew it. Rewrote the test's `before`/
+`after` probes to parse the lowest `fn item_N` line number out of `painted_texts()`
+instead of counting "colorful" pixels in a gutter-adjacent column band — same
+"assert on rendered output, not state" guarantee (CLAUDE.md), same RED-first
+verification (hardcoding `build_rendered_window`'s `scroll_top` to `0` still fails the
+new assertion, confirmed on Linux), but with no per-pixel AA tolerance left to tune.
+`src/render.rs`/`src/gtk/mod.rs` untouched — pure test-only change, `docs/RELEASING.md`
+§1.3b updated to drop this test from the known-red list (not yet re-measured on
+`macmini` — confirm there before trusting the doc over the fix's own reasoning).
+
+## #934 — the three Darwin-known-red GTK pixel probes fixed to tolerate Core Text, not routed around
+
+Follow-up to the claude-coordinator#3298 config unblock. The `uname` guard in
+`coordinator.yml`'s vimcode `test_command` exists only because of these three probes
+(`gtk::chrome_paint_tests::window_control_buttons_are_visible_against_their_background_in_every_theme`,
+`gtk::testing::minimap::minimap_click_at_the_middle_scrolls_to_half_the_file`,
+`gtk::testing::tests::window_split_divider_drag_repaints_the_line_at_the_new_position`)
+failing on Darwin's Quartz/Core Text pangocairo backend while green on Linux/freetype
+— documented since #926/#933/#970 but never actually fixed, only routed around. This
+issue is the fix.
+
+**Step 1 — settle the "is this fleet-wide" question, per the issue's own instruction:**
+ran all three at this session's SHA on a Linux (WSL2, headless, no DISPLAY) host — **all
+green**, alongside their two shared-layout/TUI twins (`render::tests::
+minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window` and
+`tui_main::shell_app::tests::minimap_click_at_the_middle_scrolls_to_the_middle_of_the_
+painted_window`, also green). Confirms the reported Darwin failures are rasteriser
+artifacts, not ordinary bugs — the fleet-wide-bug branch of the issue's decision tree
+does not apply.
+
+**Step 2 — fix each probe, not the behaviour it guards, per CLAUDE.md's "assert on
+rendered output" rule:**
+
+- `painted_divider_x` (`src/gtk/testing.rs`) now colour-matches within a TOL=10
+  per-channel tolerance (`colour_near`, mirroring `vscode_dimming::near`'s existing
+  idiom for the identical AA-rounding class) instead of `==`. The divider is a plain
+  filled line, not text, so its *geometry* can't shift with the font, but a 1px hairline
+  at a fractional x still gets antialiased across two columns, and Core Text's
+  compositing spreads that differently than freetype's — neither column may land on the
+  exact full-intensity byte value even though the line plainly painted.
+- The minimap ink sanity probe (`minimap_click_at_the_middle_scrolls_to_half_the_file`)
+  now sums colorful-pixel ink across the top **3** painted rows instead of 1, both
+  before and after the click. Every line in the fixture repeats the same token shape, so
+  this multiplies sampled ink without changing what's proven; the `frac`-tolerance keeps
+  `scroll_top` inside roughly (160,240) of 400 lines, so the widened "after" band tops
+  out around line 242 — comfortably inside the fixture's indented (100..300) range with
+  margin to spare.
+- The window-control contrast floor (`src/gtk/mod.rs`) drops from `40.0` to `25.0`. The
+  reported Darwin measurement was 36.1 (solarized-dark, minimize) — this is a single
+  data point, not a full Darwin run across every theme/button, so the new floor is a
+  reasoned floor-with-margin (≈5x above the #552 near-zero true-invisible-bug shape),
+  not a tuned-exact value.
+
+**RED-verified all three on Linux** by temporarily reintroducing the real bug each probe
+exists to catch (`apply_divider_drag` forced to `false`; `build_rendered_window`'s
+`scroll_top` hardcoded to `0`; `window_controls_status_bar`'s `fg` set equal to `bg`) —
+all three failed loudly with the expected message, confirming the widened tolerances
+did not weaken the checks. Reverted before committing; `git diff` touches only
+`src/gtk/testing.rs` and `src/gtk/mod.rs`.
+
+**Not verified on an actual Darwin host** — this session runs on WSL2/Linux, and no
+macOS machine was reachable. The fix is code-inspection-and-Linux-RED-verification
+based, not confirmed against the real Core Text failure. **Before the operator drops
+`coordinator.yml`'s `uname` guard per this issue's "follow-up once green" note, run
+`cargo test` on macmini and confirm all three (plus their #976 TUI-lane siblings, a
+separate and already-tracked issue) are actually green now.**
+
+## #1066 — TUI editor wheel scroll converges onto GTK's hovered-pane behaviour
+
+Wave 3 product decision from the #1044 audit (GOALS.md item 14): should TUI's editor wheel
+scroll the pane under the pointer, like GTK's `hovered_window_id` does, instead of always the
+focused pane? **Decided: converge.** Scroll-follows-pointer is standard in GUI editors, but the
+decisive argument was terminal-native precedent — real Vim's own mouse handling already scrolls
+the `:split` pane under the pointer independent of focus, which is what a "vim-like" editor
+should match, not GTK parity for its own sake.
+
+`mouse.rs`'s editor-viewport wheel-scroll fallback (the block a `#825` comment had explicitly
+flagged as the one place this diverged) now resolves the hovered window via `render::
+find_window_at` and routes through `Engine::scroll_viewport_with_cursor_for_window` when it
+differs from the active window — the exact shared primitives GTK's `handle_mouse_scroll_msg`
+(`app.rs`) already uses. No new per-backend code.
+
+Building the driver test surfaced a real, previously-latent `find_window_at` call-site bug:
+TUI window rects can land on a half-row boundary (an odd number of available rows splits
+unevenly, e.g. 37 → two 18.5-row panes), and querying the integer row itself — rather than the
+cell's *center* (`+ 0.5`) — lands just outside the pane that visually owns that row. Fixed by
+querying `col + 0.5, row + 0.5`, matching the cell-center convention `TuiDriver::find`/
+`find_bounds` already use.
+
+New black-box test: `wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app`
+(`src/tui_main/shell_app.rs`) — drives a real horizontal `:split` with two files through
+`driver_with_shell`, wheel-scrolls at the unfocused pane's own painted text, and asserts purely
+on the rendered screen (the driver hides the concrete `Engine` behind an opaque `AppLogic`, so
+there is no internal `scroll_top` to assert on even if the test wanted to). RED-verified by hand
+against the pre-fix `engine.scroll_viewport_with_cursor(dir, 3)`-only fallback.
+
+## #1031 — `:s///c` confirm loop built (#801 Phase 2, #986 fix)
+
+#986's v0.11.0 bug suite shipped only oracle-backed, `KNOWN_BUGS`-gated reproductions for the
+`:s///c` confirm flag — `execute.rs`'s `flags.contains('c')` check errored loudly
+("E-vimcode: the :s 'c' (confirm) flag is not implemented") rather than misbehaving, but the
+gate reported that expected-fail as a pass, so the feature shipped in v0.12.0 looking green
+while never having existed. #1031 is the fix, per `CLAUDE.md` Testing rules 3/4's requirement
+that a test-only issue get a follow-up before it may close.
+
+**`run_substitute` (`src/core/engine/execute.rs`)** now enters a real confirm loop instead of
+erroring: `collect_confirm_candidates` precomputes every match `:s///c` will offer (same
+global/same-line-dedup/multiline rules the non-confirm scan already used, just not applied
+yet) against the buffer text frozen at invocation time, then `Engine::confirm_sub` holds that
+list plus in-progress `out`/`copied`/`n_subs`/`done_lines` state between keystrokes.
+`handle_key` (`src/core/engine/keys.rs`) intercepts all keys at top priority while
+`confirm_sub` is `Some`, routing to `handle_confirm_sub_key`, which implements
+`y`/`n`/`a`/`q`/`l`/`<Esc>`/`<C-e>`/`<C-y>` per `:h :s_c`. The real buffer is spliced once, at
+the end of the loop — behaviorally identical to the non-confirm path's single splice, just
+gated per-candidate by the user's answer.
+
+**Verified against a live interactive Neovim** (`nvim --headless --listen` +
+`--remote-send`, v0.12.5 — the suite's usual `-es` batch-mode oracle silently short-circuits
+`:s///c` entirely, so this had to be checked by hand outside `cargo test`) for a handful of
+non-obvious rules the two gated scenarios alone didn't cover: the prompt's cursor sits at the
+pending match's *start*, not its line's first non-blank; `q`/`<Esc>` freeze the cursor there
+and print no report even if an earlier answer replaced something; `l` ("last") *does* re-land
+the cursor the way a natural completion would but still prints nothing; and any unrecognised
+key is silently ignored (re-prompts the same candidate) rather than treated as `n`. 5 new
+`tests/nvim_conformance.rs` cases (`"sub:c ..."`) pin these against the real oracle, and the
+11 pre-existing `sub:c` cases #986 had already shipped, `KNOWN_DEVIATIONS`-gated, all now pass
+— #1007's coverage ratchet moved (11 entries deleted). Both gated `src/harness.rs` scenarios
+(`confirm_prompt_text_is_painted`, `confirm_report_line_excludes_skipped_matches`, each
+backing both a `::gtk` and `::tui` test via the shared macro) now pass on both backends; their
+`KNOWN_BUGS` entries are deleted. No per-backend code — the fix is entirely in `src/core/`.
 
 ## #951 — ACP-0: `src/core/acp.rs`, NDJSON JSON-RPC transport + session lifecycle (foundation)
 
@@ -86,6 +1190,94 @@ internal-only: `ExtensionManifest` gains an unused-elsewhere `Option<BoardProvid
 field and `tool_client.rs`/`fetch_board_model` are not yet called from the engine or either
 backend, so per CLAUDE.md's black-box-coverage rule no driver test is added — there is no
 engine/GTK/TUI codepath yet for one to exercise.
+
+## #521 — Track A Phase 0: generic Board activity panel (read-only)
+
+Builds on #522's seam. New activity-bar entry **Board** (`PANEL_BOARD =
+"panel:board"`), appended to `sidebar::FIXED_ACTIVITY_PANEL_IDS` (now 7 —
+Explorer/Search/Debug/Git/Extensions/AI/Board), so `TOOLBAR_IDX_SETTINGS`
+shifted 7→8 and `TOOLBAR_IDX_EXT_BASE` 8→9; every hand-written test that
+hardcoded the old numbers (activity-bar keyboard-ring tests in
+`tui_main/panels.rs`, the GTK "click the first ext-panel icon" test in
+`gtk/testing.rs`, `test_ext_panel_h_focuses_activity_bar`/`_left_...` in
+`core/engine/tests.rs`, and a stale hand-rolled `8 + idx` in
+`core/engine/ext_panel.rs` that should have been reading
+`TOOLBAR_IDX_EXT_BASE` all along) needed a one-line bump — all caught by
+running the full `sidebar`/`activity`/`ext_panel` test scopes, not just the
+new tests.
+
+**`src/core/engine/board_ops.rs`** (new): `Engine::board_provider()` finds
+the first installed extension manifest with `[board]` set (`ext_installed_
+manifests()`, #522's `BoardProviderConfig`) — no coordinator (or other
+specific provider) vocabulary anywhere, enforced by the existing
+`no_coord_vocabulary_in_core` test. `board_refresh()`/`poll_board()` follow
+the established `ext_refresh`/`poll_ext_registry` background-thread +
+`mpsc` pattern, wired into `poll_idle` alongside a new `tick_board()` that
+refreshes on the provider's declared `poll_interval_secs` while the Board
+panel is active. `apply_board_action()` handles Phase 0's read-only subset
+of `quadraui::BoardAction` (`SelectCard`, `MoveSelection`, `JumpToTop/
+Bottom`, `OpenIssue` → a status-bar message) — `Dispatch`/`RecordTest`/
+`Merge`/etc. are #523. New `Engine` fields: `board_model`, `board_error`,
+`board_has_focus`, `board_fetching`, `board_rx`, `board_last_refresh`,
+`board_layout` (paint-time `quadraui::BoardLayout` cache for click
+hit-testing, same contract as `ext_panel_tree_layout`), and a
+test-swappable `board_client: Arc<dyn ToolClient>`.
+
+**`src/render.rs`**: new `BoardData` view model (`has_focus`, `model`,
+`status`) and `ScreenLayout.board`, built by `build_board_data` (always
+`Some`, mirroring `ExtSidebarData`'s doc). `SidebarOwner::Board` +
+`FocusKeyRoute::Board` slot into the existing shared routers
+(`sidebar_owner`, `route_focus_key`, `dispatch_sidebar_panel_key`) —
+`Engine::dispatch_board_key_unified` is the "unified key dispatch" every
+other panel already has. `route_board_click` resolves a press against the
+cached `BoardLayout` (`BoardLayout::hit_test`) — the same "paint caches,
+click reads" contract as `route_ext_panel_click`. `board_status_bar` is
+the one-line "no provider configured"/"fetching…"/error banner shown when
+there's no model to render (never painted over a stale-but-good model).
+
+**Backends** — GTK's `App::paint_sidebar_panel_rung` `PANEL_BOARD` arm and
+TUI's new `panels::render_board_panel` each do the *same* two calls:
+`backend.draw_board(rect, model)` (quadraui#638's rasteriser, already
+shipped for both backends at the pinned rev) or `board_status_bar` +
+`draw_status_bar`. No bespoke board-drawing code on either side — the
+Platform-Neutrality Rule holds. Click routing
+(`App::route_board_sidebar_event` / `mouse.rs`'s `SidebarOwner::Board` arm)
+is likewise a 1-line call into `render::route_board_click`.
+
+**Tests**: `board_ops.rs` unit tests (mock-provider fetch success/error,
+action application, key dispatch, focus-triggers-refresh) plus black-box
+driver coverage on both backends — TUI (`tui_main/shell_app.rs`,
+`TuiDriver`): paints a mock provider's card + column header, shows the
+"no provider configured" status, and a real click selects a card (asserted
+via the TUI board rasteriser's selected-card background style change,
+since `driver.app()` has no accessor back to `Engine` state — never via
+`Engine::board_model` being populated). GTK (`gtk/testing.rs`,
+`GtkDriver`): same three scenarios, the click one asserting the actual
+`selected_card_id` mutation since GTK's harness *does* keep an
+`Rc<RefCell<Engine>>` handle. All new tests RED-verified by temporarily
+disabling each backend's paint dispatch arm before restoring it. `cargo
+build`/`clippy -D warnings`/`fmt` clean on both feature lanes.
+
+**Bundled icon font** (test-stage follow-up): the new `icons::BOARD`
+(`\u{f0db}`, nf-fa-table_columns) is a 96th nerd codepoint, so
+`tests/icon_font_coverage.rs` went red — `data/fonts/vimcode-icons.ttf` is
+subsetted to exactly the codepoints `Icon::new` references, and an
+unbundled one paints tofu on GTK with no build signal. Regenerated with
+`scripts/gen_icon_font.py --source data/fonts/vimcode-icons.ttf
+--legacy-source SymbolsNerdFont-Regular.ttf` (upstream nerd-fonts v3.4.0)
+— i.e. the *current subset* as primary, upstream only as the donor for the
+one missing glyph, so all 95 pre-existing glyphs keep byte-identical
+outlines and metrics (verified with fontTools). Regenerating the other way
+round (upstream as `--source`) also passes, but silently restyles 9
+unrelated icons to v3.4.0's shapes — U+EA76, U+EAE6, U+EB3C, U+EB3D,
+U+EB54, U+EB85, U+F02B, U+F0140, U+F0143 — which is a deliberate font
+refresh, not a bugfix. `EXPECTED_NERD_CODEPOINT_COUNT` bumped 95 → 96.
+
+Out of scope (per the issue): provider-dispatch actions (#523), issue
+authoring as markdown buffers (#524), in-editor diff review (#525/#526),
+and the coordinator extension bundle itself (the only place `coord` will
+ever be named) — this ships the generic host only, provable end-to-end
+with a mock provider and zero coordinator code anywhere in the tree.
 
 ## #970 — the two "failing" GTK click-geometry tests are the #926/#933 Darwin font divergence, already documented; no fix needed
 
@@ -469,7 +1661,7 @@ it needs `gh` access this worker session doesn't have. **Keep #820 open until
 that issue is filed** (per `GOALS.md`'s milestone-discipline rule); once
 filed, delete the drafted entry and link the real issue number here.
 
-## Active milestone: #7 Platform-Neutral — **2 open** (#901, #902)
+## Active milestone: #7 Platform-Neutral — **15 open**, and the remainder is the TUI
 
 **The north star is [`GOALS.md`](GOALS.md): eliminate all platform-specific code from
 vimcode and lift it into quadraui.** Milestone **#7 Platform-Neutral** is the consume
@@ -649,10 +1841,23 @@ Stage 1** (the GTK-side `App` move), not a re-filing task — see `PLAN.md` and
 
 ### Milestone hygiene
 
-- **#7 is 2 open** (#901 `install_menu_bar`, #902 `show_context_menu` — both macOS
-  native-menu adoption, filed 2026-09-11). #146 moved to #4 Editor Features; #47 sits in #5 Cross-Platform UI
-  Crate, which `GOALS.md` defines as covering the macOS/Windows backends, and is
-  **open** (reopened 2026-09-03).
+- **#7 is 15 open** (updated 2026-09-19, #1168). **#901 and #902 are both closed**
+  — the macOS native-menu adoption that reopened this milestone on 2026-09-11 is
+  done. So is **#1044**, whose 16 children were filed and landed 2026-09-16→18.
+  What is open now: #1068, #1089, #1098, #1100, #1102, #1104, #1108, #1109, #1164,
+  #1165, #1166, #1167, #1168, #1169, #1175.
+- **The split matters more than the count.** Twelve of those are TUI work tracked
+  by the standing epic **#1169** (`src/tui_main/` is the last backend with its own
+  `ShellApp` impl — 11,037 production lines at `30c0077`). The GUI side is down to
+  **three** consume-side items — #1100 (clipboard via `copypasta_ext`), #1102 (GTK
+  `gdk_pixbuf` app-icon pre-rasteriser), #1104 (`TextMetricsBackend` + the second
+  owned `GtkBackend`) — each against a quadraui issue that has **already shipped
+  and is already pinned** at `d907a06`. **There is no open upstream blocker on the
+  GUI backends.** The milestone closes when those three close as well as #1169's
+  children.
+- #146 moved to #4 Editor Features; **#47 sits in #5 Cross-Platform UI Crate and is
+  open, now scoped to Stage 2** (`src/macos/mod.rs` wrapper + the `macos` feature) —
+  Stage 1's extraction is merged.
 - **quadraui milestone #9** ("vimcode Platform-Neutral blockers") is **open** (0
   open / 7 closed issues) — it held quadraui#699 and does not need re-opening.
 - **Stale Win-GUI issues.** Roughly a dozen open `Win-GUI:` issues (#160–#178, #61,

@@ -39,7 +39,12 @@ impl StatusKind {
             StatusKind::Deleted => 'D',
             StatusKind::Renamed => 'R',
             StatusKind::Copied => 'C',
-            StatusKind::Untracked => '?',
+            // VS Code's explorer/SC badge for an untracked file. Git's own
+            // porcelain notation uses `?` here (see `parse_status_char`
+            // below, which stays `?` — it parses `git status --porcelain`
+            // output, a wire format this display label must not leak into
+            // and must not be confused with) (#1051).
+            StatusKind::Untracked => 'U',
             // VS Code's conflict marker.
             StatusKind::Unmerged => '!',
         }
@@ -583,31 +588,101 @@ pub fn commit(dir: &Path, message: &str) -> Result<String, String> {
 ///
 /// Uses `SSH_ASKPASS` + `SSH_ASKPASS_REQUIRE=force` to prevent SSH from
 /// prompting on the parent terminal.  When `passphrase` is `Some`, an
-/// ephemeral askpass script echoes it; when `None`, the askpass script
+/// ephemeral askpass helper echoes it; when `None`, the askpass helper
 /// prints an empty line (handles keys with empty passphrases or keys
 /// already loaded in ssh-agent).
+///
+/// # Windows leg (#1105)
+///
+/// On Windows this writes a `.bat` helper instead of a `#!/bin/sh` script.
+/// Investigation for #1105 found:
+///   - Git for Windows' own `git.exe` (native MinGW build) has its own
+///     shebang-parsing spawn layer (`compat/mingw.c`'s `parse_interpreter` /
+///     `try_shell_exec`) — but that layer only kicks in for programs *git
+///     itself* spawns (editor, pager, `GIT_ASKPASS`/`core.askpass`).
+///   - `SSH_ASKPASS` is instead invoked by whichever `ssh` binary git's
+///     transport resolves — normally Git for Windows' own bundled
+///     MSYS2-built `ssh.exe`, whose POSIX layer (derived from Cygwin, whose
+///     user guide documents `#!`-prefixed files as recognized-executable)
+///     likely *would* run a shebang script correctly. But if `ssh` instead
+///     resolves to Windows' native OpenSSH client (`System32\OpenSSH\ssh.exe`,
+///     a plain Win32 build with no shebang support), a `#!/bin/sh` file has
+///     no interpreter to run it and the askpass helper silently fails,
+///     leaving the fetch/push blocked on a prompt nobody can see — exactly
+///     the bug this issue reports. A `.bat` file sidesteps the ambiguity
+///     entirely: Windows dispatches `.bat` through `cmd.exe` regardless of
+///     which `ssh.exe` (MSYS or native Win32) ends up invoking it, and both
+///     the MSVC CRT spawn/exec family and Cygwin/MSYS's own exec layer are
+///     documented to recognize and dispatch `.bat`/`.cmd` targets that way.
+///   - This could not be exercised on an actual Windows host in this
+///     session (no Windows machine available); the `.bat` leg is the
+///     verifiable-by-construction choice rather than a bet on which `ssh`
+///     a given install resolves.
+///
+/// ## Passphrase delivery differs per leg (review fix, #1105)
+///
+/// The POSIX leg passes the passphrase through the `VIMCODE_ASKPASS_PHRASE`
+/// env var and echoes it with `echo "$VIMCODE_ASKPASS_PHRASE"` — safe,
+/// because the shell expands a quoted `"$VAR"` to a single literal argument
+/// with no re-parsing.
+///
+/// The `.bat` leg does **not** use `%VAR%` expansion for the passphrase,
+/// because cmd.exe expands `%VAR%` while it is still scanning the line for
+/// `&`/`|`/`<`/`>`/`^`, so a passphrase containing any of those characters
+/// would be spliced into the batch file as a second command instead of
+/// printed literally — and an empty passphrase collapses `echo ` (no
+/// argument) into cmd printing its own echo-toggle state (`ECHO is off.`)
+/// instead of a blank line. Both are real, deterministic bugs, not edge
+/// cases: the first fires on every passphrase containing a cmd.exe
+/// metacharacter, the second on every no-passphrase / agent-loaded-key
+/// push. Instead, the Windows leg writes the passphrase to a sibling
+/// "phrase file" and has the `.bat` stream it with `type "<path>"`. `type`
+/// copies the file's bytes to stdout with no command-line re-parsing, so it
+/// has neither failure mode — the empty-passphrase file just produces an
+/// empty (newline-only) line, and any byte sequence in the passphrase file
+/// is passed through unparsed.
 fn run_git_remote(
     dir: &Path,
     args: &[&str],
     label: &str,
     passphrase: Option<&str>,
 ) -> Result<String, String> {
-    // Build an ephemeral askpass script that echoes the passphrase.
+    // Build an ephemeral askpass helper. On Windows the passphrase is
+    // delivered via a sibling "phrase file" streamed with `type` (see the
+    // doc comment above for why `%VAR%` expansion isn't safe there); on
+    // POSIX it's delivered via the VIMCODE_ASKPASS_PHRASE env var, which the
+    // shell script echoes back quoted.
     let phrase = passphrase.unwrap_or("");
     let askpass_dir = std::env::temp_dir();
-    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", std::process::id()));
-    std::fs::write(
-        &askpass_path,
-        format!("#!/bin/sh\necho '{}'\n", phrase.replace('\'', "'\\''")),
-    )
-    .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
+    let pid = std::process::id();
+    #[cfg(windows)]
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}.bat", pid));
+    #[cfg(not(windows))]
+    let askpass_path = askpass_dir.join(format!("vimcode_askpass_{}", pid));
+
+    #[cfg(windows)]
+    let phrase_path = askpass_dir.join(format!("vimcode_askpass_phrase_{}.txt", pid));
+    #[cfg(windows)]
+    {
+        std::fs::write(&phrase_path, windows_askpass_phrase_file_contents(phrase))
+            .map_err(|e| format!("{} failed: cannot create askpass phrase file: {}", label, e))?;
+    }
+
+    #[cfg(windows)]
+    let script = windows_askpass_script(&phrase_path);
+    #[cfg(not(windows))]
+    let script = "#!/bin/sh\necho \"$VIMCODE_ASKPASS_PHRASE\"\n".to_string();
+
+    std::fs::write(&askpass_path, script)
+        .map_err(|e| format!("{} failed: cannot create askpass helper: {}", label, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&askpass_path, std::fs::Permissions::from_mode(0o700)).ok();
     }
 
-    let output = git_command()
+    let mut command = git_command();
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -618,12 +693,18 @@ fn run_git_remote(
         .env("SSH_ASKPASS", &askpass_path)
         .env("SSH_ASKPASS_REQUIRE", "force")
         // DISPLAY must be set for SSH_ASKPASS to work on some systems.
-        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default())
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_default());
+    #[cfg(not(windows))]
+    command.env("VIMCODE_ASKPASS_PHRASE", phrase);
+
+    let output = command
         .output()
         .map_err(|e| format!("{} failed: {}", label, e));
 
-    // Clean up the askpass script.
+    // Clean up the askpass script (and, on Windows, the phrase file).
     let _ = std::fs::remove_file(&askpass_path);
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(&phrase_path);
 
     let output = output?;
     if output.status.success() {
@@ -638,6 +719,31 @@ fn run_git_remote(
             err
         })
     }
+}
+
+/// Build the contents of the Windows askpass "phrase file" (#1105): the
+/// passphrase plus a trailing newline, matching the POSIX leg's
+/// `echo "$VIMCODE_ASKPASS_PHRASE"` output (which always terminates with a
+/// newline, including when the phrase is empty). Kept as a standalone,
+/// platform-independent function — no `cfg(windows)` gate — so the exact
+/// bytes SSH will receive can be unit-tested without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_phrase_file_contents(phrase: &str) -> String {
+    let mut contents = phrase.to_string();
+    contents.push('\n');
+    contents
+}
+
+/// Build the Windows askpass `.bat` body. It streams `phrase_path`'s bytes
+/// via `type` rather than interpolating the passphrase into the script
+/// through `%VAR%` expansion — see the doc comment on `run_git_remote` for
+/// why that's unsafe (metacharacter injection, and a mis-rendered empty
+/// line). The passphrase itself must never appear in this string; platform-
+/// independent — no `cfg(windows)` gate — so that invariant is
+/// unit-testable without a Windows host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_askpass_script(phrase_path: &Path) -> String {
+    format!("@echo off\r\ntype \"{}\"\r\n", phrase_path.display())
 }
 
 /// Returns `true` when the error message looks like an SSH authentication
@@ -1037,6 +1143,46 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 mod tests {
     use super::*;
 
+    // ── Windows askpass leg (#1105) ─────────────────────────────────────────
+    // These exercise the pure string-building helpers directly so the two
+    // review-flagged bugs (empty-passphrase mis-render, metacharacter
+    // injection via %VAR% expansion) stay caught without needing a Windows
+    // host to run the actual .bat file.
+
+    #[test]
+    fn windows_askpass_phrase_file_empty_phrase_is_just_a_newline() {
+        // The old `echo %VIMCODE_ASKPASS_PHRASE%` leg rendered an empty
+        // phrase as the literal text "ECHO is off." (cmd.exe's bare-`echo`
+        // toggle-state message) instead of a blank line. The phrase-file
+        // approach must produce exactly a newline, with no such artifact.
+        assert_eq!(windows_askpass_phrase_file_contents(""), "\n");
+    }
+
+    #[test]
+    fn windows_askpass_phrase_file_preserves_metacharacters_literally() {
+        // A passphrase containing cmd.exe metacharacters must survive
+        // byte-for-byte in the phrase file — no reinterpretation, since
+        // `type` never re-parses file contents as commands.
+        let phrase = "abc&whoami|echo^pwned<x>y";
+        assert_eq!(
+            windows_askpass_phrase_file_contents(phrase),
+            format!("{}\n", phrase)
+        );
+    }
+
+    #[test]
+    fn windows_askpass_script_never_embeds_the_passphrase() {
+        // The .bat body must only ever reference the phrase file's path —
+        // never the passphrase text itself. If a future edit reintroduces
+        // `%VAR%`-style interpolation of the phrase into the script, this
+        // test catches it.
+        let phrase_path = Path::new(r"C:\Temp\vimcode_askpass_phrase_1234.txt");
+        let script = windows_askpass_script(phrase_path);
+        assert!(script.starts_with("@echo off"));
+        assert!(script.contains("type "));
+        assert!(script.contains("vimcode_askpass_phrase_1234.txt"));
+    }
+
     // ── parse_diff_hunks ───────────────────────────────────────────────────
 
     #[test]
@@ -1396,6 +1542,114 @@ mod tests {
         // Switch to feature-x again
         assert!(checkout_branch(&dir, "feature-x").is_ok());
         assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
+    }
+
+    // ── changed_files_between ────────────────────────────────────────────
+
+    #[test]
+    fn test_changed_files_between_lists_files_changed_on_head_since_base() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("unchanged.txt"), "same\n").unwrap();
+        std::fs::write(dir.join("modified.txt"), "before\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "base"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        create_branch(&dir, "feature").unwrap();
+        std::fs::write(dir.join("modified.txt"), "after\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "feature work"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // A commit on `main`/`master` after the branch diverged must not
+        // show up as a "changed" file on `feature` — three-dot semantics.
+        checkout_branch(&dir, "main")
+            .or_else(|_| checkout_branch(&dir, "master"))
+            .unwrap();
+        std::fs::write(dir.join("unchanged.txt"), "changed on base only\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "base-only change"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base = current_branch(&dir).unwrap();
+
+        let mut files = changed_files_between(&dir, &base, "feature").expect("valid refs diff");
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["modified.txt".to_string(), "new.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_changed_files_between_unknown_ref_is_none_not_an_empty_diff() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between_bad_ref");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            changed_files_between(&dir, "nope-base", "nope-head").is_none(),
+            "an unresolvable ref is a git failure, distinct from a real empty diff"
+        );
+    }
+
+    /// Review non-blocking finding (#525): `base`/`head` come straight from
+    /// an external provider's JSON with no shell involved, but a value
+    /// starting with `-` could still be parsed by git as a flag rather than
+    /// a revision when joined into `base...head`. Guard rejects it before
+    /// it ever reaches git's argv.
+    #[test]
+    fn test_changed_files_between_rejects_flag_like_revisions() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between_flag_smuggle");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(changed_files_between(&dir, "--output=/tmp/pwned", "HEAD").is_none());
+        assert!(changed_files_between(&dir, "HEAD", "--output=/tmp/pwned").is_none());
     }
 
     // ── normalize_remote_url ────────────────────────────────────────────────
@@ -2187,6 +2441,46 @@ pub fn diff_against_ref(dir: &Path, ref_spec: &str) -> Option<String> {
     run_git(dir, &["diff", ref_spec])
 }
 
+/// Paths (relative to the repository root) that differ between `base` and
+/// `head`, using git's three-dot ("what changed on `head` since it
+/// diverged from `base`") comparison rather than a plain two-dot diff —
+/// the right semantics for reviewing a feature branch against the branch
+/// it was cut from, since it ignores commits `base` has picked up in the
+/// meantime that `head` never saw. Both `base`/`head` must already be
+/// resolvable in the local repository (already pulled/checked out) — this
+/// is worktree-local, no fetch (#525's stated scope; the remote/ssh case
+/// is #530).
+///
+/// Returns `None` on any git failure — no repo, an unknown ref, or a
+/// `base`/`head` that looks like a flag (see below) — and `Some(vec![])`
+/// for a real, successful diff that just happens to contain no changes.
+/// Callers that only cared about "were there any changes" used to conflate
+/// the two (both were an empty `Vec`); keeping them apart lets
+/// `Engine::open_branch_review` report "no changes between X and Y"
+/// only when that's actually true, rather than also for a misconfigured
+/// provider's bogus branch name (review non-blocking finding, #525).
+///
+/// `base`/`head` typically arrive from an external board provider's JSON
+/// (`BranchReviewTarget`, #522's seam) and are joined into a single
+/// `base...head` positional argument below with no shell involved — so
+/// this isn't classic injection, but a value starting with `-` could still
+/// be parsed by git as a flag rather than a revision ("flag-smuggling").
+/// Reject that case up front rather than let it reach git's argv.
+pub fn changed_files_between(dir: &Path, base: &str, head: &str) -> Option<Vec<String>> {
+    if base.starts_with('-') || head.starts_with('-') {
+        return None;
+    }
+    let spec = format!("{base}...{head}");
+    run_git(dir, &["diff", "--name-only", &spec]).map(|output| {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
 /// Return detailed log entries for a specific file.
 pub fn file_log_detailed(repo_root: &Path, file: &Path, limit: usize) -> Vec<DetailedLogEntry> {
     let file_str = match file.to_str() {
@@ -2417,7 +2711,9 @@ mod sc_tests {
         assert_eq!(StatusKind::Deleted.label(), 'D');
         assert_eq!(StatusKind::Renamed.label(), 'R');
         assert_eq!(StatusKind::Copied.label(), 'C');
-        assert_eq!(StatusKind::Untracked.label(), '?');
+        // #1051: VS Code's explorer/SC badge, not git's own '?' porcelain
+        // notation (`parse_status_char` above still parses that '?').
+        assert_eq!(StatusKind::Untracked.label(), 'U');
         // #991: VS Code's conflict marker.
         assert_eq!(StatusKind::Unmerged.label(), '!');
     }

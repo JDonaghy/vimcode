@@ -81,6 +81,11 @@ pub struct ExtensionManifest {
     /// `None` means this extension doesn't provide a board.
     #[serde(default)]
     pub board: Option<BoardProviderConfig>,
+    /// Declares this extension as a document provider for buffer-based
+    /// authoring (#524). `None` means this extension can't open its
+    /// documents as editable buffers.
+    #[serde(default)]
+    pub document: Option<DocumentProviderConfig>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -113,35 +118,251 @@ pub struct BoardProviderConfig {
     /// Seconds between automatic background refreshes.
     #[serde(default = "default_board_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    /// Maps a `quadraui::BoardAction` variant name (e.g. `"OpenIssue"`,
-    /// `"OpenReview"`) to an argv template to run when that action fires.
-    /// The literal token `{id}` in any argument is replaced with the
-    /// acted-on card id at dispatch time. Actions with no entry here are
-    /// simply not runnable — the panel host should no-op rather than
-    /// error.
+    /// Named, provider-declared actions a card can be dispatched through
+    /// (#523) — the context menu's contents, a stage keybinding table, and
+    /// (via [`Self::action_by_name`]) the target of `quadraui::BoardAction`
+    /// variants like `OpenIssue`/`OpenReview` that need somewhere to
+    /// dispatch to. Generic on purpose, same spirit as the rest of this
+    /// struct: a name like `"assign"` or `"test-pass"` is whatever the
+    /// provider calls it, never a fixed enum — vimcode's `src/core/` must
+    /// never contain a specific provider's action vocabulary, see
+    /// `crate::core::tool_client`'s module doc.
     #[serde(default)]
-    pub actions: std::collections::HashMap<String, Vec<String>>,
+    pub actions: Vec<BoardActionDef>,
+    /// Argv template(s) for reporting a review verdict from the
+    /// change-review surface (#526), keyed by
+    /// `crate::core::review::ReviewVerdict::token()`
+    /// (`"approve"`/`"request-changes"`/`"comment"`). A provider that
+    /// supports only approve/request-changes simply omits `"comment"` —
+    /// the review surface only offers a verdict this map has an entry for
+    /// (mirrors `actions`' "no entry = not runnable"). The literal tokens
+    /// `{id}` and `{body_file}` in any argument are replaced at report
+    /// time: `{id}` with the reviewed card's id, `{body_file}` with the
+    /// path to a temp file holding the composed review body. The body is
+    /// **never** substituted inline — review bodies contain newlines, code
+    /// fences and quotes unsafe to splice into a single argv token, the
+    /// same reasoning `DocumentProviderConfig::write_command` already
+    /// applies by sending its payload on stdin instead.
+    #[serde(default)]
+    pub verdict_commands: std::collections::HashMap<String, Vec<String>>,
+    /// Argv to run periodically as an opt-in freshness nudge (#523) — for a
+    /// daemon-less provider whose pipeline only advances when some external
+    /// "notify" command runs, so it doesn't stall just because vimcode is
+    /// the only client with the board open. Empty (the default) means the
+    /// provider doesn't need/support this; fire-and-forget either way
+    /// (stdout discarded, only "did it run" matters) and gated on
+    /// `Settings::board_tick_enabled`, which defaults **off** — a passive
+    /// viewer must not silently dispatch metered work.
+    #[serde(default)]
+    pub tick_command: Vec<String>,
+    /// Seconds between automatic `tick_command` runs, when enabled.
+    /// Independent of `poll_interval_secs` (which governs board *reads*,
+    /// always on when a provider is configured) — this is typically much
+    /// longer, since it's a background nudge to an external pipeline, not
+    /// a refresh.
+    #[serde(default = "default_board_tick_interval_secs")]
+    pub tick_interval_secs: u64,
 }
 
 fn default_board_poll_interval_secs() -> u64 {
     30
 }
 
-impl BoardProviderConfig {
-    /// Resolve the argv to run for `action_name` (a `quadraui::BoardAction`
-    /// variant name) against `card_id`, substituting `{id}` in every
-    /// argument. Returns `None` if this provider declared no command for
-    /// that action, or if it declared one as an explicit empty array
-    /// (equivalent to "not runnable").
-    pub fn action_argv(&self, action_name: &str, card_id: &str) -> Option<Vec<String>> {
-        let template = self.actions.get(action_name)?;
+fn default_board_tick_interval_secs() -> u64 {
+    300
+}
+
+/// One provider-declared, named board action (#523) — e.g. "dispatch this
+/// card's work", "record a Test verdict", "merge". The provider names it,
+/// declares which stages (columns) it's valid in, an optional single-key
+/// binding, whether firing it needs confirmation, and the argv to run.
+///
+/// Generic on purpose, same spirit as [`BoardProviderConfig`] itself — a
+/// pipeline-management bundle might declare one named `"assign"` running
+/// its own dispatch command, but nothing here knows that; any provider's
+/// manifest can declare any action name.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct BoardActionDef {
+    /// Unique (within this provider) action name. Used as the context-menu
+    /// item's identity and the dialog/status-line label fallback.
+    pub name: String,
+    /// Human-readable label shown in the context menu / confirmation
+    /// dialog / result banner. Falls back to `name` when empty — see
+    /// [`Self::display_label`].
+    #[serde(default)]
+    pub label: String,
+    /// Argv template to run. The literal token `{id}` in any argument is
+    /// replaced with the acted-on card id at dispatch time (see
+    /// [`Self::resolve_argv`]). An action with an empty `command` is
+    /// declared-but-not-runnable — callers no-op rather than error, same
+    /// convention `DocumentProviderConfig`'s empty-template case uses.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Column (stage) ids this action is valid for, e.g. `["col:test"]`.
+    /// Empty means "valid in every stage" — most actions (assign, drop to
+    /// backlog) aren't stage-specific; a Test-only verdict action would set
+    /// this.
+    #[serde(default)]
+    pub stages: Vec<String>,
+    /// Optional single-key binding while the Board panel has focus and a
+    /// card matching one of `stages` is selected — single-letter
+    /// Test-verdict keys (e.g. `P`/`S`/`F`) are a common example.
+    /// `None` means menu-only (no keyboard shortcut).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Whether firing this action must be confirmed (a Yes/No dialog)
+    /// before it runs — irreversible or metered actions (dispatch work,
+    /// merge) should set this; read-only or idempotent ones don't need to.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+impl BoardActionDef {
+    /// `label` if set, otherwise `name` — every action has *something*
+    /// presentable without every provider having to repeat `name` as
+    /// `label` verbatim.
+    pub fn display_label(&self) -> &str {
+        if self.label.is_empty() {
+            &self.name
+        } else {
+            &self.label
+        }
+    }
+
+    /// Resolve the argv to run against `card_id`, substituting `{id}` in
+    /// every argument. Empty when `command` is empty — see the field's own
+    /// doc for why that's "not runnable", not an error.
+    pub fn resolve_argv(&self, card_id: &str) -> Vec<String> {
+        self.command
+            .iter()
+            .map(|arg| arg.replace("{id}", card_id))
+            .collect()
+    }
+
+    /// Whether this action is declared valid for `stage_id` — an empty
+    /// `stages` list means "every stage".
+    fn valid_for_stage(&self, stage_id: &str) -> bool {
+        self.stages.is_empty() || self.stages.iter().any(|s| s == stage_id)
+    }
+}
+
+/// Declares an extension as a document provider (#524, Phase 1): its
+/// documents (e.g. issues) can be opened as real markdown scratch buffers
+/// for editing, with edits pushed back through a write command on `:w`.
+///
+/// Generic on purpose, same spirit as [`BoardProviderConfig`] — names no
+/// particular provider or lifecycle vocabulary. Any extension can point
+/// `read_command`/`write_command` at external tools that speak vimcode's
+/// document contract (`crate::core::tool_client::ToolDocument`) and get
+/// working buffer-based authoring.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DocumentProviderConfig {
+    /// Argv to run to fetch a document's body for editing. The literal
+    /// token `{id}` in any argument is replaced with the document id at
+    /// dispatch time. Must emit a `ToolDocument` JSON document on stdout
+    /// and exit zero.
+    #[serde(default)]
+    pub read_command: Vec<String>,
+    /// Argv to run to push an edited document's title/body back. `{id}` is
+    /// replaced with the document id, or the empty string for a
+    /// not-yet-created document (the new-document flow: this same command
+    /// doubles as "create", the provider script tells the two apart by
+    /// whether `{id}` came through empty). The edited `{"title", "body"}`
+    /// payload is delivered on stdin as JSON, never substituted into argv
+    /// (titles/bodies are free text — unsafe to splice into a command
+    /// line).
+    #[serde(default)]
+    pub write_command: Vec<String>,
+    /// Argv to run after a successful write on an *already-existing*
+    /// document (never on the create path — see `write_command`'s doc).
+    /// `{id}` is replaced with the document id. This is where a bundle's
+    /// own lifecycle transition lives (e.g. a pipeline-management bundle
+    /// flipping a "refining" document to "ready") — this struct only
+    /// knows "run this argv after that one succeeds," no lifecycle
+    /// vocabulary itself.
+    #[serde(default)]
+    pub write_follow_up: Vec<String>,
+}
+
+impl DocumentProviderConfig {
+    /// Resolve the argv to run to fetch `id`'s body, substituting `{id}`
+    /// in every argument. `None` if this provider declared no read
+    /// command.
+    pub fn read_argv(&self, id: &str) -> Option<Vec<String>> {
+        Self::substitute(&self.read_command, id)
+    }
+
+    /// Resolve the argv to run to push an edit back. `id` is `None` for
+    /// the new-document flow (substitutes the empty string). `None` if
+    /// this provider declared no write command.
+    pub fn write_argv(&self, id: Option<&str>) -> Option<Vec<String>> {
+        Self::substitute(&self.write_command, id.unwrap_or(""))
+    }
+
+    /// Resolve the argv to run after a successful write on an existing
+    /// document. `None` if this provider declared no follow-up command
+    /// (a provider is not required to have one).
+    pub fn write_follow_up_argv(&self, id: &str) -> Option<Vec<String>> {
+        Self::substitute(&self.write_follow_up, id)
+    }
+
+    fn substitute(template: &[String], id: &str) -> Option<Vec<String>> {
         if template.is_empty() {
             return None;
         }
+        Some(template.iter().map(|arg| arg.replace("{id}", id)).collect())
+    }
+}
+
+impl BoardProviderConfig {
+    /// Find a declared action by name — `None` if this provider declared
+    /// none by that name (or no `[board]` actions at all).
+    pub fn action_by_name(&self, name: &str) -> Option<&BoardActionDef> {
+        self.actions.iter().find(|a| a.name == name)
+    }
+
+    /// Every declared action valid for `stage_id` (a column id) — the
+    /// context menu's contents (#523: "listing the actions the provider
+    /// declares as valid for that card's stage").
+    pub fn actions_for_stage(&self, stage_id: &str) -> Vec<&BoardActionDef> {
+        self.actions
+            .iter()
+            .filter(|a| a.valid_for_stage(stage_id))
+            .collect()
+    }
+
+    /// The declared action bound to `key`, if any, and valid for
+    /// `stage_id` — a stage keybinding lookup (#523's single-key verdict
+    /// bindings, e.g. `P`/`S`/`F`).
+    pub fn action_for_key(&self, key: &str, stage_id: &str) -> Option<&BoardActionDef> {
+        self.actions
+            .iter()
+            .find(|a| a.key.as_deref() == Some(key) && a.valid_for_stage(stage_id))
+    }
+
+    /// Resolve the argv to run to report `verdict` on `card_id`, with
+    /// `body_file`'s path substituted for `{body_file}` (and `card_id` for
+    /// `{id}`) in every argument. Returns `None` if this provider declared
+    /// no command for that verdict, or declared one as an explicit empty
+    /// array (equivalent to "not offered").
+    pub fn verdict_argv(
+        &self,
+        verdict: crate::core::review::ReviewVerdict,
+        card_id: &str,
+        body_file: &std::path::Path,
+    ) -> Option<Vec<String>> {
+        let template = self.verdict_commands.get(verdict.token())?;
+        if template.is_empty() {
+            return None;
+        }
+        let body_file = body_file.to_string_lossy();
         Some(
             template
                 .iter()
-                .map(|arg| arg.replace("{id}", card_id))
+                .map(|arg| {
+                    arg.replace("{id}", card_id)
+                        .replace("{body_file}", &body_file)
+                })
                 .collect(),
         )
     }
@@ -185,6 +406,13 @@ pub struct LspConfig {
     /// `{"diagnostics": {"enable": false}}` for rust-analyzer).
     #[serde(default)]
     pub initialization_options: Option<serde_json::Value>,
+    /// Native tool acquisition (#1345): download, verify and unpack the LSP
+    /// binary directly, with no shell command, `sudo`, `unzip`, or PATH
+    /// edits. When present, `ext_install_from_registry` prefers this over
+    /// `install`/`install_linux`/`install_macos`/`install_windows` — see
+    /// `crate::core::tool_acquire`.
+    #[serde(default)]
+    pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
 
 // ─── Target platform (testable seam, #919) ────────────────────────────────────
@@ -322,6 +550,9 @@ pub struct DapConfig {
     /// Arguments passed to the DAP binary.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Native tool acquisition (#1345) — see `LspConfig::acquire`'s doc.
+    #[serde(default)]
+    pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
 
 impl DapConfig {
@@ -764,8 +995,17 @@ display_name = "Example Board Provider"
 refresh_command = ["example-tool", "board", "--json"]
 poll_interval_secs = 15
 
-[board.actions]
-OpenIssue = ["example-tool", "open", "{id}"]
+[[board.actions]]
+name = "OpenIssue"
+command = ["example-tool", "open", "{id}"]
+
+[[board.actions]]
+name = "merge"
+label = "Merge"
+command = ["example-tool", "merge", "{id}"]
+stages = ["col:review"]
+key = "m"
+confirm = true
 "#;
         let m = ExtensionManifest::parse(toml).expect("should parse");
         let board = m.board.expect("board provider config should be present");
@@ -775,14 +1015,166 @@ OpenIssue = ["example-tool", "open", "{id}"]
         );
         assert_eq!(board.poll_interval_secs, 15);
         assert_eq!(
-            board.action_argv("OpenIssue", "card:42"),
+            board
+                .action_by_name("OpenIssue")
+                .map(|a| a.resolve_argv("card:42")),
             Some(vec![
                 "example-tool".to_string(),
                 "open".to_string(),
                 "card:42".to_string()
             ])
         );
-        assert_eq!(board.action_argv("Merge", "card:42"), None);
+        assert_eq!(board.action_by_name("merge_typo"), None);
+
+        let merge = board.action_by_name("merge").expect("merge declared");
+        assert_eq!(merge.display_label(), "Merge");
+        assert!(merge.confirm);
+        assert_eq!(merge.key.as_deref(), Some("m"));
+        assert_eq!(
+            board.action_for_key("m", "col:review").map(|a| &a.name),
+            Some(&"merge".to_string())
+        );
+        assert_eq!(board.action_for_key("m", "col:backlog"), None);
+        assert_eq!(
+            board
+                .actions_for_stage("col:backlog")
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OpenIssue"],
+            "an action with no declared `stages` is valid everywhere"
+        );
+    }
+
+    /// #526: verdict commands parse from a `[board.verdict_commands]` TOML
+    /// table (same nesting convention `[board.actions]` already uses) and
+    /// `{id}`/`{body_file}` both substitute correctly. A verdict with no
+    /// entry (`"comment"` here) resolves to `None` — "not offered", same as
+    /// `action_argv`'s existing convention.
+    #[test]
+    fn board_provider_config_verdict_commands_parse_and_substitute_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Board Provider"
+
+[board]
+refresh_command = ["example-tool", "board", "--json"]
+
+[board.verdict_commands]
+approve = ["example-tool", "verdict", "{id}", "--ok", "--body-file", "{body_file}"]
+request-changes = ["example-tool", "verdict", "{id}", "--changes", "--body-file", "{body_file}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let board = m.board.expect("board provider config should be present");
+        let body_file = std::path::Path::new("/tmp/review-body.md");
+
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::Approve,
+                "card:42",
+                body_file
+            ),
+            Some(vec![
+                "example-tool".to_string(),
+                "verdict".to_string(),
+                "card:42".to_string(),
+                "--ok".to_string(),
+                "--body-file".to_string(),
+                "/tmp/review-body.md".to_string(),
+            ])
+        );
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::RequestChanges,
+                "card:42",
+                body_file
+            ),
+            Some(vec![
+                "example-tool".to_string(),
+                "verdict".to_string(),
+                "card:42".to_string(),
+                "--changes".to_string(),
+                "--body-file".to_string(),
+                "/tmp/review-body.md".to_string(),
+            ])
+        );
+        assert_eq!(
+            board.verdict_argv(
+                crate::core::review::ReviewVerdict::Comment,
+                "card:42",
+                body_file
+            ),
+            None,
+            "a verdict with no declared command must resolve to None, not a panic"
+        );
+    }
+
+    #[test]
+    fn document_provider_config_defaults_when_absent_from_toml() {
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.document.is_none());
+    }
+
+    #[test]
+    fn document_provider_config_parses_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Document Provider"
+
+[document]
+read_command = ["example-tool", "show", "{id}"]
+write_command = ["example-tool", "write", "{id}"]
+write_follow_up = ["example-tool", "ready", "{id}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let doc = m
+            .document
+            .expect("document provider config should be present");
+        assert_eq!(
+            doc.read_argv("42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "show".to_string(),
+                "42".to_string()
+            ])
+        );
+        assert_eq!(
+            doc.write_argv(Some("42")),
+            Some(vec![
+                "example-tool".to_string(),
+                "write".to_string(),
+                "42".to_string()
+            ])
+        );
+        // New-document flow: no id yet, `{id}` substitutes to empty.
+        assert_eq!(
+            doc.write_argv(None),
+            Some(vec![
+                "example-tool".to_string(),
+                "write".to_string(),
+                "".to_string()
+            ])
+        );
+        assert_eq!(
+            doc.write_follow_up_argv("42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "ready".to_string(),
+                "42".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn document_provider_config_no_declared_command_is_none() {
+        let doc = DocumentProviderConfig::default();
+        assert_eq!(doc.read_argv("42"), None);
+        assert_eq!(doc.write_argv(Some("42")), None);
+        assert_eq!(doc.write_follow_up_argv("42"), None);
     }
 
     #[test]
@@ -797,6 +1189,43 @@ refresh_command = ["example-tool", "board", "--json"]
         let m = ExtensionManifest::parse(toml).expect("should parse");
         let board = m.board.expect("board provider config should be present");
         assert_eq!(board.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn lsp_acquire_absent_from_toml_parses_to_none() {
+        // #1345: every existing registry manifest has no `[lsp.acquire]` /
+        // `[dap.acquire]` table — confirm they stay unaffected.
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+[lsp]
+binary = "rust-analyzer"
+install = "cargo install rust-analyzer"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.lsp.acquire.is_none());
+        assert!(m.dap.acquire.is_none());
+    }
+
+    #[test]
+    fn lsp_acquire_table_parses_from_toml() {
+        let toml = r#"
+name = "terraform"
+display_name = "Terraform"
+[lsp]
+binary = "terraform-ls"
+[lsp.acquire]
+kind = "hashicorp-release"
+product = "terraform-ls"
+binary_path = "terraform-ls"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let acquire = m.lsp.acquire.expect("acquire table should parse");
+        assert_eq!(
+            acquire.kind,
+            crate::core::tool_acquire::AcquireKind::HashicorpRelease
+        );
+        assert_eq!(acquire.product, "terraform-ls");
     }
 
     #[test]

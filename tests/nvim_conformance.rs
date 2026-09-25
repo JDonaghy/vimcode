@@ -84,6 +84,43 @@
 //! comment explains why both entries it ever held are gone and what the bar
 //! is for adding another.
 //!
+//! ## #1283 population seam (quickfix / location-list family)
+//!
+//! #1155 shipped the whole quickfix/location-list ex-command surface (23
+//! ids, `:copen`..`:lfdo`) with no oracle case at all. Before writing any of
+//! them, #1283 first asked whether this harness can seed both sides with an
+//! identical *populated* quickfix list — the obvious route is `:vimgrep` (or
+//! `:cexpr`) over the multi-file fixture's real files. It cannot, for two
+//! independent reasons, each confirmed against a live oracle rather than
+//! assumed:
+//!
+//! 1. Real Neovim's `:vimgrep {pattern}` with no file argument **errors**:
+//!    `E683: File name missing or invalid pattern`. Vim's grammar is
+//!    `:vimgrep /pat/ {files}` — a required file-glob argument, not merely an
+//!    optional one.
+//! 2. VimCode's `:vimgrep`/`:grep` (`Engine::qf_run_grep`,
+//!    `src/core/engine/execute.rs`) take **no file argument at all** — the
+//!    entire trailing string is the search pattern, applied via
+//!    `project_search::search_in_project` to a recursive walk of the whole
+//!    `cwd`. `:cexpr` is a second dead end on the vimcode side: `NotImplemented`
+//!    (this file's own `ex(":cex[pr]", ...)` NORM_AUDIT row), matching the
+//!    permanent expression-evaluator exemption `#1170` already carries.
+//!
+//! These are two incompatible command grammars, not two implementations of
+//! the same one — no single key sequence typed identically on both sides
+//! (the contract every harness in this file relies on) can populate an
+//! identical list. That is deliverable 1's finding: **no populated-list seam
+//! exists**, so none of the 23 ids retire via a populated list.
+//!
+//! What *is* real, reachable, comparable Neovim behaviour — the same
+//! precedent `ex:cc on empty quickfix list` (#1154) already set — is every
+//! one of these commands' empty-list (global) or absent-location-list
+//! (per-window) refusal/no-op path. 19 of the 23 ids retire via a plain
+//! buffer/cursor `Case` exercising that path (`CASES_EX`'s "#1283" block);
+//! the other 4 (`:copen`/`:cwindow`/`:lopen`/`:lwindow`) open a window, so
+//! they retire via `CASES_XFILE`'s `WinCase` layout-probe harness instead,
+//! chained after #1162 per this issue's own instruction.
+//!
 //! ## Debugging a single area
 //!
 //! `PROBE_FILTER=<label-substring>` restricts the run; `PROBE_VERBOSE=1` prints
@@ -183,6 +220,7 @@ use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use vimcode_core::core::window::{SplitDirection, WindowId, WindowLayout, WindowRect};
 use vimcode_core::core::OpenMode;
 use vimcode_core::{Engine, EngineAction, Settings};
 
@@ -192,6 +230,11 @@ struct NvimResult {
     line: usize,
     col: usize,
     rows: usize,
+    /// `nvim_win_get_width(0)`, mirrored the same way as `rows` (#1280): the
+    /// six horizontal-scroll rows (`zh`/`zl`/`zH`/`zL`/`ze`/`zs`) are
+    /// meaningless if the two sides disagree on window *width*, same
+    /// reasoning as the height mirror below.
+    cols: usize,
     /// `line('w0')` sampled after **every** key (#1008), never deserialized —
     /// [`run_in_neovim`] fills it in as it feeds the sequence. It is the
     /// evidence that the redraw between keystrokes actually happened, and it
@@ -279,6 +322,24 @@ struct NvimRpc {
     /// `win_viewport` event — the value nvim computed *during a redraw*, which
     /// is a number a `-l` script could never observe.
     topline: i64,
+    /// The text of the most recent `msg_show` UI event, cleared on
+    /// `msg_clear` — only populated when [`NvimRpc::spawn`] requested the
+    /// `ext_messages` capability (#1282, [`oracle_probe_message`]).
+    ///
+    /// `msg_show`'s wire shape (batched the same way `win_viewport` is, see
+    /// [`NvimRpc::absorb_notification`]) is `[kind, content, replace_last,
+    /// history, append, ...]`, where `content` is an array of `[attr_id,
+    /// text, hl_id]` triples — one per highlight run, **not** one per line
+    /// (a `:marks`-style multi-line listing arrives as a handful of triples
+    /// whose own text already contains `\n`). Concatenating every triple's
+    /// text in order, replacing the whole thing on each new event, mirrors
+    /// `engine.message`'s own "last write wins, no highlight spans" model on
+    /// the vimcode side exactly — confirmed against a live
+    /// `nvim --headless -u NONE -i NONE` for `ga`, `g8`, `<C-g>`, `:ls`,
+    /// `:marks`, `:number`, `:reg` and more (see the git history of this
+    /// comment for the raw msgpack dumps that were read to confirm the
+    /// shape).
+    last_message: String,
 }
 
 impl NvimRpc {
@@ -294,8 +355,24 @@ impl NvimRpc {
     /// as scrolled message output, so the first buffer modification hits a
     /// `hit-enter` prompt — is deterministic rather than intermittent, and is
     /// handled by [`NvimRpc::wait_until_ready`].
-    fn spawn() -> Option<Self> {
-        let mut child = Command::new("nvim")
+    ///
+    /// `capture_messages` requests the `ext_messages` UI capability on top of
+    /// the `ext_linegrid` every case already needs (#1282). Opt-in, not
+    /// unconditional: none of the buffer/cursor-comparing cases read
+    /// `last_message`, so there is no reason to widen what every one of
+    /// those 1,400+ spawns has to negotiate and this harness has to decode.
+    ///
+    /// `cwd`, when given, becomes the spawned process's working directory
+    /// (#1328): the window-layout harness (`run_win_in_neovim`) opens real
+    /// files by path and needs relative-path resolution (`fnameescape`,
+    /// swap-file naming were it not for `-n`) to agree with vimcode's own
+    /// `Engine::cwd` for that probe. The buffer/cursor harnesses never open a
+    /// real file — every one of their probes lives entirely in the unnamed
+    /// buffer — so they pass `None` and inherit the test binary's own cwd,
+    /// unchanged from before this parameter existed.
+    fn spawn(capture_messages: bool, cwd: Option<&Path>) -> Option<Self> {
+        let mut command = Command::new("nvim");
+        command
             .arg("--headless")
             .arg("--embed")
             .arg("-u")
@@ -316,9 +393,11 @@ impl NvimRpc {
             // Deliberately discarded rather than piped-and-ignored: an unread
             // pipe fills and blocks nvim. Anything that matters comes back as
             // an RPC error instead.
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        let mut child = command.spawn().ok()?;
         let stdin = child.stdin.take()?;
         let mut stdout = BufReader::new(child.stdout.take()?);
         let (tx, frames) = std::sync::mpsc::channel();
@@ -342,13 +421,18 @@ impl NvimRpc {
             next_id: 0,
             responses: std::collections::HashMap::new(),
             topline: 1,
+            last_message: String::new(),
         };
+        let mut caps = vec![(Value::from("ext_linegrid"), Value::Boolean(true))];
+        if capture_messages {
+            caps.push((Value::from("ext_messages"), Value::Boolean(true)));
+        }
         rpc.request(
             "nvim_ui_attach",
             vec![
                 Value::from(UI_WIDTH),
                 Value::from(UI_HEIGHT),
-                Value::Map(vec![(Value::from("ext_linegrid"), Value::Boolean(true))]),
+                Value::Map(caps),
             ],
         )
         .ok()?;
@@ -390,6 +474,30 @@ impl NvimRpc {
                         self.topline = top + 1; // the event is 0-indexed
                     }
                 }
+            }
+            // `msg_show`/`msg_clear` only ever arrive when `spawn` requested
+            // the `ext_messages` capability (#1282) — see `last_message`'s
+            // own doc comment for the wire shape and why this concatenation
+            // is right.
+            match parts.first().and_then(Value::as_str) {
+                Some("msg_show") => {
+                    for call in parts.iter().skip(1) {
+                        let Value::Array(args) = call else { continue };
+                        let Some(Value::Array(content)) = args.get(1) else {
+                            continue;
+                        };
+                        let mut text = String::new();
+                        for chunk in content {
+                            let Value::Array(chunk) = chunk else { continue };
+                            if let Some(t) = chunk.get(1).and_then(Value::as_str) {
+                                text.push_str(t);
+                            }
+                        }
+                        self.last_message = text;
+                    }
+                }
+                Some("msg_clear") => self.last_message.clear(),
+                _ => {}
             }
         }
     }
@@ -642,7 +750,8 @@ fn oracle_probe(
     keys: &str,
     setup: &str,
 ) -> Result<NvimResult, String> {
-    let mut nvim = NvimRpc::spawn().ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    let mut nvim =
+        NvimRpc::spawn(false, None).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
     let mut lua = String::new();
     // Neovim ships *default mappings* (`:h default-mappings`) that redefine
     // keys this corpus probes — `Y` is `y$`, `&` is `:&&<CR>`. The `-l` oracle
@@ -663,6 +772,15 @@ fn oracle_probe(
     lua.push_str("vim.o.shiftwidth = 4\n");
     lua.push_str("vim.o.expandtab = true\n");
     lua.push_str("vim.o.tabstop = 4\n");
+    // #1280: explicit even though it's already Neovim's default, mirroring
+    // `run_in_vimcode`'s matching `engine.settings.wrap = true` below — both
+    // sides need to agree on it going in, since vimcode's own *default*
+    // (`Settings::default()`) is `wrap: false`, the opposite of Neovim's.
+    // Without this, every screen-line-relative case (`g0`/`g^`/`g$`/`gj`/
+    // `gk`/…) silently compared a wrapped oracle against an unwrapped
+    // vimcode and only two of the four `word:g<Home>`/`g^`/`g$`/`g<End>`
+    // cases added here happened to still agree by coincidence.
+    lua.push_str("vim.o.wrap = true\n");
     lua.push_str(setup);
     lua.push('\n');
     // `nvim_buf_set_lines` is itself an undo step, so without this the `undo:`
@@ -710,7 +828,8 @@ fn oracle_probe(
     let dump = "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
                 local pos = vim.api.nvim_win_get_cursor(0)\n\
                 local rows = vim.api.nvim_win_get_height(0)\n\
-                return vim.fn.json_encode({buf = buf, line = pos[1], col = pos[2] + 1, rows = rows})";
+                local cols = vim.api.nvim_win_get_width(0)\n\
+                return vim.fn.json_encode({buf = buf, line = pos[1], col = pos[2] + 1, rows = rows, cols = cols})";
     let json = nvim.request_pumped(
         "nvim_exec_lua",
         vec![Value::from(dump), Value::Array(Vec::new())],
@@ -735,6 +854,94 @@ fn run_in_neovim(
         Ok(result) => Some(result),
         Err(why) => {
             eprintln!("oracle failed for keys={keys:?}: {why}");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Echo-area / message-list probe (#1282) — a second shape the buffer+cursor
+// harness above structurally cannot see: `:reg`, `:marks`, `ga`, `<C-g>` and
+// the rest of `CASES_MESSAGE` below leave the buffer and cursor untouched, so
+// the only observable is whatever landed in the echo area. `oracle_probe`
+// itself is untouched; this is a sibling that spawns with `ext_messages`
+// (see `NvimRpc::last_message`) instead of trying to bolt message capture
+// onto the hot path every other one of the ~1,400 buffer/cursor cases runs.
+// ---------------------------------------------------------------------------
+
+/// Same fixture preamble as [`oracle_probe`] (kept in sync by hand — see that
+/// function's own comments for why each line is there), but returns the
+/// **message** the key sequence produced rather than the buffer/cursor.
+fn oracle_probe_message(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> Result<String, String> {
+    let mut nvim =
+        NvimRpc::spawn(true, None).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    let mut lua = String::new();
+    lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
+    lua.push_str("vim.o.inccommand = ''\n");
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.shiftwidth = 4\n");
+    lua.push_str("vim.o.expandtab = true\n");
+    lua.push_str("vim.o.tabstop = 4\n");
+    lua.push_str("vim.o.wrap = true\n");
+    lua.push_str(setup);
+    lua.push('\n');
+    lua.push_str("vim.o.undolevels = -1\n");
+    lua.push_str("vim.api.nvim_buf_set_lines(0, 0, -1, false, {");
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            lua.push_str(", ");
+        }
+        let escaped = line
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\t', "\\t");
+        lua.push('"');
+        lua.push_str(&escaped);
+        lua.push('"');
+    }
+    lua.push_str("})\n");
+    lua.push_str("vim.o.undolevels = 1000\n");
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        cursor_line_1,
+        cursor_col_1.saturating_sub(1)
+    ));
+    nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
+    )?;
+
+    // The fixture install above can itself produce a `msg_show` (e.g. the
+    // startup intro screen's hit-enter dismissal) — clear it so `keys` below
+    // is the only thing that can leave a message behind.
+    nvim.last_message.clear();
+    for key in nvim_key_tokens(keys) {
+        nvim.type_key(&key)?;
+    }
+    // `type_key`'s barrier (`nvim_eval "line('w0')"`) already proves the
+    // redraw that would carry a `msg_show` for the last key has happened, so
+    // no extra wait is needed here the way `request_pumped`'s hit-enter
+    // dismissal needs one elsewhere.
+    Ok(nvim.last_message.clone())
+}
+
+fn run_in_neovim_message(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> Option<String> {
+    match oracle_probe_message(lines, cursor_line_1, cursor_col_1, keys, setup) {
+        Ok(msg) => Some(msg),
+        Err(why) => {
+            eprintln!("oracle (message probe) failed for keys={keys:?}: {why}");
             None
         }
     }
@@ -928,6 +1135,32 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
         if stmt.is_empty() {
             continue;
         }
+        // #1151: the `:map` family's oracle cases need two statement shapes
+        // `vim.o.<name>=<value>` can't express — a mapping definition, and
+        // (for `<leader>` cases) the leader itself. Both are real Lua Neovim
+        // needs no help with; only vimcode's side needs a translator, since
+        // it has no Lua interpreter.
+        if let Some(value) = stmt.strip_prefix("vim.g.mapleader") {
+            let value = value.trim().strip_prefix('=').ok_or_else(|| {
+                format!("unparseable setup statement {stmt:?} — expected `vim.g.mapleader = value`")
+            })?;
+            let value = unquote_lua(value.trim())
+                .ok_or_else(|| format!("unterminated string in setup statement {stmt:?}"))?;
+            let ch = value.chars().next().ok_or_else(|| {
+                format!(
+                    "'vim.g.mapleader' must be a single character, got {value:?} (from {stmt:?})"
+                )
+            })?;
+            settings.leader = ch;
+            continue;
+        }
+        if let Some(inner) = stmt
+            .strip_prefix("vim.keymap.set(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            apply_keymap_set(settings, stmt, inner)?;
+            continue;
+        }
         let body = stmt.strip_prefix("vim.o.").ok_or_else(|| {
             format!("unsupported setup statement {stmt:?} — only `vim.o.<name>=<value>` is parsed")
         })?;
@@ -966,10 +1199,10 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                 ));
             }
             "foldmethod" | "fdm" => {
-                if value != "manual" && value != "indent" {
+                if !matches!(value, "manual" | "indent" | "marker") {
                     return Err(format!(
-                        "'foldmethod' only 'manual'/'indent' are modeled in apply_setup; \
-                         {raw_value:?} needs real handling there"
+                        "'foldmethod' only 'manual'/'indent'/'marker' are modeled in \
+                         apply_setup; {raw_value:?} needs real handling there"
                     ));
                 }
                 settings.foldmethod = value.to_string();
@@ -979,6 +1212,55 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
                     format!("'foldlevel' expects a non-negative integer, got {raw_value:?}")
                 })?;
             }
+            // #1159
+            "foldmarker" | "fmr" => {
+                settings.foldmarker = value.to_string();
+            }
+            "foldnestmax" | "fdn" => {
+                settings.foldnestmax = value.parse::<usize>().map_err(|_| {
+                    format!("'foldnestmax' expects a positive integer, got {raw_value:?}")
+                })?;
+            }
+            // #1153
+            "wrapscan" | "ws" => settings.wrapscan = parse_lua_bool(name, value)?,
+            "shiftround" | "sr" => settings.shiftround = parse_lua_bool(name, value)?,
+            "gdefault" | "gd" => settings.gdefault = parse_lua_bool(name, value)?,
+            "softtabstop" | "sts" => {
+                settings.softtabstop = value
+                    .parse::<i32>()
+                    .map_err(|_| format!("'softtabstop' expects an integer, got {raw_value:?}"))?;
+            }
+            "virtualedit" | "ve" => {
+                settings.virtualedit = value.to_string();
+            }
+            // #1191
+            "iskeyword" | "isk" => {
+                settings.iskeyword = value.to_string();
+            }
+            // #1190
+            "hidden" | "hid" => settings.hidden = parse_lua_bool(name, value)?,
+            // #1207
+            "magic" => settings.magic = parse_lua_bool(name, value)?,
+            "smartindent" | "si" => settings.smartindent = parse_lua_bool(name, value)?,
+            "cindent" | "cin" => settings.cindent = parse_lua_bool(name, value)?,
+            "showmatch" | "sm" => settings.showmatch = parse_lua_bool(name, value)?,
+            // #1206
+            "whichwrap" | "ww" => settings.whichwrap = value.to_string(),
+            "backspace" | "bs" => settings.backspace = value.to_string(),
+            "scrolljump" | "sj" => {
+                settings.scrolljump = value.parse::<usize>().map_err(|_| {
+                    format!("'scrolljump' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
+            "sidescrolloff" | "siso" => {
+                settings.sidescrolloff = value.parse::<usize>().map_err(|_| {
+                    format!("'sidescrolloff' expects a non-negative integer, got {raw_value:?}")
+                })?;
+            }
+            // #1280: the six horizontal-scroll z-commands only do anything
+            // with 'wrap' off — with it on they're documented no-ops (the
+            // line soft-wraps to another screen row instead of scrolling).
+            "wrap" | "wr" => settings.wrap = parse_lua_bool(name, value)?,
             other => {
                 return Err(format!(
                     "no vimcode Settings mapping for option '{other}' (from {stmt:?}) — add one \
@@ -990,6 +1272,65 @@ fn apply_setup(settings: &mut Settings, setup: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse and apply one `vim.keymap.set('mode', 'lhs', 'rhs' [, {remap = true}])`
+/// setup statement onto vimcode's [`Settings::keymaps`] (#1151).
+///
+/// Real Neovim's `vim.keymap.set` defaults to **non-recursive** — `opts.remap`
+/// defaults to `false`, the opposite of legacy `:map`'s default — so a call
+/// with no options table is stored `noremap`; only an explicit
+/// `remap = true` makes it recursive (vimcode's `noremap = false`). Getting
+/// this default backwards would make every case using the plain 3-argument
+/// form compare vimcode's `noremap` against Neovim's `map`, silently.
+/// Scan a Lua options-table fragment (e.g. `{ remap = true }` or
+/// `{ noremap = true, silent = true }`) for an exact `key = true` /
+/// `key=true` assignment. A raw substring test (`inner.contains("remap =
+/// true")`) also matches inside `noremap = true` — `"noremap = true"[2..]`
+/// is literally `"remap = true"` — which would flip `remap` on for the
+/// opposite, and historically real, `nvim_set_keymap` option name (#1151
+/// review). Scanning comma-separated key=value segments and matching `key`
+/// as a whole token (not a substring) avoids that.
+fn has_true_opt(inner: &str, key: &str) -> bool {
+    inner.split(',').any(|part| {
+        let part = part
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        match part.strip_prefix(key) {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                rest.strip_prefix('=')
+                    .map(|v| v.trim_start().starts_with("true"))
+                    .unwrap_or(false)
+            }
+            None => false,
+        }
+    })
+}
+
+fn apply_keymap_set(settings: &mut Settings, stmt: &str, inner: &str) -> Result<(), String> {
+    let remap = has_true_opt(inner, "remap");
+    // "'i', 'jk', '<Esc>'".split('\'') → ["", "i", ", ", "jk", ", ", "<Esc>", ""],
+    // so the three string arguments sit at indices 1, 3, 5.
+    let quoted: Vec<&str> = inner.split('\'').collect();
+    if quoted.len() < 6 {
+        return Err(format!(
+            "unparseable vim.keymap.set(...) args in {stmt:?} — expected \
+             vim.keymap.set('mode', 'lhs', 'rhs') with single-quoted string args"
+        ));
+    }
+    let (mode, lhs, rhs) = (quoted[1], quoted[3], quoted[5]);
+    if mode.chars().count() != 1 {
+        return Err(format!(
+            "vim.keymap.set mode {mode:?} must be a single letter (from {stmt:?}) — \
+             a table of modes is not supported here"
+        ));
+    }
+    let bang = if remap { "" } else { "!" };
+    settings.keymaps.push(format!("{mode}{bang} {lhs} {rhs}"));
+    Ok(())
+}
+
 fn run_in_vimcode(
     label: &str,
     lines: &[&str],
@@ -997,6 +1338,7 @@ fn run_in_vimcode(
     cursor_col_1: usize,
     keys: &str,
     rows: usize,
+    cols: usize,
     setup: &str,
 ) -> (String, usize, usize) {
     let text = lines.join("\n");
@@ -1004,21 +1346,37 @@ fn run_in_vimcode(
     engine.settings.shift_width = 4;
     engine.settings.expand_tab = true;
     engine.settings.tabstop = 4;
-    // The case's own `setup` goes on last so it overrides those three shared
+    // #1280: vimcode's own default (`Settings::default()`) is `wrap: false`
+    // — Neovim's is on — so this has to be forced the same way the three
+    // options above are, or every screen-line-relative case silently
+    // compares a wrapped oracle against an unwrapped vimcode. See the
+    // matching `vim.o.wrap = true` in `oracle_probe` for the other side.
+    engine.settings.wrap = true;
+    // The case's own `setup` goes on last so it overrides those four shared
     // defaults, mirroring `run_in_neovim`, which likewise splices `setup` in
-    // after its `shiftwidth`/`expandtab`/`tabstop` preamble.
+    // after its `shiftwidth`/`expandtab`/`tabstop`/`wrap` preamble.
     if let Err(why) = apply_setup(&mut engine.settings, setup) {
         panic!("conformance case {label:?}: bad `setup` — {why}");
     }
+    // `apply_setup` may have pushed onto `settings.keymaps` (a `vim.g.mapleader`
+    // or `vim.keymap.set` statement, #1151) or changed `settings.leader`, and
+    // `engine_with` only rebuilt `user_keymaps` from *its* defaults before any
+    // of that ran — cheap regardless, since most cases have neither.
+    engine.rebuild_user_keymaps();
     // Screen-relative motions (H/M/L, <C-d>, zt) are meaningless unless both
     // sides agree on the window height, so mirror nvim's.
     engine.set_viewport_lines(rows);
-    // Neovim computes the whole 'foldmethod'=indent fold hierarchy (down to
-    // 'foldlevel') as soon as the buffer is loaded, with no explicit `zf` —
-    // mirror that here rather than leaving it for the key sequence to
-    // trigger, since a case may probe fold state without ever pressing a
-    // z-command (e.g. plain `j`/`G` motions across an already-closed fold).
-    if engine.settings.foldmethod == "indent" {
+    // Same reasoning, horizontally (#1280): zh/zl/zH/zL/ze/zs are meaningless
+    // if the two sides disagree on window width.
+    engine.set_viewport_cols(cols);
+    // Neovim computes the whole 'foldmethod'=indent/marker fold hierarchy
+    // (down to 'foldlevel') as soon as the buffer is loaded, with no
+    // explicit `zf` — mirror that here rather than leaving it for the key
+    // sequence to trigger, since a case may probe fold state without ever
+    // pressing a z-command (e.g. plain `j`/`G` motions across an
+    // already-closed fold). #1159 extended this from "indent" to also cover
+    // "marker".
+    if matches!(engine.settings.foldmethod.as_str(), "indent" | "marker") {
         engine.apply_foldlevel(engine.settings.foldlevel);
     }
     engine.view_mut().cursor.line = cursor_line_1.saturating_sub(1);
@@ -1032,6 +1390,332 @@ fn run_in_vimcode(
     let col = engine.view().cursor.col + 1;
     (buf, line, col)
 }
+
+/// [`run_in_vimcode`]'s sibling for the message probe (#1282): same fixture
+/// preamble, but reads back `engine.message` instead of buffer/cursor. The
+/// window dims are the fixed 80x22 every other case reads dynamically off
+/// the oracle ([`UI_WIDTH`]/[`UI_HEIGHT`], minus the status+cmd lines) —
+/// fixed rather than threaded through is fine here because none of
+/// `CASES_MESSAGE` probes anything viewport-relative.
+fn run_in_vimcode_message(
+    label: &str,
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+) -> String {
+    let text = lines.join("\n");
+    let mut engine = engine_with(&text);
+    // Mirrors a real asymmetry between the two fixture-install paths, not a
+    // vimcode behaviour gap: `oracle_probe_message` seeds the buffer via
+    // `nvim_buf_set_lines` on Neovim's already-existing unnamed buffer,
+    // which Neovim always counts as a modification (confirmed against a
+    // live oracle — `<C-g>`/`:file` both print `[Modified]` even though
+    // `keys` never touched the buffer). `engine_with`'s direct
+    // `buffer_mut().insert` bypasses the edit path that would set this, so
+    // without it every message that reports dirty status would read
+    // "unmodified" purely because of *how the fixture got the text in*, not
+    // because of anything Neovim and vimcode actually disagree on.
+    if !text.is_empty() {
+        engine.set_dirty(true);
+    }
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.settings.wrap = true;
+    if let Err(why) = apply_setup(&mut engine.settings, setup) {
+        panic!("conformance case {label:?}: bad `setup` — {why}");
+    }
+    engine.rebuild_user_keymaps();
+    engine.set_viewport_lines(UI_HEIGHT as usize - 2);
+    engine.set_viewport_cols(UI_WIDTH as usize);
+    engine.view_mut().cursor.line = cursor_line_1.saturating_sub(1);
+    engine.view_mut().cursor.col = cursor_col_1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    // The `keys` sequence itself is the only thing allowed to leave a
+    // message behind, same discipline as `oracle_probe_message`'s
+    // `last_message.clear()`.
+    engine.message.clear();
+    send_keys(&mut engine, keys);
+    engine.message.clone()
+}
+
+/// Minimal, explicit normalization for comparing a message-probe pair — kept
+/// deliberately small so it cannot quietly swallow a real deviation (the
+/// module doc's warning about a vacuous normalizer). Each strip is named so
+/// a failing case says exactly what was and wasn't discounted:
+///
+/// * trailing whitespace on every line, and any run of interior spaces
+///   collapsed to one — column-padding differences between the two sides'
+///   independently-written table formatters are not a Vim-compat deviation;
+/// * this repo's own absolute path (the fixture's cwd, which `:pwd` prints
+///   verbatim) replaced with a fixed placeholder, since the raw path is a
+///   property of the machine running the test, not of either editor.
+fn normalize_message(msg: &str) -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut out = msg.to_string();
+    if !cwd.is_empty() {
+        out = out.replace(&cwd, "{CWD}");
+    }
+    out.lines()
+        .map(|line| line.trim_end())
+        .map(|line| {
+            let mut collapsed = String::with_capacity(line.len());
+            let mut last_was_space = false;
+            for ch in line.chars() {
+                if ch == ' ' {
+                    if !last_was_space {
+                        collapsed.push(' ');
+                    }
+                    last_was_space = true;
+                } else {
+                    collapsed.push(ch);
+                    last_was_space = false;
+                }
+            }
+            collapsed
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+struct MessageCase {
+    label: &'static str,
+    lines: &'static [&'static str],
+    cursor_line: usize,
+    cursor_col: usize,
+    keys: &'static str,
+    setup: &'static str,
+}
+
+const fn mc(
+    label: &'static str,
+    lines: &'static [&'static str],
+    cursor_line: usize,
+    cursor_col: usize,
+    keys: &'static str,
+) -> MessageCase {
+    MessageCase {
+        label,
+        lines,
+        cursor_line,
+        cursor_col,
+        keys,
+        setup: "",
+    }
+}
+
+fn run_message_case(case: &MessageCase) -> Outcome {
+    let nvim_msg = match run_in_neovim_message(
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        case.keys,
+        case.setup,
+    ) {
+        Some(m) => m,
+        None => return Outcome::NvimBroke,
+    };
+    let vc_msg = run_in_vimcode_message(
+        case.label,
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        case.keys,
+        case.setup,
+    );
+    let nvim_norm = normalize_message(&nvim_msg);
+    let vc_norm = normalize_message(&vc_msg);
+    if nvim_norm == vc_norm {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start={:?}@({},{})\n  message: nvim={:?} vimcode={:?}\n  normalized: nvim={:?} vimcode={:?}",
+        case.label,
+        case.keys,
+        case.lines,
+        case.cursor_line,
+        case.cursor_col,
+        nvim_msg,
+        vc_msg,
+        nvim_norm,
+        vc_norm,
+    ))
+}
+
+// One real case per id from #1282's echo-area/message-list list. Each `keys`
+// literally contains the [`CommandProbe`] needle that id's `p(..)` entry in
+// `COMMAND_PROBES` matches on — that is what retires the id from
+// `COVERAGE_EXEMPT`, same convention `CASES_XFILE`/`CASES_WIN` use.
+const CASES_MESSAGE: &[MessageCase] = &[
+    // other:ga, g:ga — `Keys("ga")`.
+    mc(
+        "msg:ga shows ascii/hex/octal value under cursor",
+        &["hello"],
+        1,
+        1,
+        "ga",
+    ),
+    // other:g8, g:g8 — `Keys("g8")`. A multi-byte character so the probe
+    // actually exercises the UTF-8-byte-sequence path, not just a 1-byte
+    // ASCII shortcut.
+    mc(
+        "msg:g8 shows utf-8 byte sequence under cursor",
+        &["h\u{65e5}llo"],
+        1,
+        2,
+        "g8",
+    ),
+    // other:CTRL-G — `Label("misc:C-g")`. `'ruler'` is on by default
+    // (Neovim's, matching this suite's default), so this is the "N lines"
+    // form — see the paired `line X of Y col C` engine-level tests in
+    // `src/core/engine/tests.rs`.
+    mc(
+        "msg:misc:C-g shows file info",
+        &["one", "two", "three"],
+        2,
+        1,
+        "<C-g>",
+    ),
+    // ex::ls, ex::buffers — `Keys(":ls")` / `Keys(":buffers")`.
+    mc("msg:ex::ls lists the buffer", &["hello"], 1, 1, ":ls<CR>"),
+    mc(
+        "msg:ex::buffers lists the buffer",
+        &["hello"],
+        1,
+        1,
+        ":buffers<CR>",
+    ),
+    // ex::reg, ex::registers — `Keys(":reg")` / `Keys(":registers")`. Named
+    // register only (`"reg a`, not bare `:reg`) so the probe's own message
+    // doesn't depend on whether the *machine* running the test has a
+    // clipboard provider — bare `:reg`/`:registers` iterates the `*`/`+`
+    // registers too, and Neovim prints a `clipboard: No provider...` line
+    // for those the instant it's asked, independent of whether anything was
+    // ever yanked.
+    mc(
+        "msg:ex::reg shows one named register's content",
+        &["hello world"],
+        1,
+        1,
+        "\"ayy:reg a<CR>",
+    ),
+    mc(
+        "msg:ex::registers shows one named register's content",
+        &["hello world"],
+        1,
+        1,
+        "\"byy:registers b<CR>",
+    ),
+    // ex::marks — `Keys(":marks")`.
+    mc(
+        "msg:ex::marks lists a set mark",
+        &["one", "two", "three"],
+        2,
+        1,
+        "maG:marks<CR>",
+    ),
+    // ex::jumps — `Keys(":jumps")`.
+    mc(
+        "msg:ex::jumps lists a jump",
+        &["one", "two", "three", "four", "five"],
+        1,
+        1,
+        "G<C-o>:jumps<CR>",
+    ),
+    // ex::digraphs — `Keys(":digraphs")`. #1160 already implements the
+    // table (`src/core/digraphs.rs`); this is that table's own listing
+    // command, not a custom `{char1}{char2} {number}` definition — Neovim
+    // emits no message at all for the definition form (confirmed against a
+    // live oracle), which would make a case built on it vacuous per this
+    // repo's #1154 bar.
+    mc(
+        "msg:ex::digraphs lists the digraph table",
+        &["hello"],
+        1,
+        1,
+        ":digraphs<CR>",
+    ),
+    // ex::changes — `Keys(":changes")`.
+    mc(
+        "msg:ex::changes lists a change",
+        &["hello"],
+        1,
+        1,
+        "ceHELLO<Esc>:changes<CR>",
+    ),
+    // ex::history — `Keys(":history")`. Two prior ex commands give it
+    // something to list.
+    mc(
+        "msg:ex::history lists prior ex commands",
+        &["hello"],
+        1,
+        1,
+        ":ls<CR>:marks<CR>:history<CR>",
+    ),
+    // ex::echo {text} — `Keys(":echo")`.
+    mc(
+        "msg:ex::echo prints its argument",
+        &["hello"],
+        1,
+        1,
+        ":echo 'hi'<CR>",
+    ),
+    // ex::pwd — `Keys(":pwd")`. No `setup` needed: both the oracle child
+    // process and this test process inherit the same cwd, so
+    // `normalize_message`'s `{CWD}` substitution applies identically to
+    // both sides even though neither is told the path explicitly.
+    mc(
+        "msg:ex::pwd prints the current directory",
+        &["hello"],
+        1,
+        1,
+        ":pwd<CR>",
+    ),
+    // ex::file — `Keys(":file")`.
+    mc(
+        "msg:ex::file prints name and status",
+        &["one", "two"],
+        1,
+        1,
+        ":file<CR>",
+    ),
+    // ex::= — `Keys(":=")`.
+    mc(
+        "msg:ex::= prints the last line number",
+        &["one", "two", "three"],
+        1,
+        1,
+        ":=<CR>",
+    ),
+    // ex::# — `Keys(":#")`, alias for `:number`.
+    mc(
+        "msg:ex::# prints the current line with its number",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":#<CR>",
+    ),
+    // ex::number — `Keys(":number")`.
+    mc(
+        "msg:ex::number prints the current line with its number",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":number<CR>",
+    ),
+    // ex::print — `Keys(":print")`.
+    mc(
+        "msg:ex::print prints the current line",
+        &["one", "two", "three"],
+        2,
+        1,
+        ":print<CR>",
+    ),
+];
 
 // ---------------------------------------------------------------------------
 // Multi-file harness (#985) — the single-buffer harness above compares only
@@ -1401,6 +2085,273 @@ fn run_multi_case(case: &MultiFileCase) -> Outcome {
 }
 
 // ---------------------------------------------------------------------------
+// On-disk probe (#1282) — a third multi-file shape. `:w`/`:write`/`:wa`/
+// `:update`/`:saveas {file}`/`:read` leave the position harness above
+// nothing to compare (an already-open, already-correctly-positioned file
+// staying open is not what any of these commands are *for*) — the only
+// observable is bytes on disk (or, for `:read`, the buffer the bytes were
+// read *into*). Reuses [`MultiFileCase`]/[`write_multi_fixture`]/
+// [`resolve_multi_keys`] for the fixture shape, but — unlike
+// [`run_multi_case`] — gives nvim and vimcode **separate** fixture
+// directories: both sides genuinely write real files here, and running them
+// against one shared directory would let whichever side runs first feed its
+// own write into the other side's starting content.
+// ---------------------------------------------------------------------------
+
+/// Observed state after `keys` ran: the active buffer's own text, plus each
+/// fixture file's on-disk content in `case.files` order (`None` if the file
+/// no longer exists — none of `CASES_DISK` deletes one, but a real deviation
+/// that did should show up as a mismatch, not a panic).
+struct DiskObserved {
+    buf: String,
+    files: Vec<Option<String>>,
+}
+
+fn read_fixture_files(paths: &[PathBuf]) -> Vec<Option<String>> {
+    paths
+        .iter()
+        .map(|p| std::fs::read_to_string(p).ok())
+        .collect()
+}
+
+fn run_disk_in_neovim(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    cwd: &Path,
+    fixture_paths: &[PathBuf],
+) -> Option<DiskObserved> {
+    #[derive(Deserialize)]
+    struct Raw {
+        buf: Vec<String>,
+    }
+
+    let id = probe_id();
+    let mut lua = String::new();
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.hidden = true\n");
+    let escaped_start = start_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    let escaped_keys = resolved_keys.replace('\\', "\\\\").replace('"', "\\\"");
+    lua.push_str(&format!(
+        "pcall(function() vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(\"{escaped_keys}\", true, false, true), \"ntx\", false) end)\n"
+    ));
+    let result_path = std::env::temp_dir().join(format!("vimcode_disk_nvim_probe_{id}.json"));
+    let result_path_str = result_path.to_string_lossy().replace('\\', "/");
+    lua.push_str(&format!(
+        "local buf = vim.api.nvim_buf_get_lines(0, 0, -1, false)\n\
+         local result = vim.fn.json_encode({{buf = buf}})\n\
+         local f = io.open(\"{result_path_str}\", \"w\")\n\
+         f:write(result)\n\
+         f:close()\n\
+         vim.cmd(\"qa!\")\n"
+    ));
+    let script_path = std::env::temp_dir().join(format!("vimcode_disk_nvim_probe_{id}.lua"));
+    {
+        let mut f = std::fs::File::create(&script_path).ok()?;
+        f.write_all(lua.as_bytes()).ok()?;
+    }
+    let _ = std::fs::remove_file(&result_path);
+    let output = std::process::Command::new("nvim")
+        .arg("--headless")
+        .arg("-u")
+        .arg("NONE")
+        .arg("-i")
+        .arg("NONE")
+        .arg("-l")
+        .arg(script_path.to_string_lossy().as_ref())
+        .current_dir(cwd)
+        .output()
+        .ok();
+    let raw: Option<Raw> = match &output {
+        Some(o) => {
+            let raw: Option<Raw> = std::fs::read_to_string(&result_path)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok());
+            if raw.is_none() && !o.status.success() {
+                eprintln!(
+                    "nvim stderr (disk probe): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            raw
+        }
+        None => None,
+    };
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+    // Deliberately read the fixture files back from Rust rather than having
+    // the Lua script report their content: nvim's own write already landed
+    // on disk by the time `qa!` runs, so this is a plain filesystem read,
+    // not a second thing that could disagree with what `:w` actually did.
+    raw.map(|r| DiskObserved {
+        buf: r.buf.join("\n"),
+        files: read_fixture_files(fixture_paths),
+    })
+}
+
+fn run_disk_in_vimcode(
+    start_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    resolved_keys: &str,
+    fixture_paths: &[PathBuf],
+) -> DiskObserved {
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(start_path, OpenMode::Permanent)
+        .expect("open start file for disk probe");
+    engine.view_mut().cursor.line = start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, resolved_keys);
+    let buf = engine.buffer().to_string();
+    DiskObserved {
+        buf,
+        files: read_fixture_files(fixture_paths),
+    }
+}
+
+/// Unlike [`run_multi_case`], this calls [`write_multi_fixture`] **twice** —
+/// see the section doc above for why the two sides cannot share one
+/// directory here.
+fn run_disk_case(case: &MultiFileCase) -> Outcome {
+    let (nvim_dir, nvim_paths) = write_multi_fixture(case);
+    let nvim_keys = resolve_multi_keys(case.keys, &nvim_paths);
+    let nvim_start = nvim_paths[case.start_file].clone();
+    let nvim_observed = match run_disk_in_neovim(
+        &nvim_start,
+        case.start_line,
+        case.start_col,
+        &nvim_keys,
+        &nvim_dir,
+        &nvim_paths,
+    ) {
+        Some(o) => o,
+        None => {
+            let _ = std::fs::remove_dir_all(&nvim_dir);
+            return Outcome::NvimBroke;
+        }
+    };
+    let _ = std::fs::remove_dir_all(&nvim_dir);
+
+    let (vc_dir, vc_paths) = write_multi_fixture(case);
+    let vc_keys = resolve_multi_keys(case.keys, &vc_paths);
+    let vc_start = vc_paths[case.start_file].clone();
+    let vc_observed = run_disk_in_vimcode(
+        &vc_start,
+        case.start_line,
+        case.start_col,
+        &vc_keys,
+        &vc_paths,
+    );
+    let _ = std::fs::remove_dir_all(&vc_dir);
+
+    let norm = |s: &str| s.trim_end_matches('\n').to_string();
+    let buf_match = norm(&nvim_observed.buf) == norm(&vc_observed.buf);
+    let files_match = nvim_observed.files.len() == vc_observed.files.len()
+        && nvim_observed
+            .files
+            .iter()
+            .zip(vc_observed.files.iter())
+            .all(|(a, b)| a.as_deref().map(norm) == b.as_deref().map(norm));
+    if buf_match && files_match {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start={:?}@({},{})\n  buffer: nvim={:?} vimcode={:?}\n  files: nvim={:?} vimcode={:?}",
+        case.label,
+        case.keys,
+        case.files.get(case.start_file).map(|(name, _)| *name),
+        case.start_line,
+        case.start_col,
+        nvim_observed.buf,
+        vc_observed.buf,
+        nvim_observed.files,
+        vc_observed.files,
+    ))
+}
+
+const CASES_DISK: &[MultiFileCase] = &[
+    // ex::w — `Keys(":w")`.
+    mfc(
+        "disk:ex::w writes the modified buffer to its file",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:w<CR>",
+    ),
+    // ex::write — `Keys(":write")`.
+    mfc(
+        "disk:ex::write writes the modified buffer to its file",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:write<CR>",
+    ),
+    // ex::wa — `Keys(":wa")`. Two modified buffers so "all" is actually
+    // exercised, not indistinguishable from plain `:w`.
+    mfc(
+        "disk:ex::wa writes every modified buffer",
+        &[("a.txt", &["foo"]), ("b.txt", &["bar"])],
+        0,
+        1,
+        1,
+        "Ax<Esc>:e {F1}<CR>Ay<Esc>:wa<CR>",
+    ),
+    // ex::update — `Keys(":update")`.
+    mfc(
+        "disk:ex::update writes a modified buffer",
+        &[("main.txt", &["hello"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:update<CR>",
+    ),
+    // ex::saveas {file} — `Keys(":saveas")`. Asserts both halves: the new
+    // path gets the modified content, and the old path is left exactly as
+    // the fixture wrote it (`:saveas` renames the buffer, it does not also
+    // write the name being abandoned). Bang required: `new.txt` already
+    // exists (the fixture pre-seeds it so there's something to assert stays
+    // untouched only where the case's own edit *didn't* land), and Neovim's
+    // `:saveas` refuses an existing target without `!` — confirmed against a
+    // live `nvim --headless -u NONE` (`E13: File exists`).
+    mfc(
+        "disk:ex::saveas {file} writes to the new path, leaves the old one untouched",
+        &[("orig.txt", &["hello"]), ("new.txt", &["placeholder"])],
+        0,
+        1,
+        1,
+        "A world<Esc>:saveas! {F1}<CR>",
+    ),
+    // ex::read — `Keys(":read")`. Buffer-visible (the read file's content
+    // lands after the cursor line), which is exactly why this harness reads
+    // `buf` too, not only `files` — and `other.txt` staying byte-identical
+    // on disk is itself part of the assertion: `:read` never writes.
+    mfc(
+        "disk:ex::read inserts a file's content after the cursor line",
+        &[("main.txt", &["one", "two"]), ("other.txt", &["OTHER"])],
+        0,
+        1,
+        1,
+        ":read {F1}<CR>",
+    ),
+];
+
+// ---------------------------------------------------------------------------
 // `:jumps` list-content harness (#985) — a second multi-file shape: instead
 // of "where did the cursor end up", this compares the jump list's *contents*
 // (count, ordering, which entry is current, and each entry's file) against
@@ -1668,6 +2619,679 @@ fn run_jumps_case(case: &MultiJumpsCase) -> Outcome {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Multi-window / multi-tab layout harness (#1162) — generalises the
+// single-buffer harness above (buffer text + one cursor) and the multi-file
+// harness above that (which file is current + one cursor) to a third
+// dimension neither can see: the *window tree* — split orientation, nesting,
+// which window is current, and each window's own (file, cursor). This is
+// what the 33 `CTRL-W` rows need and what `VIM_COMPATIBILITY.md` has never
+// had an oracle case for (`win:CTRL-W *`, 33 of 33 uncovered as of #1162).
+//
+// ## Comparing trees, not raw geometry
+//
+// The oracle side calls Neovim's own `winlayout()` — a builtin that already
+// returns exactly this shape (`{"row"|"col"|"leaf", ...}`, recursively) — via
+// a small Lua snapshot ([`WIN_SNAPSHOT_LUA`]) that resolves each `winid` leaf
+// into (file, cursor, current-window flag, height, width) so the whole
+// tabpage/window tree comes back as one JSON blob. The vimcode side walks
+// `Tab::layout` (a strict *binary* tree — every `Split` has exactly two
+// children) and **flattens runs of same-direction nested splits into one
+// N-ary group** ([`flatten_vc`]) before comparing, because Neovim's own
+// frame tree does the same thing: three side-by-side `:vsplit`s come back as
+// one `"row"` with three children, not two nested binary pairs (verified
+// empirically against nvim 0.12.5 — see the PR this landed in). Comparing
+// the flattened shapes means a case is not sensitive to *how* vimcode's
+// binary tree happens to nest a same-direction sequence of splits, only to
+// what a human (or Neovim) would actually see on screen.
+//
+// ## Size is opt-in per case (`WinCase::check_size`)
+//
+// Every leaf carries `rows`/`cols` (Neovim's `nvim_win_get_height`/`_width`,
+// vimcode's own `WindowLayout::calculate_rects` against the same pinned
+// 80x24 screen), but the comparison only *looks* at them when
+// `check_size` is set — see the [`KNOWN_DEVIATIONS_WIN`] comment block below
+// for the real, distinct behavioural gaps this surfaced along the way (a
+// resize-unit mismatch, a partial vs full maximize, a rect-rounding
+// artifact, and a divider-thickness gap — all now fixed). Every size-checked
+// id, `CTRL-W +`/`-`/`<`/`>`/`_`/`\|`, genuinely passes — not vacuously: all
+// six land on the *same* rows/cols as Neovim on this harness's fixed 80x24
+// screen.
+//
+// ## What's deliberately out of scope here
+//
+// `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` are not covered by any
+// [`CASES_WIN`] entry — see the "Deliberate semantic divergence" block in
+// [`COVERAGE_EXEMPT`] for why each is permanent, not debt. [`KNOWN_
+// DEVIATIONS_WIN`] is currently empty (every id it ever listed — `-`/`=`/
+// `r`/`R`/`p`/`<`/`>`/`\|` — got fixed and removed); were it to gain an
+// entry again, that entry would be a real, non-vacuous finding, not a
+// permanent divergence — the convention this file's comments have followed
+// throughout is that every entry names the fix it's waiting on. Cross-file/
+// cross-tab commands (`gf`, `gt`, `CTRL-^`, buffer/tab/window ex commands)
+// that could reuse this same harness are #1281, chained after this one.
+// ---------------------------------------------------------------------------
+
+/// One scenario for the window-layout harness: `lines` is written to
+/// `main.txt` in a fresh temp dir (the file the case starts on);
+/// `extra_files` are written alongside it for scenarios that need a second
+/// real file (`CTRL-W f`, which opens whatever path is under the cursor —
+/// nothing else in this array needs it, so it's empty everywhere else).
+struct WinCase {
+    label: &'static str,
+    lines: &'static [&'static str],
+    extra_files: &'static [(&'static str, &'static [&'static str])],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+    /// Whether the comparison also checks each leaf's (rows, cols). See the
+    /// module doc above — off for every id except `CTRL-W =` and the
+    /// [`KNOWN_DEVIATIONS_WIN`] resize/maximize/previous-window entries,
+    /// where the size (or lack of previous-window tracking) *is* the finding.
+    check_size: bool,
+}
+
+const fn wc(
+    label: &'static str,
+    lines: &'static [&'static str],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files: &[],
+        start_line,
+        start_col,
+        keys,
+        check_size: false,
+    }
+}
+
+/// Like [`wc`], but the comparison also checks each leaf's (rows, cols) —
+/// see [`WinCase::check_size`].
+const fn wc_sized(
+    label: &'static str,
+    lines: &'static [&'static str],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files: &[],
+        start_line,
+        start_col,
+        keys,
+        check_size: true,
+    }
+}
+
+/// Like [`wc`], but with extra files written alongside `main.txt` — only
+/// `CTRL-W f` needs this (opens whatever file path is under the cursor).
+const fn wc_files(
+    label: &'static str,
+    lines: &'static [&'static str],
+    extra_files: &'static [(&'static str, &'static [&'static str])],
+    start_line: usize,
+    start_col: usize,
+    keys: &'static str,
+) -> WinCase {
+    WinCase {
+        label,
+        lines,
+        extra_files,
+        start_line,
+        start_col,
+        keys,
+        check_size: false,
+    }
+}
+
+/// Write `case.lines` to `main.txt` and `case.extra_files` alongside it, in a
+/// fresh, canonicalized temp dir (see `write_multi_fixture`'s doc for why
+/// canonicalizing here, not at comparison time, is load-bearing on macOS).
+fn write_win_fixture(case: &WinCase) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+    let dir = std::env::temp_dir().join(format!("vimcode_win_probe_{}", probe_id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir for win probe");
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let main_path = dir.join("main.txt");
+    std::fs::write(&main_path, case.lines.join("\n")).expect("write win fixture main file");
+    let extra_paths = case
+        .extra_files
+        .iter()
+        .map(|(name, lines)| {
+            let path = dir.join(name);
+            std::fs::write(&path, lines.join("\n")).expect("write win fixture extra file");
+            path
+        })
+        .collect();
+    (dir, main_path, extra_paths)
+}
+
+/// Resolves an absolute path (from either oracle) to which fixture file it
+/// is, so the two sides' leaves can be compared without caring that they ran
+/// in different temp dirs. `None` (neither `main` nor a known extra) reads
+/// as [`FileTag::Unnamed`] — the same bucket a real unnamed scratch buffer
+/// (`:new`/`:vnew`) falls into, since neither side names a nonexistent file.
+struct FixturePaths {
+    main: PathBuf,
+    extra: Vec<PathBuf>,
+}
+
+impl FixturePaths {
+    fn tag_for(&self, path: &Path) -> FileTag {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if canon
+            == self
+                .main
+                .canonicalize()
+                .unwrap_or_else(|_| self.main.clone())
+        {
+            return FileTag::Main;
+        }
+        for (i, extra) in self.extra.iter().enumerate() {
+            if canon == extra.canonicalize().unwrap_or_else(|_| extra.clone()) {
+                return FileTag::Extra(i);
+            }
+        }
+        FileTag::Unnamed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTag {
+    /// No file backs this window's buffer (`:new`/`:vnew`'s fresh scratch
+    /// buffer, or a name neither oracle's fixture recognises).
+    Unnamed,
+    /// `main.txt` — the file every case starts on.
+    Main,
+    /// `extra_files[i]` — only reachable via `CTRL-W f`.
+    Extra(usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WinLeaf {
+    file: FileTag,
+    /// 1-indexed, matching Neovim's own `nvim_win_get_cursor`/`line()`.
+    line: usize,
+    col: usize,
+    current: bool,
+    /// `Some((rows, cols))` only when `WinCase::check_size` is set — see the
+    /// module doc for why most ids leave this `None`.
+    size: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum WinNode {
+    Leaf(WinLeaf),
+    /// `row` = side-by-side (Neovim's `"row"`, vimcode's
+    /// `SplitDirection::Vertical`); `false` = stacked (Neovim's `"col"`,
+    /// vimcode's `SplitDirection::Horizontal`) — see `to_quadraui_direction`'s
+    /// doc comment in `src/core/window.rs` for why the two crates name this
+    /// axis oppositely, which this harness deliberately does not inherit.
+    Group {
+        row: bool,
+        children: Vec<WinNode>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WinTab {
+    current: bool,
+    layout: WinNode,
+}
+
+/// The recursive Lua snapshot: resolves Neovim's own `winlayout()` (already
+/// exactly this shape — see the module doc) per tabpage into one JSON blob
+/// with each leaf's file/cursor/current/size resolved, so no further nvim
+/// round-trips are needed after the keys are fed.
+const WIN_SNAPSHOT_LUA: &str = "\
+local function resolve(node)\n\
+  if node[1] == \"leaf\" then\n\
+    local winid = node[2]\n\
+    local bufid = vim.api.nvim_win_get_buf(winid)\n\
+    local name = vim.api.nvim_buf_get_name(bufid)\n\
+    local pos = vim.api.nvim_win_get_cursor(winid)\n\
+    return {\n\
+      kind = \"leaf\",\n\
+      file = name,\n\
+      line = pos[1],\n\
+      col = pos[2] + 1,\n\
+      current = (winid == vim.api.nvim_get_current_win()),\n\
+      rows = vim.api.nvim_win_get_height(winid),\n\
+      cols = vim.api.nvim_win_get_width(winid),\n\
+    }\n\
+  else\n\
+    local children = {}\n\
+    for i, child in ipairs(node[2]) do\n\
+      children[i] = resolve(child)\n\
+    end\n\
+    return { kind = \"group\", row = (node[1] == \"row\"), children = children }\n\
+  end\n\
+end\n\
+local tabs = {}\n\
+for i, tabid in ipairs(vim.api.nvim_list_tabpages()) do\n\
+  tabs[i] = {\n\
+    current = (tabid == vim.api.nvim_get_current_tabpage()),\n\
+    layout = resolve(vim.fn.winlayout(vim.api.nvim_tabpage_get_number(tabid))),\n\
+  }\n\
+end\n\
+local result = { tabs = tabs }\n\
+";
+
+/// Drive the window-layout probe's oracle over the same attached-UI RPC
+/// transport [`oracle_probe`] uses (#1008), reporting *why* a spawn/RPC
+/// failure happened rather than collapsing it to `None` — same contract as
+/// [`oracle_probe`], and for the same reason.
+///
+/// This replaced `nvim --headless -l script.lua` + one `nvim_feedkeys` burst
+/// (#1328). That oracle attached no UI, so Neovim's own `:h cmdwin` — `q:`,
+/// `q/`, `q?` — silently refused to open (confirmed empirically: `winlayout()`
+/// and `nvim_list_wins()` came back completely unchanged) and every case
+/// exercising it compared vimcode against a harness gap, not against real
+/// Neovim behaviour. Typing through `nvim_input` one key at a time, the same
+/// way [`oracle_probe`] does, is also what lets a command's window/tab side
+/// effects (a split, a cmdwin) exist by the time the snapshot below reads
+/// them — a single `nvim_feedkeys` burst runs inside `exec_normal`, which
+/// never returns to the main loop that would apply them.
+fn oracle_probe_win(
+    main_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    keys: &str,
+    cwd: &Path,
+) -> Result<serde_json::Value, String> {
+    let mut nvim = NvimRpc::spawn(false, Some(cwd))
+        .ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    let mut lua = String::new();
+    // Same interactive-behaviour opt-outs as `oracle_probe`'s fixture
+    // preamble (#1008's module doc table) — typing for real through an
+    // attached UI brings Neovim's default mappings and live `:s` preview with
+    // it, neither of which any `CASES_WIN`/`CASES_XFILE` case means to
+    // exercise.
+    lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
+    lua.push_str("vim.o.inccommand = ''\n");
+    lua.push_str("vim.o.compatible = false\n");
+    lua.push_str("vim.o.hidden = true\n");
+    // No explicit `vim.o.lines`/`vim.o.columns` here (unlike the `-l` oracle
+    // this replaced): `NvimRpc::spawn`'s own `nvim_ui_attach(UI_WIDTH,
+    // UI_HEIGHT, ..)` already pins the same 80x24 screen `CTRL-W` resize/
+    // maximize/equalize cases need agreement on (#1162).
+    let escaped_start = main_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    lua.push_str(&format!(
+        "vim.cmd(\"edit \" .. vim.fn.fnameescape(\"{escaped_start}\"))\n"
+    ));
+    lua.push_str(&format!(
+        "vim.api.nvim_win_set_cursor(0, {{{}, {}}})\n",
+        start_line,
+        start_col.saturating_sub(1)
+    ));
+    nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(lua.as_str()), Value::Array(Vec::new())],
+    )?;
+
+    // One key at a time via `nvim_input`, never `nvim_feedkeys` — see this
+    // function's own doc comment for why.
+    for key in nvim_key_tokens(keys) {
+        nvim.type_key(&key)?;
+    }
+
+    let dump = format!("{WIN_SNAPSHOT_LUA}return vim.fn.json_encode(result)\n");
+    let json = nvim.request_pumped(
+        "nvim_exec_lua",
+        vec![Value::from(dump.as_str()), Value::Array(Vec::new())],
+    )?;
+    let json = json
+        .as_str()
+        .ok_or_else(|| format!("window-layout oracle dump was not a string: {json}"))?;
+    serde_json::from_str(json).map_err(|e| format!("window-layout oracle dump {json:?}: {e}"))
+}
+
+fn run_win_in_neovim(
+    main_path: &Path,
+    start_line: usize,
+    start_col: usize,
+    keys: &str,
+    cwd: &Path,
+) -> Option<serde_json::Value> {
+    match oracle_probe_win(main_path, start_line, start_col, keys, cwd) {
+        Ok(v) => Some(v),
+        Err(why) => {
+            eprintln!("oracle (window-layout probe) failed for keys={keys:?}: {why}");
+            None
+        }
+    }
+}
+
+fn node_from_json(v: &serde_json::Value, paths: &FixturePaths, check_size: bool) -> WinNode {
+    if v.get("kind").and_then(|k| k.as_str()) == Some("leaf") {
+        let file_str = v.get("file").and_then(|f| f.as_str()).unwrap_or("");
+        let file = if file_str.is_empty() {
+            FileTag::Unnamed
+        } else {
+            paths.tag_for(Path::new(file_str))
+        };
+        WinNode::Leaf(WinLeaf {
+            file,
+            line: v.get("line").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            col: v.get("col").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+            current: v.get("current").and_then(|x| x.as_bool()).unwrap_or(false),
+            size: check_size.then(|| {
+                (
+                    v.get("rows").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                    v.get("cols").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                )
+            }),
+        })
+    } else {
+        let row = v.get("row").and_then(|x| x.as_bool()).unwrap_or(false);
+        let children = v
+            .get("children")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| node_from_json(c, paths, check_size))
+                    .collect()
+            })
+            .unwrap_or_default();
+        WinNode::Group { row, children }
+    }
+}
+
+fn win_snapshot_from_json(
+    v: &serde_json::Value,
+    paths: &FixturePaths,
+    check_size: bool,
+) -> Vec<WinTab> {
+    v.get("tabs")
+        .and_then(|t| t.as_array())
+        .map(|tabs| {
+            tabs.iter()
+                .map(|t| WinTab {
+                    current: t.get("current").and_then(|c| c.as_bool()).unwrap_or(false),
+                    layout: node_from_json(
+                        t.get("layout").unwrap_or(&serde_json::Value::Null),
+                        paths,
+                        check_size,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn win_leaf_from_vimcode(
+    id: WindowId,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+) -> WinLeaf {
+    let window = &engine.windows[&id];
+    let file = engine
+        .buffer_manager
+        .get(window.buffer_id)
+        .and_then(|b| b.file_path.clone())
+        .map(|p| paths.tag_for(&p))
+        .unwrap_or(FileTag::Unnamed);
+    WinLeaf {
+        file,
+        line: window.view.cursor.line + 1,
+        col: window.view.cursor.col + 1,
+        current: id == current_win,
+        size: check_size.then(|| rects.get(&id).copied().unwrap_or((0, 0))),
+    }
+}
+
+/// Walk `layout`, flattening a run of nested same-direction `Split`s into one
+/// `WinNode::Group` — see the module doc for why this, not the raw binary
+/// tree, is what's compared against Neovim's own (already N-ary) `winlayout()`.
+fn win_node_from_vimcode(
+    layout: &WindowLayout,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+) -> WinNode {
+    match layout {
+        WindowLayout::Leaf(id) => WinNode::Leaf(win_leaf_from_vimcode(
+            *id,
+            engine,
+            current_win,
+            paths,
+            rects,
+            check_size,
+        )),
+        WindowLayout::Split { direction, .. } => {
+            let mut children = Vec::new();
+            flatten_vc(
+                *direction,
+                layout,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                &mut children,
+            );
+            WinNode::Group {
+                row: matches!(direction, SplitDirection::Vertical),
+                children,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn flatten_vc(
+    dir: SplitDirection,
+    node: &WindowLayout,
+    engine: &Engine,
+    current_win: WindowId,
+    paths: &FixturePaths,
+    rects: &std::collections::HashMap<WindowId, (usize, usize)>,
+    check_size: bool,
+    out: &mut Vec<WinNode>,
+) {
+    match node {
+        WindowLayout::Split {
+            direction,
+            first,
+            second,
+            ..
+        } if *direction == dir => {
+            flatten_vc(
+                dir,
+                first,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                out,
+            );
+            flatten_vc(
+                dir,
+                second,
+                engine,
+                current_win,
+                paths,
+                rects,
+                check_size,
+                out,
+            );
+        }
+        other => out.push(win_node_from_vimcode(
+            other,
+            engine,
+            current_win,
+            paths,
+            rects,
+            check_size,
+        )),
+    }
+}
+
+fn win_snapshot_from_vimcode(
+    engine: &Engine,
+    paths: &FixturePaths,
+    check_size: bool,
+) -> Vec<WinTab> {
+    let group = engine.active_group();
+    group
+        .tabs
+        .iter()
+        .enumerate()
+        .map(|(i, tab)| {
+            let rects: std::collections::HashMap<WindowId, (usize, usize)> = if check_size {
+                // Same pinned 80x24 screen as the oracle, minus one row for
+                // the command line — matching UI_HEIGHT/UI_WIDTH above.
+                // `calculate_rects` is pure ratio division with no notion of
+                // chrome (`SplitTreeMeasure::new(0.0)` — see its call site in
+                // `src/core/window.rs`), so every leaf's own statusline row
+                // (Neovim's default `'laststatus'=2`, confirmed empirically:
+                // `nvim_win_get_height` on a *lone* window is already screen
+                // rows minus 1) has to be subtracted here, once per leaf,
+                // same as Neovim's own accounting.
+                tab.layout
+                    .calculate_rects(WindowRect::new(
+                        0.0,
+                        0.0,
+                        UI_WIDTH as f64,
+                        (UI_HEIGHT - 1) as f64,
+                    ))
+                    .into_iter()
+                    .map(|(id, r)| {
+                        (
+                            id,
+                            (
+                                (r.height.round() as usize).saturating_sub(1),
+                                r.width.round() as usize,
+                            ),
+                        )
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+            // #1281 finding: "current window" is a single, process-global
+            // notion in both Neovim (`nvim_get_current_win()`, which the
+            // oracle's own snapshot compares every leaf against — see
+            // `WIN_SNAPSHOT_LUA`) and vimcode (`Tab::active_window` is only
+            // meaningful *while that tab is the focused one* — switching
+            // tabs doesn't clear it, it's what a `gt`/`gT` back into that
+            // tab restores). Comparing every tab's `active_window` against
+            // itself — the bug this WindowId(usize::MAX) sentinel fixes —
+            // marked EVERY tab's own remembered window "current" instead of
+            // only the actually-focused tab's, so a background tab's window
+            // always disagreed with Neovim (which correctly reports `false`
+            // for every window outside the tab you're actually on).
+            let current_win = if i == group.active_tab {
+                tab.active_window
+            } else {
+                WindowId(usize::MAX)
+            };
+            WinTab {
+                current: i == group.active_tab,
+                layout: win_node_from_vimcode(
+                    &tab.layout,
+                    engine,
+                    current_win,
+                    paths,
+                    &rects,
+                    check_size,
+                ),
+            }
+        })
+        .collect()
+}
+
+fn run_win_case(case: &WinCase) -> Outcome {
+    let (dir, main_path, extra_paths) = write_win_fixture(case);
+    let paths = FixturePaths {
+        main: main_path.clone(),
+        extra: extra_paths.clone(),
+    };
+
+    // #1281: `{F0}`/`{F1}`/... substitution (same mechanism `resolve_multi_
+    // keys` uses for CASES_MULTI_JUMP/CASES_MULTI_JUMPS_LIST), not a bare
+    // relative filename like `:e b.txt<CR>` — `Engine::cwd` is pure
+    // bookkeeping, unrelated to `Path::canonicalize`'s only notion of
+    // "current directory" (the *process's* CWD), so a relative filename
+    // typed into `:e`/`:split`/`:tabedit` would only resolve correctly by
+    // coincidence. An earlier version of this fix instead resolved relative
+    // ex-command paths against `Engine::cwd` inside the engine itself
+    // (`open_file_with_mode_impl` et al) — reverted: besides needing the
+    // process CWD to move too (a real hazard in a multithreaded test binary,
+    // see `src/test_cwd.rs`), it broke `test_lsp_flush_clears_diagnostics_
+    // by_canonical_path`'s deliberate #208 behaviour — a buffer's
+    // `file_path` keeps exactly the (possibly relative) string the user
+    // opened it with, not a resolved absolute one. Absolute paths in the
+    // corpus itself sidestep the question instead of relying on either
+    // side's CWD, and touch no engine code.
+    let mut all_paths = vec![main_path.clone()];
+    all_paths.extend(extra_paths.iter().cloned());
+    let resolved_keys = resolve_multi_keys(case.keys, &all_paths);
+
+    let nvim_json = match run_win_in_neovim(
+        &main_path,
+        case.start_line,
+        case.start_col,
+        &resolved_keys,
+        &dir,
+    ) {
+        Some(v) => v,
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Outcome::NvimBroke;
+        }
+    };
+    let nvim_tabs = win_snapshot_from_json(&nvim_json, &paths, case.check_size);
+
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(&main_path, OpenMode::Permanent)
+        .expect("open main file for window-layout probe");
+    engine.cwd = dir.clone();
+    // #1288: `resize_window_split` recovers a split's axis size from the
+    // active window's own currently-tracked content dims (see its doc) —
+    // real backends keep that live via `set_viewport_for_window` every
+    // repaint, but this harness never paints, so seed it once here exactly
+    // like the oracle's own lone-window budget (`UI_WIDTH` x `UI_HEIGHT - 1`
+    // raw, minus the one row the harness's own `check_size` snapshot
+    // subtracts for `'laststatus'=2`'s status line — see
+    // `win_snapshot_from_vimcode`'s doc). `split_window_with_new_first`
+    // halves this for both sibling windows the moment a split happens, so a
+    // resize immediately following one in the same key sequence (e.g.
+    // `<C-w>s5<C-w>-`) sees an accurate size without an intervening paint.
+    engine.set_viewport_lines((UI_HEIGHT - 2) as usize);
+    engine.set_viewport_cols(UI_WIDTH as usize);
+    engine.view_mut().cursor.line = case.start_line.saturating_sub(1);
+    engine.view_mut().cursor.col = case.start_col.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys_multi(&mut engine, &resolved_keys);
+    let vc_tabs = win_snapshot_from_vimcode(&engine, &paths, case.check_size);
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    if nvim_tabs == vc_tabs {
+        return Outcome::Pass;
+    }
+    Outcome::Fail(format!(
+        "[{}] keys={:?} start=({},{})\n  nvim tabs:\n{:#?}\n  vimcode tabs:\n{:#?}",
+        case.label, resolved_keys, case.start_line, case.start_col, nvim_tabs, vc_tabs
+    ))
+}
+
 struct Case {
     label: &'static str,
     lines: &'static [&'static str],
@@ -1811,6 +3435,8 @@ const CASES_OP: &[Case] = &[
         14,
         "d(",
     ),
+    c("op:d{", &["a", "", "b", "", "c"], 5, 1, "d{"),
+    c("op:d}", &["a", "", "b", "", "c"], 1, 1, "d}"),
     c("op:das", &["Hello world. Goodbye now. End."], 1, 15, "das"),
     c("op:dis", &["Hello world. Goodbye now. End."], 1, 15, "dis"),
     c("op:d% on paren", &["foo(a, b) bar"], 1, 4, "d%"),
@@ -1857,6 +3483,10 @@ const CASES_OP: &[Case] = &[
     c("op:F, F, then ,", &["a,b,c,d"], 1, 7, "F,F,,"),
     c("op:t, ; ,", &["a,b,c,d"], 1, 1, "t,;,"),
     c("op:T, then ;", &["a,b,c,d"], 1, 7, "T,;"),
+    c("op:dF,", &["a,b,c,d"], 1, 7, "dF,"),
+    c("op:dT,", &["a,b,c,d"], 1, 7, "dT,"),
+    c("op:d;", &["a,b,c,d"], 1, 1, "f,ld;"),
+    c("op:d,", &["a,b,c,d"], 1, 1, "2f,d,"),
     c("op:f fails no move", &["abc"], 1, 1, "fz"),
     c("op:df fails no delete", &["abc def"], 1, 1, "dfz"),
     c("op:3f.", &["a.b.c.d"], 1, 1, "3f."),
@@ -1867,6 +3497,12 @@ const CASES_OP: &[Case] = &[
     c("op:X at col1", &["abc"], 1, 1, "X"),
     c("op:3X", &["abcdef"], 1, 5, "3X"),
     c("op:5X beyond start", &["abcdef"], 1, 3, "5X"),
+    c("op:dg_", &["  abc  "], 1, 1, "dg_"),
+    // Cursor starts past the last non-blank, mid-trailing-whitespace (not
+    // the line's very last column) — exercises the "swap the endpoints"
+    // branch, where the post-delete cursor must land on the (swapped) low
+    // end, not on the pre-motion column (#1279).
+    c("op:dg_ from trailing ws", &["  abc      "], 1, 6, "dg_"),
     c("op:dh at col1", &["abc", "def"], 2, 1, "dh"),
     c("op:dl at eol", &["abc"], 1, 3, "dl"),
     c("op:d3l beyond eol", &["abc"], 1, 2, "d3l"),
@@ -1918,6 +3554,7 @@ const CASES_OP: &[Case] = &[
     c("op:gP linewise", &["a", "b"], 1, 1, "yygP"),
     c("op:gp charwise", &["abc"], 1, 1, "ylgp"),
     c("op:]p", &["    a", "b"], 1, 1, "yyj]p"),
+    c("op:[p", &["    a", "b"], 1, 1, "yyj[p"),
     c("op:p charwise at eol", &["abc"], 1, 3, "ylp"),
     c("op:xp swap", &["abc"], 1, 1, "xp"),
     c("op:xp at eol", &["abc"], 1, 3, "xp"),
@@ -2017,6 +3654,21 @@ const CASES_OP: &[Case] = &[
         1,
         1,
         ":set ts=4 noet<CR><<",
+    ),
+    // #1153 'shiftround' — verified against `nvim --headless`.
+    c(
+        "op:>> shiftround rounds up",
+        &["     x"], // 5-space indent
+        1,
+        1,
+        ":set sw=4 et sr<CR>>>",
+    ),
+    c(
+        "op:<< shiftround rounds down",
+        &["     x"], // 5-space indent
+        1,
+        1,
+        ":set sw=4 et sr<CR><<",
     ),
     c(
         "op:=G braces",
@@ -2134,6 +3786,7 @@ const CASES_OP: &[Case] = &[
     c("op:A Tab noet", &["a"], 1, 1, ":set noet<CR>A<Tab>x<Esc>"),
     c("op:dvj charwise force", &["abc", "def"], 1, 2, "dvj"),
     c("op:dVw linewise force", &["abc def", "ghi"], 1, 1, "dVw"),
+    c("op:dVj linewise force", &["abc", "def", "ghi"], 1, 2, "dVj"),
     c("op:dve exclusive force", &["abc def"], 1, 1, "dve"),
     c("op:dv$", &["abc def"], 1, 2, "dv$"),
     c(
@@ -2420,6 +4073,31 @@ const CASES_UNDO: &[Case] = &[
         1,
         ":%normal Ax<CR>u",
     ),
+    // #1156: the issue's own gating scenario — `u` followed by a *different*
+    // edit must not permanently discard the branch `u` left; `g-` walks the
+    // whole undo tree in chronological order and can still reach it. This is
+    // real Vim/Neovim undo-tree behavior (`:h undo-tree`), not a vimcode
+    // invention, so it belongs in the oracle corpus rather than only as the
+    // engine-level `test_g_minus_reaches_branch_abandoned_by_undo_then_edit`
+    // self-check.
+    c(
+        "undo:g- crosses a branch abandoned by u then edit",
+        &["a"],
+        1,
+        1,
+        "ihello<Esc>uiworld<Esc>g-g-",
+    ),
+    // #1280: `g+` is `g-`'s forward counterpart — same abandoned-branch
+    // scenario, walked back to the oldest state with two `g-`, then forward
+    // one step with `g+` to land on the intermediate ("helloa") state that
+    // `u` had discarded.
+    c(
+        "undo:g+ crosses a branch abandoned by u then edit",
+        &["a"],
+        1,
+        1,
+        "ihello<Esc>uiworld<Esc>g-g-g+",
+    ),
 ];
 
 // ─────────────────────────── D. registers ───────────────────────────
@@ -2696,6 +4374,15 @@ const CASES_MARK: &[Case] = &[
         "Vj<Esc>gg'>",
     ),
     c("mark:`< after v", &["abc", "def"], 1, 2, "vjl<Esc>gg`<"),
+    // #1279: `mark:'<` is the substring `REGMARK_COVERAGE_EXEMPT`'s own `'<`
+    // row needs, so this one case retires `search:'<` and that row too.
+    c(
+        "mark:'< after v",
+        &["a", "b", "c", "d"],
+        2,
+        1,
+        "vjl<Esc>gg'<",
+    ),
     c(
         "mark:mark shifts after O",
         &["a", "b", "c"],
@@ -2937,6 +4624,22 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:wrap forward", &["foo", "x"], 1, 1, "/foo<CR>"),
     c("search:wrap backward", &["x", "foo"], 1, 1, "?foo<CR>"),
+    // #1153 'wrapscan' off — no match ahead of the cursor, stay put instead
+    // of wrapping. Verified against `nvim --headless`.
+    c(
+        "search:nowrapscan forward stays put",
+        &["foo", "x"],
+        1,
+        1,
+        ":set nowrapscan<CR>/foo<CR>",
+    ),
+    c(
+        "search:nowrapscan backward stays put",
+        &["x", "foo"],
+        2,
+        1,
+        ":set nowrapscan<CR>?foo<CR>",
+    ),
     c("search:no match", &["abc"], 1, 2, "/zzz<CR>"),
     c("search:n after *", &["foo x foo x foo"], 1, 1, "*n"),
     c("search:3/pat", &["a foo foo foo"], 1, 1, "3/foo<CR>"),
@@ -3008,6 +4711,26 @@ const CASES_SEARCH: &[Case] = &[
         1,
         "/\\(foo\\)\\1<CR>",
     ),
+    // #1157: `\@=` look-ahead — only the "foo" immediately followed by
+    // "bar" qualifies; the lookahead is zero-width, so the cursor lands on
+    // that "foo"'s own 'f', not inside/after "bar".
+    c(
+        "search:/\\@= lookahead",
+        &["xx foobar foobaz"],
+        1,
+        1,
+        "/foo\\(bar\\)\\@=<CR>",
+    ),
+    // #1157: `\_s` — a whitespace class that also accepts end-of-line, so
+    // the pattern spans the newline between the two lines. Cursor starts on
+    // line 2 so the search has to wrap around to land on line 1.
+    c(
+        "search:/\\_s spans lines",
+        &["foo", "bar"],
+        2,
+        1,
+        "/foo\\_sbar<CR>",
+    ),
     c(
         "search:/\\w\\+ from col1",
         &["foo bar"],
@@ -3050,12 +4773,58 @@ const CASES_SEARCH: &[Case] = &[
     ),
     c("search:dgn", &["foo bar foo"], 1, 1, "/foo<CR>ggdgn"),
     c("search:gN", &["foo bar foo"], 1, 11, "/foo<CR>gNd"),
+    // #1153 review: `gn` is documented as "like the `n` command", so it
+    // should honour 'wrapscan' the same way `n`/`N` already do. Both cases
+    // leave the cursor past the last "alpha" (`*$j`), with no further match
+    // ahead of it — verified against `nvim --headless`.
+    c(
+        "search:gn respects nowrapscan",
+        &["alpha xxx alpha", "yyy"],
+        1,
+        1,
+        "*$j:set nowrapscan<CR>gn<Esc>",
+    ),
+    c(
+        "search:gn wraps when wrapscan on",
+        &["alpha xxx alpha", "yyy"],
+        1,
+        1,
+        "*$jgn<Esc>",
+    ),
+    // #1191: `*`/`#` (`word_under_cursor`/`star_word_under_cursor`) are the
+    // other documented consumer of 'iskeyword' — with `-` added to the
+    // keyword class, "foo-bar" is the whole word `*` searches for, so it
+    // finds the *next* "foo-bar" run rather than stopping mid-token.
+    cs(
+        "search:* with iskeyword+=- includes hyphen in the searched word",
+        &["foo-bar foo-bar"],
+        1,
+        1,
+        "*",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
 ];
 
 // ─────────────────────────── H. :s / :g / ex ───────────────────────────
 const CASES_EX: &[Case] = &[
     c("sub:basic", &["a a"], 1, 1, ":s/a/b/<CR>"),
     c("sub:g", &["a a"], 1, 1, ":s/a/b/g<CR>"),
+    // #1153 'gdefault' — inverts the meaning of the `g` flag. Verified
+    // against `nvim --headless`.
+    c(
+        "sub:gdefault makes plain sub global",
+        &["a a a"],
+        1,
+        1,
+        ":set gdefault<CR>:s/a/x/<CR>",
+    ),
+    c(
+        "sub:gdefault g flag toggles back to first-only",
+        &["a a a"],
+        1,
+        1,
+        ":set gdefault<CR>:s/a/x/g<CR>",
+    ),
     c("sub:%", &["a", "a", "a"], 1, 1, ":%s/a/b/<CR>"),
     c("sub:%g cursor", &["a a", "b", "a a"], 2, 1, ":%s/a/x/g<CR>"),
     c("sub:2,3", &["a", "a", "a", "a"], 1, 1, ":2,3s/a/b/<CR>"),
@@ -3138,6 +4907,24 @@ const CASES_EX: &[Case] = &[
     c("sub:alternation", &["a b c"], 1, 1, ":s/a\\|c/x/g<CR>"),
     c("sub:\\zs", &["foobar"], 1, 1, ":s/foo\\zsbar/X/<CR>"),
     c("sub:\\ze", &["foobar"], 1, 1, ":s/foo\\zebar/X/<CR>"),
+    // #1157: `\@=` in a `:s` pattern — the lookahead is zero-width, so only
+    // "foo" is replaced and "bar" survives untouched.
+    c(
+        "sub:\\@= lookahead",
+        &["foobar foobaz"],
+        1,
+        1,
+        ":s/foo\\(bar\\)\\@=/X/<CR>",
+    ),
+    // #1157: `\_s` in a `:s` pattern — matches the newline between the two
+    // lines, so the substitution merges them into one.
+    c(
+        "sub:\\_s spans lines",
+        &["foo", "bar"],
+        1,
+        1,
+        ":s/foo\\_sbar/X/<CR>",
+    ),
     c(
         "sub:~ prev replacement",
         &["a b"],
@@ -3226,6 +5013,47 @@ const CASES_EX: &[Case] = &[
         1,
         1,
         ":s/\\v(\\w+) (\\w+)/\\2 \\1/<CR>",
+    ),
+    // #1031 (#801 Phase 2): `:s///c` confirm loop. Verified against a real
+    // interactive `nvim --headless --listen` + `--remote-send` session
+    // (v0.12.5). The non-interactive `-es` batch mode the suite's other cases
+    // use silently short-circuits `:s///c` (the confirm prompt never
+    // engages), so these were hand-checked outside `cargo test` before being
+    // added here.
+    c(
+        "sub:c y n y y",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>ynyy",
+    ),
+    c(
+        "sub:c decline all",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>nnnn",
+    ),
+    c(
+        "sub:c quit early",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>y<Esc>",
+    ),
+    c(
+        "sub:c 'a' fills remaining",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>na",
+    ),
+    c(
+        "sub:c 'l' replaces then quits",
+        &["a", "a", "a", "a"],
+        1,
+        1,
+        ":%s/a/x/gc<CR>yl",
     ),
     c("g:d", &["a", "b", "a", "c"], 1, 1, ":g/a/d<CR>"),
     c("g:s", &["a x", "b x", "a x"], 1, 1, ":g/a/s/x/y/<CR>"),
@@ -3318,6 +5146,15 @@ const CASES_EX: &[Case] = &[
     c("ex:1,3j", &["a", "b", "c"], 1, 1, ":1,3j<CR>"),
     c("ex:j!", &["a", "  b"], 1, 1, ":j!<CR>"),
     c("ex:j 3", &["a", "b", "c", "d"], 1, 1, ":j 3<CR>"),
+    // #1280: the full-word spellings of :d/:m/:co/:j/:y — distinct doc ids
+    // from their abbreviations above (`:delete` is not covered by `:d`
+    // having a case; see the `COMMAND_PROBES` module doc), so each needs its
+    // own case using the literal long form.
+    c("ex:delete", &["a", "b", "c"], 2, 1, ":delete<CR>"),
+    c("ex:move0", &["a", "b", "c"], 3, 1, ":move0<CR>"),
+    c("ex:copy$", &["a", "b"], 1, 1, ":copy$<CR>"),
+    c("ex:join", &["a", "b", "c"], 1, 1, ":join<CR>"),
+    c("ex:yank a", &["a", "b"], 1, 1, ":yank a<CR>j\"ap"),
     c("ex:>", &["a"], 1, 1, ":><CR>"),
     c("ex:>>", &["a"], 1, 1, ":>><CR>"),
     c("ex:2,3>", &["a", "b", "c"], 1, 1, ":2,3><CR>"),
@@ -3482,7 +5319,31 @@ const CASES_EX: &[Case] = &[
         1,
         ":s/,/\\r/g<CR>",
     ),
+    // `:noh[lsearch]` clears the `'hlsearch'` highlight, which this harness
+    // cannot observe at all — it only ever diffs buffer text and cursor
+    // position, never highlight state. So, like `ex:cc on empty quickfix
+    // list` (#1154) and its own doc comment above, this is a no-op case: it
+    // guards nothing on its own (a build where `:noh` silently did nothing,
+    // or wasn't recognised at all and fell through to the unknown-ex-command
+    // fallback, would pass this case too) but is still what retires the id
+    // from `COVERAGE_EXEMPT` per this repo's "one real passing case" bar.
     c("ex:noh no effect", &["a"], 1, 1, "/a<CR>:noh<CR>"),
+    // #1280: full-word spellings, same reasoning as the `:delete`/`:move`/
+    // `:copy`/`:join`/`:yank` block above.
+    c("ex:norm Ax", &["a", "b"], 1, 1, ":norm Ax<CR>"),
+    // Same no-op reasoning as `ex:noh no effect` just above — `:nohlsearch`
+    // is the long spelling of the same command and needs its own case as a
+    // distinct doc id (see the `:delete`/etc. block's comment), but it is
+    // exactly as unobservable to this harness and just as much a no-op
+    // guarding nothing on its own.
+    c(
+        "ex:nohlsearch no effect",
+        &["a"],
+        1,
+        1,
+        "/a<CR>:nohlsearch<CR>",
+    ),
+    c("ex:ma x", &["a", "b", "c"], 2, 1, ":ma x<CR>gg'x"),
     c(
         "ex:2>3? shift count",
         &["a", "b", "c", "d"],
@@ -3645,6 +5506,482 @@ const CASES_EX: &[Case] = &[
         1,
         ":%s/abc/def/g<CR>",
     ),
+    // #1154: bare `:cc` (no count) on an empty quickfix list. This is the
+    // one `:cc`-family behaviour this single-buffer harness can actually
+    // compare: `nvim_buf_set_lines` gives both sides an *unnamed* scratch
+    // buffer with no backing file, so there is no way to seed the two sides
+    // with an identical *populated* quickfix list (real Neovim needs
+    // `:vimgrep`-on-a-real-file or `:cexpr`, and vimcode's expression
+    // evaluator is explicitly out of scope for this milestone — see the
+    // module docs' "Coverage ratchet" section and #1154's own PR
+    // description). But the empty-list error path needs no quickfix state
+    // at all: confirmed by hand against `nvim --headless -u NONE` that a
+    // bare `:cc` with no quickfix list leaves the buffer and cursor
+    // completely untouched (it errors — `E42: No Errors` — before doing
+    // anything), which is exactly what vimcode's new bare-`:cc` handler
+    // does too (`execute.rs`'s `cmd == "cc"` arm, `self.quickfix.items.is_empty()`
+    // branch). Before #1154, bare `:cc` fell through to the unknown-ex-command
+    // fallback (`"Not an editor command: cc"`) instead of a real quickfix
+    // error, but that fallback is likewise a buffer/cursor no-op — so this
+    // case cannot regression-guard the historic bug by buffer/cursor
+    // comparison alone (`src/core/engine/tests.rs`'s
+    // `test_ex_cc_on_empty_quickfix_list_errors_1154` is what actually pins
+    // the message). What it *does* prove, and what retires `"ex::cc"` from
+    // `COVERAGE_EXEMPT`, is that the id now has a real, passing oracle case
+    // at all — required once a command stops being doc-exempt.
+    c(
+        "ex:cc on empty quickfix list",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cc<CR>",
+    ),
+    // #1283: the quickfix/location-list family (23 ids: `ex::copen`..
+    // `ex::lfdo`) — see the module doc's "#1283 population seam" section for
+    // the deliverable-1 finding: no key sequence can populate an *identical*
+    // list on both sides through this shared single-buffer harness. Real
+    // Neovim's `:vimgrep pattern` with no file argument errors `E683: File
+    // name missing or invalid pattern` (confirmed against a live oracle);
+    // vimcode's `:vimgrep`/`:grep` take no file argument at all and instead
+    // recursively search the whole `cwd` for the trailing text as a plain
+    // pattern (`Engine::qf_run_grep` → `project_search::search_in_project`)
+    // — two incompatible command grammars, not two implementations of the
+    // same one, so there is no populated-list seam here (`:cexpr` is a
+    // second dead end: `NotImplemented` on the vimcode side per this file's
+    // own `ex(":cex[pr]", ...)` NORM_AUDIT row, matching the permanent
+    // expression-evaluator exemption).
+    //
+    // What *is* real, comparable, oracle-backed Neovim behaviour — same
+    // precedent as `ex:cc on empty quickfix list` right above (#1154) — is
+    // every one of these commands' empty-list (global) or absent-location-
+    // list refusal/no-op path, each confirmed by hand against a live
+    // `nvim --headless -u NONE` session before being encoded below. Four of
+    // the 23 ids (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`) open a
+    // window and are covered by `CASES_XFILE`'s `WinCase`/`run_win_case`
+    // layout-probe harness instead (chained after #1162 per this issue's own
+    // instruction) — see that array below.
+    c(
+        "ex:cnext on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cn<CR>",
+    ),
+    c(
+        "ex:cprevious on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cp<CR>",
+    ),
+    c(
+        "ex:cfirst on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cfirst<CR>",
+    ),
+    c(
+        "ex:clast on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":clast<CR>",
+    ),
+    c(
+        "ex:clist on empty quickfix list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":clist<CR>",
+    ),
+    c(
+        "ex:colder at the bottom of an empty quickfix stack errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":colder<CR>",
+    ),
+    c(
+        "ex:cnewer at the top of an empty quickfix stack errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cnewer<CR>",
+    ),
+    c(
+        "ex:cdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cdo<CR>",
+    ),
+    c(
+        "ex:cfdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cfdo<CR>",
+    ),
+    c(
+        "ex:cclose noop with no quickfix window open",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":cclose<CR>",
+    ),
+    c(
+        "ex:lnext without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lnext<CR>",
+    ),
+    c(
+        "ex:lprevious without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lprevious<CR>",
+    ),
+    c(
+        "ex:lfirst without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lfirst<CR>",
+    ),
+    // All three of `:ll`, `:llast`, and `:llist` start with the literal
+    // substring `:ll`, so `Keys(":ll")` (`ex::ll`'s probe) is a "loose
+    // needle" that would also match the `ex:llast`/`ex:llist` cases below
+    // regardless of where they sit in corpus order — `classify_coverage`'s
+    // `cases.iter().find(...)` only checks whether *some* case matches, not
+    // which one or in what position. The dedicated `ex:ll` case just below
+    // still needs to exist so the probe is verified against real `:ll`
+    // behaviour rather than accidentally "passing" on `:llast`/`:llist`'s
+    // coattails — same "loose needle" hazard the module doc calls out for
+    // `:h`/`:hide`, but it's about needle specificity, not ordering.
+    c(
+        "ex:ll without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":ll<CR>",
+    ),
+    c(
+        "ex:llast without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":llast<CR>",
+    ),
+    c(
+        "ex:llist without a location list errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":llist<CR>",
+    ),
+    c(
+        "ex:ldo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":ldo<CR>",
+    ),
+    c(
+        "ex:lfdo with no argument errors",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lfdo<CR>",
+    ),
+    c(
+        "ex:lclose noop with no location-list window open",
+        &["a", "b", "c"],
+        2,
+        1,
+        ":lclose<CR>",
+    ),
+    // #1154: the rest of this PR's backfilled ex commands. Each of these was
+    // confirmed by hand against `nvim --headless -u NONE` — a fresh
+    // single-tab/single-window/single-buffer session leaves every one of
+    // these a documented no-op or refusal, which is exactly what makes them
+    // usable here: this harness has no multi-tab/multi-window/multi-buffer
+    // real-file plumbing (see the multi-file harness section above, which
+    // needs real files on disk and its own `MultiFileCase`/`send_keys_multi`
+    // machinery), so a *populated* tab/buffer list identical on both sides
+    // isn't reachable from a bare `Case`. The no-op/refusal path is still a
+    // real, comparable behaviour, not a vacuous placeholder — a case that
+    // failed to recognise the command at all (the pre-#1154 unknown-ex-command
+    // fallback) also happens to leave the buffer/cursor untouched, so these
+    // do not regression-guard the historic "command didn't exist" bug (the
+    // engine-level `test_ex_*_1154` tests in `src/core/engine/tests.rs` do
+    // that, asserting on `Engine` state a bare buffer/cursor diff can't see);
+    // what they retire is the `COVERAGE_EXEMPT` entry itself, per this
+    // repo's "an id just needs one real passing case" bar (`ex:cc on empty
+    // quickfix list` above sets the same precedent).
+    c(
+        "ex:tabonly noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tabonly<CR>",
+    ),
+    c(
+        "ex:tabfirst noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tabfirst<CR>",
+    ),
+    c(
+        "ex:tablast noop with one tab",
+        &["a", "b"],
+        1,
+        1,
+        ":tablast<CR>",
+    ),
+    c(
+        "ex:bfirst noop with one buffer",
+        &["a", "b"],
+        1,
+        1,
+        ":bfirst<CR>",
+    ),
+    c(
+        "ex:blast noop with one buffer",
+        &["a", "b"],
+        1,
+        1,
+        ":blast<CR>",
+    ),
+    c(
+        "ex:hide refuses to close the last window",
+        &["a", "b"],
+        1,
+        1,
+        ":hide<CR>",
+    ),
+    // Leading `x` is a real edit (not just `engine_with`'s raw seed insert,
+    // which bypasses dirty-tracking on both sides — an *unmodified* sole
+    // buffer can genuinely be wiped out, and vimcode has no fallback empty
+    // buffer to swap the window onto afterwards, so exercising THAT path
+    // here would crash the harness rather than the oracle's Neovim). With a
+    // real dirty flag set identically on both sides, the un-forced wipe must
+    // refuse with "No write since last change" and leave buffer/cursor
+    // exactly where the `x` left them.
+    c(
+        "ex:bw refuses on a dirty buffer without a bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:bw<CR>",
+    ),
+    c(
+        "ex:bwipeout refuses on a dirty buffer without a bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:bwipeout<CR>",
+    ),
+    // #1190: `'hidden'`'s guard on `:enew` — before this fix vimcode had
+    // *no* dirty check on `:enew`/`:edit`/`:bnext`/`:bprevious`/`:bfirst`/
+    // `:blast`/`:buffer` at all (see `Engine::check_buffer_abandon`'s doc
+    // comment), so an un-forced `:enew` always silently wiped the modified
+    // buffer. Neovim's *actual* default for `'hidden'` is ON (confirmed by
+    // hand: `nvim --headless -u NONE -c 'set hidden?'` reports "hidden",
+    // not "nohidden" — unlike historical Vim, whose documented default is
+    // off), so the un-configured case below expects the abandon to
+    // *succeed*; the refusal only shows up once `'hidden'` is explicitly
+    // turned off. Same "real edit via `x`" reasoning as the `:bw`/
+    // `:bwipeout` cases above for why this isn't the harness's raw seed
+    // insert.
+    c(
+        "ex:enew abandons a dirty buffer by default ('hidden' is on)",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew<CR>",
+    ),
+    c(
+        "ex:enew! forces past a dirty buffer",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew!<CR>",
+    ),
+    cs(
+        "ex:enew refuses on a dirty buffer with 'nohidden' and no bang",
+        &["ab", "c"],
+        1,
+        1,
+        "x:enew<CR>",
+        "vim.o.hidden=false",
+    ),
+    c("ex:delmarks a", &["a", "b", "c"], 2, 1, "ma:delmarks a<CR>"),
+    c(
+        "ex:delm a (abbreviation)",
+        &["a", "b", "c"],
+        2,
+        1,
+        "ma:delm a<CR>",
+    ),
+    // #1156: undo tree ex-commands (`:undolist`/`:earlier`/`:later`/`:undojoin`).
+    c(
+        "ex:undolist is a no-op on the buffer",
+        &["abc"],
+        1,
+        1,
+        "x:undolist<CR>",
+    ),
+    c(
+        "ex:earlier 1 undoes one step",
+        &["abc"],
+        1,
+        1,
+        "x:earlier 1<CR>",
+    ),
+    c(
+        "ex:earlier then later round-trips",
+        &["abc"],
+        1,
+        1,
+        "x:earlier 1<CR>:later 1<CR>",
+    ),
+    // `:undojoin` typed interactively (through Command-line mode, which
+    // redraws on <CR> back to Normal) is documented by Vim itself as
+    // "fragile" and meant only for script/function use, not interactive
+    // typing (`:h :undojoin`) — confirmed empirically against this
+    // repo's own oracle transport (`nvim_input`, one key at a time, which
+    // *does* redraw between keys, unlike a bulk `nvim_feedkeys` burst):
+    // "x:undojoin<CR>xu" does NOT merge in real Neovim typed this way, so
+    // it is not a stable cross-oracle case. `:undojoin`'s one reliably
+    // deterministic, non-fragile behavior is `E790` when there is no
+    // previous change to join with — that's what this case probes; the
+    // *merging* behavior is covered self-referentially (not against nvim)
+    // by `test_undojoin_merges_next_change_into_previous_undo_step` in
+    // `src/core/engine/tests.rs`.
+    c(
+        "ex:undojoin with no previous change errors, doesn't touch the buffer",
+        &["abc"],
+        1,
+        1,
+        ":undojoin<CR>",
+    ),
+    // `:startinsert` differentially matters (unlike the no-ops above): typed
+    // text after it only lands as literal insertion if the command actually
+    // entered Insert mode. Before #1154 `:startinsert` fell through to the
+    // unknown-ex-command fallback, so `mode` stayed Normal and `XY` would
+    // have run as two Normal-mode commands instead.
+    c(
+        "ex:startinsert then type",
+        &["ab"],
+        1,
+        1,
+        ":startinsert<CR>XY<Esc>",
+    ),
+    // `:stopinsert` cannot be *typed* from Insert mode in real Vim (a bare
+    // `:` there just inserts a literal colon; reaching it needs `i_CTRL-O`
+    // or a script/mapping context this harness's single-keystroke-at-a-time
+    // `nvim_input` transport does not model). The comparable, safely-typeable
+    // case is the documented already-Normal no-op, which still exercises the
+    // real `cmd == "stopinsert"` dispatch arm added by this PR.
+    c(
+        "ex:stopinsert noop when already Normal",
+        &["ab"],
+        1,
+        1,
+        ":stopinsert<CR>x",
+    ),
+];
+
+// ─────────────────── H2. abbreviations (:abbreviate family, #1152) ───────────
+// Each case defines its abbreviation(s) with a real typed `:iabbrev`/
+// `:cabbrev`/`:abbreviate` command (both sides run the actual command, not a
+// stand-in), then exercises the documented trigger rules.
+const CASES_ABBREV: &[Case] = &[
+    c(
+        "abbrev:full-id expands on trigger char",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh <Esc>",
+    ),
+    c(
+        "abbrev:end-id expands on trigger char",
+        &[""],
+        1,
+        1,
+        ":iabbrev #i #include<CR>i#i <Esc>",
+    ),
+    c(
+        "abbrev:C-v before trigger suppresses expansion",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<C-v> <Esc>",
+    ),
+    c(
+        "abbrev:does not fire mid-word",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iateh <Esc>",
+    ),
+    c(
+        "abbrev:expands on Esc with nothing typed after",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<Esc>",
+    ),
+    c(
+        "abbrev:expands on CR",
+        &[""],
+        1,
+        1,
+        ":iabbrev teh the<CR>iteh<CR><Esc>",
+    ),
+    c(
+        "abbrev:cabbrev on the command line runs the expanded command",
+        &["foo"],
+        1,
+        1,
+        ":cabbrev X %s/foo/bar/<CR>:X<CR>",
+    ),
+    c(
+        "abbrev:iabbrev does not apply on the command line",
+        &["H"],
+        1,
+        1,
+        // `:iabbrev` is Insert-only — ":H<CR>" must NOT expand to ":help"
+        // (which would open a help window and leave the buffer untouched
+        // for a different reason). Instead ":H" is an unknown command on
+        // both sides, so the buffer and cursor stay exactly as they started.
+        ":iabbrev H help<CR>:H<CR>x",
+    ),
+    c(
+        // `:h :ia[bbrev]` — 2 chars (`:ia`) is real Vim/Neovim's minimal
+        // unambiguous prefix, confirmed against `nvim --headless -u NONE`.
+        "abbrev:2-char :ia prefix defines an iabbrev",
+        &[""],
+        1,
+        1,
+        ":ia teh the<CR>iteh <Esc>",
+    ),
+    c(
+        // `:h :ca[b]` — 2 chars (`:ca`) is real Vim/Neovim's minimal
+        // unambiguous prefix, confirmed against `nvim --headless -u NONE`.
+        // Expands into a safe substitution (not `:help`, which would open a
+        // real help window and make the two sides' final buffers
+        // environment-dependent to compare).
+        "abbrev:2-char :ca prefix defines a cabbrev",
+        &["foo"],
+        1,
+        1,
+        ":ca X %s/foo/bar/<CR>:X<CR>",
+    ),
 ];
 
 // ─────────────────────────── I. insert mode keys ───────────────────────────
@@ -3718,6 +6055,39 @@ const CASES_INS: &[Case] = &[
         ":set ts=8<CR>A<Tab>x<Esc>",
     ),
     c("ins:Tab after 2 chars ts4", &["ab"], 1, 1, "A<Tab>x<Esc>"),
+    // #1153 'softtabstop' — verified against `nvim --headless`.
+    c(
+        "ins:Tab uses softtabstop not tabstop",
+        &["ab"],
+        1,
+        2,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<Tab><Esc>",
+    ),
+    c(
+        "ins:BS over softtabstop removes a whole soft-tab",
+        &[""],
+        1,
+        1,
+        ":set et ts=8 sts=3 nosmarttab<CR>i<Tab><Tab><BS><Esc>",
+    ),
+    // Unaligned-run regressions caught in review: BackSpace must round the
+    // *absolute column* down to the previous 'softtabstop' stop, not cap the
+    // contiguous blank-run length at 'sts'. Both diverge from the aligned
+    // cases above only when the run doesn't start on a multiple of 'sts'.
+    c(
+        "ins:BS over softtabstop unaligned leading indent",
+        &["     x"],
+        1,
+        6,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<BS><Esc>",
+    ),
+    c(
+        "ins:BS over softtabstop unaligned mid-line run",
+        &["a  b"],
+        1,
+        4,
+        ":set et ts=8 sts=2 nosmarttab<CR>i<BS><Esc>",
+    ),
     c("ins:C-t", &["a"], 1, 1, "i<C-t><Esc>"),
     c("ins:C-t mid line", &["ab"], 1, 2, "i<C-t><Esc>"),
     c("ins:C-d", &["    a"], 1, 5, "i<C-d><Esc>"),
@@ -3889,6 +6259,34 @@ const CASES_INS: &[Case] = &[
     ),
     c("ins:C-t noet", &["a"], 1, 1, ":set noet<CR>i<C-t><Esc>"),
     c("ins:C-k digraph skip", &["a"], 1, 1, "l"),
+    // #1160: <C-k> digraph entry and the <C-x> completion submode.
+    c("ins:C-k a: digraph", &["x"], 1, 1, "A<C-k>a:<Esc>"),
+    // Escape must land the cursor back *on* the just-inserted multi-byte
+    // character (not past it) — nvim's cursor column is byte-based and
+    // vimcode's is char-based, so a trailing ASCII character after the
+    // arrow would make the two column numbering schemes disagree even
+    // though both editors agree on the buffer content and cursor cell.
+    c("ins:C-k -> digraph arrow", &["x"], 1, 1, "A<C-k>-><Esc>"),
+    c(
+        "ins:C-x C-l line completion",
+        &["hello world", "hel"],
+        2,
+        4,
+        "A<C-x><C-l><Esc>",
+    ),
+    // Both the oracle (nvim) and vimcode's own test process run with the
+    // crate root as their working directory (`cargo test` sets it; neither
+    // side passes `current_dir` for this single-buffer harness — #1160), so
+    // a real, checked-in, unambiguously-prefixed filename is a stable
+    // cross-process fixture: "Cargo.tom" has exactly one match in the repo
+    // root, `Cargo.toml` (`Cargo.lock` diverges at the 8th character).
+    c(
+        "ins:C-x C-f filename completion",
+        &["Cargo.tom"],
+        1,
+        10,
+        "A<C-x><C-f><Esc>",
+    ),
     c(
         "ins:BS join with autoindent",
         &["a", "    b"],
@@ -3959,6 +6357,14 @@ const CASES_VIS: &[Case] = &[
     c("vis:viwd on whitespace", &["a   b"], 1, 2, "viwd"),
     c("vis:vawd at eol", &["foo bar"], 1, 5, "vawd"),
     c("vis:vjy then P", &["abc", "def"], 1, 2, "vjyP"),
+    // #1279: `visual:P` — replace a charwise selection with a yanked word.
+    c(
+        "vis:vjP force paste",
+        &["abc", "def", "ghi"],
+        1,
+        1,
+        "yiwjvjP",
+    ),
     c("vis:vj< ", &["    a", "    b"], 1, 1, "vj<"),
     c("vis:V3>", &["a"], 1, 1, "V3>"),
     c("vis:vjo then d", &["abc", "def"], 1, 2, "vjod"),
@@ -4299,6 +6705,8 @@ const CASES_NUM: &[Case] = &[
     c("num:V C-a", &["1", "1", "1"], 1, 1, "Vjj<C-a>"),
     c("num:V g C-a", &["1", "1", "1"], 1, 1, "Vjjg<C-a>"),
     c("num:V 2g C-a", &["1", "1", "1"], 1, 1, "Vjj2g<C-a>"),
+    c("num:V C-x", &["5", "5", "5"], 1, 1, "Vjj<C-x>"),
+    c("num:V g C-x", &["5", "5", "5"], 1, 1, "Vjjg<C-x>"),
     c("num:v C-a partial", &["1 1", "1 1"], 1, 1, "vj<C-a>"),
     c("num:C-v block C-a", &["1 1", "1 1"], 1, 3, "<C-v>j<C-a>"),
     c("num:C-a hex mid", &["0x10"], 1, 3, "<C-a>"),
@@ -4504,6 +6912,79 @@ const CASES_SCROLL: &[Case] = &[
     ),
     c("scroll:C-d at last line", LONG, 60, 1, "<C-d>"),
     c("scroll:C-u at line 2", LONG, 2, 1, "<C-u>"),
+    // ── zh/zl/zH/zL/ze/zs: horizontal scroll (#1280) ───────────────────────
+    // Only meaningful with 'wrap' off (with it on, a long line soft-wraps
+    // instead of scrolling — `zh`/`zl`/etc. are then documented no-ops) and
+    // only observable through this harness's (buffer, cursor) comparison —
+    // not `scroll_left` directly — via the "cursor is adjusted if necessary"
+    // clause each of these carries in `:h scroll-horizontal`: scroll the
+    // view far enough that the cursor's column falls outside it, and the
+    // resulting cursor move is the signal. This is also the prerequisite the
+    // issue calls out: `run_in_vimcode` now mirrors the oracle's window
+    // *width* (`nvim_win_get_width`) the same way it already mirrored
+    // height, so both sides agree what "outside the view" means.
+    cs(
+        "scroll:zl scrolls view right and pulls the cursor into it",
+        NA_WIDE,
+        1,
+        1,
+        "50zl",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zh scrolls view left and pulls the cursor into it",
+        NA_WIDE,
+        1,
+        101,
+        "50zh",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zL scrolls a half screenwidth right",
+        NA_WIDE,
+        1,
+        1,
+        "zL",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zH scrolls a half screenwidth left",
+        NA_WIDE,
+        1,
+        101,
+        "zH",
+        "vim.o.wrap=false",
+    ),
+    // ze/zs move no cursor of their own — they only set the horizontal
+    // scroll position — so each is paired with a large trailing `zl` that
+    // reads that position back: `80zl` scrolls the view 80 columns further
+    // right, which only pulls the cursor along (the "adjusted if necessary"
+    // clause again) if the view `ze`/`zs` set up left the cursor's column
+    // within 80 of the *new* left edge. The leading `60zl` matters too:
+    // without it, the initial cursor placement's own
+    // `ensure_cursor_visible` scroll already lands within a column or two of
+    // where `ze` would put it anyway (both hug the cursor's right edge), so
+    // `ze`/`60zl`/`80zl` all land on the same final column — a vacuous
+    // "pass" that would say nothing. `60zl` first displaces the view well
+    // away from that coincidence (measured: plain `60zl 80zl` with no
+    // `ze`/`zs` at all lands on a third, different column), so the value
+    // `ze`/`zs` sets is what the trailing `80zl` actually reads back.
+    cs(
+        "scroll:ze scrolls so cursor is at the right edge",
+        NA_WIDE,
+        1,
+        101,
+        "60zlze80zl",
+        "vim.o.wrap=false",
+    ),
+    cs(
+        "scroll:zs scrolls so cursor is at the left edge",
+        NA_WIDE,
+        1,
+        101,
+        "60zlzs80zl",
+        "vim.o.wrap=false",
+    ),
 ];
 
 // ─────────────────────────── N. word motions & misc motions ───────────────────────────
@@ -4636,6 +7117,90 @@ const CASES_WORD: &[Case] = &[
     c("word:]}", &["{", "a", "}"], 2, 1, "]}"),
     c("word:[(", &["(a (b) c)"], 1, 5, "[("),
     c("word:])", &["(a (b) c)"], 1, 5, "])"),
+    // ── bracket:[] / ][ — section *end* (`}` in column 0), the `[[`/`]]`
+    // pair's `}` counterpart (#1280) ────────────────────────────────────
+    c("word:][", &["a", "}", "b", "}", "c"], 1, 1, "]["),
+    c("word:[]", &["a", "}", "b", "}", "c"], 5, 1, "[]"),
+    // ── bracket:[m/]m/[M/]M — method start/end (any `{`/`}`) (#1280) ─────
+    c(
+        "word:]m next method start",
+        &["fn a() {", "}", "fn b() {", "}"],
+        1,
+        1,
+        "]m",
+    ),
+    c(
+        "word:[m previous method start",
+        &["fn a() {", "}", "fn b() {", "}"],
+        4,
+        1,
+        "[m",
+    ),
+    // Unlike `]m`/`[m` above, `]M`/`[M` need the cursor positioned *inside*
+    // (for `]M`) or *after* (for `[M`) the brace pair, not before/at the
+    // second one — from an as-yet-unentered method Neovim's actual
+    // (Java-class-oriented) algorithm falls back to "start/end of the
+    // class" rather than the next/previous literal brace, which a
+    // same-shaped fixture to `]m`/`[m` above would have hit.
+    c(
+        "word:]M next method end",
+        &["fn a() {", "  body", "}"],
+        2,
+        1,
+        "]M",
+    ),
+    c(
+        "word:[M previous method end",
+        &["fn a() {", "}", "x"],
+        3,
+        1,
+        "[M",
+    ),
+    // ── bracket:[*/]* and their [/// / ]/ aliases — C comment start/end
+    // (#1280) ─────────────────────────────────────────────────────────
+    c(
+        "word:]* comment end",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "]*",
+    ),
+    c(
+        "word:[* comment start",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "[*",
+    ),
+    c(
+        "word:]/ comment end",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "]/",
+    ),
+    c(
+        "word:[/ comment start",
+        &["a", "/* comment", "middle", "*/ end", "b"],
+        3,
+        1,
+        "[/",
+    ),
+    // ── bracket:[#/]# — preprocessor directive, depth-tracked (#1280) ────
+    c(
+        "word:]# forward to matching #else/#endif",
+        &["#if X", "  a", "#else", "  b", "#endif"],
+        2,
+        1,
+        "]#",
+    ),
+    c(
+        "word:[# backward to matching #if/#else",
+        &["#if X", "  a", "#else", "  b", "#endif"],
+        4,
+        1,
+        "[#",
+    ),
     c("word:% on (", &["(a (b) c)"], 1, 1, "%"),
     c("word:% inside", &["(a (b) c)"], 1, 2, "%"),
     c("word:% on [", &["[a]"], 1, 1, "%"),
@@ -4665,10 +7230,63 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:j col memory short", &["abcdef", "ab"], 1, 5, "j"),
     c("word:5l past end", &["abc"], 1, 1, "5l"),
+    // #1279: matches the `NormAudit` "l" recording's own probe needle
+    // (`Label("word:l right")`) so one case retires both `move:l` here and
+    // the `l` row's `NORM_COVERAGE_EXEMPT` entry.
+    c("word:l right", &["abc"], 1, 1, "l"),
     c("word:h at start", &["abc"], 1, 1, "h"),
     c("word:0", &["  ab"], 1, 4, "0"),
     c("word:^", &["  ab"], 1, 4, "^"),
     c("word:g_", &["ab  "], 1, 1, "g_"),
+    // #1279: `word:g0` is the same needle `COMMAND_PROBES` uses for both
+    // `move:g0` and `g:g0` (the doc lists `g0` under both sections).
+    c("word:g0", &["  ab"], 1, 4, "g0"),
+    // #1280: `g<Home>`/`g^`/`g$`/`g<End>` are distinct doc ids from `g0`
+    // (their own keystrokes, `:h g<Home>` etc.), and only differ from the
+    // buffer-relative `0`/`^`/`$` motions when a line spans more than one
+    // *screen* line — a plain short fixture (like `word:g0` above) can't
+    // exercise that at all, so this one is 87 columns wide against an
+    // 80-column window (`'wrap'` stays on, the default), split into two
+    // screen rows at column 80: cols 0-79 (all blank) and 80-86 ("xyz").
+    // Starting on the second row lets all four disagree with their
+    // buffer-relative counterparts (`0`→col 1, `^`/`$` would land on 'x'/'z'
+    // at cols 85/87 too — same as `g^`/`g$` here only because this fixture
+    // has no blanks *within* the second row; the screen-relative-ness is in
+    // `g<Home>`/`g<End>` landing on col 81/87, not col 1/87).
+    c(
+        "word:g<Home> start of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g<Home>",
+    ),
+    c(
+        "word:g^ first non-blank of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g^",
+    ),
+    c(
+        "word:g$ end of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g$",
+    ),
+    c(
+        "word:g<End> end of screen line",
+        &["                                                                                    xyz"],
+        1,
+        86,
+        "g<End>",
+    ),
+    // #1279: short lines so `gm`/`gM` land at end-of-line on both sides
+    // regardless of window width — width is mirrored the same way height is
+    // (#1280, see `run_in_vimcode`) but this predates that and staying
+    // width-independent still doesn't hurt.
+    c("word:gm", &["alpha beta gamma"], 1, 1, "gm"),
+    c("word:gM", &["alpha beta gamma"], 1, 1, "gM"),
     c("word:gg indented (nosol)", &["  a", "b"], 2, 1, "gg"),
     cs(
         "word:gg indented (sol)",
@@ -4717,6 +7335,17 @@ const CASES_WORD: &[Case] = &[
     ),
     c("word:i esc then j", &["abcdef", "abcdef"], 1, 4, "i<Esc>j"),
     c("word:$ then h then j", &["abcdef", "abcdef"], 1, 1, "$hj"),
+    // #1153 'virtualedit' — `$` still lands on the last character, but a
+    // following `l` moves one column past it. Verified against
+    // `nvim --headless`.
+    c(
+        "word:virtualedit=all lets l pass $",
+        &["abc"],
+        1,
+        1,
+        ":set ve=all<CR>$l",
+    ),
+    c("word:virtualedit off blocks l at $", &["abc"], 1, 1, "$l"),
     c("word:w then j col", &["ab cd", "abcdef"], 1, 1, "wj"),
     c("word:e then j", &["abc def", "abcdef"], 1, 1, "ej"),
     c("word:yy then j col", &["abcdef", "abcdef"], 1, 3, "yyj"),
@@ -4845,6 +7474,38 @@ const CASES_WORD: &[Case] = &[
         1,
         1,
         "wge",
+    ),
+    // #1191: 'iskeyword' is a real input to word motions — `a-b` is two
+    // words under the default `'iskeyword'` (see "word:w a-b" above), but
+    // one word once `-` is added to the keyword class, exactly like real
+    // Vim. Before #1191, `vim.o.iskeyword=...` in a case's `setup` could
+    // only ever configure the oracle: `apply_setup` had no arm for it, so
+    // this case would have errored out of `every_corpus_setup_is_understood`
+    // (a hard failure, not a silent default) rather than compare a
+    // configured vimcode against a configured oracle.
+    cs(
+        "word:w with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        1,
+        "w",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
+    cs(
+        "word:e with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        1,
+        "e",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
+    cs(
+        "word:b with iskeyword+=- treats hyphen as a word char",
+        &["foo-bar baz"],
+        1,
+        9,
+        "b",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
     ),
 ];
 
@@ -5078,6 +7739,31 @@ const CASES_TO: &[Case] = &[
         4,
         "daw",
     ),
+    // #1191: `iw`/`aw` (`find_word_object`) are the third documented
+    // 'iskeyword' consumer — with `-` added to the keyword class, the whole
+    // hyphenated run is one word, so `diw` from inside "bar" deletes all of
+    // "foo-bar", not just "bar".
+    cs(
+        "to:diw with iskeyword+=- deletes the whole hyphenated word",
+        &["foo-bar baz"],
+        1,
+        5,
+        "diw",
+        "vim.o.iskeyword='@,48-57,_,192-255,-'",
+    ),
+    // #1279: the closing-bracket/backtick/quote aliases — `)`/`}`/`]`/`>`
+    // text objects are aliases of `(`/`{`/`[`/`<`, and `a'`/`` a` `` were the
+    // last quote text objects with no oracle case at all.
+    c("to:da'", &["x 'ab' y"], 1, 4, "da'"),
+    c("to:da`", &["x `ab` y"], 1, 4, "da`"),
+    c("to:di)", &["f(a, b)"], 1, 3, "di)"),
+    c("to:da)", &["f(a, b)"], 1, 3, "da)"),
+    c("to:di}", &["{", "  a", "  b", "}"], 2, 3, "di}"),
+    c("to:da}", &["{", "  a", "  b", "}"], 2, 3, "da}"),
+    c("to:di]", &["a[1]"], 1, 3, "di]"),
+    c("to:da]", &["a[1]"], 1, 3, "da]"),
+    c("to:di>", &["<a<b>c>"], 1, 5, "di>"),
+    c("to:da>", &["<a<b>c>"], 1, 2, "da>"),
 ];
 
 // ─────────────────────────── P. misc ───────────────────────────
@@ -5291,6 +7977,58 @@ const CASES_MISC: &[Case] = &[
         1,
         "$",
     ),
+    // #1280: `g.` — go to the position of the last change. `wx` changes
+    // (deletes) the 't' of "two" on line 1; `G` moves away to the last
+    // line; `g.` must return to where that change happened, not just to
+    // `` `. `` (a mark, which lands at the same spot here but for a
+    // different documented reason — `g.` is its own doc row).
+    c(
+        "misc:g. returns to last change",
+        &["one two", "three"],
+        1,
+        1,
+        "wxGg.",
+    ),
+    // #1280: `gR` — Virtual Replace mode. Typing exactly enough characters
+    // to span a `<Tab>`'s full visual width (tabstop 4, set by the harness
+    // — the tab at column 1 covers 3 columns to the next stop) consumes it
+    // entirely, landing on the same result a naive "expand tab, then
+    // overwrite" implementation would. `:h Virtual-Replace-mode` documents
+    // that typing *fewer* characters than the tab's width instead leaves it
+    // untouched and inserts before it (verified empirically to be a real,
+    // separate vimcode deviation) — a two-key `gRXY` case exercising that
+    // narrower one is left for a follow-up, since it needs delayed
+    // "replace-pending" bookkeeping across keystrokes, not a one-line fix.
+    c(
+        "misc:gR spans a tab's full width",
+        &["a\tbc"],
+        1,
+        2,
+        "gRXYZ<Esc>",
+    ),
+    // #1280: `g@{motion}` calls a user-registered `'operatorfunc'` — real
+    // buffer-mutating coverage of that needs a Lua callback wired up
+    // identically on both sides, which `apply_setup` has no way to express
+    // (it only translates `vim.o.<name>=<value>`/keymap statements, not
+    // arbitrary Lua function bodies into vimcode's own
+    // `vimcode.set_operatorfunc` Lua API). What *is* comparable without any
+    // of that: with no operatorfunc registered at all (true on both sides —
+    // Neovim errors `E774`, vimcode's own `test_g_at_sets_pending_operator`
+    // pins the same "no crash, no-op" contract engine-side), `g@l` changes
+    // nothing. A no-op case guards nothing on its own (`ex:cc on empty
+    // quickfix list`, #1154), so this is paired with the engine-level
+    // `test_g_at_sets_pending_operator` and the callback-registered
+    // `test_g_at_calls_operatorfunc_{linewise,charwise}`/
+    // `test_g_at_operatorfunc_can_modify_buffer` tests in
+    // `src/core/engine/tests.rs`, which do exercise the real dispatch this
+    // case structurally cannot.
+    c(
+        "misc:g@l with no operatorfunc registered is a no-op",
+        &["hello world"],
+        1,
+        1,
+        "g@l",
+    ),
 ];
 
 // ─────────────────────────── Q. folds (#1006) ───────────────────────────
@@ -5346,6 +8084,27 @@ const FOLDNEST: &[&str] = &[
     "}",
 ];
 
+// Two-level nested `foldmethod=marker` fixture (#1159), companion to
+// FOLDNEST above but nested via `{{{`/`}}}` pairs instead of indentation.
+// Verified line-for-line against `nvim --headless`: at `foldlevel=0` lines
+// 1-6 close as one fold (level 1 — the marker on line 1 itself, unlike the
+// indent method's header line, IS part of its own fold, since the marker
+// pair's *first* line is what opens the region); at `foldlevel=1` that fold
+// is open but the nested lines 2-4 are still closed (level 2); at
+// `foldlevel=2` nothing is closed.
+const FOLDMARKERNEST: &[&str] = &[
+    "fn main() { // {{{",
+    "    if true { // {{{",
+    "        x();",
+    "        } // }}}",
+    "    let a = 1;",
+    "} // }}}",
+    "// trailing",
+];
+
+// Minimal fixture for a non-default `'foldmarker'` pair (#1159).
+const FOLDMARKER_CUSTOM: &[&str] = &["alpha [[[", "beta", "]]]", "gamma"];
+
 const CASES_FOLD: &[Case] = &[
     // ── manual folds: zf{motion} ─────────────────────────────────────────
     c("fold:zfj hides one line", FOLDTXT, 1, 1, "zfjj"),
@@ -5374,6 +8133,47 @@ const CASES_FOLD: &[Case] = &[
     // ── zO/zC ─────────────────────────────────────────────────────────────
     c("fold:zO opens recursively", FOLDTXT, 1, 1, "zfjzOj"),
     c("fold:zC recloses recursively", FOLDTXT, 1, 1, "zfjzozCj"),
+    // ── zA/zF/zv/zx (#1280) ──────────────────────────────────────────────
+    // zA: recursive toggle. Build a nested fold — inner (lines 2-3) created
+    // first, then outer (lines 1-4) wraps it, same construction the zD case
+    // below reuses — and toggle from the outer, closed header. A plain `za`
+    // would only touch the outer level; `zA` must also open the inner one,
+    // so the trailing `j` lands one line lower here (line 2) than a
+    // (hypothetical) single-level toggle would leave it.
+    c(
+        "fold:zA recursively toggles nested folds",
+        FOLDTXT,
+        1,
+        1,
+        "jzfjkzf3jzAj",
+    ),
+    // zF: fold a `count` of lines from the cursor with no motion. `j` after
+    // it lands past the fold (line 4) only if it actually closed lines 1-3.
+    c("fold:zF folds a count of lines", FOLDTXT, 1, 1, "3zFj"),
+    // zv: open just enough folds to reveal a cursor that landed inside a
+    // closed one. `3G` jumps straight to the hidden interior line (folds
+    // don't stop an absolute line jump, only relative motions), then `zv`
+    // must open the enclosing fold for the following `j` to move one real
+    // line (to line 4) rather than skip straight past it (to line 5).
+    c(
+        "fold:zv reveals a cursor hidden by a closed fold",
+        FOLDTXT,
+        1,
+        1,
+        "zf3j3Gzvj",
+    ),
+    // zx: recompute (open all, then reclose all). Open the fold, move the
+    // cursor to its last line (still visible while open), then zx recloses
+    // it — the cursor is now hidden and must snap back up to the fold's
+    // header (line 1), which the trailing case comparison captures directly
+    // (no extra motion needed to observe it, unlike zA/zv above).
+    c(
+        "fold:zx recomputes and clamps a hidden cursor",
+        FOLDTXT,
+        1,
+        1,
+        "zf3jzojjjzx",
+    ),
     // ── zj/zk fold navigation ────────────────────────────────────────────
     c(
         "fold:zj moves to the defined fold header",
@@ -5459,6 +8259,19 @@ const CASES_FOLD: &[Case] = &[
         "10Gzf10j30GzzH",
     ),
     // ── foldmethod=indent / foldlevel ────────────────────────────────────
+    // #1153: foldmethod/foldlevel are now reachable from the real `:set`
+    // command (previously only `apply_setup`'s Lua-setup bypass could set
+    // them for this suite — see the issue: "exist in settings.json but are
+    // not reachable from :set"). This case drives the actual `:set fdm=
+    // indent<CR>` ex command through both sides, unlike the `cs(..)` cases
+    // below it which pin the option before the key sequence starts.
+    c(
+        "fold:indent:set fdm=indent via :set",
+        FOLDNEST,
+        1,
+        1,
+        ":set fdm=indent<CR>j",
+    ),
     cs(
         "fold:indent:foldlevel0 j crosses the whole outer fold",
         FOLDNEST,
@@ -5522,6 +8335,489 @@ const CASES_FOLD: &[Case] = &[
         1,
         "zozcj",
         "vim.o.foldmethod='indent'",
+    ),
+    // ── 'foldnestmax' (#1159) — only affects "indent"/"syntax", not
+    // "marker" (`:h 'foldnestmax'`; verified against `nvim --headless`:
+    // capping FOLDNEST's would-be level-2 inner fold to foldnestmax=1
+    // absorbs it into the level-1 outer fold instead of leaving it its own
+    // closeable region, so at foldlevel=1 the inner lines are *not* closed
+    // — contrast the default-nestmax case right below it, where they are).
+    cs(
+        "fold:indent:foldnestmax=1 absorbs the level-2 fold into level-1",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldnestmax=1\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:indent:default foldnestmax leaves the level-2 fold closed",
+        FOLDNEST,
+        1,
+        1,
+        "jjjj",
+        "vim.o.foldmethod='indent'\nvim.o.foldlevel=1",
+    ),
+    // ── foldmethod=marker (#1159) ────────────────────────────────────────
+    c(
+        "fold:marker:set fdm=marker via :set",
+        FOLDMARKERNEST,
+        1,
+        1,
+        ":set fdm=marker<CR>j",
+    ),
+    cs(
+        "fold:marker:foldlevel0 j crosses the whole outer fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "j",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=0",
+    ),
+    cs(
+        "fold:marker:foldlevel1 j steps to the nested fold header",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:marker:foldlevel1 j skips the closed nested fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jjj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=1",
+    ),
+    cs(
+        "fold:marker:foldlevel2 nothing is folded",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "jjjjjj",
+        "vim.o.foldmethod='marker'\nvim.o.foldlevel=2",
+    ),
+    cs(
+        "fold:marker:zR opens everything",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zRjjjjjj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zM recloses after zR",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zRzMj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zo opens the level-1 fold, inner stays closed",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zoj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:zc recloses the level-1 fold",
+        FOLDMARKERNEST,
+        1,
+        1,
+        "zozcj",
+        "vim.o.foldmethod='marker'",
+    ),
+    cs(
+        "fold:marker:custom foldmarker pair",
+        FOLDMARKER_CUSTOM,
+        1,
+        1,
+        "j",
+        "vim.o.foldmethod='marker'\nvim.o.foldmarker='[[[,]]]'",
+    ),
+    // ── `:fold*` ex commands (#1159) — all on FOLDTXT/manual folds, driven
+    // through the real ex-command path so they exercise
+    // `try_execute_fold_command`/`ex_fold_create`/`ex_fold_open_close`
+    // directly, the same way "fold:indent:set fdm=indent via :set" above
+    // exercises the `:set` path rather than the `cs(..)` setup bypass.
+    c(
+        "fold:ex::fold creates and closes a manual fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>jj",
+    ),
+    c(
+        "fold:ex::foldopen with a matching range reopens it",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:2,4foldopen<CR>jj",
+    ),
+    c(
+        "fold:ex::foldopen on a nested range opens only the outer level",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen<CR>jj",
+    ),
+    c(
+        "fold:ex::foldclose on a range spanning two nested headers closes only the outer",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen!<CR>:2,3foldclose<CR>2Gzojj",
+    ),
+    c(
+        "fold:ex::foldclose! on a nested range closes every level",
+        FOLDTXT,
+        1,
+        1,
+        ":3,4fold<CR>:2,5fold<CR>:2,5foldopen!<CR>:2,3foldclose!<CR>2Gzojj",
+    ),
+    c(
+        "fold:ex::folddoopen only touches lines outside the closed fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:folddoopen s/^/X/<CR>",
+    ),
+    c(
+        "fold:ex::folddoclosed only touches lines inside the closed fold",
+        FOLDTXT,
+        1,
+        1,
+        ":2,4fold<CR>:folddoclosed s/^/Z/<CR>",
+    ),
+];
+
+// ───────────────────────── G2. :map family (#1151) ─────────────────────────
+//
+// The oracle corpus's coverage of vim's `:map`/`:nmap`/`:nnoremap`/… family —
+// key-to-keys remapping, noremap-vs-map recursion, `<leader>` expansion, and
+// operator-pending maps. Mapping definitions with no `<Notation>` in the rhs
+// (`:nmap a b`, `:onoremap p i(`) are typed as literal ex-command keystrokes,
+// identically on both sides, via `c(..)`. A definition whose rhs needs
+// `<Notation>` that isn't `<CR>`/`<Esc>`/etc. already known to this suite's
+// own key tokenizer (`<Esc>` *would* tokenize fine, but sending it while
+// typing a `:` command line would send a real Escape keystroke and cancel
+// the command instead of typing the four literal characters "E","s","c" —
+// see `tokenize_keys`) instead defines the mapping via a `cs(..)` Lua
+// `vim.keymap.set(...)` / `vim.g.mapleader` setup statement, which
+// `apply_keymap_set` / `apply_setup` translate onto vimcode's
+// `Settings::keymaps` without going through any keystroke path at all.
+const CASES_MAP: &[Case] = &[
+    // `inoremap jk <Esc>` — the single most common line in any vimrc (#1151's
+    // motivating example). If the mapping fires, "jk" is consumed entirely
+    // by the mapping (buffered waiting for the "k" — same prefix contract as
+    // any other multi-key mapping) and nothing is inserted; escaping also
+    // steps the cursor back one column, same as a real `<Esc>` keypress.
+    cs(
+        "map:inoremap_jk_to_escape",
+        &["ab"],
+        1,
+        1,
+        "ijk",
+        "vim.keymap.set('i', 'jk', '<Esc>')",
+    ),
+    // A single 'j' not followed by 'k' must still just be typed — the
+    // prefix-buffering must not eat keys it doesn't end up needing.
+    cs(
+        "map:inoremap_jk_single_j_falls_through",
+        &["ab"],
+        1,
+        1,
+        "ijx",
+        "vim.keymap.set('i', 'jk', '<Esc>')",
+    ),
+    // `:nmap` (recursive): a -> b, b -> x (delete char under cursor). Chases
+    // through both hops, so pressing 'a' deletes a character.
+    c(
+        "map:nmap_chases_recursively",
+        &["abc"],
+        1,
+        1,
+        ":nmap a b<CR>:nmap b x<CR>a",
+    ),
+    // `:nnoremap` (non-recursive): a -> b, and b is *separately* mapped to x.
+    // The noremap rhs 'b' must be taken literally — the built-in word-back
+    // motion, which touches nothing at the start of the buffer — not chase
+    // into the a-priori-unrelated b -> x mapping (which would delete a char).
+    c(
+        "map:nnoremap_does_not_chase",
+        &["abc def"],
+        1,
+        1,
+        ":nnoremap a b<CR>:nmap b x<CR>a",
+    ),
+    // A cycle with no base case (`nmap a b` + `nmap b a`) must stop — vim's
+    // `maxmapdepth` — rather than hang. Neither side should have touched the
+    // buffer or cursor by the time the guard aborts it.
+    c(
+        "map:recursive_cycle_hits_depth_guard",
+        &["hello"],
+        1,
+        1,
+        ":nmap a b<CR>:nmap b a<CR>a",
+    ),
+    // `<leader>` expansion in the lhs. Using ',' rather than the real default
+    // ('\') sidesteps Lua/Rust string-escaping noise without weakening the
+    // case: what's under test is substitution of *whatever* `mapleader` is,
+    // not the specific default character.
+    cs(
+        "map:leader_expands_in_lhs",
+        &["abc"],
+        1,
+        1,
+        ",w",
+        "vim.g.mapleader = ','\nvim.keymap.set('n', '<leader>w', 'x')",
+    ),
+    // Operator-pending (`o`) maps: `onoremap p i(` makes 'p', while an
+    // operator awaits its motion, behave like the "inside parens" text
+    // object — so "dp" deletes inside the parens the cursor is in, same as
+    // "di(" would.
+    c(
+        "map:onoremap_extends_a_motion",
+        &["foo(bar)baz"],
+        1,
+        6,
+        ":onoremap p i(<CR>dp",
+    ),
+    // The same mapping must not fire outside operator-pending — bare 'p'
+    // (paste, nothing yanked) should stay a no-op, not enter Insert mode and
+    // type a literal '(' the way firing the rhs "i(" directly would.
+    c(
+        "map:onoremap_does_not_fire_without_pending_operator",
+        &["foo(bar)baz"],
+        1,
+        6,
+        ":onoremap p i(<CR>p",
+    ),
+];
+
+// ───────────────────── G3. value options (#1206) ─────────────────────
+//
+// Oracle coverage for the buffer/cursor-observable half of #1206's option
+// tranche: 'whichwrap' and 'backspace'. ('wildmode', 'scrolljump' and
+// 'sidescrolloff' only affect scroll position/command-line state, which
+// this per-case harness doesn't capture — see the module docs' "Nothing
+// here is hand-authored" note on what `run_case` actually diffs.)
+const CASES_OPT: &[Case] = &[
+    cs(
+        "opt:whichwrap h wraps to end of previous line",
+        &["ab", "cd"],
+        2,
+        1,
+        "h",
+        "vim.o.whichwrap = 'h'",
+    ),
+    cs(
+        "opt:whichwrap h does not wrap without the token",
+        &["ab", "cd"],
+        2,
+        1,
+        "h",
+        "vim.o.whichwrap = 's'",
+    ),
+    cs(
+        "opt:whichwrap l wraps to start of next line",
+        &["ab", "cd"],
+        1,
+        2,
+        "l",
+        "vim.o.whichwrap = 'l'",
+    ),
+    cs(
+        "opt:backspace without eol keeps lines separate",
+        &["ab", "cd"],
+        2,
+        1,
+        "i<BS><Esc>",
+        "vim.o.backspace = 'indent,start'",
+    ),
+    cs(
+        "opt:backspace with eol still joins (matches default)",
+        &["ab", "cd"],
+        2,
+        1,
+        "i<BS><Esc>",
+        "vim.o.backspace = 'indent,eol,start'",
+    ),
+    // Review finding (#1206 iteration 1): without "start", BackSpace must
+    // be refused outright once the cursor has moved (even just an <Up>,
+    // no typing) onto a line the current Insert session never touched —
+    // not only the exact line Insert was entered on. Before this fix,
+    // `backspace_may_delete_before`'s `line != insert_enter_line` check
+    // was true for ANY line other than the literal entry line, so it
+    // wrongly allowed deleting into "AAAA" here. Verified RED against
+    // unfixed `develop` via a local revert of the `split_insert_undo_group`
+    // re-anchoring fix (`git stash`-equivalent revert + rerun), which
+    // failed BUF: vimcode produced "AAA\nBBBB\nCCCC" (deleted the trailing
+    // 'A') while real Neovim left the buffer untouched.
+    cs(
+        "opt:backspace without start blocks BS after cursor moves off the typed line",
+        &["AAAA", "BBBB", "CCCC"],
+        2,
+        3,
+        "i<Up><BS><Esc>",
+        "vim.o.backspace = 'indent,eol'",
+    ),
+    // Non-blocking review finding (#1206 iteration 1): `'whichwrap'`'s
+    // `<BS>`/`<Space>` `"b"`/`"s"` tokens were only wired into
+    // `handle_normal_key`'s "BackSpace"/"space"/"Space" arms — Visual mode
+    // (a separate match, not falling through to Normal-mode handling) had
+    // no arm for either key at all, so `<BS>` in Visual mode stayed a
+    // silent no-op even with the default `'whichwrap'` (`"b,s"`).
+    cs(
+        "opt:whichwrap Visual-mode <BS> wraps like Normal-mode h",
+        &["ab", "cd"],
+        2,
+        1,
+        "v<BS>d",
+        "vim.o.whichwrap = 'b,s'",
+    ),
+];
+
+// ───────────────── G4. boolean options, tranche 2 (#1207) ─────────────────
+//
+// Oracle coverage for the buffer/cursor-observable half of #1207's tranche:
+// 'magic' (search/`:s` pattern semantics), 'smartindent' and 'cindent'
+// (newline/brace/hash indent behaviour). `-u NONE` (see `NvimRpc::spawn`)
+// means no filetype/indent plugins are loaded, so only 'smartindent'/
+// 'cindent' behaviour that is built into Vim core itself (brace-based
+// indent/outdent, '#' to column 0) is exercised here — not vimcode's own
+// `line_triggers_indent` language-aware extras (Python `:`, Lua/Ruby/Shell
+// `do`/`then`, ...), which are a vimcode-only enhancement layered on top of
+// real Vim's 'smartindent'/'autoindent' and have no oracle to check against.
+// ('showmatch' doesn't belong here — see `bool_opt:showmatch does not
+// disturb the buffer or final cursor position` below for why its own
+// resulting-state is not, in fact, oracle-observable.)
+const CASES_BOOLOPT: &[Case] = &[
+    // ── 'magic' ──────────────────────────────────────────────────────────
+    cs(
+        "bool_opt:magic search treats '.' as any-char wildcard",
+        &["xxx", "acb", "a.b"],
+        1,
+        1,
+        "/a.b<CR>",
+        "vim.o.magic = true",
+    ),
+    cs(
+        "bool_opt:nomagic search treats '.' as a literal dot",
+        &["xxx", "acb", "a.b"],
+        1,
+        1,
+        "/a.b<CR>",
+        "vim.o.magic = false",
+    ),
+    cs(
+        "bool_opt:magic :s treats '.' as any-char wildcard",
+        &["aXc"],
+        1,
+        1,
+        ":s/a.c/REPL/<CR>",
+        "vim.o.magic = true",
+    ),
+    cs(
+        "bool_opt:nomagic :s treats '.' as a literal dot, no match",
+        &["aXc"],
+        1,
+        1,
+        ":s/a.c/REPL/<CR>",
+        "vim.o.magic = false",
+    ),
+    cs(
+        "bool_opt:nomagic :s still substitutes an escaped \\.",
+        &["aXc"],
+        1,
+        1,
+        ":s/a\\.c/REPL/<CR>",
+        "vim.o.magic = false",
+    ),
+    // ── 'smartindent' (brace-after-newline only — see note below) ───────
+    //
+    // Real Vim's own `:h 'smartindent'` documents the "'}'/'#' as first
+    // char outdents/resets" behaviour too, but empirically (verified by
+    // hand against this exact oracle while writing these cases) it only
+    // fires when the current line's *entire* existing indent was itself
+    // produced by auto-indenting earlier in the very same Insert session
+    // (Vim's internal `did_ai` flag) — not when the leading whitespace was
+    // already sitting in the buffer before Insert was entered, which is
+    // what every case in this corpus's shared harness starts from (a fixed
+    // starting buffer, cursor placed by `nvim_win_set_cursor`, not typed).
+    // A same-session repro (`A<CR>}<Esc>` starting from a bare `{`-ending
+    // line, so the auto-indent and the `}` land in one Insert session) confirms
+    // this is a real Vim quirk, not a harness artifact: it produced the
+    // outdent nvim's side, and does not with a pre-existing indent. This
+    // repo's `smartindent` deliberately implements the *simpler*,
+    // unconditional form the issue (#1207) scoped — outdent/`#`-reset
+    // whenever the typed character is the first non-blank on the line,
+    // regardless of how the existing indent got there — so it does not
+    // chase Vim's `did_ai` gating. That divergence is covered by this
+    // repo's own engine-level tests (`src/core/engine/tests.rs`), not the
+    // oracle corpus here: `did_ai` isn't observable through this harness's
+    // `Case` shape without adding session-provenance tracking neither this
+    // issue nor a real user-facing gap calls for. `'cindent'`'s outdent/`#`
+    // rule has no such gating (see below — it fires unconditionally in
+    // both Vim and this repo), so only `'cindent'` gets oracle cases for
+    // those two rules.
+    cs(
+        "bool_opt:smartindent alone (no autoindent) indents after '{'",
+        &["if (x) {"],
+        1,
+        1,
+        "A<CR>y<Esc>",
+        "vim.o.autoindent = false\nvim.o.smartindent = true",
+    ),
+    // ── 'cindent' ─────────────────────────────────────────────────────────
+    cs(
+        "bool_opt:cindent alone (no autoindent) indents after '{'",
+        &["if (x) {"],
+        1,
+        1,
+        "A<CR>y<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    cs(
+        "bool_opt:cindent alone outdents a lone closing brace",
+        &["if (x) {", "    "],
+        2,
+        5,
+        "A}<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    cs(
+        "bool_opt:cindent alone moves a typed '#' to column 0",
+        &["    "],
+        1,
+        5,
+        "A#<Esc>",
+        "vim.o.autoindent = false\nvim.o.cindent = true",
+    ),
+    // ── 'showmatch' ───────────────────────────────────────────────────────
+    //
+    // 'showmatch' is a momentary *display* effect (`:h 'showmatch'`): Vim
+    // really does move the cursor to the matching bracket and back before
+    // the next redraw, gated on 'matchtime' — out of scope for #1207 (see
+    // the issue). Both here and in real Vim, once the dust settles the
+    // buffer and the *final* cursor position are unaffected by whether
+    // 'showmatch' was on at all — this repo's own `showmatch_flash` state
+    // (asserted directly in `src/core/engine/tests.rs`, not observable
+    // through this harness's `Case` shape) is what actually proves the
+    // flash happened; this case is a regression guard that turning
+    // 'showmatch' on doesn't accidentally leave the *real* cursor stuck at
+    // the match, which would show up here as a genuine buffer/cursor
+    // mismatch against Neovim.
+    cs(
+        "bool_opt:showmatch does not disturb the buffer or final cursor position",
+        &["(foo"],
+        1,
+        5,
+        "A)<Esc>",
+        "vim.o.showmatch = true",
     ),
 ];
 
@@ -5650,6 +8946,1324 @@ const CASES_MULTI_JUMPS_LIST: &[MultiJumpsCase] = &[
     ),
 ];
 
+// ─────────────── I. window-layout tree (#1162) — the 33 CTRL-W rows ───────────────
+//
+// See the harness's own module doc above (`WinCase`/`run_win_case`) for the
+// comparison model. `CTRL-W H`/`J`/`K`/`L`/`T`/`e`/`E`/`d` have no entry here
+// at all — permanently exempt, see `COVERAGE_EXEMPT`. `CTRL-W <`/`>`/`\|` do
+// have real cases below but are listed in `KNOWN_DEVIATIONS_WIN`, not
+// expected to pass — each case's own comment explains the finding. `CTRL-W
+// p`/`+`/`-`/`_` are real cases too, but each has since been fixed (#1288,
+// #1292) and is expected to pass like everything else not in that list.
+
+const WIN_TWO_LINES: &[&str] = &["first line", "second line", "third line"];
+
+const CASES_WIN: &[WinCase] = &[
+    // --- Focus (h/j/k/l/w/W/p/t/b) ---
+    wc(
+        "win:CTRL-W h focuses the window to the left",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>v<C-w>l<C-w>h",
+    ),
+    wc(
+        "win:CTRL-W j focuses the window below",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>j",
+    ),
+    wc(
+        "win:CTRL-W k focuses the window above",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>j<C-w>k",
+    ),
+    wc(
+        "win:CTRL-W l focuses the window to the right",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>v<C-w>l",
+    ),
+    wc(
+        "win:CTRL-W w cycles to the next window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w",
+    ),
+    // #1162 fix: `W` used to be aliased to `w` (both called
+    // `focus_next_window`) — this case is RED against the unfixed alias
+    // (both cursors land in the same, most-recently-split window instead of
+    // cycling backward to the original).
+    wc(
+        "win:CTRL-W W cycles to the previous window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w<C-w>W",
+    ),
+    // #1162 fix: `t`/`b` used to walk the VSCode-style editor-group tree
+    // (`self.group_layout`), a no-op with the single editor group every one
+    // of these cases has — RED against the unfixed version (focus never
+    // leaves the window `<C-w>s<C-w>s` left active).
+    wc(
+        "win:CTRL-W t goes to the top-left window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>s<C-w>t",
+    ),
+    wc(
+        "win:CTRL-W b goes to the bottom-right window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>s<C-w>b",
+    ),
+    // --- Split / close ---
+    wc(
+        "win:CTRL-W s splits horizontally",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s",
+    ),
+    wc(
+        "win:CTRL-W v splits vertically",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v",
+    ),
+    wc(
+        "win:CTRL-W c closes the current window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>c",
+    ),
+    wc(
+        "win:CTRL-W o closes every other window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>v<C-w>o",
+    ),
+    wc(
+        "win:CTRL-W n opens :new above",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>n",
+    ),
+    wc(
+        "win:CTRL-W q closes the current window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>q",
+    ),
+    // --- Rearrange (x/r/R) ---
+    wc(
+        "win:CTRL-W x exchanges with the next window",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>x",
+    ),
+    // #1162 finding, FIXED by #1291: `rotate_windows` used to rotate
+    // *content* across fixed `WindowId` tree slots rather than reordering
+    // window identity in the tree, so "current" stayed pinned to the same
+    // screen position instead of following the window that was focused
+    // before the rotate (every leaf shows the same file/cursor here on
+    // purpose — `current` is the only signal that can distinguish the two
+    // models). Now a real, non-vacuous pass — removed from
+    // KNOWN_DEVIATIONS_WIN.
+    wc(
+        "win:CTRL-W r rotates windows downward/rightward",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>s<C-w>r",
+    ),
+    wc(
+        "win:CTRL-W R rotates windows upward/leftward",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>s<C-w>R",
+    ),
+    // --- CTRL-W f: split + open the file under the cursor ---
+    wc_files(
+        "win:CTRL-W f opens the file under the cursor in a split",
+        &["see target.txt for the rest"],
+        &[("target.txt", &["target file line one", "line two"])],
+        1,
+        6,
+        "<C-w>f",
+    ),
+    // --- Resize / maximize / equalize ---
+    // #1162 finding, FIXED by #1290: `equalize_splits` does set every ratio
+    // to exactly 0.5 (Neovim's own default too, so this still converges to
+    // the same layout as `CASES_WIN`'s plain `s`/`v` cases regardless of
+    // the percentage-vs-line-resize that ran first), and `WindowLayout::
+    // calculate_rects`'s rect-rounding now gives the exact 12/11 split
+    // Neovim does on this odd-sized axis (was 11/11 pre-#1290).
+    wc_sized(
+        "win:CTRL-W = re-equalizes windows after a resize",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>+<C-w>=",
+    ),
+    // `CTRL-W +`/`-`: both real, non-vacuous PASSes since #1288 — the
+    // absolute-`[count]` resize math (`resize_window_split`) lands on the
+    // exact same (rows, cols) as Neovim for both directions on this
+    // harness's fixed 80x24, 2-window starting split; Horizontal splits have
+    // no divider-column gap to account for (see follow-up #6/#1326 in the
+    // KNOWN_DEVIATIONS_WIN comment block above), so there was never a second
+    // bug hiding behind the original percentage-vs-line one here.
+    wc_sized(
+        "win:CTRL-W + increases the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>+",
+    ),
+    wc_sized(
+        "win:CTRL-W - decreases the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s5<C-w>-",
+    ),
+    // `CTRL-W <`/`>`: real, non-vacuous PASSes since #1326 — `<C-w>v10<C-w><`
+    // ends up (30, 49) and `<C-w>v10<C-w>>` (50, 29), i.e. Neovim's real
+    // 40/39-of-80 divider-reserving fresh split moved by an absolute
+    // `[count]` columns. Before #1326, #1288's resize math was already
+    // correct (the active, resized window's own width matched Neovim
+    // exactly), but the *other* window was one column too wide —
+    // `WindowLayout::layout_snapped` reserved zero columns for the vertical
+    // divider bar Neovim's own layout always has. See the KNOWN_DEVIATIONS_
+    // WIN comment block's follow-up #6 for the full diagnosis.
+    wc_sized(
+        "win:CTRL-W < decreases the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v10<C-w><",
+    ),
+    wc_sized(
+        "win:CTRL-W > increases the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v10<C-w>>",
+    ),
+    // `CTRL-W _`: a real, non-vacuous PASS since #1289 — `maximize_window_
+    // split` shrinks the other window to exactly Neovim's own
+    // `'winminheight'` floor (1 content row); Horizontal splits have no
+    // divider-column analogue, so there was no second bug to find here
+    // either. `CTRL-W \|` needed the same #1326 divider-column fix as
+    // `<`/`>` above (vimcode's fixed split used to give the other window
+    // exactly 1 of its own 80-column total — `79`/`1` — where Neovim's real
+    // split is `78`/`1` of a 79-column *content* total) and is now a real,
+    // non-vacuous PASS too.
+    wc_sized(
+        "win:CTRL-W _ maximizes the active window's height",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>s<C-w>_",
+    ),
+    wc_sized(
+        "win:CTRL-W | maximizes the active window's width",
+        WIN_TWO_LINES,
+        2,
+        1,
+        "<C-w>v<C-w>|",
+    ),
+    // #1162 finding, filed and FIXED as #1292: `CTRL-W p` used to track
+    // only "previously active editor group", never "previously active
+    // window within one group" — the common single-group case every other
+    // CASES_WIN entry lives in. `Tab::prev_window` now tracks the latter,
+    // updated at every focus-changing call site (`Tab::focus_window`), and
+    // `execute_wincmd`'s `'p'` arm prefers it. PASS: no longer in
+    // KNOWN_DEVIATIONS_WIN.
+    wc(
+        "win:CTRL-W p returns to the previously active window",
+        WIN_TWO_LINES,
+        1,
+        1,
+        "<C-w>s<C-w>w<C-w>p",
+    ),
+];
+
+// ─────── J. cross-file/cross-tab jumps and buffer/tab/window ex commands (#1281) ───────
+//
+// The 40 rows #1162 deliberately left for this issue: `gf`/`gt`/`CTRL-^`/
+// `g<Tab>`, the cross-file marks (`` `{A-Z} ``, `g'`, `` g` ``), and the
+// buffer/tab/window ex commands. Same [`WinCase`]/[`run_win_case`] harness as
+// [`CASES_WIN`] — nothing new to build, per the issue's own instruction not
+// to start a second harness. Kept as a separate array (not appended to
+// `CASES_WIN`) purely so the "33 CTRL-W rows" and "40 cross-file rows" stay
+// two countable units instead of one blurred one; [`run_win_case`] and
+// [`KNOWN_DEVIATIONS_XFILE`] work identically either way.
+const XFILE_MAIN: &[&str] = &["main one", "main two", "main three"];
+const XFILE_B: &[&str] = &["b one", "b two", "b three"];
+const XFILE_C: &[&str] = &["c one", "c two", "c three"];
+
+const CASES_XFILE: &[WinCase] = &[
+    // --- Cross-file marks (search:, g:) ---
+    wc_files(
+        "mark:`A jumps to the exact position across files",
+        XFILE_MAIN,
+        &[("b.txt", &["b one", "b two here", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>2G4lmA:e {F0}<CR>`A",
+    ),
+    // First-non-blank, not the exact column the mark was set at — proves
+    // both the cross-file switch and #1281's `first_non_blank_col` fix
+    // (`g'` used to hardcode column 0, see KNOWN_DEVIATIONS_XFILE history
+    // in the commit that landed this).
+    wc_files(
+        "mark:g' jumps to the first non-blank across files",
+        XFILE_MAIN,
+        &[("b.txt", &["   indented b one", "b two", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>1G1lmA:e {F0}<CR>g'A",
+    ),
+    wc_files(
+        "mark:g` jumps to the exact position across files",
+        XFILE_MAIN,
+        &[("b.txt", &["b one", "b two here", "b three"])],
+        1,
+        1,
+        ":e {F1}<CR>2G3lmA:e {F0}<CR>g`A",
+    ),
+    // --- Tab navigation (other:, g:) ---
+    wc_files(
+        "win:gt wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabnew {F1}<CR>gt",
+    ),
+    wc_files(
+        "win:gT wraps from the first tab to the last",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>gT",
+    ),
+    wc_files(
+        "win:g<Tab> returns to the last-accessed tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>1gtg<Tab>",
+    ),
+    // --- gf/gF (other:, g:) ---
+    wc_files(
+        "win:gf opens the file path under the cursor",
+        &["see b.txt for details", "second line"],
+        &[("b.txt", XFILE_B)],
+        1,
+        5,
+        "gf",
+    ),
+    wc_files(
+        "win:gF opens file:line under the cursor and jumps to the line",
+        &["see b.txt:2 for details", "second line"],
+        &[("b.txt", XFILE_B)],
+        1,
+        5,
+        "gF",
+    ),
+    // --- Alternate file (other:) ---
+    wc_files(
+        "win:CTRL-^ toggles the alternate file",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR><C-^>",
+    ),
+    // --- Command-line window (other:) — Vim opens this in the current tab
+    // as a small split (`:h cmdwin`), and as of #1297
+    // `Engine::open_cmdline_window` does too. These three passed against the
+    // live oracle the moment `run_win_case` gained one (#1328): before that,
+    // `run_win_in_neovim` drove its oracle over `nvim --headless -l
+    // script.lua` + a single `nvim_feedkeys` burst, and `:h cmdwin` silently
+    // refuses to open without an attached UI (confirmed empirically), so that
+    // oracle reported a static, unchanged single window no matter what
+    // vimcode did — a harness gap, not a vimcode one. See
+    // KNOWN_DEVIATIONS_XFILE's history for the confirmed repro.
+    wc(
+        "win:q: opens the command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q:",
+    ),
+    wc(
+        "win:q/ opens the search-history command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q/",
+    ),
+    wc(
+        "win:q? opens the reverse-search-history command-line window",
+        XFILE_MAIN,
+        1,
+        1,
+        "q?",
+    ),
+    // --- Core buffer ex commands (ex::) ---
+    wc_files(
+        "ex:edit switches to a different file in the current window",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":edit {F1}<CR>",
+    ),
+    wc_files(
+        "ex:bn cycles forward through the buffer list",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bn<CR>",
+    ),
+    wc_files(
+        "ex:bp cycles backward through the buffer list",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bp<CR>",
+    ),
+    wc_files(
+        "ex:b# returns to the alternate buffer",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:b#<CR>",
+    ),
+    wc_files(
+        "ex:b by number returns to buffer 1",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:b 1<CR>",
+    ),
+    wc_files(
+        "ex:bd deletes the current buffer and falls back to the previous one",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bd<CR>",
+    ),
+    wc_files(
+        "ex:bdelete deletes the current buffer and falls back to the previous one",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bdelete<CR>",
+    ),
+    // --- Split/close/only ex commands (ex::) ---
+    wc_files(
+        "ex:sp opens a file in a new horizontal split",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":sp {F1}<CR>",
+    ),
+    wc_files(
+        "ex:vs opens a file in a new vertical split",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":vs {F1}<CR>",
+    ),
+    wc(
+        "ex:close closes the current split, leaving the other window",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:close<CR>",
+    ),
+    wc(
+        "ex:only closes every window but the current one",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:vs<CR>:only<CR>",
+    ),
+    wc(
+        "ex:new opens a scratch buffer in a new horizontal split",
+        XFILE_MAIN,
+        1,
+        1,
+        ":new<CR>",
+    ),
+    wc(
+        "ex:vnew opens a scratch buffer in a new vertical split",
+        XFILE_MAIN,
+        1,
+        1,
+        ":vnew<CR>",
+    ),
+    // --- Tab ex commands (ex::) ---
+    wc_files(
+        "ex:tabe opens a file in a new tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>",
+    ),
+    wc_files(
+        "ex:tabclose closes the current tab, returning to the original",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabclose<CR>",
+    ),
+    wc_files(
+        "ex:tabnext wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabnext<CR>",
+    ),
+    wc_files(
+        "ex:tabprevious wraps from the last tab to the first",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabprevious<CR>",
+    ),
+    wc_files(
+        "ex:tabmove moves the current tab to position 0",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabmove 0<CR>",
+    ),
+    // #1281 review: `:tabmove 0` above only exercises the special-cased
+    // `N=0` branch (handled the same before and after the fix). This case
+    // exercises the general `N > 0` arithmetic that the review found broken:
+    // 3 tabs main.txt/b.txt/c.txt, current = main.txt (original index 0),
+    // `:tabmove 2` lands main.txt at index 1 (not index 2) — verified
+    // against the live oracle (`nvim v0.12.5 --headless -u NONE -i NONE`):
+    // `N`(2) is greater than current's original index(0), so the tab that
+    // was originally at index 2 (c.txt) shifts back to index 1 once main.txt
+    // is removed, and main.txt is inserted right after it, landing at
+    // index 1 — i.e. `dest = N - 1`, not `dest = N`.
+    wc_files(
+        "ex:tabmove N moves the current tab to a non-edge position",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":tabnew {F1}<CR>:tabnew {F2}<CR>1gt:tabmove 2<CR>",
+    ),
+    // --- {win,buf,tab}do (ex::) — #1281's own callout: bufdo in particular
+    // "runs a command in every buffer and will surface any ordering
+    // difference immediately." It did: `:windo` iterated
+    // `self.windows.keys()` — every window in the whole engine (not just
+    // the current tabpage `:h :windo` scopes to), in `HashMap` order, so
+    // which window was left active after the loop was both wrong *and*
+    // nondeterministic across runs. Fixed to `Tab::layout.window_ids()`
+    // (tab-scoped, deterministic layout order) — see the fix commit for the
+    // full diagnosis. `normal! G` (last line) is a commutative edit
+    // regardless, so the *content* comparison was never what exposed this;
+    // only "which window/buffer/tab is left current" could disagree.
+    wc(
+        "ex:windo runs a command in every window of the current tab",
+        XFILE_MAIN,
+        1,
+        1,
+        ":sp<CR>:windo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:bufdo runs a command in every listed buffer",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":e {F1}<CR>:bufdo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:tabdo runs a command in every tab",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B)],
+        1,
+        1,
+        ":tabe {F1}<CR>:tabdo normal! G<CR>",
+    ),
+    wc_files(
+        "ex:b by name switches by partial filename match",
+        XFILE_MAIN,
+        &[("b.txt", XFILE_B), ("c.txt", XFILE_C)],
+        1,
+        1,
+        ":e {F1}<CR>:e {F2}<CR>:b b.txt<CR>",
+    ),
+    // #1283: `ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow` — the four
+    // of the quickfix/location-list family's 23 ids that open a window, so
+    // per this issue's own instruction they're chained after #1162 onto this
+    // same `WinCase`/`run_win_case` layout-probe harness instead of the
+    // plain buffer/cursor `Case` harness the other 19 ids use (see
+    // `CASES_EX`'s "#1283" block above). Every one of these starts from a
+    // single window with no quickfix items and no location list at all —
+    // same "no populated-list seam" reasoning as that block.
+    //
+    // Three of the four are genuine, non-vacuous PASSes: `:cwindow` and
+    // `:lwindow` never open (confirmed against a live oracle: `winnr('$')`
+    // is unchanged either side, since the list is empty/absent) and `:lopen`
+    // refuses outright (`E776: No location list`, also confirmed live) — so
+    // the window layout is identical (one leaf, untouched) on both sides.
+    // `:copen` is the one RED entry — see KNOWN_DEVIATIONS_XFILE.
+    wc(
+        "qf:cwindow stays closed on an empty quickfix list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":cwindow<CR>",
+    ),
+    wc(
+        "qf:lopen errors without a location list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":lopen<CR>",
+    ),
+    wc(
+        "qf:lwindow errors without a location list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":lwindow<CR>",
+    ),
+    // #1283 finding, RED: confirmed against a live oracle that `:copen`
+    // opens the quickfix window *unconditionally* — even empty, `winnr('$')`
+    // goes from 1 to 2 with no error — and vimcode's `qf_open` was fixed
+    // in this same PR to match that (see `Engine::qf_open`'s #1283 doc
+    // comment). But vimcode's quickfix panel is not a real split window at
+    // all: `qf_open` only flips `QuickfixList::open`/`has_focus`, never
+    // touching `WindowLayout` (`src/tui_main/panels.rs`,
+    // `src/tui_main/render_impl.rs` render it as a separate overlay panel,
+    // the same architecture as the sidebar/terminal panels) — so Neovim's
+    // `winlayout()` grows a second leaf and vimcode's does not, a structural
+    // mismatch no message- or cursor-level fix can close. See
+    // KNOWN_DEVIATIONS_XFILE for the follow-up-issue writeup.
+    wc(
+        "qf:copen opens the quickfix window even on an empty list",
+        XFILE_MAIN,
+        1,
+        1,
+        ":copen<CR>",
+    ),
+];
+
+// KNOWN_DEVIATIONS_XFILE — same bidirectional-gate idiom as
+// KNOWN_DEVIATIONS_WIN above, applied to CASES_XFILE (#1281). May only ever
+// SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// Same policy as KNOWN_DEVIATIONS_WIN: no `gh` access from a worker session.
+// Follow-up #1 below was filed as #1297 (filed 2026-09-22), fixed at the
+// vimcode level, and its own harness-transport remainder was filed as #1328
+// (filed 2026-09-23) and is now *also* fixed — its three case labels are
+// deleted below (the shrink-only gate again). Follow-up #2 ("reuse the
+// pristine scratch buffer", filed as #1298) was fixed — see git history for
+// the writeup that used to live here; the case labels it gated are back in
+// CASES_XFILE above.
+// Follow-up #3 was filed as #1307 (filed 2026-09-22) and is now fixed —
+// its one case label is deleted below (the shrink-only gate: a
+// KNOWN_DEVIATIONS_XFILE entry that starts passing is removed, not kept for
+// history). Follow-up #4 was filed as #1308 (filed 2026-09-22) and is now
+// fixed — it never had a case label to gate (see its own entry below for
+// why), so there is nothing to delete from the array; only its writeup below
+// is updated.
+//
+//   1. (#1297, FIXED at the vimcode level; #1328, FIXED at the harness
+//      level — its three case labels are deleted below) "win:q: opens the
+//      command-line window" / "win:q/ ..." / "win:q? ...".
+//      `Engine::open_cmdline_window` (src/core/engine/ext_panel.rs) used to
+//      push a whole new `Tab` for the scratch history buffer; it now pushes
+//      a horizontal-split `Window` into the *active tab's* layout instead —
+//      positioned last (below), per `:h cmdwin`'s "positioned just above the
+//      command-line" (always last, unlike an ordinary split, which honors
+//      'splitbelow') — and `cmdline_window_execute`/the in-window `q`
+//      handler in `src/core/engine/keys.rs` now call `close_window()`, not
+//      `close_tab()`. Verified two ways: `normal_audit_matches_the_live_engine`
+//      (`na("q:", ...)` etc. in NORM_AUDIT below, pure — no nvim needed) now
+//      records `"(h0.50 1 2*) tabs=1/1"` instead of `"1* tabs=2/2"`; and a
+//      live, **UI-attached** `nvim --headless --embed` RPC session (`nvim
+//      --server <sock> --remote-send 'q:'`, then `winlayout()`) confirms
+//      real Neovim's own shape: `['col', [['leaf', mainwin], ['leaf',
+//      cmdwin]]]` — a `col` (`SplitDirection::Horizontal`) group with the
+//      cmdwin leaf second, current. That match is what "fixed" means here.
+//
+//      The three case labels stayed listed after #1297 anyway, because
+//      `run_win_case` (`run_win_in_neovim`) could not observe *any* of this:
+//      it drove its oracle over `nvim --headless -l script.lua` + a
+//      single-burst `nvim_feedkeys`, and `:h cmdwin` silently refuses to open
+//      the command-line window with no UI attached (reproduced directly:
+//      `nvim_input`/`nvim_feedkeys` inside an `-l` script left `winlayout()`
+//      and `nvim_list_wins()` completely unchanged after `q:`; the identical
+//      keystroke over an attached-UI RPC session opened the split every
+//      time) — a `run_win_case` transport gap, not a live behavioural
+//      disagreement. #1328 closed that gap: `run_win_in_neovim`
+//      (`oracle_probe_win`) now spawns the same `NvimRpc` attached-UI
+//      transport `oracle_probe` uses for `CASES`/`KNOWN_DEVIATIONS`, typing
+//      `keys` one token at a time via `nvim_input` exactly like that
+//      function, instead of one `nvim_feedkeys` burst over `-l script.lua`.
+//      All three cases now PASS against the live oracle — confirmed by
+//      running them (not assumed): `nvim v0.12.5`'s `winlayout()` after
+//      `q:`/`q/`/`q?` matches vimcode's own layout byte-for-byte, same
+//      `col`-group, cmdwin-leaf-current shape the live-session repro above
+//      already established.
+//   3. (#1283, filed as #1307, FIXED — its case label is deleted below, not
+//      kept) "quickfix/location-list panels should be real split windows,
+//      not overlay panels". `Engine::qf_open`/`qf_close`/`qf_window`
+//      (src/core/engine/picker.rs) used to only ever flip `QuickfixList::
+//      open`/`has_focus`; nothing inserted or removed a leaf from
+//      `WindowLayout`. `qf_open`/`qf_window` now call
+//      `Engine::qf_ensure_panel_window` (src/core/engine/windows.rs), which
+//      backs the panel with a real scratch buffer + `Window` and inserts it
+//      into the active tab's `WindowLayout` — a full-tab `wrap_full` (not
+//      `split_at`) for the global quickfix window, matching Neovim's own
+//      full-width-at-the-bottom `:copen` shape even with existing `:vsplit`
+//      panes (confirmed against a live, UI-attached oracle), and an ordinary
+//      `split_at` of the owner window for a location-list panel (`:lopen`,
+//      same shape as the #1297 command-line window). `qf_close`/`qf_window`
+//      call `Engine::qf_close_panel_window`, which removes the leaf and
+//      restores focus to `Tab::prev_window` (also confirmed against a live
+//      oracle — `:cclose` returns to whichever window was current before
+//      `:copen`, not simply "the first window"). `winnr("$")` now grows,
+//      `CTRL-W` navigation reaches the panel window like any other, and
+//      `render.rs`'s legacy overlay-band renderer self-suppresses for any
+//      target with a real window open (`Engine::qf_has_real_window`) so the
+//      two never double-paint. Every caller that still pokes `open`/
+//      `has_focus` directly without going through `qf_open` (most of this
+//      codebase's own rendering tests, and `qf_set_list`'s implicit `:grep`
+//      auto-open) is untouched — see `qf_has_real_window`'s doc comment.
+//
+//   4. (#1308, FIXED — no case label, since this scenario isn't reachable
+//      through the oracle `Case` harness at all, so it never was a
+//      `KNOWN_DEVIATIONS_XFILE` entry the way #3 was; it's tracked here
+//      purely as a follow-up, and stays tracked here now that it's fixed
+//      since there is no array entry to delete.)
+//      Title: "`:cdo`/`:cfdo`/`:ldo`/`:lfdo` should be silent no-ops on an
+//      empty quickfix/location list, not set a message". Confirmed against a
+//      live `nvim --headless -u NONE`: real Neovim's `:cdo {cmd}` (etc.) on
+//      an empty list is a silent no-op — `pcall` succeeds, `v:errmsg` stays
+//      empty — unlike `:cc`/`:cnext`/`:clist`/`:cfirst`/`:clast`, which all
+//      raise `E42: No Errors`. vimcode used to set `engine.message` to the
+//      shared `E42: No Errors` wording for `:cdo`/`:cfdo`/`:ldo`/`:lfdo` too
+//      (see `execute.rs`'s handling of those four commands next to
+//      `qf_empty_msg`); `Engine::qf_do` (`src/core/engine/picker.rs`) now
+//      returns without touching `engine.message` at all on an empty list,
+//      matching the silent no-op. See
+//      `test_cdo_on_empty_list_is_silent_no_op` in `src/core/engine/tests.rs`
+//      (renamed from `test_cdo_on_empty_list_errors_without_running_anything`,
+//      which used to assert the old, wrong behaviour) for the regression
+//      guard — this is still the only one, since the scenario has no oracle
+//      `Case` to gate it.
+//
+// Follow-up #1 was not attempted in #1281 itself for the same reason #1162
+// gave for its own 5 (it since landed as #1297 for the vimcode-level fix and
+// #1328 for its harness-transport remainder — see that entry above; its
+// three case labels are gone below, not kept, now that both have landed);
+// #3 was not attempted in #1283 for the same reason again (it has since
+// landed as #1307 — its case label is gone below, not kept, since
+// `run_win_case` *can* observe this one: no attached-UI transport gap like
+// follow-up #1's, just a genuine structural mismatch that #1307 closed); and
+// #4 was left as vimcode's existing (documented) behaviour rather than
+// narrowed inline, now filed as #1308 and fixed by that issue directly (see
+// its writeup above).
+// ---------------------------------------------------------------------------
+
+const KNOWN_DEVIATIONS_XFILE: &[&str] = &[
+    // Empty (#1328): the last three entries — "win:q: opens the command-line
+    // window" / "win:q/ ..." / "win:q? ..." — are gone. #1297 fixed the
+    // vimcode-level behaviour; `run_win_case` (`run_win_in_neovim`) still
+    // could not observe it because its oracle attached no UI, so `:h cmdwin`
+    // silently refused to open on the oracle side. #1328 moved
+    // `run_win_in_neovim` onto the same attached-UI `NvimRpc` transport
+    // `oracle_probe` uses for `CASES`/`KNOWN_DEVIATIONS` (#1008) — see the
+    // follow-up #1 writeup above for the confirmed repro and the live-run
+    // PASS. Do not add a new entry here without a confirmed live-oracle
+    // finding, same bar every other entry in this file has met.
+];
+
+#[test]
+fn nvim_conformance_cross_file_ex() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_XFILE
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_win_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: cross-file/buffer/tab ex commands (#1281) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_XFILE.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_XFILE.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_XFILE,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_XFILE entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_XFILE entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} cross-file/buffer/tab REGRESSION(S) — cases not in \
+             KNOWN_DEVIATIONS_XFILE that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_XFILE now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// KNOWN_DEVIATIONS_MESSAGE — same bidirectional-gate idiom as
+// KNOWN_DEVIATIONS_XFILE above, applied to CASES_MESSAGE (#1282). May only
+// ever SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// Same policy as KNOWN_DEVIATIONS_WIN/KNOWN_DEVIATIONS_XFILE: no `gh` access
+// from a worker session. Item 1 below (#1299, "`:reg`/`:registers`: support a
+// register-name argument and match Neovim's `Type Name Content` table") is
+// FIXED — `ex_registers` (src/core/engine/execute.rs) now parses a trailing
+// register-name argument and prints the real `Type Name Content` table, so
+// its two case labels are deleted from `KNOWN_DEVIATIONS_MESSAGE` below; this
+// paragraph is left as the historical index so the remaining item numbers
+// need not be renumbered. Items 2-5 are filed, as #1300 through #1303
+// respectively (filed 2026-09-22). Item 6 (#1304) was itself a hermeticity
+// bug rather than a formatting one; it is now fixed, and the formatting gap
+// it had been masking was filed as #1327 and is now also fixed (see item 6
+// below).
+// All of these are the same shape: vimcode's message-listing ex-commands
+// were implemented against a hand-remembered idea of the classic-Vim format
+// rather than checked against a live Neovim, so every one of them differs —
+// sometimes by a column, sometimes by the whole table being a different
+// shape. None was attempted inline here because each is its own
+// non-trivial formatter rewrite (exact column widths, which rows Neovim
+// includes at all, in one case an entirely different feature — auto marks —
+// that does not exist in vimcode yet), not a one-line fix, and mixing all of
+// them into the slice that *adds the probe* would make this diff
+// unreviewable. Every entry's live-oracle output is in this file's own git
+// history (the case, run once with `PROBE_VERBOSE=1`, printed it).
+//
+//   1. (#1299 — FIXED) "msg:ex::reg shows one named register's content" /
+//      "msg:ex::registers shows one named register's content". Was:
+//      `execute_command`'s `"registers" | "display"` arm matched only the
+//      bare command — any trailing argument fell through to "not an editor
+//      command" — and even bare `:reg` printed a vimcode-invented
+//      `--- Registers ---` header/column layout instead of Neovim's real
+//      one. Now: `ex_registers` parses an optional `{register-name}...`
+//      argument (each non-space character its own register name, `:h
+//      :registers`) and lists in Neovim's canonical order (unnamed,
+//      numbered, named, then `- * + . : % # / =`) using the real
+//      `Type Name Content` header and column layout, confirmed against a
+//      live oracle.
+//   2. (#1300 — FIXED) "msg:ex::marks lists a set mark" — title: "`:marks`:
+//      emit the three auto marks (`'`, `\"`, `.`) alongside user marks".
+//      `"marks"`'s arm only iterated `self.marks` (user-set marks); Neovim's
+//      `:marks` output always also lists the previous-context (`'`,
+//      `last_jump_pos`), last-cursor-before-leaving-buffer (`"`, defaulted
+//      to the buffer start — vimcode does not track buffer-enter/leave
+//      transitions) and last-change (`.`, `last_edit_pos`) positions, each
+//      with a `file/text` column previewing the target line (leading
+//      whitespace trimmed). The header's `col`/`file/text` gap was also off
+//      by one space. Confirmed against a live oracle; its case label is
+//      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
+//   3. (#1301 — FIXED) "msg:ex::jumps lists a jump" — title: "`:jumps`: drop
+//      the vimcode-only `tab` column, add the `file/text` preview column
+//      Neovim has instead". `"jumps"`'s arm printed a header/column vimcode
+//      added on its own (`" jump line  col  tab  file/text"`) instead of
+//      Neovim's `" jump line  col file/text"` (no tab column), and never
+//      previewed the target line's text at all. Now: the `tab` column is
+//      gone, the jump number is `w_jumplistidx`-relative (counts down to 0
+//      at the current entry, then back up for entries past it — Vim/Neovim's
+//      own numbering, not the raw list index), and `file/text` previews the
+//      target line's text (leading whitespace trimmed, via the new shared
+//      `preview_line_text` helper also used by `:marks`) when the jump is
+//      within the current buffer, falling back to the file path otherwise —
+//      all confirmed against a live oracle. Its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
+//   4. (#1302 — FIXED) "msg:ex::digraphs lists the digraph table" — title:
+//      "`:digraphs`: match Neovim's default digraph table and its
+//      column-wrapped grid layout". `src/core/digraphs.rs`'s table (#1160)
+//      was built against the *Vim* digraph list, not Neovim's, and
+//      `ex_digraphs`'s no-argument listing formatted it one-per-line
+//      instead of Neovim's fixed-width, column-wrapped grid — both
+//      dimensions differed from the live oracle. Fixed: `BUILTIN_DIGRAPHS`
+//      is now Neovim's default table (1366 entries, `vim.fn
+//      .digraph_getlist(1)`'s own order — extracted from a live
+//      `nvim --headless`, documented in the module doc so it can be
+//      re-derived byte-for-byte), and `format_digraph_table` reimplements
+//      `printdigraph`/`listdigraphs` (Neovim's `digraph.c`) — the
+//      13-cell-wide, 80-column grid, its control-char/composing-mark/
+//      wide-char cell-width rules, and (a separate bug found along the
+//      way) `ex_digraphs` listing custom (`:digraph`-defined) entries
+//      *before* the builtin table when Neovim always lists them *after*.
+//      Confirmed byte-for-byte against a live oracle; its case label is
+//      deleted from `KNOWN_DEVIATIONS_MESSAGE` below.
+//   5. (#1303 — FIXED) "msg:ex::changes lists a change" — title: "`:changes`:
+//      add the `text` column, fix `change_list`'s 0- vs 1-based numbering
+//      and the marker row". `"changes"`'s arm's header had no `text`
+//      column, and the body loop printed the raw 0-based index as the
+//      change number. A live-oracle probe with a multi-entry change list
+//      (not just the single-entry case this file covers) showed the real
+//      rule is not `i + 1`: like `:jumps`' `w_jumplistidx`-relative jump
+//      number, Neovim's change number is `w_changelistidx`-relative — it
+//      counts *distance from the current position* in the list (0 at the
+//      current entry, counting up on both sides), and the marker (`>`)
+//      lands on that same current entry, falling through to a bare
+//      trailing `>` line only when no `g;` has been done since the last
+//      change (`change_list_pos == change_list.len()`) — same shape as
+//      `:jumps`. Now: the header gets a `text` column previewing the
+//      changed line via the shared `preview_line_text` helper, and the
+//      body mirrors `:jumps`' `i.abs_diff(idx)` numbering and marker logic.
+//      Confirmed against a live oracle; its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
+//   6. (#1304, hermeticity — FIXED; #1327, formatting — FIXED)
+//      "msg:ex::history lists prior ex commands". #1304 was a hermeticity
+//      bug, not a message-formatting one: `HistoryState::load()`
+//      (src/core/session.rs) read `~/.config/vimcode/history.json`
+//      unconditionally, so every `Engine::new()` in this test binary
+//      started with whatever command history was sitting in the *developer
+//      machine's* real config directory (confirmed: ~100 stale entries on
+//      this repo's own dev machine). Fixed by a `suppress_disk_loads()`
+//      flag (`src/core/session.rs`, checked by `HistoryState::load()`)
+//      alongside the existing `suppress_disk_saves()`, called from
+//      `tests/common::engine_with` before `Engine::new()`. With the
+//      developer's real history no longer leaking in, this case ran
+//      hermetically — three real entries in, three real entries out — and
+//      it still failed, on the genuine formatting gap #1304 had been
+//      hiding: Neovim's `:history` prints a `      #  cmd history` header
+//      and marks the current entry's row with a leading `>` (e.g.
+//      `>     3  history`); vimcode printed a vimcode-invented
+//      `--- Command History ---` header with no current-entry marker, the
+//      same shape as #1303's deviation. #1327 fixed the formatting: the
+//      `"history"` arm now builds the `      #  {kind} history` header and
+//      `{marker}{pos:>6}  {entry}` rows Neovim's own `:history` (`:h
+//      :history`) prints, plus `{name}` (`:`/`cmd`, `/`/`?`/`search`,
+//      `all`, and the always-empty `=`/`expr`, `@`/`input`, `>`/`debug`
+//      vimcode has no history for) and `{first}[,{last}]` index-range
+//      arguments — none of which need an expression evaluator, since both
+//      are plain keyword/integer tokens (`:h :history-indexing`). Confirmed
+//      against a live oracle; its case label is deleted from
+//      `KNOWN_DEVIATIONS_MESSAGE` below.
+const KNOWN_DEVIATIONS_MESSAGE: &[&str] = &[];
+
+#[test]
+fn nvim_conformance_messages() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_MESSAGE
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_message_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: echo-area/message probe (#1282) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_MESSAGE.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_MESSAGE.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_MESSAGE,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_MESSAGE entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_MESSAGE entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} message-probe REGRESSION(S) — cases not in KNOWN_DEVIATIONS_MESSAGE \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_MESSAGE now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// KNOWN_DEVIATIONS_DISK — same bidirectional-gate idiom, applied to
+// CASES_DISK (#1282). May only ever SHRINK.
+//
+// No `gh` access from a worker session (see KNOWN_DEVIATIONS_XFILE's own
+// header for the policy this follows), so nothing here is "filed as #NNNN"
+// yet — each entry names the exact gap so the coordinator can file it
+// verbatim.
+const KNOWN_DEVIATIONS_DISK: &[&str] = &[];
+
+#[test]
+fn nvim_conformance_disk() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_DISK
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_disk_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: on-disk probe (#1282) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_DISK.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_DISK.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_DISK,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_DISK entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_DISK entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} on-disk REGRESSION(S) — cases not in KNOWN_DEVIATIONS_DISK \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_DISK now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Categories — the runner flattens these; the split is for editability only.
 // ---------------------------------------------------------------------------
@@ -5663,6 +10277,10 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("mark    marks & jumps", CASES_MARK),
     ("search  search", CASES_SEARCH),
     ("ex      :s / :g / ex", CASES_EX),
+    (
+        "abbrev  :abbreviate / :iabbrev / :cabbrev (#1152)",
+        CASES_ABBREV,
+    ),
     ("ins     insert-mode keys", CASES_INS),
     ("vis     visual", CASES_VIS),
     ("vb      visual block", CASES_VB),
@@ -5672,6 +10290,9 @@ const CATEGORIES: &[(&str, &[Case])] = &[
     ("to      text objects", CASES_TO),
     ("misc    misc", CASES_MISC),
     ("fold    folds (#1006)", CASES_FOLD),
+    ("map     :map family (#1151)", CASES_MAP),
+    ("opt     value options (#1206)", CASES_OPT),
+    ("bool_opt boolean options tranche 2 (#1207)", CASES_BOOLOPT),
 ];
 
 // ---------------------------------------------------------------------------
@@ -5807,27 +10428,33 @@ const KNOWN_DEVIATIONS: &[&str] = &[
     // through `nvim_input` instead of `feedkeys`, so there is no synthetic
     // `<Esc>` and the case simply passes.
     //
-    // ── #986: v0.11.0 bug suite -- `:s///c` confirm-prompt spec (#801
-    // Phase 2 never built). `execute.rs`'s `flags.contains('c')` check
-    // always errors loudly instead of entering a confirm loop, so the
-    // keystrokes meant for the confirm prompt (y/n/a/q/l/<Esc>) fall
-    // through to ordinary Normal-mode command dispatch on the vimcode side
-    // instead -- see each case's own doc, in `CASES_EX`, for what that
-    // dispatch actually does today (never a crash, always a mismatch).
-    // "sub:c plain :s unaffected by confirm gate (regression guard)" is
-    // deliberately NOT listed here -- it already passes and must stay
-    // that way.
-    "sub:c y accepts each prompted match (g)",
-    "sub:c n skips each prompted match (g)",
-    "sub:c a accepts this and all remaining (g)",
-    "sub:c q quits after partial replace (g)",
-    "sub:c l replaces then quits (g)",
-    "sub:c Esc quits after partial replace (g)",
-    "sub:c q quits before any replace, cursor at match (g)",
-    "sub:c Esc quits before any replace, cursor at match (g)",
-    "sub:c y accepts first match per line (no g)",
-    "sub:c n then y across lines (no g)",
-    "sub:c skip counted correctly across buffer (g)",
+    // ── RESOLVED (#1031, #801 Phase 2): "sub:c ..." ──
+    //
+    // #986's v0.11.0 bug suite listed 11 confirm-prompt cases here because
+    // `execute.rs`'s `flags.contains('c')` check always errored loudly
+    // instead of entering a confirm loop, so the keystrokes meant for the
+    // prompt (y/n/a/q/l/<Esc>) fell through to ordinary Normal-mode command
+    // dispatch on the vimcode side. #1031 built the real confirm loop
+    // (`Engine::confirm_sub`, `execute.rs`) and all 11 now pass, alongside
+    // the 5 new cases #1031 itself added right after them in `CASES_EX`.
+    //
+    // ── RESOLVED (#1293): "scroll:so=5 30G H", "scroll:so=5 30G L" ──
+    //
+    // #1280 surfaced these (see that issue's history: `run_in_vimcode` used
+    // to never set `'wrap'`, so every case ran against vimcode's actual
+    // default of `wrap=false` regardless of the oracle's `wrap=true`; once
+    // #1280 forced both sides to match Neovim's default, this became a real,
+    // previously-hidden gap). `ensure_cursor_visible_wrap` — the vertical
+    // scroll-to-cursor path used when `'wrap'` is on, in
+    // `src/core/engine/search.rs` — never read `self.settings.scrolloff` at
+    // all, unlike the `'wrap'`-off path a few lines above it in the same
+    // file (`ensure_cursor_visible`), which does. #1293 ported `scrolloff`
+    // into the wrap path, expressed in *visual* rows (a wrapped logical line
+    // can span more than one screen row, so a flat buffer-line margin like
+    // the no-wrap path's isn't equivalent) via the new
+    // `Engine::visual_rows_for_range` helper and margin-aware top/bottom
+    // branches in `ensure_cursor_visible_wrap`. Both cases pass now; deleted
+    // per this list's own bidirectional-gate policy.
 ];
 
 // ---------------------------------------------------------------------------
@@ -5981,7 +10608,10 @@ enum DocStatus {
     Partial,
     /// ❌ — claimed not implemented. Out of scope for this gate.
     Missing,
-    /// N/A — deliberately not in scope (VimScript, digraphs, spelling…).
+    /// N/A — deliberately not in scope (VimScript and anything needing an
+    /// expression evaluator). **Not** spelling or digraphs: `src/core/spell.rs`
+    /// implements the former (#1163 moved those rows to ✅) and
+    /// `src/core/digraphs.rs` the latter (#1160 moved those rows to ✅).
     NotApplicable,
 }
 
@@ -6045,6 +10675,14 @@ const SECTION_KEYS: &[(&str, &str)] = &[
     ("Operator-Pending Mode", "oppend"),
     ("Visual Mode", "visual"),
     ("Core Vim Ex Commands", "ex"),
+    // #1163: the "Not implemented" section. Its rows are ❌ (or N/A), so they
+    // are out of `in_scope` and carry no probes — but they must still parse,
+    // because the whole point of the section is that a command with no row
+    // cannot be counted as missing. Three keys, not one, because a `###`
+    // subheading resets `section`.
+    ("Not implemented", "missing"),
+    ("Not implemented — options", "missingopt"),
+    ("Not implemented — modes", "missingmode"),
 ];
 
 /// Rows whose Command cell is prose rather than a `` `keystroke` `` span.
@@ -6457,7 +11095,8 @@ fn classify_coverage(
 }
 
 /// Every `(label, keys)` in the corpus — the single-buffer cases plus the
-/// multi-file jumplist ones, which are oracle-backed the same way.
+/// multi-file jumplist ones and the window-layout ones (#1162), all of which
+/// are oracle-backed the same way.
 fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
     let mut out: Vec<(&str, &str)> = CATEGORIES
         .iter()
@@ -6466,6 +11105,10 @@ fn all_corpus_cases() -> Vec<(&'static str, &'static str)> {
         .collect();
     out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys)));
     out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_WIN.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_XFILE.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_MESSAGE.iter().map(|c| (c.label, c.keys)));
+    out.extend(CASES_DISK.iter().map(|c| (c.label, c.keys)));
     out
 }
 
@@ -6523,6 +11166,18 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ins:CTRL-V {char}", Label("ins:C-v Tab")),
     p("ins:CTRL-G u", Label("undo:C-g u splits")),
     p("ins:CTRL-G j/k", Keys("<C-g>j")),
+    // #1160: digraphs + the <C-x> completion submode.
+    p("ins:CTRL-K {c1}{c2}", Label("ins:C-k a: digraph")),
+    p("ins:CTRL-X CTRL-N/CTRL-P", Label("ins:C-x C-n")),
+    p("ins:CTRL-X CTRL-L", Label("ins:C-x C-l line completion")),
+    p(
+        "ins:CTRL-X CTRL-F",
+        Label("ins:C-x C-f filename completion"),
+    ),
+    p("ins:CTRL-X CTRL-K", Label("ins:C-x C-k dictionary")),
+    p("ins:CTRL-X CTRL-S", Label("ins:C-x C-s spell")),
+    p("ins:CTRL-X CTRL-O", Label("ins:C-x C-o omni")),
+    p("ins:CTRL-X CTRL-E/CTRL-Y", Label("ins:C-x C-e scroll")),
     // --- Normal Mode - Movement (move) ---
     p("move:h", Label("word:h at start")),
     p("move:j", Label("word:j col memory short")),
@@ -6730,10 +11385,10 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gg", Label("word:gg indented (nosol)")),
     p("g:g_", Label("word:g_")),
     p("g:g0", Label("word:g0")),
-    p("g:g<Home>", Keys("g<Home>")),
-    p("g:g^", Keys("g^")),
-    p("g:g$", Keys("g$")),
-    p("g:g<End>", Keys("g<End>")),
+    p("g:g<Home>", Label("word:g<Home> start of screen line")),
+    p("g:g^", Label("word:g^ first non-blank of screen line")),
+    p("g:g$", Label("word:g$ end of screen line")),
+    p("g:g<End>", Label("word:g<End> end of screen line")),
     p("g:gj", Label("word:gj gk nowrap")),
     p("g:gk", Label("word:gj gk nowrap")),
     p("g:gE", Label("word:gE")),
@@ -6755,7 +11410,7 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gJ", Label("op:gJ")),
     p("g:g;", Label("jump:g;")),
     p("g:g,", Label("jump:g; g; g,")),
-    p("g:g.", Keys("g.")),
+    p("g:g.", Label("misc:g. returns to last change")),
     p("g:gp", Label("op:gp linewise")),
     p("g:gP", Label("op:gP linewise")),
     p("g:gq{motion}", Label("op:gqq tw20")),
@@ -6769,10 +11424,16 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("g:gm", Keys("gm")),
     p("g:gM", Keys("gM")),
     p("g:g?{motion}", Label("op:g?? rot13")),
-    p("g:g@{motion}", Keys("g@")),
-    p("g:g+", Keys("g+")),
+    p(
+        "g:g@{motion}",
+        Label("misc:g@l with no operatorfunc registered is a no-op"),
+    ),
+    p(
+        "g:g+",
+        Label("undo:g+ crosses a branch abandoned by u then edit"),
+    ),
     p("g:g-", Keys("g-")),
-    p("g:gR", Keys("gR")),
+    p("g:gR", Label("misc:gR spans a tab's full width")),
     p("g:g'", Label("mark:g'")),
     p("g:g`", Label("mark:g`")),
     p("g:g&", Label("dot:g&")),
@@ -6789,23 +11450,51 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("z:zc", Label("fold:zo then zc recloses the same fold")),
     p("z:zR", Label("fold:zR opens all folds")),
     p("z:zM", Label("fold:zM recloses a defined fold")),
-    p("z:zA", Keys("zA")),
+    p("z:zA", Label("fold:zA recursively toggles nested folds")),
     p("z:zO", Label("fold:zO opens recursively")),
     p("z:zC", Label("fold:zC recloses recursively")),
     p("z:zd", Label("fold:zd deletes a fold")),
     p("z:zD", Label("fold:zD deletes a fold recursively")),
     p("z:zf{motion}", Label("fold:zfj hides one line")),
-    p("z:zF", Keys("zF")),
-    p("z:zv", Keys("zv")),
-    p("z:zx", Keys("zx")),
+    p("z:zF", Label("fold:zF folds a count of lines")),
+    p(
+        "z:zv",
+        Label("fold:zv reveals a cursor hidden by a closed fold"),
+    ),
+    p(
+        "z:zx",
+        Label("fold:zx recomputes and clamps a hidden cursor"),
+    ),
+    // #1163: spell is implemented (`src/core/spell.rs`) and these rows moved
+    // N/A → ✅, so they are in scope and need probes. The corpus has no spell
+    // cases at all today, so all seven are seeded into COVERAGE_EXEMPT — that
+    // is a measured gap, and the bidirectional gate forces them to be deleted
+    // from there the moment a case starts matching.
+    p("z:z=", Label("spell:z= suggestions")),
+    p("z:zg", Label("spell:zg good word")),
+    p("z:zw", Label("spell:zw bad word")),
+    p("z:zG", Label("spell:zG good word internal")),
+    p("z:zW", Label("spell:zW bad word internal")),
     p("z:zj", Label("fold:zj moves to the defined fold header")),
     p("z:zk", Label("fold:zk moves to the defined fold header")),
-    p("z:zh", Keys("zh")),
-    p("z:zl", Keys("zl")),
-    p("z:zH", Label("scroll:zH")),
-    p("z:zL", Keys("zL")),
-    p("z:ze", Label("scroll:ze")),
-    p("z:zs", Label("scroll:zs")),
+    p(
+        "z:zh",
+        Label("scroll:zh scrolls view left and pulls the cursor into it"),
+    ),
+    p(
+        "z:zl",
+        Label("scroll:zl scrolls view right and pulls the cursor into it"),
+    ),
+    p("z:zH", Label("scroll:zH scrolls a half screenwidth left")),
+    p("z:zL", Label("scroll:zL scrolls a half screenwidth right")),
+    p(
+        "z:ze",
+        Label("scroll:ze scrolls so cursor is at the right edge"),
+    ),
+    p(
+        "z:zs",
+        Label("scroll:zs scrolls so cursor is at the left edge"),
+    ),
     // --- Window Commands (CTRL-W) (win) ---
     p("win:CTRL-W h", Keys("<C-w>h")),
     p("win:CTRL-W j", Keys("<C-w>j")),
@@ -6820,11 +11509,14 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("win:CTRL-W e/E", Keys("<C-w>e/E")),
     p("win:CTRL-W +", Keys("<C-w>+")),
     p("win:CTRL-W -", Keys("<C-w>-")),
-    p("win:CTRL-W <", Label("win:C-w <")),
+    p(
+        "win:CTRL-W <",
+        Label("win:CTRL-W < decreases the active window's width"),
+    ),
     p("win:CTRL-W >", Keys("<C-w>>")),
     p("win:CTRL-W =", Keys("<C-w>=")),
     p("win:CTRL-W _", Keys("<C-w>_")),
-    p("win:CTRL-W \\|", Keys("<C-w>\\|")),
+    p("win:CTRL-W \\|", Keys("<C-w>|")),
     p("win:CTRL-W H", Keys("<C-w>H")),
     p("win:CTRL-W J", Keys("<C-w>J")),
     p("win:CTRL-W K", Keys("<C-w>K")),
@@ -6842,6 +11534,9 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("win:CTRL-W d", Keys("<C-w>d")),
     // --- Bracket Commands (bracket) ---
     p("bracket:]c", Keys("]c")),
+    // #1163: see the z-section note — spell moved N/A → ✅.
+    p("bracket:[s", Label("spell:[s prev misspelling")),
+    p("bracket:]s", Label("spell:]s next misspelling")),
     p("bracket:[c", Keys("[c")),
     p("bracket:]d", Keys("]d")),
     p("bracket:[d", Keys("[d")),
@@ -6849,22 +11544,28 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("bracket:[p", Keys("[p")),
     p("bracket:[[", Label("word:[[")),
     p("bracket:]]", Label("word:]]")),
-    p("bracket:[]", Keys("[]")),
-    p("bracket:][", Keys("][")),
-    p("bracket:[m", Keys("[m")),
-    p("bracket:]m", Keys("]m")),
-    p("bracket:[M", Keys("[M")),
-    p("bracket:]M", Keys("]M")),
+    p("bracket:[]", Label("word:[]")),
+    p("bracket:][", Label("word:][")),
+    p("bracket:[m", Label("word:[m previous method start")),
+    p("bracket:]m", Label("word:]m next method start")),
+    p("bracket:[M", Label("word:[M previous method end")),
+    p("bracket:]M", Label("word:]M next method end")),
     p("bracket:[{", Label("word:[{")),
     p("bracket:]}", Label("word:]}")),
     p("bracket:[(", Label("word:[(")),
     p("bracket:])", Label("word:])")),
-    p("bracket:[*", Keys("[*")),
-    p("bracket:]*", Keys("]*")),
-    p("bracket:[/", Label("word:[/")),
-    p("bracket:]/", Label("word:]/")),
-    p("bracket:[#", Keys("[#")),
-    p("bracket:]#", Keys("]#")),
+    p("bracket:[*", Label("word:[* comment start")),
+    p("bracket:]*", Label("word:]* comment end")),
+    p("bracket:[/", Label("word:[/ comment start")),
+    p("bracket:]/", Label("word:]/ comment end")),
+    p(
+        "bracket:[#",
+        Label("word:[# backward to matching #if/#else"),
+    ),
+    p(
+        "bracket:]#",
+        Label("word:]# forward to matching #else/#endif"),
+    ),
     p("bracket:[z", Label("fold:[z moves to start of open fold")),
     p("bracket:]z", Label("fold:]z moves to end of open fold")),
     // --- Operator-Pending Mode (oppend) ---
@@ -6987,10 +11688,14 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::enew", Keys(":enew")),
     p("ex::bn", Keys(":bn")),
     p("ex::bp", Keys(":bp")),
+    p("ex::bfirst", Keys(":bfirst")),
+    p("ex::blast", Keys(":blast")),
     p("ex::b#", Keys(":b#")),
     p("ex::b {N}", Label("ex:b by number")),
     p("ex::bd", Keys(":bd")),
     p("ex::bdelete", Keys(":bdelete")),
+    p("ex::bw", Keys(":bw")),
+    p("ex::bwipeout", Keys(":bwipeout")),
     p("ex::ls", Keys(":ls")),
     p("ex::buffers", Keys(":buffers")),
     p("ex::split", Label("jump:multi C-o across split")),
@@ -6999,36 +11704,42 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::vs", Keys(":vs ")),
     p("ex::close", Keys(":close")),
     p("ex::only", Keys(":only")),
+    p("ex::hide", Keys(":hide")),
     p("ex::new", Keys(":new")),
     p("ex::vnew", Keys(":vnew")),
     p("ex::tabnew", Label("jump:multi C-o across tab")),
     p("ex::tabe", Keys(":tabe")),
     p("ex::tabclose", Keys(":tabclose")),
+    p("ex::tabonly", Keys(":tabonly")),
     p("ex::tabnext", Keys(":tabnext")),
     p("ex::tabprevious", Keys(":tabprevious")),
+    p("ex::tabfirst", Keys(":tabfirst")),
+    p("ex::tablast", Keys(":tablast")),
     p("ex::tabmove", Keys(":tabmove")),
     p("ex::[range]s/pat/rep/[flags] [count]", Label("sub:basic")),
     p("ex::%s/pat/rep/", Label("sub:%")),
     p("ex::[range]g/pat/cmd", Label("g:d")),
     p("ex::v/pat/cmd", Label("g:v")),
     p("ex::d", Label("ex:d")),
-    p("ex::delete", Keys(":delete")),
+    p("ex::delete", Label("ex:delete")),
     p("ex::m", Label("ex:m0")),
-    p("ex::move", Keys(":move")),
+    p("ex::move", Label("ex:move0")),
     p("ex::t", Label("ex:t.")),
     p("ex::co", Label("ex:1co$")),
-    p("ex::copy", Keys(":copy")),
+    p("ex::copy", Label("ex:copy$")),
     p("ex::j", Label("ex:j")),
-    p("ex::join", Keys(":join")),
+    p("ex::join", Label("ex:join")),
     p("ex::y", Label("ex:y a")),
-    p("ex::yank", Keys(":yank")),
+    p("ex::yank", Label("ex:yank a")),
     p("ex::pu", Label("ex:pu")),
     p("ex::put", Label("ex:put a")),
     p("ex::sort", Label("ex:sort")),
-    p("ex::norm", Keys(":norm ")),
+    p("ex::norm", Label("ex:norm Ax")),
     p("ex::normal", Label("ex:normal Ax")),
     p("ex::noh", Label("ex:noh no effect")),
-    p("ex::nohlsearch", Keys(":nohlsearch")),
+    p("ex::nohlsearch", Label("ex:nohlsearch no effect")),
+    p("ex::startinsert", Keys(":startinsert")),
+    p("ex::stopinsert", Keys(":stopinsert")),
     p("ex:Ex ranges", Label("ex:2;+1d")),
     p("ex::set {option}", Label("op:cc noautoindent")),
     p("ex::r {file}", Label("ex:r !echo")),
@@ -7038,8 +11749,15 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::registers", Keys(":registers")),
     p("ex::marks", Keys(":marks")),
     p("ex::jumps", Keys(":jumps")),
+    // #1160 — same message-only-command shape as `:marks`/`:jumps` above.
+    p("ex::digraphs", Keys(":digraphs")),
     p("ex::changes", Keys(":changes")),
     p("ex::history", Keys(":history")),
+    // #1156 — undo tree ex-commands.
+    p("ex::undolist", Keys(":undolist")),
+    p("ex::earlier", Keys(":earlier")),
+    p("ex::later", Keys(":later")),
+    p("ex::undojoin", Keys(":undojoin")),
     p("ex::echo {text}", Keys(":echo")),
     p("ex::pwd", Keys(":pwd")),
     p("ex::file", Keys(":file")),
@@ -7049,15 +11767,23 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::#", Keys(":#")),
     p("ex::number", Keys(":number")),
     p("ex::print", Keys(":print")),
-    p("ex::ma", Keys(":ma ")),
+    p("ex::ma", Label("ex:ma x")),
     p("ex::mark", Label("ex:2mark a")),
+    p("ex::delmarks", Keys(":delmarks")),
+    p("ex::delm", Keys(":delm ")),
     p("ex::retab", Label("ex:retab")),
     p("ex::saveas {file}", Keys(":saveas")),
     p("ex::update", Keys(":update")),
     p("ex::cquit", Keys(":cquit")),
     p("ex::version", Keys(":version")),
     p("ex::help", Keys(":help")),
-    p("ex::h", Keys(":h")),
+    // A bare `Keys(":h")` needle is exactly the over-crediting trap the
+    // module doc's "the probe is deliberately dumb" section warns about: it
+    // is a substring of `:help` (the id right above) and, since #1154, of
+    // `:hide` too — so it would silently "cover" `:h` off the back of an
+    // oracle case that never once typed the standalone `:h` help command.
+    // `<CR>` immediately after pins it to the bare, no-argument invocation.
+    p("ex::h", Keys(":h<CR>")),
     p("ex::windo {cmd}", Keys(":windo")),
     p("ex::bufdo {cmd}", Keys(":bufdo")),
     p("ex::tabdo {cmd}", Keys(":tabdo")),
@@ -7071,8 +11797,40 @@ const COMMAND_PROBES: &[CommandProbe] = &[
     p("ex::cn", Keys(":cn")),
     p("ex::cp", Keys(":cp")),
     p("ex::cc", Keys(":cc")),
-    p("ex::cd {path}", Keys(":cd")),
+    // --- #1155: quickfix completion + the location-list family ---
+    p("ex::cfirst", Keys(":cfirst")),
+    p("ex::clast", Keys(":clast")),
+    p("ex::cwindow", Keys(":cwindow")),
+    p("ex::clist", Keys(":clist")),
+    p("ex::colder", Keys(":colder")),
+    p("ex::cnewer", Keys(":cnewer")),
+    p("ex::cdo", Keys(":cdo")),
+    p("ex::cfdo", Keys(":cfdo")),
+    p("ex::lopen", Keys(":lopen")),
+    p("ex::lclose", Keys(":lclose")),
+    p("ex::lwindow", Keys(":lwindow")),
+    p("ex::lnext", Keys(":lnext")),
+    p("ex::lprevious", Keys(":lprevious")),
+    p("ex::lfirst", Keys(":lfirst")),
+    p("ex::llast", Keys(":llast")),
+    p("ex::ll", Keys(":ll")),
+    p("ex::llist", Keys(":llist")),
+    p("ex::ldo", Keys(":ldo")),
+    p("ex::lfdo", Keys(":lfdo")),
+    p("ex::lgrep", Keys(":lgrep")),
+    p("ex::lvimgrep", Keys(":lvimgrep")),
+    // #1283: tightened from a bare `Keys(":cd")` — that needle is a prefix
+    // of `:cdo` too, and would have silently (and wrongly) "covered" this
+    // still-uncovered id off the back of `ex:cdo with no argument errors`'s
+    // case the moment #1283 added one. The audit table's own row for `:cd`
+    // (`ex(":cd", ..., Some(Keys(":cd ")), ...)` below) already uses the
+    // trailing-space form — this probe just never matched it.
+    p("ex::cd {path}", Keys(":cd ")),
     p("ex::colorscheme", Keys(":colorscheme")),
+    // #1151
+    p("ex::map", Label("map:nmap_chases_recursively")),
+    p("ex::nmap", Label("map:nmap_chases_recursively")),
+    p("ex::imap", Label("map:inoremap_jk_to_escape")),
     p("ex::make", Keys(":make")),
     p("ex::b {name}", Label("ex:b by name")),
     p("ex::Explore", Keys(":Explore")),
@@ -7086,182 +11844,183 @@ const COMMAND_PROBES: &[CommandProbe] = &[
 // ---------------------------------------------------------------------------
 // COVERAGE_EXEMPT — this list may only ever SHRINK.
 //
-// **217 of the 563 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
-// case at all** (38.5%; 346 are covered). That number is the measurement this
-// gate exists to produce, and it is the first one anybody has taken: the doc
-// itself reads "422/424, 100% — Remaining Missing Commands: None", which is a
-// claim about *existence*, and `COVERAGE_PHASE5.md` audits 2 of 6 areas.
+// **84 of the 619 commands `VIM_COMPATIBILITY.md` marks ✅/⚠️ have no oracle
+// case at all** (13.6%; 535 are covered — both numbers straight off this
+// test's own printed banner, not hand-derived). That number is the
+// measurement this gate exists to produce, and it is the first one anybody
+// has taken: the doc itself reads "422/424, 100% — Remaining Missing
+// Commands: None", which is a claim about *existence*, and
+// `COVERAGE_PHASE5.md` audits 2 of 6 areas.
 //
-// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09):
+// Where the gap is, at a glance (uncovered / in-scope, seeded 2026-09,
+// updated 2026-09 by #1279 which retired the text-object, operator-pending,
+// visual, movement, editing and `'<` rows below, by #1162 which backfilled
+// all 33 CTRL-W rows — 26 now have a real oracle case (8 of those tracked red
+// in KNOWN_DEVIATIONS_WIN, not vacuously exempt) and the other 7
+// (`H`/`J`/`K`/`L`/`T`/`e`/`E`/`d`) moved to the permanent
+// "Deliberate semantic divergence" heading below — and by #1282, which
+// backfilled `ga`/`g8`/`<C-g>` (in both their `other:` and `g:` doc rows) and
+// the 21 echo-area/message ex-commands plus 6 on-disk ones):
 //
-//     Core Vim ex commands       84/111  :w :q :bn :ls :marks :grep …
-//     Window commands (CTRL-W)   33/33   nothing in the corpus presses <C-w>
-//     g-commands                 23/50   gt gT gf gF ga g8 gx gR g@ g+ g- …
-//     Bracket commands           17/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
-//     Normal — other             16/34   gt gT gf gF K ga g8 gx q: q/ q? …
-//     Text objects               10/32   every closing-bracket alias, a' a`
-//     Operator-pending           10/59   d{ d} d; d, dF dT and the o_ forces
+//     Core Vim ex commands      105/111  :w :q :bn :ls :marks :grep …
+//     Window commands (CTRL-W)    7/33   H J K L T e/E d — all permanent
+//     g-commands                 21/50   gt gT gf gF gx gR g@ g+ …
+//                                        (`g-` left this list in #1156,
+//                                        `g0`/`gm`/`gM` in #1279,
+//                                        `ga`/`g8` in #1282)
+//     Bracket commands           16/26   ]c [c ]d [d [m ]m [* ]* [# ]# …
+//     Normal — other             19/34   gt gT gf gF K gx q: q/ q? …
 //     z-commands                 10/28   zA zF zv zx zh zl zH zL ze zs
-//     Normal — search & marks     4/31   // /<CR> aliases, `{A-Z}, '<, g' g`
-//     Normal — movement           4/48   l g0 gm gM
-//     Visual mode                 3/38   P, CTRL-X, g CTRL-X
+//     Normal — search & marks     3/31   // /<CR> aliases, `{A-Z}, g' g`
 //     Insert mode                 2/23   CTRL-@, CTRL-G j/k
-//     Normal — editing            1/50   [p
+//     Text objects                0/32   (all retired by #1279)
+//     Operator-pending            0/59   (all retired by #1279)
+//     Normal — movement           0/48   (all retired by #1279)
+//     Visual mode                 0/38   (all retired by #1279)
+//     Normal — editing            0/50   (all retired by #1279)
 //
 // Deleting an entry is how an oracle case proves itself: the gate fails if a
 // listed id's probe starts matching, and fails if an unlisted id's probe
 // matches nothing. Never add an entry to paper over a deleted case.
+//
+// **A permanent entry carries a reason; an unannotated entry is debt (#1278).**
+// Most of this list is plain uncovered work — nobody has written the oracle
+// case yet, and the entry should read as a TODO. A minority of entries can
+// never gain a case no matter how much work goes in: the command diverges
+// from Neovim on purpose, the command ends the very session the probe is
+// running in, or the result depends on the host machine rather than on the
+// editor. Those, and only those, are annotated below under one of the four
+// "permanent" headings, each with the reason inline. If you are looking at
+// an entry with no comment above it, it is debt: pick it up, add a
+// `COMMAND_PROBES` entry and an oracle case, and delete it here. If you
+// believe an *annotated* entry is actually coverable, that is a finding for
+// whatever issue is doing that work, not license to just delete the
+// annotation — file it and let that slice make the case.
 // ---------------------------------------------------------------------------
 
 const COVERAGE_EXEMPT: &[&str] = &[
-    // --- Insert Mode (ins) ---
-    "ins:CTRL-@",
-    "ins:CTRL-G j/k",
-    // --- Normal Mode - Movement (move) ---
-    "move:l",
-    "move:g0",
-    "move:gm",
-    "move:gM",
-    // --- Normal Mode - Editing (edit) ---
-    "edit:[p",
-    // --- Normal Mode - Search & Marks (search) ---
-    "search:`{A-Z}",
-    "search:'<",
-    "search:g'",
-    "search:g`",
-    // --- Normal Mode - Other (other) ---
-    "other:gt",
-    "other:gT",
-    "other:gf",
-    "other:gF",
-    "other:K",
-    "other:ga",
-    "other:g8",
-    "other:gx",
-    "other:CTRL-^",
+    // --- Spell (#1163, deferred by #1278) ---
+    // `src/core/spell.rs` implements all seven, so they are ✅ in the doc and
+    // in scope here — but the oracle corpus contains no spell case whatsoever,
+    // so every probe above matches nothing. Exempt today, but — unlike the 46
+    // rows below this block — NOT permanent: these are deliberately left out
+    // of the "permanent" headings, because covering them is possible.
+    //
+    // #1278 looked at scoping that fixture and is deferring it rather than
+    // building it, for a concrete reason: `zg`/`zw`/`zG`/`zW` mutate word
+    // membership in a dictionary, and `z=`/`[s`/`]s` read the current
+    // dictionary's verdict — so every one of the seven is only comparable
+    // against the oracle if both sides agree on the same word list. They do
+    // not. `src/core/spell.rs` uses the `spellbook` crate (a Hunspell-format
+    // parser) against `dictionaries/en_US.dic`/`.aff`, compiled into the
+    // vimcode binary. The nvim oracle uses its own compiled `.spl` binary
+    // format, loaded at runtime from `$VIMRUNTIME/spell/en.utf-8.spl` —
+    // shipped with the Neovim *install*, not pinned by this repo, so it can
+    // silently change word list and suggestion ranking across a Neovim
+    // version bump. The two are unrelated implementations with unrelated
+    // word lists: confirmed empirically (2026-09, nvim 0.12.5) that
+    // `z=`-style suggestions for "helo" already differ in ranking between
+    // the two.
+    //
+    // That kills `z=` outright — its entire observable behavior *is* the
+    // suggestion list, so there is no dictionary-independent slice of it
+    // left to test. `zg`/`zw`/`zG`/`zW`/`[s`/`]s` are less broken: their
+    // effect is mechanical (does this word now report bad/good; does the
+    // cursor land on the next/prev bad word), which only needs both
+    // dictionaries to agree a *specific* word is bad — true for something
+    // like "helo", regardless of suggestion-list differences. A real fixture
+    // for those six would need to either (a) bundle a pinned nvim `.spl`
+    // fixture in this repo and point the oracle at it via `spellfile`, so
+    // the oracle's word list stops drifting with the host's Neovim install,
+    // or (b) hand-pick fixture words unambiguous enough (obvious nonsense vs.
+    // common real words) that both dictionaries' bad/good verdict is safe to
+    // assume without pinning. Either is scoped work for a future slice, not
+    // done here — this comment is that slice's starting point. `z=` itself
+    // stays exempt regardless of which path is taken.
+    "z:z=",
+    "z:zg",
+    "z:zw",
+    "z:zG",
+    "z:zW",
+    "bracket:[s",
+    "bracket:]s",
+    // ===========================================================================
+    // Permanent exemptions (#1278) — the 46 ids below will never gain an
+    // oracle case, each for one of the four reasons grouped under the
+    // headings that follow. See the array's own doc comment above for the
+    // rule: a permanent entry carries a reason; an unannotated entry (every
+    // entry past this block) is plain debt.
+    // ===========================================================================
+
+    // --- Deliberate semantic divergence ---
+    // vimcode implements each of these, but on purpose differently from
+    // Neovim (see `VIM_COMPATIBILITY.md`, cited per row below), so a
+    // byte-for-byte oracle comparison is meaningless: a mismatch would be
+    // the intended behavior, not a bug.
+    //
+    // Next/prev git hunk (git integration), not Neovim's diff-mode hunk
+    // navigation (VIM_COMPATIBILITY.md:488).
+    "bracket:]c",
+    "bracket:[c",
+    // Next/prev LSP diagnostic — needs a live, attached LSP client, which
+    // the oracle (`-u NONE -i NONE`, no LSP) never has
+    // (VIM_COMPATIBILITY.md:489).
+    "bracket:]d",
+    "bracket:[d",
+    // LSP goto-definition, not a ctags-file jump (VIM_COMPATIBILITY.md:319).
     "other:CTRL-]",
-    "other:CTRL-G",
+    // LSP hover info, not `:help`/man-page lookup (VIM_COMPATIBILITY.md:310).
+    "other:K",
+    // vimcode's own diff engine, not Neovim's internal diff algorithm
+    // (VIM_COMPATIBILITY.md:322-323,657).
     "other:do",
     "other:dp",
-    "other:q:",
-    "other:q/",
-    "other:q?",
-    // --- Text Objects (textobj) ---
-    "textobj:a'",
-    "textobj:a`",
-    "textobj:i)",
-    "textobj:a)",
-    "textobj:i}",
-    "textobj:a}",
-    "textobj:i]",
-    "textobj:a]",
-    "textobj:i>",
-    "textobj:a>",
-    // --- g-Commands (g) ---
-    "g:g0",
-    "g:g<Home>",
-    "g:g^",
-    "g:g$",
-    "g:g<End>",
-    "g:gf",
-    "g:gF",
-    "g:gt",
-    "g:gT",
-    "g:g<Tab>",
-    "g:g.",
+    "ex::diffsplit",
+    "ex::diffthis",
+    "ex::diffoff",
+    // Shells out to the host's default browser/opener — a side effect on
+    // the OS, not the buffer, that an oracle probe cannot observe
+    // (VIM_COMPATIBILITY.md:314,386).
+    "other:gx",
     "g:gx",
-    "g:ga",
-    "g:g8",
-    "g:gm",
-    "g:gM",
-    "g:g@{motion}",
-    "g:g+",
-    "g:g-",
-    "g:gR",
-    "g:g'",
-    "g:g`",
+    // #1280: `gh` is deliberately rebound to the editor hover popup
+    // (VIM_COMPATIBILITY.md:399) — Neovim's `gh` enters Select mode, a
+    // different mode vimcode doesn't implement (that gap is the doc's
+    // separate `` `<C-\><C-n>` `` "Not implemented — modes" row), so a
+    // byte-for-byte comparison would be comparing two unrelated features,
+    // not checking one.
     "g:gh",
-    // --- z-Commands (z) ---
-    "z:zA",
-    "z:zF",
-    "z:zv",
-    "z:zx",
-    "z:zh",
-    "z:zl",
-    "z:zH",
-    "z:zL",
-    "z:ze",
-    "z:zs",
-    // --- Window Commands (CTRL-W) (win) ---
-    "win:CTRL-W h",
-    "win:CTRL-W j",
-    "win:CTRL-W k",
-    "win:CTRL-W l",
-    "win:CTRL-W w",
-    "win:CTRL-W W",
-    "win:CTRL-W c",
-    "win:CTRL-W o",
-    "win:CTRL-W s",
-    "win:CTRL-W v",
-    "win:CTRL-W e/E",
-    "win:CTRL-W +",
-    "win:CTRL-W -",
-    "win:CTRL-W <",
-    "win:CTRL-W >",
-    "win:CTRL-W =",
-    "win:CTRL-W _",
-    "win:CTRL-W \\|",
+    // #1162: `CTRL-W H`/`J`/`K`/`L` ("move current window to far
+    // left/bottom/top/right") and `CTRL-W T` ("move window to new tab")
+    // close the window and open a brand-new VSCode-style *editor group*
+    // at the layout edge instead of restructuring the window tree within
+    // the current tab the way Neovim does (`move_window_to_edge`/
+    // `move_window_to_new_group` in `src/core/engine/windows.rs`) — already
+    // documented as such in VIM_COMPATIBILITY.md:463-467 ("Creates new
+    // group at layout edge" / "Moves to new editor group"), not something
+    // #1162 introduced. A byte-for-byte comparison against Neovim's
+    // single-tab window tree would be comparing two different features.
     "win:CTRL-W H",
     "win:CTRL-W J",
     "win:CTRL-W K",
     "win:CTRL-W L",
     "win:CTRL-W T",
-    "win:CTRL-W x",
-    "win:CTRL-W r",
-    "win:CTRL-W R",
-    "win:CTRL-W p",
-    "win:CTRL-W n",
-    "win:CTRL-W t",
-    "win:CTRL-W b",
-    "win:CTRL-W q",
-    "win:CTRL-W f",
+    // #1162: `CTRL-W e`/`E` ("split editor group right/down") is a VimCode
+    // extension bolted onto a keystroke Neovim leaves unbound — confirmed
+    // empirically (`nvim --headless -u NONE -i NONE`: `<C-w>e` opens no
+    // window and changes no state) — already documented as such in
+    // VIM_COMPATIBILITY.md:455.
+    "win:CTRL-W e/E",
+    // #1162: `CTRL-W d` ("split + go to definition") routes to LSP
+    // goto-definition — same divergence class as `other:CTRL-]` above, and
+    // for the same reason (VIM_COMPATIBILITY.md:478, "LSP-based"; the
+    // oracle's `-u NONE -i NONE` has no LSP client to compare against).
     "win:CTRL-W d",
-    // --- Bracket Commands (bracket) ---
-    "bracket:]c",
-    "bracket:[c",
-    "bracket:]d",
-    "bracket:[d",
-    "bracket:[p",
-    "bracket:[]",
-    "bracket:][",
-    "bracket:[m",
-    "bracket:]m",
-    "bracket:[M",
-    "bracket:]M",
-    "bracket:[*",
-    "bracket:]*",
-    "bracket:[/",
-    "bracket:]/",
-    "bracket:[#",
-    "bracket:]#",
-    // --- Operator-Pending Mode (oppend) ---
-    "oppend:g_",
-    "oppend:F",
-    "oppend:T",
-    "oppend:;",
-    "oppend:,",
-    "oppend:{",
-    "oppend:}",
-    "oppend:a'",
-    "oppend:a`",
-    "oppend:o_V",
-    // --- Visual Mode (visual) ---
-    "visual:P",
-    "visual:CTRL-X",
-    "visual:g CTRL-X",
-    // --- Core Vim Ex Commands (ex) ---
-    "ex::w",
-    "ex::write",
+    // --- Ends or leaves the session ---
+    // Each of these exits, or would exit, the very vimcode process the probe
+    // is driving. There is no "after" state left for the probe to read —
+    // the harness cannot observe a command that tears down the thing it is
+    // observing.
     "ex::q",
     "ex::quit",
     "ex::q!",
@@ -7269,81 +12028,94 @@ const COVERAGE_EXEMPT: &[&str] = &[
     "ex::x",
     "ex::qa",
     "ex::qa!",
-    "ex::wa",
     "ex::wqa",
     "ex::xa",
-    "ex::edit",
-    "ex::enew",
-    "ex::bn",
-    "ex::bp",
-    "ex::b#",
-    "ex::b {N}",
-    "ex::bd",
-    "ex::bdelete",
-    "ex::ls",
-    "ex::buffers",
-    "ex::sp",
-    "ex::vs",
-    "ex::close",
-    "ex::only",
-    "ex::new",
-    "ex::vnew",
-    "ex::tabe",
-    "ex::tabclose",
-    "ex::tabnext",
-    "ex::tabprevious",
-    "ex::tabmove",
-    "ex::delete",
-    "ex::move",
-    "ex::copy",
-    "ex::join",
-    "ex::yank",
-    "ex::norm",
-    "ex::nohlsearch",
-    "ex::read",
-    "ex::reg",
-    "ex::registers",
-    "ex::marks",
-    "ex::jumps",
-    "ex::changes",
-    "ex::history",
-    "ex::echo {text}",
-    "ex::pwd",
-    "ex::file",
-    "ex::=",
-    "ex::#",
-    "ex::number",
-    "ex::print",
-    "ex::ma",
-    "ex::saveas {file}",
-    "ex::update",
     "ex::cquit",
+    // `:version` prints build/version info to the message line, not buffer
+    // state — nothing here is a buffer diff. `:help`/`:h` open a help buffer
+    // whose *content* is Neovim's own bundled runtime docs, which vimcode
+    // does not reproduce and should not try to.
     "ex::version",
     "ex::help",
     "ex::h",
-    "ex::windo {cmd}",
-    "ex::bufdo {cmd}",
-    "ex::tabdo {cmd}",
-    "ex::diffsplit",
-    "ex::diffthis",
-    "ex::diffoff",
+    // --- Environment-dependent ---
+    // The result depends on the machine running the test (an installed
+    // `grep`/`make`, the set of installed colorschemes, the filesystem
+    // layout under the cwd), not on the editor. Comparing against the
+    // oracle here would be comparing hosts, not implementations, and a case
+    // that happened to pass would be pinned to this machine's environment.
     "ex::grep",
     "ex::vimgrep",
-    "ex::copen",
-    "ex::cclose",
-    "ex::cn",
-    "ex::cp",
-    "ex::cc",
-    "ex::cd {path}",
-    "ex::colorscheme",
+    "ex::lgrep",
+    "ex::lvimgrep",
     "ex::make",
-    "ex::b {name}",
+    "ex::colorscheme",
+    "ex::cd {path}",
     "ex::Explore",
     "ex::Ex",
     "ex::Sexplore",
     "ex::Sex",
     "ex::Vexplore",
     "ex::Vex",
+    // --- Already decided into unit tests (#1160) ---
+    "ins:CTRL-@",
+    "ins:CTRL-G j/k",
+    // #1160: source-dependent <C-x> sub-modes — oracle cases exist for
+    // CTRL-X CTRL-L/CTRL-F above; the rest are covered by unit tests instead
+    // (per the issue: "the rest of the CTRL-X family is source-dependent and
+    // belongs in unit tests" — buffer-scoped keyword completion, the bundled
+    // dictionary, spell suggestions, LSP-backed omni, and window scrolling
+    // are all either non-deterministic against a live oracle or already
+    // exercised at the engine-test level in `src/core/engine/tests.rs`).
+    "ins:CTRL-X CTRL-N/CTRL-P",
+    "ins:CTRL-X CTRL-K",
+    "ins:CTRL-X CTRL-S",
+    "ins:CTRL-X CTRL-O",
+    "ins:CTRL-X CTRL-E/CTRL-Y",
+    // ===========================================================================
+    // Uncovered work — plain debt, no permanent reason. Every id below this
+    // line has no annotation because it needs none: pick one up, write a
+    // `COMMAND_PROBES` entry and an oracle case, and delete it.
+    // ===========================================================================
+
+    // --- g-Commands (g) ---
+    // `g:g-` was here until #1156: the new
+    // `undo:g- crosses a branch abandoned by u then edit` case presses `g-`,
+    // so the probe matches and the ratchet demands the entry be deleted.
+    // That is the list shrinking as designed — do not re-add it.
+    // --- Window Commands (CTRL-W) (win) --- #1162 backfilled all 33: 26 now
+    // have a real oracle case (CASES_WIN — 18 pass, 8 tracked red in
+    // KNOWN_DEVIATIONS_WIN), and the other 7 (H/J/K/L/T/e/E/d) moved to the
+    // "Deliberate semantic divergence" permanent heading above.
+    // --- Core Vim Ex Commands (ex) --- #1281 backfilled the 22 buffer/tab/
+    // window rows below, plus 18 more (gf/gt/CTRL-^/marks/etc. — CASES_XFILE
+    // is 35 cases total, 28 pass, 7 tracked red in KNOWN_DEVIATIONS_XFILE —
+    // the 35th, "ex:tabmove N moves the current tab to a non-edge position",
+    // was added in review to cover the general-N `:tabmove` arithmetic the
+    // original `:tabmove 0` case didn't reach); #1282 backfilled
+    // `other:ga`/`other:g8`/`other:CTRL-G`/`g:ga`/`g:g8` and the 21
+    // echo-area/message ex-commands (CASES_MESSAGE — 12 pass, 7 tracked red
+    // in KNOWN_DEVIATIONS_MESSAGE) plus the 6 on-disk ones (CASES_DISK, all
+    // 6 pass — `ex::w` already had a vacuous case via the `:windo` needle
+    // collision below, so it gained a real one too even though there was
+    // nothing to delete here);
+    // (`ex::w`'s `Keys(":w")` probe is a loose needle that also matches
+    // ":windo" — retired before #1282 as an honest side effect of that
+    // needle, not because `:w` itself had gained a dedicated case at the
+    // time.) #1283 backfilled the whole quickfix/location-list family (23
+    // ids, `ex::copen`..`ex::lfdo`, #1155's leftover debt) — 19 via real,
+    // passing empty-list/no-location-list refusal or no-op cases in
+    // `CASES_EX` (same precedent as `ex:cc on empty quickfix list`, #1154),
+    // and 4 (`ex::copen`/`ex::cwindow`/`ex::lopen`/`ex::lwindow`, which open
+    // a window) via `CASES_XFILE`'s `WinCase` layout-probe harness per this
+    // issue's own chaining instruction — `ex::copen` is real but currently
+    // RED, tracked in `KNOWN_DEVIATIONS_XFILE`. See that block's "#1283
+    // population seam" comment in `CASES_EX` for why every one of these
+    // drives an empty/absent list rather than a populated one: no key
+    // sequence can populate an identical quickfix list on both sides
+    // through this harness (confirmed against a live oracle — `:vimgrep`
+    // with no file argument errors `E683`, and vimcode's own
+    // `:vimgrep`/`:grep` don't take a file argument at all).
 ];
 
 // ---------------------------------------------------------------------------
@@ -7403,6 +12175,7 @@ fn run_case(case: &Case) -> Outcome {
         case.cursor_col,
         case.keys,
         nvim.rows,
+        nvim.cols,
         case.setup,
     );
     let nvim_buf = nvim.buf.join("\n");
@@ -8045,38 +12818,15 @@ fn nvim_conformance() {
 // starts passing must have its entry deleted. May only ever SHRINK.
 // ---------------------------------------------------------------------------
 
-const KNOWN_DEVIATIONS_MULTI: &[&str] = &[
-    // #985: opening a file into a pane -- `:e`/`:edit` (`EngineAction::
-    // OpenFile` -> `open_file_with_mode`), `:tabnew`/`:tabe` (`new_tab`),
-    // `:split`/`:vsplit` (`split_window`) -- never calls
-    // `push_jump_location`/`record_jump_from` at all: verified by reading
-    // every call site in `src/core/engine/buffers.rs`, `windows.rs`'s
-    // `new_tab`/`split_window_with_new_first`, and `execute.rs`'s `:e`/
-    // `:tabnew`/`:split`/`:vsplit` handlers, and confirmed against the real
-    // oracle: opening a different file this way is jump-worthy in Neovim
-    // regardless of line (`getjumplist()` gains an entry), but vimcode's
-    // jumplist is untouched, so every `<C-o>`/`<C-i>` case whose only
-    // jump-worthy event is one of these finds nothing to jump to. This is
-    // the fix issue's spec, not something to paper over here -- see the PR
-    // description for the full divergence list.
-    "jump:multi C-o after :e returns to A",
-    "jump:multi C-o across tab",
-    "jump:multi C-o across split",
-    "jump:multi C-o across vsplit",
-    "jump:multi C-o after buffer swap in place",
-    "jump:multi C-o twice across three files",
-    "jump:multi C-o same line different file",
-    "jumps:multi list after two :e",
-    "jumps:multi list after C-o marker",
-    // NOT listed: "jump:multi C-i forward to B" / "jump:multi C-i across
-    // tab" currently PASS, but vacuously -- with the bug above, `<C-o>` is a
-    // complete no-op (nothing recorded to jump to), so the immediately-
-    // following `<C-i>` is *also* a no-op, and the two cancel out to the
-    // exact position `:e`/`:tabnew` already left the cursor at, matching the
-    // oracle's genuine round trip by coincidence. Real forward-jump coverage
-    // for the fix issue comes from re-running "jump:multi C-o ..." (which
-    // DOES fail today) once a fix lands, not from these two.
-];
+// #985 added the multi-file cases; #1158 fixed the underlying bug --
+// `open_file_with_mode` (`:e`/`:edit`), `new_tab` (`:tabnew`/`:tabe`), and
+// `split_window_with_new_first` (`:split`/`:vsplit`) now call
+// `push_jump_location` before switching the active buffer/window/tab away,
+// matching Neovim's rule that opening a different file this way is
+// jump-worthy regardless of line. All 9 entries this array used to carry
+// now PASS against the real oracle, so the array — which may only ever
+// SHRINK — is empty.
+const KNOWN_DEVIATIONS_MULTI: &[&str] = &[];
 
 #[test]
 fn nvim_conformance_jumplist_multi_file() {
@@ -8237,6 +12987,242 @@ fn nvim_conformance_jumplist_multi_file() {
 }
 
 // ---------------------------------------------------------------------------
+// KNOWN_DEVIATIONS_WIN — same bidirectional-gate idiom as KNOWN_DEVIATIONS_MULTI
+// above, applied to CASES_WIN (#1162). May only ever SHRINK.
+//
+// ## Follow-up issue status (read before editing any entry below)
+//
+// All 6 fixes below have filed GitHub issues: #1288, #1289, #1290, #1291,
+// #1292, #1326 respectively (#1288–#1292 filed 2026-09-22; #1326 filed as
+// the remainder #1288/#1289 left behind, recorded only in this file's
+// comments at the time — see below). The worker session that wrote this
+// harness ran under a policy that forbids it from running `gh` — issue
+// filing is reserved for the coordinator, not individual work sessions — so
+// the title/body to file was spelled out here first; it is kept below
+// verbatim as the diagnosis record for each filed issue:
+//
+//   1. (#1288) "win:CTRL-W -/</> resize by absolute count, not a fixed ratio step"
+//      — resize_window_split moves the split ratio by a fixed 5% per count
+//      step; Neovim moves the window boundary by an absolute [count]
+//      lines/columns. Fix: convert the absolute delta into a ratio delta
+//      against WindowLayout::dividers's axis_size. FIXED for the height case
+//      (`-`, and `+`/`_` were already coincidentally-then-genuinely correct);
+//      `<`/`>` (width) still failed post-fix, but for a *different*,
+//      previously-undiagnosed reason — see follow-up #6 (#1326) below.
+//   2. (#1289) "win:CTRL-W | give the current window a true winminwidth maximize"
+//      — maximize_window_split's 0.9/0.1 ratio happens to match Neovim's
+//      real "shrink the other window to its 'winminheight' minimum"
+//      behaviour for height (CTRL-W _) but not width (CTRL-W |), where 10%
+//      of 80 columns is well above Neovim's 'winminwidth' floor. Fixed:
+//      `maximize_window_split` now shrinks the other side down to a real,
+//      size-derived `'winminwidth'`/`'winminheight'` floor
+//      (`min_raw_extent`, both hardcoded at Neovim's shared default of 1
+//      since neither setting is wired up as a real `Settings` field yet)
+//      instead of a fixed ratio — same integer raw-line/column-space
+//      approach #1288 used for `resize_window_split`, for the same reason.
+//      `CTRL-W |` still failed post-fix, but — like `<`/`>` above — for the
+//      *same*, already-diagnosed divider-thickness reason, not the
+//      fixed-ratio one — see follow-up #6 (#1326) below. `CTRL-W _` needed
+//      no such fix: Horizontal splits have no divider-column analogue (each
+//      window's own status line already supplies the visual separation), so
+//      it was already a real, non-coincidental pass before and after this
+//      change.
+//   3. (#1290) "win:CTRL-W = fix off-by-one rect rounding on odd-sized splits"
+//      — WindowLayout::calculate_rects (SplitTreeMeasure::new(0.0)) rounded
+//      each child's share of a split independently instead of giving one
+//      side the exact remainder, so an odd-sized 50/50 split landed 11/11
+//      instead of Neovim's 12/11. FIXED: `calculate_rects`/`dividers` now
+//      round the split *boundary* once and derive both children's extents
+//      from that single value (moved off `quadraui::SplitTree::layout`
+//      entirely for `WindowLayout`, since that primitive's float division
+//      is correct and shared with `GroupLayout` — the rounding-tie bug was
+//      strictly downstream of it).
+//   4. (#1291) "win:CTRL-W r/R rotate window identity, not just content"
+//      — rotate_windows swapped buffer_id/view across fixed WindowId tree
+//      slots, leaving Tab::active_window pinned to the same screen
+//      position. Neovim rotates which window (identity + focus) occupies
+//      which position. FIXED: rotate_windows now permutes the `WindowId`s
+//      themselves through the tree's leaf slots (`WindowLayout::
+//      set_window_ids_in_order`) instead of copying `buffer_id`/`view`
+//      across static slots — `Tab::active_window` is left untouched, so a
+//      window that was focused before the rotate keeps its `WindowId` (and
+//      therefore focus) after landing in its new screen slot.
+//   5. (#1292) "win:CTRL-W p track Tab::prev_window for real previous-window recall"
+//      — execute_wincmd's 'p' arm only restores prev_active_group (the
+//      VSCode-style editor-group tree); there is no Tab-level "previously
+//      active window" at all, so CTRL-W p is a no-op with a single editor
+//      group. Needs a Tab::prev_window field updated at every
+//      window-focus-changing call site (cycle_next_window/cycle_prev_window/
+//      activate_window/set_cursor_for_window/mouse click — ~20 sites per a
+//      #1162 audit).
+//   6. (#1326) "win:CTRL-W </>/\| leave the other window one column too wide"
+//      — Neovim reserves one screen column for a `Vertical` split's divider
+//      bar (confirmed empirically — a fresh 80-column `<C-w>v` gives
+//      Neovim's two windows 40/39, not 40/40), but `WindowLayout::
+//      layout_snapped` hardcoded zero divider thickness for both split
+//      directions, so a vertical split's column widths always summed to the
+//      full bounds width. For `<`/`>`, the resized (active) window's own
+//      width already matched Neovim (#1288's ratio math was correct); only
+//      the *other* window was one column too wide. For `\|`, vimcode split
+//      79/1 of 80 columns where Neovim splits 78/1 of a 79-column content
+//      area. FIXED: `layout_snapped`'s `Vertical` arm now reserves one
+//      column for the divider (the boundary is still rounded exactly once
+//      against the reduced content width, per #1290's tie-break), and
+//      `split_window_with_new_first` reserves it too when seeding a fresh
+//      split's initial sizes, so `resize_window_split`/`maximize_window_
+//      split`'s existing `axis_size` (already the sum of both windows' own
+//      *current* content widths, never the raw bounds width) stays the
+//      content width post-fix without any change to either function's own
+//      math. `Horizontal` splits are unaffected: each window's own status
+//      line already supplies the visual separation, and `-`/`+`/`_` were
+//      already real, non-coincidental passes.
+//
+// None of the 6 was attempted in #1162 itself: each is a bigger, more
+// failure-prone change (rewriting window resize math, reworking a shared
+// rect-rounding routine, restructuring rotate's identity model, adding
+// focus-tracking to ~20 call sites, or reserving a divider column through
+// every consumer of `WindowLayout`'s geometry) than "generalise the harness"
+// should carry in the same slice. Kept as real, non-vacuous
+// KNOWN_DEVIATIONS_WIN findings rather than silently dropped or
+// mis-classified as passing.
+// ---------------------------------------------------------------------------
+
+const KNOWN_DEVIATIONS_WIN: &[&str] = &[];
+
+#[test]
+fn nvim_conformance_windows() {
+    let version_output = std::process::Command::new("nvim")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let resolved = resolve_on_path("nvim");
+    let resolved_display = resolved
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "nvim (resolved by PATH lookup)".to_string());
+    let probe = version_output
+        .as_deref()
+        .map(|out| (resolved_display.as_str(), out));
+
+    let allow_skip = std::env::var_os(ALLOW_SKIP_VAR).is_some();
+    let nvim_version = match preflight(probe, allow_skip) {
+        Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
+        Preflight::Skip { reason } => {
+            eprintln!("SKIP ({ALLOW_SKIP_VAR} set): {reason}");
+            return;
+        }
+        Preflight::Run { banner, version } => {
+            print_unmissable(&banner);
+            Some(version)
+        }
+    };
+
+    let filter = std::env::var("PROBE_FILTER").ok();
+    let verbose = std::env::var_os("PROBE_VERBOSE").is_some();
+
+    let mut outcomes: Vec<(&str, bool)> = Vec::new();
+    let mut detail: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut nvim_broke: Vec<&str> = Vec::new();
+
+    for case in CASES_WIN
+        .iter()
+        .filter(|c| filter.as_deref().is_none_or(|f| c.label.contains(f)))
+    {
+        match run_win_case(case) {
+            Outcome::NvimBroke => nvim_broke.push(case.label),
+            Outcome::Pass => {
+                outcomes.push((case.label, true));
+                if verbose {
+                    println!("PASS [{}]", case.label);
+                }
+            }
+            Outcome::Fail(msg) => {
+                outcomes.push((case.label, false));
+                if verbose {
+                    println!("FAIL {msg}");
+                }
+                detail.insert(case.label, msg);
+            }
+        }
+    }
+
+    println!("\n=== Neovim Conformance Results: window layout (#1162) ===");
+    println!(
+        "cases run: {}  pass: {}  known-fail: {}",
+        outcomes.len(),
+        outcomes.iter().filter(|(_, p)| *p).count(),
+        outcomes
+            .iter()
+            .filter(|(l, p)| !*p && KNOWN_DEVIATIONS_WIN.contains(l))
+            .count(),
+    );
+    if !nvim_broke.is_empty() {
+        println!(
+            "\nnvim execution failed for {} case(s): {:?}",
+            nvim_broke.len(),
+            nvim_broke
+        );
+    }
+
+    let all_labels: Vec<&str> = CASES_WIN.iter().map(|c| c.label).collect();
+    let mut verdict = classify(
+        &outcomes,
+        KNOWN_DEVIATIONS_WIN,
+        filter.is_none().then_some(all_labels.as_slice()),
+    );
+
+    if !verdict.fixed.is_empty() && !fixes_are_enforced(nvim_version) {
+        println!(
+            "\nNOTE: {} KNOWN_DEVIATIONS_WIN entr(y/ies) pass against this run's \
+             Neovim but the list was captured against {}.{}.x, so this is oracle-version \
+             skew, not a landed fix — do NOT delete them. Not failing the run:\n{}",
+            verdict.fixed.len(),
+            DEVIATIONS_ORACLE.0,
+            DEVIATIONS_ORACLE.1,
+            bullet_list(&verdict.fixed)
+        );
+        verdict.fixed.clear();
+    }
+
+    if verdict.is_clean() {
+        return;
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    if !verdict.stale.is_empty() {
+        problems.push(format!(
+            "{} KNOWN_DEVIATIONS_WIN entr(y/ies) match no case label — delete them:\n{}",
+            verdict.stale.len(),
+            bullet_list(&verdict.stale)
+        ));
+    }
+    if !verdict.regressions.is_empty() {
+        problems.push(format!(
+            "{} window-layout REGRESSION(S) — cases not in KNOWN_DEVIATIONS_WIN \
+             that do not match Neovim:\n\n{}",
+            verdict.regressions.len(),
+            verdict
+                .regressions
+                .iter()
+                .map(|l| detail.get(l).cloned().unwrap_or_else(|| (*l).to_string()))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        ));
+    }
+    if !verdict.fixed.is_empty() {
+        problems.push(format!(
+            "{} case(s) listed in KNOWN_DEVIATIONS_WIN now PASS. \
+             Good — delete these entries so the list keeps shrinking:\n{}",
+            verdict.fixed.len(),
+            bullet_list(&verdict.fixed)
+        ));
+    }
+    panic!("\n\n{}\n", problems.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
 // #1002: `setup` must actually reach the vimcode side.
 //
 // These need no nvim — they drive `run_in_vimcode` directly, which is the
@@ -8258,6 +13244,7 @@ fn sol_probe(setup: &str) -> (usize, usize) {
         1,
         "G",
         24,
+        80,
         setup,
     );
     (line, col)
@@ -8290,20 +13277,31 @@ fn case_setup_reaches_the_vimcode_side() {
 fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
     // 'joinspaces' — two spaces after a `.` when joining.
     let joined =
-        |setup: &str| run_in_vimcode("self-test:js", &["end.", "next"], 1, 1, "J", 24, setup).0;
+        |setup: &str| run_in_vimcode("self-test:js", &["end.", "next"], 1, 1, "J", 24, 80, setup).0;
     assert_eq!(joined("vim.o.joinspaces=true"), "end.  next");
     assert_eq!(joined(""), "end. next");
 
     // 'smarttab' — <BS> at the start of indent eats a whole shiftwidth with it
     // on, one column with it off.
-    let bs =
-        |setup: &str| run_in_vimcode("self-test:sta", &["    a"], 1, 5, "i<BS><Esc>", 24, setup).0;
+    let bs = |setup: &str| {
+        run_in_vimcode(
+            "self-test:sta",
+            &["    a"],
+            1,
+            5,
+            "i<BS><Esc>",
+            24,
+            80,
+            setup,
+        )
+        .0
+    };
     assert_eq!(bs("vim.o.smarttab=false"), "   a");
     assert_eq!(bs(""), "a");
 
     // 'nrformats' — octal must be opted into; alpha likewise.
     let inc = |lines: &'static [&'static str], setup: &str| {
-        run_in_vimcode("self-test:nf", lines, 1, 1, "<C-a>", 24, setup).0
+        run_in_vimcode("self-test:nf", lines, 1, 1, "<C-a>", 24, 80, setup).0
     };
     assert_eq!(inc(&["007"], "vim.o.nrformats='bin,octal,hex'"), "010");
     assert_eq!(inc(&["007"], ""), "008");
@@ -8311,8 +13309,9 @@ fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
     assert_eq!(inc(&["a"], ""), "a");
 
     // 'autoindent' — `o` off a `    foo` line.
-    let open =
-        |setup: &str| run_in_vimcode("self-test:ai", &["    foo"], 1, 1, "ox<Esc>", 24, setup).0;
+    let open = |setup: &str| {
+        run_in_vimcode("self-test:ai", &["    foo"], 1, 1, "ox<Esc>", 24, 80, setup).0
+    };
     assert_eq!(open("vim.o.autoindent=false"), "    foo\nx");
     assert_eq!(open(""), "    foo\n    x");
 }
@@ -8324,8 +13323,11 @@ fn every_setup_option_the_corpus_uses_changes_vimcode_behaviour() {
 #[test]
 fn unrecognised_setup_is_a_hard_failure_naming_the_statement() {
     let mut s = Settings::default();
-    let err = apply_setup(&mut s, "vim.o.virtualedit='all'").expect_err("must not be accepted");
-    assert!(err.contains("virtualedit"), "must name the option: {err}");
+    // #1153 added `virtualedit` to `apply_setup` — swapped this example for
+    // `listchars`, still unmapped (it's in vimcode's own "recognised but not
+    // implemented" `:set` table, not wired to any behaviour).
+    let err = apply_setup(&mut s, "vim.o.listchars='eol:$'").expect_err("must not be accepted");
+    assert!(err.contains("listchars"), "must name the option: {err}");
 
     // Not the `vim.o.` statement form at all.
     let err = apply_setup(&mut s, "vim.cmd('set sol')").expect_err("must not be accepted");
@@ -8887,7 +13889,23 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
     let cases = all_corpus_cases();
 
     // Direction 1 — delete a real entry without adding cases.
-    let victim = "win:CTRL-W h";
+    //
+    // #1162: this used to be "win:CTRL-W h", which is exactly the kind of
+    // entry the ratchet is meant to force out — CASES_WIN backfilled a real
+    // case for it, so it is no longer in COVERAGE_EXEMPT at all and this
+    // fixture would read "fixture drifted" (the assertion below) rather
+    // than test anything. #1281 did the same to `other:gt` (its own
+    // previous victim, backfilled by CASES_XFILE), #1282 did it again to
+    // `other:ga` (CASES_MESSAGE), and #1283 backfilled the quickfix family
+    // that included the next victim, `ex::copen` — which exhausted the
+    // "Uncovered work — plain debt" heading entirely (every id under it is
+    // now covered). `ex::grep` steps in from the permanent "Environment-
+    // dependent" heading instead: the mechanics below only need *some*
+    // currently-exempt id with zero matching cases, not one about to be
+    // backfilled, and `ex::grep` cannot ever pick up a case here (no
+    // installed `grep`/`rg` is deterministic across hosts) so it will not
+    // need yet another swap once this lands.
+    let victim = "ex::grep";
     assert!(COVERAGE_EXEMPT.contains(&victim), "fixture drifted");
     let without: Vec<&str> = COVERAGE_EXEMPT
         .iter()
@@ -8902,7 +13920,7 @@ fn coverage_ratchet_is_bidirectional_against_the_real_corpus() {
 
     // Direction 2 — add a case for an exempt command, leave the entry alone.
     let mut plus = cases.clone();
-    plus.push(("win:C-w h focuses the window to the left", "<C-w>hx"));
+    plus.push(("ex::grep populates the quickfix list", ":grep"));
     let improved = classify_coverage(&commands, COMMAND_PROBES, COVERAGE_EXEMPT, &plus);
     assert!(
         improved.newly_covered.iter().any(|u| u.starts_with(victim)),
@@ -9144,4 +14162,16970 @@ fn oracle_available_for_unit_test() -> Option<()> {
         }
         Preflight::Refuse { reason } => panic!("\n\n{reason}\n"),
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — `:set` options (#1225)
+//
+// `:help option-list` (Vim 9.1's `quickref.txt`) is a flat inventory of every
+// option Vim has: **421 of them**. [`OPTION_AUDIT`] below tags every one
+// Implemented / Partial / NotImplemented / Skipped against the `SettingDef`
+// registry in `src/core/settings.rs`, in `:help` order, so the tagging is
+// machine-checked rather than prose in a markdown file that nothing runs.
+//
+// The measurement, as of this slice (`undofile`/`undodir`/`undolevels` moved
+// ❌ → ✅/🟡/🟡 when #1156 landed, which is the gate working, not drift):
+//
+//     ✅ Implemented       45
+//     🟡 Partial           12
+//     ❌ Not implemented  182
+//     ⏭️  Intentionally skipped  182   (each with a reason from SKIP_REASONS)
+//                        ────
+//                         421
+//
+// ## Why an options slice goes first, measured rather than assumed
+//
+// #26 deprioritised this audit on the grounds that "bugs found here tend to be
+// 'missing feature' not 'wrong behavior'". That held for the `g`-prefix slice;
+// it does not hold here. The oracle corpus probes seven options through its
+// `cs(..)` Lua `setup`, and three of them — `'joinspaces'`, `'smarttab'`,
+// `'nrformats'` — did not exist in `Settings` at all. They were found the
+// expensive way, as unexplained conformance deviations blamed on a harness
+// bug (#1000, #1001). The three *new* findings below are the same shape,
+// found in an afternoon by tagging instead of by debugging.
+//
+// ## Gate 1 — the recorded surface must match the live registry
+//
+// Every row records the `:set` **surface** vimcode actually exposes for that
+// option name, and [`option_audit_matches_the_live_settings_registry`]
+// recomputes it by driving `Settings::parse_set_option` and diffs the two.
+// That is the bidirectional half: tagging an option `NotImplemented` and then
+// implementing it fails the gate until the row is re-tagged, and a row
+// claiming `Implemented` for a name `:set` rejects fails immediately.
+//
+// The surface is finer-grained than a bool on purpose. Three of this slice's
+// findings are *asymmetries* — a name the mutation path knows and the query
+// path does not, or the reverse — which a yes/no "is it implemented" check
+// cannot see and which is exactly what a user hits when `:set autoread` works
+// and `:set autoread?` answers "Unknown option".
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every Implemented/Partial row also carries a probe naming the oracle case
+// that exercises it; [`OPTION_COVERAGE_EXEMPT`] lists the ones no case
+// reaches today. Both directions fail, exactly as in `COVERAGE_EXEMPT`: an
+// unexempt row whose probe matches nothing, and an exempt row whose probe
+// starts matching. Writing the missing cases is #1162's job, not this
+// slice's — the exempt list is the measurement it starts from.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The audit verdict for one `:help option-list` entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptStatus {
+    /// ✅ — `:set` accepts the option and it drives real behaviour.
+    Implemented,
+    /// 🟡 — recognised, but incomplete: a missing value, a missing
+    /// abbreviation, or one of `:set x` / `:set x?` missing.
+    Partial,
+    /// ❌ — not in the registry (or recognised only to be rejected).
+    NotImplemented,
+    /// ⏭️ — deliberately out of scope. Carries the **reason**, per the bar
+    /// the insert-mode slice set ("requires VimScript eval", "no digraph
+    /// support planned") — a bare ⏭️ is not a tag, it is a shrug.
+    Skipped(&'static str),
+}
+
+// The skip-reason vocabulary. A fixed set, asserted by
+// [`option_audit_is_internally_consistent`], so a future slice cannot invent
+// a one-off excuse per row.
+const VIMSCRIPT: &str = "requires VimScript eval";
+const SCRIPTRT: &str = "no VimScript runtime (no :source, .vimrc or plugin scripts)";
+const BIDI: &str = "no right-to-left / input-method support planned";
+const ENCODING: &str = "vimcode is UTF-8 only; no encoding-conversion layer";
+const TERMCAP: &str = "terminal control belongs to quadraui; vimcode reads no termcap";
+const VIMGUI: &str = "Vim GUI-toolkit option with no GTK4/quadraui counterpart";
+const OBSOLETE: &str = "obsolete in Vim itself";
+const INTERP: &str = "language-binding dynamic library";
+const PRINTING: &str = "no :hardcopy printing planned";
+const CSCOPE: &str = "no cscope integration planned";
+const MAKE: &str = "no :make/:grep compiler integration (vimcode uses LSP diagnostics)";
+const SELECT: &str = "Select mode not supported (see the g-prefix slice: gH/gV/g CTRL-H)";
+const VICOMPAT: &str = "Vi-compatibility switch; vimcode targets nocompatible behaviour only";
+const EXMODE: &str = "Ex mode / legacy pager is out of scope (see gQ in the g-prefix slice)";
+const SESSION: &str = "no :mksession/:mkview support planned";
+const ARCH: &str = "no counterpart in vimcode's architecture (Ropey buffers, no line cache)";
+const PLATFORM: &str = "option of a Vim build for a platform vimcode does not target";
+/// Added by the registers/marks slice (#1226) for `':` — Neovim's
+/// prompt-buffer mark. vimcode has no `:h prompt-buffer` buffer type, so the
+/// mark has nothing to point at.
+const PROMPTBUF: &str = "no prompt buffers (:h prompt-buffer) in vimcode";
+/// Added by the ex-command slice (#1227) for the `:menu`/`:emenu`/`:popup`
+/// family. Distinct from [`VIMGUI`], which is about Vim *options* of a GUI
+/// build: vimcode does have menus, they are just quadraui widgets built from
+/// the accelerator registry, not entries a `:menu` command can define.
+const MENU: &str =
+    "Vim's GUI menu commands (:menu/:emenu/:popup); vimcode's menus are quadraui widgets";
+/// Added by #1227 for `:tag`/`:ptag`/`:dsearch`/`:ilist` and the rest of the
+/// tags and 'include'-search families.
+const CTAGS: &str =
+    "no ctags or 'include' file search planned; vimcode uses LSP definitions/references";
+/// Added by #1227 for `:rshada`/`:wshada`/`:rviminfo`/`:wviminfo`.
+const SHADA: &str = "no ShaDa/viminfo file; vimcode persists its own session state";
+
+const SKIP_REASONS: &[&str] = &[
+    VIMSCRIPT, SCRIPTRT, BIDI, ENCODING, TERMCAP, VIMGUI, OBSOLETE, INTERP, PRINTING, CSCOPE, MAKE,
+    SELECT, VICOMPAT, EXMODE, SESSION, ARCH, PLATFORM, PROMPTBUF, MENU, CTAGS, SHADA, PREVIEW,
+];
+
+/// What `:set` actually does with an option name today — measured, never
+/// asserted by hand. See [`measured_surface`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Surface {
+    /// Both `:set x` / `:set x=v` and `:set x?` are accepted.
+    Full,
+    /// Mutation works; `:set x?` answers "Unknown option".
+    SetOnly,
+    /// `:set x?` works; mutation answers "Unknown option".
+    QueryOnly,
+    /// Recognised by name, rejected with settings.rs's
+    /// "recognised but not implemented yet" message (`UNIMPLEMENTED_*`).
+    Stub,
+    /// Every form answers "Unknown option" — not in the registry.
+    Absent,
+}
+
+/// How an audited option is proven to be exercised by the oracle corpus.
+/// Separate from #1007's [`Probe`] because an option is pinned by a case's
+/// Lua `setup`, which `Probe` cannot see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptProbe {
+    /// At least one case whose `setup`, with **all whitespace removed**,
+    /// contains this substring. The corpus writes both `vim.o.magic = false`
+    /// and `vim.o.smarttab=false`, so a needle like `"vim.o.magic="` must
+    /// match either spelling; stripping whitespace is what makes the `=`
+    /// usable, and the `=` is what stops `"vim.o.list="` from crediting
+    /// `vim.o.listchars=...`.
+    OptSetup(&'static str),
+    /// At least one case whose **keys** contain this substring — for options
+    /// the corpus pins with a literal `:set …<CR>` prefix instead of `setup`.
+    OptKeys(&'static str),
+}
+
+struct OptionAudit {
+    /// Full option name, as `:help option-list` spells it (without quotes).
+    name: &'static str,
+    /// Vim's abbreviation, or `""` when the option has none.
+    short: &'static str,
+    status: OptStatus,
+    /// The `:set` surface vimcode exposes **today**, re-measured by gate 1.
+    surface: Surface,
+    /// Oracle probe — `Some` exactly for Implemented/Partial rows.
+    probe: Option<OptProbe>,
+    /// For ❌ rows: Vim's one-line description plus this slice's assessment of
+    /// whether it is worth implementing. For 🟡: what specifically is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn o(
+    name: &'static str,
+    short: &'static str,
+    status: OptStatus,
+    surface: Surface,
+    probe: Option<OptProbe>,
+    note: &'static str,
+) -> OptionAudit {
+    OptionAudit {
+        name,
+        short,
+        status,
+        surface,
+        probe,
+        note,
+    }
+}
+
+use crate::OptProbe::{OptKeys, OptSetup};
+use crate::OptStatus::{Implemented, NotImplemented, Partial, Skipped};
+use crate::Surface::{Absent, Full, QueryOnly, SetOnly, Stub};
+
+/// Every option in Vim 9.1's `:help option-list`, in `:help` order.
+///
+/// 421 rows, no "TODO" and no unreviewed row: adding a row, deleting one, or
+/// leaving one out of order fails [`option_audit_is_internally_consistent`].
+const OPTION_AUDIT: &[OptionAudit] = &[
+    o("aleph", "al", Skipped(BIDI), Absent, None,
+      "ASCII code of the letter Aleph (Hebrew)"),
+    o("allowrevins", "ari", Skipped(BIDI), Absent, None,
+      "allow CTRL-_ in Insert and Command-line mode"),
+    o("altkeymap", "akm", Skipped(OBSOLETE), Absent, None,
+      "obsolete option for Farsi"),
+    o("ambiwidth", "ambw", Skipped(ENCODING), Absent, None,
+      "what to do with Unicode chars of ambiguous width"),
+    o("antialias", "anti", Skipped(VIMGUI), Absent, None,
+      "Mac OS X: use smooth, antialiased fonts"),
+    o("arabic", "arab", Skipped(BIDI), Absent, None,
+      "for Arabic as a default second language"),
+    o("arabicshape", "arshape", Skipped(BIDI), Absent, None,
+      "do shaping for Arabic characters"),
+    o("autochdir", "acd", NotImplemented, Absent, None,
+      "change directory to the file in the current window — nice to have"),
+    o("autoindent", "ai", Implemented, Full, Some(OptSetup("vim.o.autoindent=")),
+      "take indent for new line from previous line"),
+    o("autoread", "ar", Partial, SetOnly, Some(OptSetup("vim.o.autoread=")),
+      "settable (:set autoread / :set noautoread) but NOT queryable — :set autoread? answers \"Unknown option\""),
+    o("autoshelldir", "asd", Skipped(PLATFORM), Absent, None,
+      "change directory to the shell's current directory"),
+    o("autowrite", "aw", NotImplemented, Absent, None,
+      "automatically write file if changed — nice to have"),
+    o("autowriteall", "awa", NotImplemented, Absent, None,
+      "as 'autowrite', but works with more commands — nice to have"),
+    o("background", "bg", NotImplemented, Absent, None,
+      "\"dark\" or \"light\", used for highlight colors — nice to have"),
+    o("backspace", "bs", Partial, Full, Some(OptSetup("vim.o.backspace=")),
+      "indent/eol/start honoured; Vim's numeric shorthand (0/1/2/3) is accepted as a list but not translated"),
+    o("backup", "bk", NotImplemented, Absent, None,
+      "keep backup file after overwriting a file — nice to have"),
+    o("backupcopy", "bkc", NotImplemented, Absent, None,
+      "make backup as a copy, don't rename the file — nice to have"),
+    o("backupdir", "bdir", NotImplemented, Absent, None,
+      "list of directories for the backup file — nice to have"),
+    o("backupext", "bex", NotImplemented, Absent, None,
+      "extension used for the backup file — nice to have"),
+    o("backupskip", "bsk", NotImplemented, Absent, None,
+      "no backup for files that match these patterns — nice to have"),
+    o("balloondelay", "bdlay", Skipped(VIMGUI), Absent, None,
+      "delay in mS before a balloon may pop up"),
+    o("ballooneval", "beval", Skipped(VIMGUI), Absent, None,
+      "switch on balloon evaluation in the GUI"),
+    o("balloonevalterm", "bevalterm", Skipped(VIMGUI), Absent, None,
+      "switch on balloon evaluation in the terminal"),
+    o("balloonexpr", "bexpr", Skipped(VIMSCRIPT), Absent, None,
+      "expression to show in balloon"),
+    o("belloff", "bo", NotImplemented, Absent, None,
+      "do not ring the bell for these reasons — nice to have"),
+    o("binary", "bin", NotImplemented, Absent, None,
+      "read/write/edit file in binary mode — nice to have"),
+    o("bioskey", "biosk", Skipped(TERMCAP), Absent, None,
+      "MS-DOS: use bios calls for input characters"),
+    o("bomb", "", Skipped(ENCODING), Absent, None,
+      "prepend a Byte Order Mark to the file"),
+    o("breakat", "brk", NotImplemented, Absent, None,
+      "characters that may cause a line break — nice to have"),
+    o("breakindent", "bri", NotImplemented, Absent, None,
+      "wrapped line repeats indent — nice to have"),
+    o("breakindentopt", "briopt", NotImplemented, Absent, None,
+      "settings for 'breakindent' — nice to have"),
+    o("browsedir", "bsdir", Skipped(VIMGUI), Absent, None,
+      "which directory to start browsing in"),
+    o("bufhidden", "bh", NotImplemented, Absent, None,
+      "what to do when buffer is no longer in window — nice to have"),
+    o("buflisted", "bl", NotImplemented, Absent, None,
+      "whether the buffer shows up in the buffer list — nice to have"),
+    o("buftype", "bt", NotImplemented, Absent, None,
+      "special type of buffer — nice to have"),
+    o("casemap", "cmp", Skipped(ENCODING), Absent, None,
+      "specifies how case of letters is changed"),
+    o("cdhome", "cdh", NotImplemented, Absent, None,
+      "change directory to the home directory by \":cd\" — low value"),
+    o("cdpath", "cd", NotImplemented, Absent, None,
+      "list of directories searched with \":cd\" — low value"),
+    o("cedit", "", NotImplemented, Absent, None,
+      "key used to open the command-line window — nice to have"),
+    o("charconvert", "ccv", Skipped(ENCODING), Absent, None,
+      "expression for character encoding conversion"),
+    o("cindent", "cin", Implemented, Full, Some(OptSetup("vim.o.cindent=")),
+      "do C program indenting"),
+    o("cinkeys", "cink", NotImplemented, Absent, None,
+      "keys that trigger indent when 'cindent' is set — nice to have"),
+    o("cinoptions", "cino", NotImplemented, Absent, None,
+      "how to do indenting when 'cindent' is set — nice to have"),
+    o("cinscopedecls", "cinsd", NotImplemented, Absent, None,
+      "words that are recognized by 'cino-g' — nice to have"),
+    o("cinwords", "cinw", NotImplemented, Absent, None,
+      "words where 'si' and 'cin' add an indent — nice to have"),
+    o("clipboard", "cb", NotImplemented, Stub, None,
+      "recognised but rejected (\"not implemented yet\"); #1100 landed backend.services().clipboard(), so the blocker is gone — worth implementing"),
+    o("cmdheight", "ch", NotImplemented, Absent, None,
+      "number of lines to use for the command-line — nice to have"),
+    o("cmdwinheight", "cwh", NotImplemented, Absent, None,
+      "height of the command-line window — nice to have"),
+    o("colorcolumn", "cc", Implemented, Full, Some(OptSetup("vim.o.colorcolumn=")),
+      "columns to highlight"),
+    o("columns", "co", NotImplemented, Absent, None,
+      "number of columns in the display — low value"),
+    o("comments", "com", NotImplemented, Absent, None,
+      "affects gq and auto-indent of comment leaders; worth implementing"),
+    o("commentstring", "cms", NotImplemented, Absent, None,
+      "commentary.vim support exists with a built-in filetype table; worth implementing"),
+    o("compatible", "cp", Skipped(VICOMPAT), Absent, None,
+      "behave Vi-compatible as much as possible"),
+    o("complete", "cpt", NotImplemented, Absent, None,
+      "specify how Insert mode completion works — worth implementing"),
+    o("completefunc", "cfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to be used for Insert mode completion"),
+    o("completeopt", "cot", NotImplemented, Absent, None,
+      "options for Insert mode completion — low value"),
+    o("completepopup", "cpp", Skipped(VIMGUI), Absent, None,
+      "options for the Insert mode completion info popup"),
+    o("completeslash", "csl", Skipped(PLATFORM), Absent, None,
+      "like 'shellslash' for completion"),
+    o("concealcursor", "cocu", NotImplemented, Absent, None,
+      "whether concealable text is hidden in cursor line — nice to have"),
+    o("conceallevel", "cole", NotImplemented, Absent, None,
+      "whether concealable text is shown or hidden — nice to have"),
+    o("confirm", "cf", NotImplemented, Absent, None,
+      "ask what to do about unsaved/read-only files — nice to have"),
+    o("conskey", "consk", Skipped(TERMCAP), Absent, None,
+      "get keys directly from console (MS-DOS only)"),
+    o("copyindent", "ci", NotImplemented, Absent, None,
+      "make 'autoindent' use existing indent structure — worth implementing"),
+    o("cpoptions", "cpo", Skipped(VICOMPAT), Absent, None,
+      "flags for Vi-compatible behavior"),
+    o("cryptmethod", "cm", NotImplemented, Absent, None,
+      "type of encryption to use for file writing — nice to have"),
+    o("cscopepathcomp", "cspc", Skipped(CSCOPE), Absent, None,
+      "how many components of the path to show"),
+    o("cscopeprg", "csprg", Skipped(CSCOPE), Absent, None,
+      "command to execute cscope"),
+    o("cscopequickfix", "csqf", Skipped(CSCOPE), Absent, None,
+      "use quickfix window for cscope results"),
+    o("cscoperelative", "csre", Skipped(CSCOPE), Absent, None,
+      "Use cscope.out path basename as prefix"),
+    o("cscopetag", "cst", Skipped(CSCOPE), Absent, None,
+      "use cscope for tag commands"),
+    o("cscopetagorder", "csto", Skipped(CSCOPE), Absent, None,
+      "determines \":cstag\" search order"),
+    o("cscopeverbose", "csverb", Skipped(CSCOPE), Absent, None,
+      "give messages when adding a cscope database"),
+    o("cursorbind", "crb", NotImplemented, Absent, None,
+      "move cursor in window as it moves in other windows — nice to have"),
+    o("cursorcolumn", "cuc", NotImplemented, Absent, None,
+      "highlight the screen column of the cursor — worth implementing"),
+    o("cursorline", "cul", Implemented, Full, Some(OptSetup("vim.o.cursorline=")),
+      "highlight the screen line of the cursor"),
+    o("cursorlineopt", "culopt", NotImplemented, Absent, None,
+      "settings for 'cursorline' — nice to have"),
+    o("debug", "", Skipped(ARCH), Absent, None,
+      "set to \"msg\" to see all error messages"),
+    o("define", "def", NotImplemented, Absent, None,
+      "pattern to be used to find a macro definition — nice to have"),
+    o("delcombine", "deco", Skipped(ENCODING), Absent, None,
+      "delete combining characters on their own"),
+    o("dictionary", "dict", NotImplemented, Absent, None,
+      "list of file names used for keyword completion — worth implementing"),
+    o("diff", "", NotImplemented, Absent, None,
+      "use diff mode for the current window — nice to have"),
+    o("diffexpr", "dex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to obtain a diff file"),
+    o("diffopt", "dip", NotImplemented, Absent, None,
+      "options for using diff mode — nice to have"),
+    o("digraph", "dg", NotImplemented, Absent, None,
+      "#1160 shipped <C-k> digraphs, so the table exists; this option only adds the char-<BS>-char entry form; worth implementing"),
+    o("directory", "dir", NotImplemented, Absent, None,
+      "list of directory names for the swap file — nice to have"),
+    o("display", "dy", NotImplemented, Absent, None,
+      "list of flags for how to display text — worth implementing"),
+    o("eadirection", "ead", NotImplemented, Absent, None,
+      "in which direction 'equalalways' works — low value"),
+    o("edcompatible", "ed", Skipped(VICOMPAT), Absent, None,
+      "toggle flags of \":substitute\" command"),
+    o("emoji", "emo", Skipped(ENCODING), Absent, None,
+      "emoji characters are considered full width"),
+    o("encoding", "enc", Skipped(ENCODING), Absent, None,
+      "encoding used internally"),
+    o("endoffile", "eof", NotImplemented, Absent, None,
+      "write CTRL-Z at end of the file — low value"),
+    o("endofline", "eol", NotImplemented, Absent, None,
+      "write <EOL> for last line in file — worth implementing"),
+    o("equalalways", "ea", NotImplemented, Absent, None,
+      "windows are automatically made the same size — nice to have"),
+    o("equalprg", "ep", NotImplemented, Absent, None,
+      "external program to use for \"=\" command — nice to have"),
+    o("errorbells", "eb", NotImplemented, Absent, None,
+      "ring the bell for error messages — nice to have"),
+    o("errorfile", "ef", Skipped(MAKE), Absent, None,
+      "name of the errorfile for the QuickFix mode"),
+    o("errorformat", "efm", Skipped(MAKE), Absent, None,
+      "description of the lines in the error file"),
+    o("esckeys", "ek", Skipped(TERMCAP), Absent, None,
+      "recognize function keys in Insert mode"),
+    o("eventignore", "ei", NotImplemented, Absent, None,
+      "autocommand events that are ignored — nice to have"),
+    o("expandtab", "et", Implemented, Full, Some(OptKeys(":set noet")),
+      "use spaces when <Tab> is inserted"),
+    o("exrc", "ex", Skipped(SCRIPTRT), Absent, None,
+      "read .vimrc and .exrc in the current directory"),
+    o("fileencoding", "fenc", Skipped(ENCODING), Absent, None,
+      "file encoding for multibyte text"),
+    o("fileencodings", "fencs", Skipped(ENCODING), Absent, None,
+      "automatically detected character encodings"),
+    o("fileformat", "ff", NotImplemented, Absent, None,
+      "file format used for file I/O — worth implementing"),
+    o("fileformats", "ffs", NotImplemented, Absent, None,
+      "automatically detected values for 'fileformat' — worth implementing"),
+    o("fileignorecase", "fic", NotImplemented, Absent, None,
+      "ignore case when using file names — nice to have"),
+    o("filetype", "ft", NotImplemented, Absent, None,
+      "type of file, used for autocommands — nice to have"),
+    o("fillchars", "fcs", NotImplemented, Absent, None,
+      "characters to use for displaying special items — nice to have"),
+    o("fixendofline", "fixeol", NotImplemented, Absent, None,
+      "make sure last line in file has <EOL> — worth implementing"),
+    o("fkmap", "fk", Skipped(OBSOLETE), Absent, None,
+      "obsolete option for Farsi"),
+    o("foldclose", "fcl", NotImplemented, Absent, None,
+      "close a fold when the cursor leaves it — worth implementing"),
+    o("foldcolumn", "fdc", NotImplemented, Absent, None,
+      "width of the column used to indicate folds — worth implementing"),
+    o("foldenable", "fen", NotImplemented, Absent, None,
+      "folds exist (foldmethod/foldlevel/foldmarker/foldnestmax); the remaining fold options are cheap follow-ons; worth implementing"),
+    o("foldexpr", "fde", Skipped(VIMSCRIPT), Absent, None,
+      "expression used when 'foldmethod' is \"expr\""),
+    o("foldignore", "fdi", NotImplemented, Absent, None,
+      "ignore lines when 'foldmethod' is \"indent\" — worth implementing"),
+    o("foldlevel", "fdl", Implemented, Full, Some(OptSetup("vim.o.foldlevel=")),
+      "close folds with a level higher than this"),
+    o("foldlevelstart", "fdls", NotImplemented, Absent, None,
+      "'foldlevel' when starting to edit a file — worth implementing"),
+    o("foldmarker", "fmr", Implemented, Full, Some(OptSetup("vim.o.foldmarker=")),
+      "markers used when 'foldmethod' is \"marker\""),
+    o("foldmethod", "fdm", Partial, Full, Some(OptSetup("vim.o.foldmethod=")),
+      "only manual/indent/marker; expr/syntax/diff are rejected"),
+    o("foldminlines", "fml", NotImplemented, Absent, None,
+      "minimum number of lines for a fold to be closed — worth implementing"),
+    o("foldnestmax", "fdn", Implemented, Full, Some(OptSetup("vim.o.foldnestmax=")),
+      "maximum fold depth"),
+    o("foldopen", "fdo", NotImplemented, Absent, None,
+      "for which commands a fold will be opened — worth implementing"),
+    o("foldtext", "fdt", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to display for a closed fold"),
+    o("formatexpr", "fex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used with \"gq\" command"),
+    o("formatlistpat", "flp", NotImplemented, Absent, None,
+      "pattern used to recognize a list header — nice to have"),
+    o("formatoptions", "fo", NotImplemented, Absent, None,
+      "gq/gw and auto-wrap are implemented but not configurable; worth implementing"),
+    o("formatprg", "fp", NotImplemented, Absent, None,
+      "name of external program used with \"gq\" command — nice to have"),
+    o("fsync", "fs", NotImplemented, Absent, None,
+      "whether to invoke fsync() after file write — nice to have"),
+    o("gdefault", "gd", Implemented, Full, Some(OptKeys(":set gdefault")),
+      "the \":substitute\" flag 'g' is default on"),
+    o("grepformat", "gfm", Skipped(MAKE), Absent, None,
+      "format of 'grepprg' output"),
+    o("grepprg", "gp", Skipped(MAKE), Absent, None,
+      "program to use for \":grep\""),
+    o("guicursor", "gcr", Skipped(VIMGUI), Absent, None,
+      "GUI: settings for cursor shape and blinking"),
+    o("guifont", "gfn", Skipped(VIMGUI), Absent, None,
+      "superseded by vimcode's own font_family/font_size settings"),
+    o("guifontset", "gfs", Skipped(VIMGUI), Absent, None,
+      "GUI: Names of multibyte fonts to be used"),
+    o("guifontwide", "gfw", Skipped(VIMGUI), Absent, None,
+      "list of font names for double-wide characters"),
+    o("guiheadroom", "ghr", Skipped(VIMGUI), Absent, None,
+      "GUI: pixels room for window decorations"),
+    o("guiligatures", "gli", Skipped(VIMGUI), Absent, None,
+      "GTK GUI: ASCII characters that can form shapes"),
+    o("guioptions", "go", Skipped(VIMGUI), Absent, None,
+      "GUI: Which components and options are used"),
+    o("guipty", "", Skipped(VIMGUI), Absent, None,
+      "GUI: try to use a pseudo-tty for \":!\" commands"),
+    o("guitablabel", "gtl", Skipped(VIMGUI), Absent, None,
+      "GUI: custom label for a tab page"),
+    o("guitabtooltip", "gtt", Skipped(VIMGUI), Absent, None,
+      "GUI: custom tooltip for a tab page"),
+    o("helpfile", "hf", Skipped(SCRIPTRT), Absent, None,
+      "full path name of the main help file"),
+    o("helpheight", "hh", Skipped(SCRIPTRT), Absent, None,
+      "minimum height of a new help window"),
+    o("helplang", "hlg", Skipped(SCRIPTRT), Absent, None,
+      "preferred help languages"),
+    o("hidden", "hid", Implemented, Full, Some(OptSetup("vim.o.hidden=")),
+      "don't unload buffer when it is |abandon|ed"),
+    o("highlight", "hl", Skipped(VIMGUI), Absent, None,
+      "vimcode themes highlight groups through colorscheme JSON, not a flag string"),
+    o("history", "hi", NotImplemented, Absent, None,
+      "number of command-lines that are remembered — worth implementing"),
+    o("hkmap", "hk", Skipped(BIDI), Absent, None,
+      "Hebrew keyboard mapping"),
+    o("hkmapp", "hkp", Skipped(BIDI), Absent, None,
+      "phonetic Hebrew keyboard mapping"),
+    o("hlsearch", "hls", Implemented, Full, Some(OptSetup("vim.o.hlsearch=")),
+      "highlight matches with last search pattern"),
+    o("icon", "", NotImplemented, Absent, None,
+      "let Vim set the text of the window icon — low value"),
+    o("iconstring", "", Skipped(VIMSCRIPT), Absent, None,
+      "string to use for the Vim icon text"),
+    o("ignorecase", "ic", Implemented, Full, Some(OptKeys(":set ic")),
+      "ignore case in search patterns"),
+    o("imactivatefunc", "imaf", Skipped(BIDI), Absent, None,
+      "function to enable/disable the X input method"),
+    o("imactivatekey", "imak", Skipped(BIDI), Absent, None,
+      "key that activates the X input method"),
+    o("imcmdline", "imc", Skipped(BIDI), Absent, None,
+      "use IM when starting to edit a command line"),
+    o("imdisable", "imd", Skipped(BIDI), Absent, None,
+      "do not use the IM in any mode"),
+    o("iminsert", "imi", Skipped(BIDI), Absent, None,
+      "use :lmap or IM in Insert mode"),
+    o("imsearch", "ims", Skipped(BIDI), Absent, None,
+      "use :lmap or IM when typing a search pattern"),
+    o("imstatusfunc", "imsf", Skipped(BIDI), Absent, None,
+      "function to obtain X input method status"),
+    o("imstyle", "imst", Skipped(BIDI), Absent, None,
+      "specifies the input style of the input method"),
+    o("include", "inc", NotImplemented, Absent, None,
+      "pattern to be used to find an include file — nice to have"),
+    o("includeexpr", "inex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to process an include line"),
+    o("incsearch", "is", Implemented, Full, Some(OptSetup("vim.o.incsearch=")),
+      "highlight match while typing search pattern"),
+    o("indentexpr", "inde", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to obtain the indent of a line"),
+    o("indentkeys", "indk", NotImplemented, Absent, None,
+      "keys that trigger indenting with 'indentexpr' — nice to have"),
+    o("infercase", "inf", NotImplemented, Absent, None,
+      "adjust case of match for keyword completion — worth implementing"),
+    o("insertmode", "im", Skipped(VICOMPAT), Absent, None,
+      "start the edit of a file in Insert mode"),
+    o("isfname", "isf", NotImplemented, Absent, None,
+      "affects gf and file-name completion; worth implementing"),
+    o("isident", "isi", NotImplemented, Absent, None,
+      "companion to the implemented 'iskeyword'; worth implementing"),
+    o("iskeyword", "isk", Implemented, Full, Some(OptSetup("vim.o.iskeyword=")),
+      "characters included in keywords"),
+    o("isprint", "isp", NotImplemented, Absent, None,
+      "affects how unprintable chars render in both backends; worth implementing"),
+    o("joinspaces", "js", Implemented, Full, Some(OptSetup("vim.o.joinspaces=")),
+      "two spaces after a period with a join command"),
+    o("jumpoptions", "jop", NotImplemented, Absent, None,
+      "specifies how jumping is done — nice to have"),
+    o("key", "", NotImplemented, Absent, None,
+      "encryption key — nice to have"),
+    o("keymap", "kmp", Skipped(BIDI), Absent, None,
+      "name of a keyboard mapping"),
+    o("keymodel", "km", Skipped(SELECT), Absent, None,
+      "enable starting/stopping selection with keys"),
+    o("keyprotocol", "kpc", Skipped(TERMCAP), Absent, None,
+      "what keyboard protocol to use for what terminal"),
+    o("keywordprg", "kp", NotImplemented, Absent, None,
+      "program to use for the \"K\" command — nice to have"),
+    o("langmap", "lmap", Skipped(BIDI), Absent, None,
+      "alphabetic characters for other language mode"),
+    o("langmenu", "lm", Skipped(BIDI), Absent, None,
+      "language to be used for the menus"),
+    o("langnoremap", "lnr", Skipped(BIDI), Absent, None,
+      "do not apply 'langmap' to mapped characters"),
+    o("langremap", "lrm", Skipped(BIDI), Absent, None,
+      "do apply 'langmap' to mapped characters"),
+    o("laststatus", "ls", Partial, Full, Some(OptSetup("vim.o.laststatus=")),
+      "0/1/2 honoured; 3 (global statusline) falls back to per-window"),
+    o("lazyredraw", "lz", Skipped(ARCH), Absent, None,
+      "both backends redraw from a single frame-driven paint; nothing to defer"),
+    o("linebreak", "lbr", Implemented, Full, Some(OptSetup("vim.o.linebreak=")),
+      "wrap long lines at a blank"),
+    o("lines", "", NotImplemented, Absent, None,
+      "number of lines in the display — low value"),
+    o("linespace", "lsp", Skipped(VIMGUI), Absent, None,
+      "superseded by vimcode's own font_size/ui_font_size; note its Vim abbreviation 'lsp' is taken by vimcode's own :set lsp"),
+    o("lisp", "", NotImplemented, Absent, None,
+      "automatic indenting for Lisp — nice to have"),
+    o("lispoptions", "lop", NotImplemented, Absent, None,
+      "changes how Lisp indenting is done — nice to have"),
+    o("lispwords", "lw", NotImplemented, Absent, None,
+      "words that change how lisp indenting works — nice to have"),
+    o("list", "", Implemented, Full, Some(OptSetup("vim.o.list=")),
+      "show <Tab> and <EOL>"),
+    o("listchars", "lcs", Partial, Full, Some(OptSetup("vim.o.listchars=")),
+      "tab/trail/eol/space rendered; extends/precedes/nbsp/conceal are not"),
+    o("loadplugins", "lpl", Skipped(SCRIPTRT), Absent, None,
+      "load plugin scripts when starting up"),
+    o("luadll", "", Skipped(INTERP), Absent, None,
+      "name of the Lua dynamic library"),
+    o("macatsui", "", Skipped(VIMGUI), Absent, None,
+      "Mac GUI: use ATSUI text drawing"),
+    o("magic", "", Implemented, Full, Some(OptSetup("vim.o.magic=")),
+      "changes special characters in search patterns"),
+    o("makeef", "mef", Skipped(MAKE), Absent, None,
+      "name of the errorfile for \":make\""),
+    o("makeencoding", "menc", Skipped(ENCODING), Absent, None,
+      "encoding of external make/grep commands"),
+    o("makeprg", "mp", Skipped(MAKE), Absent, None,
+      "program to use for the \":make\" command"),
+    o("matchpairs", "mps", NotImplemented, Absent, None,
+      "`%` matching is hardcoded to ()[]{}; worth implementing"),
+    o("matchtime", "mat", NotImplemented, Absent, None,
+      "#1207 shipped 'showmatch' with a fixed flash duration; worth implementing"),
+    o("maxcombine", "mco", Skipped(ENCODING), Absent, None,
+      "maximum nr of combining characters displayed"),
+    o("maxfuncdepth", "mfd", Skipped(SCRIPTRT), Absent, None,
+      "maximum recursive depth for user functions"),
+    o("maxmapdepth", "mmd", NotImplemented, Absent, None,
+      "maximum recursive depth for mapping — nice to have"),
+    o("maxmem", "mm", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for one buffer"),
+    o("maxmempattern", "mmp", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for pattern search"),
+    o("maxmemtot", "mmt", Skipped(ARCH), Absent, None,
+      "maximum memory (in Kbyte) used for all buffers"),
+    o("menuitems", "mis", Skipped(VIMGUI), Absent, None,
+      "maximum number of items in a menu"),
+    o("mkspellmem", "msm", NotImplemented, Absent, None,
+      "memory used before |:mkspell| compresses the tree — nice to have"),
+    o("modeline", "ml", NotImplemented, Absent, None,
+      "recognize modelines at start or end of file — nice to have"),
+    o("modelineexpr", "mle", Skipped(VIMSCRIPT), Absent, None,
+      "allow setting expression options from a modeline"),
+    o("modelines", "mls", NotImplemented, Absent, None,
+      "number of lines checked for modelines — nice to have"),
+    o("modifiable", "ma", NotImplemented, Absent, None,
+      "changes to the text are not possible — worth implementing"),
+    o("modified", "mod", NotImplemented, Absent, None,
+      "buffer has been modified — worth implementing"),
+    o("more", "", Skipped(EXMODE), Absent, None,
+      "pause listings when the whole screen is filled"),
+    o("mouse", "", NotImplemented, Absent, None,
+      "enable the use of mouse clicks — nice to have"),
+    o("mousefocus", "mousef", NotImplemented, Absent, None,
+      "keyboard focus follows the mouse — nice to have"),
+    o("mousehide", "mh", Skipped(VIMGUI), Absent, None,
+      "hide mouse pointer while typing"),
+    o("mousemodel", "mousem", NotImplemented, Absent, None,
+      "changes meaning of mouse buttons — nice to have"),
+    o("mousemoveevent", "mousemev", NotImplemented, Absent, None,
+      "report mouse moves with <MouseMove> — nice to have"),
+    o("mouseshape", "mouses", Skipped(VIMGUI), Absent, None,
+      "shape of the mouse pointer in different modes"),
+    o("mousetime", "mouset", NotImplemented, Absent, None,
+      "max time between mouse double-click — nice to have"),
+    o("mzquantum", "mzq", Skipped(INTERP), Absent, None,
+      "the interval between polls for MzScheme threads"),
+    o("mzschemedll", "", Skipped(INTERP), Absent, None,
+      "name of the MzScheme dynamic library"),
+    o("mzschemegcdll", "", Skipped(INTERP), Absent, None,
+      "name of the MzScheme dynamic library for GC"),
+    o("nrformats", "nf", Partial, Full, Some(OptSetup("vim.o.nrformats=")),
+      "alpha/octal/hex/bin parsed; 'unsigned' is not honoured"),
+    o("number", "nu", Implemented, Full, Some(OptSetup("vim.o.number=")),
+      "print the line number in front of each line"),
+    o("numberwidth", "nuw", NotImplemented, Absent, None,
+      "number of columns used for the line number — worth implementing"),
+    o("omnifunc", "ofu", Skipped(VIMSCRIPT), Absent, None,
+      "function for filetype-specific completion"),
+    o("opendevice", "odev", Skipped(PLATFORM), Absent, None,
+      "allow reading/writing devices on MS-Windows"),
+    o("operatorfunc", "opfunc", Skipped(VIMSCRIPT), Absent, None,
+      "g@ is implemented; the function is registered from Lua (vimcode.set_operatorfunc), not from :set"),
+    o("osfiletype", "oft", Skipped(OBSOLETE), Absent, None,
+      "no longer supported"),
+    o("packpath", "pp", Skipped(SCRIPTRT), Absent, None,
+      "list of directories used for packages"),
+    o("paragraphs", "para", NotImplemented, Absent, None,
+      "affects the { } paragraph motions; worth implementing"),
+    o("paste", "", Skipped(VICOMPAT), Absent, None,
+      "bracketed paste is handled by the backend; Vim itself deprecates this option"),
+    o("pastetoggle", "pt", Skipped(VICOMPAT), Absent, None,
+      "key code that causes 'paste' to toggle"),
+    o("patchexpr", "pex", Skipped(VIMSCRIPT), Absent, None,
+      "expression used to patch a file"),
+    o("patchmode", "pm", NotImplemented, Absent, None,
+      "keep the oldest version of a file — nice to have"),
+    o("path", "pa", NotImplemented, Absent, None,
+      "list of directories searched with \"gf\" et.al. — nice to have"),
+    o("perldll", "", Skipped(INTERP), Absent, None,
+      "name of the Perl dynamic library"),
+    o("preserveindent", "pi", NotImplemented, Absent, None,
+      "preserve the indent structure when reindenting — worth implementing"),
+    o("previewheight", "pvh", NotImplemented, Absent, None,
+      "height of the preview window — nice to have"),
+    o("previewpopup", "pvp", Skipped(VIMGUI), Absent, None,
+      "use popup window for preview"),
+    o("previewwindow", "pvw", NotImplemented, Absent, None,
+      "identifies the preview window — nice to have"),
+    o("printdevice", "pdev", Skipped(PRINTING), Absent, None,
+      "name of the printer to be used for :hardcopy"),
+    o("printencoding", "penc", Skipped(PRINTING), Absent, None,
+      "encoding to be used for printing"),
+    o("printexpr", "pexpr", Skipped(PRINTING), Absent, None,
+      "expression used to print PostScript for :hardcopy"),
+    o("printfont", "pfn", Skipped(PRINTING), Absent, None,
+      "name of the font to be used for :hardcopy"),
+    o("printheader", "pheader", Skipped(PRINTING), Absent, None,
+      "format of the header used for :hardcopy"),
+    o("printmbcharset", "pmbcs", Skipped(PRINTING), Absent, None,
+      "CJK character set to be used for :hardcopy"),
+    o("printmbfont", "pmbfn", Skipped(PRINTING), Absent, None,
+      "font names to be used for CJK output of :hardcopy"),
+    o("printoptions", "popt", Skipped(PRINTING), Absent, None,
+      "controls the format of :hardcopy output"),
+    o("prompt", "prompt", Skipped(EXMODE), Absent, None,
+      "enable prompt in Ex mode"),
+    o("pumheight", "ph", NotImplemented, Absent, None,
+      "maximum height of the popup menu — nice to have"),
+    o("pumwidth", "pw", NotImplemented, Absent, None,
+      "minimum width of the popup menu — nice to have"),
+    o("pythondll", "", Skipped(INTERP), Absent, None,
+      "name of the Python 2 dynamic library"),
+    o("pythonhome", "", Skipped(INTERP), Absent, None,
+      "name of the Python 2 home directory"),
+    o("pythonthreedll", "", Skipped(INTERP), Absent, None,
+      "name of the Python 3 dynamic library"),
+    o("pythonthreehome", "", Skipped(INTERP), Absent, None,
+      "name of the Python 3 home directory"),
+    o("pyxversion", "pyx", Skipped(INTERP), Absent, None,
+      "Python version used for pyx* commands"),
+    o("quickfixtextfunc", "qftf", Skipped(VIMSCRIPT), Absent, None,
+      "function for the text in the quickfix window"),
+    o("quoteescape", "qe", NotImplemented, Absent, None,
+      "affects the i\"/a\" text objects; worth implementing"),
+    o("readonly", "ro", NotImplemented, Absent, None,
+      "disallow writing the buffer — worth implementing"),
+    o("redrawtime", "rdt", NotImplemented, Absent, None,
+      "timeout for 'hlsearch' and |:match| highlighting — nice to have"),
+    o("regexpengine", "re", NotImplemented, Absent, None,
+      "default regexp engine to use — nice to have"),
+    o("relativenumber", "rnu", Implemented, Full, Some(OptSetup("vim.o.relativenumber=")),
+      "show relative line number in front of each line"),
+    o("remap", "", NotImplemented, Absent, None,
+      "allow mappings to work recursively — nice to have"),
+    o("renderoptions", "rop", Skipped(VIMGUI), Absent, None,
+      "options for text rendering on Windows"),
+    o("report", "", NotImplemented, Absent, None,
+      "threshold for reporting nr. of lines changed — worth implementing"),
+    o("restorescreen", "rs", Skipped(TERMCAP), Absent, None,
+      "Win32: restore screen when exiting"),
+    o("revins", "ri", Skipped(BIDI), Absent, None,
+      "inserting characters will work backwards"),
+    o("rightleft", "rl", Skipped(BIDI), Absent, None,
+      "window is right-to-left oriented"),
+    o("rightleftcmd", "rlc", Skipped(BIDI), Absent, None,
+      "commands for which editing works right-to-left"),
+    o("rubydll", "", Skipped(INTERP), Absent, None,
+      "name of the Ruby dynamic library"),
+    o("ruler", "ru", Implemented, Full, Some(OptSetup("vim.o.ruler=")),
+      "show cursor line and column in the status line"),
+    o("rulerformat", "ruf", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the ruler"),
+    o("runtimepath", "rtp", Skipped(SCRIPTRT), Absent, None,
+      "list of directories used for runtime files"),
+    o("scroll", "scr", NotImplemented, Absent, None,
+      "lines to scroll with CTRL-U and CTRL-D — worth implementing"),
+    o("scrollbind", "scb", NotImplemented, Absent, None,
+      "scroll in window as other windows scroll — nice to have"),
+    o("scrollfocus", "scf", NotImplemented, Absent, None,
+      "scroll wheel applies to window under pointer — low value"),
+    o("scrolljump", "sj", Implemented, Full, Some(OptSetup("vim.o.scrolljump=")),
+      "minimum number of lines to scroll"),
+    o("scrolloff", "so", Implemented, Full, Some(OptKeys(":set so=")),
+      "minimum nr. of lines above and below cursor"),
+    o("scrollopt", "sbo", NotImplemented, Absent, None,
+      "how 'scrollbind' should behave — nice to have"),
+    o("sections", "sect", NotImplemented, Absent, None,
+      "affects the [[ ]] section motions; worth implementing"),
+    o("secure", "", Skipped(SCRIPTRT), Absent, None,
+      "secure mode for reading .vimrc in current dir"),
+    o("selection", "sel", NotImplemented, Absent, None,
+      "inclusive/exclusive changes every Visual-mode operator's end column; worth implementing"),
+    o("selectmode", "slm", Skipped(SELECT), Absent, None,
+      "when to use Select mode instead of Visual mode"),
+    o("sessionoptions", "ssop", Skipped(SESSION), Absent, None,
+      "options for |:mksession|"),
+    o("shell", "sh", NotImplemented, Absent, None,
+      "`:!cmd` and range filters already shell out via a hardcoded shell — honouring :set shell would finish the feature; worth implementing"),
+    o("shellcmdflag", "shcf", NotImplemented, Absent, None,
+      "companion to 'shell' for `:!` and range filters; worth implementing"),
+    o("shellpipe", "sp", NotImplemented, Absent, None,
+      "string to put output of \":make\" in error file — nice to have"),
+    o("shellquote", "shq", NotImplemented, Absent, None,
+      "quote character(s) for around shell command — nice to have"),
+    o("shellredir", "srr", NotImplemented, Absent, None,
+      "string to put output of filter in a temp file — nice to have"),
+    o("shellslash", "ssl", Skipped(PLATFORM), Absent, None,
+      "use forward slash for shell file names"),
+    o("shelltemp", "stmp", NotImplemented, Absent, None,
+      "whether to use a temp file for shell commands — nice to have"),
+    o("shelltype", "st", Skipped(OBSOLETE), Absent, None,
+      "Amiga: influences how to use a shell"),
+    o("shellxescape", "sxe", Skipped(PLATFORM), Absent, None,
+      "characters to escape when 'shellxquote' is ("),
+    o("shellxquote", "sxq", Skipped(PLATFORM), Absent, None,
+      "like 'shellquote', but include redirection"),
+    o("shiftround", "sr", Implemented, Full, Some(OptKeys("et sr")),
+      "round indent to multiple of shiftwidth"),
+    o("shiftwidth", "sw", Implemented, Full, Some(OptKeys(":set sw=")),
+      "number of spaces to use for (auto)indent step"),
+    o("shortmess", "shm", NotImplemented, Absent, None,
+      "list of flags, reduce length of messages — nice to have"),
+    o("shortname", "sn", Skipped(OBSOLETE), Absent, None,
+      "Filenames assumed to be 8.3 chars"),
+    o("showbreak", "sbr", NotImplemented, Absent, None,
+      "string to use at the start of wrapped lines — nice to have"),
+    o("showcmd", "sc", Implemented, Full, Some(OptSetup("vim.o.showcmd=")),
+      "show (partial) command somewhere"),
+    o("showcmdloc", "sloc", NotImplemented, Absent, None,
+      "where to show (partial) command — nice to have"),
+    o("showfulltag", "sft", NotImplemented, Absent, None,
+      "show full tag pattern when completing tag — nice to have"),
+    o("showmatch", "sm", Implemented, Full, Some(OptSetup("vim.o.showmatch=")),
+      "briefly jump to matching bracket if insert one"),
+    o("showmode", "smd", NotImplemented, Absent, None,
+      "message on status line to show current mode — worth implementing"),
+    o("showtabline", "stal", NotImplemented, Absent, None,
+      "tells when the tab pages line is displayed — worth implementing"),
+    o("sidescroll", "ss", NotImplemented, Absent, None,
+      "minimum number of columns to scroll horizontal — worth implementing"),
+    o("sidescrolloff", "siso", Implemented, Full, Some(OptSetup("vim.o.sidescrolloff=")),
+      "min. nr. of columns to left and right of cursor"),
+    o("signcolumn", "scl", NotImplemented, Absent, None,
+      "when to display the sign column — nice to have"),
+    o("smartcase", "scs", Implemented, Full, Some(OptKeys(":set ic scs")),
+      "no ignore case when pattern has uppercase"),
+    o("smartindent", "si", Implemented, Full, Some(OptSetup("vim.o.smartindent=")),
+      "smart autoindenting for C programs"),
+    o("smarttab", "sta", Implemented, Full, Some(OptSetup("vim.o.smarttab=")),
+      "use 'shiftwidth' when inserting <Tab>"),
+    o("smoothscroll", "sms", NotImplemented, Absent, None,
+      "scroll by screen lines when 'wrap' is set — nice to have"),
+    o("softtabstop", "sts", Implemented, Full, Some(OptKeys("sts=2")),
+      "number of spaces that <Tab> uses while editing"),
+    o("spell", "", Implemented, Full, Some(OptSetup("vim.o.spell=")),
+      "enable spell checking"),
+    o("spellcapcheck", "spc", NotImplemented, Absent, None,
+      "pattern to locate end of a sentence — nice to have"),
+    o("spellfile", "spf", NotImplemented, Absent, None,
+      "files where |zg| and |zw| store words — nice to have"),
+    o("spelllang", "spl", Partial, QueryOnly, Some(OptSetup("vim.o.spelllang=")),
+      "queryable (:set spelllang?) but NOT settable — :set spelllang=de answers \"Unknown option\"; the 'spl' abbreviation is unknown in both directions"),
+    o("spelloptions", "spo", NotImplemented, Absent, None,
+      "options for spell checking — nice to have"),
+    o("spellsuggest", "sps", NotImplemented, Absent, None,
+      "method(s) used to suggest spelling corrections — nice to have"),
+    o("splitbelow", "sb", Implemented, Full, Some(OptSetup("vim.o.splitbelow=")),
+      "new window from split is below the current one"),
+    o("splitkeep", "spk", NotImplemented, Absent, None,
+      "determines scroll behavior for split windows — nice to have"),
+    o("splitright", "spr", Implemented, Full, Some(OptSetup("vim.o.splitright=")),
+      "new window is put right of the current one"),
+    o("startofline", "sol", Implemented, Full, Some(OptSetup("vim.o.startofline=")),
+      "commands move cursor to first non-blank in line"),
+    o("statusline", "stl", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the status line"),
+    o("suffixes", "su", NotImplemented, Absent, None,
+      "suffixes that are ignored with multiple match — nice to have"),
+    o("suffixesadd", "sua", NotImplemented, Absent, None,
+      "suffixes added when searching for a file — nice to have"),
+    o("swapfile", "swf", Partial, Full, Some(OptSetup("vim.o.swapfile=")),
+      "full name works; Vim's 'swf' abbreviation is not accepted"),
+    o("swapsync", "sws", Skipped(OBSOLETE), Absent, None,
+      "how to sync the swap file"),
+    o("switchbuf", "swb", NotImplemented, Absent, None,
+      "sets behavior when switching to another buffer — nice to have"),
+    o("synmaxcol", "smc", NotImplemented, Absent, None,
+      "maximum column to find syntax items — worth implementing"),
+    o("syntax", "syn", NotImplemented, Absent, None,
+      "syntax to be loaded for current buffer — nice to have"),
+    o("tabline", "tal", Skipped(VIMSCRIPT), Absent, None,
+      "custom format for the console tab pages line"),
+    o("tabpagemax", "tpm", NotImplemented, Absent, None,
+      "maximum number of tab pages for |-p| and \"tab all\" — nice to have"),
+    o("tabstop", "ts", Implemented, Full, Some(OptKeys(":set ts=")),
+      "number of spaces that <Tab> in file uses"),
+    o("tagbsearch", "tbs", NotImplemented, Absent, None,
+      "use binary searching in tags files — nice to have"),
+    o("tagcase", "tc", NotImplemented, Absent, None,
+      "how to handle case when searching in tags files — nice to have"),
+    o("tagfunc", "tfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to get list of tag matches"),
+    o("taglength", "tl", NotImplemented, Absent, None,
+      "number of significant characters for a tag — nice to have"),
+    o("tagrelative", "tr", NotImplemented, Absent, None,
+      "file names in tag file are relative — nice to have"),
+    o("tags", "tag", NotImplemented, Absent, None,
+      "list of file names used by the tag command — nice to have"),
+    o("tagstack", "tgst", NotImplemented, Absent, None,
+      "push tags onto the tag stack — nice to have"),
+    o("tcldll", "", Skipped(INTERP), Absent, None,
+      "name of the Tcl dynamic library"),
+    o("term", "", Skipped(TERMCAP), Absent, None,
+      "name of the terminal"),
+    o("termbidi", "tbidi", Skipped(BIDI), Absent, None,
+      "terminal takes care of bi-directionality"),
+    o("termencoding", "tenc", Skipped(ENCODING), Absent, None,
+      "character encoding used by the terminal"),
+    o("termguicolors", "tgc", NotImplemented, Absent, None,
+      "use GUI colors for the terminal — nice to have"),
+    o("termwinkey", "twk", Skipped(TERMCAP), Absent, None,
+      "key that precedes a Vim command in a terminal"),
+    o("termwinscroll", "twsl", Skipped(TERMCAP), Absent, None,
+      "max number of scrollback lines in a terminal window"),
+    o("termwinsize", "tws", Skipped(TERMCAP), Absent, None,
+      "size of a terminal window"),
+    o("termwintype", "twt", Skipped(TERMCAP), Absent, None,
+      "MS-Windows: type of pty to use for terminal window"),
+    o("terse", "", Skipped(VICOMPAT), Absent, None,
+      "shorten some messages"),
+    o("textauto", "ta", Skipped(OBSOLETE), Absent, None,
+      "obsolete, use 'fileformats'"),
+    o("textmode", "tx", Skipped(OBSOLETE), Absent, None,
+      "obsolete, use 'fileformat'"),
+    o("textwidth", "tw", Implemented, Full, Some(OptKeys(":set tw=")),
+      "maximum width of text that is being inserted"),
+    o("thesaurus", "tsr", NotImplemented, Absent, None,
+      "list of thesaurus files for keyword completion — nice to have"),
+    o("thesaurusfunc", "tsrfu", Skipped(VIMSCRIPT), Absent, None,
+      "function to be used for thesaurus completion"),
+    o("tildeop", "top", NotImplemented, Absent, None,
+      "makes `~` an operator; small, self-contained and conformance-visible; worth implementing"),
+    o("timeout", "to", NotImplemented, Absent, None,
+      "time out on mappings and key codes — nice to have"),
+    o("timeoutlen", "tm", Implemented, Full, Some(OptSetup("vim.o.timeoutlen=")),
+      "time out time in milliseconds"),
+    o("title", "", NotImplemented, Absent, None,
+      "let Vim set the title of the window — nice to have"),
+    o("titlelen", "", NotImplemented, Absent, None,
+      "percentage of 'columns' used for window title — nice to have"),
+    o("titleold", "", NotImplemented, Absent, None,
+      "old title, restored when exiting — nice to have"),
+    o("titlestring", "", Skipped(VIMSCRIPT), Absent, None,
+      "string to use for the Vim window title"),
+    o("toolbar", "tb", Skipped(VIMGUI), Absent, None,
+      "GUI: which items to show in the toolbar"),
+    o("toolbariconsize", "tbis", Skipped(VIMGUI), Absent, None,
+      "size of the toolbar icons (for GTK 2 only)"),
+    o("ttimeout", "", Skipped(ARCH), Absent, None,
+      "vimcode never reads termcap, so there are no key codes to time out on"),
+    o("ttimeoutlen", "ttm", Skipped(ARCH), Absent, None,
+      "vimcode never reads termcap, so there are no key codes to time out on"),
+    o("ttybuiltin", "tbi", Skipped(TERMCAP), Absent, None,
+      "use built-in termcap before external termcap"),
+    o("ttyfast", "tf", Skipped(TERMCAP), Absent, None,
+      "indicates a fast terminal connection"),
+    o("ttymouse", "ttym", Skipped(TERMCAP), Absent, None,
+      "type of mouse codes generated"),
+    o("ttyscroll", "tsl", Skipped(TERMCAP), Absent, None,
+      "maximum number of lines for a scroll"),
+    o("ttytype", "tty", Skipped(TERMCAP), Absent, None,
+      "alias for 'term'"),
+    // #1156 implemented these three (they were ❌ Absent when this slice ran).
+    o("undodir", "udir", Partial, Full, Some(OptSetup("vim.o.undodir=")),
+      "accepts one directory; Vim's is a comma-separated priority list with \
+       `.` and `//` forms, which vimcode has no per-directory fallback to drive"),
+    o("undofile", "udf", Implemented, Full, Some(OptSetup("vim.o.undofile=")),
+      "save undo information in a file"),
+    o("undolevels", "ul", Partial, Full, Some(OptSetup("vim.o.undolevels=")),
+      "caps live undo-tree states globally; no `ul=-1` (undo disabled) and no \
+       buffer-local `:setlocal ul`"),
+    o("undoreload", "ur", NotImplemented, Absent, None,
+      "max nr of lines to save for undo on a buffer reload — nice to have"),
+    o("updatecount", "uc", NotImplemented, Absent, None,
+      "after this many characters flush swap file — nice to have"),
+    o("updatetime", "ut", Implemented, Full, Some(OptSetup("vim.o.updatetime=")),
+      "after this many milliseconds flush swap file"),
+    o("varsofttabstop", "vsts", NotImplemented, Absent, None,
+      "a list of number of spaces when typing <Tab> — worth implementing"),
+    o("vartabstop", "vts", NotImplemented, Absent, None,
+      "a list of number of spaces for <Tab>s — worth implementing"),
+    o("verbose", "vbs", Skipped(ARCH), Absent, None,
+      "give informative messages"),
+    o("verbosefile", "vfile", Skipped(ARCH), Absent, None,
+      "file to write messages in"),
+    o("viewdir", "vdir", Skipped(SESSION), Absent, None,
+      "directory where to store files with :mkview"),
+    o("viewoptions", "vop", Skipped(SESSION), Absent, None,
+      "specifies what to save for :mkview"),
+    o("viminfo", "vi", NotImplemented, Absent, None,
+      "use .viminfo file upon startup and exiting — nice to have"),
+    o("viminfofile", "vif", NotImplemented, Absent, None,
+      "file name used for the viminfo file — nice to have"),
+    o("virtualedit", "ve", Partial, Full, Some(OptKeys(":set ve=all")),
+      "block/insert/all/onemore parsed; 'none' clearing and per-mode semantics are only partly wired"),
+    o("visualbell", "vb", NotImplemented, Absent, None,
+      "use visual bell instead of beeping — nice to have"),
+    o("warn", "", Skipped(VICOMPAT), Absent, None,
+      "warn for shell command when buffer was changed"),
+    o("weirdinvert", "wiv", Skipped(TERMCAP), Absent, None,
+      "for terminals that have weird inversion method"),
+    o("whichwrap", "ww", Implemented, Full, Some(OptSetup("vim.o.whichwrap=")),
+      "allow specified keys to cross line boundaries"),
+    o("wildchar", "wc", NotImplemented, Absent, None,
+      "command-line character for wildcard expansion — nice to have"),
+    o("wildcharm", "wcm", NotImplemented, Absent, None,
+      "like 'wildchar' but also works when mapped — nice to have"),
+    o("wildignore", "wig", NotImplemented, Absent, None,
+      "files matching these patterns are not completed — nice to have"),
+    o("wildignorecase", "wic", NotImplemented, Absent, None,
+      "ignore case when completing file names — nice to have"),
+    o("wildmenu", "wmnu", Partial, Full, Some(OptSetup("vim.o.wildmenu=")),
+      "accepted as a no-op — vimcode's wildmenu is unconditional, so :set nowildmenu does not turn it off"),
+    o("wildmode", "wim", Implemented, Full, Some(OptSetup("vim.o.wildmode=")),
+      "mode for 'wildchar' command-line expansion"),
+    o("wildoptions", "wop", NotImplemented, Absent, None,
+      "specifies how command line completion is done — nice to have"),
+    o("winaltkeys", "wak", Skipped(VIMGUI), Absent, None,
+      "when the windows system handles ALT keys"),
+    o("wincolor", "wcr", Skipped(VIMGUI), Absent, None,
+      "window-local highlighting"),
+    o("window", "wi", NotImplemented, Absent, None,
+      "nr of lines to scroll for CTRL-F and CTRL-B — nice to have"),
+    o("winfixheight", "wfh", NotImplemented, Absent, None,
+      "keep window height when opening/closing windows — nice to have"),
+    o("winfixwidth", "wfw", NotImplemented, Absent, None,
+      "keep window width when opening/closing windows — nice to have"),
+    o("winheight", "wh", NotImplemented, Absent, None,
+      "minimum number of lines for the current window — nice to have"),
+    o("winminheight", "wmh", NotImplemented, Absent, None,
+      "minimum number of lines for any window — nice to have"),
+    o("winminwidth", "wmw", NotImplemented, Absent, None,
+      "minimal number of columns for any window — nice to have"),
+    o("winptydll", "", Skipped(INTERP), Absent, None,
+      "name of the winpty dynamic library"),
+    o("winwidth", "wiw", NotImplemented, Absent, None,
+      "minimal number of columns for current window — nice to have"),
+    o("wrap", "", Implemented, Full, Some(OptSetup("vim.o.wrap=")),
+      "long lines wrap and continue on the next line"),
+    o("wrapmargin", "wm", NotImplemented, Absent, None,
+      "chars from the right where wrapping starts — worth implementing"),
+    o("wrapscan", "ws", Implemented, Full, Some(OptKeys(":set nowrapscan")),
+      "searches wrap around the end of the file"),
+    o("write", "", NotImplemented, Absent, None,
+      "writing to a file is allowed — nice to have"),
+    o("writeany", "wa", NotImplemented, Absent, None,
+      "write to file with no need for \"!\" override — nice to have"),
+    o("writebackup", "wb", NotImplemented, Absent, None,
+      "make a backup before overwriting a file — nice to have"),
+    o("writedelay", "wd", Skipped(ARCH), Absent, None,
+      "delay this many msec for each char (for debug)"),
+    o("xtermcodes", "", Skipped(TERMCAP), Absent, None,
+      "request terminal codes from an xterm"),
+];
+
+// ---------------------------------------------------------------------------
+// OPTION_COVERAGE_EXEMPT — this list may only ever SHRINK.
+//
+// The Implemented/Partial options the oracle corpus never pins. Seeded from a
+// measured run (`CONFORMANCE_DUMP_OPTION_COVERAGE=…`), not by hand, so the
+// number is the real one rather than an impression:
+//
+//     **25 of the 54 options vimcode implements have no oracle case**
+//     (29 are pinned, 54%).
+//
+// #1156 added three more implemented options (see the `undo*` entries at the
+// end of the list), so the live figure is now 28 of 57 unpinned — the ratchet
+// prints the current one on every passing run.
+//
+// Writing the cases that delete these entries is #1162's job; the entry is
+// deleted by the case, never by an editor's judgement, because gate 2 fails
+// the moment a listed option's probe starts matching.
+// ---------------------------------------------------------------------------
+const OPTION_COVERAGE_EXEMPT: &[&str] = &[
+    // Display/gutter options: nothing in the corpus renders a screen, so no
+    // case can pin one until #1162 adds render-comparing cases.
+    "colorcolumn",
+    "cursorline",
+    "laststatus",
+    "linebreak",
+    "list",
+    "listchars",
+    "number",
+    "relativenumber",
+    "ruler",
+    "showcmd",
+    // Search-highlight and incremental-search state: the corpus compares
+    // buffer text and cursor position, never highlight extents.
+    "hlsearch",
+    "incsearch",
+    // Scroll geometry beyond 'scrolloff' — the window-tracking cases pin
+    // 'scrolloff' only.
+    "scrolljump",
+    "sidescrolloff",
+    // Window/buffer and session-level behaviour, with no single-buffer
+    // keystroke that exposes it.
+    "autoread",
+    "splitbelow",
+    "splitright",
+    "swapfile",
+    "timeoutlen",
+    "updatetime",
+    // Command-line completion: no case types <Tab> on a `:` line.
+    "wildmenu",
+    "wildmode",
+    // Spelling: `src/core/spell.rs` is implemented but the corpus has no
+    // spell case at all — the same hole COVERAGE_EXEMPT records for z=/zg/zw.
+    "spell",
+    "spelllang",
+    // Undo persistence (#1156), seeded here the one way this list is allowed
+    // to grow: an option that was ❌ NotImplemented when this slice ran, and
+    // so had no probe and no entry, gained one. None of the three is
+    // reachable from a case's Lua `setup`, and not for want of writing one:
+    //
+    //   * 'undolevels' — `run_in_neovim` *overwrites* it (`= -1` around the
+    //     fixture write, then `= 1000`) after the case's `setup` has run, so
+    //     a setup that pins it is clobbered before the first keystroke. Only
+    //     an `OptKeys(":set ul=")` case could pin it, and that needs
+    //     vimcode's pruning order to match Vim's block-for-block first.
+    //   * 'undofile' / 'undodir' — the effect is a sidecar file written on
+    //     `:w` and re-read on the *next open of the same path*. The case
+    //     shape is one buffer, one keystroke sequence, compare text and
+    //     cursor; it never reopens a file, and `undofile::write` is a
+    //     `cfg!(test)` no-op on the vimcode side besides.
+    //
+    // Deleting these three is #1162's job, same as every entry above.
+    "undodir",
+    "undofile",
+    "undolevels",
+];
+
+/// Options whose **abbreviation** does not have the same surface as their full
+/// name. Every entry is a finding, not a convenience: gate 1 otherwise
+/// requires `:set sw=4` and `:set shiftwidth=4` to behave identically, which
+/// is what Vim guarantees and what every other row satisfies.
+const ABBREV_SURFACE_EXCEPTIONS: &[(&str, Surface, &str)] = &[
+    (
+        "spelllang",
+        Absent,
+        "'spl' is unknown in both directions, while the full name answers \
+         `:set spelllang?`",
+    ),
+    (
+        "swapfile",
+        Absent,
+        "'swf' is unknown, while `:set swapfile` / `:set noswapfile` work",
+    ),
+    (
+        "linespace",
+        Full,
+        "vimcode's own `:set lsp` (its LSP toggle) has taken Vim's abbreviation for \
+         'linespace' — the same collision the registry deliberately avoided for \
+         'nrformats'/'nf' vs nerdfonts",
+    ),
+];
+
+// ---------------------------------------------------------------------------
+// The audit's gates
+// ---------------------------------------------------------------------------
+
+/// Drive `Settings::parse_set_option` and report what surface `name` has.
+/// Deliberately behavioural: it asks the same public entry point `:set` asks,
+/// so nothing here can drift from what a user types.
+fn measured_surface(name: &str) -> Surface {
+    let try_set = |arg: String| Settings::default().parse_set_option(&arg);
+    const NOT_IMPL: &str = "recognised but not implemented";
+
+    let mut queryable = false;
+    let mut settable = false;
+    let mut stub = false;
+    let mut current: Option<String> = None;
+
+    match try_set(format!("{name}?")) {
+        Ok(v) => {
+            queryable = true;
+            if let Some((_, val)) = v.split_once('=') {
+                current = Some(val.to_string());
+            }
+        }
+        Err(e) if e.contains(NOT_IMPL) => stub = true,
+        Err(_) => {}
+    }
+
+    // Boolean and numeric forms both, plus a round-trip of the queried value
+    // so a value option is probed with something it actually accepts.
+    let mut probes = vec![name.to_string(), format!("no{name}"), format!("{name}=1")];
+    if let Some(c) = &current {
+        probes.push(format!("{name}={c}"));
+    }
+    for p in probes {
+        match try_set(p) {
+            Ok(_) => settable = true,
+            Err(e) if e.contains(NOT_IMPL) => stub = true,
+            Err(e) if e.starts_with("Unknown option") => {}
+            // Any other rejection ("Invalid value for …") means the *name* is
+            // in the registry — only the probe value was wrong.
+            Err(_) => settable = true,
+        }
+    }
+
+    match (stub, queryable, settable) {
+        (true, _, _) => Surface::Stub,
+        (_, true, true) => Surface::Full,
+        (_, false, true) => Surface::SetOnly,
+        (_, true, false) => Surface::QueryOnly,
+        (_, false, false) => Surface::Absent,
+    }
+}
+
+/// Every row whose recorded `surface` disagrees with what `:set` does now.
+/// Split out of the test so [`option_audit_gates_are_bidirectional`] can feed
+/// it a deliberately mis-tagged table and observe the gate go red — a gate
+/// nobody has seen fail is not a gate (#553).
+fn surface_drift(audit: &[OptionAudit], exceptions: &[(&str, Surface, &str)]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let measured = measured_surface(e.name);
+        if measured != e.surface {
+            drift.push(format!(
+                "  '{}': table says {:?}, `:set` actually gives {:?}",
+                e.name, e.surface, measured
+            ));
+        }
+        if e.short.is_empty() {
+            continue;
+        }
+        let expected_short = exceptions
+            .iter()
+            .find(|(n, _, _)| *n == e.name)
+            .map(|(_, s, _)| *s)
+            .unwrap_or(e.surface);
+        let measured_short = measured_surface(e.short);
+        if measured_short != expected_short {
+            drift.push(format!(
+                "  '{}' abbreviation '{}': expected {:?}, `:set` gives {:?}",
+                e.name, e.short, expected_short, measured_short
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1225) — the table's `surface` column is a claim about live code,
+/// and this re-measures every one of the 421 rows against it. Pure: no `nvim`,
+/// no subprocess, so it runs on every lane.
+#[test]
+fn option_audit_matches_the_live_settings_registry() {
+    let drift = surface_drift(OPTION_AUDIT, ABBREV_SURFACE_EXCEPTIONS);
+    assert!(
+        drift.is_empty(),
+        "\n\n== :set option audit drifted from src/core/settings.rs (#1225) ==\n\
+         The audit table records the surface `:set` exposed when the slice ran. \n\
+         Implementing (or breaking) an option changes that surface, so re-tag the\n\
+         row — that is how the audit stays true instead of rotting like a\n\
+         markdown checklist.\n\n{}\n\n\
+         An option that gained an implementation also needs its status changed\n\
+         from NotImplemented, a probe naming the case that covers it, and an\n\
+         OPTION_COVERAGE_EXEMPT entry if no case does yet.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1225) — the table describes itself correctly: complete, ordered,
+/// unique, no unreviewed row, every ⏭️ carrying a reason from the fixed
+/// vocabulary, and a probe on exactly the rows that can have one.
+#[test]
+fn option_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        OPTION_AUDIT.len(),
+        421,
+        "Vim 9.1's `:help option-list` has 421 entries; the audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut prev = "";
+    for e in OPTION_AUDIT {
+        if !seen.insert(e.name) {
+            problems.push(format!("  '{}': listed twice", e.name));
+        }
+        if e.name <= prev {
+            problems.push(format!(
+                "  '{}': out of order (follows '{prev}'); the table is in `:help` order",
+                e.name
+            ));
+        }
+        prev = e.name;
+
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  '{}': empty note — every row is reviewed",
+                e.name
+            ));
+        }
+
+        match e.status {
+            OptStatus::Skipped(reason) => {
+                if !SKIP_REASONS.contains(&reason) {
+                    problems.push(format!(
+                        "  '{}': skip reason {reason:?} is not in SKIP_REASONS",
+                        e.name
+                    ));
+                }
+                if !matches!(e.surface, Surface::Absent) {
+                    problems.push(format!(
+                        "  '{}': skipped, but `:set` recognises it ({:?}) — it is at least \
+                         Partial",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::Implemented => {
+                if !matches!(e.surface, Surface::Full) {
+                    problems.push(format!(
+                        "  '{}': Implemented, but its surface is {:?} — that is Partial",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::Partial => {
+                if matches!(e.surface, Surface::Absent | Surface::Stub) {
+                    problems.push(format!(
+                        "  '{}': Partial, but `:set` does not implement it ({:?})",
+                        e.name, e.surface
+                    ));
+                }
+            }
+            OptStatus::NotImplemented => {
+                if !matches!(e.surface, Surface::Absent | Surface::Stub) {
+                    problems.push(format!(
+                        "  '{}': NotImplemented, but `:set` implements it ({:?})",
+                        e.name, e.surface
+                    ));
+                }
+            }
+        }
+
+        let wants_probe = matches!(e.status, OptStatus::Implemented | OptStatus::Partial);
+        if wants_probe && e.probe.is_none() {
+            problems.push(format!(
+                "  '{}': in scope for the oracle gate but has no probe",
+                e.name
+            ));
+        }
+        if !wants_probe && e.probe.is_some() {
+            problems.push(format!(
+                "  '{}': not in scope for the oracle gate, so its probe can never fire",
+                e.name
+            ));
+        }
+    }
+
+    for (name, _, _) in ABBREV_SURFACE_EXCEPTIONS {
+        if !OPTION_AUDIT.iter().any(|e| e.name == *name) {
+            problems.push(format!(
+                "  ABBREV_SURFACE_EXCEPTIONS names '{name}', which is not an audited option"
+            ));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== :set option audit table is inconsistent (#1225) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// Every corpus case as `(label, keys, setup)`. [`all_corpus_cases`] drops the
+/// `setup`, which is precisely where an option case pins its option.
+fn all_corpus_cases_with_setup() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut out: Vec<(&str, &str, &str)> = CATEGORIES
+        .iter()
+        .flat_map(|(_, g)| g.iter())
+        .map(|c| (c.label, c.keys, c.setup))
+        .collect();
+    // The multi-file cases carry no `setup` (they pin files, not options), so
+    // they contribute an empty one rather than being dropped: a `Keys` probe
+    // must still be able to see their key sequences.
+    out.extend(CASES_MULTI_JUMP.iter().map(|c| (c.label, c.keys, "")));
+    out.extend(CASES_MULTI_JUMPS_LIST.iter().map(|c| (c.label, c.keys, "")));
+    out
+}
+
+impl OptProbe {
+    fn matches(&self, keys: &str, setup_no_ws: &str) -> bool {
+        match self {
+            OptProbe::OptSetup(n) => setup_no_ws.contains(n),
+            OptProbe::OptKeys(n) => keys.contains(n),
+        }
+    }
+}
+
+/// The option gate's verdict, in the two directions [`COVERAGE_EXEMPT`]
+/// established: coverage lost, and coverage gained but not yet claimed.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OptionCoverage {
+    /// In scope, not exempt, probe matches nothing — coverage went backwards.
+    uncovered: Vec<&'static str>,
+    /// Exempt, but a case now pins it — delete the entry.
+    newly_covered: Vec<&'static str>,
+    /// Exempt but not an in-scope audited option — stale.
+    stale: Vec<&'static str>,
+    /// In-scope rows considered (Implemented/Partial).
+    in_scope: usize,
+}
+
+/// `cases` is `(keys, setup-with-whitespace-stripped)` for the whole corpus.
+fn classify_option_coverage(
+    audit: &'static [OptionAudit],
+    exempt: &[&'static str],
+    cases: &[(&str, String)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(keys, setup)| probe.matches(keys, setup));
+        match (covered, exempt_set.contains(e.name)) {
+            (false, false) => v.uncovered.push(e.name),
+            (true, true) => v.newly_covered.push(e.name),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.name == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// The corpus as [`classify_option_coverage`] wants it: keys verbatim, and the
+/// `setup` with **all whitespace removed** so one needle matches both
+/// `vim.o.magic = false` and `vim.o.smarttab=false`.
+fn option_probe_corpus() -> Vec<(&'static str, String)> {
+    all_corpus_cases_with_setup()
+        .into_iter()
+        .map(|(_, keys, setup)| (keys, setup.chars().filter(|c| !c.is_whitespace()).collect()))
+        .collect()
+}
+
+/// Gate 2 (#1225) — the #1007 ratchet's shape, applied to the audited options:
+/// an in-scope option whose probe matches nothing must be exempt, and an
+/// exempt option whose probe now matches must lose its entry. Pure.
+#[test]
+fn option_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = option_probe_corpus();
+    let exempt: HashSet<&str> = OPTION_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        OPTION_COVERAGE_EXEMPT.len(),
+        "OPTION_COVERAGE_EXEMPT lists an option twice"
+    );
+
+    let v = classify_option_coverage(OPTION_AUDIT, OPTION_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_OPTION_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - OPTION_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== :set option oracle coverage (#1225) ==\n\
+         {covered}/{} implemented options are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        OPTION_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== :set option oracle coverage moved (#1225) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged option):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the OPTION_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited option):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// Both gates, observed **failing** — on synthetic input for the shapes a
+/// human would otherwise have to take on trust, and on the **real** table and
+/// corpus for the two that matter most. #553 shipped black-box tests that
+/// stayed green with the bug reinstated; an audit whose gate cannot go red is
+/// the same mistake in table form.
+#[test]
+fn option_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a row that under-claims. 'tabstop' is fully
+    // implemented, so tagging it Absent must be caught.
+    static MIS_ABSENT: &[OptionAudit] = &[o(
+        "tabstop",
+        "ts",
+        NotImplemented,
+        Absent,
+        None,
+        "deliberately mis-tagged fixture",
+    )];
+    let drift = surface_drift(MIS_ABSENT, &[]);
+    assert_eq!(
+        drift.len(),
+        2,
+        "mis-tagging an implemented option must be caught for both the name and \
+         the abbreviation: {drift:?}"
+    );
+
+    // ── Gate 1, direction B: a row that over-claims. 'mouse' is not in the
+    // registry at all, so tagging it Full must be caught. This is the
+    // direction that fires when a NotImplemented row gains an implementation.
+    static MIS_FULL: &[OptionAudit] = &[o(
+        "mouse",
+        "",
+        Implemented,
+        Full,
+        Some(OptKeys(":set mouse=")),
+        "deliberately mis-tagged fixture",
+    )];
+    assert_eq!(
+        surface_drift(MIS_FULL, &[]).len(),
+        1,
+        "claiming an absent option is implemented must be caught"
+    );
+
+    // ── Gate 1, direction C: the abbreviation half. Dropping the recorded
+    // exception for 'swapfile' (whose 'swf' abbreviation is missing) must
+    // fail, which is what stops the three asymmetry findings from being
+    // quietly "fixed" by deleting their exception rows.
+    let without_exceptions = surface_drift(OPTION_AUDIT, &[]);
+    assert_eq!(
+        without_exceptions.len(),
+        ABBREV_SURFACE_EXCEPTIONS.len(),
+        "each ABBREV_SURFACE_EXCEPTIONS row must be load-bearing: {without_exceptions:?}"
+    );
+
+    // ── Gate 2, direction A (synthetic): an in-scope option nothing pins,
+    // and nothing exempts.
+    static UNPINNED: &[OptionAudit] = &[o(
+        "tabstop",
+        "ts",
+        Implemented,
+        Full,
+        Some(OptSetup("vim.o.tabstop=")),
+        "fixture",
+    )];
+    let empty: Vec<(&str, String)> = Vec::new();
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &[], &empty).uncovered,
+        vec!["tabstop"]
+    );
+    // …and exempting it makes the same table clean.
+    assert!(classify_option_coverage(UNPINNED, &["tabstop"], &empty)
+        .uncovered
+        .is_empty());
+
+    // ── Gate 2, direction B (synthetic): an exempt option a case now pins.
+    let pinned = vec![("", "vim.o.tabstop=4".to_string())];
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &["tabstop"], &pinned).newly_covered,
+        vec!["tabstop"]
+    );
+
+    // ── Gate 2, direction C (synthetic): a stale exemption.
+    assert_eq!(
+        classify_option_coverage(UNPINNED, &["tabstop", "wrapmargin"], &pinned).stale,
+        vec!["wrapmargin"]
+    );
+
+    // ── Gate 2 against the REAL table and corpus, the check #1007 makes for
+    // COVERAGE_EXEMPT: deleting an exempt entry must fail, and adding a case
+    // that pins an exempt option must fail. Anything less and the list could
+    // grow silently.
+    let corpus = option_probe_corpus();
+    let victim = "listchars";
+    assert!(
+        OPTION_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is no longer exempt"
+    );
+    let without: Vec<&str> = OPTION_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    assert_eq!(
+        classify_option_coverage(OPTION_AUDIT, &without, &corpus).uncovered,
+        vec![victim],
+        "deleting {victim:?} from OPTION_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus = corpus.clone();
+    plus.push(("", "vim.o.listchars='eol:$'".to_string()));
+    assert_eq!(
+        classify_option_coverage(OPTION_AUDIT, OPTION_COVERAGE_EXEMPT, &plus).newly_covered,
+        vec![victim],
+        "a case pinning {victim:?} must force its exemption to be deleted"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — registers and marks (#1226)
+//
+// Slice 2 of 5. Walks two `:help` areas end to end and tags every command in
+// them Implemented / Partial / NotImplemented / Skipped, the same way #1225
+// walked `:help option-list`:
+//
+//   * `:help registers` — `runtime/doc/change.txt`, "Registers", the ten
+//     register *types* plus the commands that address them (`["x]`, `:reg`,
+//     `:display`, `:put`, `i_CTRL-R`, `c_CTRL-R`, `:let @x`);
+//   * `:help mark-motions` — `runtime/doc/motion.txt` §7, every `m…`, `'…`,
+//     `` `… ``, `:mark`/`:k`, `:marks`, `:delmarks`, the mark-relative
+//     `]'`/`` ]` ``/`['`/`` [` `` motions and the `:lockmarks` family.
+//
+// Both were read from the **pinned fleet oracle's own runtime docs** (Neovim
+// v0.12.5, [`DEVIATIONS_ORACLE`]) rather than from memory, so "what Vim does"
+// here is the same Vim every other gate in this file compares against.
+//
+// The measurement, as of this slice:
+//
+//     ✅ Implemented       44
+//     🟡 Partial           12
+//     ❌ Not implemented   30
+//     ⏭️  Intentionally skipped   3   (each with a reason from SKIP_REASONS)
+//                         ────
+//                          89   (34 registers, 55 marks)
+//
+// (#1299 moved `:reg[isters] {arg}` and `:di[splay] {arg}` from ❌ to ✅:
+// `execute_command`'s `"registers" | "display"` arm now parses a trailing
+// register-name argument and prints Neovim's real `Type Name Content` table
+// for both the bare and argument forms.)
+//
+// ## Why this slice is about *missing*, not *wrong*
+//
+// #1226 predicted it: the corpus already carries 44 `reg:` and 55
+// `mark:`/`jump:` cases and **none** of them is in [`KNOWN_DEVIATIONS`], so
+// the ground already entered is solid. What the walk finds is ground never
+// entered — 30 commands with no implementation at all, and 47 of the 86
+// in-scope rows that no oracle case names. That is exactly the blind spot
+// #1007 exists to measure, and the reason the deliverable is a table rather
+// than a report.
+//
+// Two findings are worse than "missing", and are the reason [`Report`] is a
+// recorded column rather than a bool:
+//
+//   * `` `[ ``/`` `] `` are set by yanks and by `>>`, but **not** by `c`, `d`
+//     or `p` — so `mark:`[ after p` in the corpus passes while the mark is
+//     unset, because Vim's answer and vimcode's cursor happen to coincide.
+//   * Command-line `<C-r>` is bound to a readline-style reverse-i-search over
+//     command history, so `:s/bar/<C-r>a/` never pastes register `a` — it
+//     runs a *different* substitute (and, before [`replay_live`] started
+//     clearing it, whatever the developer last typed at a `:` prompt).
+//
+// ## Gate 1 — the recorded behaviour must match the live engine
+//
+// Every non-Skipped row carries a [`Live`] recording: real keystrokes over a
+// real buffer, plus the buffer, cursor and `engine.message` vimcode produced
+// when the slice ran. [`regmark_audit_matches_the_live_engine`] replays all
+// of them and diffs. That is the bidirectional half — implementing `m[` or
+// `:marks {arg}` changes its recording and fails the gate until the row is
+// re-tagged, and a row claiming Implemented for something that starts
+// refusing fails immediately.
+//
+// The recording is a black-box observation (keys in, rendered buffer +
+// cursor + message out), never an engine field: a gate that asserted
+// `engine.marks` was populated would have passed throughout the `` `[ ``
+// finding above, since the field is written — just not by `p`.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every non-Skipped row also carries a [`Probe`] naming the oracle case that
+// exercises it; [`REGMARK_COVERAGE_EXEMPT`] lists the ones no case reaches
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
+// missing cases is #1162's job, not this slice's.
+//
+// ## Out of scope, deliberately
+//
+// `q{reg}` / `@{reg}` macro recording and playback read and write registers,
+// but they are documented under `:help complex-repeat`, a different `:help`
+// area, and the corpus covers them under its own `mac:` prefix. `:help
+// jump-motions` (`<C-o>`/`<C-i>`/`g;`/`g,`/`:jumps`) likewise belongs to
+// motion.txt §8, not §7, even though the corpus files its cases under
+// `jump:` alongside the mark ones.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Which `:help` area a row was walked from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RmArea {
+    /// `:help registers` — change.txt, "Registers".
+    Registers,
+    /// `:help mark-motions` — motion.txt §7, "Marks".
+    Marks,
+}
+
+/// Whether the recorded run ended with vimcode printing a refusal.
+///
+/// A recorded, re-measured column rather than a derived bool, because for a
+/// ❌ row "silent" is a strictly worse failure than "says so": a refusal
+/// sends the user to `:help`, a silent no-op looks like the command worked.
+/// Eight of this slice's 30 ❌ rows are silent — see
+/// [`regmark_audit_is_internally_consistent`], which pins that count.
+///
+/// Note a few ✅ rows are `Refuses` too, because their recording ends with a
+/// deliberate probe for absence (`:delmarks a` … `'a` → "Mark 'a' not set").
+/// The column describes the recording, not the verdict; the verdict is
+/// `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Report {
+    /// vimcode printed a refusal — an `E…` code, "Not an editor command",
+    /// "Mark … not set", "Marks must be …", "No previous …", "… is not
+    /// implemented", "E471: Argument required".
+    Refuses,
+    /// vimcode printed nothing, or printed an ordinary informational message
+    /// (`:marks`' listing, "3 lines yanked").
+    Silent,
+}
+
+/// The needles that make a `self.message` a refusal rather than a status
+/// line. Explicit and greppable: [`measured_report`] must not be allowed to
+/// quietly reclassify a row because a message was reworded.
+const REFUSAL_NEEDLES: &[&str] = &[
+    "Not an editor command",
+    "not set",
+    "Marks must be",
+    "No previous",
+    "is not implemented",
+    "Argument required",
+    "Invalid argument",
+    "no match for",
+    "Unknown option",
+    "E20",
+    "E29",
+    "E30",
+    "E471",
+    "E475",
+    "E486",
+];
+
+fn measured_report(message: &str) -> Report {
+    if REFUSAL_NEEDLES.iter().any(|n| message.contains(n)) {
+        Report::Refuses
+    } else {
+        Report::Silent
+    }
+}
+
+/// One black-box observation of what vimcode does **today**: keys in,
+/// rendered buffer + cursor + message out. Replayed by gate 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Live {
+    /// Starting buffer, one `&str` per line.
+    lines: &'static [&'static str],
+    /// Starting cursor, 1-indexed `(line, col)`.
+    at: (usize, usize),
+    /// Keys to send, in the corpus's `<C-r>`/`<Esc>`/`<CR>` notation.
+    keys: &'static str,
+    /// Resulting buffer, lines joined with `|`.
+    buffer: &'static str,
+    /// Resulting cursor, 1-indexed `(line, col)`.
+    cursor: (usize, usize),
+    /// `engine.message` afterwards, verbatim; `""` when vimcode said nothing.
+    message: &'static str,
+}
+
+const fn live(
+    lines: &'static [&'static str],
+    at: (usize, usize),
+    keys: &'static str,
+    buffer: &'static str,
+    cursor: (usize, usize),
+    message: &'static str,
+) -> Live {
+    Live {
+        lines,
+        at,
+        keys,
+        buffer,
+        cursor,
+        message,
+    }
+}
+
+struct RegMarkAudit {
+    area: RmArea,
+    /// The command/register as `:help` writes it — the table's unique key.
+    item: &'static str,
+    /// The `:help` tag it is documented under.
+    help: &'static str,
+    status: OptStatus,
+    /// Whether vimcode reports a refusal; re-measured by gate 1 from `live`.
+    report: Report,
+    /// `Some` for every non-Skipped row.
+    live: Option<Live>,
+    /// Oracle probe; `Some` for every non-Skipped row.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn rm(
+    area: RmArea,
+    item: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    report: Report,
+    live: Option<Live>,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> RegMarkAudit {
+    RegMarkAudit {
+        area,
+        item,
+        help,
+        status,
+        report,
+        live,
+        probe,
+        note,
+    }
+}
+
+use crate::Report::{Refuses, Silent};
+use crate::RmArea::{Marks, Registers};
+
+/// Every command in `:help registers` and `:help mark-motions`, in `:help`
+/// order, registers first.
+///
+/// 89 rows, no "TODO" and no unreviewed row: adding one, deleting one, or
+/// leaving one without a note fails [`regmark_audit_is_internally_consistent`].
+const REGMARK_AUDIT: &[RegMarkAudit] = &[
+    // ── 1. The unnamed register ───────────────────────────────────────────
+    rm(
+        Registers,
+        "\"\"",
+        "quotequote",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "yyj\"\"p",
+            "alpha|beta|alpha|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:yiw viwp swaps")),
+        "filled by every yank/delete; `p` with no register reads it",
+    ),
+    // ── 2. Numbered registers "0 to "9 ────────────────────────────────────
+    rm(
+        Registers,
+        "\"0",
+        "quote0",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "yyjdd\"0p",
+            "alpha|alpha|",
+            (2, 1),
+            "",
+        )),
+        Some(Label("reg:yy dd \"0p")),
+        "most recent yank; untouched by deletes and by yanks to a named register",
+    ),
+    rm(
+        Registers,
+        "\"1",
+        "quote1",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "ddj\"1p",
+            "b|c|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:dd \"1p")),
+        "most recent delete/change of at least one line",
+    ),
+    rm(
+        Registers,
+        "\"1 (special-motion exception)",
+        "quote_number",
+        Implemented,
+        Silent,
+        Some(live(&["(ab) cd"], (1, 1), "d%$\"1p", " cd(ab)", (1, 7), "")),
+        Some(Label("reg:d% goes to \"1")),
+        "`d%`/`d/`/`dn` use \"1 even when the deleted text is under one line \
+        (Engine::set_delete_register_special_motion)",
+    ),
+    rm(
+        Registers,
+        "\"2 to \"9",
+        "quote_number",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "dddd\"2p",
+            "c|a|",
+            (2, 1),
+            "",
+        )),
+        Some(Label("reg:dd dd \"2p")),
+        "the shift chain: each new line-delete pushes \"1 into \"2, \"8 into \"9",
+    ),
+    // ── 3. The small delete register ──────────────────────────────────────
+    rm(
+        Registers,
+        "\"-",
+        "quote-",
+        Implemented,
+        Silent,
+        Some(live(&["foo bar"], (1, 1), "dw$\"-p", "barfoo ", (1, 7), "")),
+        Some(Label("reg:dw goes to \"-")),
+        "sub-line deletes, and only for an unnamed delete",
+    ),
+    // ── 4. Named registers ────────────────────────────────────────────────
+    rm(
+        Registers,
+        "\"a to \"z",
+        "quotea",
+        Implemented,
+        Silent,
+        Some(live(
+            &["alpha", "beta"],
+            (1, 1),
+            "\"ayyj\"ap",
+            "alpha|beta|alpha|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"ayy \"ap")),
+        "explicit named register, replacing its contents",
+    ),
+    rm(
+        Registers,
+        "\"A to \"Z",
+        "quote_alpha",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "\"ayyj\"Ayy\"ap",
+            "a|b|a|b|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"Ayy linewise append")),
+        "uppercase appends; a linewise append widens a charwise register to linewise",
+    ),
+    // ── 5. Read-only registers ":, "., "% ────────────────────────────────
+    rm(
+        Registers,
+        "\":",
+        "quote:",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a a"],
+            (1, 1),
+            ":s/a/b/<CR>\":p",
+            "bs/a/b/ a",
+            (1, 7),
+            "",
+        )),
+        Some(Label("reg:\": last cmd")),
+        "most recent command-line, stored without its leading `:`",
+    ),
+    rm(
+        Registers,
+        "\".",
+        "quote.",
+        Implemented,
+        Silent,
+        Some(live(
+            &["ab"],
+            (1, 1),
+            "ifoo<Esc>\".p",
+            "foofooab",
+            (1, 6),
+            "",
+        )),
+        Some(Label("reg:\". insert register")),
+        "last inserted text",
+    ),
+    rm(
+        Registers,
+        "\"%",
+        "quote%",
+        Partial,
+        Silent,
+        Some(live(&["a"], (1, 1), "\"%p", "a", (1, 1), "")),
+        Some(Label("reg:\"% file name empty")),
+        "returns the file's BASENAME; Vim returns the name of the file as typed \
+        (`src/main.rs`, not `main.rs`) — see \
+        register_percent_and_hash_paste_basenames_not_paths",
+    ),
+    // ── 6. Alternate buffer register "# ──────────────────────────────────
+    rm(
+        Registers,
+        "\"#",
+        "quote#",
+        Partial,
+        Silent,
+        Some(live(&["a"], (1, 1), "\"#p", "a", (1, 1), "")),
+        Some(Label("reg:\"# alternate file")),
+        "#1161 added the read path, but it yields the basename rather than the \
+        name as typed, and \"# is read-only here (Vim allows `:let @# = bufnr`, \
+        which is VimScript and out of scope anyway)",
+    ),
+    // ── 7. The expression register ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"=",
+        "quote=",
+        Partial,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"='hi'<CR>p",
+            "a",
+            (1, 1),
+            "\"=\" register (expression evaluation) is not implemented",
+        )),
+        Some(Label("reg:\"= expr")),
+        "integer arithmetic only (`\"=1+1`); strings, functions and variables \
+        report \"not implemented\" — a full one needs VimScript eval",
+    ),
+    // ── 8. The selection registers ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"*",
+        "quotestar",
+        Implemented,
+        Silent,
+        Some(live(&["abc"], (1, 1), "\"*yl$\"*p", "abca", (1, 4), "")),
+        Some(Label("reg:\"* clipboard round trip")),
+        "writes through Engine::clipboard_write when a backend supplied one, \
+        falling back to the internal register otherwise",
+    ),
+    rm(
+        Registers,
+        "\"+",
+        "quoteplus",
+        Implemented,
+        Silent,
+        Some(live(&["abc"], (1, 1), "\"+yl$\"+p", "abca", (1, 4), "")),
+        Some(Label("reg:\"+ clipboard round trip")),
+        "same path as \"*",
+    ),
+    // ── 9. The black hole register ────────────────────────────────────────
+    rm(
+        Registers,
+        "\"_",
+        "quote_",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "yyj\"_ddp",
+            "a|c|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"_dd then p")),
+        "writes vanish and do not fall through to \"\" / \"1 / \"-",
+    ),
+    // ── 10. Last search pattern register ──────────────────────────────────
+    rm(
+        Registers,
+        "\"/",
+        "quote/",
+        Implemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "/bar<CR>\"/P",
+            "foo barbar",
+            (1, 7),
+            "",
+        )),
+        Some(Label("reg:\"/ last search")),
+        "read path only; Vim's `:let @/ = \"the\"` write is VimScript",
+    ),
+    rm(
+        Registers,
+        "\"~",
+        "quote_~",
+        Skipped(VIMGUI),
+        Silent,
+        None,
+        None,
+        "Vim's drag-and-drop register (not in Neovim's help at all); there is no \
+        text-drop path in either vimcode backend",
+    ),
+    // ── Commands that address a register ──────────────────────────────────
+    rm(
+        Registers,
+        "[\"x]{operator}",
+        "{register}",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            "\"add\"bdd\"ap\"bp",
+            "c|a|b|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("reg:\"add \"bdd \"ap \"bp")),
+        "the `\"x` prefix in front of y/d/c/s/x/p/P",
+    ),
+    rm(
+        Registers,
+        ":reg[isters]",
+        ":registers",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "yy:registers<CR>",
+            "a",
+            (1, 1),
+            "Type Name Content\n  l  \"\"   a^J\n  l  \"0   a^J",
+        )),
+        Some(Keys(":registers")),
+        "lists every non-empty register, in Neovim's canonical order, using its \
+        real `Type Name Content` header/columns (#1299)",
+    ),
+    rm(
+        Registers,
+        ":reg[isters] {arg}",
+        ":registers",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"ayy:reg a<CR>",
+            "a",
+            (1, 1),
+            "Type Name Content\n  l  \"a   a^J",
+        )),
+        Some(Keys(":reg a")),
+        "filters the listing to the requested register names, one per character \
+        of the argument (`:reg ab` == `:reg a b`); still shown in canonical, not \
+        argument, order — confirmed against a live oracle (#1299)",
+    ),
+    rm(
+        Registers,
+        ":di[splay]",
+        ":display",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "yy:display<CR>",
+            "a",
+            (1, 1),
+            "Type Name Content\n  l  \"\"   a^J\n  l  \"0   a^J",
+        )),
+        Some(Keys(":display")),
+        "synonym for :registers, same listing (#1299)",
+    ),
+    rm(
+        Registers,
+        ":di[splay] {arg}",
+        ":display",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "\"ayy:di a<CR>",
+            "a",
+            (1, 1),
+            "Type Name Content\n  l  \"a   a^J",
+        )),
+        Some(Keys(":di a")),
+        "same fix as `:reg {arg}` (#1299)",
+    ),
+    rm(
+        Registers,
+        ":[range]pu[t] [x]",
+        ":put",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "\"ayyj:put a<CR>",
+            "a|b|a|",
+            (3, 1),
+            "",
+        )),
+        Some(Label("ex:put a")),
+        "linewise put below the addressed line, with an optional register name",
+    ),
+    rm(
+        Registers,
+        ":[range]pu[t]!",
+        ":put!",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (2, 1),
+            "yy:put!<CR>",
+            "a|b|b",
+            (2, 1),
+            "",
+        )),
+        Some(Keys(":put!")),
+        "the `!` variant puts above the addressed line",
+    ),
+    rm(
+        Registers,
+        ":put ={expr}",
+        ":put_=",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a"],
+            (1, 1),
+            ":put =1+1<CR>",
+            "a",
+            (1, 1),
+            "Not an editor command: put =1+1",
+        )),
+        Some(Keys(":put =")),
+        "Vim evaluates the expression and puts the result; vimcode rejects the \
+        whole command — worth implementing, `Engine::eval_expr_register` already \
+        evaluates exactly what `\"=` accepts",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R {register}",
+        "i_CTRL-R",
+        Implemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "\"aywA<C-r>a<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Label("reg:i C-r a")),
+        "inserts the register at the cursor, \"as if typed\"",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R =",
+        "i_CTRL-R_=",
+        Partial,
+        Silent,
+        Some(live(
+            &["a"],
+            (1, 1),
+            "A<C-r>=2*3<CR><Esc>",
+            "a6",
+            (1, 2),
+            "",
+        )),
+        Some(Label("reg:C-r = in insert")),
+        "opens the expression prompt, but shares `\"=`'s arithmetic-only evaluator",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-R {register}",
+        "i_CTRL-R_CTRL-R",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-r>\"<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Keys("<C-r><C-r>")),
+        "Vim inserts the register LITERALLY (no 'textwidth'/abbreviation/indent \
+        processing); vimcode re-arms the pending <C-r> and inserts normally, so \
+        the distinction is silently lost — low value while vimcode's plain \
+        i_CTRL-R already inserts unprocessed",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-O {register}",
+        "i_CTRL-R_CTRL-O",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-o>\"<Esc>",
+            "foo bar\"",
+            (1, 8),
+            "",
+        )),
+        Some(Keys("<C-r><C-o>")),
+        "Vim inserts literally and without auto-indent; vimcode reads a register \
+        literally NAMED `o` (empty), silently swallows the keystroke and then \
+        types the register name as text — silently wrong, not just missing",
+    ),
+    rm(
+        Registers,
+        "i_CTRL-R CTRL-P {register}",
+        "i_CTRL-R_CTRL-P",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["foo bar"],
+            (1, 1),
+            "ywA<C-r><C-p>\"<Esc>",
+            "foo barfoo ",
+            (1, 11),
+            "",
+        )),
+        Some(Keys("<C-r><C-p>")),
+        "Vim inserts literally and fixes the indent; vimcode's <C-p> is consumed \
+        by the completion handler, leaving the pending <C-r> armed — silently wrong",
+    ),
+    rm(
+        Registers,
+        "c_CTRL-R {register}",
+        "c_CTRL-R",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["foo", "bar"],
+            (1, 1),
+            "\"ayw:s/bar/<C-r>a/<CR>",
+            "foo|bar",
+            (1, 1),
+            "E486: Pattern not found: bar",
+        )),
+        Some(Keys(":s/bar/<C-r>a/")),
+        "the single biggest gap in this slice: vimcode binds command-line <C-r> to \
+        a readline-style reverse-i-search over command history, so `:s/x/<C-r>a/` \
+        never pastes register a. Worth implementing, and it needs the existing \
+        binding moved or dropped",
+    ),
+    rm(
+        Registers,
+        "c_CTRL-R CTRL-W",
+        "c_CTRL-R_CTRL-W",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["foo", "bar"],
+            (1, 1),
+            ":s/bar/<C-r><C-w>/<CR>",
+            "foo|bar",
+            (1, 1),
+            "E486: Pattern not found: bar",
+        )),
+        Some(Keys("<C-r><C-w>")),
+        "insert the word under the cursor on the command line — blocked behind the \
+        same c_CTRL-R binding conflict; very commonly used with `:s`",
+    ),
+    rm(
+        Registers,
+        ":let @{register} = {expr}",
+        ":let-@",
+        Skipped(VIMSCRIPT),
+        Silent,
+        None,
+        None,
+        "the register write path is a `:let` assignment — VimScript, per the \
+        standing decision that vimcode implements Vim keybindings and editing",
+    ),
+    // ── mark-motions: setting marks ───────────────────────────────────────
+    rm(
+        Marks,
+        "m{a-zA-Z}",
+        "m",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "a-z per buffer (Engine::marks), A-Z global with a file path",
+    ),
+    rm(
+        Marks,
+        "m' and m`",
+        "m'",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c", "d", "e"],
+            (3, 1),
+            "m'jj''",
+            "a|b|c|d|e",
+            (5, 1),
+            "No previous jump position",
+        )),
+        Some(Label("mark:m'")),
+        "set the previous-context mark without moving. vimcode answers \"Marks \
+        must be a letter (a-z or A-Z)\" — worth implementing, it is one `'`/`` ` `` \
+        arm writing `last_jump_pos`",
+    ),
+    rm(
+        Marks,
+        "m[ and m]",
+        "m[",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "m[gg'[",
+            "abc|def",
+            (1, 2),
+            "No previous change",
+        )),
+        Some(Label("mark:m[")),
+        "set `'[`/`']` by hand, for simulating an operator with several commands \
+        — niche, but it is the same two fields the `'[` gap below already needs",
+    ),
+    rm(
+        Marks,
+        "m< and m>",
+        "m<",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "m<gg'<",
+            "abc|def",
+            (1, 2),
+            "No previous visual selection",
+        )),
+        Some(Label("mark:m<")),
+        "set `'<`/`'>` to change what `gv` reselects — worth implementing; \
+        visual_mark_start/end already exist and `gv` already reads them",
+    ),
+    rm(
+        Marks,
+        ":[range]ma[rk] {a-zA-Z'}",
+        ":mark",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":2mark t<CR>gg't",
+            "a|b|c",
+            (2, 1),
+            "",
+        )),
+        Some(Label("ex:2mark a")),
+        "range-addressed mark, column 0, default cursor line",
+    ),
+    rm(
+        Marks,
+        ":[range]k{a-zA-Z'}",
+        ":k",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":2kt<CR>gg't",
+            "a|b|c",
+            (2, 1),
+            "",
+        )),
+        Some(Keys(":2kt")),
+        "the no-space spelling of :mark",
+    ),
+    // ── mark-motions: jumping to a mark ───────────────────────────────────
+    rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "linewise, lands on the first non-blank, records a jumplist entry",
+    ),
+    rm(
+        Marks,
+        "`{a-z}",
+        "`a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def", "ghi"],
+            (1, 3),
+            "majj`a",
+            "abc|def|ghi",
+            (1, 3),
+            "",
+        )),
+        Some(Label("mark:`a exact")),
+        "exclusive, lands on the exact column",
+    ),
+    rm(
+        Marks,
+        "'{A-Z}",
+        "'A",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (3, 1),
+            "mAgg'A",
+            "a|b|c",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:mA global")),
+        "global file mark, linewise",
+    ),
+    rm(
+        Marks,
+        "`{A-Z}",
+        "`A",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (2, 3),
+            "mAgg`A",
+            "abc|def",
+            (2, 3),
+            "",
+        )),
+        Some(Label("mark:`A")),
+        "global file mark, exact column",
+    ),
+    rm(
+        Marks,
+        "'{0-9} and `{0-9}",
+        "'0",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "'0",
+            "a|b",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'0")),
+        "the shada/viminfo marks — where the cursor was when Vim last exited. \
+        vimcode has no shada file, so there is nothing to restore; not worth \
+        implementing before a persistent-mark store exists",
+    ),
+    rm(
+        Marks,
+        "lowercase marks restored by undo/redo",
+        "mark-motions",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "maggddu3G'a",
+            "a|b|c",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:undo restores mark")),
+        "`:help mark-motions`: \"Lowercase marks are restored when using undo and \
+        redo.\" vimcode leaves the mark where the delete shifted it. The offset \
+        snapshot/restore machinery exists (Engine::snapshot_marks_as_offsets) but \
+        is wired only to join_lines — worth implementing",
+    ),
+    rm(
+        Marks,
+        "mark erased when its line is deleted",
+        "mark-motions",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "maddgg'a",
+            "a|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Label("mark:mark on deleted line")),
+        "\"If you delete a line that contains a mark, that mark is erased.\"",
+    ),
+    rm(
+        Marks,
+        "g'{mark}",
+        "g'",
+        Partial,
+        Silent,
+        Some(live(
+            &["a", "    bcd", "e"],
+            (2, 5),
+            "maggg'a",
+            "a|    bcd|e",
+            (2, 5),
+            "",
+        )),
+        Some(Label("mark:g'")),
+        "keeps the jumplist untouched, and (#1281) lands on the first non-blank \
+        like `'{mark}` does — but accepts only a-zA-Z, where Vim's `` g`\" `` / \
+        `g'.` take any mark",
+    ),
+    rm(
+        Marks,
+        "g`{mark}",
+        "g`",
+        Partial,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (2, 2),
+            "maggg`a",
+            "abc|def",
+            (2, 2),
+            "",
+        )),
+        Some(Label("mark:g`")),
+        "correct for a-zA-Z; silently does nothing for the special marks \
+        (`` g`\" `` is the canonical last-position-jump idiom)",
+    ),
+    rm(
+        Marks,
+        ":marks",
+        ":marks",
+        Partial,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks<CR>",
+            "a|b",
+            (1, 1),
+            "mark line  col file/text\n a      1    0 a\n \"      1    0 a\n \
+             .      1    0 a",
+        )),
+        Some(Keys(":marks")),
+        "since #1300 lists the letter marks plus the three automatic marks \
+        (`'` when a jump has set the previous context, `\"`, `.`) and the \
+        `file/text` preview column, matching Neovim's header and column \
+        layout; still omits `` [ `` `` ] `` `<` `>` `^`",
+    ),
+    rm(
+        Marks,
+        ":marks {arg}",
+        ":marks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks a<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: marks a",
+        )),
+        Some(Keys(":marks a")),
+        "Vim filters the listing to the named marks (`:marks aB`); vimcode rejects \
+        any argument — same shape and same one-line fix as `:reg {arg}`",
+    ),
+    rm(
+        Marks,
+        ":delm[arks] {marks}",
+        ":delmarks",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "ma:delmarks a<CR>gg'a",
+            "a|b|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Label("ex:delmarks a")),
+        "#1154; handles space-separated names and `a-c` ranges, with E475 on an \
+        inverted or mixed-category range",
+    ),
+    rm(
+        Marks,
+        ":delm[arks]!",
+        ":delmarks",
+        Implemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "ma:delmarks!<CR>gg'a",
+            "a|b|c",
+            (1, 1),
+            "Mark 'a' not set",
+        )),
+        Some(Keys(":delmarks!")),
+        "#1154; clears the buffer's lowercase marks, leaving A-Z and 0-9",
+    ),
+    // ── mark-motions: the special marks ───────────────────────────────────
+    rm(
+        Marks,
+        "'[",
+        "'[",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (2, 1),
+            "yygg'[",
+            "abc|def",
+            (1, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:'[ after >>")),
+        "set by `>>`/`<<` and by charwise yanks, but NOT by `c`, `d`, `p` or a \
+        linewise `yy` — after any of those vimcode answers \"No previous change\"",
+    ),
+    rm(
+        Marks,
+        "`[",
+        "`[",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc def"],
+            (1, 1),
+            "ciwXY<Esc>$`[",
+            "XY def",
+            (1, 6),
+            "No previous change",
+        )),
+        Some(Label("mark:`[ after p")),
+        "same gap. Note `mark:`[ after p` in the corpus passes only by \
+        coincidence — the mark is unset and the cursor happens to already be \
+        where Vim would put it",
+    ),
+    rm(
+        Marks,
+        "']",
+        "']",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc", "def"],
+            (1, 1),
+            "yjG']",
+            "abc|def",
+            (2, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:']")),
+        "same gap as `'[`",
+    ),
+    rm(
+        Marks,
+        "`]",
+        "`]",
+        Partial,
+        Refuses,
+        Some(live(
+            &["abc def"],
+            (1, 1),
+            "ciwXY<Esc>0`]",
+            "XY def",
+            (1, 1),
+            "No previous change",
+        )),
+        Some(Label("mark:`] after yank")),
+        "correct after a yank; unset after `c`/`d`/`p`",
+    ),
+    rm(
+        Marks,
+        "'<",
+        "'<",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "Vj<Esc>gg'<",
+            "a|b|c|d",
+            (2, 1),
+            "",
+        )),
+        Some(Label("mark:'<")),
+        "start of the last visual area, linewise",
+    ),
+    rm(
+        Marks,
+        "`<",
+        "`<",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def"],
+            (1, 2),
+            "vjl<Esc>gg`<",
+            "abc|def",
+            (1, 2),
+            "",
+        )),
+        Some(Label("mark:`< after v")),
+        "start of the last visual area, exact",
+    ),
+    rm(
+        Marks,
+        "'>",
+        "'>",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "Vj<Esc>gg'>",
+            "a|b|c|d",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:'> after V")),
+        "end of the last visual area, linewise",
+    ),
+    rm(
+        Marks,
+        "`>",
+        "`>",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc"],
+            (1, 1),
+            "vl<Esc>0gv<Esc>`>",
+            "abc",
+            (1, 2),
+            "",
+        )),
+        Some(Label("mark:`> after gv")),
+        "end of the last visual area, exact; survives a `gv` round trip",
+    ),
+    rm(
+        Marks,
+        "''",
+        "''",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c", "d"],
+            (2, 1),
+            "G''",
+            "a|b|c|d",
+            (2, 1),
+            "",
+        )),
+        Some(Label("mark:'' after G")),
+        "position before the latest jump, and itself a jump, so it toggles",
+    ),
+    rm(
+        Marks,
+        "``",
+        "``",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc", "def", "ghi"],
+            (2, 2),
+            "gg``",
+            "abc|def|ghi",
+            (2, 2),
+            "",
+        )),
+        Some(Label("mark:`` after gg")),
+        "exact-column sibling of `''`, toggles the same way",
+    ),
+    rm(
+        Marks,
+        "'\"",
+        "'quote",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "'\"",
+            "a|b|c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'\"")),
+        "cursor position when the buffer was last exited, defaulting to line 1. \
+        Worth implementing: it is the mark behind the near-universal \
+        last-position-jump idiom, and it is per-buffer state vimcode already keeps",
+    ),
+    rm(
+        Marks,
+        "`\"",
+        "`quote",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (2, 1),
+            "`\"",
+            "a|b|c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`\"")),
+        "exact-column sibling of `'\"`, and the one `` g`\" `` needs",
+    ),
+    rm(
+        Marks,
+        "'^",
+        "'^",
+        Partial,
+        Silent,
+        Some(live(
+            &["x", "    yz"],
+            (1, 1),
+            "jA!<Esc>gg'^",
+            "x|    yz!",
+            (2, 7),
+            "",
+        )),
+        Some(Label("mark:'^")),
+        "jumps to the right LINE but keeps the exact column; Vim's `'^` is \
+        linewise and lands on the first non-blank (verified against the pinned \
+        oracle: col 5 vs vimcode's col 7 on `    yz!`)",
+    ),
+    rm(
+        Marks,
+        "`^",
+        "`^",
+        Implemented,
+        Silent,
+        Some(live(
+            &["ab", "cd"],
+            (1, 1),
+            "jAx<Esc>gg`^",
+            "ab|cdx",
+            (2, 3),
+            "",
+        )),
+        Some(Label("mark:`^")),
+        "where Insert mode was last left, raw column — what `gi` uses",
+    ),
+    rm(
+        Marks,
+        "'.",
+        "'.",
+        Implemented,
+        Silent,
+        Some(live(&["a", "b", "c"], (2, 1), "xgg'.", "a||c", (2, 1), "")),
+        Some(Label("mark:'.")),
+        "line of the last change, first non-blank",
+    ),
+    rm(
+        Marks,
+        "`.",
+        "`.",
+        Implemented,
+        Silent,
+        Some(live(&["abc", "def"], (2, 2), "xgg`.", "abc|df", (2, 2), "")),
+        Some(Label("mark:`.")),
+        "exact position of the last change",
+    ),
+    rm(
+        Marks,
+        "':",
+        "':",
+        Skipped(PROMPTBUF),
+        Silent,
+        None,
+        None,
+        "Neovim-only: the start of the current user input in a prompt buffer",
+    ),
+    rm(
+        Marks,
+        "'(",
+        "'(",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "'(",
+            "One two. Three four.",
+            (1, 12),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'(")),
+        "start of the current sentence, like `(`. Worth implementing — the whole \
+        family below is a thin alias layer over motions vimcode already has",
+    ),
+    rm(
+        Marks,
+        "`(",
+        "`(",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "`(",
+            "One two. Three four.",
+            (1, 12),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`(")),
+        "exact-column form of `'(`",
+    ),
+    rm(
+        Marks,
+        "')",
+        "')",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 3),
+            "')",
+            "One two. Three four.",
+            (1, 3),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:')")),
+        "end of the current sentence, like `)`",
+    ),
+    rm(
+        Marks,
+        "`)",
+        "`)",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["One two. Three four."],
+            (1, 3),
+            "`)",
+            "One two. Three four.",
+            (1, 3),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`)")),
+        "exact-column form of `')`",
+    ),
+    rm(
+        Marks,
+        "'{",
+        "'{",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (2, 1),
+            "'{",
+            "a|b||c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'{")),
+        "start of the current paragraph, like `{`",
+    ),
+    rm(
+        Marks,
+        "`{",
+        "`{",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (2, 1),
+            "`{",
+            "a|b||c",
+            (2, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`{")),
+        "exact-column form of `'{`",
+    ),
+    rm(
+        Marks,
+        "'}",
+        "'}",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (1, 1),
+            "'}",
+            "a|b||c",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:'}")),
+        "end of the current paragraph, like `}`",
+    ),
+    rm(
+        Marks,
+        "`}",
+        "`}",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "", "c"],
+            (1, 1),
+            "`}",
+            "a|b||c",
+            (1, 1),
+            "Marks must be a letter or special char",
+        )),
+        Some(Label("mark:`}")),
+        "exact-column form of `'}`",
+    ),
+    // ── mark-motions: commands that jump BETWEEN marks ────────────────────
+    rm(
+        Marks,
+        "]'",
+        "]'",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "  c", "d"],
+            (1, 1),
+            "3Gmagg]'",
+            "a|b|  c|d",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:]'")),
+        "[count] times to the next line with a lowercase mark, first non-blank. \
+        Silent no-op today — worth implementing as a set with the three below",
+    ),
+    rm(
+        Marks,
+        "]`",
+        "]`",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b", "cde", "d"],
+            (1, 1),
+            "3Gllmagg]`",
+            "a|b|cde|d",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:]`")),
+        "[count] times to the next lowercase mark, exact column — silent no-op",
+    ),
+    rm(
+        Marks,
+        "['",
+        "['",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "  b", "c", "d"],
+            (1, 1),
+            "2GmaG['",
+            "a|  b|c|d",
+            (4, 1),
+            "",
+        )),
+        Some(Label("mark:['")),
+        "backwards form of `]'` — silent no-op",
+    ),
+    rm(
+        Marks,
+        "[`",
+        "[`",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "bcd", "e"],
+            (1, 1),
+            "2GllmaG[`",
+            "a|bcd|e",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:[`")),
+        "backwards form of `` ]` `` — silent no-op",
+    ),
+    // ── mark-motions: command modifiers and the mark view ─────────────────
+    rm(
+        Marks,
+        ":loc[kmarks] {command}",
+        ":lockmarks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":lockmarks normal x<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: lockmarks normal x",
+        )),
+        Some(Keys(":lockmarks")),
+        "run a command without adjusting marks. Low value without a VimScript \
+        runtime — its users are plugins doing line-count-preserving rewrites",
+    ),
+    rm(
+        Marks,
+        ":kee[pmarks] {command}",
+        ":keepmarks",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":keepmarks normal x<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: keepmarks normal x",
+        )),
+        Some(Keys(":keepmarks")),
+        "only affects `:range!` filtering, which vimcode does not have either — \
+        low value",
+    ),
+    rm(
+        Marks,
+        ":keepj[umps] {command}",
+        ":keepjumps",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b", "c"],
+            (1, 1),
+            ":keepjumps normal G<CR>''",
+            "a|b|c",
+            (1, 1),
+            "No previous jump position",
+        )),
+        Some(Keys(":keepjumps")),
+        "run a command without touching `''`/the jumplist/the changelist — same \
+        plugin-facing audience as :lockmarks, low value here",
+    ),
+    rm(
+        Marks,
+        "mark-view ('jumpoptions' \"view\")",
+        "mark-view",
+        NotImplemented,
+        Refuses,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            ":set jumpoptions=view<CR>",
+            "a|b",
+            (1, 1),
+            "Unknown option: jumpoptions",
+        )),
+        Some(Keys("jumpoptions")),
+        "restore the window's topline as well as the cursor when jumping to a \
+        mark. Gated on the 'jumpoptions' option, tagged ❌ by the #1225 option \
+        slice — low value",
+    ),
+    // ── mark-motions: marks as operator targets ───────────────────────────
+    rm(
+        Marks,
+        "{operator}'{mark}",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(&["abc", "def"], (2, 2), "magg0d'a", "", (1, 1), "")),
+        Some(Label("mark:d'a linewise")),
+        "\"Lowercase marks can be used in combination with operators\" — linewise",
+    ),
+    rm(
+        Marks,
+        "{operator}`{mark}",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(
+            &["abc def"],
+            (1, 5),
+            "ma0c`aX<Esc>",
+            "Xdef",
+            (1, 1),
+            "",
+        )),
+        Some(Label("mark:c`a")),
+        "the backtick form is exclusive-charwise",
+    ),
+    rm(
+        Marks,
+        "y'{mark} cursor placement",
+        "mark-motions",
+        Implemented,
+        Silent,
+        Some(live(
+            &["a", "b", "c"],
+            (3, 1),
+            "maggy'a",
+            "a|b|c",
+            (1, 1),
+            "3 lines yanked",
+        )),
+        Some(Label("mark:y'a cursor")),
+        "after a linewise yank to a mark the cursor lands at the start of the range",
+    ),
+];
+
+/// Oracle cases this slice's rows are not (yet) pinned by — the measurement
+/// #1162 starts from. Shrink-only, exactly like [`COVERAGE_EXEMPT`]: adding a
+/// case for one of these fails [`regmark_audit_oracle_coverage_is_shrink_only`]
+/// until its entry is deleted.
+const REGMARK_COVERAGE_EXEMPT: &[&str] = &[
+    "\"#",
+    "\"*",
+    "\"+",
+    ":di[splay]",
+    ":di[splay] {arg}",
+    ":[range]pu[t]!",
+    ":put ={expr}",
+    "i_CTRL-R CTRL-R {register}",
+    "i_CTRL-R CTRL-O {register}",
+    "i_CTRL-R CTRL-P {register}",
+    "c_CTRL-R {register}",
+    "c_CTRL-R CTRL-W",
+    "m' and m`",
+    "m[ and m]",
+    "m< and m>",
+    ":[range]k{a-zA-Z'}",
+    "'{0-9} and `{0-9}",
+    "lowercase marks restored by undo/redo",
+    ":marks {arg}",
+    ":delm[arks]!",
+    "']",
+    "'\"",
+    "`\"",
+    "'^",
+    "'(",
+    "`(",
+    "')",
+    "`)",
+    "'{",
+    "`{",
+    "'}",
+    "`}",
+    "]'",
+    "]`",
+    "['",
+    "[`",
+    ":loc[kmarks] {command}",
+    ":kee[pmarks] {command}",
+    ":keepj[umps] {command}",
+    "mark-view ('jumpoptions' \"view\")",
+];
+
+/// Replay one [`Live`] recording against a real engine. Black-box: keys in,
+/// rendered buffer + cursor + message out.
+fn replay_live(p: &Live) -> (String, (usize, usize), String) {
+    let mut engine = engine_with(&p.lines.join("\n"));
+    // `engine_with` suppresses `HistoryState::load()`'s real-disk read
+    // (#1304), so `engine.history` already starts empty here — no manual
+    // reset needed for the `c_CTRL-R` rows this replay covers.
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.set_viewport_lines(24);
+    engine.view_mut().cursor.line = p.at.0.saturating_sub(1);
+    engine.view_mut().cursor.col = p.at.1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, p.keys);
+    (
+        engine.buffer().to_string().replace('\n', "|"),
+        (engine.view().cursor.line + 1, engine.view().cursor.col + 1),
+        engine.message.clone(),
+    )
+}
+
+/// Every row whose recorded behaviour no longer matches the live engine.
+fn regmark_drift(audit: &'static [RegMarkAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let Some(p) = e.live.as_ref() else { continue };
+        let (buffer, cursor, message) = replay_live(p);
+        if buffer != p.buffer || cursor != p.cursor || message != p.message {
+            drift.push(format!(
+                "  {:?} ({}): recorded buffer={:?} cursor={:?} message={:?}\n\
+                 {:width$}   live     buffer={:?} cursor={:?} message={:?}",
+                e.item,
+                e.help,
+                p.buffer,
+                p.cursor,
+                p.message,
+                "",
+                buffer,
+                cursor,
+                message,
+                width = 2
+            ));
+        }
+        let measured = measured_report(&message);
+        if measured != e.report {
+            drift.push(format!(
+                "  {:?} ({}): table says {:?}, the live message {:?} is {:?}",
+                e.item, e.help, e.report, message, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1226) — every row's recorded behaviour is a claim about live
+/// code, and this replays all 86 of them (the 89 rows minus the 3 ⏭️) against
+/// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
+#[test]
+fn regmark_audit_matches_the_live_engine() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_REGMARK") {
+        let mut s = String::new();
+        for e in REGMARK_AUDIT {
+            let Some(p) = e.live.as_ref() else { continue };
+            let (buffer, cursor, message) = replay_live(p);
+            // `{:?}` on a `&str` emits a valid Rust string literal, so a
+            // message containing a real newline round-trips into the table
+            // verbatim instead of being flattened into an ambiguous `\n`.
+            s.push_str(&format!(
+                "{}\t{:?}\t{}\t{}\t{:?}\n",
+                e.item, buffer, cursor.0, cursor.1, message
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = regmark_drift(REGMARK_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== registers/marks audit drifted from the engine (#1226) ==\n\
+         Each row records what vimcode actually did when the slice ran.\n\
+         Implementing (or breaking) one of these changes that recording, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, and a REGMARK_COVERAGE_EXEMPT entry deleted once\n\
+         an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1226) — the table describes itself correctly: complete, grouped
+/// by `:help` area, unique, no unreviewed row, every ⏭️ carrying a reason from
+/// the shared vocabulary, and a live recording + probe on exactly the rows
+/// that can have one.
+#[test]
+fn regmark_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        REGMARK_AUDIT.len(),
+        89,
+        "`:help registers` + `:help mark-motions` walked to 89 entries; the \
+         audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut in_marks = false;
+    for e in REGMARK_AUDIT {
+        if !seen.insert(e.item) {
+            problems.push(format!("  {:?}: listed twice", e.item));
+        }
+        match e.area {
+            RmArea::Registers if in_marks => problems.push(format!(
+                "  {:?}: a `:help registers` row after the marks rows — the table \
+                 is grouped by area, in `:help` order within each",
+                e.item
+            )),
+            RmArea::Marks => in_marks = true,
+            _ => {}
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  {:?}: empty note — every row is reviewed",
+                e.item
+            ));
+        }
+        if e.help.trim().is_empty() {
+            problems.push(format!("  {:?}: no `:help` tag", e.item));
+        }
+
+        let in_scope = !matches!(e.status, OptStatus::Skipped(_));
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {:?}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.item
+                ));
+            }
+        }
+        if in_scope && e.live.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry a live recording",
+                e.item
+            ));
+        }
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry an oracle probe",
+                e.item
+            ));
+        }
+        if !in_scope && (e.live.is_some() || e.probe.is_some()) {
+            problems.push(format!(
+                "  {:?}: skipped, so a live recording or probe can never fire",
+                e.item
+            ));
+        }
+    }
+
+    // The headline tally, pinned. The module doc quotes these numbers and a
+    // PR body quotes the module doc; without this they drift the moment a row
+    // is re-tagged, which is the exact rot a markdown checklist suffers from.
+    let tally = |want: fn(&RegMarkAudit) -> bool| REGMARK_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+            tally(|e| matches!(e.area, RmArea::Registers)),
+            tally(|e| matches!(e.area, RmArea::Marks)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented) && e.report == Report::Silent),
+        ),
+        (44, 12, 30, 3, 34, 55, 8),
+        "the audit tally moved: (implemented, partial, missing, skipped, \
+         registers, marks, missing-and-silent). Update the module doc's table \
+         in the same commit."
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== registers/marks audit table is inconsistent (#1226) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_regmark_coverage(
+    audit: &'static [RegMarkAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.item)) {
+            (false, false) => v.uncovered.push(e.item),
+            (true, true) => v.newly_covered.push(e.item),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.item == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1226) — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn regmark_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = REGMARK_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        REGMARK_COVERAGE_EXEMPT.len(),
+        "REGMARK_COVERAGE_EXEMPT lists an item twice"
+    );
+
+    let v = classify_regmark_coverage(REGMARK_AUDIT, REGMARK_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_REGMARK_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check the section doc demands a human be able to do
+        // in one grep (`Keys("g'")` silently matching `magg'a` is exactly
+        // the failure mode #1007's "deliberately dumb probe" note warns of).
+        for e in REGMARK_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.item,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - REGMARK_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== registers/marks oracle coverage (#1226) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        REGMARK_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== registers/marks oracle coverage moved (#1226) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the REGMARK_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// `"%` and `"#` hold the file name, and this pins the finding the `Live`
+/// recordings above cannot reach: with a real file open, both registers paste
+/// the **basename**, where Vim pastes the name as it was typed. Black-box —
+/// it drives `"%p` and reads the rendered buffer, not `Engine::registers`.
+#[test]
+fn register_percent_and_hash_paste_basenames_not_paths() {
+    // Same temp-dir convention as the multi-file harness above: an explicit
+    // `probe_id()`-suffixed directory, canonicalized once, no new dependency.
+    let dir = std::env::temp_dir().join(format!("vimcode_regmark_{}", probe_id()));
+    let nested = dir.join("src");
+    std::fs::create_dir_all(&nested).expect("create temp dir for the \"% probe");
+    let nested = nested.canonicalize().unwrap_or(nested);
+    let alpha = nested.join("alpha.txt");
+    let beta = nested.join("beta.txt");
+    std::fs::write(&alpha, "one\n").expect("write alpha");
+    std::fs::write(&beta, "two\n").expect("write beta");
+
+    let mut engine = engine_with("");
+    engine
+        .open_file_with_mode(&alpha, OpenMode::Permanent)
+        .expect("open alpha");
+    engine
+        .open_file_with_mode(&beta, OpenMode::Permanent)
+        .expect("open beta");
+
+    // `"%p` on the current buffer, then `"#p` for the alternate one (#1161).
+    send_keys(&mut engine, "\"%p");
+    let after_percent = engine.buffer().to_string();
+    assert!(
+        after_percent.contains("beta.txt"),
+        "`\"%p` must paste the current file name, got {after_percent:?}"
+    );
+    assert!(
+        !after_percent.contains("src/beta.txt") && !after_percent.contains("src\\beta.txt"),
+        "documented divergence (#1226): vimcode pastes the BASENAME, Vim pastes \
+         the name as typed. If this now pastes a path, the `\"%` row is no longer \
+         Partial — re-tag it. Got {after_percent:?}"
+    );
+
+    send_keys(&mut engine, "u\"#p");
+    let after_hash = engine.buffer().to_string();
+    assert!(
+        after_hash.contains("alpha.txt"),
+        "`\"#p` must paste the alternate file name, got {after_hash:?}"
+    );
+    assert!(
+        !after_hash.contains("src/alpha.txt") && !after_hash.contains("src\\alpha.txt"),
+        "documented divergence (#1226): `\"#` pastes the BASENAME too. Got {after_hash:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// All three gates, observed **failing** — on synthetic input for the shapes
+/// a human would otherwise take on trust, and on the **real** table and
+/// corpus for the two that matter most. #553 shipped black-box tests that
+/// stayed green with the bug reinstated; an audit whose gate cannot go red is
+/// the same mistake in table form.
+#[test]
+fn regmark_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a row that under-claims. `'a` works, so
+    // recording it as a no-op must be caught.
+    static MIS_NOOP: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        Some(live(
+            &["  a", "b", "c"],
+            (1, 3),
+            "majj'a",
+            "  a|b|c",
+            (3, 1),
+            "",
+        )),
+        Some(Label("mark:'a first nonblank")),
+        "deliberately mis-recorded fixture: the real cursor lands on (1, 3)",
+    )];
+    assert_eq!(
+        regmark_drift(MIS_NOOP).len(),
+        1,
+        "mis-recording a working command must be caught"
+    );
+
+    // ── Gate 1, direction B: a row that over-claims. This is the direction
+    // that fires when a NotImplemented row *gains* an implementation: record
+    // `'(` as working and the replay must disagree.
+    static MIS_WORKS: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'(",
+        "'(",
+        Implemented,
+        Silent,
+        Some(live(
+            &["One two. Three four."],
+            (1, 12),
+            "'(",
+            "One two. Three four.",
+            (1, 10),
+            "",
+        )),
+        Some(Label("mark:'(")),
+        "deliberately mis-recorded fixture: `'(` is not implemented",
+    )];
+    let drift = regmark_drift(MIS_WORKS);
+    assert_eq!(
+        drift.len(),
+        2,
+        "claiming an unimplemented command works must be caught for BOTH the \
+         recording and the Report column: {drift:?}"
+    );
+
+    // ── Gate 1, direction C: the Report column on its own. `:marks {arg}`
+    // really is refused, so tagging it Silent must fail even though the
+    // buffer/cursor/message recording is correct.
+    static MIS_SILENT: &[RegMarkAudit] = &[rm(
+        Marks,
+        ":marks {arg}",
+        ":marks",
+        NotImplemented,
+        Silent,
+        Some(live(
+            &["a", "b"],
+            (1, 1),
+            "ma:marks a<CR>",
+            "a|b",
+            (1, 1),
+            "Not an editor command: marks a",
+        )),
+        Some(Label("mark::marks a")),
+        "deliberately mis-tagged fixture: vimcode refuses this loudly",
+    )];
+    assert_eq!(
+        regmark_drift(MIS_SILENT)
+            .iter()
+            .filter(|d| d.contains("table says Silent"))
+            .count(),
+        1,
+        "calling a loud refusal Silent must be caught"
+    );
+
+    // ── Gate 1 against the REAL table: every recording is load-bearing, so
+    // perturbing one must fail. (Cheap proof that the 86 replays are really
+    // compared, not collected and dropped.)
+    let victim = REGMARK_AUDIT
+        .iter()
+        .find(|e| e.item == "]'")
+        .expect("fixture drifted — the `]'` row is gone");
+    let mut perturbed = *victim.live.as_ref().expect("`]'` has a recording");
+    perturbed.cursor = (perturbed.cursor.0 + 1, perturbed.cursor.1);
+    let (_, cursor, _) = replay_live(&perturbed);
+    assert_ne!(
+        cursor, perturbed.cursor,
+        "a perturbed recording must disagree with the live engine"
+    );
+
+    // ── Gate 2, direction A (synthetic): an in-scope row nothing pins, and
+    // nothing exempts.
+    static UNPINNED: &[RegMarkAudit] = &[rm(
+        Marks,
+        "'{a-z}",
+        "'a",
+        Implemented,
+        Silent,
+        None,
+        Some(Label("mark:'a first nonblank")),
+        "fixture",
+    )];
+    let empty: Vec<(&str, &str)> = Vec::new();
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &[], &empty).uncovered,
+        vec!["'{a-z}"]
+    );
+    // …and exempting it makes the same table clean.
+    assert!(classify_regmark_coverage(UNPINNED, &["'{a-z}"], &empty)
+        .uncovered
+        .is_empty());
+
+    // ── Gate 2, direction B (synthetic): an exempt row a case now pins.
+    let pinned = vec![("mark:'a first nonblank", "majj'a")];
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &["'{a-z}"], &pinned).newly_covered,
+        vec!["'{a-z}"]
+    );
+
+    // ── Gate 2, direction C (synthetic): a stale exemption.
+    assert_eq!(
+        classify_regmark_coverage(UNPINNED, &["'{a-z}", "`{a-z}"], &pinned).stale,
+        vec!["`{a-z}"]
+    );
+
+    // ── Gate 2 against the REAL table and corpus: deleting an exempt entry
+    // must fail, and adding a case that pins an exempt command must fail.
+    // Anything less and the list could grow silently.
+    let corpus = all_corpus_cases();
+    let victim = "'\"";
+    assert!(
+        REGMARK_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is no longer exempt"
+    );
+    let without: Vec<&str> = REGMARK_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    assert_eq!(
+        classify_regmark_coverage(REGMARK_AUDIT, &without, &corpus).uncovered,
+        vec![victim],
+        "deleting {victim:?} from REGMARK_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus = corpus.clone();
+    plus.push(("mark:'\" last exit position", "'\""));
+    assert_eq!(
+        classify_regmark_coverage(REGMARK_AUDIT, REGMARK_COVERAGE_EXEMPT, &plus).newly_covered,
+        vec![victim],
+        "a case pinning {victim:?} must force its exemption to be deleted"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 5 audit slice — ex commands (#1227)
+//
+// Slice 3 of 5, and the largest surface in the audit. Walks the pinned fleet
+// oracle's own `:help ex-cmd-index` (Neovim v0.12.5's `runtime/doc/index.txt`
+// §6, [`DEVIATIONS_ORACLE`]) end to end — **all 553 `:` commands, every one of
+// them** — and tags each Implemented / Partial / NotImplemented / Skipped
+// against `src/core/engine/execute.rs`, the same way #1225 walked
+// `:help option-list` and #1226 walked `:help registers`.
+//
+// The measurement, as of this slice:
+//
+//     ✅ Implemented      121
+//     🟡 Partial           53
+//     ❌ Not implemented  199
+//     ⏭️  Intentionally skipped  180   (each with a reason from SKIP_REASONS)
+//                         ────
+//                          553
+//
+// The slice landed at 117/203; #1156's undo tree then moved `:earlier`,
+// `:later`, `:undojoin` and `:undolist` from ❌ to ✅, which is gate 1 doing
+// its job — the branch implemented them, the recorded `ExDispatch` stopped
+// matching the live dispatcher, and the rows had to be re-tagged.
+//
+// ## Why this slice was expected to grow the denominator, and did
+//
+// `VIM_COMPATIBILITY.md`'s "Core Vim Ex Commands" section lists ~70 rows and
+// reads 100%. `:help ex-cmd-index` lists 553. The gap is not that the doc is
+// wrong about the 70 — it is that "complete" was being measured against a
+// hand-written list of the commands vimcode already had, so a command that
+// was never considered could not show up as missing. 553 rows is the
+// denominator the ratchet can now count against, and 174 of them (✅ + 🟡)
+// are the numerator that oracle cases have to reach.
+//
+// ## Gate 1 — the recorded dispatch must match the live dispatcher
+//
+// Every row records [`ExDispatch`]: what `Engine::execute_command` does with
+// the **full** command name and with the **minimal abbreviation `:help`
+// documents**, measured, never asserted by hand. Both spellings matter
+// because they fail independently in vimcode: `normalize_ex_command`'s
+// `EX_ABBREVS` table is hand-maintained and first-match-wins, so a command
+// can be reachable as `:nmap` and rejected as `:nm` (43 rows), reachable as
+// `:tabe` and rejected as `:tabedit` (6 rows), or — twice — have its
+// documented abbreviation silently point at a *different* command.
+//
+// [`ex_audit_matches_the_live_dispatcher`] replays all 551 runnable rows
+// (553 minus the two that crash, below) through a real engine and diffs.
+// Bidirectional by construction: implementing `:lcd` flips its row from
+// `Neither` and fails until it is re-tagged, and a command that stops
+// dispatching fails immediately.
+//
+// It is a black-box observation — an ex line in, `engine.message` out —
+// never an engine field. A gate that asserted "`execute.rs` contains the
+// string `lgetfile`" would be green for `:lg`, which is precisely the row
+// where vimcode runs the wrong command.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every ✅/🟡 row carries a [`Probe`] naming the oracle case that exercises
+// it; [`EX_COVERAGE_EXEMPT`] lists the ones no case reaches today. Both
+// directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the missing
+// cases is #1162's job, not this slice's — the exempt list is the
+// measurement it starts from.
+//
+// ❌ rows carry no probe, deliberately. #1226 gave one to every non-skipped
+// row because it had 32 of them; this slice has 199, and 199 permanently
+// exempt entries would drown the ~114 that describe a *real* gap in a
+// shrink-only list nobody can read. ❌ rows are already gated — harder — by
+// gate 1: a command that gains an implementation changes its `ExDispatch`.
+//
+// ## Findings that are worse than "missing"
+//
+//   * `:bdelete` and `:bwipeout` **panic** when they delete the last buffer
+//     (`active_buffer_state`'s `unwrap` on a buffer that no longer exists),
+//     where Vim falls back to an empty [No Name] buffer. Recorded as
+//     [`ExDispatch::Crashes`] and pinned by
+//     [`bdelete_on_the_last_buffer_panics_instead_of_refusing`].
+//   * `:!!` does not repeat the last `:!`; it passes the literal string `!`
+//     to the shell.
+//   * `:lg`, which `:help` documents as `:lg[etfile]`, runs `:lgrep`, and
+//     `:ln`, documented as `:ln[oremap]`, runs `:lnext` — first-match-wins
+//     abbreviations pointing at the wrong command.
+//   * `:continue`, `:debug`, `:stop` and `:restart` are bound to vimcode's
+//     DAP debugger, shadowing four Vim commands.
+//   * `:w {file}`, `:wq {file}`, `:x {file}` and `:update {file}` are all
+//     rejected — `:saveas` is the only way to write somewhere else.
+//   * `:1,2p` and `:1,2#` are rejected although bare `:p`/`:#` work: the
+//     print family takes no range.
+//   * pressing `:` then Enter answers `Not an editor command: `.
+//
+// ## Out of scope, deliberately
+//
+// VimScript (`:let`, `:if`, `:function`, `:autocmd`, `:source`, `:execute`,
+// `:call` and the rest of the ⏭️ block) is tagged Skipped per the standing
+// decision that vimcode implements Vim *keybindings and editing*, not a
+// VimScript runtime. Nothing here implements, fixes or changes any command:
+// this slice audits, tags and files. `COVERAGE_PHASE5.md` and
+// `VIM_COMPATIBILITY.md` were read, never written.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// What `Engine::execute_command` does with an ex command's two documented
+/// spellings — measured by [`measured_ex_dispatch`], never asserted by hand.
+///
+/// Two spellings rather than one because they fail independently: vimcode's
+/// `EX_ABBREVS` table is separate from its dispatch, so "vimcode has this
+/// command" and "vimcode has this command under the name `:help` says you can
+/// type" are different questions, and 49 of the 553 rows answer them
+/// differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExDispatch {
+    /// Both the full name and `:help`'s minimal abbreviation reach a handler.
+    Both,
+    /// The full name reaches a handler; the documented minimal abbreviation
+    /// is answered with "Not an editor command" (vimcode's E492).
+    FullOnly,
+    /// The abbreviation reaches a handler but the full spelling does not.
+    AbbrevOnly,
+    /// Both spellings are answered with "Not an editor command".
+    Neither,
+    /// Running it **panics**. Not executed by gate 1 — a panicking probe
+    /// would take the whole test binary down rather than report a row — so
+    /// the crash is pinned separately, and precisely, by
+    /// [`bdelete_on_the_last_buffer_panics_instead_of_refusing`].
+    Crashes,
+}
+
+/// One `:help ex-cmd-index` entry.
+struct ExAudit {
+    /// The command exactly as `:help ex-cmd-index` writes it, brackets and
+    /// all (`":ab[breviate]"`) — the table's unique key.
+    cmd: &'static str,
+    /// The `:help` tag it is documented under (`":abbreviate"`).
+    help: &'static str,
+    status: OptStatus,
+    /// Re-measured by gate 1 from `probe_full` / `probe_abbr`.
+    dispatch: ExDispatch,
+    /// The exact ex line driven for the **full** name. Usually just the name;
+    /// commands that need an argument to reach their handler carry one (and
+    /// it is always an argument with no side effect — `:make -f /dev/null -q`
+    /// reads no Makefile, `:read foo` reads a file that does not exist).
+    probe_full: &'static str,
+    /// The same, for `:help`'s minimal abbreviation.
+    probe_abbr: &'static str,
+    /// Oracle probe — `Some` exactly for Implemented/Partial rows; see the
+    /// section doc for why ❌ rows carry none.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn ex(
+    cmd: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    dispatch: ExDispatch,
+    probe_full: &'static str,
+    probe_abbr: &'static str,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> ExAudit {
+    ExAudit {
+        cmd,
+        help,
+        status,
+        dispatch,
+        probe_full,
+        probe_abbr,
+        probe,
+        note,
+    }
+}
+
+use crate::ExDispatch::{AbbrevOnly, Both, Crashes, FullOnly, Neither};
+
+/// Every command in `:help ex-cmd-index`, in `:help` order.
+///
+/// 553 rows, no "TODO" and no unreviewed row: adding one, deleting one,
+/// reordering one or leaving one without a note fails
+/// [`ex_audit_is_internally_consistent`].
+const EX_AUDIT: &[ExAudit] = &[
+    ex(":", ":", NotImplemented, Neither, "", "", None,
+       "an empty `:` line — Vim does nothing; vimcode answers `Not an editor command: `, which a user sees by pressing `:` then Enter. Worth fixing: one early return"),
+    ex(":{range}", ":range", Implemented, Both, "5", "5", Some(Label("ex:5")),
+       "`:{N}`, `:{range}{cmd}` and the `.$%'m/pat/?pat?+N;` address grammar all parse"),
+    ex(":!", ":!", Implemented, Both, "!", "!", Some(Label("ex:%!sort")),
+       "`:!{cmd}` shells out and reports the first output line; `:{range}!{cmd}` filters"),
+    ex(":!!", ":!!", NotImplemented, Both, "!!", "!!", None,
+       "repeat the last `:!` — vimcode instead passes the literal string `!` to the shell and prints `(no output)`, so the command silently runs garbage; worth implementing (the last command is already stored for `@:`)"),
+    ex(":#", ":#", Partial, Both, "#", "#", Some(Keys(":#<CR>")),
+       "prints the current line with its number, but only bare: `:1,2#` is rejected, so `:#` has no range"),
+    ex(":&", ":&", Implemented, Both, "&", "&", Some(Label("sub:& cmd")),
+       "repeats the last `:substitute` on the current line"),
+    ex(":*", ":star", Implemented, Neither, "*d", "*d", Some(Label("ex:*d after visual")),
+       "`:*` resolves to `'<,'>`, the last Visual area"),
+    ex(":<", ":<", Implemented, Both, "<", "<", Some(Label("ex:<")),
+       "shifts left, with a count and a range"),
+    ex(":=", ":=", Implemented, Both, "=", "=", Some(Keys(":=<CR>")),
+       "prints the last line number"),
+    ex(":>", ":>", Implemented, Both, ">", ">", Some(Label("ex:>")),
+       "shifts right, with a count and a range"),
+    ex(":@", ":@", NotImplemented, Neither, "@", "@", None,
+       "execute the contents of a register — Normal-mode `@a`/`@:` exist, but the ex form is rejected; cheap to wire to the same code path"),
+    ex(":@@", ":@@", NotImplemented, Neither, "@@", "@@", None,
+       "repeat the previous `:@`; blocked on `:@`"),
+    ex(":2mat[ch]", ":2match", NotImplemented, Neither, "2match", "2mat", None,
+       "define a second match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":3mat[ch]", ":3match", NotImplemented, Neither, "3match", "3mat", None,
+       "define a third match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":N[ext]", ":Next", NotImplemented, Neither, "Next", "N", None,
+       "go to previous file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":a[ppend]", ":append", Skipped(EXMODE), Neither, "append", "a", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":ab[breviate]", ":abbreviate", Implemented, Both, "abbreviate", "ab", Some(Label("abbrev:expands on CR")),
+       "defines and lists abbreviations for both Insert and Command-line mode"),
+    ex(":abc[lear]", ":abclear", Implemented, Both, "abclear", "abc", Some(Keys(":abclear<CR>")),
+       "clears every abbreviation"),
+    ex(":abo[veleft]", ":aboveleft", NotImplemented, Neither, "aboveleft", "abo", None,
+       "make split window appear left or above — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":al[l]", ":all", NotImplemented, Neither, "all", "al", None,
+       "open a window for each file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":am[enu]", ":amenu", Skipped(MENU), Neither, "amenu", "am", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":an[oremenu]", ":anoremenu", Skipped(MENU), Neither, "anoremenu", "an", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ar[gs]", ":args", NotImplemented, Neither, "args", "ar", None,
+       "print the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":arga[dd]", ":argadd", NotImplemented, Neither, "argadd", "arga", None,
+       "add items to the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argded[upe]", ":argdedupe", NotImplemented, Neither, "argdedupe", "argded", None,
+       "remove duplicates from the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argd[elete]", ":argdelete", NotImplemented, Neither, "argdelete", "argd", None,
+       "delete items from the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":arge[dit]", ":argedit", NotImplemented, Neither, "argedit", "arge", None,
+       "add item to the argument list and edit it — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argdo", ":argdo", NotImplemented, Neither, "argdo", "argdo", None,
+       "do a command on all items in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argg[lobal]", ":argglobal", NotImplemented, Neither, "argglobal", "argg", None,
+       "define the global argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argl[ocal]", ":arglocal", NotImplemented, Neither, "arglocal", "argl", None,
+       "define a local argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":argu[ment]", ":argument", NotImplemented, Neither, "argument", "argu", None,
+       "go to specific file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":as[cii]", ":ascii", NotImplemented, Neither, "ascii", "as", None,
+       "print ascii value of character under the cursor — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":au[tocmd]", ":autocmd", Skipped(SCRIPTRT), Neither, "autocmd", "au", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":aug[roup]", ":augroup", Skipped(SCRIPTRT), Neither, "augroup", "aug", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":aun[menu]", ":aunmenu", Skipped(MENU), Neither, "aunmenu", "aun", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":b[uffer]", ":buffer", Implemented, Both, "buffer 1", "b 1", Some(Keys(":buffer ")),
+       "switches to a buffer by number or name"),
+    ex(":bN[ext]", ":bNext", NotImplemented, Neither, "bNext", "bN", None,
+       "go to previous buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ba[ll]", ":ball", NotImplemented, Neither, "ball", "ba", None,
+       "open a window for each buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bad[d]", ":badd", NotImplemented, Neither, "badd", "bad", None,
+       "add buffer to the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":balt", ":balt", NotImplemented, Neither, "balt", "balt", None,
+       "like \":badd\" but also set the alternate file — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bd[elete]", ":bdelete", Partial, Crashes, "bdelete", "bd", Some(Keys(":bd<CR>")),
+       "unloads a buffer, but **panics** (`active_buffer_state`'s `unwrap`) when it deletes the last one instead of falling back to an empty [No Name] buffer — see `bdelete_on_the_last_buffer_panics_instead_of_refusing`"),
+    ex(":bel[owright]", ":belowright", NotImplemented, Neither, "belowright", "bel", None,
+       "make split window appear right or below — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":bf[irst]", ":bfirst", Implemented, Both, "bfirst", "bf", Some(Label("ex:bfirst noop with one buffer")),
+       "jumps to the first buffer"),
+    ex(":bl[ast]", ":blast", Implemented, Both, "blast", "bl", Some(Label("ex:blast noop with one buffer")),
+       "jumps to the last buffer"),
+    ex(":bm[odified]", ":bmodified", NotImplemented, Neither, "bmodified", "bm", None,
+       "go to next buffer in the buffer list that has been modified — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bn[ext]", ":bnext", Implemented, Both, "bnext", "bn", Some(Keys(":bnext<CR>")),
+       "cycles to the next buffer"),
+    ex(":bo[tright]", ":botright", NotImplemented, Neither, "botright", "bo", None,
+       "make split window appear at bottom or far right — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":bp[revious]", ":bprevious", Implemented, Both, "bprevious", "bp", Some(Keys(":bprevious<CR>")),
+       "cycles to the previous buffer"),
+    ex(":br[ewind]", ":brewind", NotImplemented, Neither, "brewind", "br", None,
+       "go to first buffer in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":brea[k]", ":break", Skipped(VIMSCRIPT), Neither, "break", "brea", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breaka[dd]", ":breakadd", Skipped(VIMSCRIPT), Neither, "breakadd", "breaka", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breakd[el]", ":breakdel", Skipped(VIMSCRIPT), Neither, "breakdel", "breakd", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":breakl[ist]", ":breaklist", Skipped(VIMSCRIPT), Neither, "breaklist", "breakl", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":bro[wse]", ":browse", NotImplemented, Neither, "browse", "bro", None,
+       "use file selection dialog — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":bufd[o]", ":bufdo", Implemented, Both, "bufdo s/a/b/", "bufdo s/a/b/", Some(Keys(":bufdo ")),
+       "runs a command in every buffer"),
+    ex(":buffers", ":buffers", Implemented, Both, "buffers", "buffers", Some(Keys(":buffers<CR>")),
+       "lists buffers with the `%a` flags"),
+    ex(":bun[load]", ":bunload", NotImplemented, Neither, "bunload", "bun", None,
+       "unload a specific buffer — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":bw[ipeout]", ":bwipeout", Partial, Crashes, "bwipeout", "bw", Some(Label("ex:bwipeout refuses on a dirty buffer without a bang")),
+       "same code path, and the same last-buffer panic as `:bdelete`"),
+    ex(":c[hange]", ":change", Skipped(EXMODE), Neither, "change", "c", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":cN[ext]", ":cNext", Partial, AbbrevOnly, "cNext", "cN", Some(Keys(":cN<CR>")),
+       "`:cN` works (it is `:cprevious`), but the full spelling `:cNext` is rejected"),
+    ex(":cNf[ile]", ":cNfile", NotImplemented, Neither, "cNfile", "cNf", None,
+       "go to last error in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ca[bbrev]", ":cabbrev", Implemented, Both, "cabbrev", "ca", Some(Label("abbrev:cabbrev on the command line runs the expanded command")),
+       "command-line abbreviations"),
+    ex(":cabc[lear]", ":cabclear", NotImplemented, Neither, "cabclear", "cabc", None,
+       "clear all abbreviations for Command-line mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cabo[ve]", ":cabove", NotImplemented, Neither, "cabove", "cabo", None,
+       "go to error above current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cad[dbuffer]", ":caddbuffer", NotImplemented, Neither, "caddbuffer", "cad", None,
+       "add errors from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cadde[xpr]", ":caddexpr", NotImplemented, Neither, "caddexpr", "cadde", None,
+       "add errors from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":caddf[ile]", ":caddfile", NotImplemented, Neither, "caddfile", "caddf", None,
+       "add error message to current quickfix list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":caf[ter]", ":cafter", NotImplemented, Neither, "cafter", "caf", None,
+       "go to error after current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cal[l]", ":call", Skipped(VIMSCRIPT), Neither, "call", "cal", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cat[ch]", ":catch", Skipped(VIMSCRIPT), Neither, "catch", "cat", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cbe[fore]", ":cbefore", NotImplemented, Neither, "cbefore", "cbe", None,
+       "go to error before current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cbel[ow]", ":cbelow", NotImplemented, Neither, "cbelow", "cbel", None,
+       "go to error below current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cbo[ttom]", ":cbottom", NotImplemented, Neither, "cbottom", "cbo", None,
+       "scroll to the bottom of the quickfix window — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cb[uffer]", ":cbuffer", NotImplemented, Neither, "cbuffer", "cb", None,
+       "parse error messages and jump to first error — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cc", ":cc", Implemented, Both, "cc", "cc", Some(Label("ex:cc on empty quickfix list")),
+       "jumps to quickfix error N, or re-jumps to the current one"),
+    ex(":ccl[ose]", ":cclose", Implemented, Both, "cclose", "ccl", Some(Keys(":cclose<CR>")),
+       "closes the quickfix window"),
+    ex(":cd", ":cd", Partial, Both, "cd .", "cd .", Some(Keys(":cd ")),
+       "changes vimcode's *workspace folder* (and the explorer root), not the process/window working directory; bare `:cd` does not go to $HOME, and `:lcd`/`:tcd` are absent"),
+    ex(":cdo", ":cdo", Implemented, Both, "cdo", "cdo", Some(Keys(":cdo ")),
+       "runs a command on each quickfix entry"),
+    ex(":cfd[o]", ":cfdo", Partial, FullOnly, "cfdo", "cfd", Some(Keys(":cfdo ")),
+       "works, but `:cfd` — Vim's documented minimum abbreviation — is rejected (vimcode's table requires 4 characters)"),
+    ex(":ce[nter]", ":center", Implemented, Both, "center", "ce", Some(Label("ex:ce 10")),
+       "centres lines within 'textwidth' or an explicit width"),
+    ex(":cex[pr]", ":cexpr", NotImplemented, Neither, "cexpr", "cex", None,
+       "read errors from expr and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cf[ile]", ":cfile", NotImplemented, Neither, "cfile", "cf", None,
+       "read file with error messages and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cfir[st]", ":cfirst", Implemented, Both, "cfirst", "cfir", Some(Keys(":cfirst<CR>")),
+       "first quickfix entry"),
+    ex(":cgetb[uffer]", ":cgetbuffer", NotImplemented, Neither, "cgetbuffer", "cgetb", None,
+       "get errors from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cgete[xpr]", ":cgetexpr", NotImplemented, Neither, "cgetexpr", "cgete", None,
+       "get errors from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cg[etfile]", ":cgetfile", NotImplemented, Neither, "cgetfile", "cg", None,
+       "read file with error messages — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":changes", ":changes", Implemented, Both, "changes", "changes", Some(Keys(":changes<CR>")),
+       "prints the change list"),
+    ex(":chd[ir]", ":chdir", NotImplemented, Neither, "chdir", "chd", None,
+       "change directory — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":che[ckhealth]", ":checkhealth", NotImplemented, Neither, "checkhealth", "che", None,
+       "run healthchecks — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":checkp[ath]", ":checkpath", Skipped(CTAGS), Neither, "checkpath", "checkp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":checkt[ime]", ":checktime", NotImplemented, Neither, "checktime", "checkt", None,
+       "check timestamp of loaded buffers — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":chi[story]", ":chistory", NotImplemented, Neither, "chistory", "chi", None,
+       "list the error lists — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cla[st]", ":clast", Implemented, Both, "clast", "cla", Some(Keys(":clast<CR>")),
+       "last quickfix entry"),
+    ex(":cle[arjumps]", ":clearjumps", NotImplemented, Neither, "clearjumps", "cle", None,
+       "clear the jump list — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cl[ist]", ":clist", Implemented, Both, "clist", "cl", Some(Keys(":clist<CR>")),
+       "lists quickfix entries"),
+    ex(":clo[se]", ":close", Implemented, Both, "close", "clo", Some(Keys(":close<CR>")),
+       "closes the window, refusing on the last one"),
+    ex(":cm[ap]", ":cmap", Partial, FullOnly, "cmap", "cm", Some(Keys(":cmap ")),
+       "works, but `:cm` is rejected"),
+    ex(":cmapc[lear]", ":cmapclear", Partial, FullOnly, "cmapclear", "cmapc", Some(Keys(":cmapclear")),
+       "works, but `:cmapc` is rejected"),
+    ex(":cme[nu]", ":cmenu", Skipped(MENU), Neither, "cmenu", "cme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":cn[ext]", ":cnext", Implemented, Both, "cnext", "cn", Some(Keys(":cnext<CR>")),
+       "next quickfix entry"),
+    ex(":cnew[er]", ":cnewer", Implemented, Both, "cnewer", "cnew", Some(Keys(":cnewer<CR>")),
+       "newer quickfix list"),
+    ex(":cnf[ile]", ":cnfile", NotImplemented, Neither, "cnfile", "cnf", None,
+       "go to first error in next file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cno[remap]", ":cnoremap", Partial, FullOnly, "cnoremap", "cno", Some(Keys(":cnoremap ")),
+       "works, but `:cno` is rejected"),
+    ex(":cnorea[bbrev]", ":cnoreabbrev", Implemented, Both, "cnoreabbrev foo bar", "cnorea foo bar", Some(Keys(":cnoreabbrev ")),
+       "defined, and stored alongside `:cabbrev`"),
+    ex(":cnoreme[nu]", ":cnoremenu", Skipped(MENU), Neither, "cnoremenu", "cnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":co[py]", ":copy", Implemented, Both, "copy 0", "co 0", Some(Label("ex:1co$")),
+       "copies a range below an address"),
+    ex(":col[der]", ":colder", Implemented, Both, "colder", "col", Some(Keys(":colder<CR>")),
+       "older quickfix list"),
+    ex(":colo[rscheme]", ":colorscheme", Implemented, Both, "colorscheme", "colo", Some(Keys(":colorscheme ")),
+       "switches themes, and lists them when called bare"),
+    ex(":com[mand]", ":command", Skipped(SCRIPTRT), Neither, "command", "com", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":comc[lear]", ":comclear", Skipped(SCRIPTRT), Neither, "comclear", "comc", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":comp[iler]", ":compiler", Skipped(SCRIPTRT), Neither, "compiler", "comp", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":con[tinue]", ":continue", Skipped(VIMSCRIPT), FullOnly, "continue", "con", None,
+       "VimScript loop control — and vimcode has taken the name for its DAP debugger's continue, so the two collide"),
+    ex(":conf[irm]", ":confirm", NotImplemented, Neither, "confirm", "conf", None,
+       "prompt user when confirmation required — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cons[t]", ":const", Skipped(VIMSCRIPT), Neither, "const", "cons", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":cope[n]", ":copen", Implemented, Both, "copen", "cope", Some(Keys(":copen<CR>")),
+       "opens the quickfix window"),
+    ex(":cp[revious]", ":cprevious", Implemented, Both, "cprevious", "cp", Some(Keys(":cprevious<CR>")),
+       "previous quickfix entry"),
+    ex(":cpf[ile]", ":cpfile", NotImplemented, Neither, "cpfile", "cpf", None,
+       "go to last error in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cq[uit]", ":cquit", Implemented, Both, "cquit", "cq", Some(Keys(":cquit<CR>")),
+       "quits with a non-zero exit code"),
+    ex(":cr[ewind]", ":crewind", NotImplemented, Neither, "crewind", "cr", None,
+       "go to the specified error, default first one — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":cu[nmap]", ":cunmap", Partial, FullOnly, "cunmap", "cu", Some(Keys(":cunmap ")),
+       "works, but `:cu` is rejected"),
+    ex(":cuna[bbrev]", ":cunabbrev", NotImplemented, Neither, "cunabbrev", "cuna", None,
+       "like \":unabbrev\" but for Command-line mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":cunme[nu]", ":cunmenu", Skipped(MENU), Neither, "cunmenu", "cunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":cw[indow]", ":cwindow", Implemented, Both, "cwindow", "cw", Some(Keys(":cwindow<CR>")),
+       "opens the quickfix window only when it is non-empty"),
+    ex(":d[elete]", ":delete", Implemented, Both, "delete", "d", Some(Label("ex:2d")),
+       "deletes a range into a register, with a count"),
+    ex(":deb[ug]", ":debug", Skipped(VIMSCRIPT), FullOnly, "debug", "deb", None,
+       "the VimScript debugger — vimcode has taken the name for starting a DAP session"),
+    ex(":debugg[reedy]", ":debuggreedy", Skipped(VIMSCRIPT), Neither, "debuggreedy", "debugg", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":defe[r]", ":defer", Skipped(VIMSCRIPT), Neither, "defer", "defe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":delc[ommand]", ":delcommand", Skipped(SCRIPTRT), Neither, "delcommand", "delc", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":delf[unction]", ":delfunction", Skipped(VIMSCRIPT), Neither, "delfunction", "delf", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":delm[arks]", ":delmarks", Implemented, Both, "delmarks", "delm", Some(Label("ex:delmarks a")),
+       "deletes marks by name and range"),
+    ex(":detach", ":detach", Skipped(PLATFORM), Neither, "detach", "detach", None,
+       "command of a Vim/Neovim build feature vimcode does not target"),
+    ex(":dif[fupdate]", ":diffupdate", NotImplemented, Neither, "diffupdate", "dif", None,
+       "update 'diff' buffers — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffg[et]", ":diffget", NotImplemented, Neither, "diffget", "diffg", None,
+       "remove differences in current buffer — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffo[ff]", ":diffoff", Partial, FullOnly, "diffoff", "diffo", Some(Keys(":diffoff")),
+       "turns diff mode off, but `:diffo` is rejected"),
+    ex(":diffp[atch]", ":diffpatch", NotImplemented, Neither, "diffpatch", "diffp", None,
+       "apply a patch and show differences — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffpu[t]", ":diffput", NotImplemented, Neither, "diffput", "diffpu", None,
+       "remove differences in other buffer — `:diffsplit`/`:diffthis` exist but no hunk transfer or refresh; `:diffget`/`:diffput` are worth implementing"),
+    ex(":diffs[plit]", ":diffsplit", Partial, FullOnly, "diffsplit", "diffs", Some(Keys(":diffsplit ")),
+       "opens the diff split, but `:diffs` — Vim's documented minimum — is rejected"),
+    ex(":difft[his]", ":diffthis", Partial, FullOnly, "diffthis", "difft", Some(Keys(":diffthis")),
+       "marks a window for diffing, but `:difft` is rejected"),
+    ex(":dig[raphs]", ":digraphs", Implemented, Both, "digraphs", "dig", Some(Keys(":digraphs<CR>")),
+       "lists the digraph table and defines user digraphs"),
+    ex(":di[splay]", ":display", Implemented, Both, "display", "di", Some(Keys(":display<CR>")),
+       "alias of `:registers`"),
+    ex(":dj[ump]", ":djump", Skipped(CTAGS), Neither, "djump", "dj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":dl", ":dl", NotImplemented, Neither, "dl", "dl", None,
+       "`:d` with the `l` list flag — same gap as `:dp`; low value"),
+    ex(":dli[st]", ":dlist", Skipped(CTAGS), Neither, "dlist", "dli", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":do[autocmd]", ":doautocmd", Skipped(SCRIPTRT), Neither, "doautocmd", "do", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":doautoa[ll]", ":doautoall", Skipped(SCRIPTRT), Neither, "doautoall", "doautoa", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":d[elete]p", ":dp", NotImplemented, Neither, "dp", "dp", None,
+       "`:d` with the `p` print flag — vimcode's `:delete` takes a register and a count but no print flags; low value"),
+    ex(":dr[op]", ":drop", NotImplemented, Neither, "drop", "dr", None,
+       "jump to window editing file or edit file in current window — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":ds[earch]", ":dsearch", Skipped(CTAGS), Neither, "dsearch", "ds", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":dsp[lit]", ":dsplit", Skipped(CTAGS), Neither, "dsplit", "dsp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":e[dit]", ":edit", Implemented, Both, "edit foo", "e foo", Some(Keys(":edit ")),
+       "opens a file, with `!` to discard changes"),
+    ex(":ea[rlier]", ":earlier", Implemented, Both, "earlier", "ea", Some(Label("ex:earlier")),
+       "go to older change, with a count — landed with the undo tree in #1156, alongside `:later`/`:undolist`/`:undojoin`"),
+    ex(":ec[ho]", ":echo", Skipped(VIMSCRIPT), Both, "echo", "ec", None,
+       "vimcode accepts `:echo {text}` and echoes it back verbatim, which looks like support but evaluates nothing — the expression half is the VimScript half"),
+    ex(":echoe[rr]", ":echoerr", Skipped(VIMSCRIPT), Neither, "echoerr", "echoe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echoh[l]", ":echohl", Skipped(VIMSCRIPT), Neither, "echohl", "echoh", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echom[sg]", ":echomsg", Skipped(VIMSCRIPT), Neither, "echomsg", "echom", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":echon", ":echon", Skipped(VIMSCRIPT), Neither, "echon", "echon", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":el[se]", ":else", Skipped(VIMSCRIPT), Neither, "else", "el", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":elsei[f]", ":elseif", Skipped(VIMSCRIPT), Neither, "elseif", "elsei", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":em[enu]", ":emenu", Skipped(MENU), Neither, "emenu", "em", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":en[dif]", ":endif", Skipped(VIMSCRIPT), Neither, "endif", "en", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endfo[r]", ":endfor", Skipped(VIMSCRIPT), Neither, "endfor", "endfo", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endf[unction]", ":endfunction", Skipped(VIMSCRIPT), Neither, "endfunction", "endf", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endt[ry]", ":endtry", Skipped(VIMSCRIPT), Neither, "endtry", "endt", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":endw[hile]", ":endwhile", Skipped(VIMSCRIPT), Neither, "endwhile", "endw", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ene[w]", ":enew", Implemented, Both, "enew", "ene", Some(Label("ex:enew abandons a dirty buffer by default ('hidden' is on)")),
+       "opens an empty buffer, with `!` to abandon a dirty one"),
+    ex(":ev[al]", ":eval", Skipped(VIMSCRIPT), Neither, "eval", "ev", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ex", ":ex", Skipped(EXMODE), Neither, "ex", "ex", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":exe[cute]", ":execute", Skipped(VIMSCRIPT), Neither, "execute", "exe", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":exi[t]", ":exit", NotImplemented, Neither, "exit", "exi", None,
+       "same as \":xit\" — no vimcode equivalent; low value"),
+    ex(":exu[sage]", ":exusage", NotImplemented, Neither, "exusage", "exu", None,
+       "overview of Ex commands — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":fc[lose]", ":fclose", NotImplemented, Neither, "fclose", "fc", None,
+       "close floating window — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":f[ile]", ":file", Partial, Both, "file", "f", Some(Keys(":file<CR>")),
+       "`:file` reports the name/line count/percentage, but `:file {name}` (rename the buffer) is rejected"),
+    ex(":files", ":files", Implemented, Both, "files", "files", Some(Keys(":files<CR>")),
+       "alias of `:buffers`"),
+    ex(":filet[ype]", ":filetype", NotImplemented, Neither, "filetype", "filet", None,
+       "switch file type detection on/off — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":filt[er]", ":filter", Skipped(VIMSCRIPT), Neither, "filter", "filt", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fin[d]", ":find", NotImplemented, FullOnly, "find", "fin", None,
+       "find a file in 'path' and edit it — `:find` bare opens vimcode's Ctrl+F find/replace overlay instead, and `:find {file}` is rejected, so the Vim command is absent behind a name that looks taken; worth implementing"),
+    ex(":fina[lly]", ":finally", Skipped(VIMSCRIPT), Neither, "finally", "fina", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fini[sh]", ":finish", Skipped(SCRIPTRT), Neither, "finish", "fini", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":fir[st]", ":first", NotImplemented, Neither, "first", "fir", None,
+       "go to the first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":fo[ld]", ":fold", Partial, FullOnly, "fold", "fo", Some(Label("fold:ex::fold creates and closes a manual fold")),
+       "creates a fold over a range, but `:fo` — Vim's documented minimum — is rejected"),
+    ex(":foldc[lose]", ":foldclose", Implemented, Both, "foldclose", "foldc", Some(Label("fold:ex::foldclose! on a nested range closes every level")),
+       "closes folds in a range, with `!` for recursive"),
+    ex(":foldd[oopen]", ":folddoopen", Implemented, Both, "folddoopen d", "foldd d", Some(Label("fold:ex::folddoopen only touches lines outside the closed fold")),
+       "runs a command on every non-folded line"),
+    ex(":folddoc[losed]", ":folddoclosed", Implemented, Both, "folddoclosed d", "folddoc d", Some(Label("fold:ex::folddoclosed only touches lines inside the closed fold")),
+       "runs a command on every folded line"),
+    ex(":foldo[pen]", ":foldopen", Implemented, Both, "foldopen", "foldo", Some(Label("fold:ex::foldopen with a matching range reopens it")),
+       "opens folds in a range, with `!` for recursive"),
+    ex(":for", ":for", Skipped(VIMSCRIPT), Neither, "for", "for", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":fu[nction]", ":function", Skipped(VIMSCRIPT), Neither, "function", "fu", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":g[lobal]", ":global", Implemented, Both, "global/beta/d", "g/beta/d", Some(Label("ex:cursor after :g/d")),
+       "`:g/pat/cmd`, with `:g!` and `:v` for the inverse"),
+    ex(":go[to]", ":goto", NotImplemented, FullOnly, "goto", "go", None,
+       "go to byte N in the buffer — vimcode recognises the name only to answer \"Use :N to go to line N\"; low value"),
+    ex(":gr[ep]", ":grep", Implemented, Both, "grep", "gr", Some(Keys(":grep ")),
+       "runs the external grep and fills the quickfix list"),
+    ex(":grepa[dd]", ":grepadd", NotImplemented, Neither, "grepadd", "grepa", None,
+       "like :grep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":gu[i]", ":gui", Skipped(MENU), Neither, "gui", "gu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":gv[im]", ":gvim", Skipped(MENU), Neither, "gvim", "gv", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":h[elp]", ":help", Partial, Both, "help", "h", Some(Keys(":help<CR>")),
+       "opens vimcode's own three-topic help buffer; `:help {tag}` into Vim's documentation does not exist"),
+    ex(":helpc[lose]", ":helpclose", NotImplemented, Neither, "helpclose", "helpc", None,
+       "close one help window — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":helpg[rep]", ":helpgrep", NotImplemented, Neither, "helpgrep", "helpg", None,
+       "like \":grep\" but searches help files — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":helpt[ags]", ":helptags", NotImplemented, Neither, "helptags", "helpt", None,
+       "generate help tags for a directory — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":hi[ghlight]", ":highlight", NotImplemented, Neither, "highlight", "hi", None,
+       "specify highlighting methods — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":hid[e]", ":hide", Implemented, Both, "hide", "hid", Some(Label("ex:hide refuses to close the last window")),
+       "closes the window, keeping the buffer loaded"),
+    ex(":his[tory]", ":history", Implemented, Both, "history", "his", Some(Keys(":history<CR>")),
+       "prints the command history"),
+    ex(":hor[izontal]", ":horizontal", NotImplemented, Neither, "horizontal", "hor", None,
+       "following window command work horizontally — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":i[nsert]", ":insert", Skipped(EXMODE), Neither, "insert", "i", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":ia[bbrev]", ":iabbrev", Implemented, Both, "iabbrev", "ia", Some(Label("abbrev:iabbrev does not apply on the command line")),
+       "insert-mode abbreviations"),
+    ex(":iabc[lear]", ":iabclear", NotImplemented, Neither, "iabclear", "iabc", None,
+       "like \":abclear\" but for Insert mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":if", ":if", Skipped(VIMSCRIPT), Neither, "if", "if", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ij[ump]", ":ijump", Skipped(CTAGS), Neither, "ijump", "ij", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":il[ist]", ":ilist", Skipped(CTAGS), Neither, "ilist", "il", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":im[ap]", ":imap", Partial, FullOnly, "imap", "im", Some(Keys(":imap ")),
+       "works, but `:im` is rejected"),
+    ex(":imapc[lear]", ":imapclear", Partial, FullOnly, "imapclear", "imapc", Some(Keys(":imapclear")),
+       "works, but `:imapc` is rejected"),
+    ex(":ime[nu]", ":imenu", Skipped(MENU), Neither, "imenu", "ime", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ino[remap]", ":inoremap", Partial, FullOnly, "inoremap", "ino", Some(Label("map:inoremap_jk_to_escape")),
+       "works, but `:ino` is rejected"),
+    ex(":inorea[bbrev]", ":inoreabbrev", Implemented, Both, "inoreabbrev foo bar", "inorea foo bar", Some(Keys(":inoreabbrev ")),
+       "defined, and stored alongside `:iabbrev`"),
+    ex(":inoreme[nu]", ":inoremenu", Skipped(MENU), Neither, "inoremenu", "inoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":int[ro]", ":intro", NotImplemented, Neither, "intro", "int", None,
+       "print the introductory message — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":ip[ut]", ":iput", NotImplemented, Neither, "iput", "ip", None,
+       "like |:put|, but adjust the indent to the current line — no vimcode equivalent; low value"),
+    ex(":is[earch]", ":isearch", Skipped(CTAGS), Neither, "isearch", "is", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":isp[lit]", ":isplit", Skipped(CTAGS), Neither, "isplit", "isp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":iu[nmap]", ":iunmap", Partial, FullOnly, "iunmap", "iu", Some(Keys(":iunmap ")),
+       "works, but `:iu` is rejected"),
+    ex(":iuna[bbrev]", ":iunabbrev", NotImplemented, Neither, "iunabbrev", "iuna", None,
+       "like \":unabbrev\" but for Insert mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":iunme[nu]", ":iunmenu", Skipped(MENU), Neither, "iunmenu", "iunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":j[oin]", ":join", Implemented, Both, "join", "j", Some(Label("ex:1,3j")),
+       "joins a range, with `!` and a count"),
+    ex(":ju[mps]", ":jumps", Implemented, Both, "jumps", "ju", Some(Keys(":jumps<CR>")),
+       "prints the jump list"),
+    ex(":k", ":k", Partial, Both, "2ka", "2ka", Some(Label("ex:2ka 'a")),
+       "only the concatenated form with a range works (`:2ka`); Vim's `:k a` and `:1k a` are both rejected"),
+    ex(":keepa[lt]", ":keepalt", NotImplemented, Neither, "keepalt", "keepa", None,
+       "following command keeps the alternate file — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":kee[pmarks]", ":keepmarks", NotImplemented, Neither, "keepmarks", "kee", None,
+       "following command keeps marks where they are — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":keepj[umps]", ":keepjumps", NotImplemented, Neither, "keepjumps", "keepj", None,
+       "following command keeps jumplist and marks — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":keepp[atterns]", ":keeppatterns", NotImplemented, Neither, "keeppatterns", "keepp", None,
+       "following command keeps search pattern history — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lN[ext]", ":lNext", Partial, AbbrevOnly, "lNext", "lN", Some(Keys(":lN<CR>")),
+       "`:lN` works (it is `:lprevious`), but the full spelling `:lNext` is rejected"),
+    ex(":lNf[ile]", ":lNfile", NotImplemented, Neither, "lNfile", "lNf", None,
+       "go to last entry in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":l[ist]", ":list", NotImplemented, Neither, "list", "l", None,
+       "print lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lab[ove]", ":labove", NotImplemented, Neither, "labove", "lab", None,
+       "go to location above current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lad[dexpr]", ":laddexpr", NotImplemented, Neither, "laddexpr", "lad", None,
+       "add locations from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laddb[uffer]", ":laddbuffer", NotImplemented, Neither, "laddbuffer", "laddb", None,
+       "add locations from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laddf[ile]", ":laddfile", NotImplemented, Neither, "laddfile", "laddf", None,
+       "add locations to current location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":laf[ter]", ":lafter", NotImplemented, Neither, "lafter", "laf", None,
+       "go to location after current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":la[st]", ":last", NotImplemented, Neither, "last", "la", None,
+       "go to the last file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":lan[guage]", ":language", Skipped(ENCODING), Neither, "language", "lan", None,
+       "vimcode is UTF-8 only; no encoding-conversion layer"),
+    ex(":lat[er]", ":later", Implemented, Both, "later", "lat", Some(Keys(":later")),
+       "go to newer change, with a count — landed with the undo tree in #1156; pinned by the `:earlier`/`:later` round-trip case"),
+    ex(":lbe[fore]", ":lbefore", NotImplemented, Neither, "lbefore", "lbe", None,
+       "go to location before current cursor — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lbel[ow]", ":lbelow", NotImplemented, Neither, "lbelow", "lbel", None,
+       "go to location below current line — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lbo[ttom]", ":lbottom", NotImplemented, Neither, "lbottom", "lbo", None,
+       "scroll to the bottom of the location window — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lb[uffer]", ":lbuffer", NotImplemented, Neither, "lbuffer", "lb", None,
+       "parse locations and jump to first location — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lc[d]", ":lcd", NotImplemented, Neither, "lcd", "lc", None,
+       "change directory locally — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lch[dir]", ":lchdir", NotImplemented, Neither, "lchdir", "lch", None,
+       "change directory locally — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lcl[ose]", ":lclose", Implemented, Both, "lclose", "lcl", Some(Keys(":lclose<CR>")),
+       "closes the location-list window"),
+    ex(":ld[o]", ":ldo", Partial, FullOnly, "ldo", "ld", Some(Keys(":ldo ")),
+       "works, but `:ld` — Vim's documented minimum — is rejected"),
+    ex(":lfd[o]", ":lfdo", Partial, FullOnly, "lfdo", "lfd", Some(Keys(":lfdo ")),
+       "works, but `:lfd` — Vim's documented minimum — is rejected"),
+    ex(":le[ft]", ":left", Implemented, Both, "left", "le", Some(Label("ex:le 4")),
+       "left-aligns with an optional indent"),
+    ex(":lefta[bove]", ":leftabove", NotImplemented, Neither, "leftabove", "lefta", None,
+       "make split window appear left or above — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":let", ":let", Skipped(VIMSCRIPT), Neither, "let", "let", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":lex[pr]", ":lexpr", NotImplemented, Neither, "lexpr", "lex", None,
+       "read locations from expr and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lf[ile]", ":lfile", NotImplemented, Neither, "lfile", "lf", None,
+       "read file with locations and jump to first — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lfir[st]", ":lfirst", Implemented, Both, "lfirst", "lfir", Some(Keys(":lfirst<CR>")),
+       "first location-list entry"),
+    ex(":lgetb[uffer]", ":lgetbuffer", NotImplemented, Neither, "lgetbuffer", "lgetb", None,
+       "get locations from buffer — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lgete[xpr]", ":lgetexpr", NotImplemented, Neither, "lgetexpr", "lgete", None,
+       "get locations from expr — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lg[etfile]", ":lgetfile", NotImplemented, AbbrevOnly, "lgetfile", "lg", None,
+       "read an error file into the location list — and vimcode's abbreviation table gives `:lg` to `:lgrep`, so Vim's documented `:lg[etfile]` silently runs a different command"),
+    ex(":lgr[ep]", ":lgrep", Implemented, Both, "lgrep", "lgr", Some(Keys(":lgrep ")),
+       "location-list grep"),
+    ex(":lgrepa[dd]", ":lgrepadd", NotImplemented, Neither, "lgrepadd", "lgrepa", None,
+       "like :grep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lh[elpgrep]", ":lhelpgrep", NotImplemented, Neither, "lhelpgrep", "lh", None,
+       "like \":helpgrep\" but uses location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lhi[story]", ":lhistory", NotImplemented, Neither, "lhistory", "lhi", None,
+       "list the location lists — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ll", ":ll", Implemented, Both, "ll", "ll", Some(Keys(":ll<CR>")),
+       "jumps to location-list entry N"),
+    ex(":lla[st]", ":llast", Implemented, Both, "llast", "lla", Some(Keys(":llast<CR>")),
+       "last location-list entry"),
+    ex(":lli[st]", ":llist", Implemented, Both, "llist", "lli", Some(Keys(":llist<CR>")),
+       "lists location-list entries"),
+    ex(":lmak[e]", ":lmake", NotImplemented, Neither, "lmake", "lmak", None,
+       "execute external command 'makeprg' and parse error messages — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lm[ap]", ":lmap", Skipped(BIDI), Neither, "lmap", "lm", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lmapc[lear]", ":lmapclear", Skipped(BIDI), Neither, "lmapclear", "lmapc", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lne[xt]", ":lnext", Implemented, Both, "lnext", "lne", Some(Keys(":lnext<CR>")),
+       "next location-list entry"),
+    ex(":lnew[er]", ":lnewer", NotImplemented, Neither, "lnewer", "lnew", None,
+       "go to newer location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lnf[ile]", ":lnfile", NotImplemented, Neither, "lnfile", "lnf", None,
+       "go to first location in next file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ln[oremap]", ":lnoremap", Skipped(BIDI), AbbrevOnly, "lnoremap", "ln", None,
+       "'langmap' mapping — and vimcode's abbreviation table gives `:ln` to `:lnext`, so Vim's documented `:ln[oremap]` runs a different command"),
+    ex(":loadk[eymap]", ":loadkeymap", Skipped(BIDI), Neither, "loadkeymap", "loadk", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lo[adview]", ":loadview", Skipped(SESSION), Neither, "loadview", "lo", None,
+       "no :mksession/:mkview support planned"),
+    ex(":loc[kmarks]", ":lockmarks", NotImplemented, Neither, "lockmarks", "loc", None,
+       "following command keeps marks where they are — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":lockv[ar]", ":lockvar", Skipped(VIMSCRIPT), Neither, "lockvar", "lockv", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":lol[der]", ":lolder", NotImplemented, Neither, "lolder", "lol", None,
+       "go to older location list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lop[en]", ":lopen", Implemented, Both, "lopen", "lop", Some(Keys(":lopen<CR>")),
+       "opens the location-list window"),
+    ex(":lp[revious]", ":lprevious", Implemented, Both, "lprevious", "lp", Some(Keys(":lprevious<CR>")),
+       "previous location-list entry"),
+    ex(":lpf[ile]", ":lpfile", NotImplemented, Neither, "lpfile", "lpf", None,
+       "go to last location in previous file — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lr[ewind]", ":lrewind", NotImplemented, Neither, "lrewind", "lr", None,
+       "go to the specified location, default first one — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":ls", ":ls", Implemented, Both, "ls", "ls", Some(Keys(":ls<CR>")),
+       "alias of `:buffers`"),
+    ex(":lsp", ":lsp", NotImplemented, Neither, "lsp", "lsp", None,
+       "language server protocol — no vimcode equivalent; low value"),
+    ex(":lt[ag]", ":ltag", Skipped(CTAGS), Neither, "ltag", "lt", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":lu[nmap]", ":lunmap", Skipped(BIDI), Neither, "lunmap", "lu", None,
+       "'langmap'/input-method mappings; no right-to-left or IME support planned"),
+    ex(":lua", ":lua", Skipped(INTERP), Neither, "lua", "lua", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":luad[o]", ":luado", Skipped(INTERP), Neither, "luado", "luad", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":luaf[ile]", ":luafile", Skipped(INTERP), Neither, "luafile", "luaf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":lv[imgrep]", ":lvimgrep", Partial, FullOnly, "lvimgrep", "lv", Some(Keys(":lvimgrep ")),
+       "works, but `:lv` — Vim's documented minimum — is rejected"),
+    ex(":lvimgrepa[dd]", ":lvimgrepadd", NotImplemented, Neither, "lvimgrepadd", "lvimgrepa", None,
+       "like :vimgrep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":lw[indow]", ":lwindow", Implemented, Both, "lwindow", "lw", Some(Keys(":lwindow<CR>")),
+       "opens the location-list window only when non-empty"),
+    ex(":m[ove]", ":move", Implemented, Both, "move 0", "m 0", Some(Label("ex:2,3m$")),
+       "moves a range"),
+    ex(":ma[rk]", ":mark", Implemented, Both, "mark a", "ma a", Some(Label("ex:2mark a")),
+       "sets a mark on a line"),
+    ex(":mak[e]", ":make", Implemented, Both, "make -f /dev/null -q", "mak -f /dev/null -q", Some(Keys(":make")),
+       "shells out to make and reports the first output line"),
+    ex(":map", ":map", Implemented, Both, "map", "map", Some(Keys(":map ")),
+       "lists and defines mappings"),
+    ex(":mapc[lear]", ":mapclear", Partial, FullOnly, "mapclear", "mapc", Some(Keys(":mapclear")),
+       "works, but `:mapc` is rejected"),
+    ex(":marks", ":marks", Implemented, Both, "marks", "marks", Some(Keys(":marks<CR>")),
+       "lists marks (see #1226 for what it omits)"),
+    ex(":mat[ch]", ":match", NotImplemented, Neither, "match", "mat", None,
+       "define a match to highlight — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":me[nu]", ":menu", Skipped(MENU), Neither, "menu", "me", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":mes[sages]", ":messages", NotImplemented, Neither, "messages", "mes", None,
+       "view previously displayed messages — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":mk[exrc]", ":mkexrc", Skipped(SESSION), Neither, "mkexrc", "mk", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mks[ession]", ":mksession", Skipped(SESSION), Neither, "mksession", "mks", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mksp[ell]", ":mkspell", NotImplemented, Neither, "mkspell", "mksp", None,
+       "produce .spl spell file — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":mkv[imrc]", ":mkvimrc", Skipped(SESSION), Neither, "mkvimrc", "mkv", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mkvie[w]", ":mkview", Skipped(SESSION), Neither, "mkview", "mkvie", None,
+       "no :mksession/:mkview support planned"),
+    ex(":mod[e]", ":mode", Skipped(TERMCAP), Neither, "mode", "mod", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":n[ext]", ":next", NotImplemented, Neither, "next", "n", None,
+       "go to next file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":new", ":new", Implemented, Both, "new", "new", Some(Keys(":new<CR>")),
+       "splits with a new empty buffer"),
+    ex(":nm[ap]", ":nmap", Partial, FullOnly, "nmap", "nm", Some(Label("map:nmap_chases_recursively")),
+       "works, but `:nm` — Vim's documented minimum — is rejected"),
+    ex(":nmapc[lear]", ":nmapclear", Partial, FullOnly, "nmapclear", "nmapc", Some(Keys(":nmapclear")),
+       "works, but `:nmapc` is rejected"),
+    ex(":nme[nu]", ":nmenu", Skipped(MENU), Neither, "nmenu", "nme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":nn[oremap]", ":nnoremap", Partial, FullOnly, "nnoremap", "nn", Some(Label("map:nnoremap_does_not_chase")),
+       "works, but `:nn` is rejected"),
+    ex(":nnoreme[nu]", ":nnoremenu", Skipped(MENU), Neither, "nnoremenu", "nnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":noa[utocmd]", ":noautocmd", NotImplemented, Neither, "noautocmd", "noa", None,
+       "following commands don't trigger autocommands — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":no[remap]", ":noremap", Partial, FullOnly, "noremap", "no", Some(Keys(":noremap ")),
+       "works, but `:no` is rejected"),
+    ex(":noh[lsearch]", ":nohlsearch", Implemented, Both, "nohlsearch", "noh", Some(Label("ex:noh no effect")),
+       "clears search highlighting"),
+    ex(":norea[bbrev]", ":noreabbrev", Implemented, Both, "noreabbrev", "norea", Some(Keys(":noreabbrev ")),
+       "non-recursive abbreviation"),
+    ex(":noreme[nu]", ":noremenu", Skipped(MENU), Neither, "noremenu", "noreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":norm[al]", ":normal", Implemented, Both, "normal x", "norm x", Some(Label("ex:normal Ax")),
+       "`:normal`/`:normal!` with a range, replaying real keystrokes"),
+    ex(":nos[wapfile]", ":noswapfile", NotImplemented, Neither, "noswapfile", "nos", None,
+       "following commands don't create a swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":nu[mber]", ":number", Partial, Both, "number", "nu", Some(Keys(":number<CR>")),
+       "prints the current line numbered, but `:1,2#`/`:1,2number` is rejected — no range"),
+    ex(":nun[map]", ":nunmap", Partial, FullOnly, "nunmap", "nun", Some(Keys(":nunmap ")),
+       "works, but `:nun` is rejected"),
+    ex(":nunme[nu]", ":nunmenu", Skipped(MENU), Neither, "nunmenu", "nunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":ol[dfiles]", ":oldfiles", NotImplemented, Neither, "oldfiles", "ol", None,
+       "list files that have marks in the |shada| file — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":om[ap]", ":omap", Partial, FullOnly, "omap", "om", Some(Keys(":omap ")),
+       "works, but `:om` is rejected"),
+    ex(":omapc[lear]", ":omapclear", Partial, FullOnly, "omapclear", "omapc", Some(Keys(":omapclear")),
+       "works, but `:omapc` is rejected"),
+    ex(":ome[nu]", ":omenu", Skipped(MENU), Neither, "omenu", "ome", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":on[ly]", ":only", Implemented, Both, "only", "on", Some(Keys(":only<CR>")),
+       "closes every other window"),
+    ex(":ono[remap]", ":onoremap", Partial, FullOnly, "onoremap", "ono", Some(Label("map:onoremap_extends_a_motion")),
+       "works, but `:ono` is rejected"),
+    ex(":onoreme[nu]", ":onoremenu", Skipped(MENU), Neither, "onoremenu", "onoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":opt[ions]", ":options", Skipped(SCRIPTRT), Neither, "options", "opt", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":ou[nmap]", ":ounmap", Partial, FullOnly, "ounmap", "ou", Some(Keys(":ounmap ")),
+       "works, but `:ou` is rejected"),
+    ex(":ounme[nu]", ":ounmenu", Skipped(MENU), Neither, "ounmenu", "ounme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":pa[ckadd]", ":packadd", Skipped(SCRIPTRT), Neither, "packadd", "pa", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":packl[oadall]", ":packloadall", Skipped(SCRIPTRT), Neither, "packloadall", "packl", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":pb[uffer]", ":pbuffer", NotImplemented, Neither, "pbuffer", "pb", None,
+       "edit buffer in the preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":pc[lose]", ":pclose", NotImplemented, Neither, "pclose", "pc", None,
+       "close preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":ped[it]", ":pedit", NotImplemented, Neither, "pedit", "ped", None,
+       "edit file in the preview window — no preview window; LSP hover and the peek panel cover the same ground; low value"),
+    ex(":pe[rl]", ":perl", Skipped(INTERP), Neither, "perl", "pe", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":perld[o]", ":perldo", Skipped(INTERP), Neither, "perldo", "perld", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":perlf[ile]", ":perlfile", Skipped(INTERP), Neither, "perlfile", "perlf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":p[rint]", ":print", Partial, Both, "print", "p", Some(Keys(":print<CR>")),
+       "prints the current line, but `:1,2p` is rejected — no range, and no `l`/`#` flags"),
+    ex(":profd[el]", ":profdel", Skipped(VIMSCRIPT), Neither, "profdel", "profd", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":prof[ile]", ":profile", Skipped(VIMSCRIPT), Neither, "profile", "prof", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":po[p]", ":pop", Skipped(CTAGS), Neither, "pop", "po", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":popu[p]", ":popup", Skipped(MENU), Neither, "popup", "popu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":pp[op]", ":ppop", Skipped(CTAGS), Neither, "ppop", "pp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pre[serve]", ":preserve", NotImplemented, Neither, "preserve", "pre", None,
+       "write all text to swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":prev[ious]", ":previous", NotImplemented, Neither, "previous", "prev", None,
+       "go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ps[earch]", ":psearch", Skipped(CTAGS), Neither, "psearch", "ps", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pt[ag]", ":ptag", Skipped(CTAGS), Neither, "ptag", "pt", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptN[ext]", ":ptNext", Skipped(CTAGS), Neither, "ptNext", "ptN", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptf[irst]", ":ptfirst", Skipped(CTAGS), Neither, "ptfirst", "ptf", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptj[ump]", ":ptjump", Skipped(CTAGS), Neither, "ptjump", "ptj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptl[ast]", ":ptlast", Skipped(CTAGS), Neither, "ptlast", "ptl", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptn[ext]", ":ptnext", Skipped(CTAGS), Neither, "ptnext", "ptn", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptp[revious]", ":ptprevious", Skipped(CTAGS), Neither, "ptprevious", "ptp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":ptr[ewind]", ":ptrewind", Skipped(CTAGS), Neither, "ptrewind", "ptr", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pts[elect]", ":ptselect", Skipped(CTAGS), Neither, "ptselect", "pts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":pu[t]", ":put", Implemented, Both, "put", "pu", Some(Label("ex:put a")),
+       "puts a register after a line, with `!` and `:0put`"),
+    ex(":pw[d]", ":pwd", Implemented, Both, "pwd", "pw", Some(Keys(":pwd<CR>")),
+       "prints the working directory"),
+    ex(":py3", ":py3", Skipped(INTERP), Neither, "py3", "py3", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":python3", ":python3", Skipped(INTERP), Neither, "python3", "python3", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py3d[o]", ":py3do", Skipped(INTERP), Neither, "py3do", "py3d", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py3f[ile]", ":py3file", Skipped(INTERP), Neither, "py3file", "py3f", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":py[thon]", ":python", Skipped(INTERP), Neither, "python", "py", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyd[o]", ":pydo", Skipped(INTERP), Neither, "pydo", "pyd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyf[ile]", ":pyfile", Skipped(INTERP), Neither, "pyfile", "pyf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyx", ":pyx", Skipped(INTERP), Neither, "pyx", "pyx", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pythonx", ":pythonx", Skipped(INTERP), Neither, "pythonx", "pythonx", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyxd[o]", ":pyxdo", Skipped(INTERP), Neither, "pyxdo", "pyxd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":pyxf[ile]", ":pyxfile", Skipped(INTERP), Neither, "pyxfile", "pyxf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":q[uit]", ":quit", Implemented, Both, "quit", "q", Some(Keys(":quit<CR>")),
+       "closes the window, refusing on unsaved changes without `!`"),
+    ex(":quita[ll]", ":quitall", NotImplemented, Neither, "quitall", "quita", None,
+       "quit Vim — no vimcode equivalent; low value"),
+    ex(":qa[ll]", ":qall", Implemented, Both, "qall", "qa", Some(Keys(":qall<CR>")),
+       "quits everything"),
+    ex(":r[ead]", ":read", Implemented, Both, "read foo", "r foo", Some(Label("ex:r !echo")),
+       "`:r {file}` inserts a file and `:r !{cmd}` inserts a command's stdout"),
+    ex(":rec[over]", ":recover", NotImplemented, Neither, "recover", "rec", None,
+       "recover a file from a swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":red[o]", ":redo", Implemented, Both, "redo", "red", Some(Label("ex:undo redo")),
+       "redo"),
+    ex(":redi[r]", ":redir", Skipped(VIMSCRIPT), Neither, "redir", "redi", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":redr[aw]", ":redraw", Skipped(TERMCAP), Neither, "redraw", "redr", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":redraws[tatus]", ":redrawstatus", Skipped(TERMCAP), Neither, "redrawstatus", "redraws", None,
+       "terminal/redraw control belongs to quadraui; vimcode's backends repaint on their own"),
+    ex(":reg[isters]", ":registers", Implemented, Both, "registers", "reg", Some(Keys(":registers<CR>")),
+       "lists registers"),
+    ex(":res[ize]", ":resize", NotImplemented, Neither, "resize", "res", None,
+       "change current window height — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":restart", ":restart", NotImplemented, Both, "restart", "restart", None,
+       "Vim's restart — vimcode binds the name to its DAP debugger's restart-session, so the Vim command is shadowed rather than missing; low value, but the collision is worth a rename"),
+    ex(":ret[ab]", ":retab", Implemented, Both, "retab", "ret", Some(Label("ex:retab")),
+       "retabs a range, honouring 'expandtab' and `!`"),
+    ex(":retu[rn]", ":return", Skipped(VIMSCRIPT), Neither, "return", "retu", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":rew[ind]", ":rewind", NotImplemented, Neither, "rewind", "rew", None,
+       "go to the first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":ri[ght]", ":right", Implemented, Both, "right", "ri", Some(Label("ex:ri 10")),
+       "right-aligns within a width"),
+    ex(":rightb[elow]", ":rightbelow", NotImplemented, Neither, "rightbelow", "rightb", None,
+       "make split window appear right or below — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":rsh[ada]", ":rshada", Skipped(SHADA), Neither, "rshada", "rsh", None,
+       "no ShaDa/viminfo file; vimcode persists its own session state (src/core/session.rs)"),
+    ex(":rub[y]", ":ruby", Skipped(INTERP), Neither, "ruby", "rub", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rubyd[o]", ":rubydo", Skipped(INTERP), Neither, "rubydo", "rubyd", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rubyf[ile]", ":rubyfile", Skipped(INTERP), Neither, "rubyfile", "rubyf", None,
+       "language-binding ex command; vimcode's Lua runtime is the extension API, not a `:` command"),
+    ex(":rund[o]", ":rundo", NotImplemented, Neither, "rundo", "rund", None,
+       "read undo information from a file — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":ru[ntime]", ":runtime", Skipped(SCRIPTRT), Neither, "runtime", "ru", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":s[ubstitute]", ":substitute", Implemented, Both, "s/alpha/A/", "s/alpha/A/", Some(Label("sub:basic")),
+       "the full `:s` surface: flags, ranges, `\\\\v`, `\\\\zs`, `c` confirm, 'gdefault'"),
+    ex(":sN[ext]", ":sNext", NotImplemented, Neither, "sNext", "sN", None,
+       "split window and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":san[dbox]", ":sandbox", Skipped(VIMSCRIPT), Neither, "sandbox", "san", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sa[rgument]", ":sargument", NotImplemented, Neither, "sargument", "sa", None,
+       "split window and go to specific file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sal[l]", ":sall", NotImplemented, Neither, "sall", "sal", None,
+       "open a window for each file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sav[eas]", ":saveas", Partial, Both, "saveas", "sav", Some(Keys(":saveas ")),
+       "`:saveas {file}` writes and renames, but bare `:saveas` is a silent no-op where Vim reports E471"),
+    ex(":sb[uffer]", ":sbuffer", NotImplemented, Neither, "sbuffer", "sb", None,
+       "split window and go to specific file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbN[ext]", ":sbNext", NotImplemented, Neither, "sbNext", "sbN", None,
+       "split window and go to previous file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sba[ll]", ":sball", NotImplemented, Neither, "sball", "sba", None,
+       "open a window for each file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbf[irst]", ":sbfirst", NotImplemented, Neither, "sbfirst", "sbf", None,
+       "split window and go to first file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbl[ast]", ":sblast", NotImplemented, Neither, "sblast", "sbl", None,
+       "split window and go to last file in buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbm[odified]", ":sbmodified", NotImplemented, Neither, "sbmodified", "sbm", None,
+       "split window and go to modified file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbn[ext]", ":sbnext", NotImplemented, Neither, "sbnext", "sbn", None,
+       "split window and go to next file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbp[revious]", ":sbprevious", NotImplemented, Neither, "sbprevious", "sbp", None,
+       "split window and go to previous file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sbr[ewind]", ":sbrewind", NotImplemented, Neither, "sbrewind", "sbr", None,
+       "split window and go to first file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":scr[iptnames]", ":scriptnames", Skipped(SCRIPTRT), Neither, "scriptnames", "scr", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":se[t]", ":set", Implemented, Both, "set", "se", Some(Keys(":set ")),
+       "the option surface audited in full by #1225"),
+    ex(":setf[iletype]", ":setfiletype", NotImplemented, Neither, "setfiletype", "setf", None,
+       "set 'filetype', unless it was set already — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":setg[lobal]", ":setglobal", NotImplemented, Neither, "setglobal", "setg", None,
+       "show global values of options — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":setl[ocal]", ":setlocal", NotImplemented, Neither, "setlocal", "setl", None,
+       "show or set options locally — `:set` exists but has no local/global split (vimcode's settings are global), and `:setfiletype`/`:filetype` are absent; `:setfiletype` is worth implementing"),
+    ex(":sf[ind]", ":sfind", NotImplemented, Neither, "sfind", "sf", None,
+       "split current window and edit file in 'path' — no vimcode equivalent; low value"),
+    ex(":sfir[st]", ":sfirst", NotImplemented, Neither, "sfirst", "sfir", None,
+       "split window and go to first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sig[n]", ":sign", NotImplemented, Neither, "sign", "sig", None,
+       "manipulate signs — vimcode paints LSP diagnostics in the gutter but exposes no `:sign` API; low value"),
+    ex(":sil[ent]", ":silent", Skipped(VIMSCRIPT), Neither, "silent", "sil", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sl[eep]", ":sleep", NotImplemented, Neither, "sleep", "sl", None,
+       "do nothing for a few seconds — only useful inside scripts; low value"),
+    ex(":sl[eep]!", ":sleep!", NotImplemented, Neither, "sleep!", "sl!", None,
+       "`:sleep` without a visible cursor; blocked on `:sleep`"),
+    ex(":sla[st]", ":slast", NotImplemented, Neither, "slast", "sla", None,
+       "split window and go to last file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sm[agic]", ":smagic", NotImplemented, Neither, "smagic/alpha/A/", "sm/alpha/A/", None,
+       ":substitute with 'magic' — no vimcode equivalent; low value"),
+    ex(":smap", ":smap", Skipped(SELECT), Both, "smap", "smap", None,
+       "recognised and stored, but vimcode has no Select mode, so the mapping can never fire"),
+    ex(":smapc[lear]", ":smapclear", Skipped(SELECT), FullOnly, "smapclear", "smapc", None,
+       "recognised, but there is no Select mode for it to apply to"),
+    ex(":sme[nu]", ":smenu", Skipped(MENU), Neither, "smenu", "sme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sn[ext]", ":snext", NotImplemented, Neither, "snext", "sn", None,
+       "split window and go to next file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sno[magic]", ":snomagic", NotImplemented, Neither, "snomagic/alpha/A/", "sno/alpha/A/", None,
+       ":substitute with 'nomagic' — no vimcode equivalent; low value"),
+    ex(":snor[emap]", ":snoremap", Skipped(SELECT), FullOnly, "snoremap", "snor", None,
+       "recognised and stored, but there is no Select mode for it to apply to"),
+    ex(":snoreme[nu]", ":snoremenu", Skipped(MENU), Neither, "snoremenu", "snoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sor[t]", ":sort", Implemented, Both, "sort", "sor", Some(Label("ex:sort")),
+       "sorts with `n`, `i`, `u`, `r`, `!` and a `/pat/`"),
+    ex(":so[urce]", ":source", Skipped(SCRIPTRT), Neither, "source", "so", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":spelld[ump]", ":spelldump", NotImplemented, Neither, "spelldump", "spelld", None,
+       "split window and fill with all correct words — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spe[llgood]", ":spellgood", NotImplemented, Neither, "spellgood", "spe", None,
+       "add good word for spelling — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spelli[nfo]", ":spellinfo", NotImplemented, Neither, "spellinfo", "spelli", None,
+       "show info about loaded spell files — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellra[re]", ":spellrare", NotImplemented, Neither, "spellrare", "spellra", None,
+       "add rare word for spelling — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellr[epall]", ":spellrepall", NotImplemented, Neither, "spellrepall", "spellr", None,
+       "replace all bad words like last |z=| — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellu[ndo]", ":spellundo", NotImplemented, Neither, "spellundo", "spellu", None,
+       "remove good or bad word — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":spellw[rong]", ":spellwrong", NotImplemented, Neither, "spellwrong", "spellw", None,
+       "add spelling mistake — vimcode ships a real spell checker (`src/core/spell.rs`, #1163) but exposes no `:spell*` ex command for it — the cheapest ❌ family in this slice to close"),
+    ex(":sp[lit]", ":split", Implemented, Both, "split", "sp", Some(Keys(":split<CR>")),
+       "horizontal split"),
+    ex(":spr[evious]", ":sprevious", NotImplemented, Neither, "sprevious", "spr", None,
+       "split window and go to previous file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sre[wind]", ":srewind", NotImplemented, Neither, "srewind", "sre", None,
+       "split window and go to first file in the argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":st[op]", ":stop", NotImplemented, FullOnly, "stop", "st", None,
+       "suspend the editor — vimcode binds `:stop` to its DAP debugger instead, so `CTRL-Z`'s ex spelling does nothing a TUI user expects; worth implementing in the TUI backend and renaming the DAP command"),
+    ex(":sta[g]", ":stag", Skipped(CTAGS), Neither, "stag", "sta", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":star[tinsert]", ":startinsert", Implemented, Both, "startinsert", "star", Some(Label("ex:startinsert then type")),
+       "enters Insert mode, with `!` for end-of-line"),
+    ex(":startr[eplace]", ":startreplace", NotImplemented, Neither, "startreplace", "startr", None,
+       "start Replace mode — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":stopi[nsert]", ":stopinsert", Implemented, Both, "stopinsert", "stopi", Some(Label("ex:stopinsert noop when already Normal")),
+       "leaves Insert mode"),
+    ex(":stj[ump]", ":stjump", Skipped(CTAGS), Neither, "stjump", "stj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":sts[elect]", ":stselect", Skipped(CTAGS), Neither, "stselect", "sts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":sun[hide]", ":sunhide", NotImplemented, Neither, "sunhide", "sun", None,
+       "same as \":unhide\" — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":sunm[ap]", ":sunmap", Skipped(SELECT), FullOnly, "sunmap", "sunm", None,
+       "recognised, but there is no Select mode for it to apply to"),
+    ex(":sunme[nu]", ":sunmenu", Skipped(MENU), Neither, "sunmenu", "sunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":sus[pend]", ":suspend", NotImplemented, Neither, "suspend", "sus", None,
+       "same as \":stop\" — no vimcode equivalent; low value"),
+    ex(":sv[iew]", ":sview", NotImplemented, Neither, "sview", "sv", None,
+       "split window and edit file read-only — no vimcode equivalent; low value"),
+    ex(":sw[apname]", ":swapname", NotImplemented, Neither, "swapname", "sw", None,
+       "show the name of the current swap file — vimcode has swap files and recovery (`tests/swap_recovery.rs`) but no ex commands for them; `:recover` is worth implementing"),
+    ex(":sy[ntax]", ":syntax", NotImplemented, Neither, "syntax", "sy", None,
+       "syntax highlighting — tree-sitter plus the theme registry replace Vim's syntax/highlight files; low value"),
+    ex(":synti[me]", ":syntime", Skipped(VIMSCRIPT), Neither, "syntime", "synti", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":sync[bind]", ":syncbind", NotImplemented, Neither, "syncbind", "sync", None,
+       "sync scroll binding — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":t", ":t", Implemented, Both, "t 0", "t 0", Some(Label("ex:1,2t$")),
+       "the short form of `:copy`"),
+    ex(":tN[ext]", ":tNext", Skipped(CTAGS), Neither, "tNext", "tN", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tabN[ext]", ":tabNext", NotImplemented, Neither, "tabNext", "tabN", None,
+       "go to previous tabpage — no vimcode equivalent; low value"),
+    ex(":tabc[lose]", ":tabclose", Implemented, Both, "tabclose", "tabc", Some(Keys(":tabclose<CR>")),
+       "closes a tab, refusing on the last one"),
+    ex(":tabd[o]", ":tabdo", Implemented, Both, "tabdo s/a/b/", "tabdo s/a/b/", Some(Keys(":tabdo ")),
+       "runs a command in every tab"),
+    ex(":tabe[dit]", ":tabedit", Partial, AbbrevOnly, "tabedit", "tabe", Some(Keys(":tabe ")),
+       "`:tabe`/`:tabnew` work; the full spelling `:tabedit` is rejected"),
+    ex(":tabf[ind]", ":tabfind", NotImplemented, Neither, "tabfind", "tabf", None,
+       "find file in 'path', edit it in a new tabpage — no vimcode equivalent; low value"),
+    ex(":tabfir[st]", ":tabfirst", Implemented, Both, "tabfirst", "tabfir", Some(Label("ex:tabfirst noop with one tab")),
+       "first tab"),
+    ex(":tabl[ast]", ":tablast", Implemented, Both, "tablast", "tabl", Some(Label("ex:tablast noop with one tab")),
+       "last tab"),
+    ex(":tabm[ove]", ":tabmove", Implemented, Both, "tabmove", "tabm", Some(Keys(":tabmove")),
+       "moves the tab"),
+    ex(":tabnew", ":tabnew", Implemented, Both, "tabnew", "tabnew", Some(Keys(":tabnew")),
+       "new tab"),
+    ex(":tabn[ext]", ":tabnext", Implemented, Both, "tabnext", "tabn", Some(Keys(":tabnext<CR>")),
+       "next tab"),
+    ex(":tabo[nly]", ":tabonly", Implemented, Both, "tabonly", "tabo", Some(Label("ex:tabonly noop with one tab")),
+       "closes every other tab"),
+    ex(":tabp[revious]", ":tabprevious", Implemented, Both, "tabprevious", "tabp", Some(Keys(":tabprevious<CR>")),
+       "previous tab"),
+    ex(":tabr[ewind]", ":tabrewind", NotImplemented, Neither, "tabrewind", "tabr", None,
+       "go to first tabpage — no vimcode equivalent; low value"),
+    ex(":tabs", ":tabs", Implemented, Both, "tabs", "tabs", Some(Keys(":tabs<CR>")),
+       "lists tabs"),
+    ex(":tab", ":tab", NotImplemented, Neither, "tab", "tab", None,
+       "create new tab when opening new window — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":ta[g]", ":tag", Skipped(CTAGS), Neither, "tag", "ta", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tags", ":tags", Skipped(CTAGS), Neither, "tags", "tags", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tc[d]", ":tcd", NotImplemented, Neither, "tcd", "tc", None,
+       "change directory for tabpage — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tch[dir]", ":tchdir", NotImplemented, Neither, "tchdir", "tch", None,
+       "change directory for tabpage — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":te[rminal]", ":terminal", Implemented, Both, "terminal", "te", Some(Keys(":terminal<CR>")),
+       "opens the terminal panel"),
+    ex(":tf[irst]", ":tfirst", Skipped(CTAGS), Neither, "tfirst", "tf", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":th[row]", ":throw", Skipped(VIMSCRIPT), Neither, "throw", "th", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":tj[ump]", ":tjump", Skipped(CTAGS), Neither, "tjump", "tj", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tl[ast]", ":tlast", Skipped(CTAGS), Neither, "tlast", "tl", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tlm[enu]", ":tlmenu", Skipped(MENU), Neither, "tlmenu", "tlm", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tln[oremenu]", ":tlnoremenu", Skipped(MENU), Neither, "tlnoremenu", "tln", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tlu[nmenu]", ":tlunmenu", Skipped(MENU), Neither, "tlunmenu", "tlu", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tmapc[lear]", ":tmapclear", NotImplemented, Neither, "tmapclear", "tmapc", None,
+       "remove all mappings for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tma[p]", ":tmap", NotImplemented, Neither, "tmap", "tma", None,
+       "like \":map\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tm[enu]", ":tmenu", Skipped(MENU), Neither, "tmenu", "tm", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":tn[ext]", ":tnext", Skipped(CTAGS), Neither, "tnext", "tn", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tno[remap]", ":tnoremap", NotImplemented, Neither, "tnoremap", "tno", None,
+       "like \":noremap\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":to[pleft]", ":topleft", NotImplemented, Neither, "topleft", "to", None,
+       "make split window appear at top or far left — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":tp[revious]", ":tprevious", Skipped(CTAGS), Neither, "tprevious", "tp", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tr[ewind]", ":trewind", Skipped(CTAGS), Neither, "trewind", "tr", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":trust", ":trust", Skipped(SCRIPTRT), Neither, "trust", "trust", None,
+       "needs a script/plugin runtime vimcode does not have"),
+    ex(":try", ":try", Skipped(VIMSCRIPT), Neither, "try", "try", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":ts[elect]", ":tselect", Skipped(CTAGS), Neither, "tselect", "ts", None,
+       "tags/'include' file search; vimcode uses LSP go-to-definition and references instead"),
+    ex(":tunma[p]", ":tunmap", NotImplemented, Neither, "tunmap", "tunma", None,
+       "like \":unmap\" but for |Terminal-mode| — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":tu[nmenu]", ":tunmenu", NotImplemented, Neither, "tunmenu", "tu", None,
+       "remove menu tooltip — no vimcode equivalent; low value"),
+    ex(":u[ndo]", ":undo", Implemented, Both, "undo", "u", Some(Label("ex:undo")),
+       "undo — backed by a real undo tree since #1156, so `g-`/`g+`/`:earlier`/`:later` can reach discarded branches"),
+    ex(":undoj[oin]", ":undojoin", Implemented, Both, "undojoin", "undoj", Some(Label("ex:undojoin")),
+       "join next change with previous undo block — landed in #1156; the oracle case pins the `E790` no-previous-change path, since Vim documents interactive `:undojoin` as fragile"),
+    ex(":undol[ist]", ":undolist", Implemented, Both, "undolist", "undol", Some(Label("ex:undolist")),
+       "list leafs of the undo tree — landed with the undo tree in #1156; message-only, so the oracle case pins that it leaves the buffer alone"),
+    ex(":una[bbreviate]", ":unabbreviate", Implemented, Both, "unabbreviate", "una", Some(Keys(":unabbreviate ")),
+       "removes an abbreviation"),
+    ex(":unh[ide]", ":unhide", NotImplemented, Neither, "unhide", "unh", None,
+       "open a window for each loaded file in the buffer list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":uni[q]", ":uniq", NotImplemented, Neither, "uniq", "uni", None,
+       "uniq lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":unl[et]", ":unlet", Skipped(VIMSCRIPT), Neither, "unlet", "unl", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":unlo[ckvar]", ":unlockvar", Skipped(VIMSCRIPT), Neither, "unlockvar", "unlo", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":unm[ap]", ":unmap", Partial, FullOnly, "unmap", "unm", Some(Keys(":unmap ")),
+       "works, but `:unm` is rejected"),
+    ex(":unme[nu]", ":unmenu", Skipped(MENU), Neither, "unmenu", "unme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":uns[ilent]", ":unsilent", Skipped(VIMSCRIPT), Neither, "unsilent", "uns", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":up[date]", ":update", Partial, Both, "update", "up", Some(Keys(":update<CR>")),
+       "writes only when modified, but `:update {file}` is rejected"),
+    ex(":v[global]", ":vglobal", Implemented, Both, "vglobal/beta/d", "v/beta/d", Some(Keys(":v/")),
+       "the inverse of `:global`"),
+    ex(":ve[rsion]", ":version", Implemented, Both, "version", "ve", Some(Keys(":version<CR>")),
+       "prints the version"),
+    ex(":verb[ose]", ":verbose", NotImplemented, Neither, "verbose", "verb", None,
+       "execute command with 'verbose' set — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":vert[ical]", ":vertical", NotImplemented, Neither, "vertical", "vert", None,
+       "make following command split vertically — `:wincmd` and `:split`/`:vsplit` cover the resize and split axes, but the `:{mod} {cmd}` modifier grammar is not parsed at all; moderate value"),
+    ex(":vim[grep]", ":vimgrep", Implemented, Both, "vimgrep", "vim", Some(Keys(":vimgrep ")),
+       "shares `:grep`'s implementation"),
+    ex(":vimgrepa[dd]", ":vimgrepadd", NotImplemented, Neither, "vimgrepadd", "vimgrepa", None,
+       "like :vimgrep, but append to current list — vimcode's quickfix list is filled by `:grep`/`:make` and LSP diagnostics, never from an error file or expression; low value"),
+    ex(":vi[sual]", ":visual", Skipped(EXMODE), Neither, "visual", "vi", None,
+       "Ex/Open mode line editing is out of scope"),
+    ex(":viu[sage]", ":viusage", NotImplemented, Neither, "viusage", "viu", None,
+       "overview of Normal mode commands — informational commands with no vimcode surface; `:messages` and `:oldfiles` (vimcode already has a recent-files picker) are the two worth adding"),
+    ex(":vie[w]", ":view", NotImplemented, Neither, "view", "vie", None,
+       "edit a file read-only — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":vm[ap]", ":vmap", Partial, FullOnly, "vmap", "vm", Some(Keys(":vmap ")),
+       "works, but `:vm` is rejected"),
+    ex(":vmapc[lear]", ":vmapclear", Partial, FullOnly, "vmapclear", "vmapc", Some(Keys(":vmapclear")),
+       "works, but `:vmapc` is rejected"),
+    ex(":vme[nu]", ":vmenu", Skipped(MENU), Neither, "vmenu", "vme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":vne[w]", ":vnew", Implemented, Both, "vnew", "vne", Some(Keys(":vnew<CR>")),
+       "vertical split with a new empty buffer"),
+    ex(":vn[oremap]", ":vnoremap", Partial, FullOnly, "vnoremap", "vn", Some(Keys(":vnoremap ")),
+       "works, but `:vn` is rejected"),
+    ex(":vnoreme[nu]", ":vnoremenu", Skipped(MENU), Neither, "vnoremenu", "vnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":vs[plit]", ":vsplit", Implemented, Both, "vsplit", "vs", Some(Keys(":vsplit<CR>")),
+       "vertical split"),
+    ex(":vu[nmap]", ":vunmap", Partial, FullOnly, "vunmap", "vu", Some(Keys(":vunmap ")),
+       "works, but `:vu` is rejected"),
+    ex(":vunme[nu]", ":vunmenu", Skipped(MENU), Neither, "vunmenu", "vunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":wind[o]", ":windo", Implemented, Both, "windo s/a/b/", "windo s/a/b/", Some(Keys(":windo ")),
+       "runs a command in every window"),
+    ex(":w[rite]", ":write", Partial, Both, "write", "w", Some(Keys(":write<CR>")),
+       "writes the current buffer, but `:w {file}`, `:w >>{file}` and `:w !{cmd}` are all rejected — `:saveas` is the only way to write elsewhere"),
+    ex(":wN[ext]", ":wNext", NotImplemented, Neither, "wNext", "wN", None,
+       "write to a file and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wa[ll]", ":wall", Implemented, Both, "wall", "wa", Some(Keys(":wall<CR>")),
+       "writes every modified buffer"),
+    ex(":wh[ile]", ":while", Skipped(VIMSCRIPT), Neither, "while", "wh", None,
+       "VimScript: out of scope per the standing decision (vimcode implements Vim keybindings and editing, not a VimScript runtime)"),
+    ex(":wi[nsize]", ":winsize", Skipped(MENU), Neither, "winsize", "wi", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":winc[md]", ":wincmd", Implemented, Both, "wincmd", "winc", Some(Keys(":wincmd ")),
+       "the ex form of CTRL-W"),
+    ex(":winp[os]", ":winpos", Skipped(MENU), Neither, "winpos", "winp", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":wn[ext]", ":wnext", NotImplemented, Neither, "wnext", "wn", None,
+       "write to a file and go to next file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wp[revious]", ":wprevious", NotImplemented, Neither, "wprevious", "wp", None,
+       "write to a file and go to previous file in argument list — vimcode has no argument list, and splits+`:buffer` cover the `:s…`/`:sb…` family; moderate value for `:argdo` alone"),
+    ex(":wq", ":wq", Partial, Both, "wq", "wq", Some(Keys(":wq<CR>")),
+       "writes and quits, but `:wq {file}` is rejected"),
+    ex(":wqa[ll]", ":wqall", Implemented, Both, "wqall", "wqa", Some(Keys(":wqall<CR>")),
+       "writes everything and quits"),
+    ex(":wsh[ada]", ":wshada", Skipped(SHADA), Neither, "wshada", "wsh", None,
+       "no ShaDa/viminfo file; vimcode persists its own session state (src/core/session.rs)"),
+    ex(":wu[ndo]", ":wundo", NotImplemented, Neither, "wundo", "wu", None,
+       "write undo information to a file — the undo-tree surface; tracked by #1156, which is implementing persistent undo and the tree"),
+    ex(":x[it]", ":xit", Partial, AbbrevOnly, "xit", "x", Some(Keys(":x<CR>")),
+       "`:x` works; the full spelling `:xit` is rejected, and `:x {file}` too"),
+    ex(":xa[ll]", ":xall", Implemented, Both, "xall", "xa", Some(Keys(":xall<CR>")),
+       "writes the modified buffers and quits"),
+    ex(":xmapc[lear]", ":xmapclear", Partial, FullOnly, "xmapclear", "xmapc", Some(Keys(":xmapclear")),
+       "works, but `:xmapc` is rejected"),
+    ex(":xm[ap]", ":xmap", Partial, FullOnly, "xmap", "xm", Some(Keys(":xmap ")),
+       "works, but `:xm` is rejected"),
+    ex(":xme[nu]", ":xmenu", Skipped(MENU), Neither, "xmenu", "xme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":xn[oremap]", ":xnoremap", Partial, FullOnly, "xnoremap", "xn", Some(Keys(":xnoremap ")),
+       "works, but `:xn` is rejected"),
+    ex(":xnoreme[nu]", ":xnoremenu", Skipped(MENU), Neither, "xnoremenu", "xnoreme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":xu[nmap]", ":xunmap", Partial, FullOnly, "xunmap", "xu", Some(Keys(":xunmap ")),
+       "works, but `:xu` is rejected"),
+    ex(":xunme[nu]", ":xunmenu", Skipped(MENU), Neither, "xunmenu", "xunme", None,
+       "Vim's GUI menu/toolkit surface; vimcode's menus are quadraui widgets, not `:menu` entries"),
+    ex(":y[ank]", ":yank", Implemented, Both, "yank", "y", Some(Label("ex:y a")),
+       "yanks a range into a register, with a count"),
+    ex(":z", ":z", NotImplemented, Neither, "z", "z", None,
+       "print some lines — one-off commands with no vimcode equivalent; `:z`, `:list`, `:lcd`, `:view`, `:uniq` and the `:keep*`/`:lockmarks` modifiers are the ones a Vim user would actually miss"),
+    ex(":~", ":~", Partial, Both, "~", "~", Some(Keys(":~<CR>")),
+       "recognised, but it is a straight alias of `:&`: Vim's `:~` reuses the last *replacement string* from any `:s`, which vimcode does not track separately"),
+];
+
+/// ✅/🟡 rows that **no** oracle case reaches today. Shrink-only, exactly
+/// like `COVERAGE_EXEMPT` and `REGMARK_COVERAGE_EXEMPT`: deleting an entry
+/// requires a case that pins it, and a case that starts pinning one forces
+/// its entry to be deleted. Writing those cases is #1162.
+const EX_COVERAGE_EXEMPT: &[&str] = &[
+    ":abc[lear]",
+    ":b[uffer]",
+    ":bn[ext]",
+    ":bp[revious]",
+    ":cN[ext]",
+    // #1283: `:cclose`/`:cfirst`/`:clast`/`:clist`/`:cnewer`/`:colder`
+    // retire here — same real, oracle-backed empty-quickfix-list cases as
+    // `ex::cclose`/etc. in `COVERAGE_EXEMPT` above (`CASES_EX`'s "#1283"
+    // block). `:copen`/`:cwindow` retire via `CASES_XFILE`'s `WinCase`
+    // entries instead (they open a window) — `:copen`'s is currently RED,
+    // tracked in `KNOWN_DEVIATIONS_XFILE`, same as its `COVERAGE_EXEMPT`
+    // sibling.
+    ":cd",
+    ":cdo",
+    ":cfd[o]",
+    ":cm[ap]",
+    ":cmapc[lear]",
+    ":cn[ext]",
+    ":cno[remap]",
+    ":cnorea[bbrev]",
+    ":colo[rscheme]",
+    ":cp[revious]",
+    ":cq[uit]",
+    ":cu[nmap]",
+    ":diffo[ff]",
+    ":diffs[plit]",
+    ":difft[his]",
+    ":di[splay]",
+    ":files",
+    ":gr[ep]",
+    ":h[elp]",
+    ":im[ap]",
+    ":imapc[lear]",
+    ":inorea[bbrev]",
+    ":iu[nmap]",
+    ":lN[ext]",
+    // #1283: `:lclose`/`:lfirst`/`:ll`/`:llast`/`:llist`/`:lnext`/
+    // `:lprevious` retire the same way as their `:c*` siblings above.
+    // `:lopen`/`:lwindow` retire via `CASES_XFILE`'s `WinCase` entries.
+    ":ld[o]",
+    ":lfd[o]",
+    ":lgr[ep]",
+    ":lv[imgrep]",
+    ":mak[e]",
+    ":map",
+    ":mapc[lear]",
+    ":nmapc[lear]",
+    ":no[remap]",
+    ":norea[bbrev]",
+    ":nun[map]",
+    ":om[ap]",
+    ":omapc[lear]",
+    ":ou[nmap]",
+    ":q[uit]",
+    ":qa[ll]",
+    ":reg[isters]",
+    ":sav[eas]",
+    ":sp[lit]",
+    ":tabs",
+    ":te[rminal]",
+    ":una[bbreviate]",
+    ":unm[ap]",
+    ":ve[rsion]",
+    ":vim[grep]",
+    ":vm[ap]",
+    ":vmapc[lear]",
+    ":vn[oremap]",
+    ":vs[plit]",
+    ":vu[nmap]",
+    ":wa[ll]",
+    ":winc[md]",
+    ":wq",
+    ":wqa[ll]",
+    ":x[it]",
+    ":xa[ll]",
+    ":xmapc[lear]",
+    ":xm[ap]",
+    ":xn[oremap]",
+    ":xu[nmap]",
+    ":~",
+];
+
+/// Rows whose `status` and `dispatch` disagree for a reason gate 1b must be
+/// told about, rather than silently tolerating the shape.
+///
+/// `(cmd, reason)`. Kept tiny on purpose: every entry is a place where the
+/// cross-check would otherwise fire, so an unexplained one is a bug in the
+/// table, not in the rule.
+const EX_STATUS_DISPATCH_EXCEPTIONS: &[(&str, &str)] = &[(
+    ":*",
+    "`:*` is the `'<,'>` range, so the probe — an ex line run with no prior \
+     Visual selection — hits unset `'<`/`'>` marks and is refused. The corpus \
+     case `ex:*d after visual` selects first and passes, which is what makes \
+     the row ✅ despite a `Neither` measurement.",
+)];
+
+/// Drive one ex line through a real engine and report whether the dispatcher
+/// recognised it. Black-box: an ex line in, `engine.message` out.
+fn ex_line_is_recognised(line: &str) -> bool {
+    let mut engine = engine_with("alpha\nbeta\ngamma\ndelta\n");
+    engine.set_viewport_lines(24);
+    engine.execute_command(line);
+    !engine.message.contains("Not an editor command")
+}
+
+/// Re-measure one row's [`ExDispatch`].
+fn measured_ex_dispatch(probe_full: &str, probe_abbr: &str) -> ExDispatch {
+    match (
+        ex_line_is_recognised(probe_full),
+        ex_line_is_recognised(probe_abbr),
+    ) {
+        (true, true) => ExDispatch::Both,
+        (true, false) => ExDispatch::FullOnly,
+        (false, true) => ExDispatch::AbbrevOnly,
+        (false, false) => ExDispatch::Neither,
+    }
+}
+
+/// Every row whose recorded dispatch no longer matches the live dispatcher.
+fn ex_dispatch_drift(audit: &'static [ExAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        if e.dispatch == ExDispatch::Crashes {
+            continue;
+        }
+        let measured = measured_ex_dispatch(e.probe_full, e.probe_abbr);
+        if measured != e.dispatch {
+            drift.push(format!(
+                "  {} ({}): table says {:?}, driving {:?} / {:?} measures {:?}",
+                e.cmd, e.help, e.dispatch, e.probe_full, e.probe_abbr, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1227) — every row's `ExDispatch` is a claim about live code, and
+/// this replays all 551 runnable rows against it. Pure: no `nvim`, no
+/// subprocess except the one `:make` probe, so it runs on every lane.
+#[test]
+fn ex_audit_matches_the_live_dispatcher() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_EX") {
+        let mut s = String::new();
+        for e in EX_AUDIT {
+            if e.dispatch == ExDispatch::Crashes {
+                s.push_str(&format!("{}\tCrashes\n", e.cmd));
+                continue;
+            }
+            s.push_str(&format!(
+                "{}\t{:?}\n",
+                e.cmd,
+                measured_ex_dispatch(e.probe_full, e.probe_abbr)
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = ex_dispatch_drift(EX_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== ex-command audit drifted from execute.rs (#1227) ==\n\
+         Each row records what `Engine::execute_command` actually did with the\n\
+         full name and with `:help`'s minimal abbreviation when the slice ran.\n\
+         Implementing (or breaking) one of these changes that measurement, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, a probe added, and an EX_COVERAGE_EXEMPT entry\n\
+         until an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1227) — the table describes itself correctly: complete, in
+/// `:help` order, unique, no unreviewed row, every ⏭️ carrying a reason from
+/// the shared vocabulary, and a probe on exactly the rows that can have one.
+#[test]
+fn ex_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        EX_AUDIT.len(),
+        553,
+        "`:help ex-cmd-index` walked to 553 entries; the audit must tag all of them"
+    );
+
+    let excepted: HashSet<&str> = EX_STATUS_DISPATCH_EXCEPTIONS
+        .iter()
+        .map(|(c, _)| *c)
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for e in EX_AUDIT {
+        if !seen.insert(e.cmd) {
+            problems.push(format!("  {}: listed twice", e.cmd));
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!("  {}: empty note — every row is reviewed", e.cmd));
+        }
+        if e.help.trim().is_empty() {
+            problems.push(format!("  {}: no `:help` tag", e.cmd));
+        }
+        if e.note.contains("TODO") {
+            problems.push(format!("  {}: TODO note — every row is reviewed", e.cmd));
+        }
+
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.cmd
+                ));
+            }
+        }
+
+        let in_scope = matches!(e.status, OptStatus::Implemented | OptStatus::Partial);
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {}: Implemented/Partial, so it must name the oracle case that covers it",
+                e.cmd
+            ));
+        }
+        if !in_scope && e.probe.is_some() {
+            problems.push(format!(
+                "  {}: only Implemented/Partial rows carry an oracle probe",
+                e.cmd
+            ));
+        }
+        if in_scope && e.dispatch == ExDispatch::Neither && !excepted.contains(e.cmd) {
+            problems.push(format!(
+                "  {}: tagged {:?} but the dispatcher rejects both spellings — \
+                 either the tag is wrong or it needs an EX_STATUS_DISPATCH_EXCEPTIONS entry",
+                e.cmd, e.status
+            ));
+        }
+        if e.probe_full.is_empty() && e.probe_abbr.is_empty() && e.cmd != ":" {
+            problems.push(format!("  {}: no probe line to re-measure", e.cmd));
+        }
+    }
+
+    for (cmd, reason) in EX_STATUS_DISPATCH_EXCEPTIONS {
+        if !EX_AUDIT.iter().any(|e| e.cmd == *cmd) {
+            problems.push(format!("  {cmd}: exception names no audited command"));
+        }
+        if reason.trim().is_empty() {
+            problems.push(format!("  {cmd}: exception with no reason is a shrug"));
+        }
+    }
+
+    // The headline tally, pinned. The module doc quotes these numbers and a
+    // PR body quotes the module doc; without this they drift the moment a row
+    // is re-tagged, which is the exact rot a markdown checklist suffers from.
+    let tally = |want: fn(&ExAudit) -> bool| EX_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+        ),
+        (121, 53, 199, 180),
+        "the audit tally moved: (implemented, partial, missing, skipped). \
+         Update the module doc's table in the same commit."
+    );
+
+    // The two shapes the findings section calls out, pinned so they cannot
+    // regress silently: commands vimcode *recognises* while not implementing
+    // them, and commands reachable under only one of their two documented
+    // spellings.
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)
+                && e.dispatch != ExDispatch::Neither),
+            tally(
+                |e| matches!(e.status, OptStatus::Skipped(_)) && e.dispatch != ExDispatch::Neither
+            ),
+            tally(|e| e.dispatch == ExDispatch::FullOnly),
+            tally(|e| e.dispatch == ExDispatch::AbbrevOnly),
+            tally(|e| e.dispatch == ExDispatch::Crashes),
+        ),
+        (6, 8, 43, 6, 2),
+        "the (recognised-but-❌, recognised-but-⏭️, full-name-only, \
+         abbreviation-only, crashing) shape moved"
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== ex-command audit table is inconsistent (#1227) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_ex_coverage(
+    audit: &'static [ExAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.cmd)) {
+            (false, false) => v.uncovered.push(e.cmd),
+            (true, true) => v.newly_covered.push(e.cmd),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.cmd == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1227) — #1007's ratchet, applied to the audited ex commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn ex_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = EX_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        EX_COVERAGE_EXEMPT.len(),
+        "EX_COVERAGE_EXEMPT lists a command twice"
+    );
+
+    let v = classify_ex_coverage(EX_AUDIT, EX_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_EX_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check #1007's "deliberately dumb probe" note demands
+        // a human be able to do in one grep.
+        for e in EX_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.cmd,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - EX_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== ex-command oracle coverage (#1227) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        EX_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== ex-command oracle coverage moved (#1227) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the EX_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// The finding behind [`ExDispatch::Crashes`], pinned precisely rather than
+/// left as a status letter: `:bdelete` on the **last** buffer panics.
+///
+/// Vim replaces it with an empty [No Name] buffer; vimcode unloads it and
+/// then dereferences the window's now-dangling `buffer_id` in
+/// `Engine::active_buffer_state`. Black-box — an ex line in, a crash out —
+/// and it is a live user path: a one-file session plus `:bd` takes the editor
+/// down. `:bwipeout` shares the code path and the crash.
+///
+/// `#[should_panic]`, not `#[ignore]`, so it is the *fix* that has to touch
+/// this test: whoever makes `:bd` fall back to an empty buffer will see this
+/// go red and rewrite it into the assertion the behaviour deserves.
+#[test]
+#[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
+fn bdelete_on_the_last_buffer_panics_instead_of_refusing() {
+    let mut engine = engine_with("alpha\nbeta\n");
+    engine.execute_command("bdelete");
+    // Unreachable today. When `:bd` learns Vim's fallback this line runs, the
+    // `should_panic` fails, and the row's `ExDispatch::Crashes` has to change.
+    let _ = engine.buffer().to_string();
+}
+
+/// Neither ex-audit gate is one nobody has seen fail. Drives all three RED on
+/// synthetic input and on the real table/corpus.
+#[test]
+fn ex_audit_gates_are_bidirectional() {
+    // ── gate 1: a perturbed dispatch is caught ──────────────────────────────
+    const FAKE: &[ExAudit] = &[
+        ex(
+            ":se[t]",
+            ":set",
+            OptStatus::Implemented,
+            // The lie: `:set` plainly dispatches.
+            ExDispatch::Neither,
+            "set",
+            "se",
+            Some(Keys(":set ")),
+            "perturbed on purpose",
+        ),
+        ex(
+            ":lcd",
+            ":lcd",
+            OptStatus::NotImplemented,
+            // The other lie: `:lcd` plainly does not.
+            ExDispatch::Both,
+            "lcd foo",
+            "lcd foo",
+            None,
+            "perturbed on purpose",
+        ),
+    ];
+    let drift = ex_dispatch_drift(FAKE);
+    assert_eq!(
+        drift.len(),
+        2,
+        "both perturbed rows must be reported, got:\n{}",
+        drift.join("\n")
+    );
+    assert!(drift[0].contains(":se[t]") && drift[0].contains("Both"));
+    assert!(drift[1].contains(":lcd") && drift[1].contains("Neither"));
+
+    // The real table must, of course, be clean.
+    assert!(
+        ex_dispatch_drift(EX_AUDIT).is_empty(),
+        "the real EX_AUDIT must match the live dispatcher"
+    );
+
+    // ── gate 2: both directions, against the real corpus ────────────────────
+    let corpus = all_corpus_cases();
+    let victim = ":ret[ab]";
+    assert!(
+        EX_AUDIT
+            .iter()
+            .any(|e| e.cmd == victim && e.probe.is_some()),
+        "fixture drifted — {victim} is no longer an in-scope audited command"
+    );
+    assert!(
+        !EX_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim} is covered, so it must not be exempt"
+    );
+    let plus_exempt: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .chain(std::iter::once(victim))
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &plus_exempt, &corpus).newly_covered,
+        vec![victim],
+        "exempting a covered command must fail the gate"
+    );
+
+    let exempt_victim = ":lgr[ep]";
+    assert!(
+        EX_COVERAGE_EXEMPT.contains(&exempt_victim),
+        "fixture drifted — {exempt_victim} is no longer exempt"
+    );
+    let without: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != exempt_victim)
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &without, &corpus).uncovered,
+        vec![exempt_victim],
+        "deleting {exempt_victim:?} from EX_COVERAGE_EXEMPT must fail the gate"
+    );
+    let mut plus_case = corpus.clone();
+    plus_case.push(("ex:lgrep fills the location list", ":lgrep foo<CR>"));
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, EX_COVERAGE_EXEMPT, &plus_case).newly_covered,
+        vec![exempt_victim],
+        "a case pinning {exempt_victim:?} must force its exemption to be deleted"
+    );
+
+    // A stale exemption — one naming no in-scope row — is reported too.
+    let stale: Vec<&str> = EX_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .chain(std::iter::once(":let"))
+        .collect();
+    assert_eq!(
+        classify_ex_coverage(EX_AUDIT, &stale, &corpus).stale,
+        vec![":let"],
+        "an exemption naming a ⏭️ row must be reported as stale"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1228 — Phase 5 audit slice 4/5: `:help visual-index`
+//
+// The fourth `:help`-area walk in the #26 audit, tagging every Visual-mode
+// command Implemented / Partial / NotImplemented / Skipped against the live
+// engine. Source: the **pinned fleet oracle's own** documentation — Neovim
+// v0.12.5's `runtime/doc/index.txt` §3, the same Vim every other gate in this
+// file compares against — walked end to end, all **84** rows:
+//
+//     ✅ Implemented       65
+//     🟡 Partial            6
+//     ❌ Not implemented   11
+//     ⏭️  Skipped            2   (each carrying a reason from SKIP_REASONS)
+//                          ──
+//                          84
+//
+// Unlike #1227's slice this one does *not* grow the denominator much —
+// `VIM_COMPATIBILITY.md`'s "Visual Mode" section and the operator/text-object
+// corpus already cover this ground well, and the tally above says so: 77% of
+// the area matches Neovim keystroke-for-keystroke. The value here is the 17
+// rows that do not, and in particular the four where vimcode does something
+// **destructive** rather than nothing (see the module-level findings in the
+// PR body): `CTRL-C`, `CTRL-\ CTRL-N`, `a>`/`i>` and `!{filter}`.
+//
+// ## Gate 1 — the recorded behaviour must match the live engine
+//
+// Every non-Skipped row carries a [`VisLive`] recording: real keystrokes over
+// a real buffer, plus the buffer, cursor, **mode indicator** and
+// `engine.message` vimcode produced when the slice ran.
+// [`visual_audit_matches_the_live_engine`] replays all 82 and diffs. That is
+// the bidirectional half — implementing `a<` or fixing `CTRL-C` changes its
+// recording and fails the gate until the row is re-tagged, and a row claiming
+// Implemented for something that regresses fails immediately.
+//
+// The recording is a black-box observation — keys in, rendered buffer +
+// cursor + the status line's own mode string (`Engine::mode_str`, what both
+// backends paint) + message out. Never an engine field: a gate that asserted
+// `engine.visual_start` was `Some` would have passed throughout every one of
+// the ❌ rows below, because vimcode *is* in Visual mode for all of them; what
+// is wrong is what the keystroke then does.
+//
+// Mode is recorded because most of this area is about mode transitions, and
+// buffer+cursor cannot see them. `v_v`'s whole content is "stop Visual mode";
+// without the mode column its recording is indistinguishable from a no-op.
+//
+// ## Why several recordings end in an operator
+//
+// A text object in Visual mode only *extends the selection* — the buffer does
+// not change, so a recording of `va(` alone would pin nothing. Each
+// text-object row therefore records `v{object}d`: the region the `d` removes
+// **is** the selection the object made, read back out of the rendered buffer.
+// Same reason `v_P`/`v_p` end in a second paste (it is the only way to see
+// whether the unnamed register was clobbered) and `v_V`/`v_CTRL-V` end in an
+// `x` (it is the only way to see that the *second* `V`/`CTRL-V` stopped
+// Visual mode rather than re-entering it).
+//
+// ## [`Touch`] — "silently mangles the buffer" is worse than "does nothing"
+//
+// Same role [`Report`] plays in #1226. For a ❌ row, a silent no-op leaves the
+// user's text intact; a row that *modifies the buffer* while doing the wrong
+// thing is strictly worse, because the user's next keystroke lands on text
+// they did not expect. Six of this slice's 11 ❌ rows are `Modified`, and
+// [`visual_audit_is_internally_consistent`] pins that count, so a future
+// change that quietly adds a seventh has to say so.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every non-Skipped row also carries a [`Probe`] naming the oracle case that
+// exercises it; [`VISUAL_COVERAGE_EXEMPT`] lists the 39 no case reaches
+// today. Both directions fail, exactly as in `COVERAGE_EXEMPT`. Writing the
+// missing cases is #1162's job, not this slice's.
+//
+// ## Out of scope, deliberately
+//
+// Select mode itself (`gH`, `gV`, `g CTRL-H`) belongs to the g-prefix slice
+// and is parked as **#1193**; the four visual-index rows that reach into it
+// (`CTRL-G`, `CTRL-O`, `<BS>`, `CTRL-H`) cite #1193 rather than filing a
+// duplicate. `:help visual-index`'s opening sentence — "most commands in
+// Visual mode are the same as in Normal mode" — means the motions are *not*
+// here: they are `:help motion.txt`, i.e. another slice.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Whether the recorded run left the buffer changed.
+///
+/// A recorded, re-measured column rather than a derived bool, for the same
+/// reason [`Report`] is one: for a ❌ row, `Modified` means vimcode mangled
+/// the user's text on its way to doing the wrong thing, which is strictly
+/// worse than refusing. `Modified` on an ✅ row is just "the command edits" —
+/// the column describes the recording, the verdict is `status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Touch {
+    /// The recorded run changed the buffer.
+    Modified,
+    /// The recorded run left the buffer byte-identical to the fixture.
+    Unchanged,
+}
+
+use crate::Touch::{Modified, Unchanged};
+
+fn measured_touch(lines: &[&str], buffer: &str) -> Touch {
+    if buffer == lines.join("|") {
+        Touch::Unchanged
+    } else {
+        Touch::Modified
+    }
+}
+
+/// One black-box observation of what vimcode does **today** in Visual mode:
+/// keys in, rendered buffer + cursor + painted mode string + message out.
+/// Replayed by gate 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VisLive {
+    /// Starting buffer, one `&str` per line.
+    lines: &'static [&'static str],
+    /// Starting cursor, 1-indexed `(line, col)`.
+    at: (usize, usize),
+    /// Keys to send, in the corpus's `<C-v>`/`<Esc>`/`<CR>` notation.
+    keys: &'static str,
+    /// Resulting buffer, lines joined with `|`.
+    buffer: &'static str,
+    /// Resulting cursor, 1-indexed `(line, col)`.
+    cursor: (usize, usize),
+    /// `Engine::mode_str()` afterwards — the string both backends paint in
+    /// the status line ("NORMAL", "VISUAL", "VISUAL LINE", "VISUAL BLOCK",
+    /// "INSERT", …).
+    mode: &'static str,
+    /// `engine.message` afterwards, verbatim; `""` when vimcode said nothing.
+    message: &'static str,
+}
+
+const fn vlive(
+    lines: &'static [&'static str],
+    at: (usize, usize),
+    keys: &'static str,
+    buffer: &'static str,
+    cursor: (usize, usize),
+    mode: &'static str,
+    message: &'static str,
+) -> VisLive {
+    VisLive {
+        lines,
+        at,
+        keys,
+        buffer,
+        cursor,
+        mode,
+        message,
+    }
+}
+
+struct VisualAudit {
+    /// The command as `:help visual-index` writes it — the table's unique key.
+    item: &'static str,
+    /// The `:help` tag it is documented under (`v_…`).
+    help: &'static str,
+    status: OptStatus,
+    /// Whether the recording changed the buffer; re-measured by gate 1.
+    touch: Touch,
+    /// `Some` for every non-Skipped row.
+    live: Option<VisLive>,
+    /// Oracle probe; `Some` for every non-Skipped row.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, plus this slice's assessment of whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+const fn vis(
+    item: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    touch: Touch,
+    live: Option<VisLive>,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> VisualAudit {
+    VisualAudit {
+        item,
+        help,
+        status,
+        touch,
+        live,
+        probe,
+        note,
+    }
+}
+
+const VA_TXT: &[&str] = &["alpha beta gamma", "delta epsilon zeta", "eta theta iota"];
+const VA_UP: &[&str] = &["ALPHA beta", "GAMMA delta"];
+const VA_NUM: &[&str] = &["count 7 here", "next 11 line"];
+const VA_NUMS: &[&str] = &["1 a", "1 b", "1 c"];
+const VA_Q: &[&str] = &[
+    "say \"hello there\" ok",
+    "it's 'a b' fine",
+    "run `cmd arg` now",
+];
+const VA_BR: &[&str] = &[
+    "foo(bar baz) qux",
+    "arr[one two] end",
+    "map{k v} tail",
+    "lt<a b> gt",
+];
+const VA_TAG: &[&str] = &["<div>hello there</div>"];
+const VA_PARA: &[&str] = &["alpha one", "beta two", "", "gamma three", "delta four"];
+const VA_SENT: &[&str] = &["One two. Three four. Five six."];
+const VA_IND: &[&str] = &["    alpha", "    beta", "    gamma"];
+
+/// Every command in `:help visual-index`, in `:help` order.
+///
+/// 84 rows, no "TODO" and no unreviewed row: adding one, deleting one, or
+/// leaving one without a note fails [`visual_audit_is_internally_consistent`].
+const VISUAL_AUDIT: &[VisualAudit] = &[
+    vis(
+        "CTRL-\\ CTRL-N",
+        "v_CTRL-\\_CTRL-N",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-\\><C-n>d",
+            "ha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-\\><C-n> stops visual")),
+        concat!(
+            "Vim leaves Visual mode for Normal; vimcode ignores both keys",
+            " and stays in Visual, so the recording's trailing `d` deletes",
+            " the selection the user believed was already cancelled. Worth",
+            " implementing: this is the canonical \"get me to Normal mode",
+            " from anywhere\" escape hatch.",
+        ),
+    ),
+    vis(
+        "CTRL-\\ CTRL-G",
+        "v_CTRL-\\_CTRL-G",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-\\><C-g>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:<C-\\><C-g> goes to normal")),
+        concat!(
+            "Vim goes to Normal mode; vimcode ignores both keys and stays",
+            " in Visual (and swallows the following `d`). Low value on its",
+            " own, but it shares the `CTRL-\\` prefix with the escape hatch",
+            " above.",
+        ),
+    ),
+    vis(
+        "CTRL-A",
+        "v_CTRL-A",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_NUM,
+            (1, 1),
+            "v$<C-a>",
+            "count 8 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("num:v C-a partial")),
+        concat!(
+            "the increment itself matches; the cursor is left on the last",
+            " digit of the number changed, where Vim puts it at the start",
+            " of the Visual area. The corpus cannot see this today —",
+            " `num:V C-a cursor`'s number is at column 1, so both answers",
+            " coincide there.",
+        ),
+    ),
+    vis(
+        "CTRL-C",
+        "v_CTRL-C",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-c>d",
+            "dha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "INSERT",
+            "",
+        )),
+        Some(Label("vis:<C-c> stops visual")),
+        concat!(
+            "Vim stops Visual mode. vimcode treats `CTRL-C` as `c`: it",
+            " **deletes the selection and enters Insert mode**, so the one",
+            " key a user presses to cancel silently destroys the selected",
+            " text. Pinned by `ctrl_c_in_visual_mode_changes_the_selection",
+            " _instead_of_stopping_visual_mode`; the highest-severity",
+            " finding in this slice.",
+        ),
+    ),
+    vis(
+        "CTRL-G",
+        "v_CTRL-G",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-g>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:<C-g> toggles select mode")),
+        concat!(
+            "toggles Visual <-> Select. vimcode has no Select mode",
+            " (parked as #1193), so `CTRL-G` is a silent no-op that also",
+            " swallows the next key — the recording's `d` never runs.",
+        ),
+    ),
+    vis(
+        "<BS>",
+        "v_<BS>",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 6),
+            "vll<BS>d",
+            "alphaeta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<BS> in select mode deletes")),
+        concat!(
+            "`:help` documents the Select-mode meaning (delete the",
+            " highlighted area). In *Visual* mode `<BS>` is the `h`",
+            " motion, which is exactly what vimcode does and what the",
+            " oracle does — the recording agrees with Neovim. Only the",
+            " Select-mode half is missing, with #1193.",
+        ),
+    ),
+    vis(
+        "CTRL-H",
+        "v_CTRL-H",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 6),
+            "vll<C-h>d",
+            "alphaeta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-h> in select mode deletes")),
+        concat!(
+            "same as `<BS>`: the Visual-mode `h` motion matches the",
+            " oracle, the Select-mode delete needs #1193.",
+        ),
+    ),
+    vis(
+        "CTRL-O",
+        "v_CTRL-O",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<C-o>d",
+            "ha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:<C-o> select one visual command")),
+        concat!(
+            "Select -> Visual for one command. vimcode has no Select mode",
+            " (#1193), and `CTRL-O` in Visual instead runs the jumplist's",
+            " older-position jump, moving the cursor out of the selection.",
+        ),
+    ),
+    vis(
+        "CTRL-V",
+        "v_CTRL-V",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "v<C-v>jd<C-v>l<C-v>x",
+            "lha beta gamma|elta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:v then C-v switch")),
+        concat!(
+            "both halves recorded: `v<C-v>` switches a charwise selection",
+            " to blockwise (the block delete matches the oracle) and a",
+            " second `<C-v>` while already blockwise stops Visual mode, so",
+            " the trailing `x` deletes one character rather than a block.",
+        ),
+    ),
+    vis(
+        "CTRL-X",
+        "v_CTRL-X",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_NUM,
+            (1, 1),
+            "v$<C-x>",
+            "count 6 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v$<C-x> cursor")),
+        concat!(
+            "same cursor deviation as `CTRL-A`: the decrement is right,",
+            " the cursor ends on the last digit instead of at the start of",
+            " the Visual area.",
+        ),
+    ),
+    vis(
+        "<Esc>",
+        "v_<Esc>",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vll<Esc>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vll Esc cursor")),
+        concat!(
+            "stops Visual mode and leaves the cursor where Vim leaves it;",
+            " the trailing `d` is then an incomplete operator and changes",
+            " nothing.",
+        ),
+    ),
+    vis(
+        "CTRL-]",
+        "v_CTRL-]",
+        Skipped(CTAGS),
+        Unchanged,
+        None,
+        None,
+        concat!(
+            "jump to the highlighted tag. vimcode ships no tags file",
+            " support at all; go-to-definition is LSP (`gd`). Measured for",
+            " the record: `<C-]>` in Visual is a silent no-op that leaves",
+            " the selection up.",
+        ),
+    ),
+    vis(
+        "!{filter}",
+        "v_!",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj!tr a-z A-Z<CR>",
+            " -z A-Z| |                  |eta theta iota",
+            (2, 2),
+            "INSERT",
+            "",
+        )),
+        Some(Label("vis:Vj! filters through an external command")),
+        concat!(
+            "filter the highlighted lines through an external command.",
+            " vimcode's `!` is a silent no-op in Visual mode, and —",
+            " because it does not open a command line — every character of",
+            " the filter the user then types is executed as a Visual-mode",
+            " command. The recording shows the damage: `Vj!tr a-z A-Z<CR>`",
+            " mangles the buffer and lands in Insert mode. Worth",
+            " implementing, or at minimum refusing.",
+        ),
+    ),
+    vis(
+        ":",
+        "v_:",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj:d<CR>",
+            "eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj: shows range")),
+        concat!(
+            "starts a command line pre-filled with `'<,'>`: the",
+            " recording's `:d<CR>` deletes both selected lines, not just",
+            " the cursor line.",
+        ),
+    ),
+    vis(
+        "<",
+        "v_<",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_IND,
+            (1, 5),
+            "Vj<",
+            "alpha|beta|    gamma",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj<")),
+        "shifts the selected lines one 'shiftwidth' left, cursor included.",
+    ),
+    vis(
+        "=",
+        "v_=",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_IND,
+            (1, 5),
+            "Vj=",
+            "alpha|beta|    gamma",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:Vj=")),
+        concat!(
+            "the reindent matches the oracle, but the cursor is moved to",
+            " column 1 where Neovim (`nostartofline`, its default) keeps",
+            " the column — and vimcode's own `<` and `>` *do* keep it, so",
+            " this is an internal inconsistency as much as a Vim",
+            " deviation.",
+        ),
+    ),
+    vis(
+        ">",
+        "v_>",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vj>",
+            "    alpha beta gamma|    delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj>")),
+        "shifts the selected lines one 'shiftwidth' right.",
+    ),
+    vis(
+        "A",
+        "v_b_A",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "<C-v>jjAX<Esc>",
+            "aXlpha beta gamma|dXelta epsilon zeta|eXta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:jjAx")),
+        concat!(
+            "blockwise append: the same text is inserted after the block",
+            " on every line.",
+        ),
+    ),
+    vis(
+        "C",
+        "v_C",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlCxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjC")),
+        concat!(
+            "deletes the selected lines and starts Insert, linewise even",
+            " from a charwise selection.",
+        ),
+    ),
+    vis(
+        "D",
+        "v_D",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlD",
+            "delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjD")),
+        "deletes the selected lines linewise.",
+    ),
+    vis(
+        "I",
+        "v_b_I",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 2),
+            "<C-v>jjIX<Esc>",
+            "aXlpha beta gamma|dXelta epsilon zeta|eXta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:jjIx")),
+        concat!(
+            "blockwise insert: the same text is inserted before the block",
+            " on every line.",
+        ),
+    ),
+    vis(
+        "J",
+        "v_J",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "VjJ",
+            "alpha beta gamma delta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjJ")),
+        "joins the selected lines, inserting a space.",
+    ),
+    vis(
+        "K",
+        "v_K",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veK",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 5),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:veK runs keywordprg")),
+        concat!(
+            "run 'keywordprg' on the highlighted area. vimcode has no",
+            " 'keywordprg' option and Visual `K` is a silent no-op. Low",
+            " value: LSP hover covers the same intent, and vimcode has no",
+            " `:Man`.",
+        ),
+    ),
+    vis(
+        "O",
+        "v_O",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 3),
+            "<C-v>jllO",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 3),
+            "VISUAL BLOCK",
+            "",
+        )),
+        Some(Label("vb:O")),
+        concat!(
+            "moves the cursor horizontally to the other corner of a",
+            " blockwise selection.",
+        ),
+    ),
+    vis(
+        "P",
+        "v_P",
+        Partial,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "yiwwvePjp",
+            "alpha alpha gamma|delta epsilbetaon zeta|eta theta iota",
+            (2, 15),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vly$P")),
+        concat!(
+            "the replacement itself is right, but vimcode clobbers the",
+            " unnamed register with the replaced text — `P` is a straight",
+            " alias of `p`. The recording proves it: after `veP` the",
+            " following `p` pastes `beta` (the text `P` replaced) where",
+            " Vim pastes `alpha` (the register, unchanged).",
+        ),
+    ),
+    vis(
+        "Q",
+        "v_Q",
+        Skipped(EXMODE),
+        Unchanged,
+        None,
+        None,
+        concat!(
+            "the row documents a *negative* — Vim's `Q` does not start Ex",
+            " mode from Visual. vimcode has no Ex mode at all (`gQ` was",
+            " tagged the same way by the g-prefix slice), so there is",
+            " nothing to not-start; `Q` in Visual is ignored.",
+        ),
+    ),
+    vis(
+        "R",
+        "v_R",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlRxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjR")),
+        "deletes the selected lines and starts Insert, like `S`/`C`.",
+    ),
+    vis(
+        "S",
+        "v_S",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlSxy<Esc>",
+            "xy|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjS")),
+        "deletes the selected lines and starts Insert.",
+    ),
+    vis(
+        "U",
+        "v_U",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veU",
+            "ALPHA beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjU")),
+        "uppercases the highlighted area.",
+    ),
+    vis(
+        "V",
+        "v_V",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vVdVVx",
+            "elta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:C-v then V")),
+        concat!(
+            "both halves recorded: `vV` promotes a charwise selection to",
+            " linewise (the delete takes the whole line) and a second `V`",
+            " while already linewise stops Visual mode, so the trailing",
+            " `x` deletes one character.",
+        ),
+    ),
+    vis(
+        "X",
+        "v_X",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlX",
+            "delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjX")),
+        "deletes the selected lines linewise, like `D`.",
+    ),
+    vis(
+        "Y",
+        "v_Y",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veYjp",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (3, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjY p")),
+        concat!(
+            "yanks the selected lines linewise; the recording's `p` puts",
+            " a whole line back.",
+        ),
+    ),
+    vis(
+        "a\"",
+        "v_aquote",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (1, 8),
+            "va\"d",
+            "say ok|it's 'a b' fine|run `cmd arg` now",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va\"d")),
+        "a double-quoted string including the quotes.",
+    ),
+    vis(
+        "a'",
+        "v_a'",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 7),
+            "va'd",
+            "say \"hello there\" ok|it's fine|run `cmd arg` now",
+            (2, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va' extends with a quoted string")),
+        concat!(
+            "a single-quoted string including the quotes; the apostrophe",
+            " in `it's` is correctly not treated as an opening quote.",
+        ),
+    ),
+    vis(
+        "a(",
+        "v_a(",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "va(d",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va(d")),
+        "a parenthesised block including the parentheses.",
+    ),
+    vis(
+        "a)",
+        "v_a)",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "va)d",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va) same as ab")),
+        concat!(
+            "the `a)` spelling of `ab`; vimcode accepts it and produces",
+            " the same selection as `a(`.",
+        ),
+    ),
+    vis(
+        "a<",
+        "v_a<",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "va<d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va< extends with an angle block")),
+        concat!(
+            "extend with a `<>` block. vimcode does not recognise `a<` at",
+            " all — the recording is a silent no-op where Vim deletes `<a",
+            " b>`. Worth implementing: `<>` is the one bracket pair",
+            " missing from an otherwise complete text-object set, and it",
+            " is the common case in HTML/JSX and Rust generics.",
+        ),
+    ),
+    vis(
+        "a>",
+        "v_a>",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "va>d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|    lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va> same as a<")),
+        concat!(
+            "the `a>` spelling of `a<`. Worse than `a<`: because `a` is",
+            " not consumed as a text-object prefix, the `>` runs as the",
+            " Visual shift command, so the recording **indents the line**",
+            " instead of selecting anything.",
+        ),
+    ),
+    vis(
+        "aB",
+        "v_aB",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vaBd",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vaB extends with a brace block")),
+        "a `{}` block including the braces.",
+    ),
+    vis(
+        "aW",
+        "v_aW",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 4),
+            "vaWd",
+            "say \"hello there\" ok|'a b' fine|run `cmd arg` now",
+            (2, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vaW extends with a WORD")),
+        "a WORD plus its trailing whitespace.",
+    ),
+    vis(
+        "a[",
+        "v_a[",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "va[d",
+            "foo(bar baz) qux|arr end|map{k v} tail|lt<a b> gt",
+            (2, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va[ extends with a bracket block")),
+        "a `[]` block including the brackets.",
+    ),
+    vis(
+        "a]",
+        "v_a]",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "va]d",
+            "foo(bar baz) qux|arr end|map{k v} tail|lt<a b> gt",
+            (2, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va] same as a[")),
+        "the `a]` spelling of `a[`.",
+    ),
+    vis(
+        "a`",
+        "v_a`",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (3, 7),
+            "va`d",
+            "say \"hello there\" ok|it's 'a b' fine|run now",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va` extends with a backtick string")),
+        "a backtick-quoted string including the backticks.",
+    ),
+    vis(
+        "ab",
+        "v_ab",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vabd",
+            "foo qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vab extends with a paren block")),
+        "the `ab` spelling of `a(`.",
+    ),
+    vis(
+        "ap",
+        "v_ap",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_PARA,
+            (1, 1),
+            "vapd",
+            "gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vapd")),
+        "a paragraph plus its trailing blank lines.",
+    ),
+    vis(
+        "as",
+        "v_as",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_SENT,
+            (1, 10),
+            "vasd",
+            "One two. Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vas extends with a sentence")),
+        "a sentence plus its trailing whitespace.",
+    ),
+    vis(
+        "at",
+        "v_at",
+        Implemented,
+        Modified,
+        Some(vlive(VA_TAG, (1, 7), "vatd", "", (1, 1), "NORMAL", "")),
+        Some(Label("vis:vat extends with a tag block")),
+        "a tag block including both tags.",
+    ),
+    vis(
+        "aw",
+        "v_aw",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 8),
+            "vawd",
+            "alpha gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v2awd")),
+        "a word plus its trailing whitespace.",
+    ),
+    vis(
+        "a{",
+        "v_a{",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "va{d",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va{ same as aB")),
+        "the `a{` spelling of `aB`.",
+    ),
+    vis(
+        "a}",
+        "v_a}",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "va}d",
+            "foo(bar baz) qux|arr[one two] end|map tail|lt<a b> gt",
+            (3, 4),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:va} same as aB")),
+        "the `a}` spelling of `aB`.",
+    ),
+    vis(
+        "c",
+        "v_c",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vecXY<Esc>",
+            "XY beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vec")),
+        "deletes the highlighted area and starts Insert.",
+    ),
+    vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "deletes the highlighted area.",
+    ),
+    vis(
+        "g CTRL-A",
+        "v_g_CTRL-A",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_NUMS,
+            (1, 1),
+            "Vjjg<C-a>",
+            "2 a|3 b|4 c",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("num:V g C-a")),
+        concat!(
+            "progressively increments the numbers on the selected lines",
+            " (1/2/3, not 2/2/2).",
+        ),
+    ),
+    vis(
+        "g CTRL-X",
+        "v_g_CTRL-X",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_NUMS,
+            (1, 1),
+            "Vjjg<C-x>",
+            "0 a|-1 b|-2 c",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:V g C-x decrements progressively")),
+        "progressively decrements the numbers on the selected lines.",
+    ),
+    vis(
+        "gJ",
+        "v_gJ",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "VjgJ",
+            "alpha beta gammadelta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v_gJ")),
+        "joins the selected lines without inserting a space.",
+    ),
+    vis(
+        "gq",
+        "v_gq",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "Vjgq",
+            "alpha beta gamma delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjgq")),
+        "formats the selected lines to 'textwidth'.",
+    ),
+    vis(
+        "gv",
+        "v_gv",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ve<Esc>gvd",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:gv")),
+        "reselects the previous Visual area after it was left with `<Esc>`.",
+    ),
+    vis(
+        "i\"",
+        "v_iquote",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (1, 8),
+            "vi\"d",
+            "say \"\" ok|it's 'a b' fine|run `cmd arg` now",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi\"d")),
+        "the inside of a double-quoted string, quotes excluded.",
+    ),
+    vis(
+        "i'",
+        "v_i'",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 7),
+            "vi'd",
+            "say \"hello there\" ok|it's '' fine|run `cmd arg` now",
+            (2, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi' extends with inner quoted string")),
+        "the inside of a single-quoted string.",
+    ),
+    vis(
+        "i(",
+        "v_i(",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vi(d",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi(d")),
+        "the inside of a parenthesised block.",
+    ),
+    vis(
+        "i)",
+        "v_i)",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vi)d",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi) same as ib")),
+        "the `i)` spelling of `ib`.",
+    ),
+    vis(
+        "i<",
+        "v_i<",
+        NotImplemented,
+        Unchanged,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "vi<d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi< extends with inner angle block")),
+        concat!(
+            "the inside of a `<>` block. Not recognised: a silent no-op,",
+            " same gap as `a<`.",
+        ),
+    ),
+    vis(
+        "i>",
+        "v_i>",
+        NotImplemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (4, 5),
+            "vi>d",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail|    lt<a b> gt",
+            (4, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi> same as i<")),
+        concat!(
+            "the `i>` spelling of `i<`. Same damage as `a>`: the",
+            " unconsumed `>` runs as the Visual shift and indents the",
+            " line.",
+        ),
+    ),
+    vis(
+        "iB",
+        "v_iB",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "viBd",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viB extends with inner brace block")),
+        "the inside of a `{}` block.",
+    ),
+    vis(
+        "iW",
+        "v_iW",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (2, 4),
+            "viWd",
+            "say \"hello there\" ok| 'a b' fine|run `cmd arg` now",
+            (2, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viW extends with inner WORD")),
+        "a WORD without surrounding whitespace.",
+    ),
+    vis(
+        "i[",
+        "v_i[",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "vi[d",
+            "foo(bar baz) qux|arr[] end|map{k v} tail|lt<a b> gt",
+            (2, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi[ extends with inner bracket block")),
+        "the inside of a `[]` block.",
+    ),
+    vis(
+        "i]",
+        "v_i]",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (2, 6),
+            "vi]d",
+            "foo(bar baz) qux|arr[] end|map{k v} tail|lt<a b> gt",
+            (2, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi] same as i[")),
+        "the `i]` spelling of `i[`.",
+    ),
+    vis(
+        "i`",
+        "v_i`",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_Q,
+            (3, 7),
+            "vi`d",
+            "say \"hello there\" ok|it's 'a b' fine|run `` now",
+            (3, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi` extends with inner backtick string")),
+        "the inside of a backtick-quoted string.",
+    ),
+    vis(
+        "ib",
+        "v_ib",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (1, 6),
+            "vibd",
+            "foo() qux|arr[one two] end|map{k v} tail|lt<a b> gt",
+            (1, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vib extends with inner paren block")),
+        "the `ib` spelling of `i(`.",
+    ),
+    vis(
+        "ip",
+        "v_ip",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_PARA,
+            (1, 1),
+            "vipd",
+            "|gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vipd")),
+        "a paragraph without its trailing blank lines.",
+    ),
+    vis(
+        "is",
+        "v_is",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_SENT,
+            (1, 10),
+            "visd",
+            "One two.  Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vis extends with inner sentence")),
+        "a sentence without its trailing whitespace.",
+    ),
+    vis(
+        "it",
+        "v_it",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TAG,
+            (1, 7),
+            "vitd",
+            "<div></div>",
+            (1, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vit extends with inner tag block")),
+        "the contents of a tag block, tags excluded.",
+    ),
+    vis(
+        "iw",
+        "v_iw",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 8),
+            "viwd",
+            "alpha  gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:viwiwiwd")),
+        "a word without surrounding whitespace.",
+    ),
+    vis(
+        "i{",
+        "v_i{",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vi{d",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi{ same as iB")),
+        "the `i{` spelling of `iB`.",
+    ),
+    vis(
+        "i}",
+        "v_i}",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_BR,
+            (3, 6),
+            "vi}d",
+            "foo(bar baz) qux|arr[one two] end|map{} tail|lt<a b> gt",
+            (3, 5),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vi} same as iB")),
+        "the `i}` spelling of `iB`.",
+    ),
+    vis(
+        "o",
+        "v_o",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 3),
+            "vllo",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 3),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vis:vllohd")),
+        concat!(
+            "moves the cursor to the other end of the selection, leaving",
+            " Visual mode active.",
+        ),
+    ),
+    vis(
+        "p",
+        "v_p",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "yiwwvepjp",
+            "alpha alpha gamma|delta epsilbetaon zeta|eta theta iota",
+            (2, 15),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vlp linewise reg")),
+        concat!(
+            "replaces the highlighted area with the register, and the",
+            " replaced text does land in the unnamed register — the",
+            " recording's second `p` pastes `beta`, matching the oracle.",
+            " It is `P` (above) that shares this behaviour and should not.",
+        ),
+    ),
+    vis(
+        "r",
+        "v_r",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "verX",
+            "XXXXX beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjr-")),
+        concat!(
+            "replaces every character of the highlighted area with the",
+            " typed character.",
+        ),
+    ),
+    vis(
+        "s",
+        "v_s",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vesXY<Esc>",
+            "XY beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v s")),
+        "deletes the highlighted area and starts Insert, like `c`.",
+    ),
+    vis(
+        "u",
+        "v_u",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_UP,
+            (1, 1),
+            "veu",
+            "alpha beta|GAMMA delta",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:Vju")),
+        "lowercases the highlighted area.",
+    ),
+    vis(
+        "v",
+        "v_v",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlvd",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vb:C-v then v switch")),
+        concat!(
+            "the recording covers the *stop* half — `v` pressed while",
+            " already charwise leaves Visual mode, so the trailing `d` is",
+            " an incomplete operator. The `make charwise` half is pinned",
+            " by the oracle case this row's probe names, which switches a",
+            " blockwise selection to charwise with `v`.",
+        ),
+    ),
+    vis(
+        "x",
+        "v_x",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vex",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:v x")),
+        "deletes the highlighted area, like `d`.",
+    ),
+    vis(
+        "y",
+        "v_y",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "veyjp",
+            "alpha beta gamma|dalphaelta epsilon zeta|eta theta iota",
+            (2, 6),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjy cursor")),
+        concat!(
+            "yanks the highlighted area charwise; the recording's `p`",
+            " puts it back inline.",
+        ),
+    ),
+    vis(
+        "~",
+        "v_~",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_UP,
+            (1, 1),
+            "ve~",
+            "alpha beta|GAMMA delta",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vj~")),
+        "swaps the case of the highlighted area.",
+    ),
+];
+
+const VISUAL_COVERAGE_EXEMPT: &[&str] = &[
+    "CTRL-\\ CTRL-N",
+    "CTRL-\\ CTRL-G",
+    "CTRL-C",
+    "CTRL-G",
+    "<BS>",
+    "CTRL-H",
+    "CTRL-O",
+    "CTRL-X",
+    "!{filter}",
+    "K",
+    "a'",
+    "a)",
+    "a<",
+    "a>",
+    "aB",
+    "aW",
+    "a[",
+    "a]",
+    "a`",
+    "ab",
+    "as",
+    "at",
+    "a{",
+    "a}",
+    "g CTRL-X",
+    "i'",
+    "i)",
+    "i<",
+    "i>",
+    "iB",
+    "iW",
+    "i[",
+    "i]",
+    "i`",
+    "ib",
+    "is",
+    "it",
+    "i{",
+    "i}",
+];
+
+/// Replay one [`VisLive`] recording against a real engine. Black-box: keys
+/// in, rendered buffer + cursor + painted mode string + message out.
+fn replay_vis_live(p: &VisLive) -> (String, (usize, usize), String, String) {
+    let mut engine = engine_with(&p.lines.join("\n"));
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.set_viewport_lines(24);
+    engine.view_mut().cursor.line = p.at.0.saturating_sub(1);
+    engine.view_mut().cursor.col = p.at.1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_keys(&mut engine, p.keys);
+    (
+        engine.buffer().to_string().replace('\n', "|"),
+        (engine.view().cursor.line + 1, engine.view().cursor.col + 1),
+        engine.mode_str().to_string(),
+        engine.message.clone(),
+    )
+}
+
+/// Every row whose recorded behaviour no longer matches the live engine.
+fn visual_drift(audit: &[VisualAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let Some(p) = e.live.as_ref() else { continue };
+        let (buffer, cursor, mode, message) = replay_vis_live(p);
+        if buffer != p.buffer || cursor != p.cursor || mode != p.mode || message != p.message {
+            drift.push(format!(
+                "  {:?} ({}): recorded buffer={:?} cursor={:?} mode={:?} message={:?}\n\
+                 \x20  live     buffer={:?} cursor={:?} mode={:?} message={:?}",
+                e.item,
+                e.help,
+                p.buffer,
+                p.cursor,
+                p.mode,
+                p.message,
+                buffer,
+                cursor,
+                mode,
+                message
+            ));
+        }
+        let measured = measured_touch(p.lines, &buffer);
+        if measured != e.touch {
+            drift.push(format!(
+                "  {:?} ({}): table says {:?}, the live run is {:?}",
+                e.item, e.help, e.touch, measured
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1228) — every row's recorded behaviour is a claim about live
+/// code, and this replays all 82 of them (the 84 rows minus the 2 ⏭️) against
+/// it. Pure: no `nvim`, no subprocess, so it runs on every lane.
+#[test]
+fn visual_audit_matches_the_live_engine() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_VISUAL") {
+        let mut s = String::new();
+        for e in VISUAL_AUDIT {
+            let Some(p) = e.live.as_ref() else { continue };
+            let (buffer, cursor, mode, message) = replay_vis_live(p);
+            s.push_str(&format!(
+                "{}\t{:?}\t{}\t{}\t{}\t{:?}\n",
+                e.item, buffer, cursor.0, cursor.1, mode, message
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = visual_drift(VISUAL_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== visual-mode audit drifted from the engine (#1228) ==\n\
+         Each row records what vimcode actually did when the slice ran.\n\
+         Implementing (or breaking) one of these changes that recording, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, and a VISUAL_COVERAGE_EXEMPT entry deleted once\n\
+         an oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1228) — the table describes itself correctly: complete, unique,
+/// no unreviewed row, every ⏭️ carrying a reason from the shared vocabulary,
+/// and a live recording + probe on exactly the rows that can have one.
+#[test]
+fn visual_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        VISUAL_AUDIT.len(),
+        84,
+        "`:help visual-index` walked to 84 entries; the audit must tag all of them"
+    );
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen_help: HashSet<&str> = HashSet::new();
+    for e in VISUAL_AUDIT {
+        if !seen.insert(e.item) {
+            problems.push(format!("  {:?}: listed twice", e.item));
+        }
+        if !seen_help.insert(e.help) {
+            problems.push(format!(
+                "  {:?}: `:help` tag {:?} used twice",
+                e.item, e.help
+            ));
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  {:?}: empty note — every row is reviewed",
+                e.item
+            ));
+        }
+        if !e.help.starts_with("v_") {
+            problems.push(format!(
+                "  {:?}: `:help` tag {:?} is not a `v_…` Visual-mode tag",
+                e.item, e.help
+            ));
+        }
+
+        let in_scope = !matches!(e.status, OptStatus::Skipped(_));
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {:?}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.item
+                ));
+            }
+        }
+        if in_scope && e.live.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry a live recording",
+                e.item
+            ));
+        }
+        if in_scope && e.probe.is_none() {
+            problems.push(format!(
+                "  {:?}: not skipped, so it must carry an oracle probe",
+                e.item
+            ));
+        }
+        if !in_scope && (e.live.is_some() || e.probe.is_some()) {
+            problems.push(format!(
+                "  {:?}: skipped, so a live recording or probe can never fire",
+                e.item
+            ));
+        }
+    }
+
+    // The headline tally, pinned. The section doc quotes these numbers and a
+    // PR body quotes the section doc; without this they drift the moment a
+    // row is re-tagged, which is the exact rot a markdown checklist suffers.
+    let tally = |want: fn(&VisualAudit) -> bool| VISUAL_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented) && e.touch == Touch::Modified),
+        ),
+        (65, 6, 11, 2, 6),
+        "the audit tally moved: (implemented, partial, missing, skipped, \
+         missing-and-buffer-modified). Update the section doc's table in the \
+         same commit."
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== visual-mode audit table is inconsistent (#1228) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_visual_coverage(
+    audit: &[VisualAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.item)) {
+            (false, false) => v.uncovered.push(e.item),
+            (true, true) => v.newly_covered.push(e.item),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.item == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1228) — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn visual_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = VISUAL_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        VISUAL_COVERAGE_EXEMPT.len(),
+        "VISUAL_COVERAGE_EXEMPT lists an item twice"
+    );
+
+    let v = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_VISUAL_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        // Every credited row plus the case that credits it — the
+        // over-crediting check #1007's "deliberately dumb probe" note demands
+        // a human be able to do in one grep.
+        for e in VISUAL_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.item,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - VISUAL_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== visual-mode oracle coverage (#1228) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n",
+        v.in_scope,
+        VISUAL_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== visual-mode oracle coverage moved (#1228) ==\n\
+         UNCOVERED (probe matches no case — add the case, or exempt it only when \
+         seeding a newly-tagged command):\n  {:?}\n\
+         NEWLY COVERED (a case now pins it — delete the VISUAL_COVERAGE_EXEMPT \
+         entry; that is how the list shrinks):\n  {:?}\n\
+         STALE (exempt but not an in-scope audited command):\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// The worst finding in this slice, pinned on its own rather than left as a
+/// status letter in the table: `CTRL-C` — the one key a user presses to
+/// *cancel* — is wired to `c` in Visual mode, so it deletes the highlighted
+/// text and drops into Insert. Black-box: it reads the rendered buffer and
+/// the status line's own mode string, not an engine flag.
+///
+/// Delete this test when `CTRL-C` is fixed; `v_CTRL-C`'s row and recording in
+/// [`VISUAL_AUDIT`] have to change in the same commit, and gate 1 enforces it.
+#[test]
+fn ctrl_c_in_visual_mode_deletes_the_selection_instead_of_stopping_visual_mode() {
+    let mut engine = engine_with("alpha beta gamma");
+    engine.set_viewport_lines(24);
+    send_keys(&mut engine, "vll<C-c>");
+
+    assert_eq!(
+        engine.buffer().to_string(),
+        "ha beta gamma",
+        "CTRL-C deleted the three highlighted characters; Vim stops Visual \
+         mode and leaves the buffer alone"
+    );
+    assert_eq!(
+        engine.mode_str(),
+        "INSERT",
+        "CTRL-C also dropped into Insert mode, so the user's next keystroke \
+         is typed into the buffer"
+    );
+}
+
+/// Gate 3 (#1228) — the gates above are observed **RED**, so none of them is
+/// a test nobody has seen fail. Synthetic tables for the drift/consistency
+/// directions, and the real corpus for the coverage ones.
+#[test]
+fn visual_audit_gates_are_bidirectional() {
+    // ── Gate 1, direction A: a recording that no longer matches ──────────
+    let wrong_buffer = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            "this is not what vimcode does",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_buffer).is_empty(),
+        "a recording whose buffer no longer matches the engine must drift"
+    );
+
+    // ── Gate 1, direction B: a recording whose *mode* no longer matches ──
+    // The column the buffer/cursor pair cannot see, and the reason it exists.
+    let wrong_mode = vec![vis(
+        "v",
+        "v_v",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "vlvd",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "VISUAL",
+            "",
+        )),
+        Some(Label("vb:C-v then v switch")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_mode).is_empty(),
+        "a recording that claims the engine stayed in VISUAL when it left \
+         must drift — otherwise the mode column is decoration"
+    );
+
+    // ── Gate 1, direction C: a mis-tagged [`Touch`] ──────────────────────
+    let wrong_touch = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Unchanged,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        !visual_drift(&wrong_touch).is_empty(),
+        "a row tagged Unchanged whose recording edits the buffer must drift"
+    );
+
+    // ── Gate 1, direction D: the unperturbed row is green ────────────────
+    let good = vec![vis(
+        "d",
+        "v_d",
+        Implemented,
+        Modified,
+        Some(vlive(
+            VA_TXT,
+            (1, 1),
+            "ved",
+            " beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+        )),
+        Some(Label("vis:vjd")),
+        "synthetic",
+    )];
+    assert!(
+        visual_drift(&good).is_empty(),
+        "the unperturbed recording must be green, or the gate is red for an \
+         unrelated reason"
+    );
+
+    // ── Gate 2, against the REAL corpus and the REAL table ───────────────
+    let corpus = all_corpus_cases();
+
+    // A real exemption deleted must fail: the command is still uncovered.
+    let victim = "a<";
+    assert!(
+        VISUAL_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted — {victim:?} is no longer exempt"
+    );
+    let without: Vec<&str> = VISUAL_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    let deleted = classify_visual_coverage(VISUAL_AUDIT, &without, &corpus);
+    assert!(
+        deleted.uncovered.contains(&victim),
+        "deleting {victim:?} from VISUAL_COVERAGE_EXEMPT must fail the gate: {deleted:?}"
+    );
+
+    // A case that pins an exempt command must fail until the entry goes.
+    let mut plus = corpus.clone();
+    plus.push(("vis:va< extends with an angle block", "va<d"));
+    let improved = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &plus);
+    assert!(
+        improved.newly_covered.contains(&victim),
+        "an oracle case for an exempt command must fail until its \
+         VISUAL_COVERAGE_EXEMPT entry is deleted: {improved:?}"
+    );
+
+    // A stale exemption — a name that is not an in-scope audited command.
+    let mut stale: Vec<&str> = VISUAL_COVERAGE_EXEMPT.to_vec();
+    stale.push("gH");
+    let with_stale = classify_visual_coverage(VISUAL_AUDIT, &stale, &corpus);
+    assert!(
+        with_stale.stale.contains(&"gH"),
+        "an exemption naming something outside the audit must be reported \
+         stale: {with_stale:?}"
+    );
+
+    // And the real pair is green, so the reds above are the perturbations.
+    let real = classify_visual_coverage(VISUAL_AUDIT, VISUAL_COVERAGE_EXEMPT, &corpus);
+    assert!(
+        real.uncovered.is_empty() && real.newly_covered.is_empty() && real.stale.is_empty(),
+        "the shipped table/exemption pair must be green: {real:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1229 — Phase 5 audit slice 5/5: `:help normal-index`, everything outside `g`
+//
+// The last `:help`-area walk of the #26 audit. Source: the **pinned fleet
+// oracle's own** documentation — Neovim v0.12.5's `runtime/doc/index.txt` §2,
+// the same Vim every other gate in this file compares against — walked end to
+// end. Every row of the Normal-mode index outside the `g`-prefix cluster is
+// tagged Implemented / Partial / NotImplemented / Skipped against the live
+// engine:
+//
+//     §2    Normal mode                200 rows
+//     §2.2  Window commands (CTRL-W)    75 rows
+//     §2.3  Square-bracket commands     46 rows
+//     §2.5  Commands starting with 'z'  52 rows (this section is *not*
+//                                               g-prefixed, so it is in scope)
+//     §2.6  Operator-pending            3 rows
+//                                      ───
+//                                      376 index rows, tagged as 370 entries
+//
+//     ✅ Implemented       217
+//     🟡 Partial            17
+//     ❌ Not implemented   112
+//     ⏭️  Skipped            24   (each carrying a reason from SKIP_REASONS)
+//                          ───
+//                          370
+//
+// ## What is *not* here, and why
+//
+// * §2.4 (`g{char}`) is slice 1 of #26, already landed. The dispatcher rows
+//   that only forward to another section — `g{char}`, `z{char}`, `[{char}`,
+//   `]{char}`, `CTRL-W {char}` — are excluded with them: they are pointers,
+//   and their targets are the subsections above.
+// * §2.1 (text objects) carries `v_a"`-style tags and was tagged by #1228's
+//   `VISUAL_AUDIT`; re-tagging it here would duplicate 36 rows.
+// * The index's untagged "not used" rows (`CTRL-K`, `CTRL-Q`, `CTRL-S`,
+//   `CTRL-_`, `\`, `CTRL-W CTRL-G`, …) have no `:help` tag and no action to
+//   conform to.
+// * The nine `|count|` rows (`1` … `9`) are one command and are tagged once,
+//   as `1 - 9`.
+//
+// The index reuses a tag twice on purpose (`q` for both "record" and "stop
+// recording"; `~` for the 'tildeop' variant), so — unlike #1228's table —
+// this one keys on `item` and allows a repeated `help` tag.
+//
+// ## Gate 1 — the recorded behaviour must match the live engine
+//
+// Every row that a keyboard can reach carries a [`NormLive`] recording: real
+// keystrokes over a real buffer, plus **eight** rendered observations vimcode
+// produced when the slice ran — buffer, cursor, `Engine::mode_str()`,
+// `engine.message`, the first rendered line, the first rendered column, the
+// rendered line ranges (what folding hides) and the window/tab layout.
+// [`normal_audit_matches_the_live_engine`] replays all 323 and diffs.
+//
+// The extra columns are not decoration; without them most of this `:help`
+// area is invisible. A third of §2.5 is *only* about which lines are
+// rendered (`zc`, `zR`, `zv`), the CTRL-W section is *only* about the window
+// tree, and `zh`/`zL`/`ze`/`zs` move nothing but the first rendered column.
+// All eight are black-box observations of rendered output — never an engine
+// flag: a gate that asserted `view.folds` was non-empty would pass for `zE`,
+// whose whole bug is that the fold it failed to delete is **still rendered as
+// hidden**.
+//
+// ## Gate 1b — rows a keyboard cannot reach
+//
+// 25 index rows are mouse, wheel or shifted keys. `Engine::handle_key(name,
+// unicode, ctrl)` has no Shift bit and no pointer events, so neither backend
+// can deliver them through the path this harness drives — they are listed in
+// [`NORM_NO_REPLAY`] with the reason, carry no recording and no probe, and
+// are still tagged. That is a finding in itself: eight index rows are
+// unreachable *because of an engine API gap*, not because nobody wrote them.
+//
+// ## Gate 2 — oracle coverage, same shrink-only shape as #1007
+//
+// Every replayable, non-Skipped row carries a [`Probe`] naming the oracle
+// case that exercises it; [`NORM_COVERAGE_EXEMPT`] lists the ones no case
+// reaches today (98 of 323 covered as of #1162, up from 93 — `CTRL-W b`/`t`
+// and their `CTRL-W CTRL-T` alias now point at real [`CASES_WIN`] cases).
+// Both directions fail, exactly as in `COVERAGE_EXEMPT`. #1162 scoped itself
+// to the 33 `win:` ids `VIM_COMPATIBILITY.md`/`COMMAND_PROBES` track (its own
+// issue text), not this index's full 75-row CTRL-W surface — most of that
+// gap (aliases, uppercase synonyms, the preview-window family) is still
+// open, tracked here rather than re-litigated in the other gate.
+//
+// ## What the pinned oracle could and could not settle
+//
+// Every row was replayed through vimcode *and* through `nvim --headless -l`
+// v0.12.5 on the identical fixture, and the two were diffed before a status
+// was written. That is how rows like `CTRL-M`, `<Del>` and `<C-Left>` were
+// caught: they look plausible until Vim's answer is next to them.
+//
+// Four columns the `-l` oracle cannot answer, and which were therefore judged
+// against `:help` plus the corpus's own UI-attached cases (`scroll:*`,
+// `fold:*`): the first rendered line and column (no UI is attached, so
+// `line('w0')` does not move), fold state, and macro recording (`q` behaves
+// differently under `feedkeys`). Those rows say so in their notes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Added by this slice for the `CTRL-W P`/`CTRL-W z`/`CTRL-W }`/`CTRL-W g }`
+/// family. Vim's preview window is a window *kind* with its own commands;
+/// vimcode has splits and LSP hover popups, and nothing a `:ptag` could
+/// target.
+const PREVIEW: &str = "no preview window (:h preview-window) in vimcode";
+
+/// One black-box observation of what vimcode does **today** in Normal mode.
+///
+/// Keys in; rendered buffer, cursor, painted mode string, message, first
+/// rendered line, first rendered column, rendered line ranges and window
+/// layout out. Replayed by gate 1. Deliberately a superset of #1228's
+/// `VisLive`: Visual mode needed buffer+cursor+mode, and most of
+/// `:help normal-index` does not touch any of the three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NormLive {
+    /// Starting buffer, one `&str` per line.
+    lines: &'static [&'static str],
+    /// Starting cursor, 1-indexed `(line, col)`.
+    at: (usize, usize),
+    /// Viewport height in lines. 10 for the scrolling rows — a 24-line
+    /// viewport over a 30-line fixture makes `CTRL-D` and `zt`
+    /// indistinguishable from a no-op.
+    view: usize,
+    /// Keys to send, in the corpus's `<C-v>`/`<Esc>`/`<CR>` notation.
+    keys: &'static str,
+    /// Resulting buffer, lines joined with `|`.
+    buffer: &'static str,
+    /// Resulting cursor, 1-indexed `(line, col)`.
+    cursor: (usize, usize),
+    /// `Engine::mode_str()` afterwards — the string both backends paint.
+    mode: &'static str,
+    /// `engine.message` afterwards, verbatim; `""` when vimcode said nothing.
+    message: &'static str,
+    /// First rendered buffer line, 1-indexed (`view.scroll_top + 1`).
+    top: usize,
+    /// First rendered column, 1-indexed (`view.scroll_left + 1`).
+    left: usize,
+    /// The rendered line ranges, e.g. `"1,3-30"` when a fold hides line 2;
+    /// `""` when every line is rendered.
+    folded: &'static str,
+    /// The window tree and tab counter, e.g. `"(h0.50 2* 1) tabs=1/2"`:
+    /// `h`/`v` split, its ratio, the leaves in layout order with `*` on the
+    /// focused one, and `tabs=<active>/<count>`.
+    windows: &'static str,
+}
+
+#[allow(clippy::too_many_arguments)]
+const fn nlive(
+    lines: &'static [&'static str],
+    at: (usize, usize),
+    view: usize,
+    keys: &'static str,
+    buffer: &'static str,
+    cursor: (usize, usize),
+    mode: &'static str,
+    message: &'static str,
+    top: usize,
+    left: usize,
+    folded: &'static str,
+    windows: &'static str,
+) -> NormLive {
+    NormLive {
+        lines,
+        at,
+        view,
+        keys,
+        buffer,
+        cursor,
+        mode,
+        message,
+        top,
+        left,
+        folded,
+        windows,
+    }
+}
+
+struct NormAudit {
+    /// The command as `:help normal-index` writes its Char column — the
+    /// table's unique key. The three operator-pending rows carry an
+    /// `(operator-pending)` suffix because `v`/`V`/`CTRL-V` also name
+    /// Normal-mode commands.
+    item: &'static str,
+    /// The `:help` tag it is documented under. Not unique: the index gives
+    /// `q` and `~` two rows each.
+    help: &'static str,
+    status: OptStatus,
+    /// `Some` for every row that is neither Skipped nor in
+    /// [`NORM_NO_REPLAY`].
+    live: Option<NormLive>,
+    /// Oracle probe, on exactly the rows that carry a recording.
+    probe: Option<Probe>,
+    /// For ❌: what Vim does, what vimcode does instead, and whether it is
+    /// worth implementing. For 🟡: exactly what is missing.
+    note: &'static str,
+}
+
+const fn na(
+    item: &'static str,
+    help: &'static str,
+    status: OptStatus,
+    live: Option<NormLive>,
+    probe: Option<Probe>,
+    note: &'static str,
+) -> NormAudit {
+    NormAudit {
+        item,
+        help,
+        status,
+        live,
+        probe,
+        note,
+    }
+}
+
+const NA_BR: &[&str] = &["foo(bar baz) qux", "arr[one two] end", "map{k v} tail"];
+const NA_CODE: &[&str] = &[
+    "#if FOO",
+    "int one(void)",
+    "{",
+    "    return 1;",
+    "}",
+    "#else",
+    "/* note */",
+    "int two(void)",
+    "{",
+    "    return 2;",
+    "}",
+    "#endif",
+];
+const NA_FILE: &[&str] = &["README.md", "second line"];
+const NA_IND: &[&str] = &["    alpha beta", "    gamma delta", "    eps zeta"];
+const NA_LONG: &[&str] = &[
+    "line 01", "line 02", "line 03", "line 04", "line 05", "line 06", "line 07", "line 08",
+    "line 09", "line 10", "line 11", "line 12", "line 13", "line 14", "line 15", "line 16",
+    "line 17", "line 18", "line 19", "line 20", "line 21", "line 22", "line 23", "line 24",
+    "line 25", "line 26", "line 27", "line 28", "line 29", "line 30",
+];
+const NA_MIX: &[&str] = &["abc DEF ghi"];
+const NA_NUM: &[&str] = &["count 7 here", "next 11 line"];
+const NA_PARA: &[&str] = &["alpha one", "beta two", "", "gamma three", "delta four"];
+const NA_SENT: &[&str] = &["One two. Three four. Five six."];
+const NA_SPELL: &[&str] = &["teh quick brwn fox"];
+const NA_TXT: &[&str] = &["alpha beta gamma", "delta epsilon zeta", "eta theta iota"];
+const NA_WIDE: &[&str] = &["001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050"];
+const NA_WORDS: &[&str] = &["alpha beta", "gamma alpha", "beta alpha"];
+
+const NORMAL_AUDIT: &[NormAudit] = &[
+    na(
+        "CTRL-A",
+        "CTRL-A",
+        Implemented,
+        Some(nlive(
+            NA_NUM,
+            (1, 7),
+            24,
+            "<C-a>",
+            "count 8 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("num:C-a on number")),
+        "matches Vim: increments the first number at or after the cursor.",
+    ),
+    na(
+        "CTRL-B",
+        "CTRL-B",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "<C-b>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (12, 1),
+            "NORMAL",
+            "",
+            3,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-b")),
+        "matches Vim: pages backwards with Vim's two-line overlap (#805).",
+    ),
+    na(
+        "CTRL-C",
+        "CTRL-C",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "/bet<C-c>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Pattern not found: betc",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-c aborts the search prompt")),
+        concat!(
+            "Vim interrupts the current (search) command. vimcode's search ",
+            "prompt takes the `c` as a literal pattern character — the ",
+            "recording ends with the pattern \"betc\" still in the command ",
+            "line. Worth implementing: <C-c> is the universal \"get me out of ",
+            "here\" key and typing into a prompt is the worst possible answer.",
+        ),
+    ),
+    na(
+        "CTRL-D",
+        "CTRL-D",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "<C-d>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (6, 1),
+            "NORMAL",
+            "",
+            6,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-d")),
+        concat!(
+            "matches Vim: scrolls down half a screen; an explicit count sets ",
+            "the sticky 'scroll' value (#805).",
+        ),
+    ),
+    na(
+        "CTRL-E",
+        "CTRL-E",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "<C-e>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (2, 1),
+            "NORMAL",
+            "",
+            2,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-e pushes cursor")),
+        concat!(
+            "matches Vim: scrolls the text up one line and pushes the cursor ",
+            "with it.",
+        ),
+    ),
+    na(
+        "CTRL-F",
+        "CTRL-F",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "<C-f>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (9, 1),
+            "NORMAL",
+            "",
+            9,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-f")),
+        "matches Vim: pages forward with the two-line overlap.",
+    ),
+    na(
+        "CTRL-G",
+        "CTRL-G",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-g>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "\"[No Name]\" 3 lines --33%--",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-g file info")),
+        concat!(
+            "matches Neovim's default-'ruler' shape (#1282: 'ruler' is on by ",
+            "default, so CTRL-G omits the cursor position it would otherwise ",
+            "have shown) — recorded as `\"[No Name]\" 3 lines --33%--`.",
+        ),
+    ),
+    na(
+        "<BS>",
+        "<BS>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 3),
+            24,
+            "<BS>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<BS> is h")),
+        "matches Vim: same as \"h\".",
+    ),
+    na(
+        "CTRL-H",
+        "CTRL-H",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 3),
+            24,
+            "<C-h>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-h is h")),
+        "matches Vim: same as \"h\".",
+    ),
+    na(
+        "<Tab>",
+        "<Tab>",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G<C-o><Tab>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (30, 1),
+            "NORMAL",
+            "",
+            21,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("jump:<Tab> newer entry")),
+        "matches Vim: goes to the newer jump-list entry.",
+    ),
+    na(
+        "CTRL-I",
+        "CTRL-I",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G<C-o><C-i>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (30, 1),
+            "NORMAL",
+            "",
+            21,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("jump:C-i newer entry")),
+        "matches Vim: same as <Tab>.",
+    ),
+    na(
+        "<NL>",
+        "<NL>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-j>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-j is j")),
+        "matches Vim: <NL> is CTRL-J, which moves down a line.",
+    ),
+    na(
+        "<S-NL>",
+        "<S-NL>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim makes Shift-<NL> a synonym for CTRL-F. `Engine::handle_key` ",
+            "has no Shift parameter at all, so both backends deliver plain ",
+            "\"Return\"/CTRL-J here and the Shift is lost before the engine ",
+            "sees it. Not worth implementing on its own — it is one of eight ",
+            "rows blocked by the same missing modifier bit.",
+        ),
+    ),
+    na(
+        "CTRL-J",
+        "CTRL-J",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-j>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-j is j")),
+        "matches Vim: same as \"j\".",
+    ),
+    na(
+        "CTRL-L",
+        "CTRL-L",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-l>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-l noop")),
+        concat!(
+            "matches Vim: a redraw the user cannot observe; the corpus pins ",
+            "it as a no-op.",
+        ),
+    ),
+    na(
+        "<CR>",
+        "<CR>",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "<CR>",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (2, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<CR>")),
+        "matches Vim: down a line, cursor on the first non-blank.",
+    ),
+    na(
+        "<S-CR>",
+        "<S-CR>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim makes Shift-<CR> a synonym for CTRL-F; the Shift bit never ",
+            "reaches the engine (see <S-NL>).",
+        ),
+    ),
+    na(
+        "CTRL-M",
+        "CTRL-M",
+        NotImplemented,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "<C-m>",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-m is <CR>")),
+        concat!(
+            "Vim's CTRL-M is <CR> — down a line, first non-blank. vimcode ",
+            "ignores it: the recording shows the cursor still at (1,1). Worth ",
+            "implementing: a three-line alias next to the existing <CR> arm.",
+        ),
+    ),
+    na(
+        "CTRL-N",
+        "CTRL-N",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-n>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-n is j")),
+        concat!(
+            "Vim's CTRL-N is \"j\". vimcode ignores it (cursor unmoved). Worth ",
+            "implementing, with the same caveat as CTRL-P: check first that ",
+            "nothing else wants <C-n>.",
+        ),
+    ),
+    na(
+        "CTRL-O",
+        "CTRL-O",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G<C-o>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("jump:C-o at start")),
+        "matches Vim: goes to the older jump-list entry.",
+    ),
+    na(
+        "CTRL-P",
+        "CTRL-P",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "<C-p>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:C-p is k")),
+        concat!(
+            "Vim's CTRL-P is \"k\". vimcode ignores it (the recording starts on ",
+            "line 2 and stays there). Worth implementing.",
+        ),
+    ),
+    na(
+        "CTRL-R",
+        "CTRL-R",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "xu<C-r>",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("undo:C-r redoes")),
+        "matches Vim: redoes the change \"u\" undid.",
+    ),
+    na(
+        "CTRL-T",
+        "CTRL-T",
+        Skipped(CTAGS),
+        None,
+        None,
+        "Vim pops the tag stack. vimcode has no tag stack at all.",
+    ),
+    na(
+        "CTRL-U",
+        "CTRL-U",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "<C-u>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            6,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-u")),
+        "matches Vim: scrolls up half a screen, mirroring CTRL-D (#805).",
+    ),
+    na(
+        "CTRL-V",
+        "CTRL-V",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-v>jl",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 2),
+            "VISUAL BLOCK",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("visual:C-v block")),
+        concat!(
+            "matches Vim: starts blockwise Visual mode (the recording ends in ",
+            "\"VISUAL BLOCK\").",
+        ),
+    ),
+    na(
+        "CTRL-X",
+        "CTRL-X",
+        Implemented,
+        Some(nlive(
+            NA_NUM,
+            (1, 7),
+            24,
+            "<C-x>",
+            "count 6 here|next 11 line",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("num:C-x to negative")),
+        "matches Vim: decrements the number at or after the cursor.",
+    ),
+    na(
+        "CTRL-Y",
+        "CTRL-Y",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "<C-y>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (19, 1),
+            "NORMAL",
+            "",
+            10,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:C-y pulls cursor")),
+        concat!(
+            "matches Vim: scrolls the text down one line, pulling the cursor ",
+            "with it.",
+        ),
+    ),
+    na(
+        "CTRL-Z",
+        "CTRL-Z",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-z>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "z: a/o/c=fold  M=closeAll  R=openAll  d/D=del  f=create  j/k=nav  z/t/b=scroll  h/l=hscroll",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-z suspends")),
+        concat!(
+            "Vim suspends the editor (or starts a shell). vimcode prints an ",
+            "unrelated fold-command hint (\"z: a/o/c=fold ...\") — the ",
+            "keystroke is bound to something else entirely. Only the TUI ",
+            "backend could ever implement this (SIGTSTP); the GUI cannot, so ",
+            "it needs a quadraui-level answer before vimcode can have one.",
+        ),
+    ),
+    na(
+        "CTRL-\\ CTRL-N",
+        "CTRL-\\_CTRL-N",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-\\><C-n>x",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-bslash C-n from Normal")),
+        concat!(
+            "In Normal mode the documented action is \"go to Normal mode ",
+            "(no-op)\", and the recording is indeed a no-op — but only because ",
+            "vimcode drops both keys on the floor. #1228 measured the same ",
+            "chord from Visual mode and it fails to leave Visual there, so ",
+            "this row is \"accidentally right\", not implemented. Fixing it is ",
+            "one arm in `handle_normal_key`.",
+        ),
+    ),
+    na(
+        "CTRL-\\ CTRL-G",
+        "CTRL-\\_CTRL-G",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-\\><C-g>x",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("misc:C-bslash C-g from Normal")),
+        concat!(
+            "Same as CTRL-\\\\ CTRL-N: the Normal-mode no-op is ",
+            "indistinguishable from the keys being ignored, and #1228 shows ",
+            "the chord does nothing from Visual either.",
+        ),
+    ),
+    na(
+        "CTRL-]",
+        "CTRL-]",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim runs `:ta` on the identifier under the cursor. vimcode has ",
+            "no ctags; go-to-definition is the LSP-backed `gd`/`gD` of the ",
+            "g-prefix slice.",
+        ),
+    ),
+    na(
+        "CTRL-^",
+        "CTRL-^",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-^>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No alternate buffer",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("buf:C-^ alternate file")),
+        concat!(
+            "Vim edits the alternate file (`:e #`). vimcode's `Engine::",
+            "alternate_buffer` already does the same thing (bound since ",
+            "before this row was written) — #1281 fixed this *spelling* of ",
+            "the key (`<C-^>`, i.e. key_name \"^\") to reach it too, not ",
+            "just the \"6\" spelling some backends report for the same ",
+            "physical Ctrl+Shift+6 combo (`:h CTRL-^`). This single-buffer ",
+            "recording has no alternate buffer set, hence the refusal ",
+            "message — see the real cross-file case in CASES_XFILE (#1281) ",
+            "for the working jump.",
+        ),
+    ),
+    na(
+        "CTRL-<Tab>",
+        "CTRL-<Tab>",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-Tab>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("tab:C-Tab last accessed")),
+        concat!(
+            "Vim goes straight to the last accessed tab page. vimcode opens ",
+            "an MRU *tab switcher overlay* instead (`keys.rs` intercepts ",
+            "ctrl+\"Tab\" before the Normal-mode dispatch), so the keystroke is ",
+            "bound but its effect is a different interaction. The recording ",
+            "cannot see the overlay — it is neither buffer, cursor, mode nor ",
+            "message.",
+        ),
+    ),
+    na(
+        "<Space>",
+        "<Space>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Space>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Space> is l")),
+        concat!(
+            "Vim's <Space> is \"l\". In vimcode <Space> is the **leader key** ",
+            "(`default_leader()` returns ' '), so it opens leader-pending ",
+            "state instead and the cursor does not move. Not worth \"fixing\" ",
+            "blindly — it is a deliberate trade, but it is a real conformance ",
+            "gap and should be documented as one.",
+        ),
+    ),
+    na(
+        "!{motion}{filter}",
+        "!",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "!jsort<CR>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "2 lines filtered",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:!Gsort")),
+        concat!(
+            "matches Vim: filters the Nmove lines through the external ",
+            "command (\"2 lines filtered\").",
+        ),
+    ),
+    na(
+        "!!{filter}",
+        "!!",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "!!tr a-z A-Z<CR>",
+            "alpha beta gamma|DELTA EPSILON ZETA|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "1 lines filtered",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:!!tr")),
+        "matches Vim: filters N lines through the external command.",
+    ),
+    na(
+        "\"{register}",
+        "quote",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "\"ayyj\"aP",
+            "alpha beta gamma|alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("reg:\"ayy \"ap")),
+        concat!(
+            "matches Vim: `\"{register}` selects the register for the next ",
+            "delete, yank or put.",
+        ),
+    ),
+    na(
+        "#",
+        "#",
+        Implemented,
+        Some(nlive(
+            NA_WORDS,
+            (3, 7),
+            24,
+            "#",
+            "alpha beta|gamma alpha|beta alpha",
+            (2, 7),
+            "NORMAL",
+            "match 2 of 3",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:#")),
+        concat!(
+            "matches Vim: searches backwards for the identifier under the ",
+            "cursor.",
+        ),
+    ),
+    na(
+        "$",
+        "$",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "$",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 16),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:2$")),
+        "matches Vim: end of the Nth next line.",
+    ),
+    na(
+        "%",
+        "%",
+        Implemented,
+        Some(nlive(
+            NA_BR,
+            (1, 4),
+            24,
+            "%",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail",
+            (1, 12),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:% on (")),
+        "matches Vim: jumps to the matching bracket.",
+    ),
+    na(
+        "{count}%",
+        "N%",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "50%",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            6,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:N% percentage")),
+        "matches Vim: `50%` on a 30-line buffer lands on line 15.",
+    ),
+    na(
+        "&",
+        "&",
+        Implemented,
+        Some(nlive(
+            NA_WORDS,
+            (1, 1),
+            24,
+            ":s/alpha/X/<CR>j&",
+            "X beta|gamma X|beta alpha",
+            (2, 1),
+            "NORMAL",
+            "1 substitution on 1 line",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:& repeats last substitute")),
+        "matches Vim: repeats the last `:s` on the current line.",
+    ),
+    na(
+        "'{a-zA-Z0-9}",
+        "'",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 7),
+            24,
+            "majj'a",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'a line")),
+        "matches Vim: to the first non-blank of the marked line.",
+    ),
+    na(
+        "''",
+        "''",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G''",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'' back")),
+        concat!(
+            "matches Vim: back to the line of the position before the latest ",
+            "jump.",
+        ),
+    ),
+    na(
+        "'(",
+        "'(",
+        NotImplemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 20),
+            24,
+            "'(",
+            "One two. Three four. Five six.",
+            (1, 20),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'( sentence start")),
+        concat!(
+            "Vim jumps to the line holding the start of the current sentence. ",
+            "vimcode rejects the mark outright — \"Marks must be a letter or ",
+            "special char\". Worth implementing together with `'`)`, `` `( `` ",
+            "and `` `) ``: four rows, one sentence-boundary helper that ",
+            "`(`/`)` already have.",
+        ),
+    ),
+    na(
+        "')",
+        "')",
+        NotImplemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 1),
+            24,
+            "')",
+            "One two. Three four. Five six.",
+            (1, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:') sentence end")),
+        concat!(
+            "Same as `'(`: rejected with \"Marks must be a letter or special ",
+            "char\".",
+        ),
+    ),
+    na(
+        "'<",
+        "'<",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "vjl<Esc>gg'<",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'< visual start")),
+        "matches Vim: first line of the last Visual area.",
+    ),
+    na(
+        "'>",
+        "'>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "vjl<Esc>gg'>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'> visual end")),
+        "matches Vim: last line of the last Visual area.",
+    ),
+    na(
+        "'[",
+        "'[",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyjpgg'[",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No previous change",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'[ change start")),
+        concat!(
+            "Vim goes to the line of the start of the last change or put; ",
+            "vimcode answers \"No previous change\" even directly after a `p`, ",
+            "so the `'[`/`']`/`` `[ ``/`` `] `` family is unset. Worth ",
+            "implementing — `]p`-style workflows and `gp` lean on it.",
+        ),
+    ),
+    na(
+        "']",
+        "']",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyjpgg']",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No previous change",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'] change end")),
+        concat!(
+            "Same as `'[`: \"No previous change\" after a put that plainly ",
+            "changed the buffer.",
+        ),
+    ),
+    na(
+        "'{",
+        "'{",
+        NotImplemented,
+        Some(nlive(
+            NA_PARA,
+            (4, 1),
+            24,
+            "'{",
+            "alpha one|beta two||gamma three|delta four",
+            (4, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'{ paragraph start")),
+        concat!(
+            "Vim goes to the line of the start of the current paragraph; ",
+            "vimcode rejects the mark (\"Marks must be a letter or special ",
+            "char\"). Cheap to implement: `{`/`}` already compute the ",
+            "boundary.",
+        ),
+    ),
+    na(
+        "'}",
+        "'}",
+        NotImplemented,
+        Some(nlive(
+            NA_PARA,
+            (1, 1),
+            24,
+            "'}",
+            "alpha one|beta two||gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:'} paragraph end")),
+        "Same as `'{`.",
+    ),
+    na(
+        "(",
+        "(",
+        Implemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 20),
+            24,
+            "(",
+            "One two. Three four. Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:( sentence")),
+        "matches Vim: N sentences backwards.",
+    ),
+    na(
+        ")",
+        ")",
+        Implemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 1),
+            24,
+            ")",
+            "One two. Three four. Five six.",
+            (1, 10),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:) sentences")),
+        "matches Vim: N sentences forwards.",
+    ),
+    na(
+        "*",
+        "star",
+        Implemented,
+        Some(nlive(
+            NA_WORDS,
+            (1, 1),
+            24,
+            "*",
+            "alpha beta|gamma alpha|beta alpha",
+            (2, 7),
+            "NORMAL",
+            "match 2 of 3",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:*")),
+        concat!(
+            "matches Vim: searches forward for the identifier under the ",
+            "cursor.",
+        ),
+    ),
+    na(
+        "+",
+        "+",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 7),
+            24,
+            "+",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (2, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:+")),
+        "matches Vim: down a line, first non-blank.",
+    ),
+    na(
+        "<S-+>",
+        "<S-Plus>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim makes Shift-+ a synonym for CTRL-F; the Shift bit never ",
+            "reaches the engine (see <S-NL>).",
+        ),
+    ),
+    na(
+        ",",
+        ",",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "$Fa,",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 16),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:F, F, then ,")),
+        "matches Vim: repeats the last f/t/F/T in the opposite direction.",
+    ),
+    na(
+        "-",
+        "-",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (2, 7),
+            24,
+            "-",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:-")),
+        "matches Vim: up a line, first non-blank.",
+    ),
+    na(
+        "<S-->",
+        "<S-Minus>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim makes Shift-- a synonym for CTRL-B; the Shift bit never ",
+            "reaches the engine (see <S-NL>).",
+        ),
+    ),
+    na(
+        ".",
+        ".",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "x.",
+            "pha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("dot:x then .")),
+        "matches Vim: repeats the last change.",
+    ),
+    na(
+        "/{pattern}<CR>",
+        "/",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "/eta<CR>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 8),
+            "NORMAL",
+            "match 1 of 4",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:/pattern")),
+        concat!(
+            "matches Vim: searches forward for the Nth occurrence, and ",
+            "reports \"match 1 of 4\".",
+        ),
+    ),
+    na(
+        "/<CR>",
+        "/<CR>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "/eta<CR>gg/<CR>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 16),
+            "NORMAL",
+            "match 2 of 4",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:/<CR> reuses last")),
+        "matches Vim: a bare `/<CR>` re-runs the previous pattern.",
+    ),
+    na(
+        "0",
+        "0",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 5),
+            24,
+            "0",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:0")),
+        "matches Vim: to the first character of the line.",
+    ),
+    na(
+        "1 - 9",
+        "count",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "3l",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 4),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:3l count")),
+        concat!(
+            "matches Vim: digits 1-9 prepend a count (the nine `|count|` rows ",
+            "of `:help normal-index` are one command and are tagged once).",
+        ),
+    ),
+    na(
+        ":",
+        ":",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            ":",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "COMMAND",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:: opens the command line")),
+        concat!(
+            "matches Vim: enters command-line mode (the recording ends in ",
+            "vimcode's \"COMMAND\" mode string).",
+        ),
+    ),
+    na(
+        "{count}:",
+        "N:",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "3:",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "COMMAND",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:3: prefills a range")),
+        concat!(
+            "matches Vim: `3:` opens the command line prefilled with the ",
+            "range `.,.+2`.",
+        ),
+    ),
+    na(
+        ";",
+        ";",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "fa;",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 10),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:f, then ;")),
+        "matches Vim: repeats the last f/t/F/T.",
+    ),
+    na(
+        "<{motion}",
+        "<",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            "<j",
+            "alpha beta|gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:< with motion")),
+        concat!(
+            "#1279 fixed the one-column cursor bug this row used to record: ",
+            "`apply_linewise_operator` forced the cursor to column 1 before ",
+            "every operator ran, which corrupted `indent_lines`'s own ",
+            "\"restore the original screen column\" logic (it captured the ",
+            "already-zeroed column as `orig_col`). Fixed for `=`/`>` too as ",
+            "the same change — same operator plumbing, same bug.",
+        ),
+    ),
+    na(
+        "<<",
+        "<<",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            "<<",
+            "alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:<< partial indent")),
+        concat!(
+            "matches Vim: shifts N lines one 'shiftwidth' left, cursor ",
+            "included.",
+        ),
+    ),
+    na(
+        "={motion}",
+        "=",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            "=j",
+            "alpha beta|gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:= with motion")),
+        "matches Vim: fixed by the same #1279 change as `<{motion}`.",
+    ),
+    na(
+        "==",
+        "==",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            "==",
+            "alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:== single")),
+        "matches Vim: re-indents the current line.",
+    ),
+    na(
+        ">{motion}",
+        ">",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            ">j",
+            "        alpha beta|        gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:> with motion")),
+        "matches Vim: fixed by the same #1279 change as `<{motion}`.",
+    ),
+    na(
+        ">>",
+        ">>",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 5),
+            24,
+            ">>",
+            "        alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:>>")),
+        "matches Vim: shifts N lines one 'shiftwidth' right.",
+    ),
+    na(
+        "?{pattern}<CR>",
+        "?",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (3, 1),
+            24,
+            "?beta<CR>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "match 1 of 1",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:?pattern")),
+        "matches Vim: searches backwards for the Nth previous occurrence.",
+    ),
+    na(
+        "?<CR>",
+        "?<CR>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (3, 1),
+            24,
+            "?beta<CR>G?<CR>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "match 1 of 1",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:?<CR> reuses last")),
+        concat!(
+            "matches Vim: a bare `?<CR>` re-runs the previous pattern ",
+            "backwards.",
+        ),
+    ),
+    na(
+        "@{a-z}",
+        "@",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "qaxqj@a",
+            "lpha beta gamma|elta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mac:qaxjq @a")),
+        "matches Vim: executes the contents of the named register.",
+    ),
+    na(
+        "@:",
+        "@:",
+        Implemented,
+        Some(nlive(
+            NA_WORDS,
+            (1, 1),
+            24,
+            ":s/a/X/<CR>j@:",
+            "Xlpha beta|gXmma alpha|beta alpha",
+            (2, 1),
+            "NORMAL",
+            "1 substitution on 1 line",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:@: repeats last ex")),
+        concat!(
+            "matches Vim: repeats the previous `:` command (the recording's ",
+            "second substitution lands on line 2).",
+        ),
+    ),
+    na(
+        "@@",
+        "@@",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "qaxqj@aj@@",
+            "lpha beta gamma|elta epsilon zeta|ta theta iota",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mac:@@ repeats")),
+        "matches Vim: repeats the previous `@{a-z}`.",
+    ),
+    na(
+        "A",
+        "A",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "AX<Esc>",
+            "alpha beta gammaX|delta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:A esc cursor")),
+        "matches Vim: appends after the end of the line.",
+    ),
+    na(
+        "B",
+        "B",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 12),
+            24,
+            "B",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:B")),
+        "matches Vim: N WORDS backwards.",
+    ),
+    na(
+        "[\"x]C",
+        "C",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 7),
+            24,
+            "CX<Esc>",
+            "alpha X|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:C")),
+        "matches Vim: changes to end of line (\"c$\").",
+    ),
+    na(
+        "[\"x]D",
+        "D",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 7),
+            24,
+            "D",
+            "alpha |delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:3D")),
+        "matches Vim: deletes to end of line (\"d$\").",
+    ),
+    na(
+        "E",
+        "E",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "E",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:E")),
+        "matches Vim: forward to the end of WORD N.",
+    ),
+    na(
+        "F{char}",
+        "F",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 12),
+            24,
+            "Fb",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:F at col1")),
+        "matches Vim: to the Nth occurrence of {char} leftwards.",
+    ),
+    na(
+        "G",
+        "G",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (30, 1),
+            "NORMAL",
+            "",
+            21,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:5G")),
+        "matches Vim: to line N, last line by default.",
+    ),
+    na(
+        "H",
+        "H",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "H",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (11, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:H from 30")),
+        concat!(
+            "matches Vim: to line N from the top of the window. (The recorded ",
+            "top differs from the `-l` oracle's because that oracle has no ",
+            "attached UI; the corpus's UI-attached `scroll:H` cases are the ",
+            "real proof.)",
+        ),
+    ),
+    na(
+        "I",
+        "I",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 8),
+            24,
+            "IX<Esc>",
+            "    Xalpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:I indented")),
+        "matches Vim: inserts before the first non-blank.",
+    ),
+    na(
+        "J",
+        "J",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "J",
+            "alpha beta gamma delta epsilon zeta|eta theta iota",
+            (1, 17),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:J basic")),
+        "matches Vim: joins N lines with a space.",
+    ),
+    na(
+        "K",
+        "K",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "K",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("lsp:K keyword lookup")),
+        concat!(
+            "Vim looks the keyword under the cursor up with 'keywordprg'. ",
+            "vimcode does nothing and says nothing. Worth implementing as LSP ",
+            "hover — vimcode already has hover, it is simply not on `K`.",
+        ),
+    ),
+    na(
+        "L",
+        "L",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "L",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:L from 30")),
+        concat!(
+            "matches Vim: to line N from the bottom of the window (see H on ",
+            "the oracle's viewport).",
+        ),
+    ),
+    na(
+        "M",
+        "M",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "M",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:M from 30")),
+        "matches Vim: to the middle line of the window.",
+    ),
+    na(
+        "N",
+        "N",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "/eta<CR>N",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (3, 7),
+            "NORMAL",
+            "match 4 of 4",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:N reverse")),
+        concat!(
+            "matches Vim: repeats the last search in the opposite direction ",
+            "(\"match 4 of 4\").",
+        ),
+    ),
+    na(
+        "O",
+        "O",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "OX<Esc>",
+            "alpha beta gamma|X|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:O first line")),
+        "matches Vim: opens a line above and inserts.",
+    ),
+    na(
+        "[\"x]P",
+        "P",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyjP",
+            "alpha beta gamma|alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:P charwise multiline")),
+        "matches Vim: puts the register before the cursor.",
+    ),
+    na(
+        "R",
+        "R",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "RXY<Esc>",
+            "XYpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:R")),
+        "matches Vim: Replace mode overtypes existing characters.",
+    ),
+    na(
+        "[\"x]S",
+        "S",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "SX<Esc>",
+            "alpha beta gamma|X|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:S keeps indent")),
+        "matches Vim: deletes N lines and starts insert (\"cc\").",
+    ),
+    na(
+        "T{char}",
+        "T",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 12),
+            24,
+            "Tb",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 8),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:T, then ;")),
+        "matches Vim: till after the Nth occurrence of {char} leftwards.",
+    ),
+    na(
+        "U",
+        "U",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "xxU",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Line restored",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("undo:U line")),
+        concat!(
+            "matches Vim: undoes all latest changes on one line (the ",
+            "recording reports \"Line restored\").",
+        ),
+    ),
+    na(
+        "V",
+        "V",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "Vj",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "VISUAL LINE",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:V2>")),
+        "matches Vim: starts linewise Visual mode.",
+    ),
+    na(
+        "W",
+        "W",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "W",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:W")),
+        "matches Vim: N WORDS forwards.",
+    ),
+    na(
+        "[\"x]X",
+        "X",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 3),
+            24,
+            "X",
+            "apha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:X at col1")),
+        "matches Vim: deletes N characters before the cursor.",
+    ),
+    na(
+        "[\"x]Y",
+        "Y",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "Yjp",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:Y is linewise")),
+        concat!(
+            "matches Vim's documented `Y` (a synonym for \"yy\"), i.e. the ",
+            "pre-'default-mappings' behaviour the whole suite compares ",
+            "against.",
+        ),
+    ),
+    na(
+        "ZZ",
+        "ZZ",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "ZZ",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:ZZ writes and closes")),
+        concat!(
+            "Vim writes the buffer if changed and closes the window. vimcode ",
+            "has **no `Z` handler at all** — the recording is a complete ",
+            "no-op, no message, no EngineAction. Worth implementing: ",
+            "`ZZ`/`ZQ` are the shortest way out of an editor and their ",
+            "absence is silent.",
+        ),
+    ),
+    na(
+        "ZQ",
+        "ZQ",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "ZQ",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("ex:ZQ closes without writing")),
+        "Same as ZZ: no handler, no message.",
+    ),
+    na(
+        "^",
+        "^",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 9),
+            24,
+            "^",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:^")),
+        "matches Vim: to the first non-blank of the line.",
+    ),
+    na(
+        "_",
+        "_",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 7),
+            24,
+            "2_",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (2, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:2_")),
+        "matches Vim: first non-blank, N-1 lines lower.",
+    ),
+    na(
+        "`{a-zA-Z0-9}",
+        "`",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 7),
+            24,
+            "majj`a",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`a exact")),
+        "matches Vim: to the exact position of the mark.",
+    ),
+    na(
+        "`(",
+        "`(",
+        NotImplemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 20),
+            24,
+            "`(",
+            "One two. Three four. Five six.",
+            (1, 20),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`( sentence start")),
+        concat!(
+            "Vim goes to the start of the current sentence; vimcode rejects ",
+            "the mark (\"Marks must be a letter or special char\"). Same ",
+            "one-line fix as `'(`.",
+        ),
+    ),
+    na(
+        "`)",
+        "`)",
+        NotImplemented,
+        Some(nlive(
+            NA_SENT,
+            (1, 1),
+            24,
+            "`)",
+            "One two. Three four. Five six.",
+            (1, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`) sentence end")),
+        "Same as `` `( ``.",
+    ),
+    na(
+        "`<",
+        "`<",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "vjl<Esc>gg`<",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`< visual start")),
+        "matches Vim: to the start of the last Visual area.",
+    ),
+    na(
+        "`>",
+        "`>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "vjl<Esc>gg`>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`> visual end")),
+        "matches Vim: to the end of the last Visual area.",
+    ),
+    na(
+        "`[",
+        "`[",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyjpgg`[",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No previous change",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`[ change start")),
+        concat!(
+            "Vim goes to the start of the last change or put; vimcode answers ",
+            "\"No previous change\" (see `'[`).",
+        ),
+    ),
+    na(
+        "`]",
+        "`]",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyjpgg`]",
+            "alpha beta gamma|delta epsilon zeta|alpha beta gamma|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No previous change",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`] change end")),
+        concat!(
+            "Vim goes to the end of the last change or put; vimcode answers ",
+            "\"No previous change\".",
+        ),
+    ),
+    na(
+        "``",
+        "``",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "G``",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`` back")),
+        "matches Vim: to the position before the latest jump.",
+    ),
+    na(
+        "`{",
+        "`{",
+        NotImplemented,
+        Some(nlive(
+            NA_PARA,
+            (4, 1),
+            24,
+            "`{",
+            "alpha one|beta two||gamma three|delta four",
+            (4, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`{ paragraph start")),
+        concat!(
+            "Vim goes to the start of the current paragraph; vimcode rejects ",
+            "the mark.",
+        ),
+    ),
+    na(
+        "`}",
+        "`}",
+        NotImplemented,
+        Some(nlive(
+            NA_PARA,
+            (1, 1),
+            24,
+            "`}",
+            "alpha one|beta two||gamma three|delta four",
+            (1, 1),
+            "NORMAL",
+            "Marks must be a letter or special char",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:`} paragraph end")),
+        "Same as `` `{ ``.",
+    ),
+    na(
+        "a",
+        "a",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "aX<Esc>",
+            "aXlpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:a at eol")),
+        "matches Vim: appends after the cursor.",
+    ),
+    na(
+        "b",
+        "b",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 12),
+            24,
+            "b",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:b from mid word")),
+        "matches Vim: N words backwards.",
+    ),
+    na(
+        "[\"x]c{motion}",
+        "c",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "cwX<Esc>",
+            "X beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:cw on word")),
+        "matches Vim: deletes Nmove text and starts insert.",
+    ),
+    na(
+        "[\"x]cc",
+        "cc",
+        Implemented,
+        Some(nlive(
+            NA_IND,
+            (1, 7),
+            24,
+            "ccX<Esc>",
+            "    X|    gamma delta|    eps zeta",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:cc keeps indent")),
+        concat!(
+            "matches Vim: deletes N lines and starts insert, keeping the ",
+            "indent.",
+        ),
+    ),
+    na(
+        "[\"x]d{motion}",
+        "d",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "dw",
+            "beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:dw last word of buffer")),
+        "matches Vim: deletes Nmove text.",
+    ),
+    na(
+        "[\"x]dd",
+        "dd",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "dd",
+            "delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:dd last line cursor")),
+        "matches Vim: deletes N lines.",
+    ),
+    na(
+        "do",
+        "do",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "do",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Not in diff mode",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("diff:do obtains a line")),
+        concat!(
+            "implemented as `Engine::diff_obtain` ",
+            "(`src/core/engine/windows.rs`); the recording shows its guard ",
+            "(\"Not in diff mode\") because a diff pair needs two windows onto ",
+            "two files, which this harness's single scratch buffer cannot set ",
+            "up.",
+        ),
+    ),
+    na(
+        "dp",
+        "dp",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "dp",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Not in diff mode",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("diff:dp puts a line")),
+        concat!(
+            "implemented as `Engine::diff_put`; recorded through the same ",
+            "\"Not in diff mode\" guard as `do`.",
+        ),
+    ),
+    na(
+        "e",
+        "e",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "e",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:e")),
+        "matches Vim: forward to the end of word N.",
+    ),
+    na(
+        "f{char}",
+        "f",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "fb",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:f, then ;")),
+        "matches Vim: to the Nth occurrence of {char} rightwards.",
+    ),
+    na(
+        "h",
+        "h",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 3),
+            24,
+            "h",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:h at start")),
+        "matches Vim: N characters left.",
+    ),
+    na(
+        "i",
+        "i",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "iX<Esc>",
+            "Xalpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:i col1 esc")),
+        "matches Vim: inserts before the cursor.",
+    ),
+    na(
+        "j",
+        "j",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "j",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:j col memory short")),
+        "matches Vim: N lines down, with column memory.",
+    ),
+    na(
+        "k",
+        "k",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "k",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:10k beyond")),
+        "matches Vim: N lines up.",
+    ),
+    na(
+        "l",
+        "l",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "l",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:l right")),
+        "matches Vim: N characters right.",
+    ),
+    na(
+        "m{A-Za-z}",
+        "m",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 7),
+            24,
+            "majj`a",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:d`a")),
+        concat!(
+            "matches Vim: sets the named mark at the cursor (the recording ",
+            "jumps back to it with `` `a ``).",
+        ),
+    ),
+    na(
+        "n",
+        "n",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "/eta<CR>ggn",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 16),
+            "NORMAL",
+            "match 2 of 4",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("search:n forward")),
+        "matches Vim: repeats the last search (\"match 2 of 4\").",
+    ),
+    na(
+        "o",
+        "o",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "oX<Esc>",
+            "alpha beta gamma|X|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:o autoindent")),
+        "matches Vim: opens a line below and inserts.",
+    ),
+    na(
+        "[\"x]p",
+        "p",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyp",
+            "alpha beta gamma|alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:p linewise cursor first nonblank")),
+        "matches Vim: puts the register after the cursor.",
+    ),
+    na(
+        "q{0-9a-zA-Z\"}",
+        "q",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "qaxx",
+            "pha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mac:qaxjq @a")),
+        "matches Vim: records typed characters into the named register.",
+    ),
+    na(
+        "q (while recording)",
+        "q",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "qaxqj@a",
+            "lpha beta gamma|elta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mac:q stops recording")),
+        concat!(
+            "matches Vim: a second `q` stops recording, and the register ",
+            "replays (the recording's `@a` deletes a character on line 2).",
+        ),
+    ),
+    na(
+        "Q",
+        "Q",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "qaxqjQ",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mac:Q replays last register")),
+        concat!(
+            "Neovim's `Q` replays the last recorded register. vimcode does ",
+            "nothing: after `qaxq` and a `j`, `Q` leaves line 2 untouched. ",
+            "Cheap to implement on top of the existing macro playback queue.",
+        ),
+    ),
+    na(
+        "q:",
+        "q:",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "q:",
+            "|",
+            (1, 1),
+            "NORMAL",
+            "Press Enter to execute, q to close",
+            1,
+            1,
+            "",
+            "(h0.50 1 2*) tabs=1/1",
+        )),
+        Some(Label("cmdwin:q: opens the history window")),
+        concat!(
+            "Vim opens the command-line window *in the current tab*, filled ",
+            "with the `:` history, and `:h cmdwin` semantics apply. As of ",
+            "#1297, vimcode does too: `q:` pushes a horizontal-split window ",
+            "(not a new tab) into the active tab, positioned last per `:h ",
+            "cmdwin`'s \"positioned just above the command-line\" (always ",
+            "last, unlike an ordinary split, which honors 'splitbelow'). ",
+            "Still Partial: no `cmdwinheight` (the split is an even 0.5 ",
+            "ratio, not Vim's default 7-line window), no E1292 nesting ",
+            "guard, and no `cmdwin-char` type indicator in the left column.",
+        ),
+    ),
+    na(
+        "q/",
+        "q/",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "q/",
+            "|",
+            (1, 1),
+            "NORMAL",
+            "Press Enter to execute, q to close",
+            1,
+            1,
+            "",
+            "(h0.50 1 2*) tabs=1/1",
+        )),
+        Some(Label("cmdwin:q/ opens the search history window")),
+        concat!(
+            "Same as `q:` — and the recording is byte-identical to it, i.e. ",
+            "vimcode does not distinguish the `/` history from the `:` ",
+            "history in this empty-history recording.",
+        ),
+    ),
+    na(
+        "q?",
+        "q?",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "q?",
+            "|",
+            (1, 1),
+            "NORMAL",
+            "Press Enter to execute, q to close",
+            1,
+            1,
+            "",
+            "(h0.50 1 2*) tabs=1/1",
+        )),
+        Some(Label("cmdwin:q? opens the reverse-search history window")),
+        "Same as `q/`.",
+    ),
+    na(
+        "r{char}",
+        "r",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "rZ",
+            "Zlpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:r")),
+        "matches Vim: replaces N characters with {char}.",
+    ),
+    na(
+        "[\"x]s",
+        "s",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "sZ<Esc>",
+            "Zlpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:s")),
+        "matches Vim: deletes N characters and starts insert.",
+    ),
+    na(
+        "t{char}",
+        "t",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "tb",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:t; then ; repeat")),
+        concat!(
+            "matches Vim: till before the Nth occurrence of {char} ",
+            "rightwards.",
+        ),
+    ),
+    na(
+        "u",
+        "u",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "xu",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("undo:u on unchanged")),
+        "matches Vim: undoes the last change.",
+    ),
+    na(
+        "v",
+        "v",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "vl",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "VISUAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("visual:v charwise")),
+        "matches Vim: starts charwise Visual mode.",
+    ),
+    na(
+        "w",
+        "w",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "w",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:w punctuation")),
+        "matches Vim: N words forwards.",
+    ),
+    na(
+        "[\"x]x",
+        "x",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "x",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:x at eol")),
+        "matches Vim: deletes N characters under and after the cursor.",
+    ),
+    na(
+        "[\"x]y{motion}",
+        "y",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "ywP",
+            "alpha alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 6),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:yiw cursor")),
+        "matches Vim: yanks Nmove text.",
+    ),
+    na(
+        "[\"x]yy",
+        "yy",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "yyp",
+            "alpha beta gamma|alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:yy 3p")),
+        "matches Vim: yanks N lines.",
+    ),
+    na(
+        "{",
+        "{",
+        Implemented,
+        Some(nlive(
+            NA_PARA,
+            (5, 1),
+            24,
+            "{",
+            "alpha one|beta two||gamma three|delta four",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:{")),
+        "matches Vim: N paragraphs backwards.",
+    ),
+    na(
+        "|",
+        "bar",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "8|",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 8),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:4|")),
+        "matches Vim: to column N.",
+    ),
+    na(
+        "}",
+        "}",
+        Implemented,
+        Some(nlive(
+            NA_PARA,
+            (1, 1),
+            24,
+            "}",
+            "alpha one|beta two||gamma three|delta four",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:2}")),
+        "matches Vim: N paragraphs forwards.",
+    ),
+    na(
+        "~",
+        "~",
+        Implemented,
+        Some(nlive(
+            NA_MIX,
+            (1, 1),
+            24,
+            "3~",
+            "ABC DEF ghi",
+            (1, 4),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:3~")),
+        concat!(
+            "matches Vim with 'tildeop' off: switches the case of N ",
+            "characters and moves right.",
+        ),
+    ),
+    na(
+        "~{motion} ('tildeop')",
+        "~",
+        NotImplemented,
+        Some(nlive(
+            NA_MIX,
+            (1, 1),
+            24,
+            ":set tildeop<CR>~w",
+            "Abc DEF ghi",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("opt:tildeop makes ~ an operator")),
+        concat!(
+            "Vim with 'tildeop' on makes `~` take a motion. vimcode has no ",
+            "'tildeop' option — `:set tildeop` is an error and `~w` switches ",
+            "a single character and then moves a word. Low value: 'tildeop' ",
+            "is off by default and rarely turned on.",
+        ),
+    ),
+    na(
+        "<C-End>",
+        "<C-End>",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "<C-End>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 7),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<C-End> is G")),
+        concat!(
+            "Vim's <C-End> is \"G\" (last line). vimcode routes it to plain ",
+            "<End> — the recording ends at the end of *line 1*, not on line ",
+            "30. Worth implementing; it is a one-line alias and the wrong ",
+            "answer is a *jump*, which is easy to mistake for a bug in G.",
+        ),
+    ),
+    na(
+        "<C-Home>",
+        "<C-Home>",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "<C-Home>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<C-Home> is gg")),
+        concat!(
+            "Vim's <C-Home> is \"gg\". vimcode ignores it entirely (cursor ",
+            "unmoved on line 20).",
+        ),
+    ),
+    na(
+        "<C-Left>",
+        "<C-Left>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 12),
+            24,
+            "<C-Left>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 11),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<C-Left> is b")),
+        concat!(
+            "Vim's <C-Left> is \"b\" (word left). vimcode moves a single ",
+            "character left, i.e. it treats it as plain <Left>. Worth ",
+            "implementing: every other editor's Ctrl+Arrow is word-wise and ",
+            "the current behaviour is quietly wrong rather than absent.",
+        ),
+    ),
+    na(
+        "<C-LeftMouse>",
+        "<C-LeftMouse>",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim runs `:ta` on the keyword at the click. vimcode has no tag ",
+            "stack (see CTRL-]).",
+        ),
+    ),
+    na(
+        "<C-Right>",
+        "<C-Right>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-Right>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<C-Right> is w")),
+        concat!(
+            "Vim's <C-Right> is \"w\". vimcode treats it as plain <Right> (one ",
+            "character).",
+        ),
+    ),
+    na(
+        "<C-RightMouse>",
+        "<C-RightMouse>",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim pops the tag stack (CTRL-T) at the click position; vimcode ",
+            "has no tag stack.",
+        ),
+    ),
+    na(
+        "<C-Tab>",
+        "<C-Tab>",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-Tab>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("tab:<C-Tab> last accessed")),
+        concat!(
+            "The doc lists this twice (`|CTRL-<Tab>|` and `|<C-Tab>|`); both ",
+            "are \"go to the last accessed tab page\". vimcode binds ctrl+Tab ",
+            "to its MRU **tab switcher overlay** instead — bound, but a ",
+            "different interaction, and invisible to a ",
+            "buffer/cursor/mode/message recording.",
+        ),
+    ),
+    na(
+        "[\"x]<Del>",
+        "<Del>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Del>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:<Del> is x")),
+        concat!(
+            "Vim's <Del> is \"x\". vimcode ignores it in Normal mode — the ",
+            "recording leaves the buffer untouched. Worth implementing: it is ",
+            "one arm, and users who reach for <Del> get silence.",
+        ),
+    ),
+    na(
+        "{count}<Del>",
+        "N<Del>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "12<Del>l",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 13),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:{count}<Del> drops a digit")),
+        concat!(
+            "Vim's `{count}<Del>` removes the last digit of the count. ",
+            "vimcode ignores the <Del> and applies the whole count — ",
+            "`12<Del>l` moves twelve columns instead of one. Very low value; ",
+            "nobody types this deliberately.",
+        ),
+    ),
+    na(
+        "<Down>",
+        "<Down>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Down>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Down> is j")),
+        "matches Vim: same as \"j\".",
+    ),
+    na(
+        "<End>",
+        "<End>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<End>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 16),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<End> is $")),
+        "matches Vim: same as \"$\".",
+    ),
+    na(
+        "<F1>",
+        "<F1>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<F1>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("help:<F1> opens help")),
+        concat!(
+            "Vim opens a help window. vimcode does nothing. Worth ",
+            "implementing only alongside a real in-app help surface; `:help` ",
+            "is itself not a vimcode command.",
+        ),
+    ),
+    na(
+        "<Help>",
+        "<Help>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Help>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("help:<Help> opens help")),
+        "Same as <F1>.",
+    ),
+    na(
+        "<Home>",
+        "<Home>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 5),
+            24,
+            "<Home>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Home> is 0")),
+        "matches Vim: same as \"0\".",
+    ),
+    na(
+        "<Insert>",
+        "<Insert>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Insert>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:<Insert> is i")),
+        concat!(
+            "Vim's <Insert> is \"i\". vimcode ignores it — the recording stays ",
+            "in NORMAL. Worth implementing: one arm, and it is what a non-Vim ",
+            "user presses first.",
+        ),
+    ),
+    na(
+        "<Left>",
+        "<Left>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 3),
+            24,
+            "<Left>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Left> is h")),
+        "matches Vim: same as \"h\".",
+    ),
+    na(
+        "<LeftMouse>",
+        "<LeftMouse>",
+        Implemented,
+        None,
+        None,
+        concat!(
+            "matches Vim: a click moves the cursor to the clicked position. ",
+            "No key-replay is possible — mouse events arrive as backend ",
+            "events, never as `handle_key` names — but both backends ",
+            "implement it and #1104's hit-testing test covers the GTK path.",
+        ),
+    ),
+    na(
+        "<MiddleMouse>",
+        "<MiddleMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim pastes (\"gP\") at the click position. vimcode's middle click ",
+            "does not paste. No key-replay possible (mouse event).",
+        ),
+    ),
+    na(
+        "<PageDown>",
+        "<PageDown>",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "<PageDown>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:<PageDown> is C-f")),
+        concat!(
+            "Vim's <PageDown> is CTRL-F. vimcode ignores the key name ",
+            "entirely — the recording never leaves line 1. Worth ",
+            "implementing: PageUp/PageDown are the two keys a mouse-first ",
+            "user reaches for, and both are dead.",
+        ),
+    ),
+    na(
+        "<PageUp>",
+        "<PageUp>",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "<PageUp>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:<PageUp> is C-b")),
+        "Same as <PageDown>: ignored.",
+    ),
+    na(
+        "<Right>",
+        "<Right>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<Right>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Right> is l")),
+        "matches Vim: same as \"l\".",
+    ),
+    na(
+        "<RightMouse>",
+        "<RightMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim starts Visual mode at the click position; vimcode opens a ",
+            "context menu instead (a deliberate IDE-shaped choice, but a ",
+            "conformance gap). No key-replay possible.",
+        ),
+    ),
+    na(
+        "<S-Down>",
+        "<S-Down>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim's <S-Down> is CTRL-F. `Engine::handle_key` has no Shift ",
+            "parameter, so the backends cannot deliver this at all (see ",
+            "<S-NL>).",
+        ),
+    ),
+    na(
+        "<S-Left>",
+        "<S-Left>",
+        NotImplemented,
+        None,
+        None,
+        "Vim's <S-Left> is \"b\"; the Shift bit never reaches the engine.",
+    ),
+    na(
+        "<S-LeftMouse>",
+        "<S-LeftMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim searches forward for the word at the click (\"*\"); vimcode ",
+            "does not. No key-replay possible.",
+        ),
+    ),
+    na(
+        "<S-Right>",
+        "<S-Right>",
+        NotImplemented,
+        None,
+        None,
+        "Vim's <S-Right> is \"w\"; the Shift bit never reaches the engine.",
+    ),
+    na(
+        "<S-RightMouse>",
+        "<S-RightMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim searches backwards for the word at the click (\"#\"); vimcode ",
+            "does not.",
+        ),
+    ),
+    na(
+        "<S-Up>",
+        "<S-Up>",
+        NotImplemented,
+        None,
+        None,
+        "Vim's <S-Up> is CTRL-B; the Shift bit never reaches the engine.",
+    ),
+    na(
+        "<Undo>",
+        "<Undo>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "x<Undo>",
+            "lpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("undo:<Undo> is u")),
+        concat!(
+            "Vim's <Undo> key is \"u\". vimcode ignores it — the recording's ",
+            "`x` is still deleted afterwards.",
+        ),
+    ),
+    na(
+        "<Up>",
+        "<Up>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (2, 1),
+            24,
+            "<Up>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:<Up> is k")),
+        "matches Vim: same as \"k\".",
+    ),
+    na(
+        "<ScrollWheelDown>",
+        "<ScrollWheelDown>",
+        Partial,
+        None,
+        None,
+        concat!(
+            "Both backends scroll the window on a wheel event ",
+            "(tests/terminal_wheel.rs), so the gesture works — but whether it ",
+            "is Vim's *three lines per notch* is pinned by nothing, and the ",
+            "event never reaches `Engine::handle_key`, so this slice cannot ",
+            "measure it.",
+        ),
+    ),
+    na(
+        "<S-ScrollWheelDown>",
+        "<S-ScrollWheelDown>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim scrolls a whole page for a shifted wheel notch; vimcode has ",
+            "no Shift-aware wheel path.",
+        ),
+    ),
+    na(
+        "<ScrollWheelUp>",
+        "<ScrollWheelUp>",
+        Partial,
+        None,
+        None,
+        "See <ScrollWheelDown>.",
+    ),
+    na(
+        "<S-ScrollWheelUp>",
+        "<S-ScrollWheelUp>",
+        NotImplemented,
+        None,
+        None,
+        "See <S-ScrollWheelDown>.",
+    ),
+    na(
+        "<ScrollWheelLeft>",
+        "<ScrollWheelLeft>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim scrolls six columns left; vimcode has no horizontal wheel ",
+            "handling.",
+        ),
+    ),
+    na(
+        "<S-ScrollWheelLeft>",
+        "<S-ScrollWheelLeft>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim scrolls a page left; vimcode has no horizontal wheel ",
+            "handling.",
+        ),
+    ),
+    na(
+        "<ScrollWheelRight>",
+        "<ScrollWheelRight>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim scrolls six columns right; vimcode has no horizontal wheel ",
+            "handling.",
+        ),
+    ),
+    na(
+        "<S-ScrollWheelRight>",
+        "<S-ScrollWheelRight>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim scrolls a page right; vimcode has no horizontal wheel ",
+            "handling.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-B",
+        "CTRL-W_CTRL-B",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-b>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-b goes to the bottom window")),
+        concat!(
+            "Vim's alias for \"CTRL-W b\". vimcode leaves the focus where it ",
+            "was (the recording ends focused on the top window). One entry in ",
+            "the wincmd alias table.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-C",
+        "CTRL-W_CTRL-C",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-c>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Cannot close last window",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-c is a no-op")),
+        concat!(
+            "`:help CTRL-W_CTRL-C` is explicit: **no-op**. vimcode routes it ",
+            "to \"close window\" — the recording only survives because there is ",
+            "a single window (\"Cannot close last window\"); with a split it ",
+            "destroys one. Worth fixing precisely because the failure is ",
+            "destructive and silent.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-D",
+        "CTRL-W_CTRL-D",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-d>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (3, 1),
+            "NORMAL",
+            "",
+            3,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-d splits to the definition")),
+        concat!(
+            "Vim's alias for \"CTRL-W d\". vimcode falls through to plain ",
+            "CTRL-D and scrolls half a page instead — no split at all.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-F",
+        "CTRL-W_CTRL-F",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "<C-w><C-f>",
+            "README.md|second line",
+            (2, 1),
+            "NORMAL",
+            "",
+            2,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-f splits to the file under the cursor")),
+        concat!(
+            "Vim's alias for \"CTRL-W f\". vimcode falls through to plain ",
+            "CTRL-F and pages down.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-H",
+        "CTRL-W_CTRL-H",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>l<C-w><C-h>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-h goes left")),
+        "matches Vim: the alias moves focus to the window on the left.",
+    ),
+    na(
+        "CTRL-W CTRL-I",
+        "CTRL-W_CTRL-I",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-i>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Already at newest position in jump list",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-i splits to the declaration")),
+        concat!(
+            "Vim's alias for \"CTRL-W i\". vimcode falls through to plain ",
+            "CTRL-I and walks the jump list (\"Already at newest position in ",
+            "jump list\").",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-J",
+        "CTRL-W_CTRL-J",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-j>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-j goes down")),
+        "matches Vim: the alias moves focus to the window below.",
+    ),
+    na(
+        "CTRL-W CTRL-K",
+        "CTRL-W_CTRL-K",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j<C-w><C-k>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-k goes up")),
+        "matches Vim: the alias moves focus to the window above.",
+    ),
+    na(
+        "CTRL-W CTRL-L",
+        "CTRL-W_CTRL-L",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>h<C-w><C-l>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-l goes right")),
+        concat!(
+            "Vim's alias for \"CTRL-W l\". vimcode does not move the focus, ",
+            "even though the unprefixed `CTRL-W l` works — the alias table ",
+            "has h/j/k but not l.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-N",
+        "CTRL-W_CTRL-N",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-n>",
+            "",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-n opens a new window")),
+        "matches Vim: opens a new window on an empty buffer.",
+    ),
+    na(
+        "CTRL-W CTRL-O",
+        "CTRL-W_CTRL-O",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-o>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Already at oldest position in jump list",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-o closes the others")),
+        concat!(
+            "Vim's alias for \"CTRL-W o\". vimcode falls through to plain ",
+            "CTRL-O and walks the jump list, leaving both windows open.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-P",
+        "CTRL-W_CTRL-P",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-p>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-p goes to the previous window")),
+        concat!(
+            "Vim's alias for \"CTRL-W p\". vimcode leaves the focus where it ",
+            "was — and so does the unprefixed `CTRL-W p`, so the gap is the ",
+            "last-accessed-window bookkeeping, not the alias.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-Q",
+        "CTRL-W_CTRL-Q",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-q>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-q quits the window")),
+        "matches Vim: quits the current window.",
+    ),
+    na(
+        "CTRL-W CTRL-R",
+        "CTRL-W_CTRL-R",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-r>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Already at newest change",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-r rotates")),
+        concat!(
+            "Vim's alias for \"CTRL-W r\". vimcode falls through to plain ",
+            "CTRL-R and tries to redo (\"Already at newest change\").",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-S",
+        "CTRL-W_CTRL-S",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-s>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Save failed: No file name",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-s splits")),
+        concat!(
+            "Vim's alias for \"CTRL-W s\". vimcode falls through to its save ",
+            "binding (\"Save failed: No file name\") and never splits — the ",
+            "most surprising of the fall-throughs, because it can write a ",
+            "file.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-T",
+        "CTRL-W_CTRL-T",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j<C-w><C-t>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:CTRL-W t goes to the top-left window")),
+        concat!(
+            "Vim's alias for \"CTRL-W t\", and correctly so as of #1162: the ",
+            "Ctrl-W prefix dispatch reads the raw key regardless of whether ",
+            "the following press was itself Ctrl-modified, so `<C-w><C-t>` ",
+            "reaches the exact same fixed `execute_wincmd('t', ..)` as plain ",
+            "`CTRL-W t` (see that row).",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-V",
+        "CTRL-W_CTRL-V",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-v>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "VISUAL BLOCK",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-v splits vertically")),
+        concat!(
+            "Vim's alias for \"CTRL-W v\". vimcode falls through to plain ",
+            "CTRL-V and **enters Visual Block mode** instead of splitting.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-W",
+        "CTRL-W_CTRL-W",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-w>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-w cycles windows")),
+        concat!(
+            "Vim's alias for \"CTRL-W w\". Focus unchanged, although the ",
+            "unprefixed `CTRL-W w` cycles correctly.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-X",
+        "CTRL-W_CTRL-X",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-x>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No number under cursor",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-x exchanges windows")),
+        concat!(
+            "Vim's alias for \"CTRL-W x\". vimcode falls through to plain ",
+            "CTRL-X and tries to decrement a number (\"No number under ",
+            "cursor\").",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-Z",
+        "CTRL-W_CTRL-Z",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-z>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Unknown wincmd: z",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-z closes the preview window")),
+        concat!(
+            "Vim's alias for \"CTRL-W z\". vimcode answers \"Unknown wincmd: z\" ",
+            "— at least it is loud.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-]",
+        "CTRL-W_CTRL-]",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim splits and jumps to the tag under the cursor; vimcode has no ",
+            "tag stack.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-^",
+        "CTRL-W_CTRL-^",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w><C-^>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "No alternate buffer",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w C-^ splits to the alternate file")),
+        concat!(
+            "Vim's alias for \"CTRL-W ^\": split, then edit the alternate ",
+            "file in the new window. vimcode still doesn't split — #1281's ",
+            "fix for plain CTRL-^ (making key_name \"^\", not just \"6\", ",
+            "reach `alternate_buffer`) is checked *before* the pending ",
+            "CTRL-W state here (a pre-existing dispatch-order quirk shared ",
+            "with `<C-w><C-6>`, not new to this fix), so the CTRL-W prefix ",
+            "is swallowed and this now falls straight into ",
+            "`alternate_buffer` on the *current* window instead of ",
+            "`execute_wincmd`. Message text changed (was \"Unknown wincmd: ",
+            "^\"); still no split, so still NotImplemented.",
+        ),
+    ),
+    na(
+        "CTRL-W CTRL-_",
+        "CTRL-W_CTRL-_",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><C-_>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.92 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w C-_ maximises the height")),
+        concat!(
+            "matches Vim: the alias sets the window height to its maximum. ",
+            "#1289: the recorded ratio used to be a flat 0.90 regardless of ",
+            "split size; `maximize_window_split` now shrinks the other ",
+            "window down to its real 'winminheight' floor (1 content row) ",
+            "instead. On this 24-line recording the split's raw axis is 25 ",
+            "rows, so the other window's 1-content-row/2-raw-row floor ",
+            "leaves 23 of 25 to the active window, i.e. ratio 0.92.",
+        ),
+    ),
+    na(
+        "CTRL-W +",
+        "CTRL-W_+",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>+",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.56 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w + grows the height")),
+        concat!(
+            "matches Vim: increases the current window's height by an ",
+            "absolute [count] screen lines (#1288). On this 24-line ",
+            "recording the split's axis is 25 raw rows, so a fresh 50/50 ",
+            "split is 13/12 raw and the default [count]=1 moves the ",
+            "boundary one row: 13 to 14 of 25, i.e. ratio 0.50 to 0.56. ",
+            "Before #1288 this moved the ratio by a fixed 5% instead ",
+            "(0.55), which only coincided with Vim by accident.",
+        ),
+    ),
+    na(
+        "CTRL-W -",
+        "CTRL-W_-",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>-",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.48 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w - shrinks the height")),
+        concat!(
+            "matches Vim: decreases the current window's height by an ",
+            "absolute [count] screen lines (#1288) — the mirror of ",
+            "`CTRL-W +` above, so the same 13/12-of-25 fresh split moves ",
+            "its boundary one row the other way: 13 to 12 of 25, i.e. ",
+            "ratio 0.50 to 0.48. Before #1288 this moved the ratio by a ",
+            "fixed 5% instead (0.45), which is why this row's oracle label ",
+            "was a KNOWN_DEVIATIONS_WIN entry until the fix landed.",
+        ),
+    ),
+    na(
+        "CTRL-W <",
+        "CTRL-W_<",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w><",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.49 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w < shrinks the width")),
+        concat!(
+            "matches Vim: decreases the current window's width by an ",
+            "absolute [count] screen columns (#1288). The 80-column ",
+            "recording's fresh vertical split reserves one column for the ",
+            "divider bar (#1326: 40/39, not 40/40), and the default ",
+            "[count]=1 moves the boundary one column within that ",
+            "79-column content total: 40 to 39, i.e. ratio 0.50 to ",
+            "39/79 = 0.4937 — rounded to 2 decimal places here, that's the ",
+            "same 0.49 the pre-#1326 (undivided) 39/80 = 0.4875 also ",
+            "rounds to, so this row's own displayed ratio didn't change; ",
+            "it was the *other* window's width (not recorded by this ",
+            "ratio-only audit — see `win:CTRL-W < decreases the active ",
+            "window's width` in `CASES_WIN` for the pixel-size proof) that ",
+            "was wrong before #1326, per KNOWN_DEVIATIONS_WIN's history.",
+        ),
+    ),
+    na(
+        "CTRL-W =",
+        "CTRL-W_=",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>+<C-w>=",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w = equalises")),
+        concat!(
+            "matches Vim: returns the split to equal shares (the 0.56 left ",
+            "by the preceding `CTRL-W +` back to 0.50).",
+        ),
+    ),
+    na(
+        "CTRL-W >",
+        "CTRL-W_>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.52 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w > grows the width")),
+        concat!(
+            "matches Vim: increases the current window's width by an ",
+            "absolute [count] screen columns (#1288) — the mirror of ",
+            "`CTRL-W <` above, so the same 40/39-of-80 fresh split (#1326: ",
+            "one column reserved for the divider bar) moves its boundary ",
+            "one column the other way within its 79-column content total: ",
+            "40 to 41, i.e. ratio 0.50 to 41/79 = 0.5190, rounded here to ",
+            "0.52. Unlike `CTRL-W <`, this one *does* move the displayed ",
+            "ratio versus the pre-#1326 39/80... 41/80 = 0.5125 -> 0.51: ",
+            "past the split's midpoint, `content_width - 1` shifts which ",
+            "2-decimal bucket the rounded fraction lands in.",
+        ),
+    ),
+    na(
+        "CTRL-W H",
+        "CTRL-W_H",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>H",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w H moves the window far left")),
+        concat!(
+            "Vim moves the current window to the far left, keeping both ",
+            "windows. vimcode **destroys the layout**: the recording ends ",
+            "with a single, brand-new window (id 3) and both original windows ",
+            "gone. The worst row in this slice — an unimplemented command ",
+            "that silently discards the user's other window.",
+        ),
+    ),
+    na(
+        "CTRL-W J",
+        "CTRL-W_J",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>J",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w J moves the window to the bottom")),
+        "Same destructive collapse as CTRL-W H.",
+    ),
+    na(
+        "CTRL-W K",
+        "CTRL-W_K",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>K",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w K moves the window to the top")),
+        "Same destructive collapse as CTRL-W H.",
+    ),
+    na(
+        "CTRL-W L",
+        "CTRL-W_L",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>L",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w L moves the window far right")),
+        "Same destructive collapse as CTRL-W H.",
+    ),
+    na(
+        "CTRL-W P",
+        "CTRL-W_P",
+        Skipped(PREVIEW),
+        None,
+        None,
+        "Vim goes to the preview window; vimcode has no preview window.",
+    ),
+    na(
+        "CTRL-W R",
+        "CTRL-W_R",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>R",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 1 2*) tabs=1/1",
+        )),
+        Some(Label("win:C-w R rotates upwards")),
+        concat!(
+            "Fixed by #1291: rotate_windows reorders WindowIds within the ",
+            "tree instead of swapping content across static slots, so ",
+            "matches Vim — with only 2 windows, R's one-step-upward ",
+            "rotation lands on the same swap as r's one-step-downward one.",
+        ),
+    ),
+    na(
+        "CTRL-W S",
+        "CTRL-W_S",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>S",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w S splits")),
+        concat!(
+            "matches Vim: the uppercase synonym for \"CTRL-W s\" splits the ",
+            "window.",
+        ),
+    ),
+    na(
+        "CTRL-W T",
+        "CTRL-W_T",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>T",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w T moves the window to a new tab")),
+        concat!(
+            "Vim moves the current window into a new tab page. vimcode ends ",
+            "with one tab and, as with CTRL-W H, a single brand-new window — ",
+            "the split is destroyed rather than moved.",
+        ),
+    ),
+    na(
+        "CTRL-W W",
+        "CTRL-W_W",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>W",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w W goes to the previous window")),
+        "matches Vim: cycles to the previous window, wrapping.",
+    ),
+    na(
+        "CTRL-W ]",
+        "CTRL-W_]",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim splits and jumps to the tag under the cursor; no tag stack ",
+            "in vimcode (\"Unknown wincmd: ]\").",
+        ),
+    ),
+    na(
+        "CTRL-W ^",
+        "CTRL-W_^",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>^",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Unknown wincmd: ^",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w ^ splits to the alternate file")),
+        concat!(
+            "Vim splits and edits the alternate file; vimcode answers ",
+            "\"Unknown wincmd: ^\" (see CTRL-^).",
+        ),
+    ),
+    na(
+        "CTRL-W _",
+        "CTRL-W__",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>_",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.92 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w _ maximises the height")),
+        concat!(
+            "matches Vim: sets the current window height to the maximum. ",
+            "#1289: recorded ratio 0.90 -> 0.92 — see the ",
+            "\"CTRL-W_CTRL-_\" row's note (the C-_ alias) for the ",
+            "'winminheight'-floor arithmetic behind the new number.",
+        ),
+    ),
+    na(
+        "CTRL-W b",
+        "CTRL-W_b",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>b",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:CTRL-W b goes to the bottom-right window")),
+        concat!(
+            "Fixed by #1162: `execute_wincmd`'s `'t'`/`'b'` arms used to walk ",
+            "the VSCode-style editor-group tree (a no-op with the single ",
+            "editor group this recording has), now they use the current ",
+            "tab's own window layout — matches Vim: goes to the bottom ",
+            "window.",
+        ),
+    ),
+    na(
+        "CTRL-W c",
+        "CTRL-W_c",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>c",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w c closes the window")),
+        "matches Vim: closes the current window like `:close`.",
+    ),
+    na(
+        "CTRL-W d",
+        "CTRL-W_d",
+        Partial,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>d",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w d splits to the definition")),
+        concat!(
+            "Vim splits and jumps to the *tag* definition. vimcode does ",
+            "split, then asks the LSP for the definition — the right shape ",
+            "through a different mechanism, and with no LSP attached the ",
+            "recording shows the split and no jump.",
+        ),
+    ),
+    na(
+        "CTRL-W f",
+        "CTRL-W_f",
+        Partial,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "<C-w>f",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w f splits to the file under the cursor")),
+        concat!(
+            "Vim splits and edits the file whose name is under the cursor. ",
+            "vimcode splits, but the new window still shows the current ",
+            "buffer — the file under the cursor is never opened.",
+        ),
+    ),
+    na(
+        "CTRL-W F",
+        "CTRL-W_F",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "<C-w>F",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "Unknown wincmd: F",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w F splits to the file and line under the cursor")),
+        concat!(
+            "Vim splits, edits the file under the cursor and jumps to the ",
+            "line number after it; vimcode answers \"Unknown wincmd: F\".",
+        ),
+    ),
+    na(
+        "CTRL-W g CTRL-]",
+        "CTRL-W_g_CTRL-]",
+        Skipped(CTAGS),
+        None,
+        None,
+        "Vim splits and does `:tjump`; no tag stack in vimcode.",
+    ),
+    na(
+        "CTRL-W g ]",
+        "CTRL-W_g]",
+        Skipped(CTAGS),
+        None,
+        None,
+        "Vim splits and does `:tselect`; no tag stack in vimcode.",
+    ),
+    na(
+        "CTRL-W g }",
+        "CTRL-W_g}",
+        Skipped(PREVIEW),
+        None,
+        None,
+        concat!(
+            "Vim does a `:ptjump` into the preview window; vimcode has ",
+            "neither tags nor a preview window.",
+        ),
+    ),
+    na(
+        "CTRL-W g f",
+        "CTRL-W_gf",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "<C-w>gf",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w gf opens the file under the cursor in a tab")),
+        concat!(
+            "Vim opens the file under the cursor in a new tab page; vimcode ",
+            "does nothing at all (no tab, no message).",
+        ),
+    ),
+    na(
+        "CTRL-W g F",
+        "CTRL-W_gF",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "<C-w>gF",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w gF opens the file and line under the cursor in a tab")),
+        "Same as `CTRL-W gf`, plus the line number; vimcode does nothing.",
+    ),
+    na(
+        "CTRL-W g t",
+        "CTRL-W_gt",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            ":tabnew<CR><C-w>gt",
+            "",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=2/2",
+        )),
+        Some(Label("win:C-w gt goes to the next tab")),
+        concat!(
+            "Vim's `CTRL-W g t` is `gt`. With two tabs open the recording ",
+            "stays on tab 2, so the prefixed form is unbound even though the ",
+            "g-prefix slice found plain `gt` implemented.",
+        ),
+    ),
+    na(
+        "CTRL-W g T",
+        "CTRL-W_gT",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            ":tabnew<CR><C-w>gT",
+            "",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=2/2",
+        )),
+        Some(Label("win:C-w gT goes to the previous tab")),
+        "Same as `CTRL-W g t`: the prefixed form does not reach `gT`.",
+    ),
+    na(
+        "CTRL-W g <Tab>",
+        "CTRL-W_g<Tab>",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            ":tabnew<CR><C-w>g<Tab>",
+            "",
+            (1, 1),
+            "NORMAL",
+            "Already at newest position in jump list",
+            1,
+            1,
+            "",
+            "1* tabs=2/2",
+        )),
+        Some(Label("win:C-w g<Tab> goes to the last accessed tab")),
+        concat!(
+            "Vim's `CTRL-W g <Tab>` is `g<Tab>`. vimcode walks the jump list ",
+            "instead (\"Already at newest position in jump list\") and stays on ",
+            "tab 2.",
+        ),
+    ),
+    na(
+        "CTRL-W h",
+        "CTRL-W_h",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>l<C-w>h",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w h goes left")),
+        "matches Vim: focus to the window on the left.",
+    ),
+    na(
+        "CTRL-W i",
+        "CTRL-W_i",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>i",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "Unknown wincmd: i",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w i splits to the declaration")),
+        concat!(
+            "Vim splits and jumps to the declaration of the identifier under ",
+            "the cursor (an 'include'-path search); vimcode answers \"Unknown ",
+            "wincmd: i\". Close relative of the CTAGS family, but listed as ❌ ",
+            "rather than skipped because vimcode's LSP could answer it, ",
+            "exactly as it already does for `CTRL-W d`.",
+        ),
+    ),
+    na(
+        "CTRL-W j",
+        "CTRL-W_j",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w j goes down")),
+        "matches Vim: focus to the window below.",
+    ),
+    na(
+        "CTRL-W k",
+        "CTRL-W_k",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j<C-w>k",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w k goes up")),
+        "matches Vim: focus to the window above.",
+    ),
+    na(
+        "CTRL-W l",
+        "CTRL-W_l",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>h<C-w>l",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w l goes right")),
+        "matches Vim: focus to the window on the right.",
+    ),
+    na(
+        "CTRL-W n",
+        "CTRL-W_n",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>n",
+            "",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w n opens a new window")),
+        "matches Vim: opens a new window on an empty buffer.",
+    ),
+    na(
+        "CTRL-W o",
+        "CTRL-W_o",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>o",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w o closes the others")),
+        "matches Vim: closes every window but the current one.",
+    ),
+    na(
+        "CTRL-W p",
+        "CTRL-W_p",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>p",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w p goes to the previous window")),
+        concat!(
+            "matches Vim: goes to the last accessed window (#1292). ",
+            "`<C-w>s` splits and focuses the new window 2, so `<C-w>p` ",
+            "returns to window 1 — the recording's focus marker moves from ",
+            "`2*` to `1*`. Before #1292 vimcode kept only a previously-",
+            "active *editor group* record, so with a single group `CTRL-W p` ",
+            "was a no-op and the focus stayed on `2*`; `Tab::prev_window` ",
+            "now records the previously active window at every ",
+            "`Tab::focus_window` call site.",
+        ),
+    ),
+    na(
+        "CTRL-W q",
+        "CTRL-W_q",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>q",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:C-w q quits the window")),
+        "matches Vim: quits the current window like `:quit`.",
+    ),
+    na(
+        "CTRL-W r",
+        "CTRL-W_r",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>r",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 1 2*) tabs=1/1",
+        )),
+        Some(Label("win:C-w r rotates downwards")),
+        concat!(
+            "Fixed by #1291: rotate_windows reorders WindowIds within the ",
+            "tree instead of swapping content across static slots, so ",
+            "matches Vim — the rotated-to window keeps focus.",
+        ),
+    ),
+    na(
+        "CTRL-W s",
+        "CTRL-W_s",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w s splits")),
+        concat!(
+            "matches Vim: splits the window horizontally, focus in the new ",
+            "one.",
+        ),
+    ),
+    na(
+        "CTRL-W t",
+        "CTRL-W_t",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j<C-w>t",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:CTRL-W t goes to the top-left window")),
+        concat!(
+            "Fixed by #1162 (see `CTRL-W b`): matches Vim, goes to the top ",
+            "window.",
+        ),
+    ),
+    na(
+        "CTRL-W v",
+        "CTRL-W_v",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w v splits vertically")),
+        "matches Vim: splits the window vertically, focus in the new one.",
+    ),
+    na(
+        "CTRL-W w",
+        "CTRL-W_w",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>w",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w w cycles windows")),
+        "matches Vim: to the next window, wrapping.",
+    ),
+    na(
+        "CTRL-W x",
+        "CTRL-W_x",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>x",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w x exchanges windows")),
+        concat!(
+            "Vim exchanges the current window with the next one; vimcode's ",
+            "layout is unchanged afterwards (both windows keep their slots).",
+        ),
+    ),
+    na(
+        "CTRL-W z",
+        "CTRL-W_z",
+        Skipped(PREVIEW),
+        None,
+        None,
+        concat!(
+            "Vim closes the preview window; vimcode has no preview window ",
+            "(\"Unknown wincmd: z\").",
+        ),
+    ),
+    na(
+        "CTRL-W |",
+        "CTRL-W_bar",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>|",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.99 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w bar maximises the width")),
+        concat!(
+            "matches Vim: sets the window width to the maximum. #1289: the ",
+            "recorded ratio used to be a flat 0.90 regardless of split ",
+            "size — the same fixed literal `maximize_window_split` used ",
+            "for height, which only ever coincidentally matched Neovim ",
+            "there and never did for width, where 10% of this fixture's ",
+            "80-column default is well above Neovim's 1-column ",
+            "'winminwidth' floor. Now shrinks the other window down to ",
+            "that real 1-column floor instead — #1326: within the ",
+            "79-column content total a fresh vertical split reserves for ",
+            "the divider bar (40/39, not 40/40), that's 78 of 79, ratio ",
+            "0.9873, which rounds to the same 0.99 displayed here as the ",
+            "pre-#1326 (undivided) 79/80 = 0.9875 also did — this row's ",
+            "own ratio didn't move, only the *other* window's now-correct ",
+            "width did (see `win:CTRL-W | maximizes the active window's ",
+            "width` in `CASES_WIN` for the pixel-size proof).",
+        ),
+    ),
+    na(
+        "CTRL-W }",
+        "CTRL-W_}",
+        Skipped(PREVIEW),
+        None,
+        None,
+        concat!(
+            "Vim shows the tag under the cursor in the preview window; ",
+            "vimcode has neither.",
+        ),
+    ),
+    na(
+        "CTRL-W <Down>",
+        "CTRL-W_<Down>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w><Down>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w <Down> goes down")),
+        "matches Vim: same as \"CTRL-W j\".",
+    ),
+    na(
+        "CTRL-W <Up>",
+        "CTRL-W_<Up>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>s<C-w>j<C-w><Up>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(h0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w <Up> goes up")),
+        "matches Vim: same as \"CTRL-W k\".",
+    ),
+    na(
+        "CTRL-W <Left>",
+        "CTRL-W_<Left>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>l<C-w><Left>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2* 1) tabs=1/1",
+        )),
+        Some(Label("win:C-w <Left> goes left")),
+        "matches Vim: same as \"CTRL-W h\".",
+    ),
+    na(
+        "CTRL-W <Right>",
+        "CTRL-W_<Right>",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-w>v<C-w>h<C-w><Right>",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "(v0.50 2 1*) tabs=1/1",
+        )),
+        Some(Label("win:C-w <Right> goes right")),
+        "matches Vim: same as \"CTRL-W l\".",
+    ),
+    na(
+        "[ CTRL-D",
+        "[_CTRL-D",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim searches the 'include' path for the first matching #define; ",
+            "vimcode has no tag or include search.",
+        ),
+    ),
+    na(
+        "[ CTRL-I",
+        "[_CTRL-I",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim searches the 'include' path for the first matching line; ",
+            "vimcode has no include search.",
+        ),
+    ),
+    na(
+        "[#",
+        "[#",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (7, 1),
+            24,
+            "[#",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (6, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[# previous unmatched if")),
+        "matches Vim: back to the previous unmatched #if/#else/#ifdef.",
+    ),
+    na(
+        "['",
+        "['",
+        NotImplemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "majjj['",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:[' previous mark line")),
+        concat!(
+            "Vim goes to the previous lowercase mark, on the first non-blank. ",
+            "vimcode does not move at all. Worth implementing with `` [` ",
+            "``/`` ]` ``/`]'` — one sorted walk over the existing mark table.",
+        ),
+    ),
+    na(
+        "[(",
+        "[(",
+        Implemented,
+        Some(nlive(
+            NA_BR,
+            (1, 8),
+            24,
+            "[(",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail",
+            (1, 4),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:[(")),
+        "matches Vim: back to the unmatched '('.",
+    ),
+    na(
+        "[*",
+        "[star",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (9, 1),
+            24,
+            "[*",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (7, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[* previous comment start")),
+        "matches Vim: back to the previous start of a C comment.",
+    ),
+    na(
+        "[`",
+        "[`",
+        NotImplemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 3),
+            24,
+            "majjj[`",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:[` previous mark")),
+        "Same as `['`: no movement.",
+    ),
+    na(
+        "[/",
+        "[/",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (9, 1),
+            24,
+            "[/",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (7, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[/ previous comment start")),
+        "matches Vim: same as \"[*\".",
+    ),
+    na(
+        "[D",
+        "[D",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim lists every matching #define from the included files; no ",
+            "include search in vimcode.",
+        ),
+    ),
+    na(
+        "[I",
+        "[I",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim lists every matching line from the included files; no ",
+            "include search in vimcode.",
+        ),
+    ),
+    na(
+        "[P",
+        "[P",
+        NotImplemented,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "yyj[P",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:[P puts with indent")),
+        concat!(
+            "Vim's `[P` is `[p` — put linewise with the indent adjusted to ",
+            "the current line. vimcode does nothing at all: the recording's ",
+            "buffer is byte-identical to the fixture, while `[p` (which it ",
+            "does implement) pastes. Worth implementing: it is an alias of a ",
+            "command that already exists.",
+        ),
+    ),
+    na(
+        "[[",
+        "[[",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (10, 1),
+            24,
+            "[[",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (9, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[[ previous section")),
+        "matches Vim: N sections backwards.",
+    ),
+    na(
+        "[]",
+        "[]",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (10, 1),
+            24,
+            "[]",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[] previous SECTION end")),
+        "matches Vim: N SECTIONS backwards.",
+    ),
+    na(
+        "[c",
+        "[c",
+        Partial,
+        Some(nlive(
+            NA_CODE,
+            (10, 1),
+            24,
+            "[c",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (10, 1),
+            "NORMAL",
+            "No more hunks",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("git:[c previous hunk")),
+        concat!(
+            "Vim moves to the previous change **in diff mode**. vimcode binds ",
+            "it to git-hunk navigation instead (\"No more hunks\"), which is ",
+            "the same gesture over a different source of truth — useful, but ",
+            "it is not `:help [c`.",
+        ),
+    ),
+    na(
+        "[d",
+        "[d",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim shows the first matching #define from the included files; no ",
+            "include search in vimcode.",
+        ),
+    ),
+    na(
+        "[f",
+        "[f",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "[f",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("file:[f opens the file under the cursor")),
+        concat!(
+            "Vim's `[f` is `gf` — edit the file whose name is under the ",
+            "cursor. vimcode does nothing (the buffer and cursor are ",
+            "untouched with `README.md` under the cursor).",
+        ),
+    ),
+    na(
+        "[i",
+        "[i",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "Vim shows the first matching line from the included files; no ",
+            "include search in vimcode.",
+        ),
+    ),
+    na(
+        "[m",
+        "[m",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (10, 5),
+            24,
+            "[m",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (9, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:[m previous member start")),
+        "matches Vim: back to the start of the previous member function.",
+    ),
+    na(
+        "[p",
+        "[p",
+        Partial,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "yyj[p",
+            "    alpha beta|    alpha beta|    gamma delta|    eps zeta",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:[p puts with indent")),
+        concat!(
+            "The pasted buffer matches Vim exactly — the indent really is ",
+            "adjusted to the current line — but the cursor lands in column 1 ",
+            "where Vim leaves it on the first non-blank (column 5 in the ",
+            "recording). Same one-column class as `<{motion}`/`]p`.",
+        ),
+    ),
+    na(
+        "[s",
+        "[s",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 14),
+            24,
+            "[s",
+            "teh quick brwn fox",
+            (1, 14),
+            "NORMAL",
+            "Spell checking is off (use :set spell)",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:[s previous misspelling")),
+        concat!(
+            "implemented in `src/core/spell.rs` (#1163) and gated on 'spell' ",
+            "exactly as Vim is: with spelling off the recording answers ",
+            "\"Spell checking is off (use :set spell)\".",
+        ),
+    ),
+    na(
+        "[z",
+        "[z",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zf5jzo3G[z",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:[z start of open fold")),
+        "matches Vim: to the start of the current open fold.",
+    ),
+    na(
+        "[{",
+        "[{",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (4, 9),
+            24,
+            "[{",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:[{")),
+        "matches Vim: back to the unmatched '{'.",
+    ),
+    na(
+        "[<MiddleMouse>",
+        "[<MiddleMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim does \"[p\" at the click position; vimcode's middle click does ",
+            "not paste at all. No key-replay possible (mouse event).",
+        ),
+    ),
+    na(
+        "] CTRL-D",
+        "]_CTRL-D",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "As `[ CTRL-D`, searching from the cursor instead of the start of ",
+            "the file.",
+        ),
+    ),
+    na(
+        "] CTRL-I",
+        "]_CTRL-I",
+        Skipped(CTAGS),
+        None,
+        None,
+        concat!(
+            "As `[ CTRL-I`, searching from the cursor instead of the start of ",
+            "the file.",
+        ),
+    ),
+    na(
+        "]#",
+        "]#",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "]#",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (6, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:]# next unmatched endif")),
+        "matches Vim: forward to the next unmatched #endif/#else.",
+    ),
+    na(
+        "]'",
+        "]'",
+        NotImplemented,
+        Some(nlive(
+            NA_CODE,
+            (4, 1),
+            24,
+            "maggj]'",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:]' next mark line")),
+        concat!(
+            "Vim goes to the next lowercase mark, on the first non-blank; ",
+            "vimcode does not move (see `['`).",
+        ),
+    ),
+    na(
+        "])",
+        "])",
+        Implemented,
+        Some(nlive(
+            NA_BR,
+            (1, 8),
+            24,
+            "])",
+            "foo(bar baz) qux|arr[one two] end|map{k v} tail",
+            (1, 12),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:])")),
+        "matches Vim: forward to the unmatched ')'.",
+    ),
+    na(
+        "]*",
+        "]star",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (8, 1),
+            24,
+            "]*",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (8, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:]* next comment end")),
+        "matches Vim: forward to the next end of a C comment.",
+    ),
+    na(
+        "]`",
+        "]`",
+        NotImplemented,
+        Some(nlive(
+            NA_CODE,
+            (4, 3),
+            24,
+            "maggj]`",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (2, 3),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("mark:]` next mark")),
+        "Same as `` [` ``: no movement.",
+    ),
+    na(
+        "]/",
+        "]/",
+        Partial,
+        Some(nlive(
+            NA_CODE,
+            (7, 1),
+            24,
+            "]/",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (7, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:]/ next comment end")),
+        concat!(
+            "vimcode finds the right *line* (the `/* note */` line) but stops ",
+            "in column 1; Vim lands on the `*/` itself (column 10 in the ",
+            "recording).",
+        ),
+    ),
+    na(
+        "]D",
+        "]D",
+        Skipped(CTAGS),
+        None,
+        None,
+        "As `[D`, searching from the cursor.",
+    ),
+    na(
+        "]I",
+        "]I",
+        Skipped(CTAGS),
+        None,
+        None,
+        "As `[I`, searching from the cursor.",
+    ),
+    na(
+        "]P",
+        "]P",
+        NotImplemented,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "yyj]P",
+            "    alpha beta|    gamma delta|    eps zeta",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:]P puts with indent")),
+        "Vim's `]P` is `[p`; vimcode does nothing (see `[P`).",
+    ),
+    na(
+        "][",
+        "][",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "][",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:][ next SECTION end")),
+        "matches Vim: N SECTIONS forwards.",
+    ),
+    na(
+        "]]",
+        "]]",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "]]",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:]] next section")),
+        "matches Vim: N sections forwards.",
+    ),
+    na(
+        "]c",
+        "]c",
+        Partial,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "]c",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (2, 1),
+            "NORMAL",
+            "No more hunks",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("git:]c next hunk")),
+        concat!(
+            "Same as `[c`: bound to git-hunk navigation rather than diff-mode ",
+            "changes.",
+        ),
+    ),
+    na(
+        "]d",
+        "]d",
+        Skipped(CTAGS),
+        None,
+        None,
+        "As `[d`, searching from the cursor.",
+    ),
+    na(
+        "]f",
+        "]f",
+        NotImplemented,
+        Some(nlive(
+            NA_FILE,
+            (1, 1),
+            24,
+            "]f",
+            "README.md|second line",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("file:]f opens the file under the cursor")),
+        "Same as `[f`: vimcode does nothing.",
+    ),
+    na(
+        "]i",
+        "]i",
+        Skipped(CTAGS),
+        None,
+        None,
+        "As `[i`, searching from the cursor.",
+    ),
+    na(
+        "]m",
+        "]m",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (2, 1),
+            24,
+            "]m",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("bracket:]m next member end")),
+        "matches Vim: forward to the end of the next member function.",
+    ),
+    na(
+        "]p",
+        "]p",
+        Partial,
+        Some(nlive(
+            NA_IND,
+            (1, 1),
+            24,
+            "yyj]p",
+            "    alpha beta|    gamma delta|    alpha beta|    eps zeta",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:]p puts with indent")),
+        concat!(
+            "The pasted buffer matches Vim exactly; the cursor lands in ",
+            "column 1 instead of on the first non-blank (see `[p`).",
+        ),
+    ),
+    na(
+        "]s",
+        "]s",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "]s",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "Spell checking is off (use :set spell)",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:]s next misspelling")),
+        concat!(
+            "implemented in `src/core/spell.rs` (#1163) and gated on 'spell' ",
+            "like Vim.",
+        ),
+    ),
+    na(
+        "]z",
+        "]z",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zf5jzo3G]z",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (6, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:]z end of open fold")),
+        "matches Vim: to the end of the current open fold.",
+    ),
+    na(
+        "]}",
+        "]}",
+        Implemented,
+        Some(nlive(
+            NA_CODE,
+            (4, 9),
+            24,
+            "]}",
+            "#if FOO|int one(void)|{|    return 1;|}|#else|/* note */|int two(void)|{|    return 2;|}|#endif",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("word:]}")),
+        "matches Vim: forward to the unmatched '}'.",
+    ),
+    na(
+        "]<MiddleMouse>",
+        "]<MiddleMouse>",
+        NotImplemented,
+        None,
+        None,
+        concat!(
+            "Vim does \"]p\" at the click position; vimcode's middle click does ",
+            "not paste. No key-replay possible (mouse event).",
+        ),
+    ),
+    na(
+        "z<CR>",
+        "z<CR>",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 3),
+            10,
+            "z<CR>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 1),
+            "NORMAL",
+            "",
+            20,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z<CR> col first nonblank")),
+        concat!(
+            "matches Vim: redraws with the cursor line at the top of the ",
+            "window, cursor on the first non-blank.",
+        ),
+    ),
+    na(
+        "z{height}<CR>",
+        "zN<CR>",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 1),
+            10,
+            "5z<CR>",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 1),
+            "NORMAL",
+            "",
+            20,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("win:z{height}<CR> resizes the window")),
+        concat!(
+            "Vim's `z{height}<CR>` makes the window {height} lines high. ",
+            "vimcode ignores the count and behaves like a plain `z<CR>`. Low ",
+            "value — `CTRL-W _` and `:resize` cover the same ground, and ",
+            "neither exists as a *count-carrying* form here.",
+        ),
+    ),
+    na(
+        "z+",
+        "z+",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (5, 1),
+            10,
+            "z+",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (5, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z+ next screenful")),
+        concat!(
+            "Vim puts line N (default: the line below the window) at the top ",
+            "of the window. vimcode does nothing at all — the recording's ",
+            "cursor and top are both unchanged.",
+        ),
+    ),
+    na(
+        "z-",
+        "z-",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (15, 3),
+            10,
+            "z-",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            6,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z- bottom first nonblank")),
+        concat!(
+            "matches Vim: cursor line to the bottom of the window, cursor on ",
+            "the first non-blank.",
+        ),
+    ),
+    na(
+        "z.",
+        "z.",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (15, 3),
+            10,
+            "z.",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z. centre first nonblank")),
+        "matches Vim: cursor line centred, cursor on the first non-blank.",
+    ),
+    na(
+        "z=",
+        "z=",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "z=",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "Spell checking is off (use :set spell)",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:z= suggestions")),
+        concat!(
+            "implemented in `src/core/spell.rs` (#1163); gated on 'spell' ",
+            "exactly as Vim is.",
+        ),
+    ),
+    na(
+        "zA",
+        "zA",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzA",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zA toggles recursively")),
+        concat!(
+            "matches Vim: opens the closed fold recursively (the recorded ",
+            "fold is gone from the rendered line set).",
+        ),
+    ),
+    na(
+        "zC",
+        "zC",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzC",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zC closes recursively")),
+        concat!(
+            "matches Vim: closes the fold recursively (line 2 is no longer ",
+            "rendered).",
+        ),
+    ),
+    na(
+        "zD",
+        "zD",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzD",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zD deletes recursively")),
+        concat!(
+            "matches Vim: deletes the fold recursively; every line is ",
+            "rendered again.",
+        ),
+    ),
+    na(
+        "zE",
+        "zE",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzE",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zE eliminates all folds")),
+        concat!(
+            "Vim eliminates *all* folds. vimcode leaves the fold standing — ",
+            "line 2 is still unrendered after `zE`. Worth implementing: `zD` ",
+            "already does the hard part for one fold.",
+        ),
+    ),
+    na(
+        "zF",
+        "zF",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "3zF",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            // #1280: `3zF` folds 3 total lines (count includes the header),
+            // not 4 — this recording used to claim otherwise (`4 lines`,
+            // range `1,5-30`) because `cmd_fold_create`'s `end` was computed
+            // as `line + count` instead of `line + count - 1`, an off-by-one
+            // measured against the real oracle (`3zF` then `j` landed on
+            // line 5, not Neovim's line 4 — see `fold:zF folds a count of
+            // lines`).
+            "2 lines folded",
+            1,
+            1,
+            "1,4-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zF folds a count of lines")),
+        "matches Vim: creates a fold for N lines (\"3 lines folded\").",
+    ),
+    na(
+        "zG",
+        "zG",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zG",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zG marks good temporarily")),
+        concat!(
+            "implemented in `src/core/spell.rs` (#1163); the recording is ",
+            "silent because the word list is not rendered.",
+        ),
+    ),
+    na(
+        "zH",
+        "zH",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "zH",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 110),
+            "NORMAL",
+            "",
+            1,
+            31,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zH half screen right")),
+        concat!(
+            "matches Vim: scrolls half a screen-width; the recorded first ",
+            "rendered column moves from 71 to 31 and the cursor follows.",
+        ),
+    ),
+    na(
+        "zL",
+        "zL",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "zL",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            111,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zL half screen left")),
+        concat!(
+            "matches Vim: scrolls half a screen-width the other way (first ",
+            "rendered column 71 to 111).",
+        ),
+    ),
+    na(
+        "zM",
+        "zM",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozM",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zM closes all")),
+        concat!(
+            "matches Vim: sets 'foldlevel' to zero, re-closing the fold the ",
+            "recording had opened.",
+        ),
+    ),
+    na(
+        "zN",
+        "zN",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozN",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zN sets foldenable")),
+        concat!(
+            "Vim sets 'foldenable', so the open fold re-closes. vimcode ",
+            "leaves it open — the whole 'foldenable' switch (`zn`/`zN`/`zi`) ",
+            "is missing.",
+        ),
+    ),
+    na(
+        "zO",
+        "zO",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzczO",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zO opens recursively")),
+        "matches Vim: opens the fold recursively.",
+    ),
+    na(
+        "zR",
+        "zR",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzczR",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zR opens all")),
+        concat!(
+            "matches Vim: sets 'foldlevel' to the deepest fold, opening ",
+            "everything.",
+        ),
+    ),
+    na(
+        "zW",
+        "zW",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zW",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zW marks bad temporarily")),
+        concat!(
+            "implemented in `src/core/spell.rs` (#1163); silent for the same ",
+            "reason as `zG`.",
+        ),
+    ),
+    na(
+        "zX",
+        "zX",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozX",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zX reapplies foldlevel")),
+        concat!(
+            "Vim re-applies 'foldlevel', re-closing folds the user opened. ",
+            "vimcode leaves them open. (Its sibling `zx` *does* re-close — so ",
+            "the two halves of the same pair disagree.)",
+        ),
+    ),
+    na(
+        "z^",
+        "z^",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (15, 1),
+            10,
+            "z^",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 1),
+            "NORMAL",
+            "",
+            6,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z^ previous screenful")),
+        concat!(
+            "Vim puts line N (default: the line above the window) at the ",
+            "bottom of the window. vimcode's recording is identical to `z-`, ",
+            "i.e. it treats `z^` as \"current line to the bottom\" and never ",
+            "pages.",
+        ),
+    ),
+    na(
+        "za",
+        "za",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjza",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:za toggles")),
+        "matches Vim: opens a closed fold, closes an open one.",
+    ),
+    na(
+        "zb",
+        "zb",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (20, 3),
+            10,
+            "zb",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (20, 3),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zbH")),
+        concat!(
+            "matches Vim: redraws with the cursor line at the bottom of the ",
+            "window.",
+        ),
+    ),
+    na(
+        "zc",
+        "zc",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozc",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zc closes")),
+        "matches Vim: closes the fold under the cursor.",
+    ),
+    na(
+        "zd",
+        "zd",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzd",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zd deletes")),
+        "matches Vim: deletes the fold under the cursor.",
+    ),
+    na(
+        "ze",
+        "ze",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "ze",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            71,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:ze cursor at right edge")),
+        concat!(
+            "matches Vim: scrolls horizontally so the cursor sits at the ",
+            "right edge (first rendered column 71 for a cursor in column 150 ",
+            "of an 80-column window).",
+        ),
+    ),
+    na(
+        "zf{motion}",
+        "zf",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfj",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "1 lines folded",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zfj hides one line")),
+        concat!(
+            "matches Vim: creates a fold over the Nmove text (\"1 lines ",
+            "folded\").",
+        ),
+    ),
+    na(
+        "zg",
+        "zg",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zg",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zg marks good")),
+        "implemented in `src/core/spell.rs` (#1163).",
+    ),
+    na(
+        "zh",
+        "zh",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "zh",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 149),
+            "NORMAL",
+            "",
+            1,
+            70,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zh one column right")),
+        concat!(
+            "matches Vim: scrolls the screen one character right and pushes ",
+            "the cursor with it.",
+        ),
+    ),
+    na(
+        "zi",
+        "zi",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzczi",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zi toggles foldenable")),
+        concat!(
+            "Vim toggles 'foldenable', so a closed fold opens. vimcode leaves ",
+            "it closed (see `zN`).",
+        ),
+    ),
+    na(
+        "zj",
+        "zj",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "3Gzfjggzj",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (3, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1-3,5-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zj next fold start")),
+        "matches Vim: moves to the start of the next fold.",
+    ),
+    na(
+        "zk",
+        "zk",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjGzk",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (2, 1),
+            "NORMAL",
+            "",
+            2,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zk previous fold end")),
+        "matches Vim: moves to the end of the previous fold.",
+    ),
+    na(
+        "zl",
+        "zl",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "zl",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            72,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zl one column left")),
+        "matches Vim: scrolls the screen one character left.",
+    ),
+    na(
+        "zm",
+        "zm",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozm",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zm lowers foldlevel")),
+        concat!(
+            "Vim subtracts one from 'foldlevel', closing the fold the ",
+            "recording had opened; vimcode leaves it open. (`zM` — \"all the ",
+            "way to zero\" — does work, so only the incremental form is ",
+            "missing.)",
+        ),
+    ),
+    na(
+        "zn",
+        "zn",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzn",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zn resets foldenable")),
+        concat!(
+            "Vim resets 'foldenable', so every fold shows its lines again; ",
+            "vimcode's fold stays closed.",
+        ),
+    ),
+    na(
+        "zo",
+        "zo",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzo",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:indent:zo opens the level-1 fold, inner stays closed")),
+        "matches Vim: opens the fold under the cursor.",
+    ),
+    na(
+        "zp",
+        "zp",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-v>jlyjzp",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:zp pastes a block without trailing spaces")),
+        concat!(
+            "Vim pastes blockwise without the trailing whitespace. vimcode ",
+            "does nothing at all — the recording's buffer is byte-identical ",
+            "to the fixture while Vim's is not. Worth implementing with ",
+            "`zP`/`zy`, which have the same gap.",
+        ),
+    ),
+    na(
+        "zP",
+        "zP",
+        NotImplemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-v>jlyjzP",
+            "alpha beta gamma|delta epsilon zeta|eta theta iota",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:zP pastes a block without trailing spaces")),
+        "Same as `zp`: no paste at all.",
+    ),
+    na(
+        "zr",
+        "zr",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzczr",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zr raises foldlevel")),
+        concat!(
+            "Vim adds one to 'foldlevel', opening a level of folds; vimcode's ",
+            "fold stays closed (see `zm`).",
+        ),
+    ),
+    na(
+        "zs",
+        "zs",
+        Implemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "zs",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            150,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zs cursor at left edge")),
+        concat!(
+            "matches Vim: scrolls horizontally so the cursor sits at the left ",
+            "edge (first rendered column becomes the cursor's column).",
+        ),
+    ),
+    na(
+        "zt",
+        "zt",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (15, 3),
+            10,
+            "zt",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 3),
+            "NORMAL",
+            "",
+            15,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zt col kept")),
+        concat!(
+            "matches Vim: redraws with the cursor line at the top of the ",
+            "window.",
+        ),
+    ),
+    na(
+        "zuw",
+        "zuw",
+        NotImplemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zwzuw",
+            "teh quick brwn fox",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zuw undoes zw")),
+        concat!(
+            "Vim undoes a `zw`. vimcode does not recognise `zu` at all: the ",
+            "recording's cursor ends a word to the right, i.e. the trailing ",
+            "`w` ran as a motion. Worth implementing — `zg`/`zw`/`zG`/`zW` ",
+            "all exist, so only their undo half is missing, and the current ",
+            "behaviour silently *moves the cursor* instead.",
+        ),
+    ),
+    na(
+        "zug",
+        "zug",
+        NotImplemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zgzug",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zug undoes zg")),
+        concat!(
+            "Same as `zuw`; `g` is swallowed rather than executed, so this ",
+            "one is at least a silent no-op.",
+        ),
+    ),
+    na(
+        "zuW",
+        "zuW",
+        NotImplemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zWzuW",
+            "teh quick brwn fox",
+            (1, 5),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zuW undoes zW")),
+        "Same as `zuw`, including the stray `W` motion.",
+    ),
+    na(
+        "zuG",
+        "zuG",
+        NotImplemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zGzuG",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zuG undoes zG")),
+        "Same as `zug`.",
+    ),
+    na(
+        "zv",
+        "zv",
+        NotImplemented,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "jzfjzcggjzv",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (2, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1-2,4-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zv opens enough to view the cursor")),
+        concat!(
+            "Vim opens exactly enough folds to make the cursor line visible. ",
+            "vimcode leaves the fold closed with the cursor on its header ",
+            "line.",
+        ),
+    ),
+    na(
+        "zw",
+        "zw",
+        Implemented,
+        Some(nlive(
+            NA_SPELL,
+            (1, 1),
+            24,
+            "zw",
+            "teh quick brwn fox",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("spell:zw marks bad")),
+        "implemented in `src/core/spell.rs` (#1163).",
+    ),
+    na(
+        "zx",
+        "zx",
+        Partial,
+        Some(nlive(
+            NA_LONG,
+            (1, 1),
+            10,
+            "zfjzozx",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "1,3-30",
+            "1* tabs=1/1",
+        )),
+        Some(Label("fold:zx reapplies foldlevel and opens to the cursor")),
+        concat!(
+            "The 'foldlevel' half works — the recording re-closes a fold the ",
+            "user had opened — but the `zv` half cannot, because `zv` itself ",
+            "is unimplemented. Its sibling `zX` does not even do the first ",
+            "half.",
+        ),
+    ),
+    na(
+        "zy",
+        "zy",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "<C-v>jlzyjp",
+            "alpha beta gamma|dalelta epsilon zeta|edeta theta iota",
+            (2, 2),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:zy yanks a block without trailing spaces")),
+        concat!(
+            "matches Vim: yanks the block and the recorded paste puts it back ",
+            "without trailing whitespace. (The one member of the ",
+            "`zp`/`zP`/`zy` trio that works.)",
+        ),
+    ),
+    na(
+        "zz",
+        "zz",
+        Implemented,
+        Some(nlive(
+            NA_LONG,
+            (15, 3),
+            10,
+            "zz",
+            "line 01|line 02|line 03|line 04|line 05|line 06|line 07|line 08|line 09|line 10|line 11|line 12|line 13|line 14|line 15|line 16|line 17|line 18|line 19|line 20|line 21|line 22|line 23|line 24|line 25|line 26|line 27|line 28|line 29|line 30",
+            (15, 3),
+            "NORMAL",
+            "",
+            11,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:zzH")),
+        "matches Vim: redraws with the cursor line centred.",
+    ),
+    na(
+        "z<Left>",
+        "z<Left>",
+        NotImplemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "z<Left>",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            71,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z<Left> is zh")),
+        concat!(
+            "Vim's `z<Left>` is `zh`. vimcode does nothing — the recorded ",
+            "first rendered column and cursor are both unchanged, while `zh` ",
+            "itself works.",
+        ),
+    ),
+    na(
+        "z<Right>",
+        "z<Right>",
+        NotImplemented,
+        Some(nlive(
+            NA_WIDE,
+            (1, 150),
+            10,
+            "z<Right>",
+            "001 002 003 004 005 006 007 008 009 010 011 012 013 014 015 016 017 018 019 020 021 022 023 024 025 026 027 028 029 030 031 032 033 034 035 036 037 038 039 040 041 042 043 044 045 046 047 048 049 050",
+            (1, 150),
+            "NORMAL",
+            "",
+            1,
+            71,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("scroll:z<Right> is zl")),
+        "Vim's `z<Right>` is `zl`; vimcode does nothing (see `z<Left>`).",
+    ),
+    na(
+        "v (operator-pending)",
+        "o_v",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "dvj",
+            "delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:o_v forces charwise")),
+        concat!(
+            "matches Vim: forces the pending operator to work charwise (`dvj` ",
+            "deletes to the start of the next line rather than both lines).",
+        ),
+    ),
+    na(
+        "V (operator-pending)",
+        "o_V",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "dVl",
+            "delta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:o_V forces linewise")),
+        concat!(
+            "matches Vim: forces the pending operator to work linewise (`dVl` ",
+            "deletes the whole line).",
+        ),
+    ),
+    na(
+        "CTRL-V (operator-pending)",
+        "o_CTRL-V",
+        Implemented,
+        Some(nlive(
+            NA_TXT,
+            (1, 1),
+            24,
+            "d<C-v>j",
+            "lpha beta gamma|elta epsilon zeta|eta theta iota",
+            (1, 1),
+            "NORMAL",
+            "",
+            1,
+            1,
+            "",
+            "1* tabs=1/1",
+        )),
+        Some(Label("op:o_C-v forces blockwise")),
+        concat!(
+            "matches Vim: forces the pending operator to work blockwise ",
+            "(`d<C-v>j` deletes one column from two lines).",
+        ),
+    ),
+];
+
+const NORM_NO_REPLAY: &[(&str, &str)] = &[
+    ("<S-NL>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-CR>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-+>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-->", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<C-LeftMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<C-RightMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<LeftMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<MiddleMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<RightMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-Down>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-Left>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-LeftMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-Right>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<S-RightMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-Up>", "`Engine::handle_key` takes no Shift modifier, so neither backend can deliver a shifted key distinctly"),
+    ("<ScrollWheelDown>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-ScrollWheelDown>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<ScrollWheelUp>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-ScrollWheelUp>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<ScrollWheelLeft>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-ScrollWheelLeft>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<ScrollWheelRight>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("<S-ScrollWheelRight>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("[<MiddleMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+    ("]<MiddleMouse>", "mouse and wheel events reach the backends as pointer events, never as a key name `Engine::handle_key` could be given"),
+];
+
+const NORM_COVERAGE_EXEMPT: &[&str] = &[
+    "CTRL-C",
+    "CTRL-G",
+    "<BS>",
+    "CTRL-H",
+    "<Tab>",
+    "CTRL-I",
+    "<NL>",
+    "CTRL-J",
+    "CTRL-M",
+    "CTRL-N",
+    "CTRL-P",
+    "CTRL-R",
+    "CTRL-V",
+    "CTRL-Y",
+    "CTRL-Z",
+    "CTRL-\\ CTRL-N",
+    "CTRL-\\ CTRL-G",
+    "CTRL-^",
+    "CTRL-<Tab>",
+    "<Space>",
+    "{count}%",
+    "&",
+    "'{a-zA-Z0-9}",
+    "''",
+    "'(",
+    "')",
+    "'<",
+    "'>",
+    "'[",
+    "']",
+    "'{",
+    "'}",
+    ".",
+    "/{pattern}<CR>",
+    "/<CR>",
+    "1 - 9",
+    ":",
+    "{count}:",
+    "<{motion}",
+    "={motion}",
+    ">{motion}",
+    "?{pattern}<CR>",
+    "?<CR>",
+    "@:",
+    "@@",
+    "K",
+    "N",
+    "U",
+    "ZZ",
+    "ZQ",
+    "`(",
+    "`)",
+    "`<",
+    "`>",
+    "`[",
+    "`]",
+    "``",
+    "`{",
+    "`}",
+    "do",
+    "dp",
+    "n",
+    "q (while recording)",
+    "Q",
+    "q:",
+    "q/",
+    "q?",
+    "v",
+    "~{motion} ('tildeop')",
+    "<C-End>",
+    "<C-Home>",
+    "<C-Left>",
+    "<C-Right>",
+    "<C-Tab>",
+    "[\"x]<Del>",
+    "{count}<Del>",
+    "<Down>",
+    "<End>",
+    "<F1>",
+    "<Help>",
+    "<Home>",
+    "<Insert>",
+    "<Left>",
+    "<PageDown>",
+    "<PageUp>",
+    "<Right>",
+    "<Undo>",
+    "<Up>",
+    "CTRL-W CTRL-B",
+    "CTRL-W CTRL-C",
+    "CTRL-W CTRL-D",
+    "CTRL-W CTRL-F",
+    "CTRL-W CTRL-H",
+    "CTRL-W CTRL-I",
+    "CTRL-W CTRL-J",
+    "CTRL-W CTRL-K",
+    "CTRL-W CTRL-L",
+    "CTRL-W CTRL-N",
+    "CTRL-W CTRL-O",
+    "CTRL-W CTRL-P",
+    "CTRL-W CTRL-Q",
+    "CTRL-W CTRL-R",
+    "CTRL-W CTRL-S",
+    "CTRL-W CTRL-V",
+    "CTRL-W CTRL-W",
+    "CTRL-W CTRL-X",
+    "CTRL-W CTRL-Z",
+    "CTRL-W CTRL-^",
+    "CTRL-W CTRL-_",
+    "CTRL-W +",
+    "CTRL-W -",
+    "CTRL-W <",
+    "CTRL-W =",
+    "CTRL-W >",
+    "CTRL-W H",
+    "CTRL-W J",
+    "CTRL-W K",
+    "CTRL-W L",
+    "CTRL-W R",
+    "CTRL-W S",
+    "CTRL-W T",
+    "CTRL-W W",
+    "CTRL-W ^",
+    "CTRL-W _",
+    "CTRL-W c",
+    "CTRL-W d",
+    "CTRL-W f",
+    "CTRL-W F",
+    "CTRL-W g f",
+    "CTRL-W g F",
+    "CTRL-W g t",
+    "CTRL-W g T",
+    "CTRL-W g <Tab>",
+    "CTRL-W h",
+    "CTRL-W i",
+    "CTRL-W j",
+    "CTRL-W k",
+    "CTRL-W l",
+    "CTRL-W n",
+    "CTRL-W o",
+    "CTRL-W p",
+    "CTRL-W q",
+    "CTRL-W r",
+    "CTRL-W s",
+    "CTRL-W v",
+    "CTRL-W w",
+    "CTRL-W x",
+    "CTRL-W |",
+    "CTRL-W <Down>",
+    "CTRL-W <Up>",
+    "CTRL-W <Left>",
+    "CTRL-W <Right>",
+    "[#",
+    "['",
+    "[*",
+    "[`",
+    "[/",
+    "[P",
+    "[[",
+    "[]",
+    "[c",
+    "[f",
+    "[m",
+    "[p",
+    "[s",
+    "[z",
+    "]#",
+    "]'",
+    "]*",
+    "]`",
+    "]/",
+    "]P",
+    "][",
+    "]]",
+    "]c",
+    "]f",
+    "]m",
+    "]p",
+    "]s",
+    "]z",
+    "z{height}<CR>",
+    "z+",
+    "z-",
+    "z.",
+    "z=",
+    "zA",
+    "zC",
+    "zD",
+    "zE",
+    "zG",
+    "zH",
+    "zL",
+    "zM",
+    "zN",
+    "zW",
+    "zX",
+    "z^",
+    "za",
+    "zc",
+    "ze",
+    "zg",
+    "zh",
+    "zi",
+    "zj",
+    "zk",
+    "zl",
+    "zm",
+    "zn",
+    "zp",
+    "zP",
+    "zr",
+    "zs",
+    "zuw",
+    "zug",
+    "zuW",
+    "zuG",
+    "zv",
+    "zw",
+    "zx",
+    "zy",
+    "z<Left>",
+    "z<Right>",
+    "v (operator-pending)",
+    "V (operator-pending)",
+    "CTRL-V (operator-pending)",
+];
+
+/// Send one key sequence to the engine, the way a backend would.
+///
+/// Deliberately **not** [`send_keys`]: that tokenizer maps every `<C-…>` name
+/// to `Ctrl(<third char>)`, so `<C-Left>` would arrive as `Ctrl('L')` and
+/// three index rows (`<C-Left>`, `<C-Right>`, `<C-Home>`/`<C-End>`) would be
+/// silently mis-measured. Here a multi-character `<C-Name>` is delivered the
+/// way GTK and the TUI deliver it: the key *name* with `ctrl = true`.
+fn send_norm_keys(engine: &mut Engine, keys: &str) {
+    let mut chars = keys.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let rest: String = chars.clone().collect();
+            let starts_special = chars
+                .peek()
+                .map(|&c| c.is_ascii_uppercase() || c == 'C')
+                .unwrap_or(false);
+            if rest.contains('>') && starts_special {
+                let name: String = chars.by_ref().take_while(|&c| c != '>').collect();
+                if let Some(sub) = name.strip_prefix("C-") {
+                    if sub.chars().count() == 1 {
+                        let c = sub.chars().next().unwrap_or('?');
+                        press_ctrl(engine, c);
+                    } else {
+                        engine.handle_key(sub, None, true);
+                        pump(engine);
+                    }
+                } else {
+                    let mapped = match name.as_str() {
+                        "Esc" => "Escape",
+                        "CR" | "Enter" => "Return",
+                        "BS" => "BackSpace",
+                        "Del" => "Delete",
+                        "PageDown" => "Page_Down",
+                        "PageUp" => "Page_Up",
+                        other => other,
+                    };
+                    if mapped == "Space" {
+                        press_char(engine, ' ');
+                    } else {
+                        press_special(engine, mapped);
+                    }
+                }
+                continue;
+            }
+            press_char(engine, '<');
+        } else {
+            press_char(engine, ch);
+        }
+    }
+}
+
+/// The rendered line ranges, 1-indexed — `"1,3-30"` when a fold hides line 2.
+/// `""` means "every line is rendered", which is the common case and keeps
+/// the table readable.
+fn norm_folded(engine: &Engine) -> String {
+    let total = engine.buffer().len_lines();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for i in 0..total {
+        if engine.view().is_line_hidden(i) {
+            continue;
+        }
+        match ranges.last_mut() {
+            Some(r) if r.1 == i => r.1 = i + 1,
+            _ => ranges.push((i + 1, i + 1)),
+        }
+    }
+    if ranges.len() == 1 && ranges[0] == (1, total) {
+        return String::new();
+    }
+    ranges
+        .iter()
+        .map(|(a, b)| {
+            if a == b {
+                format!("{a}")
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The window tree and tab counter, e.g. `"(h0.50 2* 1) tabs=1/2"`.
+///
+/// Leaves are numbered by **ascending window id**, not by position, so a
+/// rotation (`CTRL-W r`) or an exchange (`CTRL-W x`) changes the string —
+/// that is the only way those two rows can be observed at all. Numbering by
+/// position would print the same signature before and after.
+fn norm_windows(engine: &Engine) -> String {
+    use vimcode_core::core::window::{WindowId, WindowLayout};
+
+    fn walk(l: &WindowLayout, active: WindowId, ids: &[usize], out: &mut String) {
+        let idx = |w: WindowId| ids.iter().position(|x| *x == w.0).unwrap_or(98) + 1;
+        match l {
+            WindowLayout::Leaf(w) => {
+                out.push_str(&format!(
+                    "{}{}",
+                    idx(*w),
+                    if *w == active { "*" } else { "" }
+                ));
+            }
+            WindowLayout::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                out.push('(');
+                out.push_str(&format!("{direction:?}").to_lowercase()[..1]);
+                out.push_str(&format!("{ratio:.2} "));
+                walk(first, active, ids, out);
+                out.push(' ');
+                walk(second, active, ids, out);
+                out.push(')');
+            }
+        }
+    }
+
+    let tab = engine.active_tab();
+    let mut ids: Vec<usize> = tab.layout.window_ids().iter().map(|w| w.0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut s = String::new();
+    walk(&tab.layout, tab.active_window, &ids, &mut s);
+    format!(
+        "{s} tabs={}/{}",
+        engine.active_group().active_tab + 1,
+        engine.active_group().tabs.len()
+    )
+}
+
+/// What one [`NormLive`] recording claims, re-measured.
+type NormSeen = (
+    String,
+    (usize, usize),
+    String,
+    String,
+    usize,
+    usize,
+    String,
+    String,
+);
+
+/// Replay one recording against a real engine. Black-box throughout: keys in,
+/// rendered output out.
+fn replay_norm_live(p: &NormLive) -> NormSeen {
+    let mut engine = engine_with(&p.lines.join("\n"));
+    engine.settings.shift_width = 4;
+    engine.settings.expand_tab = true;
+    engine.settings.tabstop = 4;
+    engine.set_viewport_lines(p.view);
+    // 80 columns, matching the oracle's default screen: the `zh`/`zl`/`ze`/
+    // `zs`/`zH`/`zL` rows are *about* the horizontal viewport.
+    engine.view_mut().viewport_cols = 80;
+    engine.view_mut().cursor.line = p.at.0.saturating_sub(1);
+    engine.view_mut().cursor.col = p.at.1.saturating_sub(1);
+    engine.ensure_cursor_visible();
+    send_norm_keys(&mut engine, p.keys);
+    (
+        engine.buffer().to_string().replace('\n', "|"),
+        (engine.view().cursor.line + 1, engine.view().cursor.col + 1),
+        engine.mode_str().to_string(),
+        engine.message.replace('\n', "\\n"),
+        engine.view().scroll_top + 1,
+        engine.view().scroll_left + 1,
+        norm_folded(&engine),
+        norm_windows(&engine),
+    )
+}
+
+/// Every row whose recorded behaviour no longer matches the live engine.
+fn norm_drift(audit: &[NormAudit]) -> Vec<String> {
+    let mut drift: Vec<String> = Vec::new();
+    for e in audit {
+        let Some(p) = e.live.as_ref() else { continue };
+        let (buffer, cursor, mode, message, top, left, folded, windows) = replay_norm_live(p);
+        let recorded = (
+            p.buffer.to_string(),
+            p.cursor,
+            p.mode.to_string(),
+            p.message.to_string(),
+            p.top,
+            p.left,
+            p.folded.to_string(),
+            p.windows.to_string(),
+        );
+        let live = (buffer, cursor, mode, message, top, left, folded, windows);
+        if recorded != live {
+            drift.push(format!(
+                "  {:?} ({}) keys={:?}\n\
+                 \x20   recorded {:?}\n\
+                 \x20   live     {:?}",
+                e.item, e.help, p.keys, recorded, live
+            ));
+        }
+    }
+    drift
+}
+
+/// Gate 1 (#1229) — every row's recorded behaviour is a claim about live
+/// code, and this replays all 323 of them against it. Pure: no `nvim`, no
+/// subprocess, so it runs on every lane.
+#[test]
+fn normal_audit_matches_the_live_engine() {
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_NORMAL") {
+        let mut s = String::new();
+        for e in NORMAL_AUDIT {
+            let Some(p) = e.live.as_ref() else { continue };
+            let (buffer, cursor, mode, message, top, left, folded, windows) = replay_norm_live(p);
+            s.push_str(&format!(
+                "{}\t{:?}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}\n",
+                e.item, buffer, cursor.0, cursor.1, mode, message, top, left, folded, windows
+            ));
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let drift = norm_drift(NORMAL_AUDIT);
+    assert!(
+        drift.is_empty(),
+        "\n\n== normal-mode audit drifted from the engine (#1229) ==\n\
+         Each row records what vimcode actually did when the slice ran.\n\
+         Implementing (or breaking) one of these changes that recording, so\n\
+         re-tag the row — that is how the audit stays true instead of rotting\n\
+         like a markdown checklist.\n\n{}\n\n\
+         A command that gained an implementation also needs its status changed\n\
+         from NotImplemented, and a NORM_COVERAGE_EXEMPT entry deleted once an\n\
+         oracle case pins it.\n",
+        drift.join("\n")
+    );
+}
+
+/// Gate 1b (#1229) — the table describes itself correctly: complete, unique,
+/// no unreviewed row, every ⏭️ carrying a reason from the shared vocabulary,
+/// and a recording + probe on exactly the rows that can have one.
+#[test]
+fn normal_audit_is_internally_consistent() {
+    use std::collections::HashSet;
+    let mut problems: Vec<String> = Vec::new();
+
+    assert_eq!(
+        NORMAL_AUDIT.len(),
+        370,
+        "`:help normal-index` outside the g-prefix walked to 370 entries; \
+         the audit must tag all of them"
+    );
+
+    let no_replay: HashSet<&str> = NORM_NO_REPLAY.iter().map(|(item, _)| *item).collect();
+    assert_eq!(
+        no_replay.len(),
+        NORM_NO_REPLAY.len(),
+        "NORM_NO_REPLAY lists an item twice"
+    );
+    for (item, reason) in NORM_NO_REPLAY {
+        if !NORMAL_AUDIT.iter().any(|e| e.item == *item) {
+            problems.push(format!("  NORM_NO_REPLAY {item:?}: not a row of the audit"));
+        }
+        if reason.trim().is_empty() {
+            problems.push(format!("  NORM_NO_REPLAY {item:?}: needs a reason"));
+        }
+    }
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for e in NORMAL_AUDIT {
+        if !seen.insert(e.item) {
+            problems.push(format!("  {:?}: listed twice", e.item));
+        }
+        if e.note.trim().is_empty() {
+            problems.push(format!(
+                "  {:?}: empty note — every row is reviewed",
+                e.item
+            ));
+        }
+        if e.help.trim().is_empty() {
+            problems.push(format!("  {:?}: no `:help` tag", e.item));
+        }
+
+        let skipped = matches!(e.status, OptStatus::Skipped(_));
+        if let OptStatus::Skipped(reason) = e.status {
+            if !SKIP_REASONS.contains(&reason) {
+                problems.push(format!(
+                    "  {:?}: skip reason {reason:?} is not in SKIP_REASONS",
+                    e.item
+                ));
+            }
+        }
+        let replayable = !skipped && !no_replay.contains(e.item);
+        if replayable && e.live.is_none() {
+            problems.push(format!(
+                "  {:?}: reachable from a keyboard, so it must carry a live recording",
+                e.item
+            ));
+        }
+        if replayable && e.probe.is_none() {
+            problems.push(format!(
+                "  {:?}: reachable from a keyboard, so it must carry an oracle probe",
+                e.item
+            ));
+        }
+        if !replayable && (e.live.is_some() || e.probe.is_some()) {
+            problems.push(format!(
+                "  {:?}: skipped or unreachable, so a recording or probe can never fire",
+                e.item
+            ));
+        }
+    }
+
+    // The headline tally, pinned. The section doc quotes these numbers and a
+    // PR body quotes the section doc; without this they drift the moment a
+    // row is re-tagged, which is the exact rot a markdown checklist suffers.
+    let tally = |want: fn(&NormAudit) -> bool| NORMAL_AUDIT.iter().filter(|e| want(e)).count();
+    assert_eq!(
+        (
+            tally(|e| matches!(e.status, OptStatus::Implemented)),
+            tally(|e| matches!(e.status, OptStatus::Partial)),
+            tally(|e| matches!(e.status, OptStatus::NotImplemented)),
+            tally(|e| matches!(e.status, OptStatus::Skipped(_))),
+            tally(|e| e.live.is_some()),
+        ),
+        (217, 17, 112, 24, 323),
+        "the audit tally moved: (implemented, partial, missing, skipped, \
+         replayed). Update the section doc's table in the same commit."
+    );
+
+    assert!(
+        problems.is_empty(),
+        "\n\n== normal-mode audit table is inconsistent (#1229) ==\n{}\n",
+        problems.join("\n")
+    );
+}
+
+/// `cases` is `(label, keys)` for the whole corpus — the same view
+/// [`classify_coverage`] takes.
+fn classify_norm_coverage(
+    audit: &[NormAudit],
+    exempt: &[&'static str],
+    cases: &[(&'static str, &'static str)],
+) -> OptionCoverage {
+    use std::collections::HashSet;
+    let exempt_set: HashSet<&str> = exempt.iter().copied().collect();
+    let mut v = OptionCoverage::default();
+    for e in audit {
+        let Some(probe) = e.probe else { continue };
+        v.in_scope += 1;
+        let covered = cases.iter().any(|(label, keys)| probe.matches(label, keys));
+        match (covered, exempt_set.contains(e.item)) {
+            (false, false) => v.uncovered.push(e.item),
+            (true, true) => v.newly_covered.push(e.item),
+            _ => {}
+        }
+    }
+    v.stale = exempt
+        .iter()
+        .copied()
+        .filter(|n| !audit.iter().any(|e| e.item == *n && e.probe.is_some()))
+        .collect();
+    v
+}
+
+/// Gate 2 (#1229) — #1007's ratchet, applied to the audited commands: an
+/// in-scope row whose probe matches nothing must be exempt, and an exempt row
+/// whose probe now matches must lose its entry. Pure.
+#[test]
+fn normal_audit_oracle_coverage_is_shrink_only() {
+    use std::collections::HashSet;
+    let corpus = all_corpus_cases();
+    let exempt: HashSet<&str> = NORM_COVERAGE_EXEMPT.iter().copied().collect();
+    assert_eq!(
+        exempt.len(),
+        NORM_COVERAGE_EXEMPT.len(),
+        "NORM_COVERAGE_EXEMPT lists an item twice"
+    );
+
+    let v = classify_norm_coverage(NORMAL_AUDIT, NORM_COVERAGE_EXEMPT, &corpus);
+
+    if let Ok(path) = std::env::var("CONFORMANCE_DUMP_NORMAL_COVERAGE") {
+        let mut s = String::new();
+        for n in &v.uncovered {
+            s.push_str(&format!("UNCOVERED\t{n}\n"));
+        }
+        for n in &v.newly_covered {
+            s.push_str(&format!("NEWLY_COVERED\t{n}\n"));
+        }
+        for n in &v.stale {
+            s.push_str(&format!("STALE\t{n}\n"));
+        }
+        for e in NORMAL_AUDIT {
+            let Some(probe) = e.probe else { continue };
+            if let Some((label, _)) = corpus
+                .iter()
+                .find(|(label, keys)| probe.matches(label, keys))
+            {
+                s.push_str(&format!(
+                    "COVERED\t{}\t{:?}\t{}\n",
+                    e.item,
+                    probe.needle(),
+                    label
+                ));
+            }
+        }
+        std::fs::write(&path, s).unwrap_or_else(|e| panic!("dump to {path}: {e}"));
+        return;
+    }
+
+    let covered = v.in_scope - NORM_COVERAGE_EXEMPT.len();
+    println!(
+        "\n== normal-mode oracle coverage (#1229) ==\n\
+         {covered}/{} audited commands are pinned by an oracle case; {} exempt.\n\
+         Writing the missing cases is #1162.\n",
+        v.in_scope,
+        NORM_COVERAGE_EXEMPT.len()
+    );
+
+    assert!(
+        v.uncovered.is_empty() && v.newly_covered.is_empty() && v.stale.is_empty(),
+        "\n\n== normal-mode audit oracle coverage moved (#1229) ==\n\
+         no case exercises these, and they are not exempt:\n  {:?}\n\
+         a case now exercises these — delete them from NORM_COVERAGE_EXEMPT:\n  {:?}\n\
+         these exempt entries name no probed row — stale:\n  {:?}\n",
+        v.uncovered,
+        v.newly_covered,
+        v.stale
+    );
+}
+
+/// Gate 2b (#1229) — the gate above can actually fail.
+///
+/// #553's lesson, applied to a ratchet: a shrink-only list is worthless if
+/// nothing proves the three failure directions fire. Deleting a real exempt
+/// entry must report it uncovered, adding a case that matches an exempt row
+/// must report it newly covered, and an exempt entry naming nothing must be
+/// reported stale.
+#[test]
+fn normal_audit_ratchet_can_fail() {
+    let corpus = all_corpus_cases();
+
+    let victim = "CTRL-W s";
+    assert!(
+        NORM_COVERAGE_EXEMPT.contains(&victim),
+        "fixture drifted: {victim} is no longer exempt"
+    );
+    let without: Vec<&str> = NORM_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .filter(|n| *n != victim)
+        .collect();
+    let deleted = classify_norm_coverage(NORMAL_AUDIT, &without, &corpus);
+    assert_eq!(
+        deleted.uncovered,
+        vec![victim],
+        "deleting {victim:?} from NORM_COVERAGE_EXEMPT must fail the gate"
+    );
+
+    let mut plus = corpus.clone();
+    plus.push(("win:C-w s splits", "<C-w>s"));
+    let improved = classify_norm_coverage(NORMAL_AUDIT, NORM_COVERAGE_EXEMPT, &plus);
+    assert_eq!(
+        improved.newly_covered,
+        vec![victim],
+        "a case that matches an exempt row must fail the gate until the entry goes"
+    );
+
+    let stale: Vec<&str> = NORM_COVERAGE_EXEMPT
+        .iter()
+        .copied()
+        .chain(std::iter::once("CTRL-W definitely-not-a-command"))
+        .collect();
+    let with_stale = classify_norm_coverage(NORMAL_AUDIT, &stale, &corpus);
+    assert_eq!(
+        with_stale.stale,
+        vec!["CTRL-W definitely-not-a-command"],
+        "an exempt entry naming no audited row must be reported stale"
+    );
+
+    let real = classify_norm_coverage(NORMAL_AUDIT, NORM_COVERAGE_EXEMPT, &corpus);
+    assert!(
+        real.uncovered.is_empty() && real.newly_covered.is_empty() && real.stale.is_empty(),
+        "the real lists must be clean once the three injections are removed"
+    );
+}
+
+/// The `g`-prefix slice's stale header, pinned from the *read-only* doc.
+///
+/// `COVERAGE_PHASE5.md`'s "Slice 1" header still reads
+/// `✅ 36 · 🟡 2 · ❌ 14 · ⏭️ 6`, but its own "Coverage summary so far" table
+/// reads `41 / 2 / 9 / 6` for the same 58 commands. The summary is the
+/// correct one: #120–#123 were implemented and struck through in the gap
+/// list (`gF`, `g@`, `g<Tab>` and the five screen-line motions `g$` / `g0` /
+/// `g^` / `g<End>` / `g<Home>` — five rows moved from ❌ to ✅), and only the
+/// header was left behind.
+///
+/// #1229 was asked to carry that correction in **the table and the PR body**;
+/// editing `COVERAGE_PHASE5.md` is a coordinator follow-up, so this slice
+/// pins the right numbers here instead and reads the doc without writing it.
+/// The gate is deliberately asserted against the *summary row*, so "fixing"
+/// the contradiction by editing the summary down to the stale header's
+/// numbers fails here.
+const G_PREFIX_CORRECTED_TALLY: (usize, usize, usize, usize) = (41, 2, 9, 6);
+
+/// Gate 3 (#1229) — the `g`-prefix slice's corrected tally still matches the
+/// summary table of `COVERAGE_PHASE5.md`, and still sums to its 58 commands.
+#[test]
+fn g_prefix_slice_tally_is_the_summary_not_the_stale_header() {
+    let doc = include_str!("../COVERAGE_PHASE5.md");
+    let row = doc
+        .lines()
+        .find(|l| l.starts_with("| `g`-prefix |"))
+        .unwrap_or_else(|| panic!("COVERAGE_PHASE5.md has no `g`-prefix summary row"));
+    let cells: Vec<&str> = row
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    let num = |i: usize| -> usize {
+        cells
+            .get(i)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or_else(|| panic!("summary row cell {i} is not a number: {row:?}"))
+    };
+    let (total, implemented, partial, missing, skipped) = (num(1), num(2), num(3), num(4), num(5));
+
+    assert_eq!(
+        (implemented, partial, missing, skipped),
+        G_PREFIX_CORRECTED_TALLY,
+        "COVERAGE_PHASE5.md's `g`-prefix summary row moved. The stale header \
+         above it says ❌ 14; the correct count is ❌ 9 (#120–#123 landed). \
+         Fix the header, not the summary."
+    );
+    assert_eq!(
+        implemented + partial + missing + skipped,
+        total,
+        "the `g`-prefix tally must still add up to its {total} commands"
+    );
 }

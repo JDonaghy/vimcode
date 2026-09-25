@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -79,6 +79,22 @@ path = "src/tui_bin.rs"
 name = "acceptance"
 path = "tests/acceptance.rs"
 required-features = ["test-support", "gui"]
+
+# #1106 review: `tests/gtk_no_display.rs` spawns the compiled `vimcode` binary
+# and asserts on the "no display found" message that `src/gtk/mod.rs` prints
+# before `gtk4::init()`. That codepath only exists when the binary was built
+# with the `gui` feature — under `--no-default-features`, `launch_gui` falls
+# straight through to the TUI (see the #859 comment above), so the same
+# no-DISPLAY invocation instead starts the TUI against a piped, immediately-
+# EOF stdin, which is not what this test is exercising and can fail or hang
+# unpredictably in that lane. Pinning `required-features = ["gui"]` makes
+# `cargo test --no-default-features` skip this target instead of running it
+# against the wrong backend (the same trap `tests/acceptance.rs` above and
+# `tests/cli_help.rs`'s `--help` sidestep were written to avoid).
+[[test]]
+name = "gtk_no_display"
+path = "tests/gtk_no_display.rs"
+required-features = ["gui"]
 
 [features]
 default = ["gui"]
@@ -172,7 +188,7 @@ win = ["quadraui/win"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "ed402b4ae0d9b753279bebe1bba4284dbe515d8a", features = ["tui", "terminal"] }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "20a4486aa6d561eb112d105a587e6aea8960f36e", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
@@ -224,7 +240,6 @@ regex = "1"
 # transitively via `termwiz`, so this adds no new dependency to the tree.
 fancy-regex = "0.11"
 lsp-types = "0.97"
-copypasta-ext = "0.4"
 mlua = { version = "0.9", features = ["lua54", "vendored"] }
 toml = "0.8"
 libc = "0.2"
@@ -232,6 +247,21 @@ pulldown-cmark = { version = "0.13", default-features = false }
 streaming-iterator = "0.1.9"
 spellbook = "0.4.0"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+# #1345: `tool_acquire.rs` — native LSP/DAP tool acquisition (download,
+# verify, unpack) with no shell, sudo, `unzip`, or `tar` binary. `sha2` and
+# `flate2` were already in the dependency tree transitively (via other
+# crates); pinned here as direct deps since `tool_acquire.rs` uses them
+# itself. `tar` and `zip` are new — `zip`'s default features pull in every
+# supported compression method (bzip2/zstd/lzma); extension archives only
+# ever use plain DEFLATE, so this trims to `deflate` only. That avoids a C
+# dependency beyond what deflate already needs (bzip2/zstd/lzma each pull
+# their own), but doesn't trim `zip`'s dependency tree overall — `zopfli`,
+# `arbitrary`/`derive_arbitrary` and `displaydoc` are unconditional deps of
+# `zip` 2.x regardless of enabled features (confirmed in `Cargo.lock`).
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 insta = "1.39"

@@ -110,6 +110,9 @@ pub const EXTENSIONS: Icon = Icon::new("\u{eae6}", "#"); // #
 pub const EXTENSIONS_ALT: Icon = Icon::new("\u{eb85}", "#"); // nf-cod-extensions alt (TUI)
 pub const AI_CHAT: Icon = Icon::new("\u{f0e5}", ">"); // >
 pub const SETTINGS: Icon = Icon::new("\u{f013}", "*"); // *
+/// Board activity-bar panel (#521) — a generic kanban/pipeline host, not
+/// tied to any one provider. nf-fa-columns.
+pub const BOARD: Icon = Icon::new("\u{f0db}", "\u{25a6}"); // ▦
 
 // ─── File Explorer ───────────────────────────────────────────────────────────
 

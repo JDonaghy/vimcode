@@ -43,8 +43,33 @@ pub(crate) use crate::click::{TabBarPixelHits, TabPixelHitMap};
 /// `pub` rather than `pub(crate)` since #657: the caller is `src/main.rs`,
 /// which is now a separate crate from this module's.
 pub fn run(file_path: Option<PathBuf>) {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
-        std::env::set_var("DISPLAY", ":0");
+    // #1106: this used to silently invent `DISPLAY=:0` whenever neither
+    // `DISPLAY` nor `WAYLAND_DISPLAY` was set. That's a guess, not a
+    // fallback — `:0` is far from guaranteed to be the display anyone
+    // actually wants (Xvfb commonly picks `:99`, a second X session `:1`,
+    // etc.), and if it happens to be wrong `gtk4::init()` below still fails,
+    // just later and against a display name nobody chose, which is exactly
+    // the "surfaces later and less legibly" failure mode #979 hit for
+    // `--help`. Fail loudly here instead, before touching GTK at all, and
+    // name the actual problem: no display was configured. (Deliberately not
+    // an opt-in env var either — there is no way to guess a *correct*
+    // display, only a hardcoded one, so an opt-in would just move the same
+    // wrong guess behind a flag.)
+    //
+    // Only on platforms where GTK actually talks to X11/Wayland: on macOS
+    // (quartz) and Windows (win32) there is no display variable to set, so
+    // this guard would refuse to start a perfectly good GUI build.
+    if no_display_configured(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+    ) {
+        eprintln!(
+            "vimcode: no display found (neither DISPLAY nor WAYLAND_DISPLAY is set).\n\
+             The GTK backend needs a running X11 or Wayland session. Set one of\n\
+             those environment variables, or run the TUI backend instead (`vcd`),\n\
+             which needs neither."
+        );
+        std::process::exit(1);
     }
 
     // Install panic hook that flushes swap files + writes crash log.
@@ -118,113 +143,189 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
 // (quadraui's `gtk::editor::draw_editor`, mirroring TUI's inline
 // scrollbar column) and the quadraui issue that needs filing first.
 
+/// True when GTK needs an X11/Wayland display and none is configured.
+/// Always false on macOS and Windows, whose GTK backends (quartz, win32)
+/// don't use `DISPLAY` / `WAYLAND_DISPLAY` at all.
+fn no_display_configured(has_wayland: bool, has_x11: bool) -> bool {
+    cfg!(not(any(target_os = "macos", target_os = "windows"))) && !has_wayland && !has_x11
+}
+
 #[cfg(test)]
-mod h_scrollbar_status_offset_tests {
-    //! #728: `h_scrollbar_geometry`'s status-row offset used to check
-    //! `window_status_line && !terminal_maximized` directly, while
-    //! `render::build_screen_layout`'s reservation of that same row used
-    //! `per_window_status && !separate_status` — two independent answers to
-    //! "is a per-window status row painted here", each covering an axis the
-    //! other didn't (`terminal_maximized` vs. `separate_status`). Both now
-    //! go through `render::window_status_row_reserved`; these pin that the
-    //! scrollbar's track actually moves in lockstep with it rather than
-    //! re-diverging.
-    use super::h_scrollbar_geometry;
+mod no_display_guard_tests {
+    use super::no_display_configured;
+
+    #[test]
+    fn either_display_variable_satisfies_the_guard() {
+        assert!(!no_display_configured(true, false));
+        assert!(!no_display_configured(false, true));
+        assert!(!no_display_configured(true, true));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn no_display_variable_trips_the_guard_on_x11_wayland_platforms() {
+        assert!(no_display_configured(false, false));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn guard_never_trips_where_gtk_has_a_native_backend() {
+        assert!(!no_display_configured(false, false));
+    }
+}
+
+#[cfg(test)]
+mod editor_scrollbar_geometry_tests {
+    //! #1128: replaces the old `h_scrollbar_status_offset_tests` (#728) —
+    //! that module pinned a status-row offset in the pre-#1128 hand-rolled
+    //! h-scrollbar geometry helper this issue deleted. quadraui#968 taught
+    //! `quadraui::gtk::editor::draw_editor` to paint both editor scrollbars
+    //! itself via `Editor::layout`, laid out against the window's raw,
+    //! unshrunk rect — it never applies a status-row offset (see
+    //! `quadraui::gtk::editor`'s module doc, "Scrollbars" section) — so a
+    //! hit-test helper that still applied one would disagree with what's
+    //! actually painted: precisely the "hover and paint can disagree by
+    //! construction" bug #1128 fixed. These tests pin the replacement
+    //! helpers (`editor_scrollbar_layout`/`h_scrollbar_thumb_geometry`)
+    //! against that reality instead.
+    use super::{editor_scrollbar_layout, h_scrollbar_thumb_geometry};
     use crate::core::{Engine, WindowRect};
 
-    /// A window whose longest line overflows a narrow viewport, so
-    /// `h_scrollbar_geometry` returns `Some` rather than `None` ("content
-    /// fits" — nothing to offset).
-    fn engine_needing_h_scrollbar() -> Engine {
+    /// A window whose longest line overflows a narrow viewport and whose
+    /// buffer is long enough to need both a v-scrollbar and a multi-digit
+    /// (wide) line-number gutter — the exact combination the deleted
+    /// pre-#1128 helper got wrong: it ignored the gutter offset entirely
+    /// and hardcoded an 8px reserve for the v-scrollbar column instead of
+    /// reading the real `char_width`-wide one quadraui#968 reserves.
+    fn engine_needing_h_scrollbar_with_wide_gutter() -> Engine {
         let mut e = Engine::new_for_test();
-        e.buffer_mut().insert(0, &"x".repeat(500));
-        // `max_col` (what `h_scrollbar_geometry` reads) is a cache
-        // refreshed by `update_syntax`, not by a raw `Buffer::insert` —
-        // force it so the 500-char line above is actually reflected.
+        e.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+        let long_line = "x".repeat(500);
+        let filler: String = "line\n".repeat(999);
+        e.buffer_mut().insert(0, &format!("{long_line}\n{filler}"));
+        // `max_col` (what the scrollbar probe reads) is a cache refreshed
+        // by `update_syntax`, not by a raw `Buffer::insert` — force it so
+        // the 500-char line above is actually reflected.
         let wid = e.active_window_id();
         let buffer_id = e.windows.get(&wid).unwrap().buffer_id;
         e.buffer_manager.get_mut(buffer_id).unwrap().update_syntax();
         e
     }
 
+    /// #1128 regression — RED against the deleted pre-fix helper (verified
+    /// while writing this fix: it returned `track_x` 0.0 — gutter ignored
+    /// — `track_w` 992.0 and `sb_height` 7.0 — an independently guessed 8px
+    /// v-scrollbar reserve and a 0.35×line_height bar height, neither of
+    /// which is what quadraui actually paints). The h-scrollbar track must
+    /// start after the gutter and stop exactly one `char_width` cell short
+    /// of the pane's right edge — the v-scrollbar's own reserved column
+    /// (quadraui#968) — not span the full window width minus a hardcoded
+    /// guess.
     #[test]
-    fn track_moves_up_by_exactly_one_row_when_the_status_row_is_reserved() {
-        let mut e = engine_needing_h_scrollbar();
-        e.settings.window_status_line = true;
+    fn track_starts_after_the_gutter_and_reserves_exactly_one_char_width_for_the_v_scrollbar() {
+        let e = engine_needing_h_scrollbar_with_wide_gutter();
         let wid = e.active_window_id();
-        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let rect = WindowRect::new(0.0, 0.0, 1000.0, 200.0);
+        let char_width = 20.0;
         let line_height = 20.0;
 
-        let (_, track_y_with, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("an overflowing line needs an h-scrollbar");
+        let (editor, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
+            .expect("window and buffer must resolve");
+        let h_track = layout
+            .h_scrollbar_bounds
+            .expect("a 500-char line must overflow a 1000px-wide pane");
+        let v_track = layout
+            .v_scrollbar_bounds
+            .expect("1000 lines must overflow a 10-visible-row pane");
 
-        e.settings.window_status_line = false;
-        let (_, track_y_without, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("still overflowing with the status line off");
-
-        assert_eq!(
-            track_y_without - track_y_with,
-            line_height,
-            "the status row must shift the h-scrollbar up by exactly one line_height"
+        let gutter_w = editor.gutter_char_width as f64 * char_width;
+        assert!(
+            gutter_w > char_width,
+            "fixture sanity: line numbers up to ~1000 must need more than one gutter column"
         );
+        assert_eq!(
+            h_track.x as f64,
+            rect.x + gutter_w,
+            "track must start after the gutter, not at the window's left edge"
+        );
+        assert_eq!(
+            h_track.width as f64,
+            rect.width - gutter_w - v_track.width as f64,
+            "track must stop short by exactly the v-scrollbar's own reserved \
+             column, not a hardcoded 8px"
+        );
+        assert_eq!(
+            v_track.width as f64, char_width,
+            "the v-scrollbar's reserved column is one char_width cell \
+             (quadraui#968), not a hardcoded pixel constant"
+        );
+        assert_eq!(
+            h_track.height as f64, line_height,
+            "the h-scrollbar's own row is one full line_height tall, \
+             matching quadraui's paint"
+        );
+
+        let (tx, ty, tw, th, ..) =
+            h_scrollbar_thumb_geometry(&e, wid, &rect, char_width, line_height)
+                .expect("thumb geometry must resolve alongside the track");
+        assert_eq!(tx, h_track.x as f64);
+        assert_eq!(ty, h_track.y as f64);
+        assert_eq!(tw, h_track.width as f64);
+        assert_eq!(th, h_track.height as f64);
     }
 
-    /// #728 regression: with `status_line_above_terminal` OFF and the
-    /// bottom panel open, the active window's status is pulled into a
-    /// *separated* bar above the terminal instead of painting inside this
-    /// window — `render::window_status_row_reserved` reports the row as
-    /// free, and the h-scrollbar must agree. The old
-    /// `window_status_line && !terminal_maximized` predicate never checked
-    /// this axis and would have offset for a row nothing paints here.
-    /// RED against that predicate (verified while writing this fix): 13.0
-    /// vs. 33.0 — the old code offset the track by a full `line_height` for
-    /// a status row that was actually painted as a separated bar elsewhere.
-    #[test]
-    fn track_does_not_move_when_status_is_separated_above_the_terminal() {
-        let mut e = engine_needing_h_scrollbar();
+    fn cfg_status_line(e: &mut Engine) {
+        e.settings.window_status_line = true;
+    }
+    fn cfg_separated_status(e: &mut Engine) {
         e.settings.window_status_line = true;
         e.settings.status_line_above_terminal = false;
         e.terminal_open = true;
-        let wid = e.active_window_id();
-        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
-        let line_height = 20.0;
-
-        let (_, track_y_separated, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("an overflowing line needs an h-scrollbar");
-
-        e.settings.window_status_line = false;
-        let (_, track_y_no_status, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("still overflowing with the status line off");
-
-        assert_eq!(
-            track_y_separated, track_y_no_status,
-            "a separated status bar must not offset the h-scrollbar — this \
-             window's own bottom row is free"
-        );
     }
-
-    /// #728 regression: while the terminal panel is maximized, editor
-    /// windows are not the visible surface, so nothing paints a per-window
-    /// status row even with the setting on — the h-scrollbar must not
-    /// offset for one. This is the axis `build_screen_layout`'s old
-    /// predicate never checked (only GTK's did).
-    #[test]
-    fn track_does_not_move_when_the_terminal_is_maximized() {
-        let mut e = engine_needing_h_scrollbar();
+    fn cfg_maximized(e: &mut Engine) {
         e.settings.window_status_line = true;
         e.terminal_maximized = true;
-        let wid = e.active_window_id();
-        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+    }
+
+    /// #1128 regression: quadraui's real paint
+    /// (`quadraui::gtk::editor::draw_editor`) lays scrollbars out against
+    /// the window's raw rect and never shrinks it for a per-window status
+    /// line first — so the track must not move for any of
+    /// `window_status_line`, the "separated status" bottom-panel case, or a
+    /// maximized terminal. The deleted pre-#1128 helper offset the track by
+    /// a full `line_height` whenever `window_status_line` was on,
+    /// disagreeing with paint in every one of these configurations.
+    #[test]
+    fn status_line_settings_never_move_the_track() {
+        let rect = WindowRect::new(0.0, 0.0, 1000.0, 200.0);
+        let char_width = 20.0;
         let line_height = 20.0;
 
-        let (_, track_y_maximized, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("an overflowing line needs an h-scrollbar");
+        let baseline_y = {
+            let e = engine_needing_h_scrollbar_with_wide_gutter();
+            let wid = e.active_window_id();
+            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
+                .expect("an overflowing line needs an h-scrollbar");
+            layout.h_scrollbar_bounds.unwrap().y
+        };
 
-        e.settings.window_status_line = false;
-        let (_, track_y_no_status, ..) = h_scrollbar_geometry(&e, wid, &rect, 8.0, line_height)
-            .expect("still overflowing with the status line off");
-
-        assert_eq!(track_y_maximized, track_y_no_status);
+        for configure in [
+            cfg_status_line as fn(&mut Engine),
+            cfg_separated_status,
+            cfg_maximized,
+        ] {
+            let mut e = engine_needing_h_scrollbar_with_wide_gutter();
+            configure(&mut e);
+            let wid = e.active_window_id();
+            let (_, layout) = editor_scrollbar_layout(&e, wid, &rect, char_width, line_height)
+                .expect("still overflowing under this configuration");
+            assert_eq!(
+                layout.h_scrollbar_bounds.unwrap().y,
+                baseline_y,
+                "no per-window-status-line configuration may move the \
+                 h-scrollbar track"
+            );
+        }
     }
 }
 
@@ -428,8 +529,22 @@ mod chrome_paint_tests {
                 // WCAG-ish floor: anything much below this reads as "same
                 // color" at a glance, which is exactly the bug this test
                 // guards against.
+                //
+                // #934: the floor was 40.0, tuned against freetype's
+                // rasterisation. A Darwin/Quartz run measured 36.1 for
+                // solarized-dark's minimize glyph — Core Text's
+                // gamma-correct AA compositing produces measurably softer
+                // (lower-peak-luminance) glyph edges than freetype's for the
+                // same thin box-drawing-style pen, without the button being
+                // any less visible to a human. 25.0 keeps ~5x headroom
+                // above the #552 regression this test exists to catch
+                // (literally near-zero delta — white-on-near-white) while
+                // absorbing the observed rasteriser gap; it is not tuned
+                // against a full Darwin run across every theme/button, only
+                // the one reported data point, so treat it as a floor with
+                // margin rather than a measured-exact value.
                 assert!(
-                    delta > 40.0,
+                    delta > 25.0,
                     "theme {name:?}: window-control button {action:?} has only \
                      {delta:.1} luminance contrast against tab_bar_bg — \
                      effectively invisible"

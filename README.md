@@ -47,7 +47,7 @@ some test text
 - **First-class Vim mode** — deeply integrated modal editing, not a plugin bolted onto a different editor
 - **Cross-platform** — GTK4 on Linux/macOS, native Win32+Direct2D on Windows, full TUI everywhere
 - **No GPU required** — Cairo/Pango and Direct2D/DirectWrite rendering; hardware compositing when available, software fallback always works (VMs, remote desktops, SSH)
-- **Clean architecture** — platform-agnostic core (`src/core/`), 5,547 tests, zero async runtime dependency
+- **Clean architecture** — platform-agnostic core (`src/core/`), 5,572 tests, zero async runtime dependency
 
 > **Note:** VimCode does not implement VimScript. Extension and scripting is handled via
 > the built-in Lua 5.4 plugin system. The goal is full Vim *keybinding* and *editing*
@@ -475,16 +475,29 @@ Click the search box in the menu bar (or run `:CommandCenter`) to open the unifi
 
 ---
 
-### Quickfix Window
+### Quickfix Window & Location List
 
 - `:grep <pattern>` / `:vimgrep <pattern>` — search project and populate the quickfix list; opens panel automatically
 - `:copen` / `:cope` — open the quickfix panel with focus (shows all matches)
 - `:cclose` / `:ccl` — close the quickfix panel
+- `:cwindow` / `:cw` — open the quickfix panel only if it has entries; closes it otherwise
 - `:cn` / `:cnext` — jump to next match (opens file, positions cursor)
 - `:cp` / `:cprev` / `:cN` — jump to previous match
-- `:cc N` — jump to Nth match (1-based)
+- `:cc N` / bare `:cc` — jump to Nth match (1-based) / re-jump to the current one
+- `:cfirst` / `:clast` — jump to the first / last match
+- `:clist` / `:cl` — print every entry, marking the selected one
+- `:colder` `[N]` / `:cnewer` `[N]` — walk back/forward through the last 10 quickfix lists
+- `:cdo {cmd}` / `:cfdo {cmd}` — run `{cmd}` once per entry / once per distinct file
 - The quickfix panel is a **persistent bottom strip** (6 rows) above the status bar — not a floating modal
 - When open with focus (`j`/`k`, `Ctrl-N`/`Ctrl-P` → navigate; `Enter` → jump and return focus to editor; `q`/`Escape` → close)
+
+**Location list** — a per-window twin of the quickfix list: `:l*` mirrors every
+`:c*` command above (`:lopen`/`:lclose`/`:lwindow`, `:lnext`/`:lprevious`/
+`:lfirst`/`:llast`/`:ll`, `:llist`, `:ldo`/`:lfdo`, `:lgrep`/`:lvimgrep`)
+against the *active window's own* list instead of the shared global one, and
+shares the same bottom panel (quickfix wins if both happen to be open). Useful
+for keeping per-window results (e.g. LSP diagnostics workflows) from clobbering
+a shared quickfix list.
 
 ---
 
@@ -728,9 +741,34 @@ Browse extensions in the sidebar (click the extensions icon in the activity bar)
 
 ---
 
+### Board Panel
+
+A generic kanban/pipeline host — click the board icon in the activity bar. On
+its own it shows "no board provider configured"; any extension whose
+manifest declares a `[board]` section (see `EXTENSIONS.md`) supplies a real
+board over an external-tool JSON seam, no specific provider hardcoded.
+
+- **Read** — the provider's `refresh_command` populates columns of cards
+  with inline status badges, polled on its declared interval.
+- **Act** — right-click (or a provider-declared single-key stage binding, in
+  the coord-tui `P`/`S`/`F` style) runs a provider-declared named action
+  against the selected card; irreversible/metered actions the provider
+  marks `confirm` ask first. The result (exit status/stdout) shows on the
+  status line and the board refreshes afterward.
+- **Freshness** — an opt-in "Board Auto-Tick" setting (off by default) runs
+  a provider's `tick_command` on a timer, so a daemon-less pipeline doesn't
+  stall just because vimcode is the only client with the board open.
+
+---
+
 ### AI Assistant
 
-Built-in AI chat panel supporting Anthropic Claude, OpenAI, or local Ollama. Click the chat icon in the activity bar to open. Configure `ai_provider` and `ai_api_key` in `settings.json` (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars).
+Built-in AI chat panel. Click the chat icon in the activity bar to open.
+
+Two transports, picked by whether `acp_agent_command` is set:
+
+- **ACP (Agent Client Protocol)** — set `acp_agent_command` in `settings.json` to a live agent's command line (e.g. `"claude-code-acp"`). vimcode spawns it, drives the `initialize` → `session/new` → `session/prompt` handshake, and streams the agent's reply into the panel as it's generated. Requires the agent binary on `PATH`.
+- **Direct provider** (no agent binary required) — leave `acp_agent_command` empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
 
 - `i` — enter input mode; type and press `Enter` to send
 - `:AI <message>` — send from command mode; `:AiClear` — clear history
@@ -783,6 +821,9 @@ Runtime changes are written through to `~/.config/vimcode/settings.json` immedia
 | `spell` / `nospell` | | off | Enable spell checking (wavy underline on misspelled words) |
 | `spelllang=XX` | | `en_US` | Spell check language (currently only `en_US` is bundled) |
 | `syntax_max_lines=N` | `syntaxmaxlines` | 20000 | Skip tree-sitter highlighting for buffers over N lines (plain text for huge generated files) |
+| `undolevels=N` | `ul` | 1000 | Maximum undo-tree states kept per buffer, across every branch |
+| `undofile` / `noundofile` | `udf` | off | Persist each buffer's undo tree to disk so it survives closing and reopening the file |
+| `undodir=PATH` | `udir` | `~/.config/vimcode/undo/` | Directory undofiles are written to when `undofile` is on |
 | `explorersortcaseinsensitive` / `noexplorersortcaseinsensitive` | `esci` | on | Case-insensitive sorting in the file explorer |
 | `mode=vim` / `mode=vscode` | | vim | Editor mode (see **VSCode Mode** below) |
 
@@ -1005,7 +1046,7 @@ Full editor in the terminal via ratatui + crossterm — feature-parity with the 
 | `gD` | Diff peek — preview hunk popup with Revert/Stage |
 | `gh` | Editor hover popup — aggregates diagnostics, annotations, plugin content, and LSP hover at cursor; `y`/Ctrl-C copies selected text (or all text if no selection); mouse drag to select |
 | `gR` | Enter virtual replace mode (expands tabs to spaces when overwriting) |
-| `g+` / `g-` | Go to newer / older text state (chronological undo timeline) |
+| `g+` / `g-` | Go to newer / older text state — real undo-tree navigation, crosses into a branch `u` + a new edit left behind (`:earlier`/`:later`/`:undolist`/`:undojoin` cover the ex-command side) |
 | `K` | Show hover info (LSP) |
 | `]c` / `[c` | Next / previous change (works on real files + diff buffers) |
 | `]d` / `[d` | Next / previous diagnostic (LSP) |
@@ -1132,6 +1173,10 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:jumps` | Display jump list |
 | `:changes` | Display change list |
 | `:history` | Display command history |
+| `:undolist` | List every live undo-tree state, across branches |
+| `:earlier {count}` / `:earlier {N}[smhd]` | Move to an earlier undo state by step count or time offset |
+| `:later {count}` / `:later {N}[smhd]` | Move to a later undo state by step count or time offset |
+| `:undojoin` | Fold the next change into the previous undo step |
 | `:make [args]` | Run `make` with optional arguments |
 | `:b {name}` | Switch to buffer matching partial file name |
 | `:!{cmd}` | Execute shell command and show output |
@@ -1169,9 +1214,15 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:grep <pat>` / `:vimgrep <pat>` | Search project, populate quickfix list |
 | `:GrepWord` | Grep the word under cursor (same as `<leader>sw`) |
 | `:Buffers` | Open buffer picker (same as `<leader>sb`) |
-| `:copen` / `:ccl` | Open / close quickfix panel |
-| `:cn` / `:cp` | Next / previous quickfix item |
+| `:copen` / `:ccl` / `:cwindow` | Open / close quickfix panel / open-if-non-empty |
+| `:cn` / `:cp` / `:cfirst` / `:clast` | Next / previous / first / last quickfix item |
 | `:cc N` | Jump to Nth quickfix item (1-based) |
+| `:clist` / `:colder` / `:cnewer` | List entries / walk the 10-deep quickfix stack |
+| `:cdo {cmd}` / `:cfdo {cmd}` | Run `{cmd}` per quickfix entry / per distinct file |
+| `:lopen` / `:lclose` / `:lwindow` | Open / close / open-if-non-empty the **location list** (per-window) |
+| `:lnext` / `:lprevious` / `:lfirst` / `:llast` / `:ll` | Navigate the location list |
+| `:llist` / `:ldo {cmd}` / `:lfdo {cmd}` | List / run `{cmd}` over the location list |
+| `:lgrep <pat>` / `:lvimgrep <pat>` | Search project into the location list |
 | `:LspInfo` | Show running LSP servers |
 | `:LspRestart` | Restart server for current language |
 | `:LspStop` | Stop server for current language |

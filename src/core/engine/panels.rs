@@ -27,6 +27,16 @@ impl Engine {
         body: Vec<String>,
         buttons: Vec<DialogButton>,
     ) {
+        // #953 (ACP-2): a still-open `session/request_permission` dialog
+        // getting replaced by an unrelated one must still produce exactly
+        // one reply — a parked ACP request must never silently hang just
+        // because some other event (e.g. a file-changed-on-disk prompt)
+        // opened a different dialog over it. `acp_handle_permission_request`
+        // itself already clears this before opening its *own* new dialog,
+        // so this is a no-op on that path; it only fires for a genuinely
+        // unrelated caller.
+        self.acp_cancel_pending_permission();
+
         // Opening a dialog is a "user is now focused on this modal"
         // event — dismiss any passive overlays (LSP hover) so they
         // don't render behind the dialog (#247).
@@ -341,6 +351,20 @@ impl Engine {
     ) -> EngineAction {
         match tag {
             "swap_recovery" => self.process_swap_dialog_action(action),
+            "confirm_board_action" => {
+                // #523: a provider-declared action the provider marked
+                // `confirm` — `Engine::run_board_action_by_name` stashed
+                // the already-resolved argv/label here rather than
+                // dispatching immediately.
+                if action == "yes" {
+                    if let Some(pending) = self.pending_board_action.take() {
+                        self.dispatch_board_action_command(pending.argv, pending.label);
+                    }
+                } else {
+                    self.pending_board_action = None;
+                }
+                EngineAction::None
+            }
             "confirm_move" => {
                 if action == "yes" {
                     if let Some((src, dest)) = self.pending_move.take() {
@@ -505,6 +529,15 @@ impl Engine {
                 }
                 EngineAction::None
             }
+            "review_comment" => {
+                // #527: `Engine::change_review_start_comment` opened this
+                // dialog and recorded which comment it's for in
+                // `self.review_comment_target`; the resolution logic all
+                // lives on that method's sibling so it can be unit-tested
+                // directly without round-tripping a `Dialog`.
+                self.apply_review_comment_dialog_result(action, input_value);
+                EngineAction::None
+            }
             tag if tag.starts_with("open_ext_url:") => {
                 // Extension-provided link — user confirmed "Open".
                 if action == "open" {
@@ -521,8 +554,12 @@ impl Engine {
                         if let Some(ca) = self.pending_code_action_choices.get(idx).cloned() {
                             self.pending_code_action_choices.clear();
                             if let Some(edit) = ca.edit {
-                                self.apply_workspace_edit(edit);
-                                self.message = format!("Applied: {}", ca.title);
+                                let errors = self.apply_workspace_edit(edit);
+                                self.message = if errors.is_empty() {
+                                    format!("Applied: {}", ca.title)
+                                } else {
+                                    format!("Applied: {} (errors: {})", ca.title, errors.join("; "))
+                                };
                             } else {
                                 self.message = format!("No edit available for '{}'", ca.title);
                             }
@@ -558,6 +595,100 @@ impl Engine {
             },
             "file_changed" => {
                 self.handle_file_watcher_action(action);
+                EngineAction::None
+            }
+            "acp_permission" => {
+                // #953 (ACP-2): the one function that turns a dialog
+                // dismissal into the ACP reply. `dialog_click_button`/
+                // `handle_dialog_key`/`dialog_cancel` have already cleared
+                // `self.dialog` by the time this runs — only
+                // `acp_pending_permission` still needs draining, and taking
+                // it here (rather than in the branches below) guarantees
+                // every branch — including a stray "acp_permission" result
+                // for a request that's somehow already gone — produces at
+                // most one reply.
+                let Some((request_id, req)) = self.acp_pending_permission.take() else {
+                    return EngineAction::None;
+                };
+                let Some(client) = self.acp_client.as_ref() else {
+                    return EngineAction::None;
+                };
+                if action == "cancel" {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::permission_outcome_cancelled()),
+                    );
+                    return EngineAction::None;
+                }
+                // Otherwise `action` is the option_id of the button the
+                // human clicked/hotkeyed (`acp_handle_permission_request`
+                // built each `DialogButton::action` from `option_id`).
+                match req.options.iter().find(|o| o.option_id == action) {
+                    Some(opt) => {
+                        if opt.kind == "allow_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), true);
+                        } else if opt.kind == "reject_always" {
+                            self.acp_remembered_decisions
+                                .insert(req.tool_call.kind.clone(), false);
+                        }
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_selected(
+                                &opt.option_id,
+                            )),
+                        );
+                    }
+                    None => {
+                        // Shouldn't happen — every dialog button's action
+                        // is one of `req.options`' ids — but never leave
+                        // the request unanswered on an unrecognized action.
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_cancelled()),
+                        );
+                    }
+                }
+                EngineAction::None
+            }
+            "acp_auth_choice" => {
+                // #957 (ACP-6): "cancel" (Escape) and the "Continue without
+                // auth" button both mean the same thing — the human
+                // declined to pick a method, so proceed to `session/new`
+                // unauthenticated and let the agent itself accept or
+                // reject it. An agent advertising `authMethods` doesn't
+                // necessarily mean auth is *required* right now.
+                if action == "cancel" || action == "acp_auth_skip" {
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                }
+                let Some(method) = self
+                    .acp_auth_methods
+                    .iter()
+                    .find(|m| m.id == action)
+                    .cloned()
+                else {
+                    // Shouldn't happen — every dialog button's action is
+                    // either "acp_auth_skip" or one of `acp_auth_methods`'
+                    // own ids — but never strand the handshake on an
+                    // unrecognized action; fall back to unauthenticated
+                    // the same as an explicit skip.
+                    self.acp_authenticated = true;
+                    self.acp_begin_session();
+                    return EngineAction::None;
+                };
+                match method.kind {
+                    crate::core::acp::AcpAuthMethodKind::Agent => {
+                        if let Some(client) = self.acp_client.as_mut() {
+                            client.authenticate(&method.id);
+                            self.message = format!("Authenticating via {}\u{2026}", method.name);
+                        }
+                    }
+                    crate::core::acp::AcpAuthMethodKind::Terminal => {
+                        self.acp_launch_terminal_login(&method.name);
+                    }
+                }
                 EngineAction::None
             }
             "check_nerd_fonts" => {
@@ -1299,8 +1430,12 @@ impl Engine {
                         self.view_mut().cursor.col = col;
                         self.ensure_cursor_visible();
                     } else {
-                        // Multiple results — populate quickfix window
-                        self.quickfix_items = locations
+                        // Multiple results — populate the quickfix window.
+                        // `qf_set_list` also snapshots whatever quickfix list
+                        // was there before onto the `:colder`/`:cnewer` stack
+                        // (#1155), same as `:grep`.
+                        let n = locations.len();
+                        let items = locations
                             .into_iter()
                             .map(|l| ProjectMatch {
                                 file: l.path,
@@ -1309,14 +1444,15 @@ impl Engine {
                                 line_text: String::new(),
                             })
                             .collect();
-                        self.quickfix_selected = 0;
-                        self.quickfix_open = true;
                         // Focus the panel — Neovim convention for `gr`
                         // (Find References) is to land the user in the
                         // quickfix so j/k/Enter drive the result list
                         // without a follow-up `:copen`. Closes #150.
-                        self.quickfix_has_focus = true;
-                        self.message = format!("{} references found", self.quickfix_items.len());
+                        // `qf_set_list` already focuses whenever the new
+                        // list is non-empty, which always holds here (this
+                        // branch is only reached for `locations.len() > 1`).
+                        self.qf_set_list(None, items);
+                        self.message = format!("{n} references found");
                     }
                     redraw = true;
                 }
@@ -1427,8 +1563,12 @@ impl Engine {
                         self.lsp_pending_rename = None;
                         let n = workspace_edit.changes.len();
                         if n > 0 {
-                            self.apply_workspace_edit(workspace_edit);
-                            self.message = format!("Renamed in {n} file(s)");
+                            let errors = self.apply_workspace_edit(workspace_edit);
+                            self.message = if errors.is_empty() {
+                                format!("Renamed in {n} file(s)")
+                            } else {
+                                format!("Renamed in {n} file(s) with errors: {}", errors.join("; "))
+                            };
                         } else if let Some(err) = error_message {
                             self.message = format!("Rename failed: {err}");
                         } else {
@@ -1758,8 +1898,17 @@ impl Engine {
     }
 
     /// Build a JSON array of diagnostics touching a specific line (for code action context).
-    pub(crate) fn diagnostics_json_for_line(&self, path: &Path, line: usize) -> serde_json::Value {
-        let diags = match self.lsp_diagnostics.get(path) {
+    ///
+    /// `_path` is the raw path used to identify the file in the LSP request
+    /// itself (kept for API symmetry with the caller); the diagnostics
+    /// lookup must use the canonical key `Engine::lsp_diagnostics` is
+    /// actually stored under (#1373), or it silently misses whenever the
+    /// buffer was opened through a non-canonical path.
+    pub(crate) fn diagnostics_json_for_line(&self, _path: &Path, line: usize) -> serde_json::Value {
+        let diags = match self
+            .active_buffer_diagnostics_key()
+            .and_then(|key| self.lsp_diagnostics.get(&key))
+        {
             Some(d) => d,
             None => return serde_json::json!([]),
         };
@@ -2036,7 +2185,10 @@ impl Engine {
             }
         }
         if let Some(state) = self.buffer_manager.get_mut(buffer_id) {
-            state.finish_undo_group();
+            // Not necessarily the active buffer/window, so there's no engine
+            // view cursor to read for "after" — reuse the same position the
+            // group started at (LSP edits don't move the caller's cursor).
+            state.finish_undo_group(cursor);
             // Clear stale semantic tokens immediately — positions are now wrong.
             state.semantic_tokens.clear();
         }
@@ -2044,10 +2196,32 @@ impl Engine {
         self.lsp_dirty_buffers.insert(buffer_id, true);
     }
 
-    /// Apply a workspace-wide rename edit.
-    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) {
+    /// Apply a workspace-wide rename edit. Returns one error message per
+    /// file this couldn't be applied to (empty on full success) — never
+    /// swallows a failure the way the old closed-file branch did (#954
+    /// review of #1897-1964/#1967-2016).
+    ///
+    /// For a file that's already open, this delegates straight to
+    /// [`Self::apply_lsp_edits`] (undo-grouped, UTF-16-aware). For a
+    /// **closed** file, this used to fall through to a raw `fs::write` with
+    /// no undo group, no path canonicalisation (so an already-open buffer
+    /// under a differently-spelled-but-equal path could silently diverge
+    /// from what just got written to disk), and a swallowed `Result` (a
+    /// failed write — read-only file, missing parent directory, whatever —
+    /// looked identical to a no-op success). That made LSP rename-across-
+    /// files unsafe, and would have made ACP's `fs/write_text_file`
+    /// (#954) unsafe by construction had it reused this path unfixed. The
+    /// fix: open the closed file into a buffer first (`BufferManager::
+    /// open_file`, which already canonicalizes for its own dedup), then
+    /// apply through the exact same undo-grouped path an already-open file
+    /// gets — deliberately **not** an immediate disk write. This matches
+    /// how an already-open buffer behaves (dirty, undoable, saved
+    /// whenever the user next saves) instead of re-introducing a silent
+    /// background write behind the user's back.
+    pub(crate) fn apply_workspace_edit(&mut self, we: WorkspaceEdit) -> Vec<String> {
+        let mut errors = Vec::new();
         for file_edit in we.changes {
-            // Try to find an already-open buffer for this path
+            // Try to find an already-open buffer for this path.
             let buffer_id = self.buffer_manager.list().into_iter().find(|&bid| {
                 self.buffer_manager
                     .get(bid)
@@ -2056,44 +2230,19 @@ impl Engine {
                     .unwrap_or(false)
             });
 
-            if let Some(bid) = buffer_id {
-                self.apply_lsp_edits(bid, file_edit.edits);
-            } else {
-                // File not open — read, edit, and write back to disk
-                if let Ok(text) = std::fs::read_to_string(&file_edit.path) {
-                    let mut edits = file_edit.edits;
-                    // Sort in reverse order
-                    edits.sort_by(|a, b| {
-                        b.range
-                            .start
-                            .line
-                            .cmp(&a.range.start.line)
-                            .then(b.range.start.character.cmp(&a.range.start.character))
-                    });
-                    let mut rope = ropey::Rope::from_str(&text);
-                    for edit in &edits {
-                        let total_lines = rope.len_lines();
-                        let start_line =
-                            (edit.range.start.line as usize).min(total_lines.saturating_sub(1));
-                        let end_line =
-                            (edit.range.end.line as usize).min(total_lines.saturating_sub(1));
-                        let start_line_text: String = rope.line(start_line).chars().collect();
-                        let end_line_text: String = rope.line(end_line).chars().collect();
-                        let start_char =
-                            lsp::utf16_offset_to_char(&start_line_text, edit.range.start.character);
-                        let end_char =
-                            lsp::utf16_offset_to_char(&end_line_text, edit.range.end.character);
-                        let start_offset = rope.line_to_char(start_line) + start_char;
-                        let end_offset = rope.line_to_char(end_line) + end_char;
-                        if end_offset > start_offset {
-                            rope.remove(start_offset..end_offset);
-                        }
-                        rope.insert(start_offset, &edit.new_text);
+            let buffer_id = match buffer_id {
+                Some(bid) => bid,
+                None => match self.buffer_manager.open_file(&file_edit.path) {
+                    Ok(bid) => bid,
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", file_edit.path.display()));
+                        continue;
                     }
-                    let _ = std::fs::write(&file_edit.path, rope.to_string());
-                }
-            }
+                },
+            };
+            self.apply_lsp_edits(buffer_id, file_edit.edits);
         }
+        errors
     }
 
     /// Get the cursor's file path, line, and UTF-16 column for LSP requests.
@@ -2254,5 +2403,75 @@ mod lsp_stderr_snippet_tests {
     fn falls_back_when_all_lines_empty() {
         let stderr = "\n   \n\t\n";
         assert_eq!(lsp_stderr_snippet(stderr), "no output");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_json_for_line_tests {
+    use super::*;
+
+    /// #1373: `Engine::lsp_diagnostics` is keyed by the canonical absolute
+    /// path (#208), so `diagnostics_json_for_line` — which fed diagnostic
+    /// context to LSP code-action requests — must look diagnostics up
+    /// through `active_buffer_diagnostics_key()`, the same key the gutter
+    /// and hover lookups use, not through the raw `file_path` a buffer was
+    /// opened with. Opens the file through a `..` segment so the two paths
+    /// differ on every platform, not just macOS's symlinked temp dir.
+    #[test]
+    fn finds_diagnostics_for_a_non_canonical_buffer_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1373_diag_json_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1373.txt");
+        std::fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let via_dotdot = dir.join("sub").join("..").join("dk1373.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut engine = Engine::new_for_test();
+        engine
+            .open_file_with_mode(&via_dotdot, OpenMode::Permanent)
+            .unwrap();
+
+        engine.lsp_diagnostics.insert(
+            canonical,
+            vec![Diagnostic {
+                range: lsp::LspRange {
+                    start: lsp::LspPosition {
+                        line: 1,
+                        character: 0,
+                    },
+                    end: lsp::LspPosition {
+                        line: 1,
+                        character: 3,
+                    },
+                },
+                severity: DiagnosticSeverity::Error,
+                message: "non-canonical code-action diagnostic".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let json = engine.diagnostics_json_for_line(&via_dotdot, 1);
+        let arr = json.as_array().expect("expected a JSON array");
+        assert_eq!(
+            arr.len(),
+            1,
+            "diagnostic on line 1 must be found through the canonical key \
+             even though the buffer was opened via a non-canonical path \
+             ({via_dotdot:?}); json: {json:?}"
+        );
+        assert_eq!(arr[0]["message"], "non-canonical code-action diagnostic");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -7,8 +7,8 @@
 //! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs`,
 //! `src/gtk/css.rs` and `src/gtk/util.rs` re-export everything below so the
 //! rest of `crate::gtk` keeps resolving these names unchanged. The genuinely
-//! GTK-only siblings (`css::load_css`, `util::app_icon_image`'s PNG
-//! rasterisation, `util::install_icon_and_desktop`, ...) stayed behind.
+//! GTK-only siblings (`css::load_css`, `util::install_icon_and_desktop`, ...)
+//! stayed behind.
 use crate::core;
 use crate::core::Engine;
 use crate::render;
@@ -56,6 +56,27 @@ pub(crate) fn is_ext_panel_id(id: &str) -> bool {
 /// left as-is: VS Code's 13px default is a ~2% difference, dwarfed by
 /// the metric change from fixing the family, so nudging both at once
 /// would make it impossible to tell which change did what.
+///
+/// #1069 added a `cfg!` branch here, keyed on `target_os == "macos"`, to
+/// try real CoreText UI font names ahead of the Linux/Windows list — a
+/// *backend* fact (which family name resolves on which OS) leaking into
+/// otherwise shared code, and one that bought nothing:
+/// `MacBackend::parse_ui_font_desc`
+/// didn't split a comma list at the time, so the whole string always
+/// degraded to the CoreText system UI font regardless of which names led
+/// it (documented at length in the pre-#1129 revision of this comment).
+///
+/// #1129: removed once quadraui#1023 landed comma-list parsing plus
+/// [`quadraui::GenericFamily`] resolution for `Backend::set_ui_font` on
+/// every pixel backend. GTK/fontconfig already resolves this exact list
+/// natively (`Cantarell`/`Ubuntu` first, matching real Linux desktop UI
+/// fonts, then the Windows/legacy names, `Sans` as the final catch-all —
+/// see #704's history above). On macOS, `MacBackend::set_ui_font` now
+/// tries each comma-separated candidate in order via `make_font_exact`
+/// and degrades to the CoreText system UI font only if none resolve —
+/// still inert for *this* list (none of these are real CoreText family
+/// names) but no longer needs a `cfg!` branch to say so: the fix is one
+/// shared string plus quadraui resolving it per-backend, not two lists.
 const UI_FONT_FAMILY: &str = "Cantarell, Ubuntu, Segoe UI, Droid Sans, Sans";
 
 thread_local! {
@@ -179,65 +200,165 @@ pub(crate) fn compute_editor_window_rects(
     rects
 }
 
-/// Compute the thumb geometry for one window's h scrollbar.
-/// Returns `(track_x, track_y, track_w, sb_height, thumb_x, thumb_w, scroll_range, px_per_col)`.
-/// Returns `None` when no scrollbar is needed (content fits).
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub(crate) fn h_scrollbar_geometry(
+/// Build the layout-only [`quadraui::Editor`] needed to call
+/// [`quadraui::Editor::layout`] for scrollbar geometry — the same
+/// primitive GTK's real paint path builds from a full `RenderedWindow`
+/// (`render::to_q_editor` + `.layout()`, wired through
+/// `quadraui::gtk::editor::draw_editor_with_options` since quadraui#968
+/// taught that rasteriser to paint both scrollbars itself) — so hit-testing
+/// reads the identical formula paint does and can never independently
+/// drift from it the way the pre-#968 hand-rolled h-scrollbar geometry
+/// helper this replaced did (#1128).
+///
+/// `Editor::layout`/`layout_with_options` only ever read
+/// `total_lines`/`max_col`/`gutter_char_width` off the struct — never
+/// `.lines`, any paint-only cosmetic field, or even `.rect` itself (the
+/// `viewport` argument passed to `.layout()` is authoritative; see
+/// [`render::tui_editor_text_layout`]'s doc for the same fact stated on the
+/// TUI side). Building the full `RenderedWindow` paint uses would mean
+/// re-rendering the buffer's visible text on every mouse motion just to
+/// throw it away — this builds the cheap subset instead. Every other field
+/// below is a throwaway needed only to satisfy `Editor`'s exhaustive
+/// struct-literal contract (`quadraui/tests/downstream_struct_literals.rs`).
+fn scrollbar_probe_editor(engine: &Engine, window_id: core::WindowId) -> Option<quadraui::Editor> {
+    let window = engine.windows.get(&window_id)?;
+    let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
+
+    // Mirrors `render::build_rendered_window`'s `has_git`/`has_bp`/
+    // `line_number_mode` → `gutter_char_width` computation, so a wide
+    // gutter (line numbers, git column, breakpoint column) shifts this
+    // probe's scrollbar geometry by exactly the amount it shifts paint's —
+    // the pre-#1128 h-scrollbar geometry helper this replaced ignored the
+    // gutter entirely.
+    let has_git = !buffer_state.git_diff.is_empty();
+    let bp_key = buffer_state
+        .file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let has_bp = engine
+        .dap_breakpoints
+        .get(&bp_key)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        || engine.dap_session_active;
+    let line_number_mode = if buffer_state.md_rendered.is_some() {
+        core::settings::LineNumberMode::None
+    } else {
+        engine.settings.line_numbers
+    };
+    let total_lines = buffer_state.buffer.len_lines();
+    let gutter_char_width =
+        render::calculate_gutter_cols(line_number_mode, total_lines, 0.0, has_git, has_bp);
+
+    Some(quadraui::Editor {
+        id: quadraui::WidgetId::new("scrollbar_probe"),
+        rect: quadraui::Rect::new(0.0, 0.0, 0.0, 0.0),
+        lines: Vec::new(),
+        cursor: None,
+        extra_cursors: Vec::new(),
+        selection: None,
+        extra_selections: Vec::new(),
+        yank_highlight: None,
+        scroll_top: window.view.scroll_top,
+        scroll_left: window.view.scroll_left,
+        total_lines,
+        max_col: buffer_state.max_col,
+        gutter_char_width,
+        is_active: false,
+        show_active_bg: false,
+        has_git_diff: false,
+        has_breakpoints: false,
+        diagnostic_gutter: HashMap::new(),
+        code_action_lines: std::collections::HashSet::new(),
+        bracket_match_positions: Vec::new(),
+        active_indent_col: None,
+        tabstop: engine.settings.tabstop.max(1) as usize,
+        cursorline: false,
+        lightbulb_glyph: '\0',
+    })
+}
+
+/// This window's [`quadraui::Editor`] + [`quadraui::EditorLayout`], laid
+/// out against `rect` at `char_width`/`line_height` — the same
+/// [`quadraui::Editor::layout`] call paint makes, so
+/// `.h_scrollbar_bounds`/`.v_scrollbar_bounds` are never independently
+/// re-derived (#1128).
+///
+/// `rect` is handed to `.layout()` unmodified, exactly as
+/// `quadraui::gtk::editor::draw_editor_with_options` hands it `editor.rect`
+/// unmodified — including for a window with its own per-window status
+/// line, which current paint does **not** shrink `rect` for before laying
+/// out scrollbars (see `quadraui::gtk::editor`'s module doc, "Scrollbars"
+/// section). That means the painted scrollbar can currently run under
+/// where the status line paints afterward; that overlap is real, but
+/// pre-existing and out of this issue's scope — #723/#1094 are the
+/// scrollbar-*placement* follow-ups this issue's ordering note defers it
+/// to. Reintroducing a status-row offset here — as the pre-#1128 code did —
+/// would just make hit-testing disagree with paint in the other direction.
+pub(crate) fn editor_scrollbar_layout(
+    engine: &Engine,
+    window_id: core::WindowId,
+    rect: &core::WindowRect,
+    char_width: f64,
+    line_height: f64,
+) -> Option<(quadraui::Editor, quadraui::EditorLayout)> {
+    let editor = scrollbar_probe_editor(engine, window_id)?;
+    let viewport = quadraui::Rect::new(
+        rect.x as f32,
+        rect.y as f32,
+        rect.width as f32,
+        rect.height as f32,
+    );
+    let layout = editor.layout(viewport, char_width as f32, line_height as f32);
+    Some((editor, layout))
+}
+
+/// Thumb geometry for one window's h scrollbar, derived from
+/// [`editor_scrollbar_layout`]'s `h_scrollbar_bounds` track and the same
+/// [`quadraui::fit_thumb`] call `quadraui::gtk::editor::draw_editor` paints
+/// the thumb with (`Scrollbar::horizontal`'s `min_thumb_len: line_height`).
+///
+/// Replaces the pre-#1128 h-scrollbar geometry helper, whose independently
+/// guessed `8.0`px v-scrollbar reserve (the real reserve is one
+/// `char_width`-wide cell, quadraui#968) and gutter-blind track start meant
+/// hover/drag could resolve against a rect paint never actually drew.
+///
+/// Returns `(track_x, track_y, track_w, sb_height, thumb_x, thumb_w,
+/// scroll_range, px_per_col)`. `None` when no h-scrollbar is painted
+/// (content fits).
+#[allow(clippy::type_complexity)]
+pub(crate) fn h_scrollbar_thumb_geometry(
     engine: &Engine,
     window_id: core::WindowId,
     rect: &core::WindowRect,
     char_width: f64,
     line_height: f64,
 ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
-    let window = engine.windows.get(&window_id)?;
-    let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
-
-    // max_col is pre-computed and cached in BufferState on every edit — O(1) vs O(N_lines).
-    let max_line_length = buffer_state.max_col as f64;
-
-    let v_scrollbar_px = 8.0_f64;
-    let track_w = (rect.width - v_scrollbar_px).max(1.0);
-    let visible_cols = (track_w / char_width).floor().max(1.0);
-
-    if max_line_length <= visible_cols {
-        return None;
-    }
-
-    let sb_height = (line_height * 0.35).round().max(4.0);
-    let track_x = rect.x;
-    // Per-window status line lives at `rect.y + rect.height -
-    // line_height` and paints after the scrollbars, so anchor the
-    // h-scrollbar above it when the status line is on. Otherwise the
-    // status bar overdraws the entire scrollbar (it's `line_height`
-    // tall vs the scrollbar's ~5px). `render::window_status_row_reserved`
-    // is the single source of truth for whether that row is actually
-    // painted (#728) — this used to check `window_status_line &&
-    // !terminal_maximized` directly, which (unlike the shared helper)
-    // never accounted for `status_line_above_terminal`/bottom-panel state
-    // pulling the status line out into a separated bar instead, and so
-    // could disagree with `build_screen_layout` about whether this row is
-    // free.
-    let status_offset = if render::window_status_row_reserved(engine) {
-        line_height
+    let (editor, layout) =
+        editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
+    let track = layout.h_scrollbar_bounds?;
+    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+        editor.scroll_left as f32,
+        editor.max_col as f32,
+        layout.visible_cols as f32,
+        track.width,
+        line_height as f32,
+    );
+    let scroll_range = (editor.max_col as f64 - layout.visible_cols as f64).max(1.0);
+    let px_per_col = if track.width as f64 > thumb_len as f64 {
+        (track.width - thumb_len) as f64 / scroll_range
     } else {
         0.0
     };
-    let track_y = rect.y + rect.height - sb_height - status_offset;
-    let scroll_range = (max_line_length - visible_cols).max(1.0);
-    let thumb_frac = visible_cols / max_line_length;
-    let thumb_w = (thumb_frac * track_w).max(20.0).min(track_w);
-    let px_per_col = (track_w - thumb_w) / scroll_range;
-    let scroll_left = window.view.scroll_left as f64;
-    let thumb_x = track_x + (scroll_left / scroll_range) * (track_w - thumb_w);
 
     Some((
-        track_x,
-        track_y,
-        track_w,
-        sb_height,
-        thumb_x,
-        thumb_w,
+        track.x as f64,
+        track.y as f64,
+        track.width as f64,
+        track.height as f64,
+        track.x as f64 + thumb_start as f64,
+        thumb_len as f64,
         scroll_range,
         px_per_col,
     ))
@@ -255,247 +376,130 @@ pub(crate) fn h_scrollbar_hit_test(
     line_height: f64,
 ) -> Option<(core::WindowId, usize)> {
     for (window_id, rect) in window_rects {
-        if let Some((track_x, track_y, track_w, sb_height, _, _, _, _)) =
-            h_scrollbar_geometry(engine, *window_id, rect, char_width, line_height)
-        {
-            if x >= track_x && x <= track_x + track_w && y >= track_y && y <= track_y + sb_height {
-                let scroll_left = engine
-                    .windows
-                    .get(window_id)
-                    .map(|w| w.view.scroll_left)
-                    .unwrap_or(0);
-                return Some((*window_id, scroll_left));
-            }
+        let Some((_, layout)) =
+            editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
+        else {
+            continue;
+        };
+        let Some(track) = layout.h_scrollbar_bounds else {
+            continue;
+        };
+        let (tx, ty, tw, th) = (
+            track.x as f64,
+            track.y as f64,
+            track.width as f64,
+            track.height as f64,
+        );
+        if x >= tx && x <= tx + tw && y >= ty && y <= ty + th {
+            let scroll_left = engine
+                .windows
+                .get(window_id)
+                .map(|w| w.view.scroll_left)
+                .unwrap_or(0);
+            return Some((*window_id, scroll_left));
         }
     }
     None
 }
 
-/// Open a URL in the default browser (only https/http).
-pub(crate) fn open_url(url: &str) {
-    crate::core::engine::open_url_in_browser(url);
+/// Thumb geometry for one window's v scrollbar — mirrors
+/// [`h_scrollbar_thumb_geometry`], reading `v_scrollbar_bounds` off the
+/// same [`editor_scrollbar_layout`] call instead of `h_scrollbar_bounds`.
+///
+/// Returns `(track_x, track_y, track_w, track_h, thumb_y, thumb_h, scroll_range, px_per_row)`.
+/// Returns `None` when no scrollbar is needed (content fits).
+#[allow(clippy::type_complexity)]
+pub(crate) fn v_scrollbar_thumb_geometry(
+    engine: &Engine,
+    window_id: core::WindowId,
+    rect: &core::WindowRect,
+    char_width: f64,
+    line_height: f64,
+) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+    let (editor, layout) =
+        editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
+    let track = layout.v_scrollbar_bounds?;
+    let (thumb_start, thumb_len) = quadraui::fit_thumb(
+        editor.scroll_top as f32,
+        editor.total_lines as f32,
+        layout.visible_lines as f32,
+        track.height,
+        line_height as f32,
+    );
+    let scroll_range = (editor.total_lines as f64 - layout.visible_lines as f64).max(1.0);
+    let px_per_row = if track.height as f64 > thumb_len as f64 {
+        (track.height - thumb_len) as f64 / scroll_range
+    } else {
+        0.0
+    };
+
+    Some((
+        track.x as f64,
+        track.y as f64,
+        track.width as f64,
+        track.height as f64,
+        track.y as f64 + thumb_start as f64,
+        thumb_len as f64,
+        scroll_range,
+        px_per_row,
+    ))
+}
+
+/// Hit-test a point against all v scrollbars. Returns `(window_id,
+/// scroll_top_at_click)` when the point is on any v scrollbar track (not
+/// only the thumb), so the caller can decide between thumb-drag and
+/// track-page — mirrors [`h_scrollbar_hit_test`].
+pub(crate) fn v_scrollbar_hit_test(
+    engine: &Engine,
+    x: f64,
+    y: f64,
+    window_rects: &[(core::WindowId, core::WindowRect)],
+    char_width: f64,
+    line_height: f64,
+) -> Option<(core::WindowId, usize)> {
+    for (window_id, rect) in window_rects {
+        let Some((_, layout)) =
+            editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
+        else {
+            continue;
+        };
+        let Some(track) = layout.v_scrollbar_bounds else {
+            continue;
+        };
+        let (track_x, track_y, track_w, track_h) = (
+            track.x as f64,
+            track.y as f64,
+            track.width as f64,
+            track.height as f64,
+        );
+        // Half-open on the upper `x` bound (unlike `h_scrollbar_hit_test`'s
+        // `<=`) — this column's right edge coincides with the window's own
+        // right edge, which for any window sitting left of a group divider
+        // is also the divider's own hit-test coordinate
+        // (`render::route_divider_grab`'s `position`). An inclusive `<=`
+        // here would let this rung swallow a click aimed at the divider
+        // itself, failing the #987 negative-space case
+        // (`drag_group_divider_resizes`) that pins the divider's own hit
+        // zone must survive this fix. `quadraui::EditorLayout::hit_test`
+        // uses the same half-open convention for its `VScrollbar` arm.
+        if x >= track_x && x < track_x + track_w && y >= track_y && y < track_y + track_h {
+            let scroll_top = engine
+                .windows
+                .get(window_id)
+                .map(|w| w.view.scroll_top)
+                .unwrap_or(0);
+            return Some((*window_id, scroll_top));
+        }
+    }
+    None
 }
 
 /// The bundled Nerd Font icon subset (Symbols Nerd Font 3.5.1), embedded in
-/// the binary. Shared by [`install_bundled_icon_font_into`] (the fontconfig
-/// filesystem-install route #920 used, still needed on Linux/BSD) and
+/// the binary. Registered in-process through
 /// `render::register_nerd_font_fallback` (#937's `Backend::
-/// register_font_from_memory` route, which makes the filesystem install
-/// redundant on macOS/Win-GUI — see that function's doc for why Core
-/// Text/DirectWrite need it in addition to `set_nerd_fonts`'s glyph-vs-
-/// fallback flag).
+/// register_font_from_memory` route). #1130 deleted this module's former
+/// fontconfig filesystem-install route (`install_bundled_icon_font` + its
+/// font-cache-refresh shell-out) now that quadraui#1013 gives GTK a real
+/// `register_font_from_memory` override — see that function's doc for how
+/// the in-memory registration now covers every backend, GTK included.
 pub(crate) static ICON_FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
-
-/// Install the bundled Nerd Font icon subset so the platform's text-shaping
-/// stack can resolve the Nerd Font glyphs without a user-installed Nerd Font.
-/// The font file is embedded in the binary via `include_bytes!` and only
-/// written to disk if it's missing or has the wrong size.
-///
-/// Called from both `App::new` (`gui`-gated, GTK/Pango) and
-/// `App::new_portable` (un-gated — every other GUI backend, including
-/// macOS, goes through it), so every backend that ships this font actually
-/// installs it (#920: before this, `new_portable` skipped the call
-/// entirely, so `--features macos` builds never wrote the font at all).
-pub(crate) fn install_bundled_icon_font() {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
-        return;
-    };
-    install_bundled_icon_font_into(&icon_font_dest_dir(&home));
-}
-
-/// Per-platform directory the OS's text-shaping stack searches for
-/// user-installed fonts (#920).
-///
-/// - **macOS**: Core Text resolves fonts from `~/Library/Fonts` (and
-///   process-local `CTFontManagerRegisterFontsForURL` registration, which
-///   this does not use — see the issue for why that route was deferred).
-///   `~/.local/share/fonts` means nothing to Core Text.
-/// - **everything else**: fontconfig's `~/.local/share/fonts`, refreshed by
-///   [`refresh_font_cache`] after a write.
-fn icon_font_dest_dir(home: &std::path::Path) -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Fonts")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".local/share/fonts")
-    }
-}
-
-/// Write the bundled font into `fonts_dir` (creating it if needed) unless a
-/// same-sized copy is already there, then refresh whatever cache the
-/// platform needs. Takes the destination directly, rather than reading
-/// `$HOME` itself, so it can be exercised by a test with a throwaway
-/// `tempdir` instead of mutating the process's real `$HOME` (which
-/// `core::paths::home_dir`/`vimcode_config_dir` read live all over the
-/// engine — see `src/test_cwd.rs`'s doc comment for the shape of trouble a
-/// process-wide env mutation causes under `cargo test`'s parallel threads).
-fn install_bundled_icon_font_into(fonts_dir: &std::path::Path) {
-    let _ = std::fs::create_dir_all(fonts_dir);
-    let dest = fonts_dir.join("vimcode-icons.ttf");
-
-    // Skip write if the file already exists with the correct size.
-    if dest.exists() {
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            if meta.len() == ICON_FONT_BYTES.len() as u64 {
-                return;
-            }
-        }
-    }
-
-    if std::fs::write(&dest, ICON_FONT_BYTES).is_ok() {
-        refresh_font_cache(fonts_dir);
-    }
-}
-
-/// Nudge the platform's font cache after writing a new font file so it's
-/// available immediately, without waiting for a restart.
-///
-/// fontconfig (Linux/BSD) caches font metadata separately from the font
-/// files themselves and needs `fc-cache` re-run to notice a new file.
-/// Core Text has no equivalent cache to refresh — macOS's font server
-/// watches `~/Library/Fonts` directly — so this is a no-op there.
-fn refresh_font_cache(fonts_dir: &std::path::Path) {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = std::process::Command::new("fc-cache")
-            .arg("-f")
-            .arg(fonts_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = fonts_dir;
-    }
-}
-
-#[cfg(test)]
-mod icon_font_install_tests {
-    //! #920: unit coverage for the write/skip/refresh logic, isolated from
-    //! `$HOME` and from `App::new_portable`'s engine construction — see
-    //! [`install_bundled_icon_font_into`]'s doc comment for why those are
-    //! deliberately not exercised together in a test.
-    //!
-    //! `App::new_portable` actually calling [`install_bundled_icon_font`]
-    //! (the #920 bug: it didn't) is covered structurally rather than by a
-    //! runtime test — `src/app.rs`'s `new_portable` now has the call inline,
-    //! un-gated, and that function's `'static`/`ShellApp` shape is already
-    //! pinned by `app_is_runnable_by_any_quadraui_shell_runner`. Driving
-    //! `new_portable` itself here would call `Engine::startup`, which
-    //! restores *this machine's real last session* off the real `$HOME` —
-    //! exactly what `App::new_headless`'s doc comment says a test must not
-    //! do.
-
-    use super::*;
-
-    /// Fresh directory, no existing font: the bytes must land on disk
-    /// exactly as embedded.
-    ///
-    /// RED before #920 restructured `install_bundled_icon_font` around an
-    /// injectable directory: there was no seam to call this without
-    /// touching `$HOME`, so the write path had zero test coverage at all.
-    #[test]
-    fn writes_the_full_font_into_a_fresh_directory() {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode-icon-font-test-fresh-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-
-        install_bundled_icon_font_into(&dir);
-
-        let dest = dir.join("vimcode-icons.ttf");
-        let written = std::fs::read(&dest).expect("font file must be written");
-        assert_eq!(
-            written,
-            include_bytes!("../data/fonts/vimcode-icons.ttf"),
-            "written bytes must match the embedded font exactly"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A same-sized file already at the destination is left alone — the
-    /// "skip if correct size" fast path must not needlessly rewrite (and
-    /// thus not needlessly shell out to refresh the cache) on every launch.
-    #[test]
-    fn leaves_a_same_sized_file_untouched() {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode-icon-font-test-skip-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("vimcode-icons.ttf");
-        // Wrong content, right size: proves the skip is byte-size based
-        // (matching the doc comment) rather than a content comparison.
-        let decoy = vec![0u8; include_bytes!("../data/fonts/vimcode-icons.ttf").len()];
-        std::fs::write(&dest, &decoy).unwrap();
-
-        install_bundled_icon_font_into(&dir);
-
-        let after = std::fs::read(&dest).unwrap();
-        assert_eq!(
-            after, decoy,
-            "a same-sized file must be left alone, not overwritten"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A wrong-sized file at the destination (a stale, truncated, or
-    /// corrupted previous install) must be replaced with the current bytes.
-    #[test]
-    fn replaces_a_wrong_sized_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode-icon-font-test-replace-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dest = dir.join("vimcode-icons.ttf");
-        std::fs::write(&dest, b"stale").unwrap();
-
-        install_bundled_icon_font_into(&dir);
-
-        let after = std::fs::read(&dest).unwrap();
-        assert_eq!(
-            after,
-            include_bytes!("../data/fonts/vimcode-icons.ttf"),
-            "a wrong-sized existing file must be replaced with the real font"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #920 reason 2: on macOS the destination must be Core Text's
-    /// `~/Library/Fonts`, never fontconfig's `~/.local/share/fonts` — the
-    /// two are unrelated directories and Core Text does not consult the
-    /// latter at all.
-    ///
-    /// Only meaningful on a Mach-O host (the `target_os = "macos"` branch of
-    /// `icon_font_dest_dir` doesn't exist in the binary this test itself
-    /// runs in otherwise), mirroring `src/macos/mod.rs`'s own
-    /// double-gated driver tests: absent, not weakened, on every other lane.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn dest_dir_is_library_fonts_on_macos() {
-        let home = std::path::Path::new("/Users/example");
-        assert_eq!(icon_font_dest_dir(home), home.join("Library/Fonts"));
-    }
-
-    /// The non-macOS mirror of the test above: fontconfig's directory,
-    /// which is what every lane that actually compiles this test runs.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn dest_dir_is_local_share_fonts_off_macos() {
-        let home = std::path::Path::new("/home/example");
-        assert_eq!(icon_font_dest_dir(home), home.join(".local/share/fonts"));
-    }
-}

@@ -249,7 +249,7 @@
 //! [JDonaghy/quadraui#532](https://github.com/JDonaghy/quadraui/issues/532)
 //! landed `AppShell::set_title_bar_visible`, the runtime toggle this needed
 //! (unlike `AppShell::with_title_bar`, a construction-time-only commitment —
-//! see that method's own doc comment). [`TuiShellApp::shell_config`] seeds
+//! see that method's own doc comment). [`TuiShellApp::build_shell_config`] seeds
 //! the title-bar reservation from `engine.menu_bar_visible` at construction
 //! (so the very first frame, painted before any `handle()` dispatch, is
 //! already correct), and `handle()` keeps it synced via
@@ -324,7 +324,7 @@
 //! have dropped every one of those keys through to the general
 //! `Engine::handle_key` fallback.
 //!
-//! **E. `ShellConfig` build-out — done.** [`TuiShellApp::shell_config`]
+//! **E. `ShellConfig` build-out — done.** [`TuiShellApp::build_shell_config`]
 //! derives its panel list from the same `PANEL_*` ids
 //! `render::build_activity_bar`'s `fixed` array switches on (explorer,
 //! search, debug, source control, extensions, AI), plus the menu hamburger
@@ -366,14 +366,20 @@ use quadraui::{Reaction, ShellApp, ShellContext, UiEvent};
 
 use super::*;
 
-/// Link hit rects from a hover popup render: `(rect, url)`, matching
-/// `event_loop`'s `hover_link_rects`/`editor_hover_link_rects` locals
-/// verbatim. Named alias so the `TuiShellApp` fields below don't trip
-/// clippy's `type_complexity` lint. `quadraui::Rect` (#831) — TUI passes
-/// cell coordinates as `f32`, same as GTK's pixel coordinates; there is no
-/// unit parameter in quadraui's layout API, so both backends share this
-/// exact type.
+/// Link hit rects from the editor-hover-popup render: `(rect, url)`, matching
+/// `event_loop`'s `editor_hover_link_rects` local verbatim. Named alias so
+/// the `TuiShellApp` fields below don't trip clippy's `type_complexity`
+/// lint. `quadraui::Rect` (#831) — TUI passes cell coordinates as `f32`,
+/// same as GTK's pixel coordinates; there is no unit parameter in
+/// quadraui's layout API, so both backends share this exact type.
 type HoverLinkRects = Vec<(quadraui::Rect, String)>;
+
+/// Link hit rects from the panel-hover-popup render: `(rect, url,
+/// is_native)`. Matches GTK's `App::panel_hover_link_rects` element-for-
+/// element (#1067) — before this, TUI's cache dropped the trailing
+/// `is_native` flag GTK's carried, which is why the two could not share one
+/// click router.
+type PanelHoverLinkRects = Vec<(quadraui::Rect, String, bool)>;
 
 /// Activity-bar item id for the menu hamburger.
 ///
@@ -411,6 +417,22 @@ pub struct TuiShellApp {
     hover_selecting: bool,
     fr_input_dragging: bool,
     last_layout: RefCell<Option<render::ScreenLayout>>,
+    /// Cached per-window status-bar hit zones, keyed by `WindowId::0` — the
+    /// TUI twin of `gtk::App::status_segment_map` (#1250). Populated by
+    /// `render_content`'s per-window (`paint_editor_band`) and separated
+    /// (`paint_bottom_band`) status-bar paint sites from the
+    /// `quadraui::StatusBarLayout` each `Backend::draw_status_bar` call
+    /// actually returned, consumed by `render::status_bands` so
+    /// `mouse::route_and_apply_chrome_click` hit-tests what was painted
+    /// instead of re-laying every bar's text out again on each click.
+    status_segment_map: RefCell<crate::app_support::StatusSegmentMap>,
+    /// Rect the last frame painted the separated status line into, or `None`
+    /// when that frame composed no `BottomOp::SeparatedStatus` — the GTK
+    /// twin of `App::separated_status_bar_rect` (#1250).
+    separated_status_bar_rect: Cell<Option<quadraui::Rect>>,
+    /// Hit zones for the global status bar's last painted layout — the GTK
+    /// twin of `App::global_status_zones` (#1250).
+    global_status_zones: RefCell<render::StatusZones>,
     /// Per-group tab-bar visible counts measured by the most recent
     /// `render_content`. `event_loop` collected these into a `draw_frame`
     /// out-param and fed them straight to `Engine::post_draw_apply_widths`
@@ -435,8 +457,17 @@ pub struct TuiShellApp {
     tab_drag: render::TabDragState,
     last_clipboard_content: Option<String>,
     pending_startup_msg: Option<String>,
+    /// Was an editor-anchored popup (the completions/hover-doc picker or the
+    /// modal folder picker) open on the *previous* frame `render_content`
+    /// painted? #1243 gives this its reader back: the field went dead when
+    /// #634 moved TUI onto quadraui's shell runner (no more `Terminal::
+    /// clear()` call for it to drive), and `render_content` now compares
+    /// this against the current frame's popup state through
+    /// [`render::popup_overlay_closed_this_frame`] to call
+    /// `quadraui::Backend::request_full_repaint` (quadraui#1037) exactly on
+    /// the closing transition — see that function's own doc.
     had_popup_overlay: Cell<bool>,
-    hover_link_rects: RefCell<HoverLinkRects>,
+    hover_link_rects: RefCell<PanelHoverLinkRects>,
     hover_popup_rect: Cell<Option<quadraui::Rect>>,
     editor_hover_popup_rect: Cell<Option<quadraui::Rect>>,
     editor_hover_link_rects: RefCell<HoverLinkRects>,
@@ -488,16 +519,19 @@ pub struct TuiShellApp {
     last_sidebar_refresh: Cell<Instant>,
     yank_hl_deadline: Cell<Option<Instant>>,
     tab_switcher_last_cycle: Cell<Option<Instant>>,
-    /// Mirrors `event_loop`'s once-computed `keyboard_enhanced` flag
-    /// (`mod.rs:696`, from `supports_keyboard_enhancement()` before the
-    /// loop starts) — threaded into `render::engine_key_from_ui` (#826) to
-    /// disambiguate a handful of Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
+    /// Cached copy of `quadraui::BackendCaps::kitty_keyboard` (#1109 — read
+    /// once in `setup()` via `backend.backend_caps()` rather than a second,
+    /// redundant call to crossterm's own keyboard-enhancement-support probe;
+    /// quadraui's own live runner already ran that probe and recorded the
+    /// result before `setup()` ran) — threaded into
+    /// `render::engine_key_from_ui` (#826) to disambiguate a handful of
+    /// Ctrl-combo escape sequences (Ctrl+\, Ctrl+/,
     /// Ctrl+Shift+[/]) that arrive ambiguously without the kitty keyboard
-    /// protocol. Defaults to `false`, the same value `unwrap_or(false)`
-    /// falls back to on any terminal that doesn't support the protocol —
-    /// exactly what every `driver_with_shell` test gets, since
-    /// `ShellApp::setup` only queries the real terminal when [`Self::live`]
-    /// is set (see that field and `setup`'s own doc comments for why).
+    /// protocol. Defaults to `false`, the same value the cap defaults to on
+    /// any terminal that doesn't support the protocol — exactly what every
+    /// `driver_with_shell` test gets, since `ShellApp::setup` only reads the
+    /// live-probed cap when [`Self::live`] is set (see that field and
+    /// `setup`'s own doc comments for why).
     keyboard_enhanced: bool,
     /// What this app believes the *runner's* `AppShell` (the
     /// `ShellAdapter`-owned instance that paints the activity bar and
@@ -526,16 +560,21 @@ pub struct TuiShellApp {
     suppress_shell_panel_echo: bool,
     /// Set by [`Self::prepare_for_live_run`], never by anything else — in
     /// particular never by a `driver_with_shell` test. Gates the two
-    /// `ShellApp::setup` steps that are unsound or unsafe to run under a
+    /// `ShellApp::setup` steps that are unsound or wrong to run under a
     /// short-lived headless test instance (#635, Stage 6b item F):
     ///
-    /// - `supports_keyboard_enhancement()` does a blocking round-trip
-    ///   against the real terminal (enables raw mode if not already on,
-    ///   writes a query escape sequence, and reads/polls for the
-    ///   response — see crossterm's `query_keyboard_enhancement_flags_*`).
-    ///   Under `driver_with_shell`'s `TestBackend` there is no real
-    ///   terminal to answer, so every test using the driver would pay that
-    ///   round-trip's latency (or worse, hang) for no benefit.
+    /// - Reading `backend.backend_caps().kitty_keyboard` into
+    ///   [`Self::keyboard_enhanced`] is a plain field read, not I/O — since
+    ///   #1109 the actual blocking round-trip (enabling raw mode if not
+    ///   already on, writing a query escape sequence, and reading/polling
+    ///   for the response — crossterm's `query_keyboard_enhancement_flags_*`
+    ///   under the hood) happens once inside `quadraui::tui::run::run`,
+    ///   before `setup()` is ever called, live runs only. This stays gated
+    ///   on `self.live` anyway so `keyboard_enhanced` keeps its documented
+    ///   `false` default under `driver_with_shell`: that harness's
+    ///   `TuiBackend` never goes through the live runner's probe, so its cap
+    ///   is just `TuiBackend::new()`'s environment-only guess, not a
+    ///   meaningful answer to read.
     /// - `core::swap::register_emergency_engine` stores a raw
     ///   `*const Engine` in a process-global `static`, on the explicit
     ///   contract that "the caller must ensure `engine` lives for the rest
@@ -547,6 +586,18 @@ pub struct TuiShellApp {
     ///   That's a genuine soundness bug, not just a slowdown, so this must
     ///   never run under test.
     live: bool,
+    /// Set by [`render::TickHost::quit_after_format_save`]'s TUI impl once
+    /// the deferred `:wq`/`:x` format-then-quit flow has saved session state
+    /// and shut everything down — `tick()` checks it right after calling
+    /// [`render::run_shared_tick_chores`] and turns it into
+    /// `Reaction::Exit` (#1248). Mirrors GTK's `App::exit_requested`
+    /// exactly: both backends now run every other chore in the same tick
+    /// before actually exiting (this used to `return Reaction::Exit`
+    /// mid-list on TUI, skipping the pending-terminal-command/ext-panel-
+    /// focus/platform-action drains below it — harmless either way since the
+    /// process is exiting regardless, but the two backends silently
+    /// disagreed on it, which is exactly what this issue converges).
+    exit_requested: Cell<bool>,
 }
 
 /// A ratatui cell rect as the quadraui `Rect` every shared painter takes.
@@ -582,6 +633,28 @@ impl TuiShellApp {
             .and_then(|n| n.to_str())
             .map(|n| n.to_string())
             .unwrap_or_else(|| "VimCode".to_string())
+    }
+
+    /// Editor mode → hardware caret shape (#1109): block for Normal/Visual,
+    /// bar for Insert, underline for a pending replace-char (`r`) command —
+    /// the same three-way mapping the old hand-rolled crossterm cursor-style
+    /// write used, now feeding `backend.set_caret_shape` (quadraui#1015)
+    /// instead. Split out as a
+    /// pure function, separate from `tick()`'s `self.live`-gated write right
+    /// below it, specifically so the *decision* is unit-testable —
+    /// `set_caret_shape`'s `TuiBackend` impl writes straight to the real
+    /// process `std::io::stdout()` with no test-mode guard (see its own doc
+    /// comment), so the write itself can't be observed from this crate's
+    /// test suite any more than `tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable`'s
+    /// title write can — that's a `SMOKE_TESTS` item, not a driver test.
+    fn caret_shape_for_mode(&self) -> quadraui::EditorCursorShape {
+        if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
+            quadraui::EditorCursorShape::Underline
+        } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
+            quadraui::EditorCursorShape::Bar
+        } else {
+            quadraui::EditorCursorShape::Block
+        }
     }
 
     /// Compose the **bottom band** (#765, #735 slice 4): the chrome vimcode
@@ -676,11 +749,17 @@ impl TuiShellApp {
                         continue;
                     };
                     backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let _ = render::paint_separated_status_rung(
-                        backend,
-                        status,
-                        to_q_rect(chrome.separated_status),
+                    let sb_rect = to_q_rect(chrome.separated_status);
+                    let sb_layout = render::paint_separated_status_rung(backend, status, sb_rect);
+                    // #1250: keyed by `active_window_id`, mirroring GTK's
+                    // `App::render_content` — the separated line shows the
+                    // active window's status, so that's the id
+                    // `render::status_bands` looks its zones up under.
+                    self.status_segment_map.borrow_mut().insert(
+                        screen.active_window_id.0,
+                        render::status_bar_zones_from_layout(&sb_layout),
                     );
+                    self.separated_status_bar_rect.set(Some(sb_rect));
                     composed_bottom.push(render::BottomOp::SeparatedStatus);
                 }
                 // Anchored just right of the sidebar's own right edge, which in
@@ -698,12 +777,13 @@ impl TuiShellApp {
                 // The rasteriser stays per-backend here — the `EditorOp
                 // ::Windows` precedent. TUI's `hover_popup_rect` /
                 // `hover_link_rects` caches are `quadraui::Rect` now (#831),
-                // same as GTK's — GTK's link rects still carry a trailing
-                // `is_native` flag TUI's don't need, so the two `Vec` element
-                // shapes aren't byte-identical, but both express the rect
-                // itself in the one shared type rather than two backend-local
-                // tuple layouts. What #765 fixes is that the rung is now
-                // composed — and cleared — at the top level on both backends.
+                // same as GTK's, and (#1067) `hover_link_rects`' element
+                // shape now matches GTK's `panel_hover_link_rects` exactly
+                // (trailing `is_native` flag included), so
+                // `render::route_panel_hover_popup_click` is callable from
+                // both without an adapter. What #765 fixes is that the rung
+                // is now composed — and cleared — at the top level on both
+                // backends.
                 render::BottomOp::PanelHover => {
                     let Some(sb) = layout.sidebar_content_bounds else {
                         continue;
@@ -731,19 +811,17 @@ impl TuiShellApp {
         }
     }
 
-    /// Compose the **editor band** (#764, #735 slice 3) into `backend`.
+    /// Compose the **editor band** (#764, #735 slice 3; converged into one
+    /// shared walk by #1251) into `backend`.
     ///
-    /// Walks `render::compose_editor_band` — the single ordered artefact both
-    /// backends walk for the editor column, exactly as `FRAME_Z_ORDER` is for
-    /// the surrounding chrome and the app-level overlays. Geometry stays here, in cells; the *order* and the *gates*
-    /// live in `render.rs`. `EDITOR_Z_ORDER`'s doc comment records the two
-    /// defects this convergence closed (GTK never painted the group dividers
-    /// at all, and painted its tab-drag ghost above the editor popups).
+    /// Walks `render::paint_editor_band_rungs`, the single loop both this
+    /// method and GTK's `App::compose_editor_band_rungs` now call — see that
+    /// function's doc and `TuiEditorBandHost`'s for exactly which four rungs
+    /// still need a per-backend body and why. Geometry stays here, in cells.
     ///
     /// `area` is `layout.main_content_bounds` in cells. Extracted from
     /// `render_content` so the entry point *sequences* bands rather than
-    /// inlining each one — the GTK twin splits its own heavier rungs the same
-    /// way (`paint_editor_windows_rung` / `paint_tab_bars_rung`).
+    /// inlining each one.
     fn paint_editor_band(
         &self,
         backend: &mut dyn quadraui::Backend,
@@ -751,17 +829,6 @@ impl TuiShellApp {
         area: Rect,
         theme: &Theme,
     ) {
-        // ══ Editor band (#764, #735 slice 3) ═════════════════════════════
-        //
-        // Composed from `render::compose_editor_band` — the single ordered
-        // artefact both backends walk for the editor column, exactly as
-        // `CHROME_Z_ORDER` (below) is for the surrounding chrome and
-        // `OVERLAY_Z_ORDER` (below that) for the app-level overlays. Geometry
-        // stays here, in cells; only the *order* and the *gates* moved.
-        // `EDITOR_Z_ORDER`'s doc comment records the two defects this closes
-        // (GTK never painted the group dividers at all, and painted its
-        // tab-drag ghost above the editor popups).
-        //
         // Reset per-frame: `post_draw_apply_widths` wants this frame's
         // measurements, not an ever-growing accumulation.
         self.tab_visible_counts.borrow_mut().clear();
@@ -770,104 +837,32 @@ impl TuiShellApp {
         } else {
             1.0
         };
-        let mut composed_editor: Vec<render::EditorOp> = Vec::new();
-        for op in render::compose_editor_band(
+        let mut host = TuiEditorBandHost {
+            app: self,
+            area,
+            tui_tbh,
+        };
+        let band = quadraui::Rect::new(
+            area.x as f32,
+            area.y as f32,
+            area.width as f32,
+            area.height as f32,
+        );
+        let composed_editor = render::paint_editor_band_rungs(
+            backend,
             &self.engine,
             screen,
-            // `is_dragging()`, not the `source().is_some()` this call site used
-            // to test: they agree (`begin` sets both, `handle_release` clears
-            // both), but `is_dragging` is the gate that method's own doc names
-            // as "the gate both backends' drop overlays paint behind", and it
-            // is the one GTK already used.
+            theme,
+            band,
+            render::EditorBandUnits::CELL,
+            // `is_dragging()`, not the `source().is_some()` this call site
+            // used to test: they agree (`begin` sets both, `handle_release`
+            // clears both), but `is_dragging` is the gate that method's own
+            // doc names as "the gate both backends' drop overlays paint
+            // behind", and it is the one GTK already used.
             self.tab_drag.is_dragging(),
-            self.engine.terminal_maximized,
-        ) {
-            match op {
-                // `render_all_windows` also paints the within-group
-                // (`:split`/`:vsplit`) divider lines unconditionally now
-                // (#609 routed `render_separators` through
-                // `Backend::draw_status_bar` — see its doc comment — so it no
-                // longer needs the raw `Frame` that `frame: None` used to
-                // skip it for).
-                render::EditorOp::Windows => {
-                    render_all_windows(backend, None, &screen.windows, theme)
-                }
-                // #35/#722: minimap strips on every window's right edge (one
-                // entry per `WindowId` in `screen.minimap`, not just the
-                // active window's) — one call, the braille rasteriser is
-                // quadraui's.
-                render::EditorOp::Minimap => {
-                    render::draw_minimap_strip(backend, screen);
-                }
-                render::EditorOp::TabBars => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    let painted =
-                        render::paint_tab_bars(backend, &self.engine, screen, 1.0, tui_tbh, None);
-                    let mut counts = self.tab_visible_counts.borrow_mut();
-                    for bar in &painted {
-                        counts.push((bar.group_id, bar.hits.available_cols));
-                    }
-                }
-                render::EditorOp::Breadcrumbs => {
-                    backend.set_theme(super::quadraui_tui::q_theme(theme));
-                    render::paint_breadcrumb_bars(backend, screen, self.engine.terminal_maximized);
-                }
-                // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed
-                // to the `Windows` rung's within-group `render_separators`)
-                // — ported to `Backend::draw_status_bar` via
-                // `render_group_dividers` (see its doc comment, and
-                // `group_divider_cells`'s for how the #481
-                // phantom-divider-beside-scrollbar guard became a pure data
-                // computation instead of a `Buffer` read-back). GTK
-                // rasterises the same rung through quadraui's `Split`
-                // primitive instead — see `render::draw_dividers_as_splits`
-                // for why the two rasterisers legitimately differ.
-                render::EditorOp::GroupDividers => render_group_dividers(
-                    backend,
-                    &screen.group_dividers,
-                    &screen.windows,
-                    area,
-                    theme,
-                ),
-                // Drag state (the shared `render::TabDragState`) is already
-                // live here — #602 wired `handle_mouse_event` to advance it
-                // via `mouse::handle_mouse` (see `handle()` below).
-                render::EditorOp::TabDragOverlay => render_tab_drag_overlay(
-                    backend,
-                    &self.engine,
-                    screen,
-                    theme,
-                    self.tab_drag.source(),
-                    self.tab_drag.cursor(),
-                    self.tab_drag.zone(),
-                ),
-                // Unlike `draw_frame`'s `editor_area` (whose `y` is
-                // implicitly 0-based — it's the live terminal frame's own
-                // top-level split), `area` here is
-                // `layout.main_content_bounds`, already offset below whatever
-                // `AppShell::render` painted above it — see that function's
-                // doc comment for why the row math differs between the two
-                // callers. That offset already includes `AppShell`'s
-                // title-bar row whenever the menu bar is visible
-                // (`compute_layout`'s `band_y += h`), so — unlike
-                // `draw_frame`'s `menu_rows + 1` — there is no menu term to
-                // add here; adding one would double-count the row (#635 item
-                // A, and see `build_screen_for_shell_content`'s doc comment).
-                render::EditorOp::TabTooltip => {
-                    if let Some(ref tooltip_text) = screen.tab_tooltip {
-                        render_tab_hover_tooltip(
-                            backend,
-                            area.x,
-                            area.y + 1,
-                            area.width,
-                            tooltip_text,
-                            theme,
-                        );
-                    }
-                }
-            }
-            composed_editor.push(op);
-        }
+            &mut host,
+        );
         *self.composed_editor_band.borrow_mut() = composed_editor;
         // Same contract as the chrome/overlay bands: read back through the
         // field rather than the local, so the *stored* observable is what gets
@@ -939,7 +934,32 @@ impl TuiShellApp {
     /// `restore_session` is `true` for the production constructor and `false`
     /// for [`TuiShellApp::new_for_test`]; see that method for why skipping the
     /// per-workspace session restore is required for determinism.
-    fn from_engine(mut engine: Engine, file_path: Option<PathBuf>, restore_session: bool) -> Self {
+    ///
+    /// `pub(crate)` (rather than private) since #1043:
+    /// `crate::tui_main::testing::conformance_harness_prod` calls this
+    /// directly on the caller's fixture `Engine` — the *specific* instance a
+    /// scenario built and mutated (e.g. `explorer_visible`,
+    /// `explorer_expanded`) — rather than running it against a throwaway
+    /// `Engine::new_for_test()` and swapping the fixture engine in
+    /// afterwards. Swapping in afterwards was the bug #1043's review caught:
+    /// `set_backend_info` (required before `SidebarSystem::handle_cached`
+    /// does anything, see `render.rs`'s doc on that method) and
+    /// `setup_tui_clipboard` both ran against the discarded throwaway
+    /// engine, leaving the scenario's real engine with unset sidebar
+    /// backend info and no clipboard — invisible today only because no
+    /// `tui_prod` scenario yet touches SC/Ext/Search sidebars or
+    /// yank/paste. Calling this directly on the fixture engine, the same
+    /// way `App::new_headless_with_backend` operates on the caller's actual
+    /// `Engine` rather than a throwaway one, closes that gap: `file_path:
+    /// None, restore_session: false` mirrors [`TuiShellApp::new_for_test`]'s
+    /// own arguments, and `startup_without_session_restore(None)` is a
+    /// no-op when `file_path` is `None` (see `Engine::startup_inner`), so
+    /// this never overwrites whatever state the fixture already set up.
+    pub(crate) fn from_engine(
+        mut engine: Engine,
+        file_path: Option<PathBuf>,
+        restore_session: bool,
+    ) -> Self {
         let msv_metrics = quadraui::MsvLayoutMetrics {
             header_size: 1.0,
             divider_size: 0.0,
@@ -991,6 +1011,27 @@ impl TuiShellApp {
         }
         setup_tui_clipboard(&mut engine);
 
+        // #1117: re-run `Engine::sync_app_shell_sidebar_visibility` here,
+        // after `startup`/`startup_without_session_restore` — not because
+        // this click-routing fix reads `app_shell.sidebar_visible()`
+        // anymore (it doesn't: see the `TreeController` intercept's own
+        // comment), but because `TuiShellApp::handle`'s own runner-vs-shadow
+        // resync ("#634 smoke retry") pushes whatever `app_shell` says onto
+        // the *runner* every dispatch — so a shadow left stale here would
+        // go on to actively hide a sidebar the runner is correctly showing,
+        // the first time any event reaches `handle()`. Two ways it can be
+        // stale by this point: (a) a caller mutates `engine.session` on an
+        // already-built `Engine` before handing it to `from_engine` (as
+        // `Engine::new_for_test`'s own doc warns against — the `#1043`
+        // fixture pattern), or (b) `startup`'s `open_folder` applies a
+        // per-folder `.vimcode/settings.json` overlay that changes
+        // `autohide_panels`/`explorer_visible_on_startup` *after*
+        // `Engine::new_from_state` already baked in its own answer — this
+        // call running after `startup` (not before) is what picks that up.
+        // One call, no duplicated derivation: see
+        // `Engine::sync_app_shell_sidebar_visibility`'s own doc.
+        engine.sync_app_shell_sidebar_visibility();
+
         let pending_startup_msg = if nerd_fonts_undiscovered {
             Some(
                 "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
@@ -1015,6 +1056,9 @@ impl TuiShellApp {
             hover_selecting: false,
             fr_input_dragging: false,
             last_layout: RefCell::new(None),
+            status_segment_map: RefCell::new(std::collections::HashMap::new()),
+            separated_status_bar_rect: Cell::new(None),
+            global_status_zones: RefCell::new(Vec::new()),
             tab_visible_counts: RefCell::new(Vec::new()),
             debug_toolbar_rect: std::rc::Rc::new(Cell::new(quadraui::Rect::default())),
             explorer_sb_dragging: false,
@@ -1043,6 +1087,7 @@ impl TuiShellApp {
             suppress_shell_panel_echo: false,
             keyboard_enhanced: false,
             live: false,
+            exit_requested: Cell::new(false),
         }
     }
 
@@ -1071,20 +1116,26 @@ impl TuiShellApp {
         self.live = true;
     }
 
-    /// The live `ShellConfig` for `TuiShellApp` (#635, Stage 6b item E).
+    /// The static base `ShellConfig` for `TuiShellApp` (#635, Stage 6b item
+    /// E; renamed from `shell_config` and rebuilt on top of a shared icon
+    /// table in #1107 — see that issue for why two independent copies of
+    /// this builder existed in the first place).
     ///
     /// The middle six panels (explorer, search, debug, source control,
-    /// extensions, AI) are built by zipping
+    /// extensions, AI) are built by iterating
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared order constant
     /// `render::build_activity_bar`'s (`render.rs:8147`) own `fixed` array is
-    /// debug-asserted against — with this function's local icon/title/tooltip
-    /// metadata array, so the *order* can't drift from `build_activity_bar`
-    /// without both a compile error here (index/length mismatch) and a
-    /// debug-assertion failure there. (Icon/title/tooltip strings are still a
-    /// second hand-maintained copy — `PanelDefinition` and `ActivityItem` are
-    /// different shapes with no shared metadata table to draw from — so a
+    /// debug-asserted against — so the *order* can't drift from
+    /// `build_activity_bar` without a debug-assertion failure there. Each
+    /// id's icon resolves through `App::resolve_builtin_panel_icon`, the
+    /// same table `App::shell_config` (GTK/macOS/Win) uses, so the two
+    /// backends cannot independently drift onto different glyphs for the
+    /// same panel the way the search icon once did (#950). Title/tooltip
+    /// wording is still a second hand-maintained copy, looked up by id via
+    /// the local `title_tooltip` — `PanelDefinition` and `ActivityItem` are
+    /// different shapes with no shared metadata table to draw from, so a
     /// wording-only change to `build_activity_bar`'s tooltips still needs a
-    /// matching edit here; only the *ordering* is now structurally shared.)
+    /// matching edit here.
     /// Also registers the menu hamburger (top, matching its position in
     /// `build_activity_bar`'s `top` list) and settings (bottom, matching
     /// `build_activity_bar`'s `bottom` list) — the two items outside the
@@ -1123,7 +1174,7 @@ impl TuiShellApp {
     /// (`quadraui::tui::shell_runner`) reads to decide whether to call
     /// `AppShell::with_title_bar` at construction — setting them directly
     /// here is simpler than routing through that builder twice.
-    pub fn shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
+    pub fn build_shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
         fn panel(id: &str, icon: &str, title: &str, tooltip: &str) -> quadraui::PanelDefinition {
             quadraui::PanelDefinition {
                 id: quadraui::WidgetId::new(id),
@@ -1133,24 +1184,36 @@ impl TuiShellApp {
             }
         }
 
-        // Icon/title/tooltip metadata for the fixed middle panels, in the
-        // same order as `sidebar::FIXED_ACTIVITY_PANEL_IDS` — the shared
-        // constant `render::build_activity_bar`'s own `fixed` array is
-        // debug-asserted against, so both call sites are pinned to the same
-        // order (index-zipped below, not hand-matched by id). The array
-        // length is sized *from* `FIXED_ACTIVITY_PANEL_IDS::len()` itself
-        // (not a hand-copied literal `6`), so adding/removing a panel there
-        // is a compile error here until this array is resized to match —
-        // `zip` alone would otherwise silently truncate to the shorter side.
-        let mid_meta: [(&str, &str, &str);
-            crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS.len()] = [
-            (icons::EXPLORER.s(), "Explorer", "Explorer (Ctrl+Shift+E)"),
-            (icons::SEARCH.s(), "Search", "Search (Ctrl+Shift+F)"),
-            (icons::DEBUG.s(), "Debug", "Debug"),
-            (icons::GIT_BRANCH.s(), "Source Control", "Source Control"),
-            (icons::EXTENSIONS.s(), "Extensions", "Extensions"),
-            (icons::AI_CHAT.s(), "AI Assistant", "AI Assistant"),
-        ];
+        // Title/tooltip wording for the fixed middle panels, looked up *by
+        // id* rather than zipped positionally against
+        // `sidebar::FIXED_ACTIVITY_PANEL_IDS` (#1107) — a typo'd/reordered
+        // id here now falls through to the `unreachable!` below instead of
+        // silently mis-pairing two adjacent panels the way a length/order
+        // mismatch in a positional `zip` could have. This is still a
+        // second hand-maintained copy of the *wording*
+        // `render::build_activity_bar`'s `fixed` array carries — see that
+        // function's own tooltip strings — because `PanelDefinition` and
+        // `ActivityItem` are different shapes with no shared metadata table
+        // to draw from, so a wording-only change there still needs a
+        // matching edit here. What is no longer duplicated is the *icon*:
+        // this function and `App::shell_config` both resolve it through
+        // the one shared `App::resolve_builtin_panel_icon` table (#1107) —
+        // the two independent copies that used to exist here are exactly
+        // how the search panel ended up on two different glyphs across
+        // backends for months (`SEARCH_COD` on GTK, `SEARCH` on TUI, #950).
+        fn title_tooltip(id: &str) -> (&'static str, &'static str) {
+            match id {
+                PANEL_EXPLORER => ("Explorer", "Explorer (Ctrl+Shift+E)"),
+                PANEL_SEARCH => ("Search", "Search (Ctrl+Shift+F)"),
+                PANEL_DEBUG => ("Debug", "Debug"),
+                PANEL_GIT => ("Source Control", "Source Control"),
+                PANEL_EXTENSIONS => ("Extensions", "Extensions"),
+                PANEL_AI => ("AI Assistant", "AI Assistant"),
+                PANEL_BOARD => ("Board", "Board"),
+                _ => unreachable!("title_tooltip called with a non-fixed panel id: {id:?}"),
+            }
+        }
+
         let mut panels = vec![panel(
             HAMBURGER_PANEL_ID,
             icons::HAMBURGER.s(),
@@ -1160,13 +1223,16 @@ impl TuiShellApp {
         panels.extend(
             crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS
                 .into_iter()
-                .zip(mid_meta)
-                .map(|(id, (icon, title, tooltip))| panel(id, icon, title, tooltip)),
+                .map(|id| {
+                    let (title, tooltip) = title_tooltip(id);
+                    let icon = crate::app::App::resolve_builtin_panel_icon(id).unwrap_or_default();
+                    panel(id, icon, title, tooltip)
+                }),
         );
 
         let mut cfg = quadraui::ShellConfig::new("VimCode", panels).with_bottom_items(vec![panel(
             PANEL_SETTINGS,
-            icons::SETTINGS.s(),
+            crate::app::App::resolve_builtin_panel_icon(PANEL_SETTINGS).unwrap_or_default(),
             "Settings",
             "Settings",
         )]);
@@ -1207,7 +1273,7 @@ impl TuiShellApp {
     /// only seeds frame zero — [`Self::sync_ext_activity_panels`] keeps the
     /// live `AppShell` converged from there.
     pub(super) fn live_shell_config(engine: &Engine) -> quadraui::ShellConfig {
-        let mut cfg = Self::shell_config(engine.menu_bar_visible);
+        let mut cfg = Self::build_shell_config(engine.menu_bar_visible);
         cfg.panels.extend(engine.ext_activity_panels());
         cfg
     }
@@ -1320,7 +1386,29 @@ impl TuiShellApp {
         // the authoritative state, it costs nothing, and it stays correct
         // if/when #607 makes the modal-stack path work too.
         let ctx_menu_blocks_event = self.engine.context_menu.is_some();
-        let intercepts_blocked = modal_blocks_event || ctx_menu_blocks_event;
+        // #1117: an open picker (`engine.picker_open`) or folder picker
+        // (`self.folder_picker`) also has to block every panel intercept
+        // below, not just claims that land inside its own painted bounds —
+        // mirrors GTK's `try_route_sidebar_mouse_event`, which returns
+        // `false` unconditionally on `engine.picker_open` before it even
+        // looks at click position (`app.rs`, "Falling through is also what
+        // makes *dismissal* correct"), and `handle_mouse_click_msg`, which
+        // does the same for `self.folder_picker` ("checked before every
+        // other rung"). Without this, a press *outside* the popup that is
+        // meant to dismiss it — the picker floats centred over the whole
+        // window, so with the sidebar visible its left half sits on top of
+        // whichever panel is active — gets swallowed by that panel's own
+        // intercept instead of ever reaching the picker's own modal-stack
+        // dispatch (`mouse::handle_mouse`'s `route_modal_overlay_click`),
+        // which is what actually resolves an outside click as a dismissal.
+        // This was already latent before #1117 touched this function (every
+        // panel intercept below shares the same shape), just never exposed
+        // — the Explorer intercept's now-deleted `app_shell.sidebar_visible()`
+        // read happened to also decline in every scenario the existing test
+        // suite combined with an open picker, by accident of those
+        // scenarios' own setup rather than by design.
+        let picker_blocks_event = self.engine.picker_open || self.folder_picker.is_some();
+        let intercepts_blocked = modal_blocks_event || ctx_menu_blocks_event || picker_blocks_event;
 
         // ── SidebarSystem intercept: debug sidebar (mirrors `mod.rs`
         // ~1436-1471) ──
@@ -1476,8 +1564,42 @@ impl TuiShellApp {
             let is_explorer_event = match &event {
                 UiEvent::MouseDown { position, .. } | UiEvent::DoubleClick { position, .. } => {
                     let rect = self.engine.explorer_tree_rect.get();
+                    // #1117: converged onto the same predicate
+                    // `App::explorer_ui_event` (`app.rs`) uses on GTK —
+                    // `rect.width > 0.0` alone, no extra
+                    // `app_shell.sidebar_visible()` read. That extra
+                    // condition used to be needed only because
+                    // `explorer_tree_rect` was a plain `Cell` that got
+                    // *set* whenever the sidebar body painted but never
+                    // *reset* on a frame where it didn't — so once the
+                    // sidebar was hidden, this rect kept reporting the last
+                    // position it was painted at, and the sidebar-visible
+                    // shadow (`engine.app_shell`, tracked independently of
+                    // what the runner actually painted — see
+                    // `Self::handle`'s runner-vs-shadow resync) was the
+                    // only thing keeping a stale rect from mis-claiming an
+                    // editor click. That shadow can itself go stale
+                    // relative to what painted (the actual #1043 bug: a
+                    // caller that mutates `engine.session` on an
+                    // already-built `Engine`, as `Engine::new_for_test`'s
+                    // own doc warns against, leaves `app_shell` behind
+                    // without ever touching what the runner paints or what
+                    // this rect measures) — an extra, staler condition in a
+                    // backend file, exactly the per-backend drift the
+                    // Platform-Neutrality Rule says to delete rather than
+                    // maintain. `render_content` now resets
+                    // `explorer_tree_rect` to zero-width, once per frame,
+                    // unconditionally, whenever `presence.sidebar_panel` is
+                    // `false` (nothing painted the sidebar body this
+                    // frame) — ungated by which rungs end up composed, so
+                    // it still runs on a frame where the `SidebarPanel`
+                    // rung itself is entirely absent from `composed_frame`
+                    // (see that check's own comment). `rect.width > 0.0`
+                    // is on its own an accurate, self-correcting signal —
+                    // ground truth is "did the tree actually paint", not a
+                    // second copy of "is the sidebar visible" that can
+                    // drift from it.
                     !intercepts_blocked
-                        && self.engine.app_shell.sidebar_visible()
                         && self.engine.active_panel_is(PANEL_EXPLORER)
                         && rect.width > 0.0
                         && rect.contains(*position)
@@ -1562,6 +1684,8 @@ impl TuiShellApp {
 
         let mut should_quit = false;
         let last_layout = self.last_layout.borrow();
+        let status_segment_map = self.status_segment_map.borrow();
+        let global_status_zones = self.global_status_zones.borrow();
         let hover_link_rects = self.hover_link_rects.borrow();
         let editor_hover_link_rects = self.editor_hover_link_rects.borrow();
         let completion_layout = self.completion_layout.borrow();
@@ -1590,6 +1714,9 @@ impl TuiShellApp {
             &mut drag_state,
             &mut modal_stack,
             last_layout.as_ref(),
+            &status_segment_map,
+            self.separated_status_bar_rect.get(),
+            &global_status_zones,
             is_double_click,
             &mut self.folder_picker,
             &mut should_quit,
@@ -1617,6 +1744,8 @@ impl TuiShellApp {
         drop(drag_state);
         drop(modal_stack);
         drop(last_layout);
+        drop(status_segment_map);
+        drop(global_status_zones);
         drop(hover_link_rects);
         drop(editor_hover_link_rects);
         drop(completion_layout);
@@ -1741,6 +1870,171 @@ impl TuiShellApp {
             self.sidebar.has_focus = true;
         }
     }
+
+    /// #1029 (defect 2 of #988): while the runner's `AppShell` is showing
+    /// the hamburger, the sidebar-visibility sync at the end of
+    /// [`Self::handle`] deliberately leaves `runner.sidebar_visible() ==
+    /// true` in place across dispatches — see that sync's own doc comment
+    /// for why: it's what lets a second, correctly-relocated click resolve
+    /// to `SidebarHidden` instead of a fresh reveal. But `sidebar_visible ==
+    /// true` is exactly what makes quadraui's own `AppShell::layout`
+    /// reserve `sidebar_header_bounds`/`sidebar_content_bounds` at all
+    /// (`compose/app_shell.rs`'s `!self.sidebar_visible` layout branch), and
+    /// the hamburger has no real content to put there — the shadow
+    /// `engine.app_shell` this method's caller ultimately paints from
+    /// (`render_sidebar_content`) never learns about the hamburger click in
+    /// the first place (`Self::on_shell_event`'s `PanelChanged` arm). Left
+    /// alone, that reserved-but-empty region doesn't just sit blank: it
+    /// still gets painted with whatever panel the shadow's
+    /// `active_panel_id()` happens to be (Explorer, by construction
+    /// default) — a real, visible content leak into a region the user
+    /// never asked to open, for as long as the hamburger reveal is in
+    /// effect.
+    ///
+    /// Detected by the same shadow-vs-runner mismatch the sync guard above
+    /// is built on: the shadow says `sidebar_visible() == false` while
+    /// `layout` (computed by the runner) reserved a content region anyway.
+    /// For every *other* panel this mismatch cannot survive to a paint call
+    /// at all — a real panel's own `PanelChanged`/`SidebarHidden` handling
+    /// mirrors the shadow synchronously, in the same dispatch as the click,
+    /// before any render runs — so this is a reliable, hamburger-specific
+    /// signal, not a heuristic that could misfire on real sidebar content.
+    ///
+    /// Reclaims the sidebar + divider width back onto `main_content_bounds`
+    /// (mirroring `compute_layout`'s own `!sidebar_visible` branch — main
+    /// content starts right after the activity bar) and drops the sidebar
+    /// regions to `None`, so this frame paints exactly as if the sidebar had
+    /// never been reserved. `bottom_panel_bounds` (already carved to the
+    /// *narrower* main width) is left as-is — reflowing it too would need
+    /// re-deriving `carve_bottom_panel`'s split here, and the bottom panel
+    /// is not reachable while the hamburger occupies the runner's one
+    /// active-panel slot, so there is nothing to visibly narrow in
+    /// practice.
+    fn reclaim_hamburger_sidebar_reservation(
+        &self,
+        layout: &quadraui::AppShellLayout,
+    ) -> quadraui::AppShellLayout {
+        // Also gated on `menu_bar_visible`, not just the shadow/runner
+        // mismatch alone: `AppShell::new` defaults `sidebar_visible: true`
+        // (`compose/app_shell.rs`), so the *very first* frame rendered
+        // before any dispatch has ever run the sidebar-visibility sync —
+        // e.g. every `render_content_paints_*_sidebar_content_via_shell_app`
+        // test below, which asserts on frame zero without dispatching
+        // anything first — shows this exact mismatch for a real panel
+        // (Explorer, an extension panel, …) that the shadow simply hasn't
+        // been told to show *yet*, not for the hamburger at all. Without
+        // this second check, reclaiming here would blank out that real,
+        // intended content instead of the hamburger's phantom one.
+        // `menu_bar_visible` only goes `true` via an actual hamburger
+        // reveal (or an unrelated shim that never touches the sidebar) —
+        // never as a side effect of constructing a fresh shell — so paired
+        // with the mismatch it reliably means "the runner's default/active
+        // panel is the hamburger and nothing real is behind it", not "a
+        // real panel just hasn't synced yet".
+        if !self.engine.menu_bar_visible
+            || self.engine.app_shell.sidebar_visible()
+            || layout.sidebar_content_bounds.is_none()
+        {
+            return layout.clone();
+        }
+        let ab = layout.activity_bar_bounds;
+        let main = layout.main_content_bounds;
+        let reclaimed_main = quadraui::Rect::new(
+            ab.x + ab.width,
+            main.y,
+            (layout.window_bounds.x + layout.window_bounds.width - (ab.x + ab.width)).max(0.0),
+            main.height,
+        );
+        quadraui::AppShellLayout {
+            sidebar_header_bounds: None,
+            sidebar_content_bounds: None,
+            divider_bounds: None,
+            main_content_bounds: reclaimed_main,
+            ..layout.clone()
+        }
+    }
+
+    /// #1029: spend [`Engine::hamburger_stale_click_guard`] for `event` on
+    /// the [`ShellApp::handle`] path, and report whether `event` is the one
+    /// `MouseDown` that guard covers.
+    ///
+    /// Called from the very top of `handle`, before its `'dispatch` block,
+    /// so no early exit inside that block can skip it (review, fix
+    /// iteration 2 — the spend used to live inside the corner-check arm,
+    /// which several earlier arms `break` past).
+    ///
+    /// Returning `true` means "this is the single click immediately
+    /// following a hamburger reveal" — the corner check then decides,
+    /// positionally, whether it landed on the row the reveal shifted the
+    /// hamburger off. `true` is only ever returned for a
+    /// [`UiEvent::MouseDown`], so the corner check can destructure it
+    /// without re-filtering.
+    ///
+    /// The `false`-returning arms split three ways:
+    ///
+    /// - **guard not armed** — nothing to spend, nothing to correct;
+    /// - **pointer/window plumbing** (`MouseMoved`, `MouseUp`,
+    ///   `MouseEntered`/`MouseLeft`, `WindowResized`, `WindowFocused`,
+    ///   `DpiChanged`, `WindowStateChanged`) — *leaves the guard armed*.
+    ///   None of these is "the user moved on": `MouseUp` in particular is
+    ///   the release half of the reveal's *own* click and arrives before
+    ///   the stale click ever could, so spending the guard on it would
+    ///   disable the fix outright. A pointer drifting a cell or a terminal
+    ///   resize is not an interaction either.
+    /// - **everything else** (a keystroke, an accelerator, a scroll, a
+    ///   double-click, a paste, a drop, and any variant quadraui adds
+    ///   later) — *spends* the guard without correcting anything. The
+    ///   user did something other than the stale muscle-memory click, so
+    ///   the window has closed. Defaulting new variants to "spend" is the
+    ///   safe direction: the worst case is that one stale click stops
+    ///   being corrected (a missed fix), where the opposite default risks
+    ///   a live guard swallowing a deliberate `File` click (a regression).
+    fn consume_hamburger_stale_click_guard(&mut self, event: &UiEvent) -> bool {
+        if !self.engine.hamburger_stale_click_guard {
+            return false;
+        }
+        match event {
+            UiEvent::MouseDown { .. } => {
+                self.engine.hamburger_stale_click_guard = false;
+                true
+            }
+            UiEvent::MouseUp { .. }
+            | UiEvent::MouseMoved { .. }
+            | UiEvent::MouseEntered { .. }
+            | UiEvent::MouseLeft { .. }
+            | UiEvent::WindowResized { .. }
+            | UiEvent::WindowFocused(_)
+            | UiEvent::DpiChanged(_)
+            | UiEvent::WindowStateChanged { .. } => false,
+            _ => {
+                self.engine.hamburger_stale_click_guard = false;
+                false
+            }
+        }
+    }
+
+    /// #1029: spend [`Engine::hamburger_stale_click_guard`] on the
+    /// *shell-consumed* path — the half [`Self::handle`] can never see.
+    ///
+    /// `ShellAdapter::handle` hit-tests the activity bar itself; when a
+    /// click lands on a real panel icon (Explorer, Search, Git, an
+    /// extension panel) or the sidebar divider, it reports the semantic
+    /// [`quadraui::AppShellEvent`] through `on_shell_event_ctx` and
+    /// **returns without falling through to `Self::handle`** (see
+    /// [`Self::on_shell_event`]'s doc). Those clicks are exactly as much
+    /// "the user moved on" as a keystroke is, so the guard has to die here
+    /// too — the review's blocking scenario was reveal → click Search →
+    /// click `File`, where the middle click never reached `handle` and the
+    /// still-armed guard then swallowed the `File` click.
+    ///
+    /// Not called for the hamburger's own `PanelChanged` (that arm *arms*
+    /// the guard), nor for the `suppress_shell_panel_echo` echoes
+    /// `take_requested_panel` provokes — those are the app reconciling the
+    /// runner against the shadow, not user input, and one of them fires
+    /// immediately after every hamburger reveal.
+    fn disarm_hamburger_stale_click_guard(&mut self) {
+        self.engine.hamburger_stale_click_guard = false;
+    }
 }
 
 impl ShellApp for TuiShellApp {
@@ -1768,12 +2062,18 @@ impl ShellApp for TuiShellApp {
         // round-trip, and an unsound dangling-pointer registration),
         // not just redundant work.
         if self.live {
-            // Mirrors `event_loop`'s once-computed `keyboard_enhanced`
-            // query (`mod.rs:696`) — same call, same fallback, just moved
-            // to run once here instead of in the wrapper, since by this
-            // point `self` has reached the stable address the SAFETY note
-            // below also depends on.
-            self.keyboard_enhanced = supports_keyboard_enhancement().unwrap_or(false);
+            // #1109: was a direct call to crossterm's keyboard-enhancement-
+            // support probe (a blocking round-trip) duplicating a probe
+            // `quadraui::tui::run::run` already performs before `setup()`
+            // ever runs (`push_keyboard_enhancement` + `set_kitty_keyboard`,
+            // `quadraui/src/tui/run.rs`) — a second rule-6 escape-sequence
+            // reach-past on top of a redundant round-trip. `backend_caps()`
+            // just reads the value quadraui already computed live, so this
+            // stays inside `if self.live` not because the read itself could
+            // hang (it can't — no I/O), but so `keyboard_enhanced` keeps its
+            // documented `false` default under `driver_with_shell`, where
+            // `TuiBackend` never went through the live runner's probe at all.
+            self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
 
             // SAFETY: `run_with_shell` → `build_shell_adapter` →
             // `tui::run::run`'s own `mut app: A` local is what finally
@@ -1802,6 +2102,15 @@ impl ShellApp for TuiShellApp {
         // See the module doc's gap (1) for exactly what's still deferred
         // (quickfix/bottom panel #608, dividers/drag-overlay/tab-tooltip
         // #609, cursor placement #604) and why.
+        //
+        // #1029: re-bound (not mutated in place — `layout` stays a plain
+        // `&AppShellLayout` so every downstream `layout.field` read and
+        // every call site that forwards `layout` on unchanged) to the
+        // hamburger-corrected copy. See
+        // [`Self::reclaim_hamburger_sidebar_reservation`]'s own doc for why
+        // this is needed at all.
+        let corrected_layout = self.reclaim_hamburger_sidebar_reservation(layout);
+        let layout = &corrected_layout;
         let theme = self.theme();
 
         // ── Per-frame nerd-font sync ─────────────────────────────────────
@@ -1835,6 +2144,14 @@ impl ShellApp for TuiShellApp {
         };
 
         backend.set_theme(super::quadraui_tui::q_theme(&theme));
+
+        // Per-window/separated status-bar hit zones (#1250), the TUI twin of
+        // GTK's identical top-of-frame `status_segment_map` clear: cleared
+        // here and re-populated per band below, so a window that closes (or
+        // a separated line that stops painting) doesn't leave a stale, now-
+        // wrong entry keyed by its id.
+        self.status_segment_map.borrow_mut().clear();
+        self.separated_status_bar_rect.set(None);
 
         let screen = build_screen_for_shell_content(&self.engine, &theme, area, backend);
 
@@ -1871,7 +2188,7 @@ impl ShellApp for TuiShellApp {
         // generic single-drawer `BottomPanelController`, a different shape
         // than vimcode's stacked chrome, and unwired for `TuiShellApp`
         // regardless — always `None` here).
-        let chrome = bottom_chrome_rects_for_shell_content(&self.engine, &screen, area);
+        let chrome = bottom_chrome_rects_for_shell_content(&self.engine, area);
 
         // ─────────────────────────────────────────────────────────────────
         // #605 (Stage 6 parity sweep): the rest of `draw_frame`'s tail, in
@@ -1962,6 +2279,40 @@ impl ShellApp for TuiShellApp {
         presence.toast_stack = toast_stack.is_some();
         presence.folder_picker = self.folder_picker.is_some();
 
+        // #1117: `presence.sidebar_panel` (derived above, straight from
+        // `layout.sidebar_content_bounds`) is the exact gate
+        // `render::compose_frame` uses to decide whether `FrameOp::SidebarPanel`
+        // is even in this frame's op list — when it's `false`, that rung's
+        // own arm below never runs, so it can never reset `explorer_tree_rect`
+        // itself (an `else` branch inside that arm is dead code for a
+        // *hidden* sidebar, precisely the frame that needs the reset; the
+        // in-arm branch only ever ran for panels other than Explorer, e.g.
+        // Search, which was already a no-op). This has to run here, once,
+        // unconditionally, ungated by which rungs end up composed. Without
+        // it `explorer_tree_rect` — a plain `Cell` only ever *set* when the
+        // tree actually paints — keeps reporting the last position it was
+        // painted at for as long as the sidebar stays hidden, which is
+        // exactly the staleness `handle_mouse_event`'s `TreeController`
+        // intercept relies on this being fixed to have converged onto the
+        // shared `rect.width > 0.0` predicate GTK's `explorer_ui_event`
+        // uses (see that intercept's own comment).
+        if !presence.sidebar_panel {
+            self.engine
+                .explorer_tree_rect
+                .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        }
+
+        // #955 review fix — the same #1117 shape one paragraph up, for the
+        // change-review surface's full-viewport `ModalStack` entry.
+        // `presence.change_review` gates `FrameOp::ChangeReview` out of the
+        // op list the moment the surface closes, so that rung's arm can never
+        // pop its own entry (an `else` there is dead code on precisely the
+        // frame that needs it). A stuck entry is worse than a stale rect:
+        // `ShellAdapter::handle` hit-tests the modal stack *before* any chrome
+        // dispatch, so every later click would bypass the activity bar,
+        // sidebar resize and menu bar for the rest of the session.
+        render::reconcile_change_review_modal_stack(backend, presence.change_review, win_q);
+
         let mut composed: Vec<render::FrameOp> = Vec::new();
         for op in render::compose_frame(&presence) {
             match op {
@@ -2011,6 +2362,7 @@ impl ShellApp for TuiShellApp {
                     if let Some(sb) = layout.sidebar_content_bounds {
                         render_sidebar_content(
                             backend,
+                            &screen,
                             to_cell_rect(sb),
                             &self.sidebar,
                             &self.engine,
@@ -2036,12 +2388,17 @@ impl ShellApp for TuiShellApp {
                 // ── Global status bar ────────────────────────────────────
                 render::FrameOp::StatusBar => {
                     if let Some(ref bar) = screen.global_status_bar {
-                        let _ = render::paint_global_status_bar_rung(
+                        let sb_layout = render::paint_global_status_bar_rung(
                             backend,
                             &self.engine,
                             bar,
                             to_q_rect(chrome.status),
                         );
+                        // #1250: same zone recovery as the per-window and
+                        // separated bars above, mirroring GTK's
+                        // `App::global_status_zones`.
+                        *self.global_status_zones.borrow_mut() =
+                            render::status_bar_zones_from_layout(&sb_layout);
                         composed.push(render::FrameOp::StatusBar);
                     }
                 }
@@ -2148,7 +2505,7 @@ impl ShellApp for TuiShellApp {
                             &render::TUI_TAB_SWITCHER_SIZING,
                         ) {
                             let list =
-                                render::tab_switcher_to_quadraui_list_view(ts, geo.max_visible);
+                                render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
                             backend.draw_list(geo.bounds, &list);
                             *self.tab_switcher_popup_rect.borrow_mut() = Some(geo.bounds);
                             composed.push(render::FrameOp::TabSwitcher);
@@ -2205,6 +2562,27 @@ impl ShellApp for TuiShellApp {
                     }
                 }
 
+                // ── Change-review surface (#955, shared with #525) ───────
+                // `render::paint_change_review_rung` is the whole body —
+                // no TUI-specific diff rendering, matching GTK's identical
+                // arm. The surface's modal-stack entry is reconciled
+                // *before* the walk (see there), not from an `else` here —
+                // this arm cannot run on a frame where the surface is
+                // closed, since `presence.change_review` gates the rung out
+                // of the op list entirely.
+                render::FrameOp::ChangeReview => {
+                    if let Some(review) = screen.change_review.as_ref() {
+                        render::paint_change_review_rung(
+                            backend,
+                            &self.engine,
+                            review,
+                            win_q,
+                            &theme,
+                        );
+                        composed.push(render::FrameOp::ChangeReview);
+                    }
+                }
+
                 // ── Modal dialog ─────────────────────────────────────────
                 // Above the context menu, matching
                 // `route_modal_overlay_click`'s own arbitration: once a dialog
@@ -2248,13 +2626,21 @@ impl ShellApp for TuiShellApp {
         // moved in rather than cloned.
         //
         // Also mirrors `mod.rs:1164`-`:1169`'s popup-disappearance tracking.
-        // The legacy loop followed it with `terminal.clear()`; the shell
-        // runner owns the `Terminal` and exposes no repaint hook, so the flag
-        // is kept (cheap, and the state it records is real) while the clear
-        // itself is an upstream gap — see the Ctrl+L note in
-        // `handle_key_pressed`.
-        self.had_popup_overlay
-            .set(screen.picker.is_some() || self.folder_picker.is_some());
+        // The legacy loop followed it with `terminal.clear()`. #1243 gives
+        // this its reader back: `Backend::request_full_repaint`
+        // (quadraui#1037) is the hook that was missing when this field was
+        // first added — a popup (the picker or the folder-picker modal)
+        // that was up last frame and is gone this frame can leave stale
+        // glyphs in cells the popup itself painted over and the app's own
+        // content never touches, which an ordinary incremental diff skips
+        // because it still believes those cells match. Only the *closing*
+        // transition needs the hook — a popup staying open or newly opening
+        // paints its own content this frame regardless.
+        let popup_open_now = screen.picker.is_some() || self.folder_picker.is_some();
+        if render::popup_overlay_closed_this_frame(self.had_popup_overlay.get(), popup_open_now) {
+            backend.request_full_repaint();
+        }
+        self.had_popup_overlay.set(popup_open_now);
         *self.last_layout.borrow_mut() = Some(screen);
     }
 
@@ -2264,6 +2650,19 @@ impl ShellApp for TuiShellApp {
         backend: &mut dyn quadraui::Backend,
         ctx: &ShellContext<'_>,
     ) -> Reaction {
+        // ── #1029 (review, fix iteration 2): spend the one-shot
+        // stale-hamburger-corner guard here, at the very top ─────────────
+        // Deliberately *before* the labelled block below, not inside it:
+        // `'dispatch` has a dozen early exits (panel accelerators, dialogs,
+        // the `MenuSystem` intercept, …) and any one of them taken before
+        // the corner check would leave the guard armed for an arbitrarily
+        // later click — the exact "not truly one-shot" defect the review
+        // blocked on. Evaluating it up here makes "the guard covers
+        // *exactly* the next `MouseDown` to reach `Self::handle`" true by
+        // construction, independent of which arm the event ends up in.
+        // See [`Self::consume_hamburger_stale_click_guard`].
+        let stale_hamburger_corner_click = self.consume_hamburger_stale_click_guard(&event);
+
         // The dispatch below has several early exits; a labelled block (not
         // bare `return`s) is what keeps the title-bar sync that follows
         // reachable on *every* one of them, including any arm added later.
@@ -2313,6 +2712,124 @@ impl ShellApp for TuiShellApp {
                                 self.engine.menu_bar_visible = true;
                             }
                         }
+                    }
+                }
+            }
+
+            // ── #1029 (defect 1 of #988): stale hamburger-corner click ──────
+            // hides the menu bar again instead of falling into the
+            // `MenuSystem` intercept just below ────────────────────────────
+            //
+            // Revealing the menu bar shifts the whole activity bar —
+            // hamburger included — down one row to make room for the now
+            // full-width title bar. A second click at the *exact screen
+            // position* that revealed it (what a user's muscle memory
+            // reaches for — nothing about the click itself tells you the
+            // button under it moved) lands one row too high: on
+            // `title_bar_bounds`, not `activity_bar_bounds`. `AppShell`'s
+            // own hit-test (in `ShellAdapter::handle`, upstream of this
+            // method) already rejected it as `Ignored` for exactly that
+            // reason — this event only reaches `Self::handle` at all
+            // because of that rejection. Left alone it falls straight into
+            // the `MenuSystem` intercept below, which opens whatever menu
+            // happens to be painted at that column — "File", at the
+            // default sidebar/activity-bar width — the strictly-worse
+            // symptom #988 reports: not just "the click missed", but "the
+            // click opened an unrelated dropdown and left the menu bar
+            // open".
+            //
+            // **Review (fix iteration 1): position alone is not enough.**
+            // Once the menu bar is visible, row 0 (`title_bar_bounds`) *is*
+            // the menu bar, and its first item, "File", paints at exactly
+            // the same columns (`[ab.x, ab.x + ab.width)`) this check tests
+            // — the hamburger's old corner and "File"'s label fully
+            // overlap. A purely positional, stateless check (the original
+            // shape of this fix) can't tell "the one stale muscle-memory
+            // click the reveal just left behind" apart from "a deliberate
+            // click on `File`, five minutes later" — it fired for *every*
+            // left-click landing there for as long as the menu bar stayed
+            // open, permanently breaking mouse access to `File`. Gated
+            // here, additionally, on `Engine::hamburger_stale_click_guard`
+            // — a one-shot flag armed only by the hamburger's own reveal
+            // (`on_shell_event`'s `PanelChanged` arm) and spent by the very
+            // next user interaction on *any* path, hit or miss. That bounds
+            // the corner-check to the single click immediately following a
+            // reveal — the click this issue is actually about — instead of
+            // every click for the rest of the menu bar's lifetime; a later,
+            // deliberate click on `File` finds the guard already spent and
+            // falls through to the `MenuSystem` intercept below like any
+            // other menu click.
+            //
+            // **Review (fix iteration 2): "the very next click" has to mean
+            // every path, not just this one.** The guard's spend used to
+            // live inside this block, so only a `MouseDown` that actually
+            // *reached* this dispatch could clear it. Two ordinary
+            // interactions bypass it entirely: a click on a real
+            // activity-bar panel icon (Search/Explorer/Git/an extension
+            // panel) is consumed upstream by `ShellAdapter`'s own hit-test
+            // and reported as `AppShellEvent::PanelChanged`, which
+            // `ShellAdapter::handle` returns from without ever falling
+            // through to `Self::handle` (see `Self::on_shell_event`'s doc);
+            // and a keystroke that hits one of `'dispatch`'s earlier early
+            // exits never got here either. Either one left the guard armed
+            // indefinitely, so a genuine `File` click arriving *afterwards*
+            // was still misread as the stale corner — the same regression
+            // iteration 1 blocked on, reached by a different route. The
+            // spend now happens in exactly two places, both outside this
+            // block: [`Self::consume_hamburger_stale_click_guard`] at the
+            // top of `handle` (every event on the `Self::handle` path) and
+            // [`Self::disarm_hamburger_stale_click_guard`] in
+            // `Self::on_shell_event` (every event on the shell-consumed
+            // path). This block only *reads* the decision they made.
+            //
+            // Recognised structurally, not by remembering the stale
+            // coordinate: a `MouseDown` inside `title_bar_bounds` (the row
+            // the reveal itself carved out) whose column still falls
+            // within the activity bar's own width is, spatially, exactly
+            // the corner the hamburger painted in the frame before this
+            // one — one row above where it paints now. Gated on
+            // `menu_bar_visible` so this can never fire while the title
+            // bar is hidden (there is no such corner to reclaim then, and
+            // a genuine click on hidden-activity-bar row 0 already reaches
+            // the hamburger through `AppShell`'s own hit-test upstream).
+            //
+            // Mirrors the hamburger's own `SidebarHidden` handling
+            // (`Self::on_shell_event_ctx`): drops `menu_bar_visible`, pushes
+            // the title-bar hide through `ctx`, and hides the runner's own
+            // `AppShell` sidebar too so a later real click on the hamburger
+            // — now back at its un-shifted row-0 position — resolves as a
+            // fresh reveal rather than `AppShell::handle_activity_click`
+            // wrongly believing it's already open.
+            if stale_hamburger_corner_click && self.engine.menu_bar_visible {
+                // `stale_hamburger_corner_click` is only ever `true` for a
+                // `MouseDown` (see the helper), so this pattern always
+                // matches — it is how the position is read, not a second
+                // filter. Deliberately **button-agnostic** (review, fix
+                // iteration 2): gating on `Left` alone meant a non-`Left`
+                // press spent the one-shot guard "without correcting
+                // anything", and the alternative — letting a right-click
+                // leave the guard armed — is worse, since the *next* left
+                // click could then be a deliberate `File` click and would
+                // be swallowed. Any press landing on the hamburger's stale
+                // corner within the one-shot window is treated as the
+                // stale click; a press of any button there has no other
+                // meaning (a right-click on the `File` label does not open
+                // a context menu — it would fall into the `MenuSystem`
+                // intercept and open `File`'s dropdown, which is exactly
+                // the #988 symptom).
+                if let UiEvent::MouseDown { position, .. } = &event {
+                    let viewport = backend.viewport();
+                    let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+                    let layout = ctx.shell().layout(area, backend.line_height());
+                    let ab = layout.activity_bar_bounds;
+                    let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
+                        && position.x >= ab.x
+                        && position.x < ab.x + ab.width;
+                    if in_hamburger_corner {
+                        self.engine.menu_bar_visible = false;
+                        ctx.shell_mut().hide_sidebar();
+                        ctx.shell_mut().set_title_bar_visible(false);
+                        break 'dispatch Reaction::Redraw;
                     }
                 }
             }
@@ -2375,8 +2892,19 @@ impl ShellApp for TuiShellApp {
                     quadraui::MenuEvent::Activated(id) => {
                         let action = id.as_str().to_string();
                         if action == "open_file_dialog" {
-                            self.engine
-                                .open_picker(crate::core::engine::PickerSource::Files);
+                            // #1125: was `open_picker(PickerSource::Files)`
+                            // (an in-canvas fuzzy finder, not a real "Open
+                            // File" dialog) — now the shared native-dialog
+                            // rung both backends use (`render.rs`). `backend`
+                            // is already in scope here, so TUI calls it
+                            // synchronously; no GTK-style `tick()` deferral
+                            // needed (see the rung's header comment).
+                            if render::run_open_file_dialog(&mut self.engine, backend).is_some() {
+                                self.engine.explorer_rebuild_rows();
+                                if let Some(path) = self.engine.file_path().cloned() {
+                                    self.engine.explorer_reveal_path(&path);
+                                }
+                            }
                         } else {
                             // #634: `dispatch_menu_action` returns an
                             // `EngineAction` the engine can't complete on its
@@ -2406,6 +2934,7 @@ impl ShellApp for TuiShellApp {
                                 viewport.width as u16,
                                 viewport.height as u16,
                                 self.sidebar_width,
+                                backend,
                             ) {
                                 break 'dispatch Reaction::Exit;
                             }
@@ -2586,7 +3115,43 @@ impl ShellApp for TuiShellApp {
         // every dispatch, unconditionally and idempotently.
         let shadow_visible = self.engine.app_shell.sidebar_visible();
         let runner_visible = ctx.shell().sidebar_visible();
-        if runner_visible != shadow_visible {
+        // #1029 (defect 2 of #988): the hamburger is special-cased out of
+        // this sync entirely while it's the reveal actually in effect.
+        // `engine.app_shell` — the shadow this sync otherwise mirrors —
+        // has no hamburger `PanelDefinition` at all (see
+        // `Self::on_shell_event`'s `PanelChanged` arm doc): it's registered
+        // only on the *runner's* `AppShell` (`Self::shell_config`), so
+        // `shadow_visible` can never reflect a hamburger reveal — it's
+        // always whatever the last *real* panel click left behind. Without
+        // this guard, the very next dispatch after a hamburger click (the
+        // `WindowFocused` pump every caller issues to land other syncs, or
+        // any other unrelated keypress) reads that stale `false` and force-
+        // hides the runner's own sidebar in response — leaving
+        // `active_panel == Some(hamburger)` but `sidebar_visible == false`
+        // by the time a second click lands. That permanently blocks
+        // `AppShell::handle_activity_click`'s "already active + visible →
+        // hide" branch for the hamburger: every click, first or Nth,
+        // resolves as a fresh `PanelChanged` reveal, never a
+        // `SidebarHidden` — the second click that's supposed to hide the
+        // menu bar again does nothing (#988).
+        //
+        // Gated on `engine.menu_bar_visible` too, not just "is the runner
+        // showing the hamburger" — `AppShell::new` defaults `active_panel`
+        // to index 0, which the hamburger occupies (`Self::shell_config`
+        // puts it first), so a *fresh* runner starts "showing the
+        // hamburger" before any click ever happens. `menu_bar_visible`
+        // is what distinguishes an actual, user-driven reveal from that
+        // construction-time default — without it, this guard would also
+        // suppress the very first dispatch's correction of `AppShell::new`'s
+        // own `sidebar_visible: true` default, leaving a phantom "Menu"
+        // sidebar pane reserved forever.
+        let runner_shows_hamburger = self.engine.menu_bar_visible
+            && ctx
+                .shell()
+                .active_panel_id()
+                .map(quadraui::WidgetId::as_str)
+                == Some(HAMBURGER_PANEL_ID);
+        if runner_visible != shadow_visible && !runner_shows_hamburger {
             if shadow_visible {
                 // #557: while a plugin panel is open the shadow's
                 // active-panel id still names the built-in that preceded it
@@ -2705,10 +3270,56 @@ impl ShellApp for TuiShellApp {
     /// the sync itself, on the same frame the click fires, closing that
     /// gap without waiting for a second event.
     fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
+        // first — see `render::sync_shell_event_shadow`'s rung comment for
+        // why this call has to come before any of the id-specific branching
+        // below (including the hamburger check right after it) rather than
+        // be repeated, or omitted, inside each arm. #988 was exactly a
+        // hamburger `return` reached before an equivalent statement used to
+        // exist here at all.
+        render::sync_shell_event_shadow(event, &mut self.engine, &TuiShellShadowHost);
         match event {
             quadraui::AppShellEvent::PanelChanged { panel_id } => {
                 if panel_id.as_str() == HAMBURGER_PANEL_ID {
+                    // #1029 (review, fix iteration 1): arm the stale-corner
+                    // one-shot guard only on a genuine reveal (the
+                    // `false -> true` transition), not on every echo
+                    // `ShellAdapter` re-fires through this same arm after
+                    // each `handle()`/`tick()` poll (`take_requested_panel`'s
+                    // doc above) — those see `menu_bar_visible` already
+                    // `true` and must NOT keep re-arming the guard, or it
+                    // would stay armed indefinitely and reproduce the exact
+                    // "fires for as long as the menu bar stays visible" bug
+                    // the guard exists to bound. See
+                    // `Engine::hamburger_stale_click_guard`'s own doc for
+                    // the full guard lifecycle.
+                    let just_revealed = !self.engine.menu_bar_visible;
                     self.engine.menu_bar_visible = true;
+                    if just_revealed {
+                        self.engine.hamburger_stale_click_guard = true;
+                    }
+                    // #1029 (defect 2 of #988): deliberately does NOT mirror
+                    // this onto the shadow `engine.app_shell` the way the
+                    // real-panel branch below does for its own click —
+                    // `engine.app_shell` has no hamburger `PanelDefinition`
+                    // at all (`Self::shell_config`, which the hamburger
+                    // panel *is* registered on, builds the *runner's*
+                    // `AppShell`; the shadow is built separately, in
+                    // `Engine::new`, from only the real content panels), so
+                    // `AppShell::show_panel(panel_id)` here would be a
+                    // silent no-op — it searches `self.panels` for a match
+                    // and finds none. The end-of-`handle` runner/shadow
+                    // visibility sync (`Self::handle`, "keep the runner
+                    // AppShell's sidebar visibility == the shadow's") is
+                    // where the hamburger's special-casing actually lives:
+                    // it skips itself entirely while `engine.menu_bar_visible`
+                    // is true and the runner's active panel is the
+                    // hamburger, so the runner's own `sidebar_visible` (set
+                    // by `handle_activity_click`, same as any other panel's
+                    // click) is never force-hidden behind the shadow's back.
+                    // See that guard's own doc comment for why the
+                    // hamburger needed a *different* fix shape than every
+                    // other panel here.
                     // The runner's `AppShell` now points at the hamburger
                     // (`handle_activity_click` treats it as an ordinary
                     // panel). Recording that here makes the next
@@ -2737,6 +3348,13 @@ impl ShellApp for TuiShellApp {
                     if std::mem::take(&mut self.suppress_shell_panel_echo) {
                         return;
                     }
+                    // #1029 (review, fix iteration 2): a genuine extension-panel
+                    // icon click — `ShellAdapter` consumed the `MouseDown`, so
+                    // `Self::handle` never sees it and can't spend the
+                    // stale-corner guard. Spend it here. (Below the echo check
+                    // on purpose: a suppressed echo is our own reconciliation,
+                    // not user input.)
+                    self.disarm_hamburger_stale_click_guard();
                     self.activate_ext_panel(&name);
                     return;
                 }
@@ -2744,8 +3362,20 @@ impl ShellApp for TuiShellApp {
                     // Echo of our own `take_requested_panel` reconciliation
                     // (see that method): the engine already holds this
                     // state — don't re-run the click path and steal focus.
+                    // Deliberately *before* the guard spend just below: a
+                    // hamburger reveal provokes exactly one of these echoes
+                    // on the very next poll (see the hamburger arm above),
+                    // and spending the guard on it would kill the #1029 fix
+                    // before the stale click could ever arrive.
                     return;
                 }
+                // #1029 (review, fix iteration 2): the review's blocking
+                // scenario — reveal, then click Search/Explorer/Git, then
+                // click `File`. This middle click is consumed upstream by
+                // `ShellAdapter` and never reaches `Self::handle`, so
+                // without this the guard stayed armed and the later `File`
+                // click was misread as the stale hamburger corner.
+                self.disarm_hamburger_stale_click_guard();
                 // ── #634 smoke retry: a real activity-bar click ─────────
                 // `ShellAdapter` consumed the `MouseDown` and only reports
                 // this semantic event, so the legacy `mouse::handle_mouse`
@@ -2758,10 +3388,14 @@ impl ShellApp for TuiShellApp {
                 // Mirrors `mouse.rs`'s `target_panel_id` arm minus the
                 // toggle decision (the runner already made it: a
                 // same-panel-while-visible click arrives as
-                // `SidebarHidden`, not `PanelChanged`).
+                // `SidebarHidden`, not `PanelChanged`). The
+                // `ext_panel_active`/`ext_panel_has_focus` clear now happens
+                // unconditionally in `render::sync_shell_event_shadow`,
+                // above — `focus_sidebar_panel` still owns the extra
+                // TUI-only bookkeeping (`clear_sidebar_focus`,
+                // per-panel focus flag, session) that has no GTK equivalent
+                // (GTK gets real widget focus from the toolkit instead).
                 self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
                 self.engine.focus_sidebar_panel(panel_id.as_str());
                 self.sidebar.has_focus = true;
             }
@@ -2772,30 +3406,55 @@ impl ShellApp for TuiShellApp {
             // `mouse::handle_mouse` hit tests, autohide, session
             // persistence) don't keep believing the sidebar is open.
             quadraui::AppShellEvent::SidebarHidden => {
+                // #1029 (defect 2 of #988): a `SidebarHidden` for the
+                // hamburger itself is intercepted and fully handled by
+                // `Self::on_shell_event_ctx` *before* it ever reaches this
+                // ctx-less method — this arm only ever sees a real panel's
+                // second click. (It has to be handled there rather than
+                // here: telling the two apart needs `ctx.shell()`'s
+                // `active_panel_id()`, the *runner's* state, which isn't
+                // reachable from this deprecated, ctx-less signature — the
+                // shadow `engine.app_shell` this arm reads below never
+                // learns about the hamburger at all, see the `PanelChanged`
+                // arm above.)
                 // #557: this is also how a *second* click on an open
                 // extension panel's icon arrives, so drop the plugin-panel
                 // state here too — `mouse.rs`'s `ExtensionPanel` arm clears
                 // the same three fields in its own hide branch. Leaving them
                 // set would make `take_requested_panel` keep steering the
                 // runner back onto a panel whose sidebar the user just closed.
+                // The `ext_panel_active`/`ext_panel_has_focus` half of that
+                // clear (plus `app_shell.hide_sidebar()` itself) now runs
+                // unconditionally in `render::sync_shell_event_shadow`,
+                // above; `collapse_sidebar()` below is TUI's own superset —
+                // it additionally clears every *other* sidebar-panel focus
+                // flag and persists the session, neither of which GTK's
+                // widget-focus model needs.
+                // #1029 (review, fix iteration 2): another shell-consumed
+                // user click that never reaches `Self::handle` — spend the
+                // stale-corner guard.
+                self.disarm_hamburger_stale_click_guard();
                 self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
                 self.engine.collapse_sidebar();
             }
-            // ── #634 smoke retry: the Settings cog is registered as a
-            // *bottom item* (`shell_config`), and `AppShell` doesn't run
-            // its panel toggle for those — it only reports the click. Run
-            // the legacy toggle on the shadow (same call `mouse.rs`'s
-            // `ActivityBarTarget::Settings` arm made); the end-of-`handle`
-            // visibility sync + `take_requested_panel` then carry the
-            // result back to the runner's `AppShell`.
-            quadraui::AppShellEvent::BottomItemClicked { id } if id.as_str() == PANEL_SETTINGS => {
-                self.sidebar.ext_panel_name = None;
-                self.engine.ext_panel_has_focus = false;
-                self.engine.ext_panel_active = None;
-                self.engine.toggle_sidebar_panel(PANEL_SETTINGS);
-                if self.engine.app_shell.sidebar_visible() {
+            // ── #634 smoke retry, generalised by #1057: bottom items
+            // (`shell_config`'s "bottom:*" ids, currently just Settings)
+            // are registered as *bottom items*, and `AppShell` doesn't run
+            // its panel toggle for those — it only reports the click, for
+            // every click, not just the second one. #1057 found GTK's own
+            // `BottomItemClicked` arm skipping the toggle entirely
+            // (always `show_panel`, never hide) while this arm ran it —
+            // the two backends disagreed on whether a second click on the
+            // active bottom item collapses the sidebar. VS Code collapses
+            // it, so that's the converged behaviour; run it through
+            // `render::apply_activity_panel_switch`, the same shared call
+            // `activate_ext_panel` and GTK's `switch_panel` already use,
+            // rather than hand-rolling the toggle again here.
+            quadraui::AppShellEvent::BottomItemClicked { id } => {
+                self.disarm_hamburger_stale_click_guard();
+                let switched = render::apply_activity_panel_switch(&mut self.engine, id.as_str());
+                self.sidebar.ext_panel_name = switched.ext_panel;
+                if switched.sidebar_visible {
                     self.sidebar.has_focus = true;
                 }
             }
@@ -2803,11 +3462,27 @@ impl ShellApp for TuiShellApp {
             // the way out — when `AppShell` resolves its *own* divider drag
             // it reports the settled width here, and vimcode's copy has to
             // follow or the next `handle()` would immediately push the stale
-            // value back and undo the drag.
+            // value back and undo the drag. `render::sync_shell_event_shadow`
+            // above already pushed `new_width` into the shadow
+            // `engine.app_shell` (#1062 — previously nothing did, since
+            // nothing reads that copy's width back on TUI);
+            // `self.sidebar_width` here is the separate TUI-local field
+            // the column math in `tick()`/`mouse.rs` actually reads.
             quadraui::AppShellEvent::SidebarResized { new_width } => {
+                self.disarm_hamburger_stale_click_guard();
                 self.sidebar_width = new_width.round().max(0.0) as u16;
             }
-            _ => {}
+            // #1029 (review, fix iteration 2): every remaining
+            // `AppShellEvent` variant (`BottomPanelResized`,
+            // `BottomPanelHidden`, a non-Settings `BottomItemClicked`) is
+            // likewise a shell-consumed *user interaction* —
+            // `ShellAdapter::handle` only ever notifies these in response
+            // to real input, and never notifies `Consumed`/`Ignored` at
+            // all (`Ignored` is precisely what falls through to
+            // `Self::handle` instead). So spend the guard here too, and
+            // let any variant quadraui adds later default to the safe
+            // direction.
+            _ => self.disarm_hamburger_stale_click_guard(),
         }
     }
 
@@ -2839,200 +3514,139 @@ impl ShellApp for TuiShellApp {
     /// arm that ends up flipping `menu_bar_visible` gets the same
     /// same-frame guarantee for free.
     fn on_shell_event_ctx(&mut self, event: &quadraui::AppShellEvent, ctx: &ShellContext<'_>) {
+        // #1029 (defect 2 of #988): a `SidebarHidden` for the hamburger —
+        // the runner's second click on it while the menu is open, once the
+        // sync guard in `Self::handle` (see its own doc) stops force-hiding
+        // the runner's sidebar behind the reveal's back — has to be
+        // special-cased *here*, before delegating to the ctx-less
+        // `Self::on_shell_event` below, because only `ctx` can tell the
+        // hamburger apart from a real panel's own second click: the shadow
+        // `engine.app_shell` `on_shell_event` reads has no hamburger
+        // `PanelDefinition` at all (see that method's `PanelChanged` arm),
+        // so it can never answer "was that the hamburger?" — only the
+        // *runner's* `AppShell`, reachable through `ctx.shell()`, knows.
+        // Flips the one piece of state a hamburger close needs
+        // (`engine.menu_bar_visible`) and returns *without* running the
+        // generic `SidebarHidden` arm's shadow-sidebar bookkeeping
+        // (`collapse_sidebar`, ext-panel-state clearing) — none of that
+        // applies here, since the reveal never touched the shadow in the
+        // first place.
+        if matches!(event, quadraui::AppShellEvent::SidebarHidden)
+            && ctx
+                .shell()
+                .active_panel_id()
+                .map(quadraui::WidgetId::as_str)
+                == Some(HAMBURGER_PANEL_ID)
+        {
+            // #1029 (review, fix iteration 2): the menu bar is closing, so
+            // there is no stale corner left to reclaim — spend the guard
+            // rather than carry it across into the next reveal.
+            self.disarm_hamburger_stale_click_guard();
+            self.engine.menu_bar_visible = false;
+            ctx.shell_mut().set_title_bar_visible(false);
+            return;
+        }
         #[allow(deprecated)]
         self.on_shell_event(event);
+        // #1356 (quadraui bump for quadraui#1055): mirrors the identical
+        // GTK fix in `App::on_shell_event_ctx` — a bottom item's click
+        // never moves the *real* `AppShell` on its own (the
+        // `BottomItemClicked` arm above only toggles the engine-side
+        // shadow via `render::apply_activity_panel_switch`); `show_panel`
+        // now accepts a bottom item's id, but an app has to opt in
+        // explicitly from its own `BottomItemClicked` handler — exactly
+        // what quadraui's own `AppShellDemo` does. Without this, the
+        // runner's own `AppShell` never learns Settings now owns the
+        // sidebar, and the header stays stuck on whatever top panel was
+        // open before.
+        if let quadraui::AppShellEvent::BottomItemClicked { id } = event {
+            if self.engine.app_shell.sidebar_visible() {
+                ctx.shell_mut().show_panel(id);
+            } else {
+                ctx.shell_mut().hide_sidebar();
+            }
+        }
         ctx.shell_mut()
             .set_title_bar_visible(self.engine.menu_bar_visible);
     }
 
     fn tick(&mut self, backend: &mut dyn quadraui::Backend) -> Reaction {
-        let mut needs_redraw = false;
-
-        // ── Per-frame viewport sync (mirrors `mod.rs:916`-`:967`) ───────────
-        // `event_loop` reads `terminal.size()`; the runner keeps
-        // `backend.viewport()` in sync every frame via `begin_frame`, so it
-        // is an exact substitute.
-        let viewport = backend.viewport();
-        let (vw, vh) = (viewport.width as u16, viewport.height as u16);
-        {
-            let engine = &mut self.engine;
-            let qf_rows: u16 = if engine.quickfix_open { 6 } else { 0 };
-            let trm_rows: u16 = if engine.terminal_open || engine.bottom_panel_open {
-                let target = terminal_target_maximize_rows_tui(engine, vh);
-                engine.effective_terminal_panel_rows(target) + 2
-            } else {
-                0
-            };
-            let menu_row: u16 = if engine.menu_bar_visible { 1 } else { 0 };
-            let dbg_row: u16 = if engine.debug_toolbar_visible { 1 } else { 0 };
-            let wm_row: u16 = if !engine.wildmenu_items.is_empty() {
-                1
-            } else {
-                0
-            };
-            let content_rows =
-                vh.saturating_sub(2 + qf_rows + trm_rows + menu_row + dbg_row + wm_row);
-            let gutter_approx = 4u16;
-            let sb_visible = engine.app_shell.sidebar_visible();
-            let sidebar_cols = if sb_visible {
-                self.sidebar_width + 1
-            } else {
-                0
-            };
-            let ab_w = if engine.settings.autohide_panels && !sb_visible {
-                0
-            } else {
-                ACTIVITY_BAR_WIDTH
-            };
-            let content_cols = vw.saturating_sub(ab_w + sidebar_cols + gutter_approx);
-            let show_breadcrumbs = engine.settings.breadcrumbs && !engine.terminal_maximized;
-            let tab_bar_rows: u16 = {
-                let has_single_tab = engine.active_group().tabs.len() <= 1;
-                if engine.settings.hide_single_tab && has_single_tab {
-                    u16::from(show_breadcrumbs)
-                } else if show_breadcrumbs {
-                    2
-                } else {
-                    1
-                }
-            };
-            engine.set_viewport_lines(content_rows.saturating_sub(tab_bar_rows).max(1) as usize);
-            engine.set_viewport_cols(content_cols.max(1) as usize);
-        }
-
-        // ── Post-paint feedback from the last `render_content` (#634) ─────
-        // `event_loop` did both of these *inside* its draw block, between
-        // building the layout and the `terminal.draw` call (`mod.rs:1139`-
-        // `:1149`) and immediately after it (`:1216`-`:1266`). `render_content`
-        // is `&self` and can't touch `Engine`'s `&mut` API, so both read the
-        // caches it left behind and apply them here — the runner calls `tick`
-        // after every event batch, and returning `Reaction::Redraw` when
-        // anything moved reproduces the legacy two-pass repaint one frame
-        // later instead of within the same one.
-        {
-            let layout = self.last_layout.borrow();
-            if let Some(ref screen) = *layout {
-                // Exact per-window viewport dimensions from paint-time
-                // geometry, so `ensure_cursor_visible` uses real column
-                // counts rather than `tick`'s whole-screen approximation
-                // above (which can't see splits).
-                for rw in &screen.windows {
-                    self.engine.set_viewport_for_window(
-                        rw.window_id,
-                        rw.lines.len().max(1),
-                        rw.text_viewport_cols.max(1),
-                    );
-                }
-            }
-        }
-        {
-            // Apply the per-group tab-bar widths the paint measured and
-            // re-check that every group's active tab is on screen. Shared
-            // across backends — see `Engine::post_draw_apply_widths`.
-            let counts = self.tab_visible_counts.borrow().clone();
-            if !counts.is_empty() && self.engine.post_draw_apply_widths(&counts) {
-                needs_redraw = true;
-            }
-        }
+        // #1248: the whole-screen per-frame viewport *estimate* that used to
+        // live here (hand-summing `bottom_band_row_heights`/tab-bar/status-
+        // row reservations from the raw `backend.viewport()` size, ahead of
+        // any paint) is gone. It pre-resolved exactly what
+        // `build_screen_layout`'s real per-split accounting resolves anyway
+        // — `render::run_shared_tick_chores`'s `set_viewport_for_window` loop
+        // below applies that real geometry from the last paint every tick
+        // regardless, the same as GTK, which never had an estimate to begin
+        // with (GTK never calls `set_viewport_lines`/`set_viewport_cols` at
+        // all). Before the very first paint, `View::viewport_lines` sits at
+        // its documented sensible-default `40` (`core/view.rs`) — the same
+        // starting point GTK has always used.
 
         // ── Terminal chrome the runner doesn't own ───────────────────────
-        // Not a keyboard rung; #762 only drops the stale cross-file
-        // line-number citation it used to carry (the GTK loop it named is
-        // gone, and this has no GTK counterpart — GTK4 owns cursor shape
-        // and window title).
-        // Cursor shape per mode and the emulator window title. Both are plain
-        // escape sequences rather than anything ratatui buffers, so writing
-        // them to the shared process stdout between frames is exactly what
-        // `event_loop` did through `terminal.backend_mut()`. Live runs only:
-        // under `driver_with_shell` there is no real terminal, and emitting
-        // control sequences from a test binary would corrupt the harness'
-        // own output.
+        // Cursor shape per mode used to be a hand-rolled crossterm
+        // cursor-style write straight to the shared process stdout (an
+        // `execute!` of crossterm's own cursor-style command) — a rule-6
+        // violation (only quadraui should emit escape
+        // sequences). #1109 routed it through `backend.set_caret_shape(..)`
+        // instead: `TuiBackend`'s impl (quadraui#1015) emits the exact same
+        // DECSCUSR sequence underneath, it just no longer happens in this
+        // crate. Still live-runs-only: under `driver_with_shell` there is no
+        // real terminal, and `set_caret_shape`'s `TuiBackend` impl writes to
+        // `std::io::stdout()` unconditionally (no test-mode guard of its
+        // own — see its doc comment), so calling it outside `self.live`
+        // would corrupt the harness' own output exactly as the old
+        // hand-rolled write would have. No GTK counterpart — GTK4 owns
+        // cursor shape itself.
         if self.live {
-            let cursor_style = if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
-                SetCursorStyle::SteadyUnderScore
-            } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
-                SetCursorStyle::BlinkingBar
-            } else {
-                SetCursorStyle::SteadyBlock
+            backend.set_caret_shape(self.caret_shape_for_mode());
+        }
+
+        // #1248: the rest of this function's chores — per-window viewport
+        // sync, tab-visibility re-check, window title, yank-highlight clear,
+        // the tab-switcher popup's own auto-confirm gate, idle/SC polling,
+        // deferred format-then-quit, terminal command, ext-panel focus, and
+        // the platform-action drain — are shared with GTK's
+        // `App::handle_poll_tick` via `render::run_shared_tick_chores`. See
+        // that function's rung header comment for the full list and why the
+        // pieces in `TuiTickHost` below differ.
+        let tab_switcher_was_open = self.engine.tab_switcher_open;
+        let mut needs_redraw = {
+            let mut host = TuiTickHost {
+                sidebar: &mut self.sidebar,
+                last_layout: &self.last_layout,
+                tab_visible_counts: &self.tab_visible_counts,
+                yank_hl_deadline: &self.yank_hl_deadline,
+                tab_switcher_last_cycle: &self.tab_switcher_last_cycle,
+                last_sidebar_refresh: &self.last_sidebar_refresh,
+                exit_requested: &self.exit_requested,
+                live: self.live,
+                backend,
             };
-            let mut out = io::stdout();
-            let _ = execute!(out, cursor_style);
-            let tui_title = self
-                .engine
-                .active_buffer_name()
-                .map(|n| format!("VimCode \u{2014} {}", n))
-                .unwrap_or_else(|| "VimCode".to_string());
-            let _ = execute!(out, SetTitle(tui_title.as_str()));
-        }
+            render::run_shared_tick_chores(&mut self.engine, &mut host)
+        };
 
-        // ── Idle background work (mirrors `mod.rs:1157`-`:1247`) ───────────
-        if let Some(dl) = self.yank_hl_deadline.get() {
-            if Instant::now() >= dl {
-                self.engine.clear_yank_highlight();
-                self.yank_hl_deadline.set(None);
-                needs_redraw = true;
-            }
-        }
-
-        if self.engine.tab_switcher_open {
-            if let Some(last) = self.tab_switcher_last_cycle.get() {
-                if last.elapsed() >= Duration::from_millis(500) {
-                    self.engine.tab_switcher_confirm();
-                    self.tab_switcher_last_cycle.set(None);
-                    needs_redraw = true;
-                }
-            }
-            return if needs_redraw {
-                Reaction::Redraw
-            } else {
-                Reaction::Continue
-            };
-        }
-
-        needs_redraw |= self.engine.poll_idle();
-
-        if self.engine.format_save_quit_ready {
-            self.engine.format_save_quit_ready = false;
-            self.engine.cleanup_all_swaps();
-            self.engine.lsp_shutdown();
-            save_session(&mut self.engine);
+        if self.exit_requested.get() {
             return Reaction::Exit;
         }
 
-        if self.engine.app_shell.sidebar_visible()
-            && self.last_sidebar_refresh.get().elapsed() >= Duration::from_secs(2)
-        {
-            self.engine.explorer_rebuild_rows();
-            if self.engine.active_panel_is(PANEL_GIT) || self.engine.active_panel_is(PANEL_EXPLORER)
-            {
-                self.engine.sc_refresh();
+        // Settings-file reload and the startup message aren't part of the
+        // shared chore list — GTK's own reload additionally reloads the
+        // colorscheme's CSS (TUI has no CSS), and the startup message is a
+        // TUI-only concept (`pending_startup_msg`). Both stay gated on the
+        // tab-switcher popup, same as the rest of the list they used to sit
+        // alongside before #1248 (`TickHost::tab_switcher_gate` short-
+        // circuits `run_shared_tick_chores` the same way this used to
+        // `return` early).
+        if !tab_switcher_was_open {
+            if self.engine.check_settings_reload() {
+                needs_redraw = true;
             }
-            self.last_sidebar_refresh.set(Instant::now());
-            needs_redraw = true;
-        }
-
-        if self.engine.check_settings_reload() {
-            needs_redraw = true;
-        }
-
-        if let Some(cmd) = self.engine.pending_terminal_command.take() {
-            self.engine
-                .terminal_run_command(&cmd, vw, self.engine.session.terminal_panel_rows);
-            needs_redraw = true;
-        }
-
-        if let Some(msg) = self.pending_startup_msg.take() {
-            self.engine.message = msg;
-            needs_redraw = true;
-        }
-
-        if let Some(panel_name) = self.engine.ext_panel_focus_pending.take() {
-            self.sidebar.ext_panel_name = Some(panel_name);
-            if !self.engine.app_shell.sidebar_visible() {
-                self.engine.toggle_sidebar();
+            if let Some(msg) = self.pending_startup_msg.take() {
+                self.engine.message = msg;
+                needs_redraw = true;
             }
-            self.sidebar.has_focus = true;
-            needs_redraw = true;
         }
 
         if needs_redraw {
@@ -3040,6 +3654,232 @@ impl ShellApp for TuiShellApp {
         } else {
             Reaction::Continue
         }
+    }
+}
+
+/// [`render::TickHost`] impl for TUI — the tick-time background chores
+/// `TuiShellApp::tick` shares with GTK's `App::handle_poll_tick` (#1248).
+/// Holds direct field borrows (rather than `&mut TuiShellApp` — `tick`
+/// already holds `&mut self.engine` separately, and `Engine` is an owned
+/// field here, not the `Rc<RefCell<Engine>>` GTK's `App` uses, so a whole
+/// `&mut self` borrow would alias it) plus `backend`, following
+/// [`TuiEngineActionHost`]'s established shape.
+struct TuiTickHost<'a> {
+    sidebar: &'a mut TuiSidebar,
+    last_layout: &'a RefCell<Option<render::ScreenLayout>>,
+    tab_visible_counts: &'a RefCell<Vec<(GroupId, usize)>>,
+    yank_hl_deadline: &'a Cell<Option<Instant>>,
+    tab_switcher_last_cycle: &'a Cell<Option<Instant>>,
+    last_sidebar_refresh: &'a Cell<Instant>,
+    exit_requested: &'a Cell<bool>,
+    live: bool,
+    backend: &'a mut dyn quadraui::Backend,
+}
+
+impl render::TickHost for TuiTickHost<'_> {
+    fn with_last_layout(&self, f: &mut dyn FnMut(&render::ScreenLayout)) {
+        if let Some(layout) = self.last_layout.borrow().as_ref() {
+            f(layout);
+        }
+    }
+
+    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)> {
+        self.tab_visible_counts.borrow().clone()
+    }
+
+    fn yank_highlight_deadline(&self) -> Option<Instant> {
+        self.yank_hl_deadline.get()
+    }
+
+    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine) {
+        engine.clear_yank_highlight();
+        self.yank_hl_deadline.set(None);
+    }
+
+    /// While the tab-switcher popup is mid-cycle, only its own 500ms
+    /// auto-confirm timer runs — everything else in the shared chore list
+    /// (idle polling, SC refresh, deferred quit, ...) waits until it closes,
+    /// exactly as it did before #1248 folded the rest of this list into
+    /// [`render::run_shared_tick_chores`]. GTK has no such popup, so the
+    /// trait's default (`None`, "no gate") applies there.
+    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
+        if !engine.tab_switcher_open {
+            return None;
+        }
+        let mut redraw = false;
+        if let Some(last) = self.tab_switcher_last_cycle.get() {
+            if last.elapsed() >= Duration::from_millis(500) {
+                engine.tab_switcher_confirm();
+                self.tab_switcher_last_cycle.set(None);
+                redraw = true;
+            }
+        }
+        Some(redraw)
+    }
+
+    fn sidebar_refresh_due(&mut self) -> bool {
+        if self.last_sidebar_refresh.get().elapsed() >= Duration::from_secs(2) {
+            self.last_sidebar_refresh.set(Instant::now());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// #1165: rebuild the explorer row cache on the same 2s tick, regardless
+    /// of which panel is active — mirrors the legacy `event_loop` behavior.
+    /// No GTK counterpart; see `TickHost::on_sidebar_refresh_tick`'s doc.
+    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
+        engine.explorer_rebuild_rows();
+    }
+
+    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
+        let vw = self.backend.viewport().width as u16;
+        engine.terminal_run_command(&cmd, vw, engine.session.terminal_panel_rows);
+    }
+
+    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String) {
+        self.sidebar.ext_panel_name = Some(panel_name);
+        if !engine.app_shell.sidebar_visible() {
+            engine.toggle_sidebar();
+        }
+        self.sidebar.has_focus = true;
+    }
+
+    fn quit_after_format_save(&mut self, engine: &mut Engine) {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+        self.exit_requested.set(true);
+    }
+
+    fn run_platform_action(
+        &mut self,
+        engine: &mut Engine,
+        action: crate::core::engine::PendingPlatformAction,
+    ) {
+        render::run_pending_platform_action(engine, action, self.backend);
+    }
+
+    /// The emulator window title used to be hand-rolled (crossterm's
+    /// `SetTitle` directly), but #1124 routed it through
+    /// `backend.window()?.set_title(..)` instead — the `WindowControl`
+    /// surface (quadraui#950) `TuiBackend` backs with the exact same OSC 0/2
+    /// escape underneath, so this stays gated on `self.live` for the same
+    /// reason as the cursor style in `tick()` — a real terminal, not
+    /// `driver_with_shell`'s harness.
+    fn sync_window_title(&mut self, engine: &Engine) {
+        if !self.live {
+            return;
+        }
+        let tui_title = render::window_title(engine);
+        if let Some(w) = self.backend.window() {
+            let _ = w.set_title(&tui_title);
+        }
+    }
+}
+
+/// [`render::EditorBandHost`] impl for TUI (#1251) — the four [`render::
+/// EditorOp`] rungs `TuiShellApp::paint_editor_band`'s shared walk still
+/// hands back per-backend. See that trait's own doc for why each of these
+/// four, specifically, can't be inlined into the walk. Holds `app: &'a
+/// TuiShellApp` as a plain borrow (`paint_editor_band` takes `&self`, unlike
+/// `tick`'s `&mut self`, so — unlike `TuiTickHost` — there is no aliasing
+/// concern in borrowing the whole app at once).
+struct TuiEditorBandHost<'a> {
+    app: &'a TuiShellApp,
+    area: Rect,
+    tui_tbh: f64,
+}
+
+impl<'screen> render::EditorBandHost<'screen> for TuiEditorBandHost<'_> {
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        _engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        // #1250: cache the layout each window's status line actually
+        // painted, keyed by its `WindowId` — the same paint-time cache GTK's
+        // `render_content` fills at its own per-window status-bar paint
+        // site, so `render::status_bands` can read it back instead of
+        // `mouse::route_and_apply_chrome_click` re-laying every bar's text
+        // out again on each click. `render_all_windows` also paints the
+        // within-group (`:split`/`:vsplit`) divider lines unconditionally
+        // (#609 routed `render_separators` through `Backend::draw_status_bar`
+        // — see its doc comment — so it no longer needs the raw `Frame` that
+        // `frame: None` used to skip it for).
+        let status_layouts = render_all_windows(
+            backend,
+            None,
+            &screen.windows,
+            &screen.group_dividers,
+            theme,
+        );
+        let mut segment_map = self.app.status_segment_map.borrow_mut();
+        for (window_id, layout) in status_layouts {
+            segment_map.insert(window_id.0, render::status_bar_zones_from_layout(&layout));
+        }
+    }
+
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        let painted = render::paint_tab_bars(backend, engine, screen, 1.0, self.tui_tbh, None);
+        let mut counts = self.app.tab_visible_counts.borrow_mut();
+        for bar in &painted {
+            counts.push((bar.group_id, bar.hits.available_cols));
+        }
+    }
+
+    // Between-*group* dividers (`Ctrl+W v`/`Ctrl+W s`, as opposed to the
+    // `Windows` rung's within-group `render_separators`) — ported to
+    // `Backend::draw_status_bar` via `render_group_dividers` (see its doc
+    // comment, and `group_divider_cells`'s for how the #481
+    // phantom-divider-beside-scrollbar guard became a pure data computation
+    // instead of a `Buffer` read-back). GTK rasterises the same rung through
+    // quadraui's `Split` primitive instead — see
+    // `render::draw_dividers_as_splits` for why the two rasterisers
+    // legitimately differ.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_group_dividers(
+            backend,
+            &screen.group_dividers,
+            &screen.windows,
+            self.area,
+            theme,
+        );
+    }
+
+    // Drag state (the shared `render::TabDragState`) is already live here —
+    // #602 wired `handle_mouse_event` to advance it via `mouse::handle_mouse`
+    // (see `handle()`).
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen render::ScreenLayout,
+        theme: &Theme,
+    ) {
+        render_tab_drag_overlay(
+            backend,
+            engine,
+            screen,
+            theme,
+            self.app.tab_drag.source(),
+            self.app.tab_drag.cursor(),
+        );
     }
 }
 
@@ -3113,6 +3953,20 @@ impl render::PanelAcceleratorHost for TuiAccelHost<'_> {
             ),
             ctx,
         );
+    }
+}
+
+/// [`render::ShellShadowSyncHost`] impl for TUI (#1062): the one id that
+/// exists in the runner's `AppShell` but has no matching shadow
+/// `PanelDefinition` — see
+/// [`render::ShellShadowSyncHost::panel_absent_from_shadow`]'s doc for why.
+/// GTK has no such id at all (`GtkShellShadowHost` in `app.rs` answers
+/// `false` unconditionally).
+struct TuiShellShadowHost;
+
+impl render::ShellShadowSyncHost for TuiShellShadowHost {
+    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool {
+        panel_id.as_str() == HAMBURGER_PANEL_ID
     }
 }
 
@@ -3219,8 +4073,10 @@ fn handle_focus_owner_key(
     // #826: every `tui_key_to_engine_name(code)` call in this function's old
     // crossterm-`KeyCode` tables becomes this — the one shared decoder's
     // named-key table (`render::engine_key_from_ui`), which also backs GTK's
-    // `Key::Named` decode now. `Key::Char` stays inline per arm below (each
-    // panel's own char whitelist), unchanged from before.
+    // `Key::Named` decode now. `Key::Char` is handled inline per arm below —
+    // as of #1249 that's `c.to_string()` (or, for Source Control,
+    // `engine_key_from_ui`'s own shift resolution) rather than a fifth copy
+    // of a hand-written char->name table.
     let engine_name = || {
         render::engine_key_from_ui(key, modifiers, keyboard_enhanced)
             .map(|(name, _, _)| name)
@@ -3271,30 +4127,15 @@ fn handle_focus_owner_key(
 
     // ── Search panel ────────────────────────────────────────────────────
     if route == render::FocusKeyRoute::Search {
-        // Ctrl+V paste (backend-specific clipboard access).
-        //
-        // #946: quadraui#813 intercepts every Ctrl+V/Ctrl+Shift+V
-        // `KeyPressed` ahead of `AppLogic::handle` on every backend
-        // (`quadraui::runtime::preprocess_event`, step 6) and redelivers it
-        // as `UiEvent::ClipboardPaste(text)` instead — so in practice this
-        // arm's `ctrl && key_val == Key::Char('v')` guard never matches a
-        // real keypress; `Engine::route_paste`'s own `search_has_focus`
-        // branch (`keys.rs`) is the one live backends actually reach, via
-        // the `UiEvent::ClipboardPaste` arm in `handle()` above. Kept here
-        // (reading `engine.clipboard_read` rather than the deleted
-        // `Engine::clipboard_paste()` shell-out #946 removed) as the
-        // documented, still-correct fallback for any caller that reaches
-        // this function with an already-raw `KeyPressed` Ctrl+V — e.g. a
-        // synthetic/replayed event that bypasses quadraui's own runtime
-        // preprocessing.
-        if ctrl && key_val == Key::Char('v') {
-            let is_replace =
-                engine.search_panel_form_focus.borrow().as_deref() == Some("search:replace");
-            if let Some(text) = engine.clipboard_read.as_ref().and_then(|cb| cb().ok()) {
-                engine.search_input_paste(is_replace, &text);
-            }
-            return Reaction::Redraw;
-        }
+        // No Ctrl+V arm here (#1249): quadraui#813 intercepts every
+        // Ctrl+V/Ctrl+Shift+V `KeyPressed` ahead of `AppLogic::handle` on
+        // every backend (`quadraui::runtime::preprocess_event`, step 6) and
+        // redelivers it as `UiEvent::ClipboardPaste(text)` instead, so no
+        // real (or synthetic, replayed-through-the-runner) keypress can ever
+        // reach this function with `ctrl && key_val == Key::Char('v')`.
+        // `Engine::route_paste`'s `search_has_focus` branch (`keys.rs`) is
+        // the one every backend actually reaches, via the top-level
+        // `UiEvent::ClipboardPaste` arm in `handle()` above.
         let key_name = match key_val {
             // Single-char keys use the char as the key name (via `unicode`
             // below); Ctrl+b is the one that needs an explicit name.
@@ -3334,18 +4175,22 @@ fn handle_focus_owner_key(
             .handle(ui_event, backend, rect);
         if !engine.dispatch_dap_sidebar_event(sidebar_event) {
             // Ignored by the MSV — handle action keys via shared dispatch.
+            // Ctrl+b hides the sidebar (shared shape with the other panels'
+            // Ctrl+b arm below).
+            if ctrl && key_val == Key::Char('b') {
+                sidebar.has_focus = false;
+                engine.collapse_sidebar();
+                return Reaction::Redraw;
+            }
+            // #1249: `c.to_string()`, not a hand-written char->`String`
+            // identity table (`'q' => "q".to_string()`, …) — like GTK's own
+            // pass-through (`map_gtk_key_name`'s `other => other`),
+            // `dispatch_dap_sidebar_action_key` already ignores any letter
+            // it doesn't whitelist. Also fixes 'h' silently doing nothing on
+            // TUI: the old table never listed it, though the dispatch
+            // function (and GTK) both treat it the same as "Left".
             let key_name = match key_val {
-                Key::Char(c) => match c {
-                    'q' => "q".to_string(),
-                    'x' => "x".to_string(),
-                    'd' => "d".to_string(),
-                    'b' if ctrl => {
-                        sidebar.has_focus = false;
-                        engine.collapse_sidebar();
-                        String::new()
-                    }
-                    _ => String::new(),
-                },
+                Key::Char(c) => c.to_string(),
                 Key::Named(NamedKey::F(n)) if (5..=11).contains(&n) => match n {
                     5 | 9 | 10 | 11 => {
                         let name = format!("F{n}");
@@ -3412,36 +4257,31 @@ fn handle_focus_owner_key(
         // h/Left focus-to-activity-bar lives inside `handle_settings_key`:
         // when the selected row is not an enum, `h` sets
         // `activity_bar_focused`.
-        // Ctrl-V paste into the search input or an inline edit.
-        if ctrl && key_val == Key::Char('v') {
-            if engine.settings_input_active || engine.settings_editing.is_some() {
-                let text = match engine.clipboard_read {
-                    Some(ref cb) => cb().ok(),
-                    None => None,
-                };
-                if let Some(t) = text {
-                    engine.settings_paste(&t);
-                }
-            }
-            return Reaction::Redraw;
-        }
+        //
+        // No Ctrl+V arm here (#1249): `Engine::route_paste`'s
+        // `settings_input_active || settings_editing.is_some()` branch is
+        // what every backend's `UiEvent::ClipboardPaste` actually reaches —
+        // quadraui#813 intercepts the raw `KeyPressed` before it gets here.
+        //
+        // #1249: char/named key straight through, not a hand-written
+        // identity table (`Key::Char('j') => ("j".to_string(), None)`, …) —
+        // `handle_settings_key` already accepts both spellings for nav
+        // ("j"/"Down", "k"/"Up", "l"/"Right", "h"/"Left"), and always passing
+        // `unicode` (not just for the old catch-all's `"char"` sentinel) is
+        // what lets `j`/`k`/`h`/`l`/`/`/`q`/space be typed into the settings
+        // search filter, which the old table silently dropped. `' '` keeps
+        // its own arm: `handle_settings_key` matches literal `"Space"`, not
+        // `" "`.
         let (key_name, unicode): (String, Option<char>) = match key_val {
-            Key::Char('j') | Key::Named(NamedKey::Down) => ("j".to_string(), None),
-            Key::Char('k') | Key::Named(NamedKey::Up) => ("k".to_string(), None),
-            Key::Char('l') | Key::Named(NamedKey::Right) => ("l".to_string(), None),
-            Key::Char('h') | Key::Named(NamedKey::Left) => ("h".to_string(), None),
-            Key::Char(' ') => ("Space".to_string(), None),
-            Key::Char('/') => ("/".to_string(), None),
-            Key::Char('q') => ("Escape".to_string(), None),
-            Key::Char(ch) => ("char".to_string(), Some(ch)),
+            Key::Char(' ') => ("Space".to_string(), Some(' ')),
+            Key::Char(c) => (c.to_string(), Some(c)),
             Key::Named(_) => (engine_name(), None),
         };
         if !key_name.is_empty() {
-            let ch = if key_name == "char" { unicode } else { None };
-            let mapped: &str = if key_name == "char" { "" } else { &key_name };
-            let still_focused =
-                render::dispatch_sidebar_panel_key(engine, route, mapped, ch, None, ctrl, false)
-                    .unwrap_or(true);
+            let still_focused = render::dispatch_sidebar_panel_key(
+                engine, route, &key_name, unicode, None, ctrl, false,
+            )
+            .unwrap_or(true);
             if !still_focused {
                 sidebar.has_focus = false;
             }
@@ -3466,20 +4306,12 @@ fn handle_focus_owner_key(
     // text, not a hand-rolled key table like the retired
     // `handle_ai_panel_key` built from `KeyCode` spellings.
     if route == render::FocusKeyRoute::Ai {
-        // Literal Ctrl+V fallback for terminals that don't send bracketed
-        // paste as bytes — real terminal pastes already reach every panel
-        // uniformly via `UiEvent::ClipboardPaste` -> `Engine::route_paste`
-        // (see this file's top-level `handle` match).
-        if ctrl && key_val == Key::Char('v') {
-            let text = match engine.clipboard_read {
-                Some(ref cb) => cb().ok(),
-                None => None,
-            };
-            if let Some(t) = text {
-                engine.ai_chat.borrow_mut().input_insert_str(&t);
-            }
-            return Reaction::Redraw;
-        }
+        // No Ctrl+V arm here (#1249): every real (or synthetic,
+        // replayed-through-the-runner) terminal paste already reaches
+        // `Engine::route_paste`'s `ai_has_focus` branch uniformly via
+        // `UiEvent::ClipboardPaste` (see this file's top-level `handle`
+        // match) — quadraui#813 intercepts the raw Ctrl+V `KeyPressed`
+        // before it ever gets here, on every backend.
         let rect = engine.ai_chat_rect.get();
         let theme = render::Theme::from_name(&engine.settings.colorscheme);
         let still_focused = render::route_ai_chat_event(engine, ui_event, rect, &theme, backend);
@@ -3498,40 +4330,38 @@ fn handle_focus_owner_key(
             engine.collapse_sidebar();
             return Reaction::Redraw;
         }
-        // With keyboard enhancement (kitty protocol), Shift+s arrives as
-        // Char('s') + SHIFT, not Char('S'). Resolve the actual character
-        // before matching the whitelist.
-        let shift = modifiers.shift;
+        // #1249: reuse `render::engine_key_from_ui`'s keyboard-enhancement
+        // shift resolution (kitty: Shift+s arrives as Char('s') + SHIFT, not
+        // Char('S')) instead of a second, SC-local copy of it plus a
+        // 20-entry char->`&str` identity table gating which resolved letters
+        // pass through. `ctrl` is forced off: the one SC ctrl chord (Ctrl+b)
+        // is handled above, and `dispatch_sc_sidebar_key_unified` (like
+        // GTK's `map_gtk_key_with_unicode`) already ignores any letter it
+        // doesn't recognise.
+        //
+        // Deliberate incidental fix, called out per review (non-blocking,
+        // #1249 iteration 1): the old SC-local shift resolver only
+        // uppercased `is_ascii_lowercase()` characters, so under
+        // keyboard-enhanced (kitty) terminals a `Shift+/` (`Char('/') +
+        // shift`) resolved to the literal `'/'` — matching the old
+        // whitelist's own `'/'` entry — instead of `'?'`. `shift_map_us`
+        // resolves it correctly to `'?'`, which is what a non-kitty
+        // terminal (or GTK) already sends for that chord. Narrow (kitty
+        // keyboard protocol only) and one-directional (fixes a wrong
+        // character, doesn't drop one), so left as this comment rather than
+        // a dedicated driver test.
         let (key_str, unicode): (String, Option<char>) = match key_val {
-            Key::Char(ch) => {
-                let resolved = if shift && ch.is_ascii_lowercase() {
-                    ch.to_ascii_uppercase()
-                } else {
-                    ch
+            Key::Char(_) => {
+                let plain_modifiers = quadraui::Modifiers {
+                    ctrl: false,
+                    ..modifiers
                 };
-                let name = match resolved {
-                    'j' => "j",
-                    'k' => "k",
-                    'h' => "h",
-                    'l' => "l",
-                    's' => "s",
-                    'S' => "S",
-                    'd' => "d",
-                    'D' => "D",
-                    'c' => "c",
-                    'C' => "C",
-                    'p' => "p",
-                    'P' => "P",
-                    'f' => "f",
-                    'r' => "r",
-                    'b' => "b",
-                    'B' => "B",
-                    'q' => "q",
-                    '?' => "?",
-                    '/' => "/",
-                    _ => "",
-                };
-                (name.to_string(), Some(resolved))
+                let resolved = render::engine_key_from_ui(key, plain_modifiers, keyboard_enhanced)
+                    .and_then(|(_, unicode, _)| unicode);
+                (
+                    resolved.map(|c| c.to_string()).unwrap_or_default(),
+                    resolved,
+                )
             }
             Key::Named(_) => (engine_name(), None),
         };
@@ -3550,6 +4380,31 @@ fn handle_focus_owner_key(
         return Reaction::Redraw;
     }
 
+    // ── Board panel (#521 / #524) ───────────────────────────────────────
+    // Missing until now: every other panel route above has its own
+    // `if route == FocusKeyRoute::X` arm here, but `Board` had none, so a
+    // real keypress (j/k/h/l/g/G/Enter) fell all the way through to the
+    // Explorer fallback below instead of ever reaching
+    // `Engine::dispatch_board_key_unified` — GTK's generic
+    // `dispatch_sidebar_panel_key` call (`app.rs`) already covered every
+    // route including this one, so the gap was TUI-only. Same
+    // char/named-key shape as the `ExtSidebar` arm above; Board needs
+    // nothing more (no shift resolution, no ctrl chord).
+    if route == render::FocusKeyRoute::Board {
+        let (key_name, unicode) = match key_val {
+            Key::Char(c) => (c.to_string(), Some(c)),
+            Key::Named(_) => (engine_name(), None),
+        };
+        let still_focused = render::dispatch_sidebar_panel_key(
+            engine, route, &key_name, unicode, None, ctrl, false,
+        )
+        .unwrap_or(true);
+        if !still_focused {
+            sidebar.has_focus = false;
+        }
+        return Reaction::Redraw;
+    }
+
     // ── Explorer (`FocusKeyRoute::Explorer`, the resolver's fallback) ───
     {
         use crate::core::engine::ExplorerKeyResult;
@@ -3564,13 +4419,17 @@ fn handle_focus_owner_key(
             // editing lost those two keys on TUI while GTK
             // (`map_gtk_key_name`) had them. `Page_Up`/`Page_Down` and
             // `PageUp`/`PageDown` are both accepted by the engine.
+            //
+            // #1249: `c.to_string()`, not a hand-written char->`String`
+            // identity table (`'j' => "j".to_string()`, …, `_ =>
+            // String::new()`) — `dispatch_explorer_key`'s own whitelist
+            // ignores any name it doesn't recognise and falls through to its
+            // `chr`-driven custom-keybinding lookup, which never read
+            // `key_name` anyway, so restricting which chars got a real name
+            // bought nothing (GTK's `map_gtk_key_with_unicode` is the same
+            // unrestricted pass-through).
             let key_name = match key_val {
-                Key::Char('j') => "j".to_string(),
-                Key::Char('k') => "k".to_string(),
-                Key::Char('h') => "h".to_string(),
-                Key::Char('l') => "l".to_string(),
-                Key::Char('q') => "q".to_string(),
-                Key::Char(_) => String::new(),
+                Key::Char(c) => c.to_string(),
                 Key::Named(_) => engine_name(),
             };
             let chr = if let Key::Char(c) = key_val {
@@ -3710,7 +4569,20 @@ fn handle_key_pressed(
     };
 
     // ── Shared Ctrl+L force-redraw rung (#762 / #734 slice 7) ───────────
-    if render::is_force_redraw_key(&key_name, unicode, ctrl) {
+    // #1243: `request_full_repaint` (quadraui#1037) is the hook `render.rs`'s
+    // own doc on `is_force_redraw_key` named as missing — the actual
+    // `ratatui::Terminal::clear()`-equivalent now lives one layer down, in
+    // `tui::run::run_inner`'s frame loop, and is armed by this flag rather
+    // than called directly here. An ordinary `Reaction::Redraw` alone would
+    // still just re-run the incremental diff against the same stale buffer
+    // Ctrl+L exists to escape.
+    if render::is_force_redraw_key(
+        &key_name,
+        unicode,
+        ctrl,
+        engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending,
+    ) {
+        backend.request_full_repaint();
         return Reaction::Redraw;
     }
 
@@ -3797,6 +4669,7 @@ fn handle_key_pressed(
         screen_w,
         screen_h,
         *state.sidebar_width,
+        backend,
     ) {
         return Reaction::Exit;
     }
@@ -3829,14 +4702,95 @@ fn handle_key_pressed(
     Reaction::Redraw
 }
 
+/// [`render::EngineActionHost`] impl for TUI (#1063) — the TUI-only state
+/// (`TuiSidebar`, the `quadraui::FolderPickerController` slot, and the
+/// screen geometry needed for terminal column/row counts) that
+/// [`dispatch_post_key_action`], below, packages up so it can call the one
+/// shared applier both backends now use. Mirrors GTK's
+/// `GtkEngineActionHost` (`app.rs`) — see [`render::apply_engine_action`]'s
+/// rung header comment in `render.rs` for why this convergence exists.
+struct TuiEngineActionHost<'a> {
+    sidebar: &'a mut TuiSidebar,
+    folder_picker: &'a mut Option<quadraui::FolderPickerController>,
+    screen_w: u16,
+    screen_h: u16,
+    sidebar_width: u16,
+    /// Live handle to the runner-owned backend, needed for
+    /// `save_workspace_as_dialog`'s native file dialog (#1125). Unlike
+    /// GTK's `GtkEngineActionHost`, TUI's callers always have `backend` in
+    /// scope already (see [`dispatch_post_key_action`]'s doc), so this
+    /// reaches the dialog synchronously instead of deferring to `tick()`.
+    backend: &'a mut dyn quadraui::Backend,
+}
+
+impl render::EngineActionHost for TuiEngineActionHost<'_> {
+    fn open_terminal(&mut self, engine: &mut Engine) {
+        let cols = terminal_panel_cols(engine, self.screen_w, self.sidebar_width);
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab(cols, rows);
+    }
+    fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
+        let ctx = crate::core::engine::UiEventContext {
+            terminal_cols: terminal_panel_cols(engine, self.screen_w, self.sidebar_width),
+            terminal_max_rows: terminal_target_maximize_rows_tui(engine, self.screen_h),
+        };
+        engine.handle_ui_event(
+            crate::core::engine::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
+                quadraui::Modifiers::default(),
+            ),
+            ctx,
+        );
+    }
+    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, self.screen_w, rows);
+    }
+    fn open_folder_dialog(&mut self, engine: &mut Engine) {
+        *self.folder_picker = Some(new_folder_picker_controller(engine));
+    }
+    fn open_workspace_dialog(&mut self, engine: &mut Engine) {
+        *self.sidebar = TuiSidebar::new();
+        engine.explorer_rebuild_rows();
+    }
+    fn save_workspace_as_dialog(&mut self, engine: &mut Engine) {
+        render::run_save_workspace_as_dialog(engine, self.backend);
+    }
+    fn open_recent_dialog(&mut self, engine: &mut Engine) {
+        if engine.session.recent_workspaces.is_empty() {
+            engine.message = "No recent workspaces".to_string();
+        } else {
+            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+        }
+    }
+    /// TUI has no widget tree to resync — the engine already applied the
+    /// toggle internally. Matches `handle_action`'s `ToggleSidebar` no-op.
+    fn sidebar_toggled(&mut self, _engine: &mut Engine) {}
+    fn quit_with_unsaved(&mut self, engine: &mut Engine) {
+        engine.show_quit_confirm();
+    }
+    fn quit(&mut self, engine: &mut Engine) {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+    }
+    fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
+        engine.cleanup_all_swaps();
+        engine.lsp_shutdown();
+        save_session(engine);
+        std::process::exit(1);
+    }
+}
+
 /// TUI's counterpart to GTK's `App::dispatch_engine_action`: apply the
-/// [`EngineAction`] the general keyboard fallback produced. Returns `true`
-/// when the app should exit.
+/// [`EngineAction`] the general keyboard fallback (and the menu-activation
+/// arm above) produced. Returns `true` when the app should exit.
 ///
-/// The eight named arms are the ones whose effect needs TUI-only state — the
-/// terminal panel's column/row geometry, the `quadraui::FolderPickerController`
-/// (#815; GTK's `App` carries the identical field), and `TuiSidebar`.
-/// Everything else falls through to `handle_action`.
+/// A thin wrapper around [`render::apply_engine_action`] (#1063) that
+/// packages the TUI-only state ([`TuiEngineActionHost`], above) the shared
+/// applier's backend hooks need — the terminal panel's column/row geometry,
+/// the `quadraui::FolderPickerController` (#815; GTK's `App` carries the
+/// identical field), and `TuiSidebar`.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_post_key_action(
     action: EngineAction,
@@ -3846,46 +4800,17 @@ fn dispatch_post_key_action(
     screen_w: u16,
     screen_h: u16,
     sidebar_width: u16,
+    backend: &mut dyn quadraui::Backend,
 ) -> bool {
-    if action == EngineAction::OpenTerminal {
-        let cols = terminal_panel_cols(engine, screen_w, sidebar_width);
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab(cols, rows);
-    } else if action == EngineAction::ToggleTerminalMaximize {
-        let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: terminal_panel_cols(engine, screen_w, sidebar_width),
-            terminal_max_rows: terminal_target_maximize_rows_tui(engine, screen_h),
-        };
-        engine.handle_ui_event(
-            crate::core::engine::UiEvent::Accelerator(
-                quadraui::AcceleratorId::new(render::ACC_TERMINAL_TOGGLE_MAX),
-                quadraui::Modifiers::default(),
-            ),
-            ctx,
-        );
-    } else if let EngineAction::RunInTerminal(cmd) = &action {
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(cmd, screen_w, rows);
-    } else if action == EngineAction::OpenFolderDialog {
-        *folder_picker = Some(new_folder_picker_controller(engine));
-    } else if action == EngineAction::OpenRecentDialog {
-        if engine.session.recent_workspaces.is_empty() {
-            engine.message = "No recent workspaces".to_string();
-        } else {
-            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
-        }
-    } else if action == EngineAction::OpenWorkspaceDialog {
-        *sidebar = TuiSidebar::new();
-        engine.explorer_rebuild_rows();
-    } else if action == EngineAction::SaveWorkspaceAsDialog {
-        let ws_path = engine.cwd.join(".vimcode-workspace");
-        engine.save_workspace_as(&ws_path);
-    } else if action == EngineAction::QuitWithUnsaved {
-        engine.show_quit_confirm();
-    } else if handle_action(engine, action) {
-        return true;
-    }
-    false
+    let mut host = TuiEngineActionHost {
+        sidebar,
+        folder_picker,
+        screen_w,
+        screen_h,
+        sidebar_width,
+        backend,
+    };
+    render::apply_engine_action(action, engine, &mut host)
 }
 
 /// Apply a resolved [`render::ModalKeyRoute`] on the TUI side.
@@ -3910,7 +4835,7 @@ fn apply_modal_key_route(
     modifiers: quadraui::Modifiers,
     keyboard_enhanced: bool,
     engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
+    _sidebar: &mut TuiSidebar,
     screen_w: u16,
     screen_h: u16,
 ) -> Reaction {
@@ -3941,13 +4866,11 @@ fn apply_modal_key_route(
                 let ctx = engine.context_menu_target_path();
                 let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
                 if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
-                    handle_explorer_context_action(
-                        &act,
-                        engine,
-                        sidebar,
-                        Some(Size::new(screen_w, screen_h)),
-                        ctx_path,
-                        ctx_is_dir,
+                    let mut host = TuiExplorerCtxHost {
+                        terminal_size: Some(Size::new(screen_w, screen_h)),
+                    };
+                    render::apply_explorer_context_action(
+                        engine, &act, &ctx_path, ctx_is_dir, &mut host,
                     );
                 }
             }
@@ -4091,7 +5014,7 @@ mod tests {
                 tooltip: String::new(),
             }],
         );
-        // Match `TuiShellApp::shell_config`'s 1-row title bar rather than
+        // Match `TuiShellApp::build_shell_config`'s 1-row title bar rather than
         // `ShellConfig`'s own 1.5-line-height default, so tests that reveal
         // the menu bar at runtime through this minimal config measure the
         // same reservation the live config produces (quadraui#547).
@@ -4130,8 +5053,24 @@ mod tests {
     /// `AppShellEvent::SidebarHidden` is supposed to clear, so it is seeded
     /// too — otherwise a test asserting that it ends up `false` would pass
     /// vacuously.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): pinning sidebar visibility here fixed the #634 ambient-config
+    /// leak but left the *other* half `new_for_test`'s own doc warns about —
+    /// `TuiShellApp::new(None)` also runs `restore_session_files()`, which
+    /// restores whatever window/split/scroll-position state is saved in the
+    /// developer's real per-workspace session file for this exact checkout
+    /// path. On a box that has ever run vimcode from this repo, callers of
+    /// this fixture (`alt_letter_reveals_menu_bar_via_shell_app`,
+    /// `alt_right_widens_the_painted_sidebar_via_shell_app`) inserted their
+    /// buffer-offset-0 marker into whatever window/scroll state the restore
+    /// left behind rather than a fresh, empty one, so a restored non-zero
+    /// scroll offset could scroll the marker out of the viewport before the
+    /// test's own precondition assertion ever ran — green in CI (no config),
+    /// red on a dev box. `new_for_test` skips the restore entirely, so the
+    /// starting state is the same everywhere.
     fn app_with_sidebar_open() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
@@ -4169,6 +5108,106 @@ mod tests {
         assert!(app.live);
     }
 
+    /// #1124 routed `tick()`'s terminal-title write through
+    /// `backend.window()?.set_title(..)` (`WindowControl`, quadraui#950)
+    /// instead of hand-rolling crossterm's `SetTitle` directly — see the
+    /// doc comment on that call, right above the `if self.live` block it
+    /// lives in. Unlike GTK's `Backend::window()` (see `src/app.rs`'s
+    /// `gtk_backend_window_is_none_without_a_live_window_...` test), TUI's
+    /// limitation is the opposite shape: `TuiBackend::window()` is
+    /// unconditionally `Some` (asserted below) — the call is real and
+    /// always reachable — but it is gated behind `self.live`, which
+    /// `prepare_for_live_run_only_sets_the_flag` right above already pins
+    /// as `false` for every `driver_with_shell`/direct-construction test,
+    /// and `TuiBackend::set_title` (quadraui `tui/backend.rs`'s `impl
+    /// WindowControl for TuiBackend`) writes straight to the real process
+    /// `std::io::stdout()` with no injectable writer.
+    ///
+    /// Forcing `live = true` here to exercise the call would inject a raw
+    /// OSC 0/2 escape sequence into this test binary's actual stdout —
+    /// bypassing `cargo test`'s output capture entirely, since that only
+    /// intercepts the `print!`/`println!` macros, not direct `Write`
+    /// calls on `Stdout` — exactly the "corrupt the harness' own output"
+    /// scenario `tick()`'s own comment warns about for the cursor-style
+    /// write right next to it. So there is no way to assert the title
+    /// actually reached the terminal from inside this crate's test suite;
+    /// manual verification (does the emulator tab/window retitle when
+    /// switching buffers) is a `SMOKE_TESTS` item on #1124's PR instead.
+    ///
+    /// RED-verification note: nothing to make RED here — this pins two
+    /// structural facts (the flag defaults false, `TuiBackend::window()`
+    /// is always `Some`) that together explain why the write is
+    /// unreachable in this harness, not a vimcode behaviour that could
+    /// regress on its own.
+    #[test]
+    fn tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable() {
+        use quadraui::Backend;
+
+        let app = TuiShellApp::new(None);
+        let mut backend = backend_at(80.0, 24.0);
+        assert!(
+            backend.window().is_some(),
+            "TuiBackend::window() should always be Some (it backs set_title \
+             unconditionally) -- if this fires, quadraui has changed and \
+             #1124's title-sync path may need to be revisited"
+        );
+        assert!(
+            !app.live,
+            "a driver/direct-constructed TuiShellApp must default to \
+             live=false, or tick() would attempt the real stdout OSC write \
+             during ordinary test runs -- see \
+             prepare_for_live_run_only_sets_the_flag"
+        );
+    }
+
+    /// [`TuiShellApp::caret_shape_for_mode`] (#1109) is the pure decision
+    /// `tick()` feeds `backend.set_caret_shape` — block for Normal, bar for
+    /// Insert, underline for a pending `r` (replace-char). Unlike the title
+    /// write right next to it in `tick()`, this branching has no I/O of its
+    /// own, so — unlike
+    /// `tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable`
+    /// right above — it genuinely can be exercised directly, distinct from
+    /// the `self.live`-gated `set_caret_shape` write itself, which remains
+    /// out of this crate's reach for the same reason the title write is (see
+    /// that test, and `caret_shape_for_mode`'s own doc comment).
+    ///
+    /// RED-verification: before wiring `caret_shape_for_mode` in, this
+    /// module had no mode->shape mapping to call at all (the old code
+    /// inlined the three-way `if` straight into `tick()`'s crossterm call),
+    /// so there was nothing for a test like this to assert on — the old
+    /// arrangement was exactly the "no driver-testable seam" gap #1109
+    /// closes by extracting the decision into its own method.
+    #[test]
+    fn caret_shape_for_mode_tracks_engine_mode_and_pending_replace() {
+        let mut app = TuiShellApp::new_for_test();
+        assert!(
+            !app.sidebar.has_focus,
+            "fixture must start with sidebar unfocused, or every branch \
+             below falls through to Block regardless of mode/pending_key"
+        );
+
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Block,
+            "Normal mode, no pending key -> Block"
+        );
+
+        app.engine.mode = Mode::Insert;
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Bar,
+            "Insert mode -> Bar"
+        );
+
+        app.engine.mode = Mode::Normal;
+        app.engine.pending_key = Some('r');
+        assert_eq!(
+            app.caret_shape_for_mode(),
+            quadraui::EditorCursorShape::Underline,
+            "pending 'r' (replace-char) -> Underline, even back in Normal mode"
+        );
+    }
+
     /// `setup()` must register the panel-key accelerators and populate the
     /// menu system — the two pieces of state `handle()` depends on.
     #[test]
@@ -4191,6 +5230,133 @@ mod tests {
         assert!(app.engine.viewport_lines() > 0);
     }
 
+    /// #1248: `tick()`'s own per-frame viewport *estimate* — the subject of
+    /// the matrix-fixture drift check this test replaces — is deleted
+    /// outright, not folded into the shared chore list: it pre-resolved
+    /// exactly what `build_screen_for_shell_content`'s real per-split
+    /// accounting resolves anyway, and GTK never had an estimate of its own
+    /// to begin with. `Engine`'s per-window viewport now comes solely from
+    /// `render::run_shared_tick_chores`'s `set_viewport_for_window` loop,
+    /// applied from whatever `render_content` last left in `last_layout` —
+    /// this drives that loop directly (seeding `last_layout` with a real
+    /// `ScreenLayout` from the same composer the deleted test cross-checked
+    /// the old estimate against, `build_screen_for_shell_content`) and
+    /// checks `Engine::viewport_lines` ends up exactly matching the row
+    /// count that composer painted, with no second, independently-computed
+    /// estimate left to compare it against.
+    ///
+    /// RED-verification: stubbing `TickHost::with_last_layout`'s TUI impl to
+    /// a no-op (so the sync loop never runs) leaves `viewport_lines()` at
+    /// `View`'s startup-default `40` (`core/view.rs`) instead of this
+    /// fixture's real, smaller composed row count — confirmed by hand
+    /// before committing (the `assert_ne!` below is what makes that
+    /// distinguishable at all: a fixture whose composed row count happened
+    /// to equal 40 would pass either way).
+    #[test]
+    fn tick_syncs_viewport_from_the_last_paint_now_the_estimate_is_gone() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
+
+        let theme = app.theme();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 20,
+        };
+        let tui_backend = super::super::backend::TuiBackend::new();
+        let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
+        let painted_rows = screen
+            .windows
+            .iter()
+            .find(|w| w.window_id == screen.active_window_id)
+            .expect("build_screen_for_shell_content must paint the active window")
+            .lines
+            .len();
+        assert_ne!(
+            painted_rows, 40,
+            "fixture must differ from View's startup-default viewport_lines \
+             (40, core/view.rs), or this test can't tell 'synced from the \
+             last paint' apart from 'never synced at all'"
+        );
+        *app.last_layout.borrow_mut() = Some(screen);
+
+        let mut backend = backend_at(100.0, 20.0);
+        app.tick(&mut backend);
+
+        assert_eq!(
+            app.engine.viewport_lines(),
+            painted_rows,
+            "tick() did not sync Engine::viewport_lines from the last paint — \
+             with the per-frame estimate gone (#1248), \
+             `render::run_shared_tick_chores`'s `set_viewport_for_window` \
+             loop is the only mechanism left to do it"
+        );
+    }
+
+    /// #1165: `tick()`'s periodic SC/explorer auto-refresh used to call
+    /// `Engine::sc_refresh` directly — the *synchronous* variant that
+    /// spawns four `git` subprocesses (`status`, `worktree list`,
+    /// `rev-list`, `log`) and blocks until all of them return.
+    /// `App::handle_poll_tick` (GTK's twin of this method) has always used
+    /// the async pair, `sc_refresh_async`/`poll_sc_refresh`, instead —
+    /// specifically to avoid stalling the UI thread on exactly this work.
+    /// A single-threaded terminal event loop has nothing else to run while
+    /// blocked, so TUI's version of this bug was strictly worse than GTK's
+    /// would have been: every repaint, keypress, and cursor blink froze for
+    /// however long those four spawns took on the sidebar's 2-second timer,
+    /// for as long as the SC or Explorer panel stayed open.
+    ///
+    /// Distinguishing "used the async path" from "used the sync path"
+    /// without racing the background thread on wall-clock time:
+    /// `sc_refresh_in_flight` is set `true` by `sc_refresh_async` *before*
+    /// it ever spawns the thread, and is only ever cleared by
+    /// `poll_sc_refresh` — which this test deliberately does not call
+    /// before its first assertion. The synchronous `sc_refresh` never
+    /// touches that flag at all, so it would stay `false` under the old
+    /// code regardless of how fast or slow the `git` subprocesses run —
+    /// the assertion below distinguishes the two code paths
+    /// deterministically.
+    ///
+    /// RED-verification: reverting `tick()`'s sidebar-refresh block back to
+    /// calling `self.engine.sc_refresh()` directly turns this red —
+    /// confirmed by hand before committing.
+    #[test]
+    fn tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread() {
+        let mut app = app_with_sidebar_open();
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        // Force the 2-second auto-refresh gate open immediately rather than
+        // waiting on it in real time.
+        app.last_sidebar_refresh
+            .set(Instant::now() - Duration::from_secs(3));
+
+        app.tick(&mut backend);
+
+        assert!(
+            app.engine.sc_refresh_in_flight,
+            "tick() did not trigger the async SC refresh -- #1165 found it \
+             calling the synchronous `sc_refresh` directly instead, \
+             blocking this thread (the only thread driving the TUI's event \
+             loop) for every `git` subprocess it spawns"
+        );
+
+        // Drain the background thread so it doesn't outlive the test
+        // process; bounded, not a fixed sleep, so this stays fast on a
+        // quiet repo and still passes on a slow/loaded CI box.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.engine.sc_refresh_in_flight && Instant::now() < deadline {
+            app.engine.poll_sc_refresh();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !app.engine.sc_refresh_in_flight,
+            "background SC refresh thread never completed within 5s"
+        );
+    }
+
     /// End-to-end smoke: the `ShellConfig`/`PanelDefinition` wiring this
     /// stage introduced constructs through the real `driver_with_shell`
     /// harness and paints a first frame without panicking.
@@ -4200,21 +5366,21 @@ mod tests {
         let _ = driver.screen();
     }
 
-    /// #635 (Stage 6b item E): [`TuiShellApp::shell_config`] must register
+    /// #635 (Stage 6b item E): [`TuiShellApp::build_shell_config`] must register
     /// exactly the panels `render::build_activity_bar`'s `fixed` array
     /// plus the hamburger (top) and settings (bottom) — the two items
     /// outside that array — in the same order, so the eventual live
     /// `AppShell` activity bar (#634) can't drift from what `draw_frame`
     /// paints today. The middle six ids are asserted against
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly — the same array
-    /// `shell_config` zips its metadata against and `build_activity_bar`
-    /// debug-asserts its own `fixed` order against — rather than a
-    /// hand-transcribed literal, so a reordering of the shared constant
-    /// changes what this test expects automatically instead of needing a
-    /// matching hand-edit here.
+    /// `build_shell_config` iterates and `build_activity_bar` debug-asserts
+    /// its own `fixed` order against — rather than a hand-transcribed
+    /// literal, so a reordering of the shared constant changes what this
+    /// test expects automatically instead of needing a matching hand-edit
+    /// here.
     #[test]
     fn shell_config_registers_every_build_activity_bar_panel() {
-        let cfg = TuiShellApp::shell_config(false);
+        let cfg = TuiShellApp::build_shell_config(false);
         let ids: Vec<&str> = cfg.panels.iter().map(|p| p.id.as_str()).collect();
         let mut expected = vec![HAMBURGER_PANEL_ID];
         expected.extend(crate::core::engine::sidebar::FIXED_ACTIVITY_PANEL_IDS);
@@ -4232,7 +5398,7 @@ mod tests {
     fn shell_app_constructs_via_driver_with_shell_using_live_config() {
         let driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -4486,14 +5652,31 @@ mod tests {
     /// placeholder — content only `render_search_panel` paints, never the
     /// explorer tree or the runner's own " Search " header chrome (which
     /// updated even while the content pane was stuck — the smoke bug).
+    ///
+    /// #1053 review: `set_double_click_folding(false)` added. Without it,
+    /// these two `driver.click(1.0, 2.0)` calls — identical coordinates,
+    /// no simulated time between them — folded into a single
+    /// `UiEvent::DoubleClick` (`TuiDriver`'s `DoubleClickDetector`, same
+    /// mechanism `hamburger_relocated_click_after_reveal_hides_menu_bar`'s
+    /// doc comment documents in full). A folded `DoubleClick` bypasses
+    /// `ShellAdapter`'s semantic dispatch and falls through to
+    /// `TuiShellApp::handle` -> `mouse::handle_mouse` — before #1053 that
+    /// path's activity-bar block resolved it anyway (identically to a
+    /// single click, since the deleted block never distinguished the
+    /// two), so the "second click toggles closed" assertion below passed,
+    /// but for the wrong reason: it was never proving the *real* second-
+    /// single-click path (`AppShell::handle_activity_click`'s "already
+    /// active + visible -> hide" branch) at all. Folding disabled makes
+    /// this test what its own doc comment always claimed it was.
     #[test]
     fn driver_click_on_search_icon_switches_and_toggles_sidebar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
+        driver.set_double_click_folding(false);
         assert!(
             !driver.screen_contains("Replace…"),
             "precondition: startup sidebar shows Explorer, not Search"
@@ -4511,6 +5694,247 @@ mod tests {
         assert!(
             !driver.screen_contains("Replace…"),
             "second click on the active icon must toggle the sidebar closed"
+        );
+    }
+
+    // ── #1243: the `Backend::request_full_repaint` call sites ──────────
+    //
+    // Black-box, through the real `driver_with_shell` shell wiring (the
+    // `tui_prod` lane's harness), asserting on the painted grid — the
+    // user-visible guarantee #1243's hook exists to make good on.
+    //
+    // **What this specific test cannot prove, and why** (verified against
+    // pinned rev `215e9e4`, see `render::popup_overlay_closed_this_frame`'s
+    // doc for the full write-up): under a `ratatui` `TestBackend`,
+    // `Terminal::clear()` is *provably output-identical* to not clearing —
+    // it blanks the backend buffer and resets the back buffer, so the
+    // following `draw` writes every non-blank cell and lands on
+    // byte-for-byte the buffer the incremental path lands on. So no
+    // `screen()`/`style_at()`/`terminal_cursor_position()` assertion can
+    // distinguish "`request_full_repaint` fired" from "it didn't", and the
+    // test below does not go RED if the `backend.request_full_repaint()`
+    // calls are deleted. This is therefore *paint-integrity* coverage of
+    // the popup-dismiss call site (the popup leaves no `TestBackend`-level
+    // trace), kept alongside the repaint proof rather than replaced by it —
+    // it is cheaper to run and catches a different failure mode (the popup
+    // itself failing to actually stop rendering).
+    //
+    // **#1393 closed the gap this comment used to point at as unfiled**:
+    // quadraui#1060 (`vt_testing::driver_with_shell` +
+    // `TuiVtDriver::inject_raw`, landed at this repo's pinned rev) exposes
+    // the vt100-backed driver needed to observe the *actual* repaint — a
+    // stale cell written out-of-band from anything `paint_frame` ever
+    // sends. See `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+    // and `popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+    // below (both RED-verified by disabling their respective
+    // `backend.request_full_repaint()` call sites) for that proof.
+
+    /// #1243, popup-dismiss call site: opening the unified picker must
+    /// paint its header, and dismissing it must leave **no** trace of it
+    /// on the grid — the exact stale-glyph symptom the
+    /// `had_popup_overlay` → `request_full_repaint` transition in
+    /// `render_content` exists to prevent on a real terminal.
+    ///
+    /// Drives the whole prod path: `driver_with_shell` →
+    /// `ShellAdapter::handle` → `TuiShellApp::handle` → `handle_key_pressed`
+    /// → `Engine`, then `ShellAdapter::render` → `render_content`, which is
+    /// where the new `popup_overlay_closed_this_frame` branch runs. Uses
+    /// `PickerSource::Keybindings` because `picker_populate_keybindings`
+    /// reads the in-memory keymap — no filesystem, no `cwd` dependence, so
+    /// the header and at least one row are deterministic on any machine.
+    ///
+    /// RED-verified for what it *does* cover: making the Escape rung in
+    /// `handle_key_pressed` leave `engine.picker_open` set makes the second
+    /// assertion fail ("Key Bindings" stays painted). It does **not** go
+    /// RED on removing `backend.request_full_repaint()` — see the module
+    /// comment above this test for the proof of why no `TestBackend`-based
+    /// assertion can.
+    #[test]
+    fn picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::Keybindings);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        assert!(
+            driver.screen_contains("Key Bindings"),
+            "precondition: an open picker must paint its header through \
+             render_content — screen was:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.press_named(quadraui::NamedKey::Escape);
+        assert_eq!(
+            reaction,
+            Reaction::Redraw,
+            "dismissing the picker must repaint"
+        );
+        assert!(
+            !driver.screen_contains("Key Bindings"),
+            "the dismissed picker must leave no glyphs behind — screen \
+             was:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #1393: the actual repaint proof, via quadraui#1060's `vt_testing`
+    // `ShellApp` driver ───────────────────────────────────────────────────
+    //
+    // The module comment above `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`
+    // (and `render::popup_overlay_closed_this_frame`'s own doc) explains why
+    // no assertion built on `quadraui::tui::testing::TuiDriver`
+    // (`ratatui::backend::TestBackend`) can distinguish "`request_full_repaint`
+    // fired" from "it didn't": `Terminal::clear()` is output-identical to an
+    // ordinary diffed redraw under that backend, so there is no stale cell
+    // for it to observe. quadraui#1060 (landed at this repo's pinned rev —
+    // `vt_testing::driver_with_shell` + the public `TuiVtDriver::inject_raw`
+    // hook) exposes the real `vt100`-backed driver quadraui already uses
+    // in-crate to prove the mechanism
+    // (`vt_testing::render_actually_clears_stale_content_outside_the_diff_cache`)
+    // to downstream `ShellApp` consumers, so the two tests below can assert
+    // on the actual repaint instead of the paint-integrity proxy above.
+    //
+    // Technique (mirrors the upstream test exactly): `inject_raw` writes a
+    // byte straight into the `vt100::Parser` underneath `paint_frame`, out
+    // of band from anything the app's own `ratatui::Buffer` diffing ever
+    // sees — modelling a process (a PTY, a subshell, anything sharing the
+    // terminal) writing directly to the screen. As long as the app's *own*
+    // content at that cell is unchanged between frames, a plain redraw
+    // leaves the injected glyph in place: ratatui's diff believes the cell
+    // is unchanged and sends nothing for it. That plain-redraw step is
+    // deliberately asserted *before* the triggering key, in both tests
+    // below — it is what makes each test RED-capable rather than vacuous:
+    // without `request_full_repaint` wired to the trigger, the final
+    // assertion in each test would fail exactly the way the plain-redraw
+    // assertion just passed. The coordinate used (bottom-right cell) is
+    // never painted by either the status bar or the popup at 80x24, so its
+    // content is identical across every frame in both tests regardless of
+    // popup/cursor state — the injected glyph's survival is purely a
+    // function of whether a full repaint was requested, not of what the
+    // app happens to draw there.
+    const STALE_CELL_ANSI_MOVE: &[u8] = b"\x1b[24;80H";
+
+    /// #1393 acceptance: Ctrl+L (`render::is_force_redraw_key`'s call site
+    /// in `handle_key_pressed`) must force the next paint to wipe a cell an
+    /// incremental diff would otherwise skip.
+    #[test]
+    fn ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = quadraui::tui::vt_testing::driver_with_shell(app, config(), 80, 24);
+
+        driver.inject_raw(STALE_CELL_ANSI_MOVE);
+        driver.inject_raw(b"Z");
+        assert!(
+            driver.screen_contains("Z"),
+            "sanity: the injected stale glyph must be visible before either \
+             render — screen:\n{}",
+            driver.screen()
+        );
+
+        // Plain redraw, nothing pending: the app never paints that corner,
+        // so ratatui's diff still believes it's unchanged and sends
+        // nothing for it — the stale glyph survives. Proves this test can
+        // go RED: without Ctrl+L wired to `request_full_repaint`, the
+        // assertion after `ctrl_char('l')` below would fail the same way.
+        driver.render();
+        assert!(
+            driver.screen_contains("Z"),
+            "a redraw with no full-repaint request pending must not touch \
+             cells the diff cache believes are unchanged — screen:\n{}",
+            driver.screen()
+        );
+
+        let reaction = driver.ctrl_char('l');
+        assert_eq!(reaction, Reaction::Redraw, "Ctrl+L must request a redraw");
+        assert!(
+            !driver.screen_contains("Z"),
+            "Ctrl+L must call Backend::request_full_repaint and force the \
+             stale glyph to clear — screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1393 acceptance: dismissing the unified picker
+    /// (`render::popup_overlay_closed_this_frame`'s `had_popup_overlay`
+    /// transition in `render_content`) must force the next paint to wipe a
+    /// cell an incremental diff would otherwise skip — the actual repaint
+    /// `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`
+    /// above cannot observe under `TestBackend`.
+    ///
+    /// Unlike the Ctrl+L rung (which calls `request_full_repaint` *before*
+    /// returning `Reaction::Redraw`, so the very next paint consumes it),
+    /// `render_content`'s `had_popup_overlay` check runs at the *end* of
+    /// the same render it's judging — after that frame has already drawn —
+    /// so the request lands for the *following* paint, matching
+    /// `Backend::request_full_repaint`'s own doc ("the next time it
+    /// paints"). This test therefore drives one extra plain `render()`
+    /// after the dismissing Escape before asserting the glyph is gone —
+    /// simulating any subsequent frame the live runner would paint anyway
+    /// (a cursor blink, the next keystroke, …).
+    #[test]
+    fn popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::Keybindings);
+        let mut driver = quadraui::tui::vt_testing::driver_with_shell(app, config(), 80, 24);
+
+        assert!(
+            driver.screen_contains("Key Bindings"),
+            "precondition: an open picker must paint its header — \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.inject_raw(STALE_CELL_ANSI_MOVE);
+        driver.inject_raw(b"Z");
+        assert!(
+            driver.screen_contains("Z"),
+            "sanity: the injected stale glyph must be visible before either \
+             render — screen:\n{}",
+            driver.screen()
+        );
+
+        // Plain redraw that leaves the picker open (typing filters the
+        // query, it does not close the popup): the bottom-right corner is
+        // outside both the status bar and the popup rect, unchanged by
+        // this keystroke, so the diff skips it and the stale glyph
+        // survives. Proves this test can go RED: without the
+        // `had_popup_overlay` transition wired to `request_full_repaint`,
+        // the assertion after Escape below would fail the same way.
+        let typed = driver.type_char('h');
+        assert_eq!(
+            typed,
+            Reaction::Redraw,
+            "typing into the picker query must redraw"
+        );
+        assert!(
+            driver.screen_contains("Z"),
+            "a redraw that leaves the popup open must not touch cells the \
+             diff cache believes are unchanged — screen:\n{}",
+            driver.screen()
+        );
+
+        let dismissed = driver.press_named(quadraui::NamedKey::Escape);
+        assert_eq!(
+            dismissed,
+            Reaction::Redraw,
+            "dismissing the picker must repaint"
+        );
+        assert!(
+            !driver.screen_contains("Key Bindings"),
+            "the dismissed picker must leave no glyphs behind — screen:\n{}",
+            driver.screen()
+        );
+
+        // The dismissing frame itself only *requests* the repaint (see the
+        // doc comment above) — consume it with one more plain render.
+        driver.render();
+        assert!(
+            !driver.screen_contains("Z"),
+            "closing the popup must call Backend::request_full_repaint and \
+             force the stale glyph to clear on the next paint — \
+             screen:\n{}",
+            driver.screen()
         );
     }
 
@@ -4590,7 +6014,7 @@ mod tests {
     #[test]
     fn driver_paints_an_extension_panel_registered_after_the_first_frame() {
         let app = app_with_ext_panel();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         assert!(
             !driver.screen().contains(EXT_ICON),
             "precondition: the static config carries no extension panels"
@@ -4607,8 +6031,8 @@ mod tests {
     }
 
     /// End-to-end: clicking the extension panel's icon must open *that*
-    /// panel's body. Row 7 = hamburger@0, explorer@1, search@2, debug@3,
-    /// git@4, extensions@5, ai@6, ext@7 — the same index
+    /// panel's body. Row 8 = hamburger@0, explorer@1, search@2, debug@3,
+    /// git@4, extensions@5, ai@6, board@7 (#521), ext@8 — the same index
     /// `resolve_activity_bar_click` (the legacy mouse path) assigns, since
     /// `Engine::ext_activity_panels` appends in the same sorted order.
     /// "Git Insights" is the panel *title*, which only `render_ext_panel`
@@ -4624,13 +6048,146 @@ mod tests {
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
 
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
         let screen = driver.screen();
         assert!(
             screen.to_uppercase().contains("GIT INSIGHTS"),
             "clicking an extension panel's activity-bar icon must open its \
              sidebar body; screen:\n{screen}"
         );
+    }
+
+    /// #1053: before deleting `mouse.rs`'s dead activity-bar block (the
+    /// hand-rolled `ActivityBarTarget` dispatch, including the
+    /// `ActivityBarTarget::MenuToggle` arm #988's own "likely shape" guess
+    /// pointed at, wrongly — see `hamburger_relocated_click_after_reveal_
+    /// hides_menu_bar`'s doc comment for the mechanism), prove every target
+    /// that block used to (claim to) resolve is actually reachable through
+    /// the real production path: `ShellAdapter::handle` ->
+    /// `AppShell::handle_activity_click`, which consumes a genuine single
+    /// `MouseDown` into a semantic `AppShellEvent` *before*
+    /// `TuiShellApp::handle` -> `mouse::handle_mouse` ever sees it.
+    ///
+    /// Covers 7 of the 8 `ActivityBarTarget` kinds plus the hamburger: the
+    /// 6 fixed panels (`Panel(SidebarPanel::*)`), `Settings` (a *bottom*
+    /// item, dispatched as `AppShellEvent::BottomItemClicked`, not
+    /// `PanelChanged` — see `on_shell_event`'s `BottomItemClicked` arm),
+    /// and `MenuToggle`. The 8th kind, `ExtensionPanel`, already has its
+    /// own dedicated click-driven coverage just above
+    /// (`driver_click_on_extension_icon_opens_the_plugin_panel`) — not
+    /// repeated here.
+    ///
+    /// Every click is genuine and independent (`set_double_click_folding
+    /// (false)`, matching the hamburger tests' own rationale — two clicks
+    /// close together in simulated time would otherwise fold into a
+    /// `DoubleClick`, which bypasses `ShellAdapter`'s semantic dispatch
+    /// entirely and falls through to the very `mouse::handle_mouse` path
+    /// this test exists to prove is *not* load-bearing), located fresh
+    /// from the just-painted frame via `driver.find` (never a stored
+    /// coordinate — `hamburger_stale_click_position_after_reveal_still_
+    /// hides_menu_bar` documents why a stale coordinate can silently
+    /// exercise a different code path). Built with
+    /// `TuiShellApp::new_for_test` (`#868`) and the real production
+    /// `TuiShellApp::build_shell_config(false)` — not the single-panel test
+    /// `config()` helper — so this is the actual activity bar a user
+    /// clicks, not a stand-in.
+    ///
+    /// The hamburger is clicked last, after every real panel: revealing
+    /// the menu bar reserves a title-bar row and shifts the whole activity
+    /// bar down by one, which `driver.find` handles automatically for
+    /// anything clicked afterwards, but there is no need to keep clicking
+    /// after the hamburger's own assertion, so it's simplest to end there.
+    #[test]
+    fn driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1053_activity_bar_all_targets_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw1053.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker_file);
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("zqxw1053.txt"),
+            "precondition: Explorer is the default active panel but starts \
+             hidden (sidebar visibility defaults to false — see \
+             `app_with_sidebar_open`'s doc); screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            driver.screen()
+        );
+
+        // Click each icon, freshly located, and confirm the click actually
+        // switched the sidebar's *content* (not just chrome) via the real
+        // `ShellAdapter` path.
+        let mut click_icon_and_expect = |icon: &str, marker: &str, label: &str| {
+            let (x, y) = driver.find(icon).unwrap_or_else(|| {
+                panic!(
+                    "{label} icon must paint on the activity bar; screen:\n{}",
+                    driver.screen()
+                )
+            });
+            driver.click(x, y);
+            driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+            driver.render();
+            let screen = driver.screen();
+            assert!(
+                screen.contains(marker),
+                "clicking the {label} icon must open its panel via the \
+                 real ShellApp path (marker {marker:?} missing); \
+                 screen:\n{screen}"
+            );
+        };
+
+        click_icon_and_expect(crate::icons::SEARCH.s(), "Replace…", "Search");
+        click_icon_and_expect(crate::icons::DEBUG.s(), "DEBUG", "Debug");
+        click_icon_and_expect(
+            crate::icons::GIT_BRANCH.s(),
+            "SOURCE CONTROL",
+            "Source Control",
+        );
+        // #1343: "Extensions"/"Settings", not the all-caps "EXTENSIONS"/
+        // "SETTINGS" the other panels below still hand-paint — those two
+        // panels' own duplicate header rows are deleted now (#1256's
+        // double-header bug), so the only header left is the shell's own
+        // `AppShell` one, which uses this config's title-case
+        // `title_tooltip` strings, not the shared `App`'s all-caps
+        // `PanelDefinition` titles (see `issue_1256_sidebar_chrome`'s doc
+        // table in `harness.rs` for why the casing differs by arm).
+        click_icon_and_expect(crate::icons::EXTENSIONS.s(), "Extensions", "Extensions");
+        click_icon_and_expect(crate::icons::AI_CHAT.s(), "AI ASSISTANT", "AI");
+        click_icon_and_expect(crate::icons::SETTINGS.s(), "Settings", "Settings");
+        click_icon_and_expect(crate::icons::EXPLORER.s(), "zqxw1053.txt", "Explorer");
+
+        // Hamburger last: `ActivityBarTarget::MenuToggle`, the specific arm
+        // #988's "likely shape" guess named.
+        let (hx, hy) = driver
+            .find(crate::icons::HAMBURGER.s())
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "clicking the hamburger must reveal the menu bar via the real \
+             ShellApp path; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Unit half of the click path: `AppShell` reports an extension icon
@@ -4777,7 +6334,7 @@ mod tests {
     #[test]
     fn live_shell_config_appends_extension_panels_after_the_builtins() {
         let app = app_with_ext_panel();
-        let base: Vec<String> = TuiShellApp::shell_config(false)
+        let base: Vec<String> = TuiShellApp::build_shell_config(false)
             .panels
             .iter()
             .map(|p| p.id.as_str().to_string())
@@ -4827,7 +6384,7 @@ mod tests {
     fn menu_reveal_then_search_icon_click_opens_search_not_explorer() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -4867,18 +6424,19 @@ mod tests {
         );
     }
 
-    /// #988: v0.11.0 bug report — "the hamburger button won't re-hide the
-    /// menu bar once revealed." **Correction (review, fix iteration 1):** an
-    /// earlier version of this test claimed the toggle *mechanism* had no
-    /// defect at all, supported by a three-click open→closed→open sequence
-    /// that appeared to pass. That claim was wrong and the test that backed
-    /// it was invalid — see "Why the old version was green for the wrong
-    /// reason" below. Driven correctly (below), a second click on the
-    /// hamburger — even when perfectly re-located from the freshly painted
-    /// frame — genuinely fails to hide the menu row. This is a real,
-    /// reproducible defect in the toggle mechanism itself, gated via
-    /// [`crate::harness::known_bug_gate`] under its own label so the suite
-    /// stays green while it remains test-only per this issue's scope.
+    /// #988 / fix #1029: v0.11.0 bug report — "the hamburger button won't
+    /// re-hide the menu bar once revealed." **Correction (review, fix
+    /// iteration 1):** an earlier version of this test claimed the toggle
+    /// *mechanism* had no defect at all, supported by a three-click
+    /// open→closed→open sequence that appeared to pass. That claim was
+    /// wrong and the test that backed it was invalid — see "Why the old
+    /// version was green for the wrong reason" below. Driven correctly
+    /// (below), a second click on the hamburger — even when perfectly
+    /// re-located from the freshly painted frame — genuinely failed to hide
+    /// the menu row. This was a real, reproducible defect in the toggle
+    /// mechanism itself (defect 2 of #988) — see [`Self::on_shell_event`]'s
+    /// `PanelChanged` arm and the sidebar-visibility sync at the end of
+    /// [`Self::handle`] for the fix.
     ///
     /// # Why the old version was green for the wrong reason
     ///
@@ -4907,7 +6465,7 @@ mod tests {
     /// `ActivityBarTarget::MenuToggle` arm mis-resolving a shifted row. That
     /// arm is **unreachable** for a genuine single click on the hamburger in
     /// production: the hamburger is a registered top-row `PanelDefinition`
-    /// (`TuiShellApp::shell_config`), so `quadraui`'s own
+    /// (`TuiShellApp::build_shell_config`), so `quadraui`'s own
     /// `ShellAdapter::handle` → `AppShell::handle_activity_click`
     /// (`compose/app_shell.rs`) hit-tests and consumes a plain `MouseDown`
     /// into a semantic `AppShellEvent` before it ever reaches
@@ -4915,43 +6473,75 @@ mod tests {
     /// the `DoubleClick` fold above).
     ///
     /// `on_shell_event`'s `PanelChanged { hamburger }` arm (which reveals the
-    /// menu) never touches the shadow `engine.app_shell`, so
-    /// `engine.app_shell.sidebar_visible()` stays `false` for the hamburger
+    /// menu) never touched the shadow `engine.app_shell`, so
+    /// `engine.app_shell.sidebar_visible()` stayed `false` for the hamburger
     /// for the lifetime of the test. `TuiShellApp::handle`'s own
     /// end-of-dispatch "keep the runner `AppShell`'s sidebar visibility ==
-    /// the shadow's" sync reads that `false` on *every* intervening
+    /// the shadow's" sync read that `false` on *every* intervening
     /// dispatch — including the benign `WindowFocused` pump this test issues
     /// after each click purely to land the title-bar sync — and
-    /// force-hides the *runner*'s own `AppShell` sidebar
-    /// (`ctx.shell_mut().hide_sidebar()`) in response. That leaves the
+    /// force-hid the *runner*'s own `AppShell` sidebar
+    /// (`ctx.shell_mut().hide_sidebar()`) in response. That left the
     /// runner's `AppShell::active_panel == Some(hamburger)` but
-    /// `sidebar_visible == false` by the time the next click lands, so
+    /// `sidebar_visible == false` by the time the next click landed, so
     /// `AppShell::handle_activity_click`'s "already active + visible → hide"
-    /// branch is never reached for the hamburger at all: every click —
-    /// first or Nth, correctly located or not — resolves as a fresh
-    /// `PanelChanged` reveal, which unconditionally sets
-    /// `engine.menu_bar_visible = true` again. The flag never gets a chance
+    /// branch was never reached for the hamburger at all: every click —
+    /// first or Nth, correctly located or not — resolved as a fresh
+    /// `PanelChanged` reveal, which unconditionally set
+    /// `engine.menu_bar_visible = true` again. The flag never got a chance
     /// to flip back to `false` through this path. (Confirmed directly by
     /// temporarily instrumenting `on_shell_event`: the second,
-    /// correctly-relocated click below emits a second
+    /// correctly-relocated click used to emit a second
     /// `PanelChanged { hamburger }`, never a `SidebarHidden`.)
     ///
-    /// This is a deeper defect than the row-shift bug pinned by this
-    /// module's sibling test,
-    /// [`hamburger_stale_click_position_after_reveal_misses_the_shifted_button`]:
-    /// fixing the row-shift alone (making the second click land back on the
-    /// hamburger) would not be sufficient on its own, since a click that
-    /// does land still can't reach the "hide" branch.
+    /// **The fix:** the sidebar-visibility sync at the end of
+    /// [`Self::handle`] now special-cases the hamburger out of that force-hide
+    /// entirely while `engine.menu_bar_visible` is true and the runner's
+    /// active panel is the hamburger — see that sync's own doc comment for
+    /// why it's gated on both, not just the active-panel check. That alone
+    /// would leave the runner's own reserved-but-contentless sidebar region
+    /// leaking whatever real panel the shadow's `active_panel_id()` defaults
+    /// to (Explorer) into the screen for as long as the menu stays open, so
+    /// [`Self::reclaim_hamburger_sidebar_reservation`] additionally corrects
+    /// the *painted* layout back to "no sidebar reserved" for exactly that
+    /// mismatch. The hamburger's own `SidebarHidden` (the second click,
+    /// correctly located) is special-cased in
+    /// [`Self::on_shell_event_ctx`], ahead of the ctx-less
+    /// [`Self::on_shell_event`] below, because only `ctx.shell()` can tell
+    /// the hamburger's second click apart from a real panel's.
     ///
-    /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario's gated body with `KNOWN_BUGS` temporarily emptied — the
+    /// This was a deeper defect than the row-shift bug pinned by this
+    /// module's sibling test,
+    /// [`hamburger_stale_click_position_after_reveal_still_hides_menu_bar`]:
+    /// fixing the row-shift alone (making the second click land back on the
+    /// hamburger) would not have been sufficient on its own, since a click
+    /// that lands still couldn't have reached the "hide" branch.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by reverting this fix
+    /// (both the sync guard in `Self::handle` and the `SidebarHidden`
+    /// special-case in `Self::on_shell_event_ctx`) and re-running — the
     /// `!screen_contains("File")` assertion below fails; the menu row is
     /// still painted after the second, correctly re-located click.
+    ///
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the latter is ambient in exactly the way that method's own doc
+    /// comment warns about — `Engine::new()` reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json`, and a machine that has
+    /// ever opened the explorer has a persisted `explorer_visible: true` that
+    /// boots this app with the sidebar *showing*. This scenario is about the
+    /// hamburger's own reserved-but-contentless sidebar region, so it only
+    /// holds from the "no real panel open" state a fresh checkout and CI
+    /// boot into: with an ambient sidebar already visible the second click
+    /// takes the real-panel path instead and the menu row stays painted,
+    /// which made this test red on a dev box and green in CI. `new_for_test`
+    /// substitutes in-memory `Settings::default()`/`SessionState::default()`
+    /// and skips the per-workspace session restore, so the starting state is
+    /// the same everywhere.
     #[test]
-    fn hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar() {
+    fn hamburger_relocated_click_after_reveal_hides_menu_bar() {
         let mut driver = driver_with_shell(
-            TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::new_for_test(),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -4991,8 +6581,7 @@ mod tests {
             driver.screen()
         );
 
-        // ── Click 2: RE-LOCATE from the newly painted frame, then attempt
-        // to hide — #988's real, reproducible defect (see doc above) ─────
+        // ── Click 2: RE-LOCATE from the newly painted frame, then hide ───
         // Revealing the menu row shifted every activity-bar item, including
         // the hamburger itself, down by one — confirmed by the assertion
         // below. A test that reused `(hx1, hy1)` here would be reproducing
@@ -5010,34 +6599,48 @@ mod tests {
              row, or this test isn't exercising the row-shift this issue is \
              about"
         );
-        crate::harness::known_bug_gate(
-            "hamburger_second_click_at_correct_position_does_not_hide_menu_bar::tui",
-            || {
-                driver.click(hx2, hy2);
-                driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-                driver.render();
-                assert!(
-                    !driver.screen_contains("File"),
-                    "second hamburger click, correctly re-located, must \
-                     hide the menu row again; screen:\n{}",
-                    driver.screen()
-                );
-            },
+        driver.click(hx2, hy2);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            !driver.screen_contains("File"),
+            "second hamburger click, correctly re-located, must hide the \
+             menu row again; screen:\n{}",
+            driver.screen()
         );
 
-        // Deliverable 4 (a third click completing a second on/off cycle) is
-        // deferred: with the click above already failing to hide the menu,
-        // there is no "closed" state for a third click to reveal from —
-        // testing it now would just re-assert the same root cause the gate
-        // above already pins under a second label. Restore it alongside
-        // deleting the `KNOWN_BUGS` entries once the real fix lands.
+        // ── Click 3 (deliverable 4): a second on/off cycle ───────────────
+        // Was deferred while click 2 above still failed to hide the menu —
+        // there was no "closed" state for a third click to reveal from.
+        // Now that it does, re-locate once more (hiding the menu shifted
+        // the hamburger back up a row) and confirm the toggle survives a
+        // second full cycle rather than just the first.
+        let (hx3, hy3) = driver
+            .find(hamburger)
+            .expect("hamburger icon must still paint with the menu bar hidden again");
+        assert_eq!(
+            (hx1, hy1),
+            (hx3, hy3),
+            "sanity: hiding the menu bar must shift the hamburger back to \
+             its original row"
+        );
+        driver.click(hx3, hy3);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "a third hamburger click must reveal the menu row again — the \
+             toggle must survive a second on/off cycle, not just the \
+             first; screen:\n{}",
+            driver.screen()
+        );
 
         // ── No orphaned modal (deliverable 2), asserted via behaviour ───
-        // Independent of whether click 2 above actually hid the menu: a
-        // subsequent click on an unrelated activity-bar icon must still
-        // reach its own normal target rather than being swallowed by a
-        // stuck `menu-system-dropdown` overlay. Located from the painted
-        // frame, never a stored coordinate, same as every click above.
+        // After the reveal → hide → reveal dance above, a click on an
+        // unrelated activity-bar icon must still reach its own normal
+        // target rather than being swallowed by a stuck
+        // `menu-system-dropdown` overlay. Located from the painted frame,
+        // never a stored coordinate, same as every click above.
         assert!(
             !driver.screen_contains("Replace…"),
             "precondition: Search panel is not already open; screen:\n{}",
@@ -5060,20 +6663,20 @@ mod tests {
         );
     }
 
-    /// #988's row-shift finding, one of two complementary, independently
-    /// gated defects this issue pins (see this module's sibling test,
-    /// [`hamburger_relocated_click_after_reveal_still_fails_to_hide_menu_bar`],
+    /// #988's row-shift finding, one of two complementary defects this
+    /// issue (fixed by #1029) pins (see this module's sibling test,
+    /// [`hamburger_relocated_click_after_reveal_hides_menu_bar`],
     /// for the deeper one and the corrected mechanism write-up — the toggle
-    /// logic is *not* innocent, contrary to what an earlier version of that
+    /// logic was *not* innocent, contrary to what an earlier version of that
     /// test's doc comment claimed). This one: the hamburger button visually
     /// moves down one screen row the instant its first click reserves the
     /// title-bar row for the menu. A second click at the *exact same
     /// physical position* that worked to reveal the menu — the position a
     /// user's eye and muscle memory would reach for, since nothing about a
-    /// click *tells* you the button under it moved — no longer lands on the
-    /// hamburger.
+    /// click *tells* you the button under it moved — no longer lands on
+    /// `activity_bar_bounds`.
     ///
-    /// # What the stale click actually resolves to (the issue's acceptance ask)
+    /// # What the stale click used to resolve to, and the fix
     ///
     /// Confirmed empirically by probing the painted frame at this exact
     /// geometry, **with the double-click fold disabled** (see below) so the
@@ -5082,18 +6685,24 @@ mod tests {
     /// menu hidden and moves to `(1.5, 1.5)` once the reveal reserves row 0.
     /// The stale click therefore lands on row 0 — and row 0 is now the menu
     /// bar, whose first item `File` occupies exactly those columns
-    /// (` File  Edit  View  Go  …`). So the second click does **not** hit
-    /// the activity bar at all, and is **not** silently swallowed: it
-    /// **opens the `File` dropdown**, painting a `New Tab / Open File… /
-    /// Quit` overlay over the top-left of the screen.
+    /// (` File  Edit  View  Go  …`). So the second click did **not** hit
+    /// the activity bar at all, and was **not** silently swallowed: it used
+    /// to **open the `File` dropdown**, painting a `New Tab / Open File… /
+    /// Quit` overlay over the top-left of the screen — strictly worse than
+    /// "the button didn't work": the menu row stayed visible *and* an
+    /// unwanted dropdown covered the activity bar, swallowing the next
+    /// click too.
     ///
-    /// That makes the user-visible symptom strictly worse than "the button
-    /// didn't work": the menu row stays visible *and* an unwanted dropdown
-    /// is now covering the activity bar, swallowing the next click too. The
-    /// gated body below asserts all three post-fix properties together —
-    /// menu row hidden, no `File` dropdown, and a following click on an
-    /// unrelated icon still reaching its own target (the issue's
-    /// deliverable 2) — because today the stale click breaks all three.
+    /// **The fix**, in `Self::handle`, runs ahead of the `MenuSystem`
+    /// intercept that used to swallow this click: a `MouseDown` inside
+    /// `title_bar_bounds` whose column still falls within the activity
+    /// bar's own width is recognised structurally as the corner the
+    /// hamburger painted in the previous frame, and is handled as the
+    /// hamburger's own close (drop `menu_bar_visible`, hide the runner's
+    /// sidebar, hide the title bar) instead of being handed to
+    /// `MenuSystem`. See that check's own doc comment for the exact
+    /// geometry and why it can't misfire on a genuine click elsewhere on
+    /// the menu bar.
     ///
     /// (An earlier version of this doc comment claimed the click "lands in
     /// the now-relocated title-bar band … which silently swallows the click:
@@ -5114,18 +6723,16 @@ mod tests {
     /// was wrong. [`quadraui::tui::testing::TuiDriver::set_double_click_folding`]
     /// is what stops that.
     ///
-    /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario's gated body with `KNOWN_BUGS` temporarily emptied — the
-    /// first assertion in the gate (`File` no longer painted) fails, and the
-    /// two that follow it would fail too; the menu row is still visible and
-    /// the `File` dropdown is open after the stale-position second click.
-    /// Gated via [`crate::harness::known_bug_gate`] so the suite stays green
-    /// while this is documented as test-only.
+    /// **RED against unfixed `develop`:** confirmed by reverting the
+    /// hamburger-corner check in `Self::handle` and re-running — the first
+    /// assertion below (`File` no longer painted) fails, and the two that
+    /// follow it fail too; the menu row is still visible and the `File`
+    /// dropdown is open after the stale-position second click.
     #[test]
-    fn hamburger_stale_click_position_after_reveal_misses_the_shifted_button() {
+    fn hamburger_stale_click_position_after_reveal_still_hides_menu_bar() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -5173,61 +6780,367 @@ mod tests {
              about"
         );
 
-        crate::harness::known_bug_gate(
-            "hamburger_second_click_at_stale_position_does_not_hide_menu_bar::tui",
-            || {
-                // Deliberately the SAME `(hx1, hy1)` as the first click —
-                // this is the point of this scenario, unlike its sibling
-                // above.
-                driver.click(hx1, hy1);
-                driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-                driver.render();
-                assert!(
-                    !driver.screen_contains("File"),
-                    "second click at the SAME physical position the first \
-                     click used must hide the menu row again (#988); \
-                     screen:\n{}",
-                    driver.screen()
-                );
+        // Deliberately the SAME `(hx1, hy1)` as the first click — this is
+        // the point of this scenario, unlike its sibling above.
+        driver.click(hx1, hy1);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            !driver.screen_contains("File"),
+            "second click at the SAME physical position the first click \
+             used must hide the menu row again (#988); screen:\n{}",
+            driver.screen()
+        );
 
-                // Deliverable 2, restated for this scenario, and asserted
-                // *inside* the gate because today the stale click actively
-                // breaks it: the click lands on the menu bar's `File` item
-                // (see this test's doc comment) and opens its dropdown,
-                // which then covers the activity bar. Post-fix, the click
-                // belongs to the hamburger and no dropdown may appear.
-                assert!(
-                    !driver.screen_contains("New Tab"),
-                    "the stale second click must not open the `File` \
-                     dropdown — post-fix it belongs to the hamburger, and a \
-                     stuck `menu-system-dropdown` overlay would swallow \
-                     later input; screen:\n{}",
-                    driver.screen()
-                );
+        // Deliverable 2, restated for this scenario: the stale click used
+        // to land on the menu bar's `File` item (see this test's doc
+        // comment) and open its dropdown, which then covered the activity
+        // bar. Post-fix, the click belongs to the hamburger and no
+        // dropdown may appear.
+        assert!(
+            !driver.screen_contains("New Tab"),
+            "the stale second click must not open the `File` dropdown — \
+             it belongs to the hamburger, and a stuck \
+             `menu-system-dropdown` overlay would swallow later input; \
+             screen:\n{}",
+            driver.screen()
+        );
 
-                // …and behaviourally: a following click on an unrelated
-                // activity-bar icon must still reach its own normal target.
-                // Located from the painted frame, never a stored coordinate.
-                let search = crate::icons::SEARCH.s();
-                let (sx, sy) = driver.find(search).unwrap_or_else(|| {
-                    panic!(
-                        "search icon must still paint on the activity bar \
-                         after the stale hamburger click — an overlay \
-                         covering it is itself the #988 symptom; screen:\n{}",
-                        driver.screen()
-                    )
-                });
-                driver.click(sx, sy);
-                driver.dispatch(quadraui::UiEvent::WindowFocused(true));
-                driver.render();
-                assert!(
-                    driver.screen_contains("Replace…"),
-                    "a click on the Search icon after the stale hamburger \
-                     click above must still open the Search panel; \
-                     screen:\n{}",
-                    driver.screen()
-                );
-            },
+        // …and behaviourally: a following click on an unrelated
+        // activity-bar icon must still reach its own normal target.
+        // Located from the painted frame, never a stored coordinate.
+        let search = crate::icons::SEARCH.s();
+        let (sx, sy) = driver.find(search).unwrap_or_else(|| {
+            panic!(
+                "search icon must still paint on the activity bar after \
+                 the stale hamburger click — an overlay covering it is \
+                 itself the #988 symptom; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "a click on the Search icon after the stale hamburger click \
+             above must still open the Search panel; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1029 review (non-blocking concern): pins the behaviour of
+    /// [`TuiShellApp::reclaim_hamburger_sidebar_reservation`] when a real
+    /// sidebar panel (Explorer here, via [`app_with_sidebar_open`]) is
+    /// already open before the hamburger is clicked. That method's own doc
+    /// comment explains it only reclaims the sidebar region when the shadow
+    /// `engine.app_shell` says `sidebar_visible() == false` — the "nothing
+    /// real was ever shown" case, where leaving the reservation in place
+    /// would leak the shadow's *default* active panel (Explorer, which is
+    /// active but not visible until a real click or fixture opens it) into
+    /// a region the user never opened. When a real panel is already open,
+    /// `sidebar_visible()` is `true`, the reclaim is skipped, and the
+    /// previously-open panel's content keeps painting alongside the
+    /// now-visible menu bar — the same way opening a menu bar in a real
+    /// editor doesn't hide whatever sidebar panel was already open. This is
+    /// intended, not a residual content leak: the shadow's content is
+    /// *real* here (the user asked for it, via `show_panel`), unlike the
+    /// phantom-default-Explorer case the reclaim exists to correct.
+    #[test]
+    fn hamburger_click_with_real_sidebar_panel_open_keeps_its_content_painted() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1029_hamburger_sidebar_open_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker_file = dir.join("zqxw1029.txt");
+        std::fs::write(&marker_file, "marker").unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&marker_file);
+        assert!(
+            app.engine.app_shell.sidebar_visible(),
+            "precondition: Explorer must be open before the hamburger is \
+             ever clicked"
+        );
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("zqxw1029.txt"),
+            "precondition: Explorer's marker file must paint before the \
+             hamburger is clicked; screen:\n{}",
+            driver.screen()
+        );
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File"),
+            "hamburger click must reveal the menu row even with a real \
+             sidebar panel already open; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("zqxw1029.txt"),
+            "Explorer's content must stay painted alongside the revealed \
+             menu bar — `reclaim_hamburger_sidebar_reservation` must not \
+             blank out a real, user-opened panel's content; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1029 review (blocking finding, fix iteration 1): the original
+    /// stale-corner-click fix was purely positional and stateless, so it
+    /// swallowed *every* left-click landing on `File`'s columns for as long
+    /// as the menu bar stayed open — not just the one stale click a reveal
+    /// leaves behind. This pins the fix: `Engine::hamburger_stale_click_guard`
+    /// bounds the corner interception to a single one-shot click immediately
+    /// after a reveal, consumed by the very next `MouseDown` regardless of
+    /// where it lands. Reveal, spend that one-shot click on a genuine,
+    /// unrelated menu click (`Edit`, which does not fall in the hamburger's
+    /// corner columns), then confirm mouse access to `File` still works
+    /// afterwards — the exact capability the review said was permanently
+    /// broken.
+    ///
+    /// **RED against the pre-review (iteration 0) shape of this fix:**
+    /// confirmed by reverting the one-shot guard (making the corner-check
+    /// unconditional on `menu_bar_visible` alone, as it originally was) and
+    /// re-running — the final `New Tab` assertion fails: the click on
+    /// `File` lands in the same `[ab.x, ab.x + ab.width)` column range as
+    /// the hamburger's corner and is swallowed as a "close the menu"
+    /// action instead of opening the `File` dropdown.
+    #[test]
+    fn hamburger_corner_guard_does_not_permanently_block_file_menu_clicks() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::build_shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // ── Click 1: reveal (arms the one-shot guard) ───────────────────
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 2: spend the one-shot guard on a genuine, unrelated
+        // menu click ─────────────────────────────────────────────────────
+        // `Edit` sits well to the right of the hamburger's corner columns
+        // (`[ab.x, ab.x + ab.width)`), so this click both consumes the
+        // guard *and* must behave exactly like any ordinary menu click —
+        // opening `Edit`'s dropdown, not closing the menu bar.
+        let (ex, ey) = driver
+            .find("Edit")
+            .expect("Edit menu label must paint once the menu bar is open");
+        driver.click(ex, ey);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Undo"),
+            "clicking Edit must open its dropdown, spending the one-shot \
+             guard on an unrelated click; screen:\n{}",
+            driver.screen()
+        );
+
+        // Close the Edit dropdown without touching `menu_bar_visible` —
+        // Escape only closes the open dropdown here (mirrors
+        // `menu_intercept_routes_via_is_open_when_bar_hidden_with_dropdown_
+        // open_via_shell_app`'s use of the same key for the same reason).
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && !screen.contains("Undo"),
+            "Escape should close the Edit dropdown while leaving the menu \
+             bar itself open; screen:\n{screen}"
+        );
+
+        // ── Click 3: File, now that the guard is already spent ──────────
+        // With the one-shot guard consumed by click 2, this click must
+        // reach the `MenuSystem` intercept like any other menu click — not
+        // be swallowed as a phantom "close the menu" action just because
+        // it lands in the same columns the hamburger's corner used to
+        // occupy.
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "a later, deliberate click on File must open its dropdown — \
+             mouse access to File must not stay permanently broken just \
+             because the menu bar is open; screen:\n{screen}"
+        );
+    }
+
+    /// #1029 review (blocking finding, fix iteration 2): the one-shot
+    /// stale-corner guard used to be spent only by a `MouseDown` that
+    /// actually reached `TuiShellApp::handle`. A click on a **real
+    /// activity-bar panel icon** never does — `ShellAdapter::handle`
+    /// hit-tests the activity bar itself, reports
+    /// `AppShellEvent::PanelChanged`, and returns without falling through
+    /// (see `TuiShellApp::on_shell_event`'s doc). So the wholly ordinary
+    /// sequence *reveal → switch panels → click `File`* left the guard
+    /// armed across the middle click, and the `File` click — which paints
+    /// at exactly the hamburger's old corner columns — was swallowed as a
+    /// phantom "close the menu" action.
+    ///
+    /// The sibling test above spends the guard on `Edit`, a menu-*bar*
+    /// label, which is one of the click types that always *did* reach
+    /// `handle`; this one drives the path that did not.
+    ///
+    /// **Verified RED against the iteration-1 fix:** removing the
+    /// `disarm_hamburger_stale_click_guard()` call from
+    /// `on_shell_event`'s real-panel arm and re-running fails the final
+    /// `New Tab` assertion — the `File` click hides the menu bar instead
+    /// of opening the dropdown.
+    #[test]
+    fn hamburger_corner_guard_is_spent_by_a_real_activity_bar_panel_click() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::build_shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        // ── Click 1: reveal (arms the one-shot guard) ───────────────────
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 2: a real activity-bar panel icon ─────────────────────
+        // Consumed entirely by `ShellAdapter`'s own hit-test — it never
+        // reaches `TuiShellApp::handle`, which is the whole point.
+        let search = crate::icons::SEARCH.s();
+        let (sx, sy) = driver.find(search).unwrap_or_else(|| {
+            panic!(
+                "search icon must paint on the activity bar with the menu \
+                 bar open; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "sanity: the Search icon click must actually open the Search \
+             panel, or it isn't the shell-consumed click this test needs; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("File"),
+            "switching panels must leave the revealed menu bar alone; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Click 3: File, with the guard long since spent ──────────────
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "after using an ordinary activity-bar panel, a deliberate click \
+             on File must open its dropdown — the stale-hamburger-corner \
+             guard must not have survived the intervening panel click; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1029 review (blocking finding, fix iteration 2), keyboard half:
+    /// the guard's spend now lives at the very top of
+    /// [`TuiShellApp::handle`], above the `'dispatch` block, so a
+    /// keystroke that takes one of that block's earlier early exits still
+    /// spends it. Before that move the spend sat inside the corner-check
+    /// arm, which several arms `break` past — so *reveal → type → click
+    /// `File`* was the same latent regression as the panel-click path.
+    ///
+    /// **Verified RED against the iteration-1 fix:** moving the spend back
+    /// inside the corner-check arm (so only a `MouseDown` reaching it
+    /// clears the guard) fails the final `New Tab` assertion.
+    #[test]
+    fn hamburger_corner_guard_is_spent_by_an_intervening_keystroke() {
+        let mut driver = driver_with_shell(
+            TuiShellApp::new(None),
+            TuiShellApp::build_shell_config(false),
+            80,
+            24,
+        );
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx, hy) = driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        driver.click(hx, hy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("File"),
+            "hamburger click must reveal the menu row; screen:\n{}",
+            driver.screen()
+        );
+
+        // A plain keystroke: the user moved on, so the stale muscle-memory
+        // click can never arrive any more.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let (fx, fy) = driver
+            .find("File")
+            .expect("File menu label must still paint after a keystroke");
+        driver.click(fx, fy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File") && screen.contains("New Tab"),
+            "after an intervening keystroke, a deliberate click on File \
+             must open its dropdown; screen:\n{screen}"
         );
     }
 
@@ -5249,6 +7162,49 @@ mod tests {
         assert!(
             screen.contains("ZQXW_STAGE2_EDITOR_MARKER"),
             "editor content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #1134: `gx` used to shell out directly from `core/engine/keys.rs` via
+    /// a bare `Command::new` call to the Linux freedesktop.org opener, with
+    /// no `target_os` guard at all — it ran that opener even on
+    /// macOS/Windows, and (being
+    /// `#[cfg(not(test))]`) was structurally unreachable from any test, so
+    /// nothing could have caught that. Now `gx` queues a
+    /// `PendingPlatformAction::OpenUrl` onto `Engine::pending_platform_actions`
+    /// (asserted directly in `core::engine::tests`) and sets `engine.message`
+    /// synchronously — this test drives that through the real
+    /// `TuiDriver → ShellAdapter → dispatch_event → Engine::handle_key` path
+    /// and asserts on the *painted* status line, not on engine state, per
+    /// this repo's black-box testing rule. It deliberately does **not**
+    /// call `driver.tick()`: that's a separate `ShellApp::tick` call the
+    /// runner makes between event batches, and it's what actually drains
+    /// the queue through `PlatformServices::open_url_result` — exercising
+    /// it here would really shell out to (or OSC-8-fallback through) the
+    /// test process's own stdout, which is exactly the side effect a
+    /// deterministic, headless `cargo test` run must not have.
+    ///
+    /// **RED-verified against unfixed `develop`:** `Engine` has no
+    /// `pending_platform_actions` field there at all, so
+    /// `core::engine::tests`' queue assertions fail to *compile* — as red as
+    /// a reproduction of a `#[cfg(not(test))]`-gated, test-invisible bug can
+    /// get. This driver test additionally pins the user-visible half (the
+    /// status message), which compiles fine against unfixed `develop` but
+    /// is exactly the line the old code's `#[cfg(not(test))]` `Command::new`
+    /// swap must not regress.
+    #[test]
+    fn gx_shows_opening_message_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.buffer_mut().insert(0, "ZQXW1134GXMARKER");
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Cursor starts at (0, 0), on the marker word inserted above.
+        driver.type_char('g');
+        driver.type_char('x');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Opening: ZQXW1134GXMARKER"),
+            "gx should paint an \"Opening: <word>\" status message; screen:\n{screen}"
         );
     }
 
@@ -5984,6 +7940,94 @@ mod tests {
         );
     }
 
+    /// #1160: `<C-k>{c1}{c2}` in Insert mode enters digraph mode and inserts
+    /// the mapped glyph — `a:` gives `ä` (`:h digraph-table`). The
+    /// engine-level `test_1160_ctrl_k_inserts_digraph` pokes
+    /// `engine.buffer()` directly; this drives the real key sequence through
+    /// `TuiDriver` and asserts on the *rendered* screen, closing the
+    /// driver-tier gap the repo's Testing rule requires for a new
+    /// user-visible key binding.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the `<C-k>` block
+    /// removed from `handle_insert_key` (pre-#1160 `keys.rs`), `<C-k>a:`
+    /// falls through to plain self-insert of `a` and `:`, so the screen
+    /// shows `ZQXWDIGRAPH_a:` and never `ZQXWDIGRAPH_ä`.
+    #[test]
+    fn ctrl_k_digraph_inserts_glyph_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXWDIGRAPH_");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('A');
+        driver.ctrl_char('k');
+        driver.type_char('a');
+        driver.type_char(':');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXWDIGRAPH_ä"),
+            "<C-k>a: should insert the ä digraph; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXWDIGRAPH_a:"),
+            "the digraph must replace the two typed chars, not leave them \
+             as plain self-insert; screen:\n{screen}"
+        );
+    }
+
+    /// #1160: `<C-x><C-l>` in Insert mode completes the current line against
+    /// another line in the buffer sharing its prefix (`:h i_CTRL-X_CTRL-L`).
+    /// Mirrors the engine-level `test_1160_ctrl_x_ctrl_l_completes_whole_line`
+    /// but drives the real `<C-x><C-x>` submode dispatch through `TuiDriver`
+    /// and asserts on the *rendered* screen — closing the same driver-tier
+    /// gap for the `<C-x>` completion family.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the
+    /// `insert_ctrl_x_pending` dispatch removed from `handle_insert_key`,
+    /// `<C-x><C-l>` has no effect on Insert-mode text entry, so the second
+    /// line stays `ZQXWCXL_hel` and the screen never shows the completed
+    /// `ZQXWCXL_hello world`.
+    #[test]
+    fn ctrl_x_ctrl_l_completes_whole_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "ZQXWCXL_hello world\nZQXWCXL_hel");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('G');
+        driver.type_char('A');
+        driver.ctrl_char('x');
+        driver.ctrl_char('l');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen = driver.screen();
+        // The fixture's first line already reads "ZQXWCXL_hello world"
+        // before any key is pressed, so a bare `contains` would pass
+        // trivially even if `<C-x><C-l>` did nothing. Require the full text
+        // to appear *twice* — once from the untouched first line, once from
+        // the second line the completion should now have filled in — so the
+        // assertion actually exercises the completion, not the fixture.
+        assert_eq!(
+            screen.matches("ZQXWCXL_hello world").count(),
+            2,
+            "<C-x><C-l> should complete the second line to the first \
+             line's full text, appearing once per line; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXWCXL_hel\n"),
+            "the second line must have been replaced by the completion, \
+             not left as the original unfinished prefix; screen:\n{screen}"
+        );
+    }
+
     /// #882: `2cc` changes exactly the two lines the count names, not just
     /// the first one. Verified against `nvim --headless -u NONE` (0.12.5) as
     /// the `tests/nvim_conformance.rs` oracle case "op:2cc".
@@ -6681,6 +8725,15 @@ mod tests {
     /// second `Ctrl-O` would move the cursor inside tab B's own buffer
     /// instead of switching back to tab A — the painted screen would still
     /// show `BBB674`, not `AAA674`.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can reopen
+    /// extra tabs before this test opens its own two — shifting
+    /// `active_group().active_tab` away from the `1` the assertions below
+    /// assume. Measured red on a dev box with a saved session for this repo
+    /// path (`docs/RELEASING.md` §1.0), green in CI where no such session
+    /// exists.
     #[test]
     fn ctrl_o_activates_original_tab_via_shell_app() {
         let dir = std::env::temp_dir().join(format!(
@@ -6696,7 +8749,7 @@ mod tests {
         std::fs::write(&file_a, &content_a).unwrap();
         std::fs::write(&file_b, &content_b).unwrap();
 
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine
             .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
             .unwrap();
@@ -6739,6 +8792,69 @@ mod tests {
         assert!(
             !screen.contains("BBB674"),
             "tab A's pane must not still be showing tab B's text; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1158: opening a *different file* into the current pane — `:e`,
+    /// `EngineAction::OpenFile` → `open_file_with_mode` — is jump-worthy in
+    /// Neovim regardless of line, but `open_file_with_mode` never called
+    /// `push_jump_location`, so `Ctrl-O` right after `:e` was a complete
+    /// no-op: nothing had ever been recorded to jump back to. No `G`, no
+    /// search, no other jump command runs here — the single-window `:e`
+    /// switch is the *only* jump-worthy event in this test, isolating
+    /// exactly the gap `KNOWN_DEVIATIONS_MULTI` used to excuse under "jump:
+    /// multi C-o after :e returns to A".
+    ///
+    /// Drives real key input (`ctrl_char('o')`) through `TuiDriver` and
+    /// asserts on the painted editor body, per the black-box tier this
+    /// repo's testing rule requires for behaviour changes — not an
+    /// `Engine`-internal check that `jump_list` got populated.
+    ///
+    /// Measured red against unfixed `develop`: with no jump ever recorded,
+    /// `Ctrl-O` leaves the cursor exactly where `:e b1158.txt` left it, so
+    /// the screen keeps showing "BBB1158" instead of switching back to
+    /// "AAA1158".
+    #[test]
+    fn ctrl_o_after_e_returns_to_prior_file_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1158_shell_app_jumplist_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1158.txt");
+        let file_b = dir.join("b1158.txt");
+        std::fs::write(&file_a, "AAA1158 first line\nAAA1158 second line\n").unwrap();
+        std::fs::write(&file_b, "BBB1158 first line\nBBB1158 second line\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        // The one and only jump-worthy event: `:e file_b` in the same
+        // window, no other motion in between.
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BBB1158"),
+            "sanity: should be looking at file B before Ctrl-O; screen:\n{screen}"
+        );
+
+        driver.ctrl_char('o');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1158"),
+            "Ctrl-O after :e should return to file A; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB1158"),
+            "pane should no longer show file B after Ctrl-O; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6803,6 +8919,136 @@ mod tests {
                 stray
             );
         }
+    }
+
+    /// #1038: closing one of *several* views of a dirty buffer must not
+    /// prompt to save/discard — only closing the **last** view should.
+    /// `Engine::dirty()` is buffer-level and has no idea how many windows
+    /// display that buffer, so the tab-bar close path used to prompt on
+    /// every close, however many views remained (the `:q` path already got
+    /// this right; see `execute.rs`'s "quit" handler and the new shared
+    /// `Engine::buffer_has_other_views` helper both now call).
+    ///
+    /// End to end through the real `driver_with_shell` pipeline: a genuine
+    /// mouse click on the painted × closes one group's tab, and the
+    /// assertion reads the **painted screen** (`CLAUDE.md` rule 1) — not
+    /// `engine.dialog.is_some()` — for both the positive case (no dialog,
+    /// one view survives) and the negative case in the same fixture
+    /// (closing the last remaining view still prompts).
+    ///
+    /// Fixture shape borrowed from
+    /// `render_content_paints_group_divider_via_shell_app` below: a short
+    /// scratch buffer split into two editor groups via `open_editor_group`,
+    /// which points the new group's window at the *same* buffer id — the
+    /// same "two views, one buffer" shape #1038 reports.
+    ///
+    /// Built with [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#868): the production constructor reads the developer's real
+    /// `~/.config/vimcode/{settings,session}.json` and restores that
+    /// workspace's session files, so the number of painted `[No Name]` tabs
+    /// this test counts would depend on whose machine it runs on.
+    /// `hide_single_tab` is additionally pinned off regardless of what
+    /// `Settings::default()` says: after the first close only one group
+    /// remains, and with that flag on `is_tab_bar_hidden` would suppress the
+    /// second click's tab bar entirely.
+    ///
+    /// RED-verified: with the `buffer_has_other_views` guard removed from
+    /// `handle_tab_bar_click`'s `CloseTab` arm (i.e. prompting on
+    /// `self.dirty()` alone, the pre-#1038 behaviour), this test fails at
+    /// the first `screen_contains("Unsaved Changes")` assertion — the
+    /// dialog paints after closing the *first* of two views. Restored
+    /// before committing.
+    #[test]
+    fn tab_bar_close_dirty_tab_with_other_view_does_not_confirm_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        app.engine.buffer_mut().insert(0, "short\n");
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        let buf_id = app.engine.active_buffer_id();
+        app.engine.buffer_manager.get_mut(buf_id).unwrap().dirty = true;
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Precondition: two groups, both showing the dirty shared buffer,
+        // no dialog yet.
+        let tab_bar_id = quadraui::WidgetId::new(crate::render::EDITOR_TAB_BAR_WIDGET_ID);
+        let starts_before = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_before,
+            2,
+            "precondition: two editor groups must both show the shared \
+             buffer; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "precondition: no confirm dialog before any close"
+        );
+
+        // Close one group's only tab through a real click on its painted ×.
+        // With two groups sharing the "tabs:group" widget id, this resolves
+        // to whichever group's bar painted last this frame — it doesn't
+        // matter which, since both show the identical dirty buffer.
+        let (cx, cy) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("a group's tab bar must have painted tab 0's close button");
+        driver.click(cx, cy);
+
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "closing one of two views of a dirty buffer must not prompt \
+             (#1038) — the other view can still save it; screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_first = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_first,
+            1,
+            "the closed group is gone but the other view of the buffer \
+             must survive; screen:\n{}",
+            driver.screen()
+        );
+
+        // Negative case, same fixture: only one view is left now, so
+        // closing it must still prompt — otherwise deleting the
+        // other-views check entirely would also pass this test.
+        let (cx2, cy2) = driver
+            .tab_close_center(&tab_bar_id, 0)
+            .expect("the surviving group's tab bar must still paint a close button");
+        driver.click(cx2, cy2);
+
+        assert!(
+            driver.screen_contains("Unsaved Changes"),
+            "closing the LAST view of a still-dirty buffer must still \
+             prompt (#1038 negative case); screen:\n{}",
+            driver.screen()
+        );
+        let starts_after_second = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap()
+            .match_indices("[No Name]")
+            .count();
+        assert_eq!(
+            starts_after_second,
+            1,
+            "the tab must not actually be closed yet — the confirm dialog \
+             intercepts it; screen:\n{}",
+            driver.screen()
+        );
     }
 
     /// #609: `render_content` must also paint the *group-level* divider
@@ -6874,6 +9120,203 @@ mod tests {
             "expected the group divider glyph '│' to paint via \
              TuiShellApp::render_content; screen:\n{screen}"
         );
+    }
+
+    /// #1040: clicking in the RIGHT group of a vertical split must land the
+    /// cursor on the exact character clicked, not the one one cell to its
+    /// left.
+    ///
+    /// Root cause: `RenderedWindow::rect`'s x/width come from continuous
+    /// float split math (`quadraui::SplitTree::layout`, zero divider
+    /// thickness) and are not integer-valued in general. At the default
+    /// 50/50 ratio, an *odd* editor content width gives the right pane's
+    /// `rect.x` a `.5`-cell fractional origin (e.g. content width 81 ->
+    /// right `rect.x = 40.5`). TUI's paint path truncates that away before
+    /// drawing (`tui_main::render_impl`'s `win_rect`/`editor_area`, both
+    /// `rect.x as u16`) — so the right pane's text is actually painted
+    /// starting at column 40 — but the *old* click math
+    /// (`render::editor_text_layout`, shared verbatim with GTK, which is
+    /// not itself buggy since GTK's rects really are the sub-pixel
+    /// geometry Cairo paints) fed the raw, untruncated `40.5` into
+    /// `EditorLayout::col_at_x`'s `floor()` division instead. That
+    /// resolves every clicked column one cell short of the real one
+    /// (column 0 clamps to 0 via `.max(0.0)`, correct by luck — matching
+    /// the report's "at least some of the time"). The left pane never
+    /// shows this: its `rect.x` is always the group's own whole-cell
+    /// screen edge, never fractional.
+    ///
+    /// Fixed via `render::tui_editor_text_layout`, which resolves against
+    /// [`crate::render::tui_window_paint_rect`]'s whole-cell-truncated
+    /// viewport — the same one paint actually used — instead of the raw
+    /// `RenderedWindow::rect`. TUI-only: GTK's `gtk/click.rs` callers of
+    /// `editor_text_layout` are untouched.
+    ///
+    /// **Confirmed RED against unfixed `develop`**: with the three TUI
+    /// call sites in `tui_main/mouse.rs` reverted to
+    /// `render::editor_text_layout(rw, 1.0, 1.0)`, this test fails at
+    /// every odd-content-width entry in `WIDTHS` for every marker column
+    /// past the first, with the painted cursor landing exactly one column
+    /// left of the clicked one.
+    ///
+    /// Sweeps several terminal widths — rather than hand-deriving
+    /// vimcode's activity-bar/sidebar reservation arithmetic to predict
+    /// exactly which raw terminal width yields an odd editor content
+    /// width, this tries a spread and requires every one to pass, per the
+    /// issue's "characterise, don't guess" framing — and several columns
+    /// per width. For each column it checks both scenarios the issue asks
+    /// about: the right group already active (its state immediately after
+    /// `open_editor_group`, i.e. a "later" click) and the first click back
+    /// into the right group right after deliberately defocusing to the
+    /// left pane. Both come back identical, which is exactly what the
+    /// root cause above predicts — nothing about this bug is
+    /// focus-dependent, only geometry-dependent.
+    #[test]
+    fn right_group_click_resolves_to_the_clicked_column_via_shell_app() {
+        const WIDTHS: [u16; 6] = [79, 80, 81, 100, 101, 121];
+        const HEIGHT: u16 = 24;
+        const MARKER_WORD: &str = "QWERTYUIOP";
+
+        /// The row `MARKER_WORD` paints on, found by scanning every row for
+        /// one that shows it *exactly twice* (once per pane). This doesn't
+        /// assume a fixed sidebar width/visibility or tab-bar height: the
+        /// explorer sidebar's default is closed, but a prior interactive
+        /// session against this checkout can leave it open showing this
+        /// checkout's own directory tree — as observed while writing this
+        /// test, it also pushes editor content down by an extra row versus
+        /// a clean sidebar-closed run. Locating content by what's actually
+        /// painted sidesteps both instead of hard-coding a row index.
+        fn find_content_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            height: u16,
+            needle: &str,
+        ) -> u16 {
+            let needle_chars: Vec<char> = needle.chars().collect();
+            for y in 0..height {
+                let row = driver.styled_row(y);
+                let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+                let count = chars
+                    .windows(needle_chars.len())
+                    .filter(|w| *w == needle_chars.as_slice())
+                    .count();
+                if count == 2 {
+                    return y;
+                }
+            }
+            panic!(
+                "expected \"{needle}\" painted exactly twice (once per pane) on \
+                 some row within height {height}"
+            );
+        }
+
+        /// The two screen columns where `needle` starts on `row_y` — one per
+        /// pane, left then right. Uses [`quadraui::tui::testing::TuiDriver::
+        /// styled_row`]'s per-*cell* vec, not a `screen()` string index,
+        /// because `screen()` undercounts columns wherever a preceding
+        /// wide glyph (e.g. the explorer's icons) painted — see
+        /// `divider_col_on_row`'s doc below for the same concern.
+        fn needle_starts_on_row(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            row_y: u16,
+            needle: &str,
+        ) -> (u16, u16) {
+            let row = driver.styled_row(row_y);
+            let chars: Vec<char> = row.iter().map(|&(c, _)| c).collect();
+            let needle_chars: Vec<char> = needle.chars().collect();
+            let starts: Vec<u16> = chars
+                .windows(needle_chars.len())
+                .enumerate()
+                .filter(|(_, w)| *w == needle_chars.as_slice())
+                .map(|(i, _)| i as u16)
+                .collect();
+            match starts.as_slice() {
+                [l, r] => (*l, *r),
+                other => panic!(
+                    "expected \"{needle}\" painted exactly twice on row {row_y}, \
+                     found {}; row: {chars:?}",
+                    other.len()
+                ),
+            }
+        }
+
+        fn painted_cursor_col(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            width: u16,
+            row_y: u16,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<u16> {
+            (0..width).find(|&x| driver.style_at(x, row_y).map(|s| s.bg) == Some(cursor_bg))
+        }
+
+        for &width in &WIDTHS {
+            let mut app = TuiShellApp::new_for_test();
+            app.engine
+                .buffer_mut()
+                .insert(0, &format!("{MARKER_WORD}\n"));
+            app.engine.open_editor_group(SplitDirection::Vertical);
+
+            let theme = Theme::from_name(&app.engine.settings.colorscheme);
+            let cursor_bg =
+                quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+            let mut driver = driver_with_shell(app, config(), width, HEIGHT);
+            // This test's synthetic clicks land close together with no
+            // real wall-clock gap, which would otherwise fold consecutive
+            // same-spot clicks into a double-click (word-select) — turn
+            // that off so every click is a plain single click placing the
+            // cursor at the exact column, as a real user's well-spaced
+            // clicks would.
+            driver.set_double_click_folding(false);
+            driver.render();
+            // Frame zero renders with the *runner*'s `AppShell` default
+            // (`sidebar_visible: true`, showing this checkout's own
+            // directory tree) rather than the shadow `engine.app_shell`'s
+            // setting-derived one (closed) — the two only get synced to
+            // agree inside `TuiShellApp::handle`'s sidebar-visibility sync,
+            // which runs on the first real dispatch. A throwaway `Escape`
+            // (a no-op in Normal mode) forces that sync before this test
+            // starts measuring columns/clicking for real, so the layout it
+            // clicks against is the stable, settings-derived one — not the
+            // one-frame-only runner default that would otherwise flip
+            // (and reflow the whole screen) on whatever the *first real*
+            // click happens to be.
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+
+            let content_row = find_content_row(&driver, HEIGHT, MARKER_WORD);
+            let (left_start, right_start) = needle_starts_on_row(&driver, content_row, MARKER_WORD);
+
+            for (k, marker) in MARKER_WORD.chars().enumerate() {
+                let left_col = left_start + k as u16;
+                let right_col = right_start + k as u16;
+
+                // Scenario A: right group already active — the "later click"
+                // case.
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): clicking \
+                     column {right_col} in an already-active right group \
+                     should land the cursor there, not one column to the left"
+                );
+
+                // Scenario B: defocus to the left pane, then click straight
+                // back into the right group — the "first click into a
+                // just-unfocused group" case the issue asks about.
+                driver.click(left_col as f32, content_row as f32);
+                driver.render();
+                driver.click(right_col as f32, content_row as f32);
+                driver.render();
+                assert_eq!(
+                    painted_cursor_col(&driver, width, content_row, cursor_bg),
+                    Some(right_col),
+                    "width {width}, marker '{marker}' (col {k}): the FIRST \
+                     click back into a just-defocused right group should \
+                     also land on column {right_col}"
+                );
+            }
+        }
     }
 
     /// Terminal column of the group divider glyph in one painted row,
@@ -7153,6 +9596,18 @@ mod tests {
             "this test covers the unsplit single-group tab bar arm"
         );
         let mut driver = driver_with_shell(app, config(), 100, 24);
+        // Settle the sidebar width before measuring anything — see hazard (2)
+        // in `tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router`'s
+        // doc comment. `driver_with_shell` paints frame 1 from the [`config`]
+        // helper, which leaves quadraui's generic 20-column
+        // `default_sidebar_width` in place, and `handle()`'s end-of-dispatch
+        // `set_sidebar_width(self.sidebar_width)` sync re-widens it to
+        // `SIDEBAR_WIDTH` (30) on the first event of *any* kind. Without this
+        // no-op key first, every tab column measured off frame 1 is 10 cells
+        // stale from frame 2 onwards, so `mouse_down` lands on a tab slot the
+        // press itself has already moved — a machine-dependent failure that
+        // only shows up when the ambient session leaves the sidebar visible.
+        driver.press_named(quadraui::NamedKey::Escape);
 
         // `find_bounds` scans rows top-down and the tab bar always paints on
         // row 0 (see `render_content_paints_single_group_tab_bar_via_shell_app`
@@ -7175,8 +9630,13 @@ mod tests {
             left_before.x + left_before.width / 2.0,
             left_before.y + left_before.height / 2.0,
         );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // the GTK twin's identical comment: `quadraui::compose::
+        // resolve_tab_drop` (#1370) compares the cursor to the target
+        // slot's own midpoint, so a dead-centre drop is ambiguous between
+        // "insert before" and "insert after".
         let to = (
-            right_before.x + right_before.width / 2.0,
+            right_before.x + right_before.width * 0.75,
             right_before.y + right_before.height / 2.0,
         );
         driver.mouse_down(from.0, from.1);
@@ -7198,6 +9658,211 @@ mod tests {
             right_before.x,
             left_after.x,
             right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, TUI half: dragging a tab from one editor **group**
+    /// (VSCode-style pane, not a `:split` window) onto another group's own
+    /// tab bar must merge it in and collapse the now-empty source group —
+    /// `TabDropInstruction::MoveToPane`, resolved via `resolve_tui_tab_drop_zone`
+    /// / `quadraui::compose::resolve_tab_drop` (quadraui#998) — rather than
+    /// vimcode's own hand-rolled `compute_tui_tab_drop_zone` geometry walk
+    /// this issue replaces. Only the same-group reorder case (the sibling
+    /// test above) had driver coverage before this issue on either backend;
+    /// this cross-group merge path was untested.
+    ///
+    /// Asserted purely on painted output — `driver_with_shell` wraps
+    /// `TuiShellApp` opaquely, so there is no `app.engine` to read after this
+    /// point (see the ghost-overlay test's doc comment above). The fixture's
+    /// two side-by-side groups must paint a divider between them up front
+    /// (sanity: the drag really starts from two panes, not one); after the
+    /// drop, the two labels must repaint in `[right, left]` order (the same
+    /// midpoint-drop insertion-index convention the reorder test above
+    /// pins) and the right group's own tab must have repainted well to the
+    /// *left* of where it started — proof its pane widened to fill the
+    /// whole editor column, which only happens if the source pane actually
+    /// collapsed away, not merely that both labels still exist somewhere.
+    ///
+    /// Behaviour-preserving refactor, not a bug fix: this same gesture
+    /// already worked on unfixed `develop` through the old
+    /// `compute_tui_tab_drop_zone` path (`Engine::apply_tab_drop_zone`'s
+    /// `DropZone::Center`/`DropZone::TabReorder` cross-group arms are
+    /// untouched by this issue). This test guards the geometry-resolution
+    /// path #1370 replaces, rather than reproducing a prior bug.
+    #[test]
+    fn tui_tab_drag_into_another_group_merges_and_collapses_the_source() {
+        let (app, dir) = app_with_two_file_groups("1370merge");
+        let mut driver = driver_with_shell(app, config(), 120, 24);
+        // Settle the sidebar width before measuring — same frame-1
+        // `default_sidebar_width` staleness the sibling reorder test above
+        // guards against; see its comment for the full mechanism.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let left_before = driver
+            .find_bounds("left1039.txt")
+            .expect("the left group's tab must be painted");
+        let right_before = driver
+            .find_bounds("right1039.txt")
+            .expect("the right group's tab must be painted");
+        assert!(
+            left_before.x < right_before.x,
+            "the left group's own tab must paint left of the right group's"
+        );
+
+        let row = 5_u16;
+        let divider_before = divider_col_on_row(
+            &driver.styled_row(row),
+            (left_before.x + left_before.width) as usize,
+        );
+        assert!(
+            divider_before.is_some_and(|d| (d as f32) < right_before.x),
+            "fixture sanity: two side-by-side groups must paint a divider \
+             between them before the drag"
+        );
+
+        let from = (
+            left_before.x + left_before.width / 2.0,
+            left_before.y + left_before.height / 2.0,
+        );
+        // Three-quarters into the target's slot, not its exact centre — see
+        // `tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar`'s
+        // identical comment above for why a dead-centre drop is ambiguous
+        // under `quadraui::compose::resolve_tab_drop`'s own midpoint
+        // comparison.
+        let to = (
+            right_before.x + right_before.width * 0.75,
+            right_before.y + right_before.height / 2.0,
+        );
+        driver.mouse_down(from.0, from.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_up(to.0, to.1);
+
+        let left_after = driver
+            .find_bounds("left1039.txt")
+            .expect("the merged-in tab must still be painted");
+        let right_after = driver
+            .find_bounds("right1039.txt")
+            .expect("the target group's tab must still be painted");
+        assert!(
+            left_after.x > right_after.x,
+            "dropping onto the right group's own tab slot must insert after \
+             it (was left={} right={}, now left={} right={})",
+            left_before.x,
+            right_before.x,
+            left_after.x,
+            right_after.x
+        );
+        assert!(
+            right_after.x < right_before.x,
+            "the target group's tab must repaint further LEFT once the \
+             source group collapses and its pane widens to fill the whole \
+             editor column (was {}, now {})",
+            right_before.x,
+            right_after.x
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1370 acceptance, TUI half: dragging a tab to a group's own left edge
+    /// (a content-area drop, not a tab-bar drop) must split it into a new
+    /// pane — `TabDropInstruction::SplitToNewPane`, resolved the same way as
+    /// the merge test above. `quadraui::compute_drop_zone`'s edge-split zone
+    /// is 20% of the group's width (clamped to `[3, width/2]`), so a drop one
+    /// column inside the group's left edge is comfortably inside it.
+    ///
+    /// Two tabs in the one starting group (not one) so the
+    /// "only tab of the only pane" no-op guard in
+    /// `quadraui::compose::resolve_tab_drop` — splitting a pane's sole tab
+    /// onto its own only edge is defined as a no-op — does not swallow the
+    /// drop; this fixture always has a second tab left behind in the
+    /// original pane.
+    ///
+    /// Behaviour-preserving refactor: this gesture already worked on
+    /// unfixed `develop` through the old `compute_tui_tab_drop_zone` /
+    /// `Engine::apply_tab_drop_zone`'s `DropZone::Split` arm, both untouched
+    /// by this issue; this test guards the geometry-resolution path #1370
+    /// replaces rather than reproducing a prior bug.
+    #[test]
+    fn tui_tab_drag_to_the_left_edge_splits_into_a_new_group() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1370_tui_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("only1370a.txt");
+        let b = dir.join("only1370b.txt");
+        std::fs::write(&a, "a\n").unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        // `open_file_with_mode` replaces the default `[No Name]` tab's own
+        // content in place rather than appending a new one (unlike
+        // `new_tab`) — needed here so tab "a" is genuinely the group's
+        // *first* tab, painted flush against the group's left edge, which
+        // is what the left-edge drop target below depends on.
+        app.engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.new_tab(Some(&b));
+        assert_eq!(
+            app.engine.group_layout.leaf_count(),
+            1,
+            "this test starts from a single, unsplit group"
+        );
+        // A wide terminal (not the usual 100-column fixture width): the
+        // 20%-of-group-width edge-split zone needs enough clearance that the
+        // drop target stays comfortably inside it and past `editor_left`
+        // (the sidebar/activity-bar boundary `resolve_tui_tab_drop_zone`
+        // rejects drops left of) at once, without hand-deriving the exact
+        // painted sidebar width.
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+        // Settle the sidebar width before measuring — same frame-1
+        // `default_sidebar_width` staleness the sibling reorder test above
+        // guards against; see its comment for the full mechanism. It matters
+        // doubly here: the drop point is derived from `a_before.x`, and a
+        // 10-cell-stale origin can push it left of `editor_left`, which
+        // `resolve_tui_tab_drop_zone` rejects outright.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let a_before = driver
+            .find_bounds("only1370a.txt")
+            .expect("tab a should be painted");
+
+        let from = (
+            a_before.x + a_before.width / 2.0,
+            a_before.y + a_before.height / 2.0,
+        );
+        let to = (a_before.x + 20.0, 15.0);
+        driver.mouse_down(from.0, from.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_move(to.0, to.1);
+        driver.mouse_up(to.0, to.1);
+
+        let a_after = driver
+            .find_bounds("only1370a.txt")
+            .expect("tab a must still be painted after the split");
+        let b_after = driver
+            .find_bounds("only1370b.txt")
+            .expect("tab b must still be painted after the split");
+        assert!(
+            a_after.x < b_after.x,
+            "dropping on the LEFT edge must create the new pane to the left \
+             of the target — a's tab should now paint left of b's; \
+             a={a_after:?} b={b_after:?}"
+        );
+
+        let cells_after = driver.styled_row(15);
+        let screen = driver.screen();
+        let divider_after = divider_col_on_row(&cells_after, (a_after.x + a_after.width) as usize);
+        assert!(
+            divider_after.is_some_and(|d| (d as f32) < b_after.x),
+            "dropping on a group's edge must split it into two groups, \
+             painting a new divider between them; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7316,7 +9981,7 @@ mod tests {
     /// 2. **The sidebar-width settle.** `driver_with_shell` paints frame 1
     ///    straight from the [`config`] helper, which leaves quadraui's generic
     ///    20-column `default_sidebar_width` in place rather than mirroring
-    ///    `TuiShellApp::shell_config`'s #634 clamp to `SIDEBAR_WIDTH`. The
+    ///    `TuiShellApp::build_shell_config`'s #634 clamp to `SIDEBAR_WIDTH`. The
     ///    end-of-dispatch `set_sidebar_width(self.sidebar_width)` sync in
     ///    `handle()` re-widens it on the first event of *any* kind, so a
     ///    column measured off frame 1 is stale from frame 2 onwards. The
@@ -7551,16 +10216,17 @@ mod tests {
     /// flipping to `"[ ]"` (quadraui's TUI `Form` renderer's literal
     /// checkbox glyphs) is the rendered-output assertion.
     ///
-    /// The click's row is derived from `engine.settings_flat_list()` — the
-    /// same list `mouse.rs`'s `SidebarOwner::Settings` arm indexes into via
-    /// `fi = settings_scroll_top + content_row` — rather than from
-    /// `find_bounds("Cursor Line")`'s painted position: the two disagree by
-    /// one row in this fixture (a pre-existing mismatch between where
-    /// `render_settings_panel` paints row N and where the click router's
-    /// `content_row = sidebar_row - 2` resolves row N, unrelated to #817 —
-    /// tracked separately). Computing the target row from the same list the
-    /// click router consults keeps this test about the double-click verdict,
-    /// not that separate off-by-one.
+    /// #1238: the click's row used to be derived from
+    /// `engine.settings_flat_list()` via the same `content_row = sidebar_row
+    /// - 2` formula `mouse.rs`'s `SidebarOwner::Settings` arm hand-derived —
+    /// this test's own doc comment used to record that it disagreed with
+    /// `find_bounds("Cursor Line")`'s painted position by one row, "unrelated
+    /// to #817 — tracked separately". #1238 *is* that tracked fix: the click
+    /// router now hit-tests against the rect `render_settings_panel` actually
+    /// painted into (`engine.settings_form_rect`), so this test now clicks
+    /// the real painted position too — the two can no longer disagree by
+    /// construction, and a future divergence would fail here rather than
+    /// silently relying on this test not looking where it should.
     #[test]
     fn tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch() {
         let mut app = TuiShellApp::new_for_test();
@@ -7572,23 +10238,6 @@ mod tests {
             "setup sanity: `cursorline` must default to true so the test can \
              observe a true -> false double-click toggle"
         );
-        let flat = app.engine.settings_flat_list();
-        let flat_idx = flat
-            .iter()
-            .position(|row| {
-                matches!(
-                    row,
-                    crate::core::engine::SettingsRow::CoreSetting(idx)
-                        if crate::core::settings::SETTING_DEFS[*idx].key == "cursorline"
-                )
-            })
-            .expect("the flat settings list must contain the `cursorline` row");
-        // Mirrors `mouse.rs`'s `SidebarOwner::Settings` arm: `sidebar_row =
-        // row - menu_rows` (menu bar hidden here, so `menu_rows == 0`), then
-        // `content_row = sidebar_row - 2` (header + search rows), then
-        // `fi = settings_scroll_top + content_row` (scrolled to the top).
-        let row = flat_idx as u16 + 2;
-        let col = ACTIVITY_BAR_WIDTH + 2;
 
         let mut driver = driver_with_shell(app, config(), 100, 24);
 
@@ -7603,7 +10252,10 @@ mod tests {
              it defaults to true; line: {before_line:?}"
         );
 
-        driver.double_click(col as f32, row as f32 + 0.5);
+        let bounds = driver
+            .find_bounds("Cursor Line")
+            .expect("the Cursor Line row must paint");
+        driver.double_click(bounds.x + 2.0, bounds.y);
 
         let after = driver.screen();
         let after_line = after
@@ -7685,11 +10337,11 @@ mod tests {
         // Same reveal-then-click sequence as
         // `driver_click_on_extension_icon_opens_the_plugin_panel`: one benign
         // event lets `take_requested_panel` steer the runner onto the shadow's
-        // real panel before the icon click, and row 7 is this fixture's only
-        // extension icon (hamburger@0 .. ai@6, ext@7).
+        // real panel before the icon click, and row 8 is this fixture's only
+        // extension icon (hamburger@0 .. ai@6, board@7 (#521), ext@8).
         driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         driver.render();
-        driver.click(1.0, 7.0);
+        driver.click(1.0, 8.0);
 
         assert!(
             driver.screen_contains("AlphaItemZQXW817"),
@@ -7701,20 +10353,16 @@ mod tests {
         let header = driver
             .find_bounds("AlphaZQXW817")
             .expect("the section header should be painted");
-        let header_col = header.x as u16 + 1;
-        // The row to *click*, mirroring `mouse.rs`'s `SidebarOwner::ExtPanel`
-        // arm's own formula (`sidebar_row = content_start + flat_idx`, here
-        // `flat_idx = 0` for the section header) rather than the row
-        // `find_bounds` reports the header *painted* at — the two disagree by
-        // one row in this fixture (menu bar hidden, so `menu_rows == 0`; no
-        // search input active, so `content_start == 1`), the same kind of
-        // paint/click-router mismatch
-        // `tui_settings_double_click_toggles_a_boolean_row_via_shared_dispatch`
-        // documents and works around for the Settings sidebar, unrelated to
-        // #817.
-        let header_click_row = 1u16;
 
-        driver.double_click(header_col as f32, header_click_row as f32 + 0.5);
+        // #1086: click the row `find_bounds` reports the header *painted*
+        // at, directly — no hand-rolled `content_start`/`sidebar_row`
+        // formula to disagree with it. Before #1086 this test hardcoded
+        // `header_click_row = 1` (mirroring `mouse.rs`'s old formula) because
+        // that formula and the painted row disagreed by one; the click
+        // router now derives its row from the same painted rect
+        // (`ext_panel_content_rect`) `find_bounds` reads here, so the two
+        // cannot drift apart again.
+        driver.double_click(header.x + 1.0, header.y + header.height / 2.0);
 
         assert!(
             driver.screen_contains("AlphaItemZQXW817"),
@@ -7724,6 +10372,433 @@ mod tests {
              be suppressed by `is_double_click` — but the item under the \
              section disappeared, meaning the double-click was mis-read as a \
              plain click; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A `TuiShellApp` with a "git-insights" ext panel registered, two
+    /// sections ("Branches" then "Log", so the fixture exercises a
+    /// *non-first* section header too — #499's report was specifically that
+    /// only the top section header toggled), the second carrying two items.
+    /// Shared by the #1086 click-routing tests below.
+    fn app_with_two_ext_panel_sections() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Branches".to_string(), "Log".to_string()],
+            },
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Branches".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "mainZQXW1086".to_string(),
+                id: "branch1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![
+                crate::core::plugin::ExtPanelItem {
+                    text: "commit1ZQXW1086".to_string(),
+                    id: "commit1".to_string(),
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "commit2ZQXW1086".to_string(),
+                    id: "commit2".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        // See `tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it`'s
+        // comment: start on a non-Explorer panel so frame 1 never paints (and
+        // leaves a stale claim from) the explorer tree.
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app
+    }
+
+    /// #1086: a single left-click on a section header must toggle *that*
+    /// section's expand/collapse state — the root-cause bug this issue fixes
+    /// resolved every click to the row one below the one clicked, so a click
+    /// on "Log" actually selected/acted on "commit1ZQXW1086" (the first row
+    /// *under* Log) and no section could ever be collapsed with the mouse
+    /// (#484/#499).
+    ///
+    /// Clicks the row `find_bounds` reports the header *painted* at —
+    /// never a hand-derived row — so this test can't encode the same bug it's
+    /// meant to catch. Verified RED against unfixed `develop`: reverting the
+    /// `mouse.rs`/`panels.rs`/`core/engine/mod.rs` changes this issue makes
+    /// (restoring the old `sidebar_row.saturating_sub(menu_rows)` /
+    /// `content_start = 1 + input_rows` arithmetic) reproduces exactly the
+    /// bug — the click lands on "commit1ZQXW1086" instead of "Log", so the
+    /// first assertion below (`commit1ZQXW1086` disappearing) fails.
+    #[test]
+    fn tui_ext_panel_click_on_a_section_header_toggles_it() {
+        let app = app_with_two_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // Two deliberately separate single clicks on the same header below
+        // (collapse, then re-expand) — not a double-click (quadraui#592's
+        // 400ms/1.5-cell fold window has no wall-clock meaning inside a
+        // single synchronous test).
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 8.0);
+
+        assert!(
+            driver.screen_contains("commit1ZQXW1086"),
+            "precondition: the Log section defaults to expanded, so its \
+             items must already be painted; screen:\n{}",
+            driver.screen()
+        );
+
+        let header = driver
+            .find_bounds("Log")
+            .expect("the Log section header should be painted");
+        let click_x = header.x + 1.0;
+        let click_y = header.y + header.height / 2.0;
+
+        driver.click(click_x, click_y);
+        assert!(
+            !driver.screen_contains("commit1ZQXW1086"),
+            "clicking the Log section header must collapse it, but its item \
+             is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(click_x, click_y);
+        assert!(
+            driver.screen_contains("commit1ZQXW1086"),
+            "clicking the (now collapsed) Log header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1086: a single left-click on an ordinary (non-header) item row must
+    /// select *that* row, painted as the tree's selection highlight
+    /// (`quadraui::tui::tree::draw_tree`'s `sel_bg`) — not the row below it.
+    /// Clicks "commit2ZQXW1086", the *second* item of the *second* section,
+    /// so the fixed offset the bug applied (independent of scroll position or
+    /// which row/section) can't accidentally cancel out.
+    ///
+    /// Asserts on the rendered cell style at the clicked row and at a
+    /// neighboring, un-clicked row — never on `engine.ext_panel_selected` —
+    /// per CLAUDE.md's "rendered output, not state" rule: the selected index
+    /// could be populated correctly while still painting the highlight one
+    /// row off, if the paint side used a different origin than the state
+    /// update (not the case here, but state-only wouldn't catch it).
+    ///
+    /// Verified RED against unfixed `develop` the same way as the header
+    /// test above: the old arithmetic selects "commit2ZQXW1086"'s neighbor
+    /// (there being no item below it in this fixture, the click misses the
+    /// list entirely and nothing highlights), so this test's highlight
+    /// assertion fails.
+    #[test]
+    fn tui_ext_panel_click_on_an_item_row_selects_it() {
+        let app = app_with_two_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 8.0);
+
+        let target = driver
+            .find_bounds("commit2ZQXW1086")
+            .expect("the second Log item should be painted");
+        let neighbor = driver
+            .find_bounds("commit1ZQXW1086")
+            .expect("the first Log item should be painted");
+
+        driver.click(target.x + 1.0, target.y + target.height / 2.0);
+
+        let target_style = driver
+            .style_at(target.x as u16, target.y as u16)
+            .expect("the clicked row must have a paintable cell");
+        let neighbor_style = driver
+            .style_at(neighbor.x as u16, neighbor.y as u16)
+            .expect("the neighboring row must have a paintable cell");
+
+        assert_ne!(
+            target_style.bg, neighbor_style.bg,
+            "clicking \"commit2ZQXW1086\" must paint its row with the \
+             selection background, distinct from its un-clicked neighbor \
+             \"commit1ZQXW1086\" — but the two rows share a background, \
+             meaning the click resolved to the wrong row (or no row)"
+        );
+    }
+
+    /// #499's exact repro: a "git-insights" ext panel with **three** sections
+    /// (Branches / Log / Stash), each carrying one item. The issue reported
+    /// that after the initial #484 fix, clicking the *top* header
+    /// (Branches) toggled correctly but the other two (Log, Stash) did not —
+    /// i.e. the bug was two-thirds still broken, not fully fixed. #1086
+    /// later found the real root cause (a fixed one-row-low offset in the
+    /// click arm's row derivation, independent of which section is
+    /// clicked) and fixed it generically; this test pins #499's own
+    /// three-section repro directly, rather than relying only on #1086's
+    /// two-section coverage above, so a regression narrower than #1086's
+    /// fix (e.g. one that only rebreaks the *last* section) would still be
+    /// caught.
+    fn app_with_three_ext_panel_sections() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec![
+                    "Branches".to_string(),
+                    "Log".to_string(),
+                    "Stash".to_string(),
+                ],
+            },
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Branches".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "mainZQXW499".to_string(),
+                id: "branch1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "commitZQXW499".to_string(),
+                id: "commit1".to_string(),
+                ..Default::default()
+            }],
+        );
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Stash".to_string()),
+            vec![crate::core::plugin::ExtPanelItem {
+                text: "stashZQXW499".to_string(),
+                id: "stash1".to_string(),
+                ..Default::default()
+            }],
+        );
+        // See `tui_ext_panel_double_click_on_a_section_header_does_not_toggle_it`'s
+        // comment: start on a non-Explorer panel so frame 1 never paints (and
+        // leaves a stale claim from) the explorer tree.
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app
+    }
+
+    /// #499: clicking the **Log** header (middle section) and the **Stash**
+    /// header (last section) must each toggle only that section — the
+    /// issue's report was that both stayed broken even after the top
+    /// (Branches) section was fixed by #484. Verified RED against unfixed
+    /// `develop` the same way `tui_ext_panel_click_on_a_section_header_toggles_it`
+    /// was: reverting #1086's `mouse.rs`/`panels.rs`/`core/engine/mod.rs`
+    /// changes reproduces the one-row-low click offset, so clicking "Log"
+    /// lands on "commitZQXW499" and clicking "Stash" lands one row past the
+    /// end of the list (a no-op) — both assertions below fail.
+    #[test]
+    fn tui_ext_panel_click_toggles_the_log_and_stash_headers_499() {
+        let app = app_with_three_ext_panel_sections();
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        driver.click(1.0, 8.0);
+
+        assert!(
+            driver.screen_contains("commitZQXW499") && driver.screen_contains("stashZQXW499"),
+            "precondition: all three sections default to expanded, so every \
+             item must already be painted; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Log (middle section) ────────────────────────────────────────
+        let log_header = driver
+            .find_bounds("Log")
+            .expect("the Log section header should be painted");
+        driver.click(log_header.x + 1.0, log_header.y + log_header.height / 2.0);
+        assert!(
+            !driver.screen_contains("commitZQXW499"),
+            "clicking the Log section header must collapse it, but its item \
+             is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+        driver.click(log_header.x + 1.0, log_header.y + log_header.height / 2.0);
+        assert!(
+            driver.screen_contains("commitZQXW499"),
+            "clicking the (now collapsed) Log header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Stash (last section) ────────────────────────────────────────
+        let stash_header = driver
+            .find_bounds("Stash")
+            .expect("the Stash section header should be painted");
+        driver.click(
+            stash_header.x + 1.0,
+            stash_header.y + stash_header.height / 2.0,
+        );
+        assert!(
+            !driver.screen_contains("stashZQXW499"),
+            "clicking the Stash section header must collapse it, but its \
+             item is still painted — the click resolved to a different row; \
+             screen:\n{}",
+            driver.screen()
+        );
+        driver.click(
+            stash_header.x + 1.0,
+            stash_header.y + stash_header.height / 2.0,
+        );
+        assert!(
+            driver.screen_contains("stashZQXW499"),
+            "clicking the (now collapsed) Stash header a second time must \
+             re-expand it; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A "git-insights" ext panel with a single "Log" section shaped like
+    /// `git_log_panel.lua`'s real output: a leading empty-id separator (the
+    /// #1088 fuzzy-match trap — `item_id.starts_with(&items[vi].id)` used to
+    /// treat that empty id as a prefix of *every* hash), the target commit,
+    /// a `<hash>:<path>` file child under it, and one unrelated commit.
+    fn app_with_git_log_panel_for_reveal() -> TuiShellApp {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let hash = "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        app.engine.ext_panel_items.insert(
+            ("git-insights".to_string(), "Log".to_string()),
+            vec![
+                crate::core::plugin::ExtPanelItem {
+                    text: String::new(),
+                    id: String::new(),
+                    is_separator: true,
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "26cf7ef8ZQXW1088".to_string(),
+                    id: hash.to_string(),
+                    expandable: true,
+                    expanded: true,
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "src/main.rsZQXW1088".to_string(),
+                    id: format!("{hash}:src/main.rs"),
+                    parent_id: hash.to_string(),
+                    ..Default::default()
+                },
+                crate::core::plugin::ExtPanelItem {
+                    text: "deadbeefZQXW1088".to_string(),
+                    id: "deadbeefbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                    ..Default::default()
+                },
+            ],
+        );
+        app
+    }
+
+    /// #1088: `Engine::ext_panel_reveal_item` — the same call
+    /// `Engine::apply_plugin_ctx`'s `panel_reveal_request` handling makes for
+    /// `:GitShow`'s "Open Commit" link — must land the *painted* selection
+    /// highlight on the commit row matching the queried short hash, not on
+    /// whatever row happened to occupy that flat index under the old
+    /// three-way-fuzzy id match (here, the leading empty-id separator).
+    ///
+    /// Drives the same engine-state + `ext_panel_focus_pending` handoff
+    /// `plugins.rs` does — applied to the `TuiShellApp` *before* it's handed
+    /// to `driver_with_shell` (the wrapped `ShellAdapter<TuiShellApp>` the
+    /// driver owns keeps its inner app crate-private, so a test can't reach
+    /// `driver.app_mut().engine` after construction) — then lets the real
+    /// `ShellAdapter`/`TuiShellApp` reconciliation (`take_requested_panel`,
+    /// polled every `tick()`) apply the panel switch — the same mechanism
+    /// the mouse-click tests above exercise — before asserting on the
+    /// rendered grid via `style_at`, never on `engine.ext_panel_selected`.
+    ///
+    /// Verified RED against unfixed `ext_panel.rs` (restoring the old
+    /// `id == item_id || id.starts_with(item_id) ||
+    /// item_id.starts_with(&id)` match): the empty-id separator satisfies the
+    /// third arm for any query, so the reveal selects flat index 1 (the
+    /// separator) instead of flat index 2 (the commit), and this test's
+    /// `assert_ne!` fails because the commit row then shares the separator's
+    /// (non-highlighted) background instead of the selection highlight.
+    #[test]
+    fn tui_ext_panel_reveal_by_short_hash_selects_the_commit_row_not_the_separator() {
+        let mut app = app_with_git_log_panel_for_reveal();
+        // Mirrors `Engine::apply_plugin_ctx`'s `panel_reveal_request` arm
+        // (`src/core/engine/plugins.rs`): activate the panel, resolve+select
+        // the target row, then hand the panel switch to the backend via
+        // `ext_panel_focus_pending`.
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.engine.ext_panel_has_focus = true;
+        app.engine
+            .ext_panel_reveal_item("git-insights", "Log", "26cf7ef8");
+        app.engine.ext_panel_focus_pending = Some("git-insights".to_string());
+
+        let cfg = TuiShellApp::live_shell_config(&app.engine);
+        let mut driver = driver_with_shell(app, cfg, 80, 24);
+        // `TuiShellApp::tick` is what consumes `ext_panel_focus_pending`
+        // (setting `sidebar.ext_panel_name` and making the sidebar visible),
+        // and `ShellAdapter::tick` polls `take_requested_panel` right after —
+        // one `tick()` both reveals the sidebar and switches it onto the
+        // panel `ext_panel_active` names.
+        driver.tick();
+        driver.render();
+
+        let commit_row = driver
+            .find_bounds("26cf7ef8ZQXW1088")
+            .expect("the target commit row should be painted");
+        let other_commit_row = driver
+            .find_bounds("deadbeefZQXW1088")
+            .expect("the unrelated commit row should be painted");
+
+        let commit_style = driver
+            .style_at(commit_row.x as u16, commit_row.y as u16)
+            .expect("the commit row must have a paintable cell");
+        let other_style = driver
+            .style_at(other_commit_row.x as u16, other_commit_row.y as u16)
+            .expect("the unrelated commit row must have a paintable cell");
+
+        assert_ne!(
+            commit_style.bg,
+            other_style.bg,
+            "reveal for short hash \"26cf7ef8\" must paint the selection \
+             highlight on \"26cf7ef8ZQXW1088\", distinct from \
+             the unrelated commit row — but the two share a background, \
+             meaning the reveal landed on the wrong row; screen:\n{}",
             driver.screen()
         );
     }
@@ -8158,20 +11233,21 @@ mod tests {
     /// distinctive `line_text` (short enough to survive the
     /// `file:line: snippet` formatting `render.rs`'s quickfix adapter
     /// applies) and opens the panel directly on `engine` state, mirroring
-    /// how the live find-references flow sets `quickfix_items` +
-    /// `quickfix_open` (`core/engine/panels.rs`).
+    /// how the live find-references flow sets `quickfix.items` +
+    /// `quickfix.open` (`core/engine/panels.rs`).
     #[test]
     fn render_content_paints_quickfix_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
         app.engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: PathBuf::from("zqxw608.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW_608_QUICKFIX_MARKER".to_string(),
             });
-        app.engine.quickfix_open = true;
+        app.engine.quickfix.open = true;
 
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
@@ -8179,6 +11255,251 @@ mod tests {
             screen.contains("ZQXW_608_QUICKFIX_MARKER"),
             "quickfix panel content should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
+    }
+
+    /// #1155: the active window's location list shares the quickfix panel's
+    /// bottom "list rung" (`render::quickfix_list_to_panel`,
+    /// `build_screen_layout`'s `quickfix` field population) — `:lopen`
+    /// painting distinct "LOCATION LIST" content proves that wiring, not
+    /// just that `engine.location_lists` got populated (state-only would
+    /// pass even if nothing ever reached the painter, exactly the #587/#592
+    /// failure mode this repo's testing guidance calls out).
+    ///
+    /// RED against unfixed `develop`: before #1155, `engine.location_lists`
+    /// didn't exist, `render.rs`'s quickfix population only ever read
+    /// `engine.quickfix`, and there was no location list to paint here at
+    /// all — this exact scenario had no way to produce "LOCATION LIST" on
+    /// screen.
+    #[test]
+    fn render_content_paints_location_list_panel_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let win = app.engine.active_window_id();
+        let list = app.engine.location_lists.entry(win).or_default();
+        list.items.push(crate::core::project_search::ProjectMatch {
+            file: PathBuf::from("zqxw1155.rs"),
+            line: 0,
+            col: 0,
+            line_text: "ZQXW_1155_LOCLIST_MARKER".to_string(),
+        });
+        list.open = true;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_1155_LOCLIST_MARKER"),
+            "location-list panel content should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("LOCATION LIST"),
+            "the shared bottom rung must show the location-list title, not \
+             \"QUICKFIX\", when the global quickfix list is empty/closed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("QUICKFIX ("),
+            "the global quickfix panel must not also paint; screen:\n{screen}"
+        );
+    }
+
+    /// #1155: when *both* the global quickfix list and the active window's
+    /// location list are open, the shared bottom rung shows quickfix — this
+    /// is the priority rule `build_screen_layout` documents, not an
+    /// arbitrary pick between two equally-valid states.
+    #[test]
+    fn quickfix_panel_takes_priority_over_location_list_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("zqxw1155qf.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1155_QF_MARKER".to_string(),
+            });
+        app.engine.quickfix.open = true;
+        let win = app.engine.active_window_id();
+        let list = app.engine.location_lists.entry(win).or_default();
+        list.items.push(crate::core::project_search::ProjectMatch {
+            file: PathBuf::from("zqxw1155loc.rs"),
+            line: 0,
+            col: 0,
+            line_text: "ZQXW_1155_LOC_MARKER".to_string(),
+        });
+        list.open = true;
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW_1155_QF_MARKER"),
+            "quickfix must win the shared bottom rung when both lists are open; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXW_1155_LOC_MARKER"),
+            "the location list must not also paint while quickfix has the rung; screen:\n{screen}"
+        );
+    }
+
+    /// #1283: the empty-list refusals in the quickfix/location-list family
+    /// are only *user-visible* through the painted command-line row, so
+    /// that is where they have to be asserted.
+    ///
+    /// `:cnext` on an empty quickfix list is the sharpest case: before #1283
+    /// `Engine::qf_next` had no empty-list guard at all — `qf_jump` merely
+    /// declined to move (there is no item at index 0 of an empty `Vec`) and
+    /// `engine.message` was left untouched, so the row painted *nothing*.
+    /// Real Neovim raises `Vim(cnext):E42: No Errors` (re-confirmed against a
+    /// live `nvim --headless -u NONE`). Driven through the real command line
+    /// rather than by calling `qf_next` directly, so the claim is "the user
+    /// sees the error", not "a field got set" — the state-only trap this
+    /// repo's testing guidance calls out (#587/#592).
+    ///
+    /// RED against unfixed `develop`: with the `qf_next` guard removed the
+    /// message is empty and `E42: No Errors` never reaches the screen.
+    #[test]
+    fn cnext_on_empty_quickfix_list_paints_e42_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        assert!(
+            app.engine.quickfix.items.is_empty(),
+            "precondition: a fresh engine has an empty quickfix list"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":cnext".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("E42: No Errors"),
+            ":cnext on an empty quickfix list must paint Neovim's E42 on the \
+             command line; screen:\n{screen}"
+        );
+    }
+
+    /// #1283: the flip side of the test above — `:copen` on an empty
+    /// quickfix list must paint *no* error at all.
+    ///
+    /// Before #1283 `Engine::qf_open` refused whenever the target list had
+    /// zero items and painted the invented prose "Quickfix list is empty" on
+    /// the command-line row. A live oracle opens the quickfix window
+    /// unconditionally instead (`winnr('$')` 1 -> 2, empty `v:errmsg`), so
+    /// the row must stay clean. Asserted on painted text for the same reason
+    /// as above; the panel body itself is deliberately not asserted here
+    /// because `quickfix_panel_rows` reserves no rows for a zero-item list
+    /// (see its doc comment — that height rule is #754's, not #1283's).
+    ///
+    /// RED against unfixed `develop`: "Quickfix list is empty" is painted.
+    #[test]
+    fn copen_on_empty_quickfix_list_paints_no_error_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("empty"),
+            ":copen on an empty quickfix list must not paint a refusal; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("E42"),
+            ":copen never errors in Neovim, empty list or not; screen:\n{screen}"
+        );
+    }
+
+    /// #1283: `:lwindow` on a window that has *never* had a location list
+    /// must paint `E776: No location list`.
+    ///
+    /// Before #1283 `Engine::qf_window` read the list through `qf_get_mut`,
+    /// whose `entry(..).or_default()` autovivified an empty list and made
+    /// "never created" indistinguishable from "created but empty" — so the
+    /// command silently stayed closed and painted nothing. A live oracle
+    /// errors for the never-created case and is a silent no-op only once a
+    /// list exists (`setloclist(0, [])`).
+    ///
+    /// RED against unfixed `develop`: nothing is painted on the command line.
+    #[test]
+    fn lwindow_without_location_list_paints_e776_via_shell_app() {
+        let app = TuiShellApp::new(None);
+        assert!(
+            app.engine.location_lists.is_empty(),
+            "precondition: a fresh engine has no location list at all"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        for c in ":lwindow".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("E776: No location list"),
+            ":lwindow with no location list must paint Neovim's E776; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1308: real Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` on an empty
+    /// quickfix/location list are a *silent* no-op (`pcall` succeeds,
+    /// `v:errmsg` stays empty) — confirmed against a live
+    /// `nvim --headless -u NONE` oracle. That's unlike `:cc`/`:cnext`/
+    /// `:clist`/`:cfirst`/`:clast` (see
+    /// `cnext_on_empty_quickfix_list_paints_e42_via_shell_app` above), which
+    /// all raise `E42: No Errors`.
+    ///
+    /// Before this fix `Engine::qf_do` (`picker.rs`) set the same shared
+    /// `E42: No Errors` message the other quickfix commands use, so `:cdo`
+    /// (and its three siblings) painted an error a live oracle never raises.
+    /// Driven through the real command line so the assertion is "the user
+    /// sees nothing", not "a field was left unset" — the state-only trap
+    /// this repo's testing guidance calls out (#587/#592).
+    ///
+    /// RED against unfixed `qf_do`: the command-line row paints
+    /// "E42: No Errors" for all four commands.
+    #[test]
+    fn cdo_family_on_empty_quickfix_list_paints_no_error_via_shell_app() {
+        for cmd in [
+            ":cdo normal! Ax",
+            ":cfdo normal! Ax",
+            ":ldo normal! Ax",
+            ":lfdo normal! Ax",
+        ] {
+            let app = TuiShellApp::new(None);
+            assert!(
+                app.engine.quickfix.items.is_empty(),
+                "precondition: a fresh engine has an empty quickfix list"
+            );
+            assert!(
+                app.engine.location_lists.is_empty(),
+                "precondition: a fresh engine has no location list at all"
+            );
+
+            let mut driver = driver_with_shell(app, config(), 80, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            for c in cmd.chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("E42"),
+                "{cmd} on an empty list must never raise E42 in Neovim; \
+                 screen:\n{screen}"
+            );
+        }
     }
 
     /// #608: `render_content` must also paint the *bottom panel* (terminal
@@ -8304,6 +11625,230 @@ mod tests {
         );
     }
 
+    // ── #1125: TUI file dialogs go through the real native picker ──────────
+    //
+    // Before this fix, `TuiEngineActionHost::save_workspace_as_dialog` wrote
+    // `engine.cwd.join(".vimcode-workspace")` unconditionally — no prompt,
+    // no way to cancel — and the `open_file_dialog` menu action fell back to
+    // the in-canvas fuzzy finder (`open_picker(PickerSource::Files)`)
+    // instead of a real "Open File" dialog. Both now call the shared
+    // `render::run_open_file_dialog`/`run_save_workspace_as_dialog` (#1125),
+    // backed by quadraui#965's `TuiPlatformServices::show_file_open_dialog`/
+    // `show_file_save_dialog` — a real nested draw-and-read loop over
+    // `FilePickerController`, resolved synchronously inside one
+    // `TuiDriver::dispatch`/`click` call.
+    //
+    // That synchronous, single-call design is also why these tests can't
+    // assert on `driver.screen()` for the dialog's *own* painted content the
+    // way most of this module's tests do: the dialog opens and resolves
+    // entirely inside one `dispatch`/`click`, and whatever it painted is
+    // overwritten by `TuiShellApp`'s own next full-frame render before
+    // `dispatch`/`click` ever returns control to the test — there is no
+    // point between "dialog painted" and "app repainted over it" a caller
+    // outside `TuiShellApp::handle` can observe. (`TuiPlatformServices::
+    // set_dialog_surface`/`queue_dialog_events` are `pub(crate)` in
+    // quadraui — reachable only through `TuiDriver`'s public
+    // `queue_dialog_events` wrapper, which schedules the dialog's *input*,
+    // not a way to peek at its output mid-call.) GTK's own precedent test
+    // for exactly this class of native/nested dialog,
+    // `native_dialog_presented_exactly_once_across_repeated_frames`
+    // (`gtk/testing.rs`), hits the identical wall for `show_message_dialog`
+    // and documents it the same way. What *is* observable, and is the
+    // stronger proof besides: the real filesystem side effect the dialog's
+    // resolution drives — exactly the thing the pre-#1125 bug got wrong.
+
+    /// Cancelling "Save Workspace As" must write nothing.
+    ///
+    /// No `queue_dialog_events` call is made, so the dialog's nested loop
+    /// paints one frame and then — its scripted-event queue empty —
+    /// synthesizes a single Escape (`TuiPlatformServices::
+    /// next_dialog_events`'s documented behaviour) and resolves `Cancelled`.
+    ///
+    /// RED-verified: reverting `TuiEngineActionHost::save_workspace_as_dialog`
+    /// to its pre-#1125 body (`engine.cwd.join(".vimcode-workspace");
+    /// engine.save_workspace_as(&ws_path);`) makes this fail — that body
+    /// writes the file unconditionally, with no dialog and so no way for a
+    /// "cancel" to exist at all.
+    #[test]
+    fn menu_save_workspace_as_cancelled_dialog_writes_nothing_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_save_workspace_as_cancel_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        // Alt+F reveals the menu bar and opens the File dropdown in one
+        // dispatch — the #318 shim; mirrors
+        // `menu_terminal_activation_opens_terminal_pane_via_shell_app`'s
+        // identical use of Alt+<letter> for Terminal.
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Save Workspace As").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Save Workspace As\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        let ws_path = dir.join(".vimcode-workspace");
+        assert!(
+            !ws_path.exists(),
+            "an unscripted (cancelled) Save Workspace As dialog must not \
+             write cwd/.vimcode-workspace — the pre-#1125 code wrote it \
+             unconditionally with no dialog at all"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Confirming "Save Workspace As" with a *typed* name must save under
+    /// that name, not the hardcoded `.vimcode-workspace` the pre-#1125 code
+    /// always used — the distinguishing half of the #1125 fix the cancel
+    /// test above can't cover on its own (a bare, unscripted confirm of the
+    /// dialog's seeded `.vimcode-workspace` initial filename would land on
+    /// the very same path the old hardcoded write did, so it can't tell the
+    /// two implementations apart).
+    ///
+    /// Clears the picker's seeded `.vimcode-workspace` query (one Backspace
+    /// per character, matching `FilePickerController::pop_char`) before
+    /// typing a different name, then confirms with Enter —
+    /// `FilePickerController::confirm_selection` resolves a non-empty
+    /// Save-mode query to `root.join(query)` regardless of whether that name
+    /// already exists.
+    ///
+    /// RED-verified: reverting `TuiEngineActionHost::save_workspace_as_dialog`
+    /// to its pre-#1125 body makes this fail — `renamed-workspace` never
+    /// gets created (the hardcoded body only ever writes `.vimcode-workspace`,
+    /// ignoring the scripted dialog entirely).
+    #[test]
+    fn menu_save_workspace_as_confirmed_with_a_typed_name_saves_to_that_path_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_save_workspace_as_confirm_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        let mut events: Vec<quadraui::UiEvent> = Vec::new();
+        for _ in ".vimcode-workspace".chars() {
+            events.push(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        for c in "renamed-workspace".chars() {
+            events.push(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        events.push(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Named(quadraui::NamedKey::Enter),
+            modifiers: quadraui::Modifiers::default(),
+            repeat: false,
+        });
+        driver.queue_dialog_events(events);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Save Workspace As").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Save Workspace As\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        assert!(
+            dir.join("renamed-workspace").exists(),
+            "confirming the dialog with a typed name must save under that \
+             name — the real dialog's result must reach \
+             Engine::save_workspace_as, not a hardcoded path"
+        );
+        assert!(
+            !dir.join(".vimcode-workspace").exists(),
+            "the confirmed name was \"renamed-workspace\", not \
+             \".vimcode-workspace\" — a stray file at the old hardcoded \
+             name would mean the dialog's result was ignored"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// File ▸ Open File… must no longer fall back to the in-canvas fuzzy
+    /// finder (`open_picker(PickerSource::Files)`, painted with a "Find
+    /// Files" header) — it now goes through `render::run_open_file_dialog`,
+    /// the same native-dialog rung `Save Workspace As` uses above.
+    ///
+    /// RED-verified: reverting the `open_file_dialog` menu-id arm in
+    /// `TuiShellApp::handle` to
+    /// `self.engine.open_picker(crate::core::engine::PickerSource::Files)`
+    /// makes this fail — "Find Files" paints.
+    #[test]
+    fn menu_open_file_no_longer_falls_back_to_the_in_canvas_picker_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1125_open_file_dialog_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let (x, y) = driver.find("Open File").unwrap_or_else(|| {
+            panic!(
+                "File dropdown must list Open File\u{2026}; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+
+        assert!(
+            !driver.screen_contains("Find Files"),
+            "File \u{25b8} Open File\u{2026} must no longer fall back to the \
+             in-canvas fuzzy finder (PickerSource::Files, \"Find Files\" \
+             header) — it should go through the real native dialog instead; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── #758 / #734 slice 3: the shared terminal (PTY) keyboard rung ───────
 
     /// TUI half of `terminal_ctrl_f_opens_the_painted_find_bar` (`gtk/
@@ -8375,9 +11920,16 @@ mod tests {
     /// `default_ctrl_f_action()` unconditionally returned `"find"`, so this
     /// same Ctrl+F press opened the find/replace overlay (the `"Aa"` toggle
     /// appears) instead of paging the viewport.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore a
+    /// non-zero scroll offset before the "top of file visible" precondition
+    /// below ever runs — red on a dev box with a saved session for this repo
+    /// path, green in CI where no such session exists.
     #[test]
     fn ctrl_f_pages_down_the_viewport_in_default_vim_mode_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         assert_eq!(
             app.engine.settings.editor_mode,
             crate::core::settings::EditorMode::Vim,
@@ -8446,10 +11998,17 @@ mod tests {
     /// unconditionally, so `<Tab>` accepted the popup even in default Vim
     /// mode — the `after_tab` assertion below (expected count 1) observes 2
     /// instead against that code.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can leave the
+    /// fixture with extra restored windows/scroll state before the typed
+    /// completion popup is built — red on a dev box with a saved session for
+    /// this repo path, green in CI where no such session exists.
     #[test]
     fn ctrl_y_accepts_tab_falls_through_for_completion_popup_in_default_vim_mode_via_shell_app() {
         let build = || {
-            let mut app = TuiShellApp::new(None);
+            let mut app = TuiShellApp::new_for_test();
             assert_eq!(
                 app.engine.settings.editor_mode,
                 crate::core::settings::EditorMode::Vim,
@@ -8504,6 +12063,317 @@ mod tests {
         );
     }
 
+    /// #1237: the completion popup must anchor at the cursor's real
+    /// *display* column, not its raw character column — on a
+    /// tab-indented line the two disagree, and GTK's own anchor used to
+    /// compute the latter directly (`cursor_pos.col as f64 * cw`, see
+    /// `render::editor_popup_anchors`'s doc). TUI already got this right
+    /// pre-#1237, via its own (now-shared) `char_col_to_visual`; this
+    /// locks that in as a shared-function regression guard, and is the
+    /// TUI half of the both-backends pair #1237 asks for — GTK's half is
+    /// `gtk::testing::editor_popups::
+    /// completion_popup_anchors_at_visual_column_on_tab_indented_line`,
+    /// RED-verified there against the raw-char-column formula.
+    ///
+    /// Ground truth is the real terminal cursor position quadraui's own
+    /// `tui::editor::draw_editor` reports via `Frame::set_cursor_position`
+    /// (`TuiDriver::terminal_cursor_position`) — computed by quadraui's
+    /// *own* `char_col_to_visual` from the identical `(gutter_w, vis_col,
+    /// scroll_left)` inputs, entirely independent of the popup-anchor code
+    /// under test. Two tabs (tabstop defaults to 4) then `"ZQXWFOO"` put
+    /// the cursor at char column 9 but display column 15 — anchoring the
+    /// popup on the raw char column would land it 6 columns left of the
+    /// caret; `expand_tab = false` keeps the typed `<Tab>`s literal so the
+    /// line actually has tabs to expand.
+    #[test]
+    fn completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "ZQXWFOOBAR\n");
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        // Go to the last line, open a new line below, indent it with two
+        // literal tabs, then type a prefix that matches the dictionary
+        // word above — triggers the real word-completion auto-popup (not
+        // hand-set engine state).
+        driver.type_char('G');
+        driver.type_char('o');
+        driver.type_char('\t');
+        driver.type_char('\t');
+        for c in "ZQXWFOO".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert_eq!(
+            screen.matches("ZQXWFOOBAR").count(),
+            2,
+            "precondition: the popup must be showing the \"ZQXWFOOBAR\" \
+             candidate (once in the dictionary line, once in the popup); \
+             screen:\n{screen}"
+        );
+
+        let (cursor_x, _) = driver
+            .terminal_cursor_position()
+            .expect("insert-mode cursor must be visible after typing");
+        let popup_bounds = driver
+            // The candidate text also appears verbatim as plain buffer
+            // content (the dictionary line above), and this fixture's own
+            // window chrome puts a `│` at column 0 of *every* row (so a
+            // leading-border-only prefix isn't unique either) — bracketing
+            // with *both* the popup's own left and right borders (see
+            // quadraui's `tui::completions::draw_completions`, which pads
+            // the label with exactly one leading space before the closing
+            // border) picks out the popup's rendering specifically.
+            .find_bounds("│ ZQXWFOOBAR │")
+            .expect("completion popup must be visible on screen");
+
+        assert!(
+            (popup_bounds.x - cursor_x as f32).abs() <= 1.0,
+            "completion popup (x={}) must anchor at the real cursor's \
+             display column (x={cursor_x}), not the raw character column \
+             (6 columns left of it, for two tabstop-4 tabs); screen:\n{screen}",
+            popup_bounds.x,
+        );
+    }
+
+    /// #1237 review: the completion test above only covers the popup TUI
+    /// already anchored correctly pre-fix; this covers the LSP hover
+    /// popup (`ScreenLayout::hover`), which — like GTK's completion popup
+    /// — used the raw char column with **no** `char_col_to_visual` call at
+    /// all before #1237 (see `render::editor_popup_anchors`'s doc). Same
+    /// `"\t\tZZQ\n"` / char-col-5 fixture as the completion test (tabstop
+    /// defaults to 4, so display column 11).
+    ///
+    /// Ground truth is the buffer's own rendered `"ZZQ"` text, found via
+    /// `find_bounds` rather than `terminal_cursor_position` (normal mode's
+    /// Block cursor doesn't report a terminal cursor position the way
+    /// Insert mode's Bar cursor does — see `TuiDriver::terminal_cursor_
+    /// position`'s doc — and hover doesn't require Insert mode). The
+    /// popup's own left border sits exactly at `"ZZQ"`'s end (display col
+    /// 11), and `quadraui::tui::tooltip::draw_tooltip`'s `Sides` chrome
+    /// puts one border + one pad column before content, so the hover
+    /// text itself starts 2 cells past that.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting
+    /// `render::editor_popup_anchors`'s `anchor_xy` closure to
+    /// `char_col.saturating_sub(scroll_left)` (dropping the
+    /// `char_col_to_visual` call) fails this assertion — the popup lands 6
+    /// columns left of `"ZZQ"` instead.
+    #[test]
+    fn hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.view_mut().cursor.col = 5;
+        app.engine.lsp_hover_text = Some("QXZZYHVR".to_string());
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let hover_bounds = driver
+            .find_bounds("QXZZYHVR")
+            .expect("hover popup must be visible on screen");
+
+        // display col 11 (right after "ZZQ") + 2 cells (border + pad) that
+        // `draw_tooltip`'s `Sides` chrome always puts before content.
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 2.0;
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (hover_bounds.x - expected_x).abs() <= 1.0,
+            "hover popup (x={}) must anchor at the tab-expanded display \
+             column (x≈{expected_x}, right after \"ZZQ\"), not the raw \
+             character column (x≈{buggy_x}); screen:\n{screen}",
+            hover_bounds.x,
+        );
+    }
+
+    /// #1237 review: same bug, the signature-help popup
+    /// (`ScreenLayout::signature_help`). See the hover test above for the
+    /// fixture and RED-verification method — identical here, just a
+    /// different popup sharing the same `anchor_xy` closure in
+    /// `render::editor_popup_anchors`. `signature_help_to_quadraui_
+    /// tooltip` puts one extra leading space inside the border (see its
+    /// "Leading space inside the border" comment) versus hover's plain
+    /// text, so the label text itself starts 3 cells past the border
+    /// (border + pad + leading space) — one further right than hover's 2.
+    #[test]
+    fn signature_help_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.view_mut().cursor.col = 5;
+        app.engine.lsp_signature_help = Some(crate::core::lsp::SignatureHelpData {
+            label: "fn bar(x: i32)".to_string(),
+            params: vec![(7, 13)],
+            active_param: Some(0),
+        });
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let sig_bounds = driver
+            .find_bounds("fn bar(x: i32)")
+            .expect("signature-help popup must be visible on screen");
+
+        // border + pad (as hover's +2) + the label's own leading-space span.
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 3.0;
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (sig_bounds.x - expected_x).abs() <= 1.0,
+            "signature-help popup (x={}) must anchor at the tab-expanded \
+             display column (x≈{expected_x}), not the raw character column \
+             (x≈{buggy_x}); screen:\n{screen}",
+            sig_bounds.x,
+        );
+    }
+
+    /// #1237 review: same bug, the rich-markdown editor-hover popup
+    /// (`ScreenLayout::editor_hover`, `gh`/dwell-triggered). Its own
+    /// content box (a different rasteriser than the plain-text tooltip
+    /// hover/signature-help share) puts content directly one cell past
+    /// its left border, no extra pad column.
+    #[test]
+    fn editor_hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.expand_tab = false;
+        app.engine.buffer_mut().insert(0, "\t\tZZQ\n");
+        app.engine.editor_hover = Some(crate::core::engine::EditorHoverPopup {
+            markdown: "helloworld".to_string(),
+            line_text: vec!["helloworld".to_string()],
+            code_highlights: vec![vec![]],
+            links: vec![],
+            anchor_line: 0,
+            anchor_col: 5,
+            source: crate::core::engine::EditorHoverSource::Lsp,
+            scroll_top: 0,
+            focused_link: None,
+            popup_width: 10,
+            frozen_scroll_top: 0,
+            frozen_scroll_left: 0,
+            selection: None,
+        });
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+        let screen = driver.screen();
+
+        let zzq_bounds = driver
+            .find_bounds("ZZQ")
+            .expect("the tab-indented buffer line must be visible");
+        let eh_bounds = driver
+            .find_bounds("helloworld")
+            .expect("editor-hover popup must be visible on screen");
+
+        let expected_x = zzq_bounds.x + zzq_bounds.width + 1.0; // "ZZQ" end + 1-cell border, no pad
+        let buggy_x = expected_x - 6.0; // raw char col 5, 6 cols left for two tabstop-4 tabs
+        assert!(
+            (eh_bounds.x - expected_x).abs() <= 1.0,
+            "editor-hover popup (x={}) must anchor at the tab-expanded \
+             display column (x≈{expected_x}), not the raw character column \
+             (x≈{buggy_x}); screen:\n{screen}",
+            eh_bounds.x,
+        );
+    }
+
+    /// #420: the completion popup, anchored in the right-hand split of a
+    /// `:vnew`, must never render past that split's own left edge — not
+    /// even after the "shift left to avoid right-edge overflow" placement
+    /// kicks in for a long candidate label.
+    ///
+    /// Before the fix, `paint_editor_popups` clamped the popup's position
+    /// into the *shared* editor-band viewport (spanning every split), not
+    /// the *active window's own* rect, so the left-shift clamp let the
+    /// popup travel past the divider and render on top of the left split's
+    /// own content — which, with the left split narrow (or a sidebar open
+    /// next to it), looks exactly like the popup bleeding into the sidebar
+    /// region the bug report describes. GTK's equivalent code in `app.rs`
+    /// already scoped to the active window's own rect, so this was a
+    /// TUI-only divergence from the multi-backend rule.
+    ///
+    /// Asserts on rendered output: locates the right split's own left edge
+    /// via its per-window status line's leading `"INSERT"` mode badge
+    /// (`build_window_status_line` puts the mode text in
+    /// `left_segments[0]`, flush against the window's own rect — see that
+    /// function), then checks the popup's rendered left border+label never
+    /// starts left of it. Never asserts on `completion_layout` state
+    /// directly, which would stay populated (and pass) even if the popup
+    /// painted over the wrong split entirely (the #587/#592 failure shape).
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix, in this
+    /// exact fixture (90-col terminal, ~63-char candidate label), the
+    /// popup's rendered left edge landed at x=24 while the right split's
+    /// own status-line edge sat at x=47 — the popup painted 23 columns into
+    /// the left split. Reverting `render_impl.rs`'s `win_viewport` back to
+    /// the shared `viewport` reproduces this and fails the assertion below.
+    #[test]
+    fn completion_popup_stays_within_its_own_split_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // `:vnew` opens a *fresh empty buffer* in a new vertical split and
+        // moves focus there — unlike `:vsplit` (same buffer in both
+        // windows, same starting scroll position), this gives the two
+        // splits independent content with zero setup, so the long
+        // completion candidate only needs to exist in the split under
+        // test. Force the new (active) split onto the right, so that
+        // shifting the popup left to dodge a right-edge overflow is the
+        // exact case that could cross into the *other* split (`splitright`
+        // defaults to `false` — new window first/left — same as real Vim).
+        app.engine.settings.splitright = true;
+        app.engine.execute_command("vnew");
+        app.engine.buffer_mut().insert(
+            0,
+            "ZQXWFOOBARLONGCANDIDATEWORDXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 90, 24);
+        driver.render();
+        // Jump to the last line (the fresh buffer's only line, the long
+        // candidate above), open a new line below it, and type a prefix
+        // matching it — triggers the real word-completion auto-popup, in
+        // the right split only.
+        driver.type_char('G');
+        driver.type_char('o');
+        for c in "ZQXWFOO".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        let insert_bounds = driver
+            .find_bounds("INSERT")
+            .expect("right split must be in Insert mode and show its mode badge");
+
+        let popup_bounds = driver
+            // The candidate text also appears verbatim as plain buffer
+            // content (the line we inserted above); prefixing with the
+            // popup's own left border + label padding picks out the
+            // popup's rendering specifically, not that buffer line.
+            .find_bounds("│ ZQXWFOOBARLONGCANDIDATEWORD")
+            .expect("completion popup must be visible on screen");
+
+        // Small tolerance for the mode badge's own left padding inside the
+        // status bar — the real bug shifted the popup by ~12 columns, far
+        // outside this margin.
+        assert!(
+            popup_bounds.x + 3.0 >= insert_bounds.x,
+            "completion popup (x={}) must not render left of the right \
+             split's own edge (status line at x={}) — it bled into the \
+             neighbouring split; screen:\n{screen}",
+            popup_bounds.x,
+            insert_bounds.x,
+        );
+    }
+
     /// A focused terminal must swallow ordinary keys so they never reach the
     /// editor buffer — the divergence that made GTK unusable (there, `x` ran
     /// vim's delete-char on the file while the user thought they were typing
@@ -8515,11 +12385,18 @@ mod tests {
     /// `terminal_has_focus` and repeating the *identical* key must delete the
     /// character, so a fixture whose text simply could not change would fail
     /// the second half.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own marker insert
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn focused_terminal_swallows_editor_keys_via_shell_app() {
         // Same fixture twice, differing only in `terminal_has_focus`.
         let build = |focused: bool| {
-            let mut app = TuiShellApp::new(None);
+            let mut app = TuiShellApp::new_for_test();
             app.engine.buffer_mut().insert(0, "ZQXWTERM758\n");
             app.engine.terminal_new_tab(80, 6);
             app.engine.terminal_has_focus = focused;
@@ -8635,9 +12512,9 @@ mod tests {
     /// An **open but empty** quickfix list must reserve no rows for mouse
     /// routing, because it reserves none for painting.
     ///
-    /// `compute_editor_layout` gates the quickfix band on `quickfix_open &&
-    /// !quickfix_items.is_empty()`, but `handle_mouse` asked `if
-    /// engine.quickfix_open { 6 }` in four places — so `:copen` on an empty
+    /// `compute_editor_layout` gates the quickfix band on `quickfix.open &&
+    /// !quickfix.items.is_empty()`, but `handle_mouse` asked `if
+    /// engine.quickfix.open { 6 }` in four places — so `:copen` on an empty
     /// list moved every band below the editor six rows up from where it was
     /// painted. `render::quickfix_panel_rows` is now the single rule.
     ///
@@ -8652,8 +12529,8 @@ mod tests {
         let mut app = TuiShellApp::new(None);
         app.engine.terminal_new_tab(80, 8);
         // `:copen` with nothing in the list — open, but paints nothing.
-        app.engine.quickfix_open = true;
-        app.engine.quickfix_items.clear();
+        app.engine.quickfix.open = true;
+        app.engine.quickfix.items.clear();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
         driver.mouse_up(1.0, 1.0);
@@ -8709,10 +12586,10 @@ mod tests {
 
     /// Command mode paints the typed `:command` *and* its inverted block
     /// cursor. The cursor is a colour inversion, invisible to `screen()`'s
-    /// text dump, so this asserts on the text and relies on the run-batching
-    /// in `render_command_line` not swallowing cells: a cursor mid-string
-    /// splits the row into three colour runs, so a bug there would drop or
-    /// duplicate characters rather than merely mis-colour them.
+    /// text dump, so this asserts on the text and relies on `panels::
+    /// render_command_line` (which now delegates to quadraui's own
+    /// `Backend::draw_command_line_selection`, #1185) not swallowing cells: a
+    /// cursor mid-string must not drop or duplicate the characters around it.
     #[test]
     fn render_content_paints_command_mode_text_with_cursor_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -8725,6 +12602,68 @@ mod tests {
         assert!(
             screen.contains(":ZQXW605CMD"),
             "command-mode text should paint intact around the inverted cursor cell; screen:\n{screen}"
+        );
+    }
+
+    /// #1185: adopts quadraui#1001's `Backend::draw_command_line_selection`.
+    /// Before this, GTK painted no visual feedback at all for a command-line
+    /// drag-selection (`cmd_sel`/Ctrl+C-copy worked; nothing was drawn), and
+    /// TUI got a highlight only via its own hand-rolled per-cell fg/bg
+    /// inversion in `panels::render_command_line` — exactly the kind of
+    /// per-backend paint code `CLAUDE.md`'s Platform-Neutrality Rule exists
+    /// to delete. This seeds `engine.cmd_sel` directly (the doc comment at
+    /// its definition recommends exactly this for tests that need it, rather
+    /// than driving a synthetic mouse drag) and asserts on the **painted
+    /// background colour** of individual columns — not on `cmd_sel` being
+    /// `Some` (`CLAUDE.md` rule 1: `ScreenLayout.picker`'s #587/#592 history
+    /// is why state-only assertions are rejected here).
+    ///
+    /// Confirmed RED against unfixed `develop`: reverting this PR's
+    /// `panels::render_command_line` restores the hand-rolled inversion,
+    /// which never applies `theme.selection`'s colour to any cell (it swaps
+    /// the existing `theme.command_fg`/`theme.command_bg` pair instead), so
+    /// the `sel_bg` assertions below fail without the fix.
+    #[test]
+    fn render_content_paints_command_line_selection_highlight_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.mode = crate::core::Mode::Command;
+        app.engine.command_buffer = "wq!".to_string();
+        app.engine.command_cursor = 3;
+        // Full displayed text is ":wq!" (prompt + buffer). Char indices
+        // (1, 2) select "wq" — columns 1 (':') skipped, 'w' and 'q' selected,
+        // '!' left unselected. Same inclusive-range convention as GTK's
+        // `drag_select_then_ctrl_c_copies_the_command_buffer_substring`.
+        app.engine.cmd_sel.set(Some((1usize, 2usize)));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let sel_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).selection);
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let bounds = driver
+            .find_bounds(":wq!")
+            .expect("command line text must paint");
+        let row = bounds.y as u16;
+        let col0 = bounds.x as u16; // ':'
+
+        assert_eq!(
+            driver.style_at(col0 + 1, row).map(|s| s.bg),
+            Some(sel_bg),
+            "selected column 'w' must carry the selection background"
+        );
+        assert_eq!(
+            driver.style_at(col0 + 2, row).map(|s| s.bg),
+            Some(sel_bg),
+            "selected column 'q' must carry the selection background"
+        );
+        assert_ne!(
+            driver.style_at(col0 + 3, row).map(|s| s.bg),
+            Some(sel_bg),
+            "unselected column '!' must not carry the selection background"
+        );
+        assert_ne!(
+            driver.style_at(col0, row).map(|s| s.bg),
+            Some(sel_bg),
+            "unselected prompt column ':' must not carry the selection background"
         );
     }
 
@@ -8806,6 +12745,341 @@ mod tests {
              the document body — a hit anywhere else means the keystrokes \
              were swallowed as normal/insert-mode edits instead of reaching \
              the ex `:!` branch; screen:\n{screen}"
+        );
+    }
+
+    /// #1299: `:reg {register-name}` must reach the ex parser *and* paint
+    /// Neovim's real `Type Name Content` header. Two bugs in one row, both
+    /// visible on the command line:
+    ///
+    /// * before the fix, `execute_command`'s `"registers" | "display"` arm
+    ///   matched only the bare command, so any argument fell through to the
+    ///   unknown-command path and the command line painted
+    ///   `Not an editor command: registers a`;
+    /// * even bare `:reg` painted a vimcode-invented `--- Registers ---`
+    ///   banner rather than Neovim's header.
+    ///
+    /// Reads the **painted last row** rather than `engine.message`, per
+    /// `render_content_paints_command_line_via_shell_app` above (which
+    /// establishes that the command line renders `engine.message` verbatim)
+    /// and per `CLAUDE.md`'s rule 1 — `tests/ex_commands.rs`'s
+    /// `cmd_display_shows_registers` / `cmd_registers_argument_filters_listing`
+    /// are the engine-tier twins that cover the full multi-row table, which
+    /// the one-row command line necessarily truncates to its first line
+    /// (`build_command_line` strips newlines so the row can never overflow).
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs` reverted
+    /// to develop's `"registers" | "display"` match arm, the row paints
+    /// `Not an editor command: registers a` and both assertions below fail.
+    #[test]
+    fn reg_with_register_argument_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let mut app = TuiShellApp::new_for_test();
+        // Seeded rather than yanked: the register's *provenance* is not what
+        // is under test here, the argument parse and the header are. The
+        // engine-tier twins in `tests/ex_commands.rs` drive real yanks.
+        app.engine.registers.insert(
+            'a',
+            (
+                "alpha\n".to_string(),
+                crate::core::engine::RegType::Linewise,
+            ),
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":reg a");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("Type Name Content").unwrap_or_else(|| {
+            panic!(
+                "`:reg a` must reach the ex parser and paint Neovim's real \
+                 `Type Name Content` header on the command line (#1299); \
+                 screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the register listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else means \
+             the keystrokes were swallowed as normal/insert-mode edits \
+             instead of reaching the ex `:registers` branch; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:reg a` must not be rejected as an unknown command (#1299); \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("--- Registers ---"),
+            "the pre-#1299 invented header must be gone; screen:\n{screen}"
+        );
+    }
+
+    /// #1301: `:jumps` must paint Neovim's real ` jump line  col file/text`
+    /// header — no vimcode-invented `tab` column — and must reach the ex
+    /// `"jumps"` branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above, which explains the same constraint), a one-row
+    /// command line can only show the message's *first* line, i.e. the
+    /// header. The full multi-row listing — the jump-number/line/col
+    /// columns, the `file/text` preview content for both same-buffer and
+    /// cross-buffer entries, and the trailing bare `>` line — is covered by
+    /// `test_ex_jumps_drops_tab_column_and_shows_file_text_preview` in
+    /// `src/core/engine/tests.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"jumps"` arm, the header paints
+    /// ` jump line  col  tab  file/text` (vimcode's invented `tab` column)
+    /// and the assertion below fails.
+    #[test]
+    fn jumps_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":jumps");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find(" jump line  col file/text").unwrap_or_else(|| {
+            panic!(
+                "`:jumps` must reach the ex parser and paint Neovim's \
+                     real ` jump line  col file/text` header on the command \
+                     line (#1301); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the jumps listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:jumps` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:jumps` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        let header_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            !header_row.contains("tab"),
+            "the pre-#1301 invented `tab` column must be gone from the \
+             command-line header row; row:\n{header_row}"
+        );
+    }
+
+    /// #1300: `:marks` must paint Neovim's real `mark line  col file/text`
+    /// header (single space before `file/text` — the pre-fix arm had two)
+    /// and must reach the ex `"marks"` branch at all.
+    ///
+    /// The command line renders `engine.message` verbatim but strips
+    /// newlines (`render_content_paints_command_line_via_shell_app`
+    /// establishes this, and `reg_with_register_argument_paints_nvim_header_
+    /// via_shell_app`'s doc comment above explains why), so the header —
+    /// the message's first line — is what a one-row command line can show;
+    /// the full multi-row listing (the `'`/user-mark/`"`/`.` rows) is
+    /// covered by `cmd_marks_lists_auto_marks_alongside_user_marks` in
+    /// `tests/ex_commands.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"marks"` arm, the row paints
+    /// `mark line  col  file/text` (double space) and the assertion below
+    /// fails.
+    #[test]
+    fn marks_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":marks");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("mark line  col file/text").unwrap_or_else(|| {
+            panic!(
+                "`:marks` must reach the ex parser and paint Neovim's real \
+                 `mark line  col file/text` header on the command line \
+                 (#1300); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the marks listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:marks` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:marks` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1303: `:changes` must paint Neovim's real `change line  col text`
+    /// header — with the `text` column the pre-fix arm omitted entirely —
+    /// and must reach the ex `"changes"` branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above), a one-row command line can only show the
+    /// message's *first* line, i.e. the header. The full multi-row listing —
+    /// the change-number/line/col/text columns and the marker row — is
+    /// covered by `test_ex_changes_shows_text_column_and_relative_numbering`
+    /// in `src/core/engine/tests.rs`, this test's engine-tier twin.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"changes"` arm, the header paints
+    /// `change line  col` (no `text` column) and the assertion below fails.
+    #[test]
+    fn changes_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":changes");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("change line  col text").unwrap_or_else(|| {
+            panic!(
+                "`:changes` must reach the ex parser and paint Neovim's \
+                 real `change line  col text` header on the command line \
+                 (#1303); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the changes listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:changes` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:changes` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        let header_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            header_row.trim_end().ends_with("text"),
+            "the pre-#1303 header omitted the `text` column entirely; \
+             row:\n{header_row}"
+        );
+    }
+
+    /// #1302: `:digraphs` (no bang) must paint Neovim's real digraph table
+    /// on the command line, not a blank row.
+    ///
+    /// `format_digraph_table` deliberately prepends a leading blank line to
+    /// `engine.message` to mirror Neovim's `listdigraphs` (`digraph.c`'s
+    /// `msg_putchar('\n')` before the loop) — but `build_command_line`
+    /// collapses a multi-line message to one row for display, and naively
+    /// taking `.lines().next()` of a string that *starts* with `\n` yields
+    /// `""`, painting nothing at all even though the message holds the real
+    /// table on its second line. `build_command_line` must skip past that
+    /// leading blank line and show the first line with actual content
+    /// (here, the `NU ^@  10 ...` row) instead.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `render.rs` reverted
+    /// to plain `text.lines().next()`, the command line row is empty and
+    /// the `driver.find` below panics.
+    #[test]
+    fn digraphs_paints_first_table_row_not_a_blank_line_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        run_ex_command(&mut driver, ":digraphs");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("NU ^@  10").unwrap_or_else(|| {
+            panic!(
+                "`:digraphs` must reach the ex parser and paint Neovim's \
+                 real digraph table on the command line, starting with the \
+                 `NU ^@  10 ...` row (#1302) — not a blank row; \
+                 screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the digraph table's first content row must paint on the \
+             command line (last row), not in the document body — a hit \
+             anywhere else means the keystrokes were swallowed as \
+             normal/insert-mode edits instead of reaching the ex \
+             `:digraphs` branch; screen:\n{screen}"
+        );
+        let command_row = screen.lines().nth(y as usize).unwrap_or_default();
+        assert!(
+            !command_row.trim().is_empty(),
+            "the command line must not be blank after `:digraphs` \
+             (the #1302 regression — a leading `\\n` in `engine.message` \
+             made `build_command_line` paint an empty row); \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:digraphs` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1327: `:history` must paint Neovim's real `      #  cmd history`
+    /// header on the command line — not the vimcode-invented
+    /// `--- Command History ---` banner — and must reach the ex `"history"`
+    /// branch at all.
+    ///
+    /// Per `build_command_line`'s "strip newlines so the command line never
+    /// exceeds one row" rule (see `marks_paints_nvim_header_via_shell_app`'s
+    /// doc comment above), a one-row command line can only show the
+    /// message's *first* line, i.e. the header. The full multi-row listing —
+    /// the numbered rows and the `>` current-entry marker — is covered by
+    /// `test_history_is_hermetic_and_shows_only_this_tests_commands` and its
+    /// siblings in `tests/new_vim_features.rs`, this test's engine-tier
+    /// twins.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `execute.rs`
+    /// reverted to develop's `"history"` arm, the row paints
+    /// `--- Command History ---` and the assertion below fails.
+    #[test]
+    fn history_paints_nvim_header_via_shell_app() {
+        const HEIGHT: u16 = 24;
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, HEIGHT);
+        // Populate command history (bare `:history` on a session with
+        // nothing recorded errors instead — see the engine-tier
+        // `test_history_named_empty_kind_errors`).
+        run_ex_command(&mut driver, ":echo hi");
+        run_ex_command(&mut driver, ":history");
+
+        let screen = driver.screen();
+        let (_, y) = driver.find("      #  cmd history").unwrap_or_else(|| {
+            panic!(
+                "`:history` must reach the ex parser and paint Neovim's \
+                 real `      #  cmd history` header on the command line \
+                 (#1327); screen:\n{screen}"
+            )
+        });
+        assert_eq!(
+            y as u16,
+            HEIGHT - 1,
+            "the history listing's header must paint on the command line \
+             (last row), not in the document body — a hit anywhere else \
+             means the keystrokes were swallowed as normal/insert-mode \
+             edits instead of reaching the ex `:history` branch; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            "`:history` must not be rejected as an unknown command; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("--- Command History ---"),
+            "the pre-#1327 invented header must be gone; screen:\n{screen}"
         );
     }
 
@@ -8933,7 +13207,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the three title-bar rungs are not live at all.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -8989,7 +13263,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the menu-dropdown rung has nothing to paint into.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -9081,9 +13355,12 @@ mod tests {
     fn chrome_band_composes_in_canonical_order_via_shell_app() {
         let mut app = app_with_sidebar_open();
         // The *settings* panel, not the explorer: its body paints a fixed
-        // "SETTINGS" heading, where the explorer's would be this checkout's
-        // own directory listing — ambient state a test must not depend on
-        // (#762).
+        // "Appearance" category heading, where the explorer's would be this
+        // checkout's own directory listing — ambient state a test must not
+        // depend on (#762). Not "SETTINGS" (#1343): that was
+        // `render_settings_panel`'s own hand-painted duplicate header,
+        // deleted now that the shell's `AppShell` owns the sidebar header
+        // alone — see `issue_1256_sidebar_chrome` in `harness.rs`.
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
@@ -9100,7 +13377,7 @@ mod tests {
         // `shell_config(true)`, not `config()`: `AppShell::set_title_bar_visible`
         // is what reserves `layout.title_bar_bounds`, and with no reserved row
         // the `MenuRow` rung is not live at all.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         assert_eq!(
@@ -9121,7 +13398,7 @@ mod tests {
             "MenuRow was composed but the menu bar never painted; screen:\n{screen}"
         );
         assert!(
-            driver.find_bounds("SETTINGS").is_some(),
+            driver.find_bounds("Appearance").is_some(),
             "SidebarPanel was composed but the settings panel never painted; \
              screen:\n{screen}"
         );
@@ -9153,7 +13430,7 @@ mod tests {
         );
 
         let frame = app.composed_frame.clone();
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
         assert_eq!(
             chrome_half(&frame.borrow()),
@@ -9415,14 +13692,15 @@ mod tests {
         app.engine.settings.window_status_line = true;
         app.engine.settings.status_line_above_terminal = false;
         app.engine
-            .quickfix_items
+            .quickfix
+            .items
             .push(crate::core::project_search::ProjectMatch {
                 file: PathBuf::from("zqxw765.rs"),
                 line: 0,
                 col: 0,
                 line_text: "ZQXW765QF".to_string(),
             });
-        app.engine.quickfix_open = true;
+        app.engine.quickfix.open = true;
         app.engine.bottom_panel_open = true;
         app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
         app.engine.dap_output_lines.push("ZQXW765DBG".to_string());
@@ -9572,10 +13850,20 @@ mod tests {
     /// The *settings* sidebar panel must now paint through `render_content`
     /// too — it was one of #607's documented gaps, blocked on
     /// `quadraui::tui::draw_settings_chrome` being a free `&mut Buffer`
-    /// rasteriser. #635 (Stage 6b item B) switches this to the real
-    /// `Backend::draw_settings_chrome` trait method (`quadraui#531`), so the
-    /// `" SETTINGS"` header row (a literal, hence deterministic) should
-    /// reach the screen.
+    /// rasteriser. #635 (Stage 6b item B) switched this to the real
+    /// `Backend::draw_settings_chrome` trait method (`quadraui#531`).
+    ///
+    /// #1343: this used to assert on a literal `" SETTINGS"` header row
+    /// `render_settings_panel` hand-painted on top of the shell's own —
+    /// exactly the double-header #1256 found. That row is deleted now;
+    /// the shell (`AppShell`) owns the *one* header, and this local `config()`
+    /// fixture (unlike `TuiShellApp::build_shell_config`) never registers
+    /// Settings as a bottom item, so its header wouldn't reach "Settings"
+    /// either. What this test actually needs to prove is unchanged —
+    /// `render_content` paints the settings *form body* — so it asserts on
+    /// that instead (`issue_1256_sidebar_chrome::settings_header_names_
+    /// settings` in `harness.rs` covers the real shell-header text, through
+    /// the production `shell_config`).
     #[test]
     fn render_content_paints_settings_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -9586,8 +13874,229 @@ mod tests {
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
         assert!(
-            screen.contains("SETTINGS"),
-            "settings panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+            screen.contains("Appearance"),
+            "settings panel body should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// #1238: TUI hit-tested the Settings panel against a hand-derived
+    /// `(ab_width, y = 2, sidebar_width, term_height - 4)` rect in three
+    /// places in `mouse.rs`, while `render_settings_panel` (`panels.rs`)
+    /// painted the form at `sidebar_content_bounds.y + 2` — the *real*
+    /// painted origin, which is not `y == 2` once the menu bar (or any
+    /// other chrome above the sidebar) shifts `sidebar_content_bounds`.
+    /// Fixed by caching the exact rect `render_settings_panel` painted
+    /// into (`engine.settings_form_rect`) and hit-testing against it
+    /// through the shared `render::handle_settings_form_ui_event` — the
+    /// same router GTK's `App::try_route_sidebar_mouse_event` (`app.rs`)
+    /// already used.
+    ///
+    /// With the menu bar visible, `sidebar_content_bounds.y` is no longer
+    /// `0`, so the old `y = 2` rect silently landed one (or more) rows
+    /// away from what was actually drawn. This test clicks squarely on
+    /// the "Cursor Line" toggle's own painted row and asserts *that* row's
+    /// glyph flips — RED-verified: reverting the `mouse.rs`/`panels.rs`/
+    /// `engine/mod.rs` side of #1238 while keeping this test fails here,
+    /// because the stale rect resolves the click to the neighbouring row
+    /// instead.
+    #[test]
+    fn driver_click_on_settings_toggle_with_menu_bar_visible_flips_its_own_row_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        // `cursorline` defaults on (`default_cursorline`) — assert it so a
+        // future default flip can't silently defang this test.
+        assert!(
+            app.engine.settings.cursorline,
+            "fixture assumes cursorline defaults to true"
+        );
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
+        let before = driver
+            .find_bounds("Cursor Line")
+            .expect("the \"Cursor Line\" toggle row must paint");
+
+        // Click mid-row (not on the label's own first cell) — the whole
+        // row is the control's hit target (`form_click_event`), so this
+        // still proves the click resolved to *this* row's control, not a
+        // fluke hit on the label glyph itself.
+        driver.click(before.x + 2.0, before.y);
+
+        let screen = driver.screen();
+        let clicked_row = screen.lines().nth(before.y as usize).unwrap_or_default();
+        assert!(
+            clicked_row.contains("[ ]"),
+            "clicking the \"Cursor Line\" row should flip its own toggle off (was \"[x]\"); \
+             row:\n{clicked_row}\nfull screen:\n{screen}"
+        );
+    }
+
+    /// #1249: before `handle_focus_owner_key`'s Settings-panel char table
+    /// was replaced with a straight `c.to_string()`/`Some(c)` pass-through,
+    /// `Key::Char('j'|'k'|'h'|'l'|' '|'/')` were each remapped to their own
+    /// nav-key name with `unicode: None`, so typing any of them into the
+    /// settings search filter did nothing (the text-input branch only ever
+    /// reads `unicode`); and `Key::Char('q')` was renamed to `"Escape"`, so
+    /// typing `q` closed the search box outright instead of appending the
+    /// letter.
+    ///
+    /// Covers all seven characters the doc comment on the fixed arm claims
+    /// (review non-blocking finding on #1249 iteration 1: the test used to
+    /// cover six of the seven and silently drop `'/'` from the loop even
+    /// though the comment listed it).
+    ///
+    /// RED-verified: reverting this commit's `shell_app.rs` change while
+    /// keeping this test fails the assertion below — the first keypress
+    /// ('q') closes the search box, so the query stays empty and never
+    /// reaches `"qj khl/"`.
+    #[test]
+    fn settings_search_filter_accepts_letters_the_old_hand_written_table_dropped_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        app.engine.settings_has_focus = true;
+        app.engine.settings_input_active = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        // Every one of these seven characters used to be dropped (or, for
+        // 'q', used to close the search box) by the old hand-written table.
+        for c in ['q', 'j', ' ', 'k', 'h', 'l', '/'] {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("qj khl/"),
+            "typing q/j/space/k/h/l/'/' into the settings search filter must \
+             append all seven characters to the painted query, not silently \
+             drop most of them (or close the search box on 'q'); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// Blocking review finding on #1249 iteration 1: `h`/`Left` inside the
+    /// Debug (DAP) sidebar was unreachable from the TUI keyboard before this
+    /// fix — the old hand-written char whitelist only listed `'q'`/`'x'`/`'d'`,
+    /// never `'h'`, even though `Engine::dispatch_dap_sidebar_action_key`
+    /// (`src/core/engine/dap_ops.rs`) and GTK's `map_gtk_key_name`
+    /// pass-through both treat `"h"` the same as `"Left"`: focus leaves the
+    /// sidebar and parks the activity-bar cursor on the Debug slot
+    /// (`Engine::activity_bar_focus_in_at(3)`). The new
+    /// `Key::Char(c) => c.to_string()` pass-through restores it.
+    ///
+    /// Asserted on painted, not internal, state (CLAUDE.md rule 1): after
+    /// `h`, activity-bar navigation (`j` then `l`) must actually work — `j`
+    /// moves the toolbar cursor off the Debug slot onto the Source Control
+    /// slot, and `l` activates it, so `SOURCE CONTROL` must paint (replacing
+    /// the Debug sidebar's own "DEBUG | ..." title row). That chain only
+    /// succeeds if `h` genuinely handed keyboard focus to the activity bar:
+    /// `render::route_focus_key` checks `engine.activity_bar_focused`
+    /// *before* any sidebar-panel route, so if `h` were swallowed (old
+    /// behaviour), the Debug panel would still own focus and the trailing
+    /// `j`/`l` would instead reach `dispatch_dap_sidebar_action_key`, which
+    /// ignores both.
+    ///
+    /// **Verified RED against the reverted char-whitelist table:** with
+    /// `'h'` absent from the table, the keypress reaches neither
+    /// `dispatch_dap_sidebar_action_key` nor anywhere else,
+    /// `activity_bar_focused` never becomes `true`, and the final assertion
+    /// (`SOURCE CONTROL` painted) fails — the screen still shows the Debug
+    /// sidebar.
+    #[test]
+    fn debug_sidebar_h_hands_focus_to_activity_bar_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_DEBUG);
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
+
+        let before = driver.screen();
+        assert!(
+            before.contains("DEBUG"),
+            "precondition: the Debug panel must be open and painted before \
+             the keypress (`render::debug_sidebar_chrome`'s title row \
+             always contains the literal \"DEBUG\"); screen:\n{before}"
+        );
+
+        for c in ['h', 'j', 'l'] {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers::default(),
+                repeat: false,
+            });
+        }
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("SOURCE CONTROL"),
+            "'h' in the Debug sidebar must hand keyboard focus to the \
+             activity bar (parked on the Debug slot); 'j' then 'l' should \
+             move to and activate the Source Control slot, painting SOURCE \
+             CONTROL — this only happens if 'h' actually worked; \
+             screen:\n{after}"
+        );
+    }
+
+    /// #1392: the debug sidebar's Run/Stop action button is painted through
+    /// `SidebarPanelBody::render_with`'s `SidebarPanelChrome::StatusBars`
+    /// (quadraui#1061) and routed via `mouse::handle_mouse`'s
+    /// `dap_sidebar_action_click_at` call, which reads the
+    /// `status_bar_hit_regions` that `render_with` returned — the same
+    /// geometry that was painted, not a separately re-derived rect. Drives
+    /// the real `driver_with_shell` mouse pipeline end to end (backend
+    /// translation → `ShellAdapter::handle` → `TuiShellApp::handle` →
+    /// `mouse::handle_mouse`) and asserts on rendered screen text, not an
+    /// engine flag: a fake active session (no real `dap_manager`) paints
+    /// "Stop"; clicking it must run
+    /// `Engine::handle_dap_sidebar_action_click`'s stop branch and repaint
+    /// "Start Debugging" in its place.
+    ///
+    /// Verified RED by temporarily skipping the
+    /// `engine.dap_sidebar_action_hits.replace(...)` call in
+    /// `panels::render_debug_sidebar`: the click then has no hit regions to
+    /// match, `screen.contains("Start Debugging")` fails, and this test
+    /// fails with it.
+    #[test]
+    fn debug_sidebar_run_stop_click_routes_from_status_bar_hit_regions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        ensure_panel_active(&mut app.engine, PANEL_DEBUG);
+        app.engine.dap_session_active = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let before = driver.screen();
+        assert!(
+            before.contains("Stop"),
+            "precondition: an active, unstopped debug session must paint a \
+             \"Stop\" action label; screen:\n{before}"
+        );
+
+        let (x, y) = driver.find("Stop").unwrap_or_else(|| {
+            panic!(
+                "could not find the \"Stop\" action label on screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.render();
+
+        let after = driver.screen();
+        assert!(
+            after.contains("Start Debugging"),
+            "clicking the debug sidebar's action row must route through \
+             SidebarPanelBodyLayout::status_bar_hit_regions to \
+             Engine::handle_dap_sidebar_action_click, which stops the \
+             (faked) active session and repaints \"Start Debugging\" in its \
+             place; screen:\n{after}"
         );
     }
 
@@ -9603,7 +14112,7 @@ mod tests {
         let mut app = TuiShellApp::new(None);
         app.engine.menu_bar_visible = true;
 
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
         assert!(
             screen.contains("File"),
@@ -9654,7 +14163,7 @@ mod tests {
     #[test]
     fn render_content_paints_command_center_after_menu_labels_via_shell_app() {
         let app = app_with_menu_bar_and_tab_history();
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         let screen = driver.screen();
 
         let file = driver
@@ -9692,7 +14201,7 @@ mod tests {
     #[test]
     fn command_center_click_routes_nav_and_opens_picker_via_shell_app() {
         let app = app_with_menu_bar_and_tab_history();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
 
         let back = driver.find_bounds("◀").expect("back arrow must paint");
         let fwd = driver.find_bounds("▶").expect("forward arrow must paint");
@@ -9783,7 +14292,7 @@ mod tests {
         let (search_x, search_y) = {
             let probe_driver = driver_with_shell(
                 app_with_menu_bar_and_tab_history(),
-                TuiShellApp::shell_config(true),
+                TuiShellApp::build_shell_config(true),
                 80,
                 24,
             );
@@ -9796,7 +14305,7 @@ mod tests {
         let mut app = app_with_menu_bar_and_tab_history();
 
         app.engine.menu_bar_visible = false;
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(true), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
         assert!(
             driver.find_bounds("🔍").is_none(),
             "the search-box icon must not paint once the menu bar is hidden"
@@ -9986,6 +14495,165 @@ mod tests {
         );
     }
 
+    /// #234: mouse hover over the menu bar must (a) switch the open
+    /// dropdown to whichever top-level label the pointer is over, and (b)
+    /// move the highlighted row inside that dropdown to whichever item the
+    /// pointer is over — both driven by a bare `UiEvent::MouseMoved` with no
+    /// button held, exactly what a real terminal's SGR any-motion tracking
+    /// (crossterm's `EnableMouseCapture` enables mode 1003 unconditionally)
+    /// delivers on ordinary pointer movement.
+    ///
+    /// #234 reported both as broken on TUI ("hovering over a different
+    /// top-level menu doesn't switch the dropdown"; "hovering over an entry
+    /// doesn't highlight it"), by analogy with GTK's #373/#751 fix (GTK's
+    /// own `UiEvent::MouseMoved` arm did nothing unless a button was held).
+    /// TUI's menu bar goes through a different pipe than GTK's, though:
+    /// `TuiShellApp::handle`'s `MenuSystem` intercept (`menu_bar_visible ||
+    /// menu_system.borrow().is_open()`) forwards the raw event straight to
+    /// quadraui's `MenuSystem::handle`, whose `UiEvent::MouseMoved` arm
+    /// already implements both behaviours unconditionally (`compose/
+    /// menu_system.rs`) — there is no per-backend hover code for TUI to be
+    /// missing in the first place.
+    ///
+    /// **Could not reproduce.** This test asserts on rendered output (the
+    /// dropdown's own text disappearing/appearing, plus `style_at`'s two
+    /// rows swapping which one carries the selected-row colours) and passes
+    /// against unfixed `develop` — proven not vacuous by disabling the
+    /// `MenuSystem` intercept in `TuiShellApp::handle` above (temporarily
+    /// changing its `if` to `if false &&`) during this investigation, which
+    /// turns every assertion below red (the dropdown never even opens
+    /// without the intercept forwarding `MouseDown` to `MenuSystem` either,
+    /// let alone tracks hover) — restored before committing. Kept as a
+    /// permanent regression guard; see `menu_bar_click_then_hover_switches_
+    /// and_highlights_234` below for the same behaviour through the actual
+    /// user-facing entry point (a mouse click to open, sidebar visible).
+    #[test]
+    fn menu_bar_hover_switches_menu_and_highlight_234() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.menu_bar_visible = true;
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 80, 24);
+
+        // Open File via Alt+F (`MENU_STRUCTURE`'s alt-letter shim).
+        driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Tab"),
+            "File dropdown should be open; screen:\n{screen}"
+        );
+
+        // (a) Hovering a different top-level label must switch the dropdown.
+        let edit = driver
+            .find_bounds("Edit")
+            .expect("Edit label must paint on the menu bar");
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(edit.x + edit.width / 2.0, edit.y + edit.height / 2.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Undo"),
+            "hovering Edit should open the Edit dropdown; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("New Tab"),
+            "the File dropdown should have closed once Edit took over; screen:\n{screen}"
+        );
+
+        // (b) Hovering a sibling item inside the now-open Edit dropdown must
+        // move the highlight onto it.
+        let undo = driver.find_bounds("Undo").expect("Undo item must paint");
+        let redo = driver.find_bounds("Redo").expect("Redo item must paint");
+        let undo_style_before = driver.style_at(undo.x as u16 + 1, undo.y as u16);
+        let redo_style_before = driver.style_at(redo.x as u16 + 1, redo.y as u16);
+        assert_ne!(
+            undo_style_before, redo_style_before,
+            "sanity: the selected row must already paint differently from an \
+             unselected one, otherwise this test cannot see a highlight move"
+        );
+
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(redo.x + 1.0, redo.y + 0.5),
+            buttons: quadraui::ButtonMask::default(),
+        });
+
+        assert_eq!(
+            driver.style_at(redo.x as u16 + 1, redo.y as u16),
+            undo_style_before,
+            "hovering Redo should move the selected-row style onto it"
+        );
+        assert_eq!(
+            driver.style_at(undo.x as u16 + 1, undo.y as u16),
+            redo_style_before,
+            "Undo should lose the highlight once Redo is hovered"
+        );
+    }
+
+    /// #234 companion: the same two behaviours as
+    /// `menu_bar_hover_switches_menu_and_highlight_234` above, but through
+    /// the path an actual user takes — a mouse click on "File" to open the
+    /// dropdown (not the Alt-letter shim), with the explorer sidebar
+    /// visible so the menu bar's column offsets are non-trivial (the
+    /// activity-bar + sidebar width shift every column the hit-tests below
+    /// read). Kept separate from the test above rather than folded in,
+    /// since a failure here that passes there would point specifically at
+    /// the click-open path or the sidebar-offset geometry rather than
+    /// `MenuSystem` itself.
+    #[test]
+    fn menu_bar_click_then_hover_switches_and_highlights_234() {
+        let mut app = app_with_sidebar_open();
+        app.engine.menu_bar_visible = true;
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(true), 100, 30);
+
+        let file = driver.find_bounds("File").expect("File label must paint");
+        driver.click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("New Tab"),
+            "clicking File should open its dropdown; screen:\n{screen}"
+        );
+
+        let edit = driver.find_bounds("Edit").expect("Edit label must paint");
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(edit.x + edit.width / 2.0, edit.y + edit.height / 2.0),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Undo"),
+            "hovering Edit after a click-open should switch dropdowns; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("New Tab"),
+            "the File dropdown should have closed; screen:\n{screen}"
+        );
+
+        let undo = driver.find_bounds("Undo").expect("Undo item must paint");
+        let redo = driver.find_bounds("Redo").expect("Redo item must paint");
+        let undo_style_before = driver.style_at(undo.x as u16 + 1, undo.y as u16);
+        let redo_style_before = driver.style_at(redo.x as u16 + 1, redo.y as u16);
+        driver.dispatch(quadraui::UiEvent::MouseMoved {
+            position: quadraui::Point::new(redo.x + 1.0, redo.y + 0.5),
+            buttons: quadraui::ButtonMask::default(),
+        });
+        assert_eq!(
+            driver.style_at(redo.x as u16 + 1, redo.y as u16),
+            undo_style_before,
+            "hovering Redo should move the highlight onto it"
+        );
+        assert_eq!(
+            driver.style_at(undo.x as u16 + 1, undo.y as u16),
+            redo_style_before,
+            "Undo should lose the highlight once Redo is hovered"
+        );
+    }
+
     /// The title-bar row must NOT be reserved (and nothing painted into
     /// row 0) when the menu is hidden — `shell_config(false)` is the
     /// default `TuiShellApp::new` state, so this is the same driver setup
@@ -9996,7 +14664,7 @@ mod tests {
         let app = TuiShellApp::new(None);
         assert!(!app.engine.menu_bar_visible);
 
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
         let screen = driver.screen();
         assert!(
             !screen.contains("File"),
@@ -10055,7 +14723,7 @@ mod tests {
         app.engine.buffer_mut().insert(0, "ZQXW547MARKER");
         assert!(!app.engine.menu_bar_visible);
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         let before_row = before
@@ -10121,9 +14789,21 @@ mod tests {
         );
     }
 
-    /// The *extensions* sidebar panel, likewise — its two chrome rows (the
-    /// header and the search box) were a local raw-`set_cell` `write_row`
-    /// closure that #605 collapsed into `panels::fill_row`.
+    /// The *extensions* sidebar panel, likewise — its search-box row was a
+    /// local raw-`set_cell` `write_row` closure that #605 collapsed into
+    /// `panels::fill_row`.
+    ///
+    /// #1343: this used to also assert a literal `" EXTENSIONS"` header row
+    /// `render_ext_sidebar` hand-painted on top of the shell's own — exactly
+    /// the double-header #1256 found. That row is deleted now; the shell
+    /// (`AppShell`) owns the *one* header, and this local `config()` fixture
+    /// (unlike `TuiShellApp::build_shell_config`) never registers Extensions
+    /// as a panel, so its header wouldn't reach "Extensions" either. What
+    /// this test actually needs to prove is unchanged — `render_content`
+    /// paints the marketplace body — so it asserts on that instead
+    /// (`issue_1256_sidebar_chrome::extensions_header_is_painted` in
+    /// `harness.rs` covers the real shell-header text, through the
+    /// production `shell_config`).
     #[test]
     fn render_content_paints_extensions_panel_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -10134,8 +14814,8 @@ mod tests {
         let driver = driver_with_shell(app, config(), 80, 24);
         let screen = driver.screen();
         assert!(
-            screen.contains("EXTENSIONS"),
-            "extensions panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+            screen.contains("INSTALLED") && screen.contains("AVAILABLE"),
+            "extensions panel body should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
     }
 
@@ -10186,6 +14866,618 @@ mod tests {
         assert!(
             screen.contains("AI ASSISTANT"),
             "AI panel chrome should paint via TuiShellApp::render_content; screen:\n{screen}"
+        );
+    }
+
+    /// Install a mock board provider — an installed extension whose
+    /// manifest declares `[board]` (#522's seam). No coordinator (or any
+    /// other specific provider) anywhere in this test, per #521's "generic
+    /// host" scope.
+    fn install_mock_board_provider(engine: &mut Engine) {
+        let mut manifest = crate::core::extensions::ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        manifest.board = Some(crate::core::extensions::BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions: Default::default(),
+            ..Default::default()
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+    }
+
+    fn mock_board_model() -> quadraui::BoardModel {
+        quadraui::BoardModel {
+            id: quadraui::WidgetId::new("board"),
+            columns: vec![quadraui::BoardColumn {
+                id: quadraui::WidgetId::new("col:backlog"),
+                title: "Backlog".to_string(),
+                cards: vec![quadraui::BoardCard {
+                    id: quadraui::WidgetId::new("card:1"),
+                    title: "Improve board host".to_string(),
+                    labels: vec![],
+                    badges: vec![],
+                    hint: None,
+                }],
+                scroll_offset: 0,
+            }],
+            selected_card_id: Some(quadraui::WidgetId::new("card:1")),
+            col_scroll_offset: 0,
+        }
+    }
+
+    /// #521 Phase 0 acceptance: selecting Board renders a board sourced from
+    /// a mock provider — proving the generic host works with no coordinator
+    /// present anywhere. Asserts on the rendered screen text (`ratatui`
+    /// buffer contents via `Backend::draw_board`), not on `board_model`
+    /// being populated (#587/#592's lesson: state populated is not evidence
+    /// of paint).
+    #[test]
+    fn render_content_paints_board_panel_from_mock_provider_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Improve board host"),
+            "Board panel should paint the mock provider's card via \
+             TuiShellApp::render_content; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Backlog"),
+            "the column header should paint too; screen:\n{screen}"
+        );
+    }
+
+    /// With no provider configured at all, the generic host says so rather
+    /// than implying a missing coordinator (design doc §7).
+    #[test]
+    fn render_content_paints_board_panel_no_provider_status_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        // The default sidebar width truncates the full sentence — assert on
+        // the prefix that survives, which is enough to tell "no provider"
+        // apart from a stale/empty board.
+        assert!(screen.contains("No board provider"), "screen:\n{screen}");
+    }
+
+    /// Clicking a card selects it (#521 Phase 0: "Key/click -> BoardAction;
+    /// only selection/open are handled"). `driver.app()` returns an opaque
+    /// `impl AppLogic` on TUI (no accessor back to the concrete
+    /// `TuiShellApp`/`Engine`, see `Self::composed_frame`'s doc), so this
+    /// probes the *rasterised* effect instead: the TUI board rasteriser
+    /// paints the selected card's body with `theme.board_selected_card_bg`
+    /// (`quadraui::tui::board::draw_board`) — a real style change a user
+    /// would see, not `Engine::board_model` being populated (#587/#592).
+    #[test]
+    fn board_panel_click_selects_the_clicked_card_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        let mut model = mock_board_model();
+        model.columns[0].cards.push(quadraui::BoardCard {
+            id: quadraui::WidgetId::new("card:2"),
+            title: "Second card".to_string(),
+            labels: vec![],
+            badges: vec![],
+            hint: None,
+        });
+        model.selected_card_id = Some(quadraui::WidgetId::new("card:1"));
+        app.engine.board_model = Some(model);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let (row, col) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| l.find("Second card").map(|c| (i, c)))
+            .unwrap_or_else(|| panic!("'Second card' must be painted; screen:\n{screen}"));
+        let before = driver.style_at(col as u16, row as u16);
+
+        driver.click(col as f32 + 1.0, row as f32);
+
+        let after = driver.style_at(col as u16, row as u16);
+        assert_ne!(
+            before.map(|s| s.bg),
+            after.map(|s| s.bg),
+            "clicking 'Second card' must repaint it as selected \
+             (a background change), before: {before:?}, after: {after:?}"
+        );
+    }
+
+    /// #524 Track A Phase 1 (review-requested driver coverage): `OpenIssue`
+    /// with a `[document]` provider configured opens an editable markdown
+    /// buffer in a new tab — asserted on the *rendered* screen, not on
+    /// `Engine::tool_document`/buffer state being populated (#587/#592's
+    /// lesson: state populated is not evidence of paint). Drives the real
+    /// key path (`Enter` on the selected board card ->
+    /// `quadraui::BoardModel::handle_key` -> `Engine::apply_board_action` ->
+    /// `Engine::open_tool_document` -> a new buffer/tab) through
+    /// `TuiDriver`, exactly the way a user would trigger it — mirroring
+    /// `board_panel_click_selects_the_clicked_card_via_shell_app`'s
+    /// no-coordinator-anywhere pattern, with a `[document]` provider layered
+    /// onto the same mock extension manifest a `[board]` provider already
+    /// installed (#522: one manifest can declare both).
+    #[test]
+    fn board_open_issue_paints_document_buffer_tab_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].document = Some(crate::core::extensions::DocumentProviderConfig {
+                read_command: vec!["mock".to_string(), "show".to_string(), "{id}".to_string()],
+                write_command: vec!["mock".to_string(), "write".to_string(), "{id}".to_string()],
+                write_follow_up: vec![],
+            });
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .set_document_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({
+                    "title": "Improve board host, in full",
+                    "body": "Full body seeded from the mock provider.\n",
+                }),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Board,
+            "precondition: the Board panel must own the keyboard"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Improve board host, in full"),
+            "Enter on the selected card should paint a new tab with the \
+             seeded document title, not just set a status message; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #525 review-requested driver coverage: pressing `R` on a selected
+    /// board card with a `[board]` provider's `"OpenReview"` action
+    /// configured resolves a **real local git branch** to a diff and opens
+    /// it as the shared change-review surface (#955) — asserted on the
+    /// *rendered* screen, not on `Engine::change_review` being `Some`
+    /// (#587/#592's lesson: state populated is not evidence of paint).
+    /// Drives the real key path exactly the way a user would trigger it:
+    /// `R` -> `TuiShellApp::handle` -> `render::dispatch_sidebar_panel_key`
+    /// -> `Engine::dispatch_board_key_unified` ->
+    /// `Engine::apply_board_action(OpenReview)` -> the mock provider's
+    /// `"OpenReview"` command -> `Engine::open_branch_review` -> a real
+    /// `git diff --name-only` against a temp repo ->
+    /// `Engine::open_change_review`.
+    ///
+    /// RED verified: before `apply_board_action` handled
+    /// `BoardAction::OpenReview` (and before the host-level `R` key was
+    /// wired into `dispatch_board_key_unified`), pressing `R` here left the
+    /// Board panel on screen with no diff ever painted — this test failed
+    /// exactly that way (screen missing the reviewed file's name) against
+    /// the pre-#525 code.
+    #[test]
+    fn board_review_key_paints_branch_diff_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({"branch": "feature", "base": base}),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Board,
+            "precondition: the Board panel must own the keyboard"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new_from_branch.rs"),
+            "pressing R on the selected card should resolve the card to a \
+             branch and paint a real multi-file diff for it via the \
+             shared change-review surface, not just set a status message; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #528 Track A Phase 3 ("push human review edits back to the
+    /// branch"): once `R` opens a branch review, the diff surface's footer
+    /// must name which branch is under review — the "must know they are
+    /// editing the agent's branch, not their own checkout" footgun the
+    /// issue calls out as the main risk. Asserted on the *rendered*
+    /// screen, not on `Engine::review_target` being `Some` (#587/#592's
+    /// lesson: state populated is not evidence of paint). A wide terminal
+    /// avoids the status-bar-truncation ambiguity a real temp-dir-path
+    /// segment would otherwise hit at 80 columns.
+    ///
+    /// RED verified: with `render::paint_change_review_rung`'s provenance
+    /// segment removed (reverting to the pre-#528 `right_segments: vec![]`
+    /// literal), this test fails — the screen shows the diff but never the
+    /// reviewed branch name.
+    #[test]
+    fn board_review_footer_paints_branch_provenance_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-provenance-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({"branch": "feature", "base": base}),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        // Wide terminal: the footer's provenance segment carries a real
+        // temp-dir path, and this test cares whether the branch name
+        // painted at all, not how a narrow terminal would truncate it.
+        let mut driver = driver_with_shell(app, config(), 240, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("reviewing branch 'feature'"),
+            "the diff surface footer must show which branch is under \
+             review, so a human editing files here can tell this isn't \
+             their own checkout; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #530 (Track A Phase 5, the fleet review seat): when the provider's
+    /// `"OpenReview"` response names a `host` (a fleet roster spans more
+    /// than one worker machine), the footer must paint *which machine*
+    /// alongside the branch/worktree — "which worktree" alone stops being
+    /// enough provenance once vimcode itself can be the process running
+    /// on that worker box (vimcode-over-ssh), not just a local pull.
+    ///
+    /// RED verified: with `host` dropped from
+    /// `branch_review_provenance_segment`'s formatted text (reverting to
+    /// the pre-#530 single-format line), this test fails — the screen
+    /// still shows the branch but never the machine name.
+    #[test]
+    fn board_review_footer_paints_host_provenance_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-host-provenance-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({
+                    "branch": "feature",
+                    "base": base,
+                    "host": "worker-3.fleet.local",
+                }),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 240, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("reviewing branch 'feature'")
+                && screen.contains("worker-3.fleet.local"),
+            "the diff surface footer must name which fleet machine this \
+             worktree lives on, not just the branch/path; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #523 acceptance: right-clicking a card lists the provider-declared
+    /// actions valid for its stage in a real context menu, driven through
+    /// the actual right-click event path (`mouse::handle_mouse`'s
+    /// `SidebarOwner::Board` right-click arm ->
+    /// `Engine::open_board_context_menu`), not by poking
+    /// `Engine::context_menu` directly. Asserted on the *painted* menu
+    /// (`ContextMenuPanel`'s rung), not on `Engine::context_menu.is_some()`
+    /// (#587/#592's lesson).
+    #[test]
+    fn board_right_click_opens_context_menu_with_provider_actions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let (x, y) = driver
+            .find("Improve board host")
+            .expect("the mock card must be painted before it can be right-clicked");
+        driver.right_click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Assign"),
+            "right-clicking a card should open a context menu listing the \
+             provider's declared action for its stage; screen:\n{screen}"
+        );
+    }
+
+    /// #523 acceptance, continued: confirming a menu item (Enter — the
+    /// generic context-menu key route `render::route_modal_key` gives
+    /// priority over every focus-owner route, so this works with no board
+    /// focus set) dispatches the provider's argv (`{id}` substituted) and
+    /// surfaces the result to the status line, then a background refresh is
+    /// kicked off. Proven end-to-end with a mock provider — no coordinator
+    /// (or any other specific provider) anywhere, per #521/#522/#523's
+    /// "generic host" scope. `driver.tick()` (via `poll_until_screen`) is
+    /// what actually reaches `Engine::poll_idle` -> `poll_board_action`,
+    /// exactly as the live event loop does.
+    #[test]
+    fn board_context_menu_action_dispatches_provider_command_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        let recorder = crate::core::tool_client::RecordingToolClient::default();
+        app.engine.set_board_client_for_test(recorder.clone());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let (x, y) = driver
+            .find("Improve board host")
+            .expect("the mock card must be painted before it can be right-clicked");
+        driver.right_click(x, y);
+        assert!(
+            driver.screen().contains("Assign"),
+            "precondition: the context menu must be open"
+        );
+
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let surfaced = poll_until_screen(&mut driver, Duration::from_secs(2), |s| {
+            s.contains("'Assign'")
+        });
+        assert!(
+            surfaced,
+            "the dispatched action's result must be surfaced to the status \
+             line, not just recorded internally; screen:\n{}",
+            driver.screen()
+        );
+
+        // Two calls land on the recorder: the action dispatch itself, plus
+        // the `board_refresh()` `poll_board_action` triggers afterward
+        // (#523's "board refreshed on next poll") — both go through the
+        // same `Engine::board_client`, so this asserts the dispatch call
+        // specifically rather than assuming it's the only one.
+        let calls = recorder.calls();
+        assert!(
+            calls.iter().any(|c| c.argv
+                == vec![
+                    "mock".to_string(),
+                    "assign".to_string(),
+                    "card:1".to_string()
+                ]),
+            "'{{id}}' must be substituted with the acted-on card's id; calls: {calls:?}"
         );
     }
 
@@ -10322,6 +15614,1478 @@ mod tests {
         );
     }
 
+    /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
+    /// the AI panel transcript incrementally through the real
+    /// `TuiShellApp`/`TuiDriver` stack — `Ctrl+S` submits, `driver.tick()`
+    /// drives `Engine::poll_idle` -> `poll_acp` exactly as the live TUI
+    /// event loop does, and the fixture's `agent_thought_chunk` +
+    /// two `agent_message_chunk`s must land as two visually distinct
+    /// transcript turns (thought under quadraui's `System` role label,
+    /// message under `AI`) once the turn completes.
+    ///
+    /// The agent subprocess is pre-spawned with `ACP_FAKE_NO_TOOL_REQUEST`
+    /// (via `AcpClient::spawn_with_env`, unreachable through
+    /// `settings.acp_agent_command` alone, which only offers plain
+    /// `AcpClient::spawn`) so the turn completes without needing the fs/*
+    /// bridge — a later ACP slice, out of ACP-1's scope — while still
+    /// exercising the exact same `poll_acp` session/prompt/session-update
+    /// path a real agent reply would drive `ai_send_message`'s "reuse an
+    /// already-running client" branch through.
+    ///
+    /// **RED verified**: before the `update.get("update")` unwrap fix in
+    /// `Engine::poll_acp`'s `SessionUpdate` arm (the handler read
+    /// `sessionUpdate`/`content.text` off the wrong JSON level — the whole
+    /// `session/update` `params` object, not its nested `update` field),
+    /// this test failed with the transcript stuck at only the just-typed
+    /// user turn: neither "pondering the question" nor "Hello world" ever
+    /// appeared, because `session_update_chunk` silently returned `None`
+    /// for every chunk (wrong nesting level, not a wrong field name) and
+    /// `ai_streaming` still cleared on `PromptStopped`. That is exactly the
+    /// "streamed chunks silently vanish, panel still looks done" failure
+    /// shape this test exists to catch.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_streams_acp_thought_and_message_chunks_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Only needs to be non-empty: routing checks emptiness to pick the
+        // transport, but the client above already exists, so
+        // `ai_send_message` takes the "reuse existing client" branch, never
+        // reading this value to spawn anything.
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello agent"),
+            "the submitted user turn must appear immediately; screen:\n{screen}"
+        );
+
+        // Drive real ticks until the streamed turn completes, bounded like
+        // `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+        // above (a background thread there, a real subprocess here — same
+        // "don't busy-loop, don't hang the suite" tradeoff).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Hello world"),
+            "the two agent_message_chunk notifications must stream into the \
+             transcript within 5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("pondering the question"),
+            "the agent_thought_chunk must also reach the transcript, not be \
+             dropped as an unrecognized update kind; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("System"),
+            "the thought turn renders under ChatRole::System -- a role \
+             header distinct from the message turn's \"AI\" label, per \
+             ACP-1's \"thought chunks visually distinct from message \
+             chunks\" acceptance criterion; screen:\n{screen}"
+        );
+    }
+
+    /// #953 (ACP-2): `session/request_permission` — the human-in-the-loop
+    /// tool-call approval chokepoint — through the real `TuiShellApp`/
+    /// `TuiDriver` stack. The dialog must actually paint the agent's own
+    /// `toolCall` title/kind/location (not just flip some internal flag —
+    /// "a permission prompt with no visible target is not a decision, it
+    /// is a rubber stamp"), and pressing the "Allow Once" button's hotkey
+    /// must reply with that option's id and let the parked turn resume to
+    /// completion.
+    ///
+    /// RED verified: with the `"acp_permission"` arm of
+    /// `Engine::process_dialog_result` reverted to the default no-op, this
+    /// test times out waiting for "Hello world" to reach the transcript —
+    /// the fixture stays blocked on its `read -r _reply` forever because
+    /// nothing ever answers `respond_to_client_request`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Edit src/main.rs") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Edit src/main.rs"),
+            "the permission dialog must paint the tool call's title within \
+             5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("edit"),
+            "the tool call's kind must be visible so a human has something \
+             to decide on; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("src/main.rs:42"),
+            "the tool call's location (path + line) must be visible; \
+             screen:\n{screen}"
+        );
+        // Button labels paint with their hotkey letter bracketed
+        // (`[A]llow Once`), per this dialog widget's convention — not a
+        // rendering detail specific to this test. "Allow Once" and "Always
+        // Allow" both start with 'a'; `acp_handle_permission_request`
+        // de-duplicates hotkeys across a dialog's own buttons (#953
+        // review), so "Always Allow"'s bracketed letter lands on its next
+        // unclaimed 'l' (`A[L]ways Allow`) rather than colliding with
+        // "Allow Once"'s `[A]`.
+        assert!(
+            screen.contains("llow Once")
+                && screen.contains("A[L]ways Allow")
+                && screen.contains("eject"),
+            "the agent's own options must be presented verbatim, not a \
+             hardcoded yes/no, and each hotkey must be unique within the \
+             dialog; screen:\n{screen}"
+        );
+        // The panel's busy spinner ("AI ASSISTANT  (thinking…)",
+        // `render.rs`) must still be up here — the turn is genuinely
+        // parked on the dialog, not already finished. Asserting the
+        // *disappearance* of this same marker below (rather than
+        // re-checking "Hello world", which the fixture already streamed
+        // into the transcript **before** ever asking for permission) is
+        // what makes the post-click assertion non-vacuous: "Hello world"
+        // would stay on screen even if the reply were silently never sent.
+        assert!(
+            screen.contains("(thinking"),
+            "the panel must still be busy while the permission dialog is \
+             open, or the completion check below would pass trivially; \
+             screen:\n{screen}"
+        );
+
+        // "Allow Once" is the dialog's first button and 'a' is its hotkey —
+        // unambiguous (`handle_dialog_key` matches buttons in order, and it
+        // is index 0).
+        driver.type_char('a');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while screen.contains("(thinking") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            !screen.contains("(thinking"),
+            "the reply must actually reach the (fake) agent and let the \
+             turn resume to completion (busy spinner cleared) within 5s; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Edit src/main.rs"),
+            "the dialog must be gone once answered; screen:\n{screen}"
+        );
+    }
+
+    /// #952 (ACP-1) acceptance: "Agent binary missing from PATH -> a clear,
+    /// actionable panel message, not a crash and not a silent empty panel."
+    /// `settings.acp_agent_command` pointing at a program that doesn't exist
+    /// must surface *in the transcript itself* (not just the status line,
+    /// which a user watching the panel might not be looking at), and must
+    /// not panic the process.
+    #[test]
+    fn ai_panel_shows_actionable_message_when_agent_binary_is_missing_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        // No hyphens/spaces: the transcript word-wraps at ~28 columns in an
+        // 80-col frame (the sidebar is a fraction of the width), and a
+        // single unbroken token is the only shape guaranteed to survive
+        // that wrap intact for a `screen.contains` check — a hyphenated
+        // name here would (and did, in an earlier draft of this test) get
+        // split mid-word across two wrapped rows, which is a rendering
+        // detail of the panel's text wrapping, not a bug in the message
+        // itself.
+        app.engine.settings.acp_agent_command = "nosuchagentbinary952".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Could not start ACP agent"),
+            "the panel must say why, not just that something went wrong; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("nosuchagentbinary952"),
+            "the panel must name the agent command it failed to start; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.trim().is_empty(),
+            "a failed agent start must not leave a silently empty panel"
+        );
+    }
+
+    /// #958 (ACP-7) acceptance: a second, differently-configured
+    /// `settings.acp_agents` entry completes its own independent session,
+    /// and `:AiAgent <name>` (the real ex-command path, typed through the
+    /// command line — not a direct `Engine::acp_switch_agent` call) hands
+    /// the *next* message to the newly-active profile without restarting
+    /// vimcode. Both registry entries spawn the exact same
+    /// `fake_acp_agent.sh` binary — only their `env` entry
+    /// (`ACP_FAKE_AGENT_LABEL`) differs — proving "a second agent" is a
+    /// config fact flowing through one generic spawn path, not a Rust
+    /// branch on agent identity.
+    ///
+    /// RED verified: pinning `Engine::acp_resolve_agent_launch` to always
+    /// return `settings.acp_agents[0]` (ignoring `acp_active_agent`
+    /// entirely, as an earlier draft of this slice did) makes this fail —
+    /// the second `:AI` send still greets as `Hello_AlphaTag958` after
+    /// `:AiAgent beta`, because the switch never reaches the spawn call.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_switches_between_registered_agents_via_ai_agent_command_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![
+            crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
+                ],
+            },
+            crate::core::acp::AcpAgentProfile {
+                name: "beta".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
+                ],
+            },
+        ];
+        app.engine.settings.acp_active_agent = "alpha".to_string();
+
+        // Never sets `ai_has_focus`/sidebar focus, so `:` reaches the
+        // normal-mode command line (`route_focus_key` falls through to
+        // `FocusKeyRoute::None`) rather than being typed as literal chat
+        // input — the same reasoning `count_before_colon_prefills_range_
+        // via_shell_app` above relies on.
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "AI hi".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_AlphaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_AlphaTag958"),
+            "the initially-active agent (alpha) must reply within 5s; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AiAgent beta".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        driver.type_char(':');
+        for c in "AI hi again".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_BetaTag958") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_BetaTag958"),
+            "after `:AiAgent beta`, the next message must be answered by \
+             the beta profile within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("AlphaTag958"),
+            "switching agents ends the old session -- the new agent's \
+             transcript must not still show the previous agent's reply; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
+    /// **dirty** buffer's unsaved in-memory content, not stale on-disk
+    /// text — the single most important correctness property in the
+    /// slice, per the issue's own framing (an agent reasoning over stale
+    /// text proposes edits against lines the user already changed). Uses
+    /// the fixture's `ACP_FAKE_FS_READ_PATH` branch (see its own doc
+    /// comment), which echoes back whatever `fs/read_text_file` returned
+    /// as a transcript chunk — so this reads the answer off the rendered
+    /// screen through the real `TuiShellApp`/`TuiDriver` stack, exactly
+    /// like `ai_panel_streams_acp_thought_and_message_chunks_via_shell_app`
+    /// above does for `session/update` chunks.
+    ///
+    /// RED verified: reverting `Engine::acp_read_text_file` to always
+    /// `std::fs::read_to_string` (skipping the buffer-first lookup) makes
+    /// this fail — the screen shows `"read:on disk"` instead of
+    /// `"read:DIRTYMARKER123"`.
+    #[cfg(unix)]
+    #[test]
+    fn fs_read_text_file_serves_dirty_buffer_content_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp3-tui-read-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("dirty.txt");
+        std::fs::write(&file_path, "on disk").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let buffer_id = app
+            .engine
+            .buffer_manager
+            .open_file(&file_path)
+            .expect("should open");
+        {
+            let state = app.engine.buffer_manager.get_mut(buffer_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "DIRTYMARKER123");
+            state.dirty = true;
+        }
+
+        let path_str = file_path.to_string_lossy().into_owned();
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please read".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("read:DIRTYMARKER123") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("read:DIRTYMARKER123"),
+            "the agent's fs/read_text_file reply must carry the dirty \
+             buffer's unsaved content within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("read:on disk"),
+            "must never serve stale on-disk content for an open, dirty \
+             buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #956 (ACP-5) acceptance: "Two successive `plan` updates leave
+    /// **exactly one** plan rendered, reflecting the second." The fixture's
+    /// `ACP_FAKE_PLAN` branch emits two back-to-back `plan` updates for one
+    /// `session/prompt` turn — the first marks "Write the fix" in_progress,
+    /// the second (a full replacement) marks it completed and adds a new
+    /// "Add tests" entry — plus an `available_commands_update` and a
+    /// `usage_update`, all exercised here through the real `TuiShellApp`/
+    /// `TuiDriver` stack.
+    ///
+    /// RED verified: changing `Engine::acp_handle_session_update`'s
+    /// `self.acp_plan = entries` to `self.acp_plan.extend(entries)` (the
+    /// append-only bug #956 explicitly calls out as "the single most common
+    /// way to get this wrong") makes the "exactly one occurrence" assertion
+    /// below fail — "Write the fix" then appears twice (once in_progress
+    /// from the first update, once completed from the second) instead of
+    /// once.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_plan_update_fully_replaces_not_accumulates_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Add tests") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("Add tests"),
+            "the second plan update's new entry must render within 5s; \
+             screen:\n{screen}"
+        );
+        assert_eq!(
+            screen.matches("Write the fix").count(),
+            1,
+            "two successive plan updates must leave exactly one rendering \
+             of a step present in both, not one per update; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("\u{2611} Write the fix"),
+            "the rendered checklist must reflect the SECOND update's status \
+             (completed), not the first's (in_progress); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Write the fix (in progress)"),
+            "the stale in_progress state from the first update must not \
+             survive; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("120+45 tok"),
+            "usage_update telemetry must render in the status header \
+             (the cost figure may be truncated by the narrow sidebar column \
+             here; `format_usage_summary`'s own unit tests cover the full \
+             string); screen:\n{screen}"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a tool call's transcript summary shows `title` +
+    /// `kind`, and its status glyph reflects the LAST `tool_call_update`
+    /// (`completed`, per the fixture's `ACP_FAKE_TOOL_CALL_STATUS_ONLY`
+    /// branch — no `diff` content here, so the change-review surface never
+    /// opens and covers the transcript; see the next test for that path).
+    ///
+    /// RED verified: with `Engine::acp_apply_tool_call_update`'s status
+    /// assignment commented out, the screen never shows `"[x] execute:"`
+    /// (it stays stuck on `"[ ]"`, the initial `tool_call` announcement's
+    /// `pending` status) within the deadline — this failed exactly that
+    /// way before the status transition was wired up.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_status_transitions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please run tests".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("[x] execute:") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("[x] execute: Run the tests"),
+            "the tool call's LAST status update (completed) must be the \
+             one rendered, together with its title and kind; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("[ ] execute:") && !screen.contains("[~] execute:"),
+            "only the final status should be visible once the turn has \
+             ended, not a stale pending/in_progress rendering; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #955 (ACP-4) acceptance, end to end through the real `TuiShellApp`/
+    /// `TuiDriver` stack: a `diff` content block on a `tool_call_update`
+    /// opens the change-review surface with both `oldText` and `newText`
+    /// painted (a real `quadraui::DiffView`, not just engine state — see
+    /// this crate's `CLAUDE.md` "rendered output, not state" rule), and
+    /// pressing `a` (accept) writes `newText` to the real file and closes
+    /// the surface. The surface being full-viewport is why the AI panel's
+    /// own transcript ("[x] edit: ...") is not asserted here — it is
+    /// genuinely covered, which the previous test already covers on its
+    /// own scenario.
+    ///
+    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
+    /// from `acp_apply_tool_call_update`, the screen never shows
+    /// `"old line"`/`"new line"` and the accept keypress has nothing to
+    /// act on, so the file on disk is never rewritten — this failed
+    /// exactly that way (screen missing the diff text, file unchanged)
+    /// before the `diff` block was wired to the review surface.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp4-tui-tool-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            screen.contains("old line"),
+            "the change-review surface must paint the diff's oldText; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("new line"),
+            "the change-review surface must paint the diff's newText; \
+             screen:\n{screen}"
+        );
+
+        // Accept the change: 'a' while the surface is open.
+        driver.type_char('a');
+        driver.tick();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
+            && Instant::now() < deadline
+        {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "accepting the change must write newText to the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 (ACP-4) review follow-up: "clicking a `location` jumps to that
+    /// file and line" driven through a *real mouse click* against the
+    /// painted diff geometry — `driver.click(x, y)` on the row `driver.find`
+    /// locates, not `handle_change_review_key("Return", ...)` (that path is
+    /// already covered by `core::engine::review_ops`'s unit test). This is
+    /// the paint↔hit-test path the review flagged as untested: TUI's
+    /// `mouse::handle_mouse` → `render::route_change_review_click` →
+    /// `Engine::change_review_jump_to_hit`, resolved against the *exact*
+    /// `diff_rect`/`line_height` `render::paint_change_review_rung` last
+    /// cached on `Engine::change_review_diff_rect`.
+    ///
+    /// The click closes the full-viewport change-review surface (see
+    /// `change_review_jump_to_hit`'s doc comment — the jump would be
+    /// invisible otherwise, since the diff would just paint right back
+    /// over the buffer it switched to), so the assertion is: the diff's
+    /// `oldText`/`newText` markers are gone and the real on-disk file
+    /// content is what's on screen instead — the file was never accepted,
+    /// so seeing its real ("old line") content, not the proposed
+    /// ("new line") one, confirms the click jumped to the buffer rather
+    /// than accepting the change.
+    ///
+    /// RED verified: before `route_and_apply_change_review_click`/
+    /// `mouse::handle_mouse`'s change-review branch existed, a click at
+    /// this exact geometry fell through to the ordinary editor mouse
+    /// handling underneath the (still-open) full-viewport overlay, so the
+    /// screen kept showing "old line"/"new line" (the diff, unclosed) and
+    /// never showed the tab bar for `target.txt` — this failed exactly
+    /// that way before the click routing was wired.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_via_shell_app() {
+        let dir =
+            std::env::temp_dir().join(format!("acp4-tui-tool-call-click-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "precondition: change-review surface must be open with both \
+             sides of the diff painted before the click; screen:\n{screen}"
+        );
+
+        // A real mouse click on the painted "old line" row — the exact
+        // geometry `mouse::handle_mouse`'s change-review branch resolves
+        // through `render::route_change_review_click`.
+        let (x, y) = driver.find("old line").unwrap_or_else(|| {
+            panic!("diff row 'old line' must be locatable on screen; screen:\n{screen}")
+        });
+        driver.click(x, y);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut screen = driver.screen();
+        while screen.contains("a=accept") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+
+        assert!(
+            !screen.contains("a=accept"),
+            "clicking a diff row must close the change-review surface \
+             (jump, not accept); screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("new line"),
+            "the surface must be gone — 'new line' (the proposed text) \
+             must no longer paint anywhere on screen; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("target.txt"),
+            "the click must have opened target.txt's own tab, proving the \
+             jump landed on the right file; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("old line"),
+            "the buffer shown after the jump must be target.txt's real, \
+             unmodified on-disk content ('old line'), not the proposed \
+             ('new line') text — confirming this was a jump, not an \
+             accept; screen:\n{screen}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old line\n",
+            "a click-to-jump must never write to the file — that's \
+             accept's job, not jump's"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #955 review regression guard: once the change-review surface
+    /// **closes**, its full-viewport `quadraui::ModalStack` entry must be
+    /// gone, so ordinary shell chrome (activity bar, sidebar, menu bar)
+    /// keeps receiving clicks.
+    ///
+    /// Why this is worth its own test: `ShellAdapter::handle` consults
+    /// `ModalStack::hit_test` *before* any chrome dispatch, and the entry
+    /// this surface registers covers the entire viewport. A stuck entry is
+    /// therefore not a cosmetic defect — every subsequent mouse event for
+    /// the rest of the session is routed straight into
+    /// `TuiShellApp::handle` instead of `AppShell`'s own handling, so the
+    /// activity bar silently stops switching panels, the sidebar stops
+    /// resizing, and so on. The symptom shows up nowhere near the
+    /// change-review code, which is exactly why it needs to be asserted
+    /// here.
+    ///
+    /// RED verified: with the pop moved back into an `else` arm inside the
+    /// frame walk's `FrameOp::ChangeReview` match (where
+    /// `presence.change_review` gates the whole rung out of
+    /// `render::compose_frame`'s op list the moment the surface closes, so
+    /// the `else` is unreachable), the final Search-icon click below
+    /// leaves the Explorer panel up and "Replace…" never paints.
+    ///
+    /// The surface is opened from a plain `ChangeReviewState::new(vec![
+    /// ProposedChange { .. }])` — the source-agnostic constructor, no ACP
+    /// involved — and closed through the real click-to-jump path
+    /// (`driver.click` on a painted diff row), the close path the review
+    /// finding named.
+    #[test]
+    fn change_review_close_restores_chrome_clicks_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_955_review_modal_pop_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("zqxw955.txt");
+        std::fs::write(&target, "old line\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&target);
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: target.to_string_lossy().into_owned(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.set_double_click_folding(false);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted from the source-agnostic change list; screen:\n{screen}"
+        );
+
+        // Close it the way a user would: click a diff row to jump.
+        let (x, y) = driver
+            .find("old line")
+            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable; screen:\n{screen}"));
+        driver.click(x, y);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            !driver.screen_contains("a=accept"),
+            "precondition: clicking a diff row must have closed the \
+             change-review surface; screen:\n{}",
+            driver.screen()
+        );
+
+        // The regression: with the surface closed, a click on the Search
+        // icon must still reach `AppShell`'s activity-bar dispatch.
+        let (sx, sy) = driver
+            .find(crate::icons::SEARCH.s())
+            .unwrap_or_else(|| panic!("Search icon must paint; screen:\n{}", driver.screen()));
+        driver.click(sx, sy);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("Replace…"),
+            "after the change-review surface closed, an activity-bar click \
+             must still switch panels — a leftover full-viewport ModalStack \
+             entry routes it past AppShell's chrome dispatch entirely; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #527 acceptance: "Comments anchor to lines, render inline, survive
+    /// scrolling, and appear in the submitted body." Drives the real key
+    /// path end to end: `c` opens the one-line comment dialog (`Engine::
+    /// change_review_start_comment`), typing + Enter saves it (`Dialog`'s
+    /// existing text-input handling -> `process_dialog_result`'s
+    /// `"review_comment"` arm), and the comment text must then be visible
+    /// *painted into the diff row itself* — not merely present in
+    /// `Engine::change_review.comments` (#587/#592's lesson: state
+    /// populated is not evidence of paint). Navigating away to a second
+    /// file and back (the same `Tab`/`p` keys `tab_and_n_advance_to_the_
+    /// next_file` already covers) proves the comment is re-derived from
+    /// `(file, line)` on every paint rather than pinned to a row index
+    /// that would drift or vanish once the surface's `current` entry
+    /// changes — the "survive scrolling"/navigation half of the
+    /// acceptance bar. `d` then deletes it, and the surface goes back to
+    /// painting exactly what it did before `c` was ever pressed.
+    ///
+    /// RED verified: with `paint_change_review_rung`'s
+    /// `view_with_inline_comments` call reverted to painting `&entry.view`
+    /// directly (the pre-#527 line), this test fails at the first
+    /// "comment must be painted inline" assertion — the pinned comment
+    /// exists in `Engine::change_review.comments` but nothing on screen
+    /// ever shows it.
+    #[test]
+    fn change_review_c_key_pins_and_paints_an_inline_comment_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "first.rs".to_string(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+            crate::core::review::ProposedChange {
+                path: "second.rs".to_string(),
+                old_text: Some("second old\n".to_string()),
+                new_text: "second new\n".to_string(),
+            },
+        ]));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line") && !screen.contains("a design nit here"),
+            "precondition: the first file's diff is painted with no \
+             comment yet; screen:\n{screen}"
+        );
+
+        // `c`: open the comment dialog on the current (first) row.
+        driver.type_char('c');
+        driver.render();
+        assert!(
+            driver.screen_contains("Add comment"),
+            "'c' must open a comment dialog; screen:\n{}",
+            driver.screen()
+        );
+
+        for ch in "a design nit here".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Add comment"),
+            "Enter must dismiss the dialog; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("a design nit here"),
+            "the pinned comment must be painted inline into the diff row, \
+             not just recorded in state; screen:\n{screen}"
+        );
+
+        // Navigate away to the second file and back — the comment must
+        // still paint on the first file's row, not follow the row index
+        // or disappear.
+        driver.type_char('n');
+        driver.render();
+        assert!(
+            driver.screen_contains("second new") && !driver.screen_contains("a design nit here"),
+            "switching files must show the second file's diff, with no \
+             leftover comment text from the first file; screen:\n{}",
+            driver.screen()
+        );
+        driver.type_char('p');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line") && screen.contains("a design nit here"),
+            "returning to the first file must still show its pinned \
+             comment, re-derived by (file, line) rather than a stale row \
+             index; screen:\n{screen}"
+        );
+
+        // `d`: delete the comment on the current line.
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            !driver.screen_contains("a design nit here"),
+            "'d' must remove the pinned comment from the painted diff; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #526 acceptance: pressing `A` on an open change-review surface that
+    /// was opened for a board card closes the diff (same as Esc) and opens
+    /// a verdict-composer buffer bound to that card — asserted on the
+    /// *rendered* screen (the diff content disappearing, the new tab's
+    /// name painting), not on `Engine::review_verdict`/`change_review`
+    /// state being flipped (#587/#592's lesson: state populated is not
+    /// evidence of paint). Drives the real key path exactly the way a user
+    /// would trigger it: `A` -> `TuiShellApp::handle` ->
+    /// `Engine::handle_change_review_key` -> `Engine::start_review_verdict`
+    /// -> a new buffer/tab, with no coordinator anywhere in the test (a
+    /// mock `[board]` provider's `verdict_commands`, #522's seam).
+    ///
+    /// RED verified: before `handle_change_review_key` matched `'A'` (and
+    /// before `BoardProviderConfig::verdict_commands` existed at all),
+    /// pressing `A` here left the diff surface exactly as painted before —
+    /// this test failed on both assertions (the diff never closed, no new
+    /// tab ever appeared) against the pre-#526 code.
+    #[test]
+    fn change_review_shift_a_paints_a_verdict_composer_tab_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            let mut verdict_commands = std::collections::HashMap::new();
+            verdict_commands.insert(
+                "approve".to_string(),
+                vec![
+                    "mock-verdict".to_string(),
+                    "{id}".to_string(),
+                    "--body-file".to_string(),
+                    "{body_file}".to_string(),
+                ],
+            );
+            registry[0].board.as_mut().unwrap().verdict_commands = verdict_commands;
+        }
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "reviewed.rs".to_string(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+        ]));
+        app.engine.review_card_id = Some("card:9".to_string());
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line"),
+            "precondition: the change-review surface must be open and \
+             painted; screen:\n{screen}"
+        );
+
+        driver.type_char('A');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("new line"),
+            "A must close the diff surface, same as Esc; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("[Review approve: card:9]"),
+            "A must open a verdict-composer tab named for the verdict and \
+             the reviewed card; screen:\n{screen}"
+        );
+    }
+
+    /// #956 (ACP-5) acceptance: slash commands declared via
+    /// `available_commands_update` must appear as completions in the AI
+    /// panel's input, and accepting one must produce ordinary prompt text
+    /// (no separate RPC) — submitting it is indistinguishable from typing
+    /// it by hand.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_slash_command_completions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client =
+            crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
+                .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        // Drive one full turn first so `available_commands_update` lands.
+        for c in "please plan".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+        // Wait for the turn to fully complete ("Plan ready" is the last
+        // chunk the fixture streams) rather than for "compact" to appear on
+        // screen — `available_commands_update` only updates engine state,
+        // it never paints anything by itself until the popup below renders
+        // it, so waiting on screen text for it here would just burn the
+        // whole deadline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Plan ready") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Plan ready"),
+            "setup turn must complete within 5s so available_commands_update \
+             has landed; screen:\n{screen}"
+        );
+        // `dispatch_ai_chat_event` already cleared the input on submit.
+
+        for c in "/co".chars() {
+            driver.type_char(c);
+        }
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/commit") && screen.contains("/compact"),
+            "both agent-declared commands sharing the \"co\" prefix must \
+             appear as completions; screen:\n{screen}"
+        );
+
+        // Cycle from "/commit" (alphabetically first, so selected by
+        // default) to "/compact", then accept.
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact "),
+            "accepting the completion must fill the input with the full \
+             command name plus a trailing space, ready for arguments; \
+             screen:\n{screen}"
+        );
+
+        // Invoking it is nothing more than submitting that text normally —
+        // there is no separate RPC for a slash command.
+        driver.ctrl_char('s');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("/compact"),
+            "the accepted command must reach the transcript as ordinary \
+             prompt text once submitted; screen:\n{screen}"
+        );
+    }
+
+    /// How long the two #957 (ACP-6) driver tests below wait on a real
+    /// child process before giving up.
+    ///
+    /// Deliberately the same 30s as `core::engine::acp_ops::tests::
+    /// TEST_DEADLINE`, and generous for the same reason: every one of
+    /// these loops exits the instant its condition holds, so the bound is
+    /// only ever reached on a *failing* run, while a loaded `cargo test`
+    /// (GTK harness + nvim oracles + ~3.6k lib tests at once) can
+    /// deschedule a `fork`/`exec` — and, for the terminal-login pane, a
+    /// whole interactive `$SHELL` startup, rc files included — for far
+    /// longer than the milliseconds any of it takes standalone. The first
+    /// cut used 5s and flaked in roughly one full-suite run in eight
+    /// (#957 smoke); nothing about the assertions changed, only the
+    /// patience behind them.
+    const ACP_DRIVER_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// #957 (ACP-6) acceptance: "with `auth.terminal` advertised against a
+    /// fake agent offering a terminal auth method, ... the method is
+    /// present" and "with the capability not advertised, the method is
+    /// absent" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods`.
+    ///
+    /// Unlike the buttons-only `"acp_permission"` dialog on GTK, TUI has no
+    /// native-dialog concept at all — every dialog paints in-canvas — so
+    /// this asserts directly on the painted screen text, same shape as
+    /// `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection_via_shell_app`.
+    ///
+    /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
+    /// changed to call `self.acp_begin_session()` unconditionally (skipping
+    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// check), no dialog ever opens and this test times out waiting for
+    /// `"Authenticate"` — the loop below exits on the deadline and the
+    /// final assertion fails. Restored before committing.
+    #[test]
+    fn ai_panel_shows_auth_choice_dialog_with_agent_and_terminal_methods_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_AUTH_METHODS", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Authenticate"),
+            "the auth-choice dialog's title must paint within ACP_DRIVER_DEADLINE; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ways to sign in"),
+            "the dialog's explanatory body text must be painted; \
+             screen:\n{screen}"
+        );
+        // Same hotkey-collision reasoning as the GTK twin: "API Key" claims
+        // 'a'; "Claude Subscription" claims its own leading 'c'; "Continue
+        // without auth" falls to its next unclaimed letter, 'o'.
+        assert!(
+            screen.contains("[A]PI Key")
+                && screen.contains("[C]laude Subscription")
+                && screen.contains("C[O]ntinue without auth"),
+            "both the agent-type and terminal-type auth methods the fixture \
+             advertised must be presented verbatim, plus the fallback skip \
+             button, each with a unique hotkey; screen:\n{screen}"
+        );
+    }
+
+    /// #1374 (review round 1): see `core::engine::acp_ops::tests::
+    /// ensure_no_zsh_newuser_wizard`'s doc comment for the full rationale —
+    /// same helper, duplicated here rather than shared because
+    /// `core::engine::acp_ops` is a private module (its `mod acp_ops;`
+    /// declaration in `engine/mod.rs` has no `pub(crate)`), so nothing
+    /// outside `core::engine` can name a path through it regardless of the
+    /// visibility of items inside. Kept intentionally tiny and duplicated
+    /// rather than widening that module's visibility just for test
+    /// plumbing.
+    #[cfg(unix)]
+    fn ensure_no_zsh_newuser_wizard() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("vimcode_test_zdotdir_tui_{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+                let _ = std::fs::write(dir.join(name), "");
+            }
+            std::env::set_var("ZDOTDIR", &dir);
+        });
+    }
+
+    /// #957 (ACP-6) acceptance: "choosing [the terminal method] launches
+    /// the interactive process and completion re-initializes the
+    /// session" — TUI's twin of `gtk::testing::sidebar_panel_clicks::
+    /// ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session`.
+    ///
+    /// Drives the choice via the dialog's own hotkey (`'c'`, matching the
+    /// bracketed `[C]laude Subscription` label the previous test
+    /// confirmed), then proves the login pane actually **painted** —
+    /// `screen.contains` on the fixture's own PTY output, not just
+    /// `terminal_panes.len()` / `acp_authenticated` state — before it exits
+    /// and the queued turn resumes.
+    ///
+    /// `settings.acp_agent_command` here is the *real* fixture path (not
+    /// the `"already-spawned-above"` placeholder the NDJSON-only tests
+    /// use): `Engine::acp_launch_terminal_login` reads that setting
+    /// directly to spawn the interactive login process, independently of
+    /// the already-spawned NDJSON `acp_client` above. The `succeed-slow`
+    /// arg (fixture doc) gives `driver.tick()` a real window to observe the
+    /// pane's painted output before it exits and is reaped.
+    ///
+    /// RED verified: with `Engine::acp_finish_terminal_login`'s `Some(0)`
+    /// branch changed to a no-op (never calling `client.initialize()`),
+    /// this test times out waiting for `"Hello world"` — the client stays
+    /// parked after the login pane exits instead of resuming the queued
+    /// turn.
+    #[test]
+    fn ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app() {
+        #[cfg(unix)]
+        ensure_no_zsh_newuser_wizard();
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture_path.to_string()];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_AUTH_METHODS", "1"),
+                ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        // Read directly by `acp_launch_terminal_login` — distinct from (and
+        // independent of) the NDJSON client spawned above. Quoted because
+        // `CARGO_MANIFEST_DIR` may contain spaces (a coord worktree under
+        // `~/Library/Application Support/...`), which the login pane's
+        // shell would otherwise word-split into a 127 "command not found"
+        // — see `acp6_fixture_argv_string` in `core/engine/acp_ops.rs`.
+        app.engine.settings.acp_agent_command = format!("sh \"{fixture_path}\" succeed-slow");
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("[C]laude Subscription"),
+            "the auth-choice dialog must paint the Claude Subscription \
+             option within ACP_DRIVER_DEADLINE; screen:\n{screen}"
+        );
+
+        driver.type_char('c');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Authenticate"),
+            "the dialog must close the moment the hotkey is pressed; \
+             screen:\n{screen}"
+        );
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut saw_login_pane = false;
+        while Instant::now() < deadline {
+            driver.tick();
+            if driver.screen().contains("interactive login succeeded") {
+                saw_login_pane = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_login_pane,
+            "the login pane's own PTY output must actually be painted on \
+             the surface within ACP_DRIVER_DEADLINE, not just recorded in engine state"
+        );
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello world"),
+            "completing the login must re-initialize the client and resume \
+             the queued turn within ACP_DRIVER_DEADLINE; screen:\n{screen}"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {
@@ -10335,6 +17099,288 @@ mod tests {
             screen.contains("ZQXW605TOAST"),
             "toast stack should paint via TuiShellApp::render_content; screen:\n{screen}"
         );
+    }
+
+    // ── #1397: recommended-extension install offer — actionable toast, not
+    // a missable status-line hint — black-box coverage ─────────────────────
+    //
+    // Before #1397 the only surface was `Engine::message` (the status
+    // line), overwritten by any later status message before a user ever
+    // saw it. These tests drive the real `lsp_did_open` → toast → click/
+    // key pipeline through `TuiShellApp` + `driver_with_shell`, asserting
+    // on painted screen content — never on `engine.toasts`/
+    // `ext_hint_pending_name` directly (CLAUDE.md's "assert on rendered
+    // output" rule) — except for the one precondition check in the shared
+    // fixture below, which mirrors the #1344 install tests' own "state
+    // before `driver_with_shell`, screen after" split (`driver.app_mut()
+    // .engine` is unreachable once wrapped — see the #1088 test's comment
+    // above).
+    //
+    // **Verified RED against unfixed `develop`:** before #1397,
+    // `lsp_did_open` never pushed a toast at all — only `self.message` —
+    // so `render::build_toast_stack` returned `None` and nothing painted;
+    // `extension_install_offer_toast_renders_and_keeps_editor_focus_via_shell_app`'s
+    // first assertion failed immediately. Reverting `lsp_did_open`'s
+    // `push_sticky_action_toast` call back to a plain `self.message =
+    // format!(...)` reproduces that failure.
+
+    /// Build a `TuiShellApp` whose first frame already shows the #1397
+    /// install-offer toast for a synthetic extension: a fake `lsp.binary`
+    /// (never actually resolvable) mapped to a fake language via
+    /// `settings.language_map`, opened via `open_file_in_tab` (which runs
+    /// `lsp_did_open` for real) *before* the app is handed to
+    /// `driver_with_shell`.
+    ///
+    /// `unique` tags every synthetic name (extension, language, file
+    /// extension, temp path) so parallel test threads never collide, and
+    /// is deliberately kept free of the substring "install" — the title
+    /// this builds says "Install {display_name}?" (the issue's own
+    /// wording), and a `unique` containing "install" would make that
+    /// substring appear a second time on the title's own row, breaking
+    /// the "only the action button matches after the title" assumption
+    /// the click test below relies on.
+    fn app_with_ext_install_offer(unique: &str) -> (TuiShellApp, String, String, PathBuf) {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use std::io::Write;
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = format!("vimcode-test-ext-1397-{unique}");
+        // Short: the toast box is only ~27 cells wide once the dismiss ×
+        // and action-button regions are reserved (`quadraui::tui::toast`'s
+        // `TUI_TOAST_WIDTH`/`TUI_DISMISS_WIDTH`/action-padding constants) —
+        // a longer title truncates before "?", breaking the exact-title
+        // match the tests below do.
+        let display_name = format!("X1397{unique}");
+        let lang_id = format!("vimcode-test-lang-1397-{unique}");
+        let file_ext = format!("zqx1397{unique}");
+
+        app.engine
+            .settings
+            .language_map
+            .insert(file_ext.clone(), lang_id.clone());
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: display_name.clone(),
+            language_ids: vec![lang_id],
+            lsp: LspConfig {
+                binary: "vc-bin-1397".to_string(),
+                install: "true".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let path = std::env::temp_dir().join(format!(
+            "vimcode_test_1397_{unique}_{}.{file_ext}",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"hello\n").unwrap();
+        }
+
+        app.engine.open_file_in_tab(&path);
+        assert!(
+            app.engine.ext_hint_pending_name.is_some(),
+            "precondition: opening the file must queue the install offer toast"
+        );
+
+        (app, ext_name, display_name, path)
+    }
+
+    /// Locate `needle` in row `y`, starting the search at column `after_x`
+    /// (exclusive) — used to find the toast's action-button label, which
+    /// repeats the same word ("Install") the toast's title also contains,
+    /// on the same painted row. `TuiDriver::find`/`find_bounds` only ever
+    /// return the *first* match on the whole screen, which would be the
+    /// title's own occurrence; this scans the specific row with
+    /// `styled_row` (public) to find the next one instead.
+    fn find_in_row_after(
+        driver: &quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        y: u16,
+        after_x: u16,
+        needle: &str,
+    ) -> Option<(f32, f32)> {
+        let needle: Vec<char> = needle.chars().collect();
+        let row: Vec<char> = driver.styled_row(y).into_iter().map(|(c, _)| c).collect();
+        if row.len() < needle.len() {
+            return None;
+        }
+        for start in (after_x as usize)..=(row.len() - needle.len()) {
+            if row[start..start + needle.len()] == needle[..] {
+                return Some((start as f32 + 0.5, y as f32 + 0.5));
+            }
+        }
+        None
+    }
+
+    /// #1397 core acceptance: opening a file whose recommended extension
+    /// isn't installed must paint a toast offer — not just a status-line
+    /// hint any later message silently overwrites — and that toast must
+    /// not steal keyboard focus (#416): typing must still reach the
+    /// editor while it's up.
+    #[test]
+    fn extension_install_offer_toast_renders_and_keeps_editor_focus_via_shell_app() {
+        let (app, _ext_name, display_name, _path) = app_with_ext_install_offer("render");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        let want_title = format!("Install {display_name}?");
+        assert!(
+            screen.contains(&want_title),
+            "install offer toast title must paint; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("N: don't ask again"),
+            "toast must document the N keyboard shortcut (keyboard parity \
+             with the action button, for TUI/mouse-less users); screen:\n{screen}"
+        );
+
+        // Type directly (no click first) — the toast must not have grabbed
+        // keyboard focus away from the editor, which still has it from
+        // `open_file_in_tab` leaving the cursor at (0, 0).
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Zhello"),
+            "typing must still reach the editor while the install-offer \
+             toast is up — it must not steal keyboard focus (#416); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1397: clicking the toast's "Install" action button must run the
+    /// same install path `:ExtInstall <name>` does
+    /// (`Engine::ext_install_from_registry`), proven by the command line's
+    /// "Extension '…' installed — …" outcome message that call always
+    /// leaves behind — real rendered output, not
+    /// `engine.pending_terminal_command` (unreachable through `driver`
+    /// once wrapped, and exactly the state-vs-paint distinction #587/#592
+    /// exist to enforce).
+    #[test]
+    fn extension_install_offer_toast_install_action_triggers_install_via_shell_app() {
+        let (app, ext_name, display_name, _path) = app_with_ext_install_offer("act");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        let title_bounds = driver
+            .find_bounds(&want_title)
+            .unwrap_or_else(|| panic!("toast title must paint; screen:\n{}", driver.screen()));
+        let button_x = title_bounds.x as u16 + title_bounds.width as u16;
+        let (ax, ay) = find_in_row_after(&driver, title_bounds.y as u16, button_x, "Install")
+            .unwrap_or_else(|| {
+                panic!(
+                    "action button 'Install' must paint after the title on \
+                     its own row; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+        driver.click(ax, ay);
+
+        let screen = driver.screen();
+        let want_outcome = format!("Extension '{ext_name}' installed");
+        assert!(
+            screen.contains(&want_outcome),
+            "clicking the toast's Install button must run \
+             ext_install_from_registry for the right extension; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(&want_title),
+            "the toast must be gone once its action has run; screen:\n{screen}"
+        );
+    }
+
+    /// #1397 "Don't ask again": `N` (the pre-#1397 keyboard shortcut,
+    /// preserved for parity) must dismiss the toast *and* persist the
+    /// dismissal for the rest of the session — re-opening the same file
+    /// must not show the offer again. Mirrors the pre-#1397 `N`-to-dismiss
+    /// behaviour (`extension_state.mark_dismissed`), just re-targeted at
+    /// the toast instead of `self.message`.
+    #[test]
+    fn extension_install_offer_toast_n_key_dismisses_and_persists_for_session_via_shell_app() {
+        let (app, _ext_name, display_name, path) = app_with_ext_install_offer("keyn");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        assert!(
+            driver.screen().contains(&want_title),
+            "precondition: offer must be showing; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('N');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'N' must dismiss the toast; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("dismissed"),
+            "'N' must confirm the dismissal on the command line; screen:\n{screen}"
+        );
+
+        // Re-open the same file (`:e <path>` on an already-open buffer
+        // still re-runs `lsp_did_open` — see `open_file_in_tab`'s
+        // "already shows this buffer" branch) through the real
+        // command-line pipeline, and confirm the offer does not come back
+        // this session.
+        run_ex_command(&mut driver, &format!(":e {}", path.display()));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'N' ('Don't ask again') must persist for the rest of the \
+             session, not just the first showing; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1397 "Not now": dismissing the toast via its × (the dismiss
+    /// affordance every toast has, `ToastHit::Dismiss`) must hide it
+    /// without asking again this session (today's `prompted_extensions`
+    /// behaviour, which is recorded when the toast is *pushed*, not when
+    /// it's dismissed — see `lsp_did_open`).
+    #[test]
+    fn extension_install_offer_toast_dismiss_x_hides_for_session_via_shell_app() {
+        let (app, _ext_name, display_name, path) = app_with_ext_install_offer("keyx");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        let title_bounds = driver
+            .find_bounds(&want_title)
+            .unwrap_or_else(|| panic!("toast title must paint; screen:\n{}", driver.screen()));
+
+        // Locate the toast's own dismiss × by row, not `driver.find("×")`
+        // (which would match the *tab bar's* close × first — same glyph,
+        // a different, higher-up row — since `find`/`find_bounds` always
+        // return the first match on the whole screen).
+        let dismiss_x = title_bounds.x as u16 + title_bounds.width as u16;
+        let (dx, dy) = find_in_row_after(&driver, title_bounds.y as u16, dismiss_x, "×")
+            .unwrap_or_else(|| {
+                panic!(
+                    "dismiss × must paint on the toast's own row; screen:\n{}",
+                    driver.screen()
+                )
+            });
+        driver.click(dx, dy);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "clicking × must dismiss the toast; screen:\n{screen}"
+        );
+
+        run_ex_command(&mut driver, &format!(":e {}", path.display()));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'Not now' must not re-prompt again this session \
+             (prompted_extensions); screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `TuiAccelHost::terminal_toggle_max` must derive `terminal_max_rows`
@@ -10580,7 +17626,7 @@ mod tests {
     // and never parses real ANSI (see this file's module doc, "raw-mode,
     // SGR mouse... stay outside its reach"), so it cannot exercise
     // anything specific to the live terminal — raw-mode escape sequence
-    // parsing, a real PTY, `supports_keyboard_enhancement()`'s blocking
+    // parsing, a real PTY, the keyboard-enhancement-support probe's blocking
     // round-trip, or genuine OS-level blocking/deadlock. A live-terminal
     // repro attempt (this session: `vcd` under `tmux`, real SGR mouse
     // byte sequences, ~150+ hamburger interactions across the same
@@ -10609,7 +17655,7 @@ mod tests {
     fn driver_hamburger_click_sidebar_closed_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -10645,7 +17691,7 @@ mod tests {
     fn driver_hamburger_click_twice_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -10675,7 +17721,7 @@ mod tests {
     fn driver_hamburger_click_with_sidebar_open_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -10703,7 +17749,7 @@ mod tests {
     fn driver_hamburger_click_then_key_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -10735,7 +17781,7 @@ mod tests {
     fn driver_hamburger_click_then_key_with_sidebar_open_does_not_panic() {
         let mut driver = driver_with_shell(
             TuiShellApp::new(None),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -10958,6 +18004,25 @@ mod tests {
     ///
     /// Both are exactly the "stops responding" symptom, and both
     /// reproduce on any machine regardless of installed extensions.
+    ///
+    /// #1053 review: this test's setup step used to drive
+    /// `handle_mouse_event` directly with a raw `MouseDown` at the plugin
+    /// icon's activity-bar coordinates, relying on `mouse::handle_mouse`'s
+    /// (now-deleted) `ActivityBarTarget::ExtensionPanel` arm to resolve it.
+    /// That bypassed `ShellAdapter`/`AppShell::handle` entirely — in
+    /// production a genuine single click there never reaches
+    /// `handle_mouse_event` at all (see `driver_click_on_every_activity_
+    /// bar_icon_opens_its_panel_via_shell_app`'s doc comment), so the raw
+    /// coordinate was never representative of the real dispatch. Replaced
+    /// with the actual semantic event `ShellAdapter` produces for that
+    /// click — `AppShellEvent::PanelChanged { panel_id: "ext:git-insights"
+    /// }` — driven through `on_shell_event`, the same "unit half of the
+    /// click path" `on_shell_event_extension_panel_changed_opens_the_
+    /// plugin_panel` above already exercises. The rest of this test (the
+    /// stale-`ext_sidebar_body_rect` click below) is untouched: that lands
+    /// inside the sidebar body, not the activity bar, so it was never
+    /// depending on the deleted block.
+    #[allow(deprecated)]
     #[test]
     fn plugin_ext_panel_wins_focus_and_clicks_after_marketplace_visit() {
         let mut app = TuiShellApp::new(None);
@@ -10984,18 +18049,13 @@ mod tests {
 
         let mut backend = backend_at(80.0, 24.0);
 
-        // Click the plugin panel's activity-bar icon — row 7, after
-        // menu(0)/explorer(1)/search(2)/debug(3)/git(4)/extensions(5)/ai(6)
-        // (`resolve_activity_bar_click`).
-        app.handle_mouse_event(
-            UiEvent::MouseDown {
-                widget: None,
-                button: quadraui::MouseButton::Left,
-                position: quadraui::Point::new(1.0, 7.0),
-                modifiers: quadraui::Modifiers::default(),
-            },
-            &mut backend,
-        );
+        // The plugin panel's activity-bar icon click, as `ShellAdapter`
+        // actually reports it: a semantic `PanelChanged` for its `"ext:"`
+        // id, consumed by `on_shell_event` before `handle_mouse_event`
+        // would ever see a raw `MouseDown` for it.
+        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+            panel_id: quadraui::WidgetId::new("ext:git-insights"),
+        });
         assert_eq!(app.sidebar.ext_panel_name.as_deref(), Some("git-insights"));
         assert!(
             app.engine.ext_panel_has_focus && !app.engine.ext_sidebar_has_focus,
@@ -11195,6 +18255,455 @@ mod tests {
         );
     }
 
+    /// Builds a `TuiShellApp` whose explorer is expanded over `dir` and
+    /// active/visible, for the `#1025` tests below. A fresh instance is
+    /// built per driver (rather than sharing one across a right-click and a
+    /// parity left-click) because `TuiDriver` has no accessor back to the
+    /// concrete `TuiShellApp`/`Engine` (see this module's own doc comment
+    /// on that gap) — so a right-click's effects can only be read back by
+    /// re-painting and inspecting *styles*, never by asking the engine
+    /// directly. Two identically-seeded drivers, each probed once, sidestep
+    /// that entirely.
+    fn app_with_expanded_explorer(dir: &std::path::Path) -> TuiShellApp {
+        let mut app = TuiShellApp::new(None);
+        app.engine.cwd = dir.to_path_buf();
+        app.engine.explorer_expanded.insert(dir.to_path_buf());
+        app.engine.explorer_rebuild_rows();
+        ensure_panel_active(&mut app.engine, PANEL_EXPLORER);
+        app
+    }
+
+    /// #1025: right-clicking an explorer row must select that *same* row,
+    /// not the row painted directly below it — and a left-click on the same
+    /// painted cell must resolve identically.
+    ///
+    /// Before the fix, `mouse::handle_mouse`'s right-click arm hand-rolled
+    /// `row.saturating_sub(menu_rows)` as the tree row directly, never
+    /// subtracting the one-row sidebar header that `explorer_tree_rect`
+    /// (and the left-click arm, via `render::route_explorer_tree_event`)
+    /// already accounts for — landing the selection (and the context menu)
+    /// one row low.
+    ///
+    /// A real terminal click typically delivers **both** `Down(Right)` and
+    /// `Up(Right)`. `TuiShellApp::handle_mouse_event`'s own `TreeController`
+    /// intercept claims the `Down` correctly (button-agnostic, already
+    /// routes through the shared function) — but only its *drag* arm would
+    /// claim a `MouseUp`, and this isn't a drag, so the `Up` falls through
+    /// to `mouse::handle_mouse`'s own `Down(Right) | Up(Right)` block,
+    /// which unconditionally closes whatever menu the `Down` just opened
+    /// and reopens one from its own row math. That second, buggy
+    /// resolution is what the user actually ends up seeing, which is why
+    /// this test dispatches both halves rather than just one.
+    ///
+    /// Reads rendered *style*, not engine state (`TreeRow`'s selected/
+    /// unselected background, `quadraui/src/tui/tree.rs`) — the row a click
+    /// actually resolved to repaints with a different background than its
+    /// neighbours the moment it becomes `TreeController::selected_path`, so
+    /// "did the row below light up instead" is directly observable on
+    /// screen, exactly the failure mode #1025 reports.
+    ///
+    /// RED-verified: reverting the `mouse.rs` explorer right-click arm to
+    /// its pre-fix hand-rolled `sidebar_row`/`tree_row` arithmetic makes
+    /// this fail — `zqxw1025_c.txt` (one row below the clicked
+    /// `zqxw1025_b.txt`) lights up instead, and the parity assertion fails
+    /// the same way.
+    #[test]
+    fn explorer_right_click_targets_the_clicked_row_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1025_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files = ["zqxw1025_a.txt", "zqxw1025_b.txt", "zqxw1025_c.txt"];
+        for f in files {
+            std::fs::write(dir.join(f), "marker").unwrap();
+        }
+
+        // ── Right-click on "b" ──────────────────────────────────────────
+        let mut driver = driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        driver.render();
+
+        let (bx, by) = driver
+            .find("zqxw1025_b.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let (cx, cy) = driver
+            .find("zqxw1025_c.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let b_before = driver.style_at(bx as u16, by as u16);
+        let c_before = driver.style_at(cx as u16, cy as u16);
+
+        // A real click: Down(Right) then Up(Right) at the same painted cell
+        // (see doc comment above for why both matter).
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.dispatch(UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(bx, by),
+        });
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Open to the Side"),
+            "right-clicking a file row must open the explorer file context \
+             menu; screen:\n{}",
+            driver.screen()
+        );
+
+        // The open menu floats *over* the tree (it anchors at the click
+        // position, not the resolved row), which would otherwise paint
+        // over both probed cells and make the comparison below vacuous.
+        // Escape closes it (`Engine::handle_context_menu_key`) without
+        // touching `TreeController::selected_path`, so the persisted
+        // selection highlight underneath is what the repaint below reads.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Open to the Side"),
+            "precondition: Escape must close the context menu so the \
+             selection highlight underneath is observable; screen:\n{}",
+            driver.screen()
+        );
+
+        let b_after_right = driver.style_at(bx as u16, by as u16);
+        let c_after_right = driver.style_at(cx as u16, cy as u16);
+
+        assert_ne!(
+            b_after_right,
+            b_before,
+            "right-clicking zqxw1025_b.txt's painted row must repaint it \
+             with the TreeController's selected-row style (#1025); \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            c_after_right,
+            c_before,
+            "right-clicking zqxw1025_b.txt must NOT select \
+             zqxw1025_c.txt — the row directly below — which is exactly \
+             #1025's reported symptom; screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Parity: a fresh, identically-seeded app, left-clicked at the
+        // same painted cell, must resolve to the same row — b lights up,
+        // c doesn't. (Not compared for byte-identical style against the
+        // right-click case: a left click also focuses the tree, which
+        // paints the active- vs inactive-selected background differently
+        // from a right click's `ContextMenuRequested`, which doesn't touch
+        // focus — see `quadraui/src/tui/tree.rs`'s `is_selected`/
+        // `is_inactive_selected`. Both are still "this row is selected",
+        // just two different colors for it.) ─────────────────────────────
+        let mut driver2 = driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        driver2.render();
+        let (bx2, by2) = driver2
+            .find("zqxw1025_b.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        let (cx2, cy2) = driver2
+            .find("zqxw1025_c.txt")
+            .expect("the expanded explorer tree must paint the seeded file rows");
+        assert_eq!(
+            (bx2, by2),
+            (bx, by),
+            "the fixture must paint identically across the two drivers"
+        );
+        let b2_before = driver2.style_at(bx2 as u16, by2 as u16);
+        let c2_before = driver2.style_at(cx2 as u16, cy2 as u16);
+
+        driver2.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(bx2, by2),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver2.render();
+        let b_after_left = driver2.style_at(bx2 as u16, by2 as u16);
+        let c_after_left = driver2.style_at(cx2 as u16, cy2 as u16);
+
+        assert_ne!(
+            b_after_left,
+            b2_before,
+            "left-clicking zqxw1025_b.txt's painted row must repaint it \
+             as selected, exactly like the right-click case above (#1025 \
+             parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+        assert_eq!(
+            c_after_left,
+            c2_before,
+            "left-clicking zqxw1025_b.txt must NOT select \
+             zqxw1025_c.txt either (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #231: a modal `Dialog` painted over the explorer tree must leave no
+    /// residue once it closes — every row it covered must repaint back to
+    /// its pre-dialog background, not retain a leftover tint.
+    ///
+    /// #231's own repro used the rename input prompt, but that was the
+    /// pre-#223 `Dialog`-based flow; rename today is inline row editing via
+    /// `TreeController` (`explorer_tree.is_editing()` /
+    /// `TreeControllerEvent::EditConfirmed`, `explorer_ops.rs`) and never
+    /// opens `engine.dialog` at all — `ExplorerRenameState` is
+    /// `#[allow(dead_code)]` on this backend (`buffers.rs`). This test
+    /// substitutes a `Dialog` that's still very much alive on this path —
+    /// `Engine::show_quit_confirm` — which `paint_dialog_rung` centers over
+    /// the *window* viewport (`win_q`, not the content area), so on an
+    /// 80×24 screen it does overlap the sidebar tree exactly like the old
+    /// rename prompt did.
+    ///
+    /// `TuiDriver` keeps its wrapped `ShellAdapter<TuiShellApp>` crate-
+    /// private (see the doc comment on `app_with_expanded_explorer` /
+    /// #1088's test above — no `driver.app_mut().engine` after
+    /// construction), so the dialog is opened on the `Engine` *before* the
+    /// app is handed to `driver_with_shell`, and closed the same way a
+    /// real user would: pressing Escape, which
+    /// `Engine::handle_dialog_key`'s "Escape" arm routes to (proven
+    /// generically by `handle_key_pressed_dialog_intercepts_all_keys`
+    /// above). A second, dialog-free driver on an identically seeded
+    /// fixture supplies the "clean" reference style for each row, since
+    /// nothing about dialog open/close touches tree selection or focus.
+    ///
+    /// Reads rendered `style_at`, not engine state, per CLAUDE.md's
+    /// "rendered output, not state" rule — `ScreenLayout` fields have
+    /// looked populated while nothing painted correctly before (#587/#592).
+    #[test]
+    fn explorer_tree_rows_repaint_clean_after_dialog_closes_231() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_231_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Enough rows to span the vertical middle of a 24-row screen, where
+        // a centered quit-confirm dialog actually lands.
+        let files: Vec<String> = (0..18).map(|i| format!("zqxw231_{i:02}.txt")).collect();
+        for f in &files {
+            std::fs::write(dir.join(f), "marker").unwrap();
+        }
+
+        // ── Reference: same fixture, dialog never opened ─────────────────
+        let mut clean_driver =
+            driver_with_shell(app_with_expanded_explorer(&dir), config(), 80, 24);
+        clean_driver.render();
+        let baseline: Vec<((u16, u16), quadraui::tui::testing::CellStyle)> = files
+            .iter()
+            .map(|f| {
+                let (x, y) = clean_driver.find(f).unwrap_or_else(|| {
+                    panic!(
+                        "seeded row {f} must paint; screen:\n{}",
+                        clean_driver.screen()
+                    )
+                });
+                let xy = (x as u16, y as u16);
+                let style = clean_driver
+                    .style_at(xy.0, xy.1)
+                    .unwrap_or_else(|| panic!("row {f} must have a style"));
+                (xy, style)
+            })
+            .collect();
+
+        // ── Dialog opened before the driver ever renders a frame ─────────
+        let mut app = app_with_expanded_explorer(&dir);
+        app.engine.show_quit_confirm();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        // Find at least one seeded row the open dialog painted over — the
+        // repro is meaningless if the dialog missed the tree entirely.
+        let covered_idx = baseline
+            .iter()
+            .position(|(xy, base)| driver.style_at(xy.0, xy.1) != Some(*base))
+            .unwrap_or_else(|| {
+                panic!(
+                    "precondition: the quit-confirm dialog must paint over \
+                     at least one explorer row on an 80x24 screen for this \
+                     repro to be meaningful; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+        // Close it the way a user would.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Unsaved Changes"),
+            "precondition: Escape must close the quit-confirm dialog; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let (xy, expected) = baseline[covered_idx];
+        let after = driver.style_at(xy.0, xy.1);
+        assert_eq!(
+            after,
+            Some(expected),
+            "explorer row {:?} must repaint to its pre-dialog style once \
+             the dialog closes, not retain a leftover tint from the \
+             dialog's chrome (#231); screen:\n{}",
+            files[covered_idx],
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1025 companion: the same invariant at a non-zero `scroll_offset`, so
+    /// a fix that hardcodes `- 1` into the wrong place (rather than
+    /// deleting the hand-rolled arithmetic in favour of the shared
+    /// `render::route_explorer_tree_event`) doesn't coincidentally pass at
+    /// `scroll_offset == 0` and stay broken everywhere else.
+    #[test]
+    fn explorer_right_click_targets_the_clicked_row_when_scrolled_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1025_scrolled_shell_app_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Short names: with 30 siblings the tree paints a scrollbar, which
+        // eats one more column than the zero-scrollbar 3-file fixture
+        // above — `zqxw1025s_NN.txt` truncated under it and `find` missed
+        // the match entirely.
+        for i in 0..30 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), "marker").unwrap();
+        }
+        // Row index 10 (root=0, files 1..=30 sorted by name): "f09" is the
+        // target, "f10" is the row directly below it.
+        let target_name = "f09.txt";
+        let below_name = "f10.txt";
+
+        let build = || {
+            let app = app_with_expanded_explorer(&dir);
+            // Force a non-zero scroll offset — well within range for 30
+            // files in a short (14-row) terminal, see below.
+            app.engine.explorer_tree.borrow_mut().set_scroll_offset(5);
+            app
+        };
+
+        // ── Right-click the target row ──────────────────────────────────
+        // Short terminal so the tree viewport can't show all 31 rows
+        // (root + 30 files) at once — `scroll_offset` actually matters.
+        let mut driver = driver_with_shell(build(), config(), 80, 14);
+        driver.render();
+
+        let (tx, ty) = driver.find(target_name).unwrap_or_else(|| {
+            panic!(
+                "row for {target_name} must be visible at scroll_offset=5; screen:\n{}",
+                driver.screen()
+            )
+        });
+        let (nx, ny) = driver.find(below_name).unwrap_or_else(|| {
+            panic!(
+                "row for {below_name} must be visible at scroll_offset=5; screen:\n{}",
+                driver.screen()
+            )
+        });
+        let target_before = driver.style_at(tx as u16, ty as u16);
+        let below_before = driver.style_at(nx as u16, ny as u16);
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(tx, ty),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.dispatch(UiEvent::MouseUp {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(tx, ty),
+        });
+        driver.render();
+
+        assert!(
+            driver.screen_contains("Open to the Side"),
+            "right-clicking a file row must open the explorer file context \
+             menu; screen:\n{}",
+            driver.screen()
+        );
+
+        // See the sibling test's doc comment: the menu floats over the
+        // tree at the click position, so it must be closed before the
+        // underlying selection highlight is observable again.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("Open to the Side"),
+            "precondition: Escape must close the context menu; screen:\n{}",
+            driver.screen()
+        );
+
+        let target_after_right = driver.style_at(tx as u16, ty as u16);
+        let below_after_right = driver.style_at(nx as u16, ny as u16);
+
+        assert_ne!(
+            target_after_right,
+            target_before,
+            "right-clicking {target_name}'s painted row at scroll_offset=5 \
+             must repaint it as selected (#1025); screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            below_after_right,
+            below_before,
+            "right-clicking {target_name} must NOT select {below_name} — \
+             the row directly below — at a non-zero scroll_offset (#1025); \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // ── Parity at the same scroll offset (see the sibling test's doc
+        // comment on why this checks "selected vs not", not byte-identical
+        // style against the right-click case). ──────────────────────────
+        let mut driver2 = driver_with_shell(build(), config(), 80, 14);
+        driver2.render();
+        let (tx2, ty2) = driver2
+            .find(target_name)
+            .expect("row must paint identically across the two drivers");
+        let (nx2, ny2) = driver2
+            .find(below_name)
+            .expect("row must paint identically across the two drivers");
+        assert_eq!((tx2, ty2), (tx, ty));
+        let target2_before = driver2.style_at(tx2 as u16, ty2 as u16);
+        let below2_before = driver2.style_at(nx2 as u16, ny2 as u16);
+
+        driver2.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(tx2, ty2),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver2.render();
+        let target_after_left = driver2.style_at(tx2 as u16, ty2 as u16);
+        let below_after_left = driver2.style_at(nx2 as u16, ny2 as u16);
+
+        assert_ne!(
+            target_after_left,
+            target2_before,
+            "left-clicking {target_name}'s painted row at scroll_offset=5 \
+             must repaint it as selected, exactly like the right-click \
+             case above (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+        assert_eq!(
+            below_after_left,
+            below2_before,
+            "left-clicking {target_name} must NOT select {below_name} \
+             either (#1025 parity invariant); screen:\n{}",
+            driver2.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #603 baseline: a plain `KeyPressed` sequence (no modal state open)
     /// must reach `Engine::handle_key` and actually mutate the buffer —
     /// establishes that the general fallback in `handle_key_pressed` is
@@ -11275,6 +18784,255 @@ mod tests {
             driver.terminal_cursor_position(),
             Some((expected.0 + 1, expected.1)),
             "a later frame's draw_editor call must overwrite the previous cursor position"
+        );
+    }
+
+    /// #1039 fixture: two editor **groups** (`open_editor_group` —
+    /// VSCode-style split panes — not `:split`'s in-tab window split), each
+    /// showing a *different* file. Distinct files (rather than the same
+    /// buffer split two ways, as `app_with_split_shaped_buffer` uses) mean
+    /// each pane's content is unambiguous on screen: a marker typed into
+    /// one pane can never collide with the other pane's own text, so the
+    /// two tests below can locate it with a plain `TuiDriver::find` instead
+    /// of the split-column arithmetic `focus_change_does_not_move_either_
+    /// panes_text_via_shell_app` needs for a same-buffer split.
+    ///
+    /// `open_editor_group` leaves the *new* (right) group focused — callers
+    /// that want the left group active call `Engine::focus_other_group`
+    /// themselves, exactly as a real `<C-w>w` keybinding would.
+    ///
+    /// Returns the temp dir alongside the app so callers can remove it once
+    /// the driver built from the app is done with it.
+    fn app_with_two_file_groups(tag: &str) -> (TuiShellApp, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1039_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_left = dir.join("left1039.txt");
+        let file_right = dir.join("right1039.txt");
+        std::fs::write(&file_left, "left file\n").unwrap();
+        std::fs::write(&file_right, "right file\n").unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .open_file_with_mode(&file_left, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine.open_editor_group(SplitDirection::Vertical);
+        // `open_editor_group` focuses the new (right) group, so this opens
+        // into the right pane only — the left pane keeps showing file_left.
+        app.engine
+            .open_file_with_mode(&file_right, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        (app, dir)
+    }
+
+    /// #1039 acceptance, painted-output tier: with two editor groups open
+    /// and the **left** one focused, insert mode's `Bar` cursor must land
+    /// inside the left pane — not vanish, and not land in the right pane.
+    ///
+    /// Root cause (see the issue): quadraui's `TuiBackend` caches the most
+    /// recent `Backend::draw_editor` call's cursor position on itself and
+    /// applies it to the real `Frame` once the frame's done painting, but
+    /// that cache is overwritten unconditionally on *every* `draw_editor`
+    /// call in the frame — including calls for inactive windows, which
+    /// always report `cursor_position: None`. `render_all_windows` used to
+    /// paint windows in a fixed (layout) order regardless of which one was
+    /// active, so painting the left pane (active here) *before* the right
+    /// pane (inactive) meant the right pane's `None` clobbered the left
+    /// pane's real position last — no caret at all, anywhere.
+    ///
+    /// RED against unfixed develop (confirmed by hand, reverting
+    /// `render_all_windows`'s active-last reordering back to plain
+    /// iteration order): `driver.terminal_cursor_position()` comes back
+    /// `None` instead of `Some(expected)`, because the left pane is
+    /// `window_rects`' first entry and the right pane paints after it.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_left_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_LEFT_1039";
+
+        let (mut app, dir) = app_with_two_file_groups("left");
+        app.engine.focus_other_group(); // right -> left (only two groups)
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i'); // Normal -> Insert, Bar cursor shape.
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("left-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused left group's Bar cursor should reach the terminal \
+             frame, not be clobbered by the unfocused right group's paint; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1039 acceptance, mirror case: same fixture, **right** group
+    /// focused (the default after `open_editor_group`, so no explicit
+    /// focus change needed here) — the caret must land in the right pane.
+    /// Paired with `insert_mode_bar_cursor_focuses_left_group_of_split_
+    /// via_shell_app` above so a fix that just hardcodes "paint window 0
+    /// last" or "first window always wins" can't pass both.
+    #[test]
+    fn insert_mode_bar_cursor_focuses_right_group_of_split_via_shell_app() {
+        const MARKER: &str = "ZQXW_RIGHT_1039";
+
+        let (app, dir) = app_with_two_file_groups("right");
+        // `app_with_two_file_groups` already leaves the right group active.
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.type_char('i');
+        for c in MARKER.chars() {
+            driver.type_char(c);
+        }
+
+        let (marker_x, marker_y) = driver
+            .find(MARKER)
+            .expect("right-group marker should be visible on screen");
+        let marker_col = (marker_x - 0.5).round() as u16;
+        let expected = (
+            marker_col + MARKER.chars().count() as u16,
+            (marker_y - 0.5).round() as u16,
+        );
+
+        assert_eq!(
+            driver.terminal_cursor_position(),
+            Some(expected),
+            "the focused right group's Bar cursor should reach the terminal \
+             frame; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1162 acceptance, painted-output tier: `CTRL-W t` / `CTRL-W b` name
+    /// the corner window of the **screen**, so with two editor groups open
+    /// they must cross the group boundary — `t` into the left group, `b`
+    /// into the right one.
+    ///
+    /// Asserts on painted text rather than on `active_group`: each group
+    /// shows a *different* file, so typing a marker in insert mode and then
+    /// reading the marker back fused to that file's own first line
+    /// (`"<mark>left file"` vs `"<mark>right file"`) proves which pane the
+    /// keystrokes actually reached, with no coordinate arithmetic.
+    ///
+    /// RED against the window-layout-only first cut of the #1162 fix
+    /// (`'t' => { … self.active_tab().window_ids().first() … }`): the
+    /// fixture leaves the right group focused and each group holds a single
+    /// window, so `<C-w>t` was a no-op and `LEFT_MARK` landed in
+    /// `right file` instead. Green on develop for this case and RED there
+    /// for the single-group case covered by
+    /// `ctrl_w_t_and_b_move_the_caret_between_split_panes_via_shell_app`
+    /// below — together they pin both levels of the layout.
+    #[test]
+    fn ctrl_w_t_and_b_cross_editor_groups_via_shell_app() {
+        const LEFT_MARK: &str = "ZQXWT1162";
+        const RIGHT_MARK: &str = "ZQXWB1162";
+
+        let (app, dir) = app_with_two_file_groups("ctrlw_tb");
+        // `app_with_two_file_groups` leaves the *right* group focused.
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+
+        driver.ctrl_char('w');
+        driver.type_char('t');
+        driver.type_char('i');
+        for c in LEFT_MARK.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            driver.screen().contains(&format!("{LEFT_MARK}left file")),
+            "CTRL-W t must focus the left editor group, so the typed marker \
+             should be painted fused to the left file's own text; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.ctrl_char('w');
+        driver.type_char('b');
+        driver.type_char('i');
+        for c in RIGHT_MARK.chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains(&format!("{RIGHT_MARK}right file")),
+            "CTRL-W b must focus the right editor group; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("{LEFT_MARK}left file")),
+            "the left pane's earlier marker must still be painted — `b` \
+             moves focus, it does not retype into the left buffer; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1162 acceptance, painted-output tier, single-group half: with one
+    /// editor group split into two vim windows (`:vsplit`), `CTRL-W t` /
+    /// `CTRL-W b` must move the caret between the two panes.
+    ///
+    /// Both panes show the same buffer, so the marker trick used by
+    /// `ctrl_w_t_and_b_cross_editor_groups_via_shell_app` cannot tell them
+    /// apart — this reads the real terminal caret instead (the same painted
+    /// signal the #1039 tests above use) and checks which half of the
+    /// 160-column frame it lands in. The fixture hides the sidebar, so the
+    /// two panes split the full width and the midpoint is the divider.
+    ///
+    /// RED against unfixed develop: `t`/`b` walked `group_layout` only, and
+    /// a `:vsplit` leaves a single editor group — both were no-ops, so the
+    /// caret never left the pane `split_window` made active and the two
+    /// recorded positions were identical.
+    #[test]
+    fn ctrl_w_t_and_b_move_the_caret_between_split_panes_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_split_shaped_buffer(), config(), 160, 30);
+
+        driver.ctrl_char('w');
+        driver.type_char('t');
+        driver.type_char('i');
+        let top_left = driver
+            .terminal_cursor_position()
+            .expect("insert-mode caret should reach the frame after CTRL-W t");
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.ctrl_char('w');
+        driver.type_char('b');
+        driver.type_char('i');
+        let bottom_right = driver
+            .terminal_cursor_position()
+            .expect("insert-mode caret should reach the frame after CTRL-W b");
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        assert!(
+            top_left.0 < 80,
+            "CTRL-W t must put the caret in the left pane, got {top_left:?}; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            bottom_right.0 >= 80,
+            "CTRL-W b must put the caret in the right pane, got \
+             {bottom_right:?}; screen:\n{}",
+            driver.screen()
         );
     }
 
@@ -11435,7 +19193,7 @@ mod tests {
     fn hamburger_click_paints_menu_bar_immediately_via_shell_app() {
         let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW_HAMBURGER_MARKER");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         // Prime the runner off the hamburger's default-active slot
         // (`AppShell::new` activates panel index 0, the hamburger) so the
@@ -11596,12 +19354,14 @@ mod tests {
     }
 
     /// `handle_key_pressed`'s context-menu branch must dispatch the
-    /// confirmed item's action to [`handle_explorer_context_action`]
-    /// (mirrors `mod.rs:2703`-`:2706`) — unlike `Engine::handle_key`'s own
-    /// context-menu branch (`keys.rs:66`-`:71`), which consumes the key but
-    /// silently discards the resulting action. Confirms the first item
-    /// ("New File...", action `"new_file"`) of a folder context menu and
-    /// asserts on `explorer_new_entry_pending`, the observable side effect
+    /// confirmed item's action to [`render::apply_explorer_context_action`]
+    /// (#1418, the shared applier `handle_explorer_context_action` used to
+    /// be before both backends' hand-rolled copies converged onto it) —
+    /// unlike `Engine::handle_key`'s own context-menu branch
+    /// (`keys.rs:66`-`:71`), which consumes the key but silently discards
+    /// the resulting action. Confirms the first item ("New File...", action
+    /// `"new_file"`) of a folder context menu and asserts on
+    /// `explorer_new_entry_pending`, the observable side effect
     /// `dispatch_explorer_crud(ExplorerAction::NewFile)` produces.
     #[test]
     fn handle_key_pressed_context_menu_dispatches_explorer_action() {
@@ -11635,8 +19395,9 @@ mod tests {
         );
         assert!(
             engine.explorer_new_entry_pending.is_some(),
-            "the 'New File...' action should reach `handle_explorer_context_action` \
-             and dispatch `ExplorerAction::NewFile`"
+            "the 'New File...' action should reach \
+             `render::apply_explorer_context_action` and dispatch \
+             `ExplorerAction::NewFile`"
         );
     }
 
@@ -11779,6 +19540,82 @@ mod tests {
             !engine.message.contains("Copied") && !engine.message.contains("clipboard"),
             "no copy should happen on a non-Ctrl+C key; message: {}",
             engine.message
+        );
+    }
+
+    /// #1239: `sync_tui_clipboard` (now a thin wrapper over
+    /// `render::sync_register_to_clipboard`, matching GTK's
+    /// `App::sync_plus_register_to_clipboard`) must mirror the explicit `+`
+    /// register ahead of the unnamed `"` register, not `"` alone.
+    ///
+    /// `"+yy` writes both `+` and `"` to the same content (`set_register_typed`
+    /// always copies a named-register write into `"` too), so that alone
+    /// can't distinguish the two priorities — the divergence only shows up
+    /// once something *else* changes `"` without touching `+`. A plain `dd`
+    /// with no register prefix is exactly that: it only ever touches the
+    /// unnamed register. Pre-fix `sync_tui_clipboard` mirrored `"` only, so
+    /// this second delete would wrongly clobber the clipboard with the
+    /// deleted line instead of leaving the explicitly-yanked one in place.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `sync_tui_clipboard` body (mirrors `"` only), the final assertion
+    /// failed — the captured clipboard content was `"BBBB\n"` (the `dd`'s
+    /// deleted line) instead of `"AAAA\n"` (the `"+yy`'d line).
+    #[test]
+    fn handle_key_pressed_clipboard_prioritizes_explicit_plus_register_over_unnamed_1239() {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "AAAA\nBBBB\n");
+        let captured = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+        let captured_hook = std::rc::Rc::clone(&captured);
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *captured_hook.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        let mut sidebar = TuiSidebar::new();
+        let mut folder_picker = None;
+        let mut backend = backend_at(80.0, 24.0);
+        let mut scratch = KeyScratch::new();
+
+        let mut press = |ch: char| {
+            let _ = handle_key_pressed(
+                quadraui::Key::Char(ch),
+                quadraui::Modifiers::default(),
+                false,
+                &mut engine,
+                &mut sidebar,
+                &mut folder_picker,
+                false,
+                80,
+                24,
+                &mut backend,
+                &mut scratch.state(),
+            );
+        };
+
+        // `"+yy`: explicit write to the `+` register. `set_register_typed`
+        // also copies it into `"`, so both hold "AAAA\n" afterward.
+        for ch in ['"', '+', 'y', 'y'] {
+            press(ch);
+        }
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "\"+yy must push the explicitly-yanked line to the clipboard"
+        );
+
+        press('j'); // move to line 1 ("BBBB") — no register change.
+
+        // `dd`: a plain, no-register delete only ever touches `"`, never `+`.
+        for ch in ['d', 'd'] {
+            press(ch);
+        }
+
+        assert_eq!(
+            captured.borrow().as_deref(),
+            Some("AAAA\n"),
+            "a plain delete must not clobber the clipboard mirror of an \
+             explicit `+` register write — TUI used to mirror `\"` only \
+             (#1239)"
         );
     }
 
@@ -11950,8 +19787,8 @@ mod tests {
     #[test]
     fn post_key_epilogue_scrolls_the_quickfix_selection_into_view() {
         let mut engine = Engine::new();
-        engine.quickfix_open = true;
-        engine.quickfix_selected = 9;
+        engine.quickfix.open = true;
+        engine.quickfix.selected = 9;
         let mut sidebar = TuiSidebar::new();
         let mut folder_picker = None;
         let mut backend = backend_at(80.0, 24.0);
@@ -11976,7 +19813,7 @@ mod tests {
         // 6 panel rows − 1 header = 5 visible; selection 9 ⇒ top 5.
         assert_eq!(scratch.quickfix_scroll_top, 5);
 
-        engine.quickfix_open = false;
+        engine.quickfix.open = false;
         handle_key_pressed(
             quadraui::Key::Named(quadraui::NamedKey::Escape),
             quadraui::Modifiers::default(),
@@ -12070,9 +19907,16 @@ mod tests {
     /// cursor, off the narrow visible editor column in this fixture's
     /// wide-sidebar layout, which is itself further evidence the paste went
     /// to the wrong place rather than nowhere at all).
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own overlay setup
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn ctrl_v_paste_reaches_the_find_replace_overlay_via_clipboard_paste_event() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "fn main() {}\n");
         app.engine.find_replace_open = true;
         app.engine.find_replace_focus = 0; // query field
@@ -12129,9 +19973,16 @@ mod tests {
     /// arm) to a no-op and re-running this test fails it — the rendered
     /// line still shows the marker with a literal 'h' appended instead of
     /// losing its trailing character.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore
+    /// extra windows/scroll state before the fixture's own marker insert
+    /// runs — red on a dev box with a saved session for this repo path,
+    /// green in CI where no such session exists.
     #[test]
     fn ctrl_h_backspaces_in_insert_mode_via_shell_app() {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         let marker = "ZQXW804MARK";
         app.engine.buffer_mut().insert(0, marker);
         app.engine.mode = crate::core::Mode::Insert;
@@ -12771,6 +20622,264 @@ mod tests {
         );
     }
 
+    /// #1381: the explorer's filetype glyph must paint in the same colour
+    /// the tab bar uses for that file (`render::tab_icon_color` /
+    /// `icons::file_icon_color_for_name`), not the default foreground — and
+    /// a folder row must stay uncoloured (default fg), proving the colour
+    /// is filetype-specific, not a blanket recolor of every icon cell.
+    ///
+    /// Reads the *painted* icon cell's `fg` via `styled_row` — never engine
+    /// state — per the "rendered output, not state" rule: `Icon.color`
+    /// could be populated on the `TreeRow` while nothing paints it (the
+    /// #587/#592 shape), and a test asserting only that would pass against
+    /// that bug.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Pre-#1381, `build_explorer_tree_rows` builds every file icon with
+    /// `QIcon::new(glyph, ".")` and never calls `.with_color(..)`, so
+    /// `Icon.color` is `None` and quadraui's `draw_tree` paints the glyph
+    /// in the row's `default_fg` — identical to the folder row's fg. The
+    /// `assert_ne!` between the two, and the `assert_eq!` against the tab
+    /// bar's colour, both fail.
+    #[test]
+    fn explorer_file_icon_paints_in_the_tab_bar_s_filetype_colour() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1381_explorer_icon_color_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rust_file = dir.join("main.rs");
+        std::fs::write(&rust_file, "fn main() {}\n").unwrap();
+        let subdir = dir.join("srcdir1381");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&rust_file);
+        // Read the fixture's own resolved theme before `app` moves into the
+        // driver (see `focus_change_does_not_move_either_panes_text_via_
+        // shell_app`'s doc comment for why: it must match whatever colour
+        // this fixture actually paints with, not a hardcoded theme that
+        // could silently drift from it).
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        crate::icons::set_nerd_fonts(prev_nf);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let file_bounds = driver
+            .find_bounds("main.rs")
+            .expect("main.rs row should be painted in the explorer");
+        let dir_bounds = driver
+            .find_bounds("srcdir1381")
+            .expect("folder row should be painted in the explorer");
+
+        // Icon layout (`quadraui::tui::draw_tree`): a 1-codepoint glyph
+        // followed by a single space cell immediately precedes the row's
+        // text — both the Rust glyph (`FILE_RUST.nerd`) and the folder
+        // glyph (`FOLDER.nerd`) are single codepoints, so the icon column
+        // is always 2 cells left of where the name text starts.
+        let file_icon_col = file_bounds.x as usize - 2;
+        let dir_icon_col = dir_bounds.x as usize - 2;
+
+        let file_row = driver.styled_row(file_bounds.y as u16);
+        let dir_row = driver.styled_row(dir_bounds.y as u16);
+        let (file_icon_ch, file_icon_style) = file_row[file_icon_col];
+        let (dir_icon_ch, dir_icon_style) = dir_row[dir_icon_col];
+
+        assert_eq!(
+            file_icon_ch,
+            crate::icons::FILE_RUST.nerd.chars().next().unwrap(),
+            "main.rs's icon cell must be the Rust glyph"
+        );
+        assert_eq!(
+            dir_icon_ch,
+            crate::icons::FOLDER.nerd.chars().next().unwrap(),
+            "the folder row's icon cell must be the folder glyph"
+        );
+
+        let (r, g, b) = crate::icons::file_icon_color_for_name("main.rs");
+        let expected_rust_fg = quadraui::tui::ratatui_color(Color::from_rgb(r, g, b));
+        let default_fg =
+            quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).foreground);
+
+        assert_eq!(
+            file_icon_style.fg, expected_rust_fg,
+            "main.rs's explorer icon must paint in the same colour the tab \
+             bar uses for a .rs file"
+        );
+        assert_eq!(
+            dir_icon_style.fg, default_fg,
+            "a folder row's icon must stay the default foreground, not a \
+             filetype colour"
+        );
+        assert_ne!(
+            file_icon_style.fg, dir_icon_style.fg,
+            "the coloured file icon and the uncoloured folder icon must be \
+             visibly different, proving the colour is filetype-specific"
+        );
+    }
+
+    // ── #1051: explorer paints VS Code's 'U' for untracked, not git's '?' ──
+
+    /// The explorer's git-status badge for an untracked file must be VS
+    /// Code's `U`, not git's own `--porcelain` `?` notation leaking into the
+    /// UI — and a modified file's badge must still read `M`, proving the
+    /// fix didn't just blanket-recolor/relabel every status. Reads the
+    /// *painted* badge glyph (`styled_row`, cell-by-cell), never
+    /// `engine.sc_file_statuses` — that field was already populated with
+    /// `StatusKind::Untracked` before this fix; the bug was entirely in
+    /// what character `StatusKind::label()` painted from it.
+    ///
+    /// RED against unfixed `develop`: the untracked row's badge cell holds
+    /// `?`, so the first assertion fails.
+    #[test]
+    fn explorer_tree_paints_u_for_untracked_not_git_porcelain_question_mark() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1051_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .ok();
+        // Short names: the explorer sidebar column is narrow, and a longer
+        // name (e.g. "untracked1051.txt") truncates before the badge column
+        // — `find_bounds` on the full name would then never match.
+        let untracked_file = dir.join("u1051.txt");
+        let modified_file = dir.join("m1051.txt");
+        std::fs::write(&untracked_file, "new\n").unwrap();
+        std::fs::write(&modified_file, "changed\n").unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "u1051.txt".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Untracked),
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "m1051.txt".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            },
+        ];
+        app.engine.explorer_reveal_path(&untracked_file);
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+
+        let untracked_bounds = driver
+            .find_bounds("u1051.txt")
+            .expect("untracked file row should be painted in the explorer");
+        let modified_bounds = driver
+            .find_bounds("m1051.txt")
+            .expect("modified file row should be painted in the explorer");
+
+        let untracked_row = driver.styled_row(untracked_bounds.y as u16);
+        let modified_row = driver.styled_row(modified_bounds.y as u16);
+
+        // The badge is right-aligned within the explorer tree's own area,
+        // well before the editor pane begins (`draw_tree` clears the whole
+        // tree area to background before painting text/badge) — the first
+        // non-space cell after the filename ends is the badge glyph.
+        let badge_after = |row: &[(char, _)], name_end_x: usize| {
+            row.iter()
+                .skip(name_end_x)
+                .map(|(c, _)| *c)
+                .find(|c| *c != ' ')
+        };
+
+        let untracked_badge = badge_after(
+            &untracked_row,
+            (untracked_bounds.x + untracked_bounds.width) as usize,
+        );
+        let modified_badge = badge_after(
+            &modified_row,
+            (modified_bounds.x + modified_bounds.width) as usize,
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            untracked_badge,
+            Some('U'),
+            "untracked file's explorer badge must be VS Code's 'U', not \
+             git's own '?' porcelain notation"
+        );
+        assert_eq!(
+            modified_badge,
+            Some('M'),
+            "modified file's explorer badge must still read 'M'"
+        );
+    }
+
+    /// #1051: VS Code paints the untracked badge green — the same family as
+    /// Added — distinct from Modified's orange/yellow. Swapping
+    /// `StatusKind::Untracked::label()` from `?` to `U` alone would have
+    /// left `populate_sc_sidebar_system`'s color match falling through its
+    /// `_ => mod_fg` arm (the same arm `?` used to hit), painting the
+    /// now-correct `U` glyph in the *wrong* color — indistinguishable from
+    /// an ordinary Modified row. This reads the actual painted cell color
+    /// (`styled_row`'s `CellStyle`), not just the glyph.
+    ///
+    /// RED against a fix that only swaps the letter (no color arm added):
+    /// the untracked badge's `fg` equals the modified badge's `fg`.
+    #[test]
+    fn sc_panel_paints_untracked_badge_in_a_distinct_color_from_modified() {
+        // Short names: the SC panel column is narrow and a longer name
+        // (e.g. "untracked1051.txt") truncates before it fully paints, so
+        // `find_bounds` on the full name would never match.
+        let porcelain = "?? u1051.txt\n M m1051.txt\n";
+        let app = sc_app_with_porcelain(porcelain);
+        let driver = driver_with_shell(app, config(), 100, 30);
+
+        let untracked_bounds = driver
+            .find_bounds("u1051.txt")
+            .expect("untracked row should be painted in the SC panel");
+        let modified_bounds = driver
+            .find_bounds("m1051.txt")
+            .expect("modified row should be painted in the SC panel");
+
+        let untracked_row = driver.styled_row(untracked_bounds.y as u16);
+        let modified_row = driver.styled_row(modified_bounds.y as u16);
+
+        // `populate_sc_sidebar_system`'s `file_row` closure paints the
+        // status glyph as its own span, immediately followed by a literal
+        // space then the path — so the glyph sits exactly 2 cells before
+        // where the filename text starts (see `draw_tree`'s leaf leading
+        // gap + the "<ch> <path>" span layout).
+        let untracked_badge_x = untracked_bounds.x as usize - 2;
+        let modified_badge_x = modified_bounds.x as usize - 2;
+
+        let (untracked_ch, untracked_style) = untracked_row[untracked_badge_x];
+        let (modified_ch, modified_style) = modified_row[modified_badge_x];
+
+        assert_eq!(
+            untracked_ch, 'U',
+            "untracked row's SC panel badge glyph must be 'U'"
+        );
+        assert_eq!(
+            modified_ch, 'M',
+            "modified row's SC panel badge glyph must remain 'M'"
+        );
+        assert_ne!(
+            untracked_style.fg, modified_style.fg,
+            "untracked (VS Code: green, same family as Added) and modified \
+             (orange/yellow) badges must not share a color"
+        );
+    }
+
     // ── Minimap (#35) ───────────────────────────────────────────────────
 
     /// Buffer with a lopsided indentation shape, long enough that the
@@ -12829,6 +20938,397 @@ mod tests {
         app
     }
 
+    /// [`app_with_split_shaped_buffer`]'s sibling, split *horizontally*
+    /// (`:split`) instead: the two panes stack, so the boundary between
+    /// them is a screen **row** and `CTRL-W +`/`CTRL-W -` move it. Same
+    /// sidebar/autohide pinning, for the same reason.
+    fn app_with_hsplit_shaped_buffer() -> TuiShellApp {
+        let mut app = app_with_shaped_buffer();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine.split_window(SplitDirection::Horizontal, None);
+        app
+    }
+
+    /// Row of the **lower** pane's first painted buffer line in a
+    /// horizontal split — i.e. where the pane boundary currently sits,
+    /// located from painted content rather than from coordinates (or from
+    /// `WindowLayout`'s ratio, which is exactly the state-not-output
+    /// assertion this repo's testing rules forbid).
+    ///
+    /// Both panes show the same fixture buffer scrolled to its top, so the
+    /// literal `"line 0"` is painted on exactly two rows: the upper pane's
+    /// first content row and the lower pane's. No other fixture line
+    /// contains that substring (`"line 0"` is never a prefix of `"line
+    /// 1"`..`"line 239"` — a digit always follows the `0`), so the second
+    /// hit is the lower pane, wherever status lines, gutter and scrollbars
+    /// happen to put it.
+    fn lower_pane_first_row(screen: &str) -> Option<usize> {
+        let hits: Vec<usize> = screen
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("line 0"))
+            .map(|(row, _)| row)
+            .collect();
+        hits.get(1).copied()
+    }
+
+    /// #1288 acceptance, painted-output tier: `CTRL-W -` / `CTRL-W +` move
+    /// a horizontal split's boundary by an absolute `[count]` **screen
+    /// rows**, exactly like Neovim's `CTRL-W_-` / `CTRL-W_+` — not by a
+    /// fixed 5%-per-count slice of the split's height.
+    ///
+    /// Reads the boundary back out of the painted frame via
+    /// [`lower_pane_first_row`] and asserts the *delta* in rows, so it is
+    /// independent of the exact chrome above/below each pane.
+    ///
+    /// RED-verified against unfixed `develop`: `resize_window_split` moved
+    /// the ratio by `0.05 * count`, so `5<C-w>-` took a fresh 50/50 split
+    /// from 0.50 to 0.25 — on this frame's 36-row split axis a **nine**-row
+    /// jump, not the five rows Vim moves. Confirmed by restoring
+    /// `develop`'s `src/core/engine/windows.rs` + `src/core/window.rs` over
+    /// the fix and re-running: `left: 9, right: 5` on the first assertion.
+    ///
+    /// The `tick()` calls are what the live runner does between event
+    /// batches, and they matter here rather than being ceremony: `tick`'s
+    /// post-paint block is what feeds each pane's *painted* height back
+    /// into `Engine` via `set_viewport_for_window`, and an absolute-count
+    /// resize is only absolute if it measures the split against those real
+    /// sizes. Skip the opening pair and the engine still holds the
+    /// pre-paint estimate `split_window` seeded (41 raw rows against a
+    /// real 36), so every resize comes out ~12% short — `<C-w>-` with no
+    /// count doesn't move the boundary at all. Skip the one after each
+    /// resize and the *next* resize measures from the pre-resize sizes and
+    /// compounds. Hence one tick per event batch, exactly like `mod.rs`'s
+    /// runner.
+    #[test]
+    fn ctrl_w_resize_moves_the_split_boundary_by_an_absolute_count_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_hsplit_shaped_buffer(), config(), 120, 40);
+        driver.tick();
+        driver.tick();
+        let before = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint both panes' first buffer line; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        // `5<C-w>-`: shrink the active (upper) window by five rows, so the
+        // boundary rises by exactly five.
+        driver.type_char('5');
+        driver.ctrl_char('w');
+        driver.type_char('-');
+        driver.tick();
+        let shrunk = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "both panes must still paint their first buffer line after \
+                 `5<C-w>-`; screen:\n{}",
+                driver.screen()
+            )
+        });
+        assert_eq!(
+            before as i64 - shrunk as i64,
+            5,
+            "`5<C-w>-` must move the split boundary up by exactly 5 screen \
+             rows (Vim resizes by an absolute [count], #1288); boundary went \
+             from row {before} to row {shrunk}; screen:\n{}",
+            driver.screen()
+        );
+
+        // `3<C-w>+`: grow it back by three, so the boundary drops by three.
+        driver.type_char('3');
+        driver.ctrl_char('w');
+        driver.type_char('+');
+        driver.tick();
+        let grown = lower_pane_first_row(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "both panes must still paint their first buffer line after \
+                 `3<C-w>+`; screen:\n{}",
+                driver.screen()
+            )
+        });
+        assert_eq!(
+            grown as i64 - shrunk as i64,
+            3,
+            "`3<C-w>+` must move the split boundary down by exactly 3 screen \
+             rows; boundary went from row {shrunk} to row {grown}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// Row of the **upper** pane's first painted buffer line in a
+    /// horizontal split — [`lower_pane_first_row`]'s sibling, giving the
+    /// *first* (rather than second) occurrence of `"line 0"`. Both are
+    /// located from painted content, never from `WindowLayout`'s ratio.
+    fn upper_pane_first_row(screen: &str) -> Option<usize> {
+        screen.lines().position(|line| line.contains("line 0"))
+    }
+
+    /// Count of screen rows starting at `start_row` that still paint
+    /// buffer content (`"line "` followed by a number, per
+    /// `app_with_shaped_buffer`'s fixture text) — i.e. a pane's *content*
+    /// height read back from the painted frame, stopping at the first row
+    /// that isn't buffer text (that pane's own per-window status line, or
+    /// the frame's bottom chrome). Located from painted output, never from
+    /// `WindowRect`.
+    fn contiguous_content_rows(screen: &str, start_row: usize) -> usize {
+        screen
+            .lines()
+            .skip(start_row)
+            .take_while(|line| line.contains("line "))
+            .count()
+    }
+
+    /// #1290 acceptance, painted-output tier: after a resize *and* a
+    /// re-equalize (`CTRL-W =`), an odd-height horizontal split must land
+    /// on Neovim's real 12/11 (first/top pane one row taller than the
+    /// second/bottom), never `WindowLayout::calculate_rects`'s old
+    /// independently-rounded 11/11 tie.
+    ///
+    /// Height 26 was picked empirically (not guessed): probing this
+    /// fixture's content-row counts across a range of frame heights shows
+    /// height 26 is the first that lands the fresh 50/50 split's raw
+    /// content-row axis on an *odd* total, which is the only axis parity
+    /// where the old and new rounding strategies disagree at all — on an
+    /// even axis both strategies agree (each side gets exactly half), so a
+    /// height that happened to be even would pass before and after the fix
+    /// and prove nothing.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily restoring
+    /// `develop`'s `src/core/window.rs` (`SplitTreeMeasure`-based
+    /// `calculate_rects`, rounding each child's share independently) over
+    /// the fix and re-running this exact scenario gives the upper pane 10
+    /// content rows and the lower pane 10 — an equal (11/11-shaped) split,
+    /// not Neovim's asymmetric 12/11. The fix instead gives the upper pane
+    /// 11 content rows and the lower pane 10, a one-row difference in the
+    /// upper pane's favour (matching a live `nvim --headless`'s tie-break,
+    /// per `WindowLayout::calculate_rects`'s doc comment).
+    #[test]
+    fn ctrl_w_equals_reequalizes_an_odd_split_to_the_real_nvim_tie_break_via_shell_app() {
+        let mut driver = driver_with_shell(app_with_hsplit_shaped_buffer(), config(), 120, 26);
+        driver.tick();
+        driver.tick();
+
+        // Knock the fresh 50/50 split off-centre first, so re-equalizing
+        // is actually exercising `CTRL-W =`'s own math rather than just
+        // reading back the split's untouched initial ratio.
+        driver.type_char('5');
+        driver.ctrl_char('w');
+        driver.type_char('-');
+        driver.tick();
+
+        driver.ctrl_char('w');
+        driver.type_char('=');
+        driver.tick();
+
+        let screen = driver.screen();
+        let top0 = upper_pane_first_row(&screen).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint the upper pane's first buffer line; screen:\n{}",
+                screen
+            )
+        });
+        let boundary = lower_pane_first_row(&screen).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint the lower pane's first buffer line; screen:\n{}",
+                screen
+            )
+        });
+        let top_h = contiguous_content_rows(&screen, top0);
+        let bot_h = contiguous_content_rows(&screen, boundary);
+
+        assert_eq!(
+            top_h as i64 - bot_h as i64,
+            1,
+            "`CTRL-W =` on an odd-height split must give the upper (first) \
+             pane exactly one more content row than the lower (second) \
+             pane (Neovim's real 12/11 tie-break), not an equal split; got \
+             upper={top_h} rows, lower={bot_h} rows; screen:\n{}",
+            screen
+        );
+    }
+
+    /// Column of the left pane's own per-window scrollbar-strip glyph
+    /// (`'⢸'`, painted at the right edge of *each* window's content area) on
+    /// the first content row that carries one — a stand-in for "where does
+    /// the left pane's content area end", located from painted content
+    /// rather than from `WindowLayout`'s ratio (#1289). In a `:vsplit` this
+    /// glyph paints once per pane per content row (two occurrences per row,
+    /// left pane's then right pane's), so the *first* hit is always the
+    /// left (active, maximized-into) pane's own strip, regardless of
+    /// whether the right pane is wide enough to paint one of its own.
+    fn left_pane_scrollbar_col(screen: &str) -> Option<usize> {
+        screen
+            .lines()
+            .find_map(|line| line.char_indices().find(|(_, c)| *c == '⢸').map(|(i, _)| i))
+    }
+
+    /// #1289 acceptance, painted-output tier: `CTRL-W |` (maximize width)
+    /// shrinks the *other* window down to its real `'winminwidth'` floor (1
+    /// column), not a fixed 90/10 split — so on a wide-enough terminal the
+    /// active (left) pane's content area, and so its own painted
+    /// right-edge scrollbar strip, should get pushed almost all the way to
+    /// the frame's right edge, not just to ~90% of the width.
+    ///
+    /// RED-verified against unfixed `develop`: restoring `develop`'s
+    /// `src/core/engine/windows.rs` + `src/core/window.rs` over the fix and
+    /// re-running moved the strip from column 101 (fresh 50/50 split) to
+    /// only column 169 on this test's 200-col frame — short of the `WIDTH -
+    /// 20` (180) assertion below, because the flat `0.9` ratio it used
+    /// ignores the split's actual raw column count. The fix instead lands
+    /// it at column 188.
+    ///
+    /// Same `tick()`-per-event-batch precondition as
+    /// `ctrl_w_resize_moves_the_split_boundary_by_an_absolute_count_via_shell_app`
+    /// (#1288's doc comment on that test has the full account): the
+    /// maximize math reads each window's *painted* raw column count via
+    /// `Engine::windows`, which only reflects reality once `tick`'s
+    /// post-paint `set_viewport_for_window` sync has run at least once after
+    /// the split.
+    #[test]
+    fn ctrl_w_bar_maximizes_width_to_the_real_winminwidth_floor_via_shell_app() {
+        const WIDTH: u16 = 200;
+        const HEIGHT: u16 = 30;
+
+        let mut driver = driver_with_shell(app_with_split_shaped_buffer(), config(), WIDTH, HEIGHT);
+        driver.tick();
+        driver.tick();
+        let before = left_pane_scrollbar_col(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "fixture must paint a per-window scrollbar strip; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        driver.ctrl_char('w');
+        driver.type_char('|');
+        driver.tick();
+        let after = left_pane_scrollbar_col(&driver.screen()).unwrap_or_else(|| {
+            panic!(
+                "the maximized left pane must still paint its own \
+                 scrollbar strip after `<C-w>|`; screen:\n{}",
+                driver.screen()
+            )
+        });
+
+        assert!(
+            after > before,
+            "`<C-w>|` must push the left (active) pane's content area \
+             further right, not leave it in place; before col {before}, \
+             after col {after}; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            after as u16 >= WIDTH - 20,
+            "`<C-w>|` must shrink the other window down to its real \
+             1-column 'winminwidth' floor, not a fixed 90/10 split — \
+             expected the active pane's scrollbar strip to land within 20 \
+             columns of the {WIDTH}-wide frame's right edge, got column \
+             {after}; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1326 acceptance, painted-output tier: a fresh `<C-w>v` must reserve
+    /// exactly one blank screen column for the vertical divider bar itself,
+    /// matching Neovim (a fresh 80-column `<C-w>v` gives `40`/`39`, never
+    /// `40`/`40`) — not paint the two panes' content flush against each
+    /// other with the divider glyph squeezed into the left pane's own last
+    /// column.
+    ///
+    /// Minimap off, so the left pane's own right-edge scrollbar track (`'█'`
+    /// thumb / `'░'` track, per `draw_editor`) is unambiguous — with the
+    /// minimap on, its braille density pattern can coincidentally contain
+    /// the same glyphs used elsewhere on the row, at the wrong column.
+    ///
+    /// Asserts the one fact that genuinely distinguishes "the divider has
+    /// its own reserved column" from "the divider shares the left pane's
+    /// own last column": **the scrollbar strip and the divider glyph paint
+    /// on the very same row, in adjacent-but-distinct columns.** Before
+    /// #1326 the two were mutually exclusive on any given row — `render_
+    /// impl.rs`'s old `vertical_separator_cells` only painted the divider
+    /// glyph into the shared cell when the left window had *no* scrollbar
+    /// (`has_scroll`'s guard, needed because both used to compete for the
+    /// same cell when there was no real gap between the panes) — so a row
+    /// with a visible scrollbar strip could never also show a divider glyph
+    /// immediately beside it. Both panes share `app_with_shaped_buffer`'s
+    /// 240-line fixture, taller than any test viewport here, so every
+    /// content row overflows and paints a scrollbar strip.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily restoring
+    /// `develop`'s `src/core/window.rs` (`layout_snapped`'s `Vertical` arm,
+    /// zero reserved divider thickness — so `a.rect`/`b.rect` touch exactly,
+    /// `gap == 0`) and `src/tui_main/render_impl.rs` (`vertical_separator_
+    /// cells`'s pre-#1326 zero-gap-only logic) over the fix and re-running
+    /// finds no row where a `'█'`/`'░'` scrollbar cell is immediately
+    /// followed by `'│'` at all — every content row's own scrollbar
+    /// (`has_scroll` is true throughout this fixture) suppresses the
+    /// divider glyph entirely in that shared cell.
+    #[test]
+    fn ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app() {
+        let mut app = app_with_split_shaped_buffer();
+        app.engine.settings.minimap = false;
+        let mut driver = driver_with_shell(app, config(), 120, 30);
+        // Same precondition as the other `app_with_split_shaped_buffer`
+        // tests above (see `ctrl_w_resize_moves_the_split_boundary_by_an_
+        // absolute_count_via_shell_app`'s doc comment): the sidebar-hide
+        // this fixture sets on the engine only reconciles into the
+        // runner's own painted `AppShell` at the tail of a dispatch, never
+        // on the very first frame.
+        driver.tick();
+        driver.tick();
+        let screen = driver.screen();
+
+        // A row must paint both panes' `"line "` text (proving it's inside
+        // the split's content area, not sidebar/tab-bar chrome) *and* carry
+        // a scrollbar cell immediately followed by the divider glyph.
+        let mut found: Option<(usize, String)> = None;
+        for line in screen.lines() {
+            if line.match_indices("line ").count() < 2 {
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let Some(div_col) = chars
+                .windows(2)
+                .position(|w| matches!(w[0], '█' | '░') && w[1] == '│')
+                .map(|i| i + 1)
+            else {
+                continue;
+            };
+            found = Some((div_col, line.to_string()));
+            break;
+        }
+
+        let (div_col, row) = found.unwrap_or_else(|| {
+            panic!(
+                "expected a content row painting both panes' \"line \" text \
+                 with a scrollbar cell ('█'/'░') immediately followed by \
+                 the '│' window-divider glyph — i.e. the divider in its \
+                 own reserved column, not sharing the left pane's own last \
+                 column; screen:\n{screen}"
+            )
+        });
+
+        // Sanity: the divider sits strictly between the two panes' text,
+        // not before the left pane's own content or past the right pane's.
+        let text_cols: Vec<usize> = row
+            .char_indices()
+            .filter(|&(_, c)| c == 'l')
+            .filter_map(|(byte_i, _)| {
+                row[byte_i..]
+                    .starts_with("line ")
+                    .then(|| row[..byte_i].chars().count())
+            })
+            .collect();
+        assert!(
+            text_cols.len() >= 2 && text_cols[0] < div_col && div_col < text_cols[1],
+            "the divider (col {div_col}) must sit strictly between the \
+             left and right panes' own \"line \" text columns {text_cols:?}; \
+             row:\n{row}"
+        );
+    }
+
     /// #722 acceptance, painted-output tier: a `:vsplit` must paint **two**
     /// independent minimap strips, one over each pane's own buffer — not a
     /// single strip pinned to whichever pane happens to be active.
@@ -12876,6 +21376,123 @@ mod tests {
             "a `:vsplit` must paint minimap braille in both the left pane \
              and the right pane, not just one; screen:\n{screen}"
         );
+    }
+
+    /// #1066 product decision: converge TUI's editor-viewport wheel scroll
+    /// onto GTK's "scroll the pane under the pointer, not whichever pane
+    /// holds focus" behaviour (`hovered_window_id` in `App::
+    /// handle_mouse_scroll_msg`, `app.rs`). Weighed against keeping the
+    /// divergence: scroll-follows-pointer is the norm in GUI editors, but
+    /// more importantly it is *also* real Vim's own mouse behaviour
+    /// (`:split` panes each scroll independently under the pointer without
+    /// stealing focus) — the terminal-native precedent a "vim-like" editor
+    /// should match, not just GTK parity for its own sake. Routed through
+    /// the same shared primitives GTK already uses
+    /// (`render::find_window_at`, `Engine::
+    /// scroll_viewport_with_cursor_for_window`), so this is TUI-side wiring
+    /// onto existing engine/render infrastructure — no new per-backend
+    /// logic (Platform-Neutrality Rule).
+    ///
+    /// Drives two real files into a horizontal split. `Engine::
+    /// split_window` always makes the *new* window active and — since
+    /// `splitbelow` defaults to `false` — places it *first* on screen, so
+    /// the top pane (file B) ends up focused and the bottom pane (file A,
+    /// the window that was active before the split) ends up unfocused.
+    /// Wheel-scrolling over the bottom pane's own painted text must scroll
+    /// *that* pane's content off screen while leaving the top pane's first
+    /// line untouched.
+    ///
+    /// Asserted purely on the rendered screen: `driver_with_shell` hides
+    /// the concrete `TuiShellApp`/`Engine` behind an opaque `AppLogic` with
+    /// no accessor back out (this module's own doc comment above), so
+    /// there is no internal `scroll_top` for this test to peek at even if
+    /// it wanted to — `find`/`screen_contains` against painted text is the
+    /// only tier available, which is also the tier CLAUDE.md's "Testing"
+    /// section requires.
+    ///
+    /// RED against unfixed `develop`: before this fix, `mouse.rs`'s
+    /// editor-viewport wheel fallback unconditionally called
+    /// `engine.scroll_viewport_with_cursor` — the *active*-window scroll —
+    /// regardless of pointer position, so a wheel event dispatched over
+    /// the unfocused bottom pane's own text actually scrolled the focused
+    /// top pane instead: "AAA1066_000" (bottom pane) would have stayed on
+    /// screen and "BBB1066_000" (top, focused pane) would have scrolled off
+    /// — i.e. the two assertions below inverted. Confirmed by hand:
+    /// reverting the `find_window_at`/`_for_window` routing in `mouse.rs`
+    /// back to a bare `engine.scroll_viewport_with_cursor(dir, 3)` call
+    /// flips both assertions and fails this test.
+    #[test]
+    fn wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1066_hovered_pane_scroll_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1066.txt"); // becomes the unfocused (bottom) pane
+        let file_b = dir.join("b1066.txt"); // becomes the focused (top) pane
+        let content_a: String = (0..80).map(|i| format!("AAA1066_{i:03}\n")).collect();
+        let content_b: String = (0..80).map(|i| format!("BBB1066_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let mut driver = driver_with_shell(app, config(), 120, 40);
+        // Warm-up dispatch: the very first frame `driver_with_shell` paints
+        // reflects the *runner*'s own `AppShell` sidebar-visibility default,
+        // not yet the engine's (the "shadow"'s) state set above — that only
+        // reconciles at the tail of a dispatch (see this module's doc
+        // comment on the runner/shadow bridge). A no-op mouse move forces
+        // one reconcile pass so `last_layout`'s window rects and the
+        // painted screen agree before any coordinate is read off either.
+        driver.mouse_move(0.0, 0.0);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1066_000") && screen.contains("BBB1066_000"),
+            "both panes must paint their own first line before any \
+             scroll; screen:\n{screen}"
+        );
+
+        let (ax, ay) = driver
+            .find("AAA1066_000")
+            .expect("the unfocused pane's first line must be painted somewhere");
+
+        // Wheel *down* — `delta.y < 0.0` is quadraui's convention for a
+        // downward notch (see `synth_mouseevent` in quadraui's
+        // `tui/events.rs`) — dispatched at the point the unfocused pane's
+        // own text painted at, several notches so the first line is well
+        // clear of the viewport rather than borderline.
+        for _ in 0..4 {
+            driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                position: quadraui::Point::new(ax, ay),
+                delta: quadraui::ScrollDelta::new(0.0, -1.0),
+            });
+        }
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("AAA1066_000"),
+            "wheel over the unfocused pane must scroll it — its first \
+             line should have scrolled off screen; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("BBB1066_000"),
+            "wheel over the unfocused pane must NOT scroll the focused \
+             pane — its first line should be untouched; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #722 acceptance, painted-output tier: switching focus between panes
@@ -12994,6 +21611,984 @@ mod tests {
         );
     }
 
+    /// #1291 acceptance, painted-output tier: `CTRL-W r` must rotate window
+    /// *identity* — which window's content and focus land in which screen
+    /// slot — not just swap `buffer_id`/view content across fixed screen
+    /// positions while focus stays pinned to the same slot.
+    ///
+    /// Drives two real files into a horizontal split, the same fixture
+    /// shape `wheel_scrolls_the_hovered_pane_not_the_focused_one_via_shell_app`
+    /// (#1066) uses above: `Engine::split_window` always makes the new
+    /// window (file B) active and, since `splitbelow` defaults to `false`,
+    /// places it *first* (top) on screen — so before the rotate the top
+    /// pane shows file B's content and holds focus (the painted block
+    /// cursor), and the bottom pane shows file A's content and is
+    /// unfocused.
+    ///
+    /// With only two windows, a single `<C-w>r` is a straight swap of
+    /// which slot each window occupies (Neovim's own behaviour, confirmed
+    /// against the live oracle by `tests/nvim_conformance.rs`'s `win:
+    /// CTRL-W r rotates windows downward/rightward` case). Because
+    /// `rotate_windows` now permutes `WindowId`s through the
+    /// `WindowLayout` tree rather than copying content across fixed
+    /// slots, file A's content *and* the previously-unfocused window's
+    /// identity move to the top slot, while file B's content, its
+    /// still-active window, and the block cursor move to the bottom slot.
+    ///
+    /// RED against unfixed `rotate_windows` (pre-#1291): that version
+    /// swapped `buffer_id`/`view` across the two static `WindowLayout`
+    /// leaf slots while leaving `Tab::active_window` — and so the painted
+    /// block cursor — pinned to the top slot. The content assertion below
+    /// would still have passed (the two panes' text does swap either way),
+    /// but the cursor-follows-focus assertion would have failed: the
+    /// cursor cell would stay in the top slot (now painting file A) rather
+    /// than following file B's window down to the bottom slot. Confirmed
+    /// by hand: reverting `rotate_windows` to the pre-#1291 slot-swap
+    /// implementation flips the final assertion.
+    #[test]
+    fn ctrl_w_r_rotates_window_identity_and_focus_not_just_content_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1291_rotate_identity_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1291.txt"); // bottom pane, unfocused, before rotate
+        let file_b = dir.join("b1291.txt"); // top pane, focused, before rotate
+        let content_a: String = (0..40).map(|i| format!("AAA1291_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("BBB1291_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        // Read the fixture's own resolved theme before `app` moves into
+        // the driver, the same way `focus_change_does_not_move_either_
+        // panes_text_via_shell_app` above does, so the cursor-cell scan
+        // matches whatever colour this fixture actually paints with.
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        // Warm-up dispatch: force one reconcile pass so the runner's
+        // painted `AppShell` sidebar/autohide state agrees with the
+        // engine's pinned state before anything is read off the screen
+        // (see #1066's fixture doc comment above for the full mechanism).
+        driver.mouse_move(0.0, 0.0);
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1291_000") && screen.contains("BBB1291_000"),
+            "both panes must paint their own first line before any \
+             rotate; screen:\n{screen}"
+        );
+        let (_, a_row_before) = driver
+            .find("AAA1291_000")
+            .expect("file A's first line must be painted somewhere");
+        let (_, b_row_before) = driver
+            .find("BBB1291_000")
+            .expect("file B's first line must be painted somewhere");
+        assert!(
+            b_row_before < a_row_before,
+            "test setup sanity: file B (the new, active window) must \
+             start in the top slot before the rotate; B row \
+             {b_row_before}, A row {a_row_before}"
+        );
+        let cell_before = cursor_cell(&driver, cursor_bg)
+            .expect("the active (top, file B) pane must paint a block cursor cell");
+        assert!(
+            (cell_before.1 as f32) < a_row_before,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's row {a_row_before}; cursor \
+             cell {cell_before:?}"
+        );
+
+        driver.ctrl_char('w');
+        driver.type_char('r');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1291_000") && screen.contains("BBB1291_000"),
+            "both panes must still paint their own first line after \
+             `<C-w>r`; screen:\n{screen}"
+        );
+        let (_, a_row_after) = driver
+            .find("AAA1291_000")
+            .expect("file A's first line must still be painted somewhere");
+        let (_, b_row_after) = driver
+            .find("BBB1291_000")
+            .expect("file B's first line must still be painted somewhere");
+        assert!(
+            a_row_after < b_row_after,
+            "`<C-w>r` on two windows must swap which slot each window's \
+             content paints in — file A should now be in the top slot \
+             and file B in the bottom slot; A row {a_row_after}, B row \
+             {b_row_after}; screen:\n{screen}"
+        );
+
+        let cell_after = cursor_cell(&driver, cursor_bg).expect(
+            "the still-active (file B) pane must paint a block cursor \
+             cell after the rotate",
+        );
+        assert!(
+            (cell_after.1 as f32) > a_row_after,
+            "`<C-w>r` must move focus (and so the painted block-cursor \
+             cell) to follow the window that was active before the \
+             rotate (file B) down into its new, bottom slot — not leave \
+             it pinned to the top (now file A's) slot; file A row \
+             {a_row_after}, cursor cell {cell_after:?}; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1292 acceptance, painted-output tier: `CTRL-W p` must return focus
+    /// (the painted block cursor) to the window that was active
+    /// immediately before the current one, at the *tab*/split level —
+    /// distinct from `prev_active_group`'s VSCode-editor-group toggle,
+    /// which is a no-op with a single group.
+    ///
+    /// Fixture shape matches the #1291 rotate test just above: split two
+    /// distinguishable files horizontally. `Engine::split_window` makes
+    /// the new window (file B) active and, since `splitbelow` defaults to
+    /// `false`, places it in the *top* slot — so after the split, file B
+    /// (top) holds focus and file A (bottom) doesn't. `<C-w>w` then cycles
+    /// focus to file A (bottom) — with exactly two windows this also
+    /// happens to be `<C-w>p`'s expected target on the very next press.
+    ///
+    /// RED against unfixed `execute_wincmd`'s `'p'` arm (pre-#1292): that
+    /// version only restored `prev_active_group` — the VSCode-style
+    /// editor-group tree, which has never changed here (there's only ever
+    /// one group in this fixture) — so `<C-w>p` was a no-op and the
+    /// cursor stayed in file A's (bottom) pane. Confirmed by hand:
+    /// reverting `execute_wincmd`'s `'p'` arm to the pre-#1292
+    /// group-only version flips the final assertion.
+    #[test]
+    fn ctrl_w_p_returns_focus_to_the_previously_active_window_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1292_prev_window_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1292.txt"); // bottom pane, before/after
+        let file_b = dir.join("b1292.txt"); // top pane, active right after split
+        let content_a: String = (0..40).map(|i| format!("AAA1292_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("BBB1292_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let (_, a_row) = driver
+            .find("AAA1292_000")
+            .expect("file A's first line must be painted somewhere");
+        let (_, b_row) = driver
+            .find("BBB1292_000")
+            .expect("file B's first line must be painted somewhere");
+        assert!(
+            b_row < a_row,
+            "test setup sanity: file B (the new, active window) must \
+             start in the top slot; B row {b_row}, A row {a_row}"
+        );
+        let cell_after_split = cursor_cell(&driver, cursor_bg)
+            .expect("the active (top, file B) pane must paint a block cursor cell");
+        assert!(
+            (cell_after_split.1 as f32) < a_row,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's row {a_row}; cursor cell \
+             {cell_after_split:?}"
+        );
+
+        // Cycle focus to the other window (file A, bottom).
+        driver.ctrl_char('w');
+        driver.type_char('w');
+        driver.render();
+
+        let cell_after_cycle = cursor_cell(&driver, cursor_bg)
+            .expect("the newly-focused (bottom, file A) pane must paint a block cursor cell");
+        assert!(
+            (cell_after_cycle.1 as f32) > b_row,
+            "test setup sanity: `<C-w>w` must move focus to the bottom \
+             (file A) pane; file B row {b_row}, cursor cell \
+             {cell_after_cycle:?}"
+        );
+
+        // `<C-w>p` must return focus to the window active immediately
+        // before this one — file B, back in the top slot.
+        driver.ctrl_char('w');
+        driver.type_char('p');
+        driver.render();
+
+        let screen = driver.screen();
+        let cell_after_prev = cursor_cell(&driver, cursor_bg).expect(
+            "the previously-active (top, file B) pane must paint a \
+             block cursor cell after `<C-w>p`",
+        );
+        // Compare against the two already-observed cursor rows directly
+        // (rather than against `a_row`/`b_row`, the *text* rows, which sit
+        // close enough to the cursor row that a coarse `< a_row` threshold
+        // does not actually discriminate top-pane focus from bottom-pane
+        // focus — confirmed by hand: that weaker assertion stayed green
+        // even with `execute_wincmd`'s `'p'` arm reverted to its pre-#1292
+        // group-only version). `<C-w>p` must land the cursor back on
+        // exactly the row it painted right after the split (top, file B),
+        // not the row it moved to after `<C-w>w` (bottom, file A).
+        assert_eq!(
+            cell_after_prev.1,
+            cell_after_split.1,
+            "`<C-w>p` must move focus (and so the painted block-cursor \
+             cell) back to the window that was active immediately \
+             before the current one (file B, top slot, row \
+             {split_row}) — not leave it on file A (bottom slot, row \
+             {cycle_row}); cursor cell {cell_after_prev:?}; \
+             screen:\n{screen}",
+            split_row = cell_after_split.1,
+            cycle_row = cell_after_cycle.1,
+        );
+        assert_ne!(
+            cell_after_prev.1, cell_after_cycle.1,
+            "`<C-w>p` must actually move focus away from file A's \
+             (bottom) pane, not stay put; cursor cell {cell_after_prev:?}; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1292 review round 2 (blocking finding), painted-output tier: a
+    /// *mouse* gutter click on a background split pane is a real
+    /// focus-changing call site, so a following `CTRL-W p` must recall the
+    /// pane the click came *from*.
+    ///
+    /// Drives the whole stack the user does: `TuiDriver::click` →
+    /// `tui_main::mouse`'s gutter branch → `render::apply_gutter_action`'s
+    /// `DiagnosticHover` arm → `Tab::focus_window`, then two real
+    /// keystrokes (`<C-w>`, `p`) → `execute_wincmd`'s `'p'` arm — and
+    /// reads the answer off the painted block-cursor cell, never off
+    /// `Tab::prev_window` directly (CLAUDE.md "Testing (CRITICAL)" rule 1:
+    /// assert on rendered output, never on state being populated).
+    ///
+    /// Fixture: file A (bottom pane) carries an LSP error diagnostic on
+    /// line 2, so that line's gutter resolves to
+    /// `GutterAction::DiagnosticHover`. After `split_window` the *new*
+    /// window (file B) is active and — `splitbelow` defaulting to `false`
+    /// — sits in the top slot, so file A's pane is the background one the
+    /// click must move focus into.
+    ///
+    /// **Verified RED against the pre-fix shape** (confirmed by hand):
+    /// reverting `apply_gutter_action`'s `DiagnosticHover` arm to the
+    /// original `engine.active_tab_mut().active_window = window_id;`
+    /// direct assignment leaves `prev_window` pointing at file A — the
+    /// window the click just made active — so `execute_wincmd`'s `'p'`
+    /// arm filters it out (`w != active_window`), falls through to the
+    /// single-group `prev_active_group` no-op, and the painted cursor
+    /// stays in file A's bottom pane. The final assertion flips.
+    #[test]
+    fn gutter_click_on_a_background_pane_then_ctrl_w_p_returns_focus_via_shell_app() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 40;
+
+        // Canonicalize the temp root before joining: on macOS
+        // `std::env::temp_dir()` returns a path under `/var/folders/...`,
+        // and `/var` is a symlink to `/private/var`. `file_a` is opened
+        // below by this un-canonicalized path, but the diagnostic is keyed
+        // by `file_a.canonicalize()` — without canonicalizing here first,
+        // those two paths differ (`/var/...` vs `/private/var/...`), the
+        // lookup misses, no diagnostic renders, and the gutter click this
+        // test exercises never opens the popup it's asserting on (#1350).
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "vimcode_test_1292_gutter_prev_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("ga1292.txt"); // bottom pane, background, carries the diagnostic
+        let file_b = dir.join("gb1292.txt"); // top pane, active right after the split
+        let content_a: String = (0..40).map(|i| format!("GAA1292_{i:03}\n")).collect();
+        let content_b: String = (0..40).map(|i| format!("GBB1292_{i:03}\n")).collect();
+        std::fs::write(&file_a, &content_a).unwrap();
+        std::fs::write(&file_b, &content_b).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        // Diagnostics are keyed by the *canonical* path (that's the key
+        // `build_rendered_window` looks up when filling `diagnostic_gutter`).
+        const DIAG_LINE: u32 = 2;
+        app.engine.lsp_diagnostics.insert(
+            file_a.canonicalize().unwrap(),
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "gutter click focus test".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+        driver.render();
+
+        fn cursor_cell(
+            driver: &quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            cursor_bg: quadraui::tui::testing::Color,
+        ) -> Option<(u16, u16)> {
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    if driver.style_at(x, y).map(|s| s.bg) == Some(cursor_bg) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            None
+        }
+
+        let screen_before = driver.screen();
+        let (diag_x, diag_y) = driver.find("GAA1292_002").unwrap_or_else(|| {
+            panic!("file A's diagnostic line must be painted;\nscreen:\n{screen_before}")
+        });
+        let (_, b_row) = driver.find("GBB1292_000").unwrap_or_else(|| {
+            panic!("file B's first line must be painted;\nscreen:\n{screen_before}")
+        });
+        assert!(
+            b_row < diag_y,
+            "test setup sanity: file B (the new, active window) must start \
+             in the top slot, above file A; B row {b_row}, A diag row \
+             {diag_y};\nscreen:\n{screen_before}"
+        );
+
+        let cell_after_split = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the active (top, file B) pane must paint a block cursor cell;\nscreen:\n{screen_before}")
+        });
+        assert!(
+            (cell_after_split.1 as f32) < diag_y,
+            "test setup sanity: the block cursor must start in the top \
+             (file B) pane, above file A's rows; cursor cell \
+             {cell_after_split:?}, file A diag row {diag_y};\nscreen:\n{screen_before}"
+        );
+
+        // Click the *gutter* cell immediately left of file A's diagnostic
+        // line — a background pane the user has not focused yet.
+        assert!(
+            diag_x >= 1.0,
+            "test setup sanity: file A's text must leave at least one \
+             gutter column to its left; text x {diag_x};\nscreen:\n{screen_before}"
+        );
+        driver.click(diag_x - 1.0, diag_y);
+        driver.render();
+
+        // Painted proof the gutter click really was routed to the
+        // `DiagnosticHover` arm (and not swallowed as a plain text click):
+        // that arm pops the diagnostic hover, which takes keyboard focus.
+        assert!(
+            driver.screen_contains("gutter click focus test"),
+            "the gutter click must open the diagnostic hover popup — \
+             otherwise this test is not exercising `apply_gutter_action`'s \
+             focus-changing arm at all;\nscreen:\n{}",
+            driver.screen()
+        );
+        // Dismiss it so the following `<C-w>p` reaches the editor rather
+        // than the focused popup's own key handler.
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after_click = driver.screen();
+        let cell_after_click = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the clicked (bottom, file A) pane must paint a block cursor cell;\nscreen:\n{screen_after_click}")
+        });
+        assert!(
+            (cell_after_click.1 as f32) > b_row,
+            "test setup sanity: clicking file A's gutter must move focus \
+             (and so the painted block cursor) into the bottom pane; file B \
+             row {b_row}, cursor cell {cell_after_click:?};\nscreen:\n{screen_after_click}"
+        );
+        assert_ne!(
+            cell_after_click.1, cell_after_split.1,
+            "test setup sanity: the gutter click must actually have moved \
+             the painted cursor off file B's row;\nscreen:\n{screen_after_click}"
+        );
+
+        // `<C-w>p` must now return focus to file B — the window that was
+        // active immediately before the gutter click stole focus.
+        driver.ctrl_char('w');
+        driver.type_char('p');
+        driver.render();
+
+        let screen = driver.screen();
+        let cell_after_prev = cursor_cell(&driver, cursor_bg).unwrap_or_else(|| {
+            panic!("the previously-active (top, file B) pane must paint a block cursor cell after `<C-w>p`;\nscreen:\n{screen}")
+        });
+        assert_eq!(
+            cell_after_prev.1,
+            cell_after_split.1,
+            "a gutter click on a background pane must record the window it \
+             stole focus from, so `<C-w>p` moves focus (and the painted \
+             block-cursor cell) back to file B's top-slot row \
+             {split_row} — not leave it on file A's row {click_row}; \
+             cursor cell {cell_after_prev:?};\nscreen:\n{screen}",
+            split_row = cell_after_split.1,
+            click_row = cell_after_click.1,
+        );
+        assert_ne!(
+            cell_after_prev.1, cell_after_click.1,
+            "`<C-w>p` must actually move focus away from the pane the \
+             gutter click focused, not stay put; cursor cell \
+             {cell_after_prev:?};\nscreen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gutter click must open the diagnostic hover for a buffer opened
+    /// through a **non-canonical** path.
+    ///
+    /// `Engine::lsp_diagnostics` is keyed by the canonical absolute path
+    /// (#208), and that is the key `build_rendered_window` uses when it
+    /// fills `RenderedWindow::diagnostic_gutter` — so the gutter *marker*
+    /// paints. The hover lookups on the engine side used the buffer's raw
+    /// `file_path` instead, so clicking that marker found no diagnostic and
+    /// popped no hover: a painted affordance that did nothing.
+    ///
+    /// This is invisible on a Linux CI box, where `std::env::temp_dir()` is
+    /// already canonical, and unconditional on macOS, where it is
+    /// `/var/folders/…` — a symlink to `/private/var/folders/…`. That
+    /// platform asymmetry is why
+    /// `gutter_click_on_a_background_pane_then_ctrl_w_p_returns_focus_via_shell_app`
+    /// was red on macOS and green on Linux on the same commit. To reproduce
+    /// it on *every* platform this test opens the file through a path with
+    /// a `..` segment, which `canonicalize` resolves everywhere.
+    ///
+    /// **Verified RED against unfixed `develop`**: restoring
+    /// `active_buffer_path()` (raw `file_path`) in
+    /// `Engine::trigger_editor_hover_for_line` makes the final
+    /// `screen_contains` assertion fail — the gutter marker still paints,
+    /// the click is still routed, and no hover text ever reaches the
+    /// screen.
+    #[test]
+    fn gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 30;
+        const DIAG_LINE: u32 = 2;
+        const HOVER_MSG: &str = "non-canonical gutter diagnostic";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1256_diag_key_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("dk1256.txt");
+        let content: String = (0..20).map(|i| format!("DKA1256_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        // The same file, reached through a `..` segment: `canonicalize`
+        // resolves it on every platform, so `file_path != canonical_path`
+        // on Linux too — not just on macOS's symlinked temp dir.
+        let via_dotdot = dir.join("sub").join("..").join("dk1256.txt");
+        let canonical = via_dotdot.canonicalize().unwrap();
+        assert_ne!(
+            via_dotdot, canonical,
+            "test setup sanity: the open path must differ from the \
+             canonical one, otherwise this test cannot reach the bug"
+        );
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&via_dotdot, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        app.engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 0,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: DIAG_LINE,
+                        character: 5,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: HOVER_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.mouse_move(0.0, 0.0);
+        driver.render();
+
+        let screen_before = driver.screen();
+        let (diag_x, diag_y) = driver
+            .find(&format!("DKA1256_{:03}", DIAG_LINE))
+            .unwrap_or_else(|| {
+                panic!("the diagnostic's line must be painted;\nscreen:\n{screen_before}")
+            });
+        assert!(
+            diag_x >= 1.0,
+            "test setup sanity: the text must leave at least one gutter \
+             column to its left; text x {diag_x};\nscreen:\n{screen_before}"
+        );
+
+        driver.click(diag_x - 1.0, diag_y);
+        driver.render();
+
+        assert!(
+            driver.screen_contains(HOVER_MSG),
+            "clicking the diagnostic gutter marker must paint the \
+             diagnostic hover even though the buffer was opened through a \
+             non-canonical path ({via_dotdot:?});\nscreen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1297: `q:` must open the command-line window as a horizontal split
+    /// in the *current* tabpage (`:h cmdwin`), not push a whole new `Tab`.
+    /// Reads the answer off the painted screen, not off `Engine` state
+    /// (CLAUDE.md "Testing (CRITICAL)" rule 1): a `Tab` and a split are
+    /// indistinguishable by inspecting `is_cmdline_buf` alone, but a tab
+    /// swap makes the *previous* tab's buffer stop painting entirely, while
+    /// a split keeps painting both windows at once. So the fix's signature
+    /// is that the original file's content and the new cmdline window's
+    /// history content are simultaneously on screen after `q:` — something
+    /// a new-tab implementation can never produce.
+    ///
+    /// **Verified RED against the pre-fix shape** (confirmed by hand,
+    /// reverting `open_cmdline_window` to push a new `Tab`/`close_tab`
+    /// instead of a split window/`close_window`): the original file's line
+    /// disappears from the screen the moment `q:` runs (the new tab
+    /// replaces it entirely), so the first `screen_contains` assertion
+    /// below fails. Restored, green again.
+    ///
+    /// Also covers the review follow-up: swapping `close_tab()` for
+    /// `close_window()` on the split-close path dropped `close_tab`'s
+    /// implicit eviction of buffers no longer referenced by any window, so
+    /// the cmdline window's `[Command History]`/`[Search History]` scratch
+    /// buffer leaked into `buffer_manager` on every `q:`/`q`. The `:bn`
+    /// block below proves it's gone via `close_window()`'s own orphan-scratch
+    /// sweep, black-box: with the leak, `:bn` has a second buffer to cycle
+    /// onto and its marker text reappears; fixed, `:bn` is a no-op.
+    /// **Verified RED against the pre-fix shape** for this part too
+    /// (confirmed by hand, reverting the `close_window()` orphan-scratch
+    /// sweep added for this review round): the `:bn` block's first
+    /// `screen_after_bn` assertion fails because `:bn` lands on the leaked
+    /// `[Command History]` buffer, blanking out the original file's line.
+    #[test]
+    fn q_colon_opens_a_split_not_a_new_tab_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1297_cmdwin_split_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cmdwin1297.txt");
+        let content: String = (0..10).map(|i| format!("CMDWIN1297_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        // Seed command history so the cmdline window's buffer paints
+        // distinctive text of its own, not just a blank line.
+        app.engine.history.add_command("set cmdwin1297marker");
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        let screen_before = driver.screen();
+        assert!(
+            driver.screen_contains("CMDWIN1297_000"),
+            "test setup sanity: the opened file's first line must paint \
+             before `q:` runs;\nscreen:\n{screen_before}"
+        );
+
+        driver.type_char('q');
+        driver.type_char(':');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CMDWIN1297_000"),
+            "`q:` must open the command-line window as a split in the \
+             current tab — the original file's content must still be \
+             painted alongside it, not replaced by a whole new tab's \
+             content;\nscreen:\n{screen}"
+        );
+        assert!(
+            screen.contains("set cmdwin1297marker"),
+            "the cmdline window's own history buffer must also be painted \
+             at the same time as the original file above — proof both are \
+             live windows in one split layout, not two mutually-exclusive \
+             tabs;\nscreen:\n{screen}"
+        );
+
+        // `q` in the cmdline window closes just that split, not the whole
+        // tab it lives in.
+        driver.type_char('q');
+        driver.render();
+
+        let screen_after_close = driver.screen();
+        assert!(
+            screen_after_close.contains("CMDWIN1297_000"),
+            "closing the cmdline window with `q` must leave the original \
+             file's window in place (and now filling the tab again);\n\
+             screen:\n{screen_after_close}"
+        );
+        assert!(
+            !screen_after_close.contains("set cmdwin1297marker"),
+            "closing the cmdline window with `q` must remove its pane from \
+             the screen;\nscreen:\n{screen_after_close}"
+        );
+
+        // #1297 review: closing the cmdline window via `close_window()`
+        // (instead of the old `close_tab()`) must still evict its ephemeral
+        // `[Command History]` scratch buffer from `buffer_manager` — not just
+        // unmap its window. Prove it black-box via `:bn`: if the scratch
+        // buffer had leaked, it would be the *only* other buffer left, so
+        // `:bn` would cycle the active window straight onto it and its
+        // history content (the marker line) would paint in the main window.
+        // With the leak fixed, there is nothing else to cycle to, so `:bn`
+        // is a no-op and the original file stays on screen.
+        for c in ":bn".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen_after_bn = driver.screen();
+        assert!(
+            screen_after_bn.contains("CMDWIN1297_000"),
+            "`:bn` after closing the cmdline window must stay on the \
+             original file — a second buffer to cycle onto means the \
+             `[Command History]` scratch buffer leaked instead of being \
+             evicted on window close;\nscreen:\n{screen_after_bn}"
+        );
+        assert!(
+            !screen_after_bn.contains("set cmdwin1297marker"),
+            "`:bn` must never land on a leaked `[Command History]` scratch \
+             buffer — its history content (the marker line) must not \
+             reappear on screen;\nscreen:\n{screen_after_bn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1307: `:copen` must open the quickfix panel as a genuine
+    /// `WindowLayout` leaf — `CTRL-W` reachable, not the sidebar/terminal-
+    /// style overlay it used to be. Painted screen *text* alone can't tell
+    /// the two apart (`quickfix_list_to_panel`'s overlay and the new real
+    /// window's scratch buffer render near-identical content in the same
+    /// spot by design — see `Engine::qf_has_real_window`'s doc comment), so
+    /// this drives the one behaviour that genuinely depends on window
+    /// *count*. A click back into the file pane first clears
+    /// `QuickfixList::has_focus` (pre-existing, unrelated to #1307 — while
+    /// set, it intercepts *every* key, `CTRL-W` chords included, regardless
+    /// of whether a real window backs the panel, which would otherwise mask
+    /// the discriminator entirely): with only the file window open, `CTRL-W
+    /// w` is then a self-cycle no-op (`WindowLayout::next_window` on a
+    /// single leaf returns that same leaf) and further typing lands right
+    /// back in the file buffer; with a real second (quickfix) window open,
+    /// the same `CTRL-W w` moves focus onto it, and further typing is
+    /// swallowed instead — `qf_panel_target` routes it to `qf_handle_key`
+    /// purely by *window identity* now (no `has_focus` involved), and
+    /// nothing in `qf_handle_key`'s `match` handles a bare letter.
+    ///
+    /// **Verified RED against unfixed `develop`** (confirmed by hand:
+    /// reverting `qf_open` to only flip `QuickfixList::open`/`has_focus`,
+    /// as it did before #1307, with no `qf_ensure_panel_window` call):
+    /// `engine.windows.len()` stays `1` through `:copen`, so after the
+    /// click-back-in clears `has_focus`, `CTRL-W w` keeps focus on the file
+    /// window, and the `i`/`Z`/`Escape` below inserts `Z` into it — the
+    /// final `!screen.contains("ZCOPEN1307_000")` assertion fails, catching
+    /// exactly the corruption this test guards against.
+    #[test]
+    fn copen_opens_a_real_window_ctrl_w_reaches_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1307_copen_real_window_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("copen1307.txt");
+        let content: String = (0..5).map(|i| format!("COPEN1307_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("qfmarker1307.rs"),
+                line: 0,
+                col: 0,
+                line_text: "MARKERTEXT1307".to_string(),
+            });
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("COPEN1307_000"),
+            "test setup sanity: the opened file's first line must paint \
+             before `:copen` runs;\nscreen:\n{screen_before}"
+        );
+
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("COPEN1307_000"),
+            "`:copen` must keep the original file's window painted \
+             alongside the quickfix panel, not replace it;\nscreen:\n{screen}"
+        );
+        assert!(
+            screen.contains("qfmarker1307.rs") && screen.contains("MARKERTEXT1307"),
+            "the quickfix panel's own content must paint at the same time \
+             as the original file above;\nscreen:\n{screen}"
+        );
+
+        // Click back into the file pane first: `:copen` leaves the panel
+        // with `QuickfixList::has_focus` set, which intercepts *every* key
+        // (including a `CTRL-W` chord) on its own regardless of whether a
+        // real window backs it — that's pre-existing, unrelated to #1307,
+        // and would mask the discriminator below. A click on the file's own
+        // content clears `has_focus` (`Engine::mouse_click`) and returns
+        // keys to ordinary dispatch, exactly like a user clicking back into
+        // their buffer after `:copen`.
+        let (fx, fy) = driver
+            .find("COPEN1307_000")
+            .expect("file's first line must still be locatable to click on");
+        driver.click(fx, fy);
+        driver.render();
+
+        // The discriminating step: cycle windows, then type into whatever
+        // is now focused.
+        driver.ctrl_char('w');
+        driver.type_char('w');
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after = driver.screen();
+        assert!(
+            !screen_after.contains("ZCOPEN1307_000"),
+            "`CTRL-W w` after `:copen` must move focus onto the real \
+             quickfix window, not stay on the file — typing `iZ<Esc>` \
+             afterward must not corrupt the file's first line;\n\
+             screen:\n{screen_after}"
+        );
+        assert!(
+            screen_after.contains("COPEN1307_000"),
+            "the file's first line must still be painted, unmodified, \
+             after the CTRL-W cycle + typing above;\nscreen:\n{screen_after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1307 review: `CTRL-W` must be able to *leave* the quickfix panel
+    /// window, not just enter it — the previous test above deliberately
+    /// clicks back into the file pane before pressing `CTRL-W` specifically
+    /// to route around `QuickfixList::has_focus` swallowing every key
+    /// (including a `CTRL-W` chord) while focus is inside the panel. That
+    /// left the exact scenario the issue is about — a keyboard-only user
+    /// doing `:copen` then trying `CTRL-W` to get back to their file —
+    /// uncovered. This test presses `CTRL-W` immediately after `:copen`,
+    /// with no click in between, so focus starts out genuinely inside the
+    /// panel (`QuickfixList::has_focus` still set, exactly as `:copen`
+    /// leaves it).
+    ///
+    /// **Verified RED against unfixed `develop`** (confirmed by hand: with
+    /// `Engine::handle_key`'s quickfix-interception block routing `CTRL-W`
+    /// to `qf_handle_key` like every other key, its `_ => EngineAction::None`
+    /// fallback swallows the chord — focus never leaves the panel, so
+    /// `iZ<Esc>` below inserts into the quickfix scratch buffer instead of
+    /// the file, and the final `screen.contains("ZCOPEN1307B_000")`
+    /// assertion fails).
+    #[test]
+    fn copen_ctrl_w_from_inside_panel_reaches_file_window_via_shell_app() {
+        const WIDTH: u16 = 100;
+        const HEIGHT: u16 = 32;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1307_copen_ctrl_w_from_inside_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("copen1307b.txt");
+        let content: String = (0..5).map(|i| format!("COPEN1307B_{i:03}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .quickfix
+            .items
+            .push(crate::core::project_search::ProjectMatch {
+                file: PathBuf::from("qfmarker1307b.rs"),
+                line: 0,
+                col: 0,
+                line_text: "MARKERTEXT1307B".to_string(),
+            });
+
+        let mut driver = driver_with_shell(app, config(), WIDTH, HEIGHT);
+        driver.render();
+
+        for c in ":copen".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        // Sanity: the quickfix panel's content painted, confirming `:copen`
+        // ran and (per its own doc comment) left focus inside the panel —
+        // this is the state the fix must be able to navigate *out of* via
+        // `CTRL-W`, not around.
+        let screen_before = driver.screen();
+        assert!(
+            screen_before.contains("qfmarker1307b.rs") && screen_before.contains("MARKERTEXT1307B"),
+            "test setup sanity: `:copen` must paint the quickfix panel \
+             before the CTRL-W chord under test runs;\nscreen:\n{screen_before}"
+        );
+
+        // The discriminating step: CTRL-W directly from inside the panel,
+        // no click in between. The quickfix window sits at the bottom of a
+        // full-width wrap, so `CTRL-W k` (move up) must reach the file
+        // window above it.
+        driver.ctrl_char('w');
+        driver.type_char('k');
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        let screen_after = driver.screen();
+        assert!(
+            screen_after.contains("ZCOPEN1307B_000"),
+            "`CTRL-W k` pressed from *inside* the quickfix panel must move \
+             focus onto the file window above it, so `iZ<Esc>` afterward \
+             edits the file, not the quickfix scratch buffer;\n\
+             screen:\n{screen_after}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #35: `render_content` must paint the minimap through the shell path,
     /// as braille — not just populate `ScreenLayout.minimap`.
     ///
@@ -13037,17 +22632,32 @@ mod tests {
         );
     }
 
-    /// Acceptance (#35): a click at the vertical middle of the strip scrolls
-    /// the editor to ~50% of the file — the TUI half of the cross-backend
-    /// claim, asserted on the painted line numbers rather than engine state.
+    /// #1093 acceptance (was #35's "~50% of the file" claim): a click at the
+    /// vertical middle of the strip scrolls the editor to ~50% of the
+    /// strip's *painted window* — the TUI half of the cross-backend claim,
+    /// asserted on the painted line numbers rather than engine state.
     ///
-    /// RED-first: with the shell path's `draw_minimap_strip` call commented
-    /// out (see `render_content_paints_minimap_braille_via_shell_app`), the
-    /// `braille_col` lookup below panics — nothing paints on `mid_row` to
-    /// click — confirmed by hand before restoring the fix.
+    /// **RED against the pre-#1093 shape:** the old assertion here was
+    /// `(0.3..0.7).contains(&frac)` against `frac = top / 240.0` — i.e.
+    /// "lands near 50% of the whole 240-line file" — exactly the bug this
+    /// issue reports (the whole buffer squeezed into the strip on every
+    /// frame, so the strip's middle always meant the file's middle
+    /// regardless of scroll position). Confirmed by hand: reverting
+    /// `build_minimap_data`'s windowing makes the new `frac < 0.4`
+    /// assertion below fail, since the click would once again land near
+    /// the file's actual middle.
+    ///
+    /// #1186: `app_with_shaped_buffer`'s original 240 lines now fits
+    /// *entirely* inside this geometry's compressed window (#1186's whole
+    /// point — small files show top-to-bottom now), so `TOTAL_LINES` below
+    /// is a much larger fixture, comfortably past
+    /// `render::MINIMAP_MAX_COMPRESSION * target_lines`, to keep exercising
+    /// #1093's genuine sliding-window regime that this test is actually
+    /// about.
     #[test]
-    fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
-        let mut driver = driver_with_shell(app_with_shaped_buffer(), config(), 100, 24);
+    fn minimap_click_at_the_middle_scrolls_to_the_middle_of_the_painted_window() {
+        const TOTAL_LINES: usize = 100_000;
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
 
         /// Lowest `line N` number visible on screen — the file's scroll
         /// position, read back out of the paint.
@@ -13068,9 +22678,18 @@ mod tests {
             "fixture must start at the top of the file; screen:\n{before}"
         );
 
-        // Find the strip on a row it actually paints, then click its middle.
-        let mid_row = 12u16;
-        let x = braille_col(&before, mid_row as usize).unwrap_or_else(|| {
+        // Locate the strip's own painted extent — never hardcode a row —
+        // and click its actual vertical middle.
+        let rows = minimap_painted_rows(&before);
+        assert!(
+            rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows; got \
+             {rows:?}; screen:\n{before}"
+        );
+        let strip_top = *rows.first().unwrap();
+        let strip_bottom = *rows.last().unwrap();
+        let mid_row = strip_top + (strip_bottom - strip_top) / 2;
+        let x = braille_col(&before, mid_row).unwrap_or_else(|| {
             panic!("the minimap must paint braille on row {mid_row}; screen:\n{before}")
         });
         driver.click(x as f32 + 1.0, mid_row as f32);
@@ -13079,11 +22698,366 @@ mod tests {
         let after = driver.screen();
         let top = top_line(&after)
             .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
-        let frac = top as f64 / 240.0;
+
+        // The strip's own painted rows, at 4 buffer lines per row, is a
+        // measured upper bound on `target_lines` (the strip's own block
+        // count) — used to prove the click landed *inside* the strip's own
+        // window, not deep into the file.
+        let target_lines_upper_bound = (strip_bottom - strip_top + 1) * 4;
+        // #1186: `render::MINIMAP_MAX_COMPRESSION` lets the window grow to
+        // `MINIMAP_MAX_COMPRESSION * target_lines` buffer lines once the
+        // file no longer fits in one uncompressed window. #1211 made `K`
+        // itself geometry-only (a small, constant value on every real call —
+        // see `MINIMAP_VIEWPORT_MULTIPLE`), so `MINIMAP_MAX_COMPRESSION` is
+        // now only a loose safety-net upper bound rather than the value `K`
+        // actually reaches here — this assertion stays correct (just
+        // looser) either way, using the real, `pub(crate)` constant instead
+        // of a hand-copied mirror that could drift out of sync with it.
+        let window_len_upper_bound =
+            target_lines_upper_bound * crate::render::MINIMAP_MAX_COMPRESSION;
+        // Half the strip's own window, not half the file: with the cursor
+        // at the top, a middle click must land comfortably inside the
+        // window's own first half — confirmed by hand against a reverted
+        // fix (window computed over the whole buffer again), where the
+        // same click lands near the file's own middle instead of near the
+        // top of its (much smaller) window.
+        let half_window = window_len_upper_bound / 2;
         assert!(
-            (0.3..0.7).contains(&frac),
-            "clicking the middle of the minimap must scroll to ~50% of the \
-             240-line file, landed on line {top} ({frac:.3}); screen:\n{after}"
+            top < half_window,
+            "clicking the middle of the minimap while the cursor is at \
+             the top of the file must land well inside the strip's own \
+             window (half of it is {half_window} lines), not deep into \
+             the {TOTAL_LINES}-line file: landed on line {top}; screen:\n{after}"
+        );
+        let frac = top as f64 / TOTAL_LINES as f64;
+        assert!(
+            frac < 0.4,
+            "clicking the middle of the minimap must NOT scroll to ~50% \
+             of the whole file — that is the pre-#1093 whole-buffer- \
+             squeeze bug: landed on line {top} ({frac:.3}); screen:\n{after}"
+        );
+    }
+
+    /// #1187 acceptance (black-box, driver tier): dragging the minimap's own
+    /// viewport-highlight thumb from the top of the strip to the bottom must
+    /// scroll through virtually the whole file in one gesture — exactly like
+    /// dragging the real vertical scrollbar handle the same distance — not
+    /// crawl within roughly one strip-window's worth of lines.
+    ///
+    /// With the file scrolled to the top, the highlight band's own top edge
+    /// coincides with the strip's top row (#1093: the highlight always
+    /// starts where the editor's own viewport does), so pressing there and
+    /// dragging to the strip's bottom row is exactly the issue's own
+    /// reproduction: "press on the highlight's top edge, drag to the bottom
+    /// of the strip".
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `mouse::handle_mouse`'s minimap press rung to call
+    /// `render::apply_minimap_click` directly (no `DragTarget::ScrollbarY`
+    /// arm) and the drag-move arm to keep re-running it per move reproduces
+    /// the root cause this issue describes: the strip's own painted window
+    /// slides in lockstep with `scroll_top` (#1093), so the drag's motion
+    /// mostly cancels itself out and the reachable range is roughly one
+    /// strip window (`target_lines * MINIMAP_MAX_COMPRESSION`, a few
+    /// thousand lines here) — the final assertion below (>90% of a
+    /// 100,000-line file) fails on that code, landing well under 10%.
+    #[test]
+    fn dragging_the_minimap_viewport_highlight_scrolls_the_whole_file_not_a_crawl() {
+        const TOTAL_LINES: usize = 100_000;
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        let before = driver.screen();
+        assert_eq!(
+            top_line(&before),
+            Some(0),
+            "fixture must start at the top of the file; screen:\n{before}"
+        );
+
+        // Locate the strip's own painted extent — never hardcode a row.
+        let rows = minimap_painted_rows(&before);
+        assert!(
+            rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows; got \
+             {rows:?}; screen:\n{before}"
+        );
+        let strip_top = *rows.first().unwrap();
+        let strip_bottom = *rows.last().unwrap();
+        let x = braille_col(&before, strip_top).unwrap_or_else(|| {
+            panic!("the minimap must paint braille on row {strip_top}; screen:\n{before}")
+        }) as f32
+            + 1.0;
+
+        driver.mouse_down(x, strip_top as f32);
+        driver.mouse_move(x, strip_bottom as f32);
+        driver.mouse_up(x, strip_bottom as f32);
+        driver.render();
+
+        let after = driver.screen();
+        let top = top_line(&after)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+
+        assert!(
+            top > TOTAL_LINES * 9 / 10,
+            "dragging from the highlight's top edge to the strip's bottom \
+             row must scroll through virtually the whole file in one \
+             gesture, not crawl within one strip window — landed on line \
+             {top} of {TOTAL_LINES}; screen:\n{after}"
+        );
+    }
+
+    /// #1271 acceptance (black-box, driver tier): holding **Alt** at press
+    /// time arms the minimap thumb drag's fine-seek geometry — the same
+    /// strip pixels this test's sibling above drags the *whole file* with
+    /// (#1187) instead steer the buffer at roughly `MINIMAP_LINES_PER_ROW`
+    /// (4) lines per row of pointer travel, scoped to the strip's currently
+    /// painted window (`render::minimap_press`'s `fine` parameter). The
+    /// identical gesture *without* Alt must still seek at the file-wide
+    /// rate — #1187's own guarantee, pinned here rather than only in the
+    /// sibling test so a regression that broke the `alt` plumbing itself
+    /// (e.g. always taking the fine branch) would show up here too.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — before this
+    /// fix, `mouse::handle_mouse` never read `ev.modifiers` for the minimap
+    /// press rung and `render::minimap_press` took no `fine` argument at
+    /// all, so Alt held or not, every drag used the file-wide (#1187)
+    /// geometry — the `fine_top < 200` assertion below fails on that code:
+    /// a 3-row drag at ~100,000/track_length lines/row lands far past 200.
+    #[test]
+    fn alt_drag_on_the_minimap_thumb_fine_seeks_the_painted_window() {
+        const TOTAL_LINES: usize = 100_000;
+        const ROWS_DRAGGED: f32 = 3.0;
+
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        // Locate the strip's top row and a column that hits its braille the
+        // same way in both halves of this test — never hardcode a coordinate.
+        fn strip_top_and_x(screen: &str) -> (usize, f32) {
+            let rows = minimap_painted_rows(screen);
+            assert!(
+                rows.len() >= 4,
+                "precondition: the strip must paint at least 4 rows; got \
+                 {rows:?}; screen:\n{screen}"
+            );
+            let top = *rows.first().unwrap();
+            let x = braille_col(screen, top).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {top}; screen:\n{screen}")
+            }) as f32
+                + 1.0;
+            (top, x)
+        }
+
+        // ── Alt-held drag: fine seek, scoped to the painted window ───────
+        let mut driver = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+        let before = driver.screen();
+        assert_eq!(
+            top_line(&before),
+            Some(0),
+            "fixture must start at the top of the file; screen:\n{before}"
+        );
+        let (strip_top, x) = strip_top_and_x(&before);
+        let target_row = strip_top as f32 + ROWS_DRAGGED;
+
+        driver.click_with(
+            quadraui::MouseButton::Left,
+            quadraui::Modifiers {
+                alt: true,
+                ..Default::default()
+            },
+            x,
+            strip_top as f32,
+        );
+        driver.mouse_move(x, target_row);
+        driver.mouse_up(x, target_row);
+        driver.render();
+
+        let after = driver.screen();
+        let fine_top = top_line(&after)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after}"));
+
+        // ~4 lines/row, with slack for the strip's own aggregation
+        // (#1186/#1211) and cell-quantised motion — still tiny next to the
+        // 100,000-line file, and asserted against below by the coarse
+        // comparison rather than a single fragile absolute bound.
+        assert!(
+            fine_top < 200,
+            "an Alt-held drag {ROWS_DRAGGED} rows down the strip must \
+             fine-seek within roughly {ROWS_DRAGGED} * MINIMAP_LINES_PER_ROW \
+             (4) lines of the top, not crawl deep into the {TOTAL_LINES}-line \
+             file: landed on line {fine_top}; screen:\n{after}"
+        );
+
+        // ── Same gesture, no Alt: #1187's file-wide guarantee is untouched ──
+        let mut driver2 = driver_with_shell(app_with_plain_lines(TOTAL_LINES), config(), 100, 24);
+        let before2 = driver2.screen();
+        let (strip_top2, x2) = strip_top_and_x(&before2);
+        let target_row2 = strip_top2 as f32 + ROWS_DRAGGED;
+
+        driver2.mouse_down(x2, strip_top2 as f32);
+        driver2.mouse_move(x2, target_row2);
+        driver2.mouse_up(x2, target_row2);
+        driver2.render();
+
+        let after2 = driver2.screen();
+        let coarse_top = top_line(&after2)
+            .unwrap_or_else(|| panic!("the editor must still paint line numbers:\n{after2}"));
+
+        assert!(
+            coarse_top > fine_top * 10,
+            "the identical {ROWS_DRAGGED}-row drag WITHOUT Alt must still \
+             seek at the file-wide rate (#1187), far past the Alt-held \
+             drag's fine-seek landing spot — fine landed on line {fine_top}, \
+             coarse landed on line {coarse_top}; screen:\n{after2}"
+        );
+    }
+
+    /// #1211 acceptance (black-box, driver tier): the strip's own painted
+    /// window — measured by clicking its top and bottom rows and reading
+    /// back the resulting scroll positions — must be the **same size**
+    /// for a 2,000-line file and a 20,000-line file at identical strip
+    /// geometry, driven through the real `TuiShellApp`/`TuiDriver` stack
+    /// (not `build_minimap_data` in isolation) so this proves the fix
+    /// actually lands on the path a real keystroke/redraw takes.
+    ///
+    /// #1186 derived the window's own compression factor `K` from
+    /// `total_buffer_lines`, which squeezed the *whole file* into the
+    /// strip for every file under `MINIMAP_MAX_COMPRESSION * target_lines`
+    /// — the two fixtures below both sit comfortably under that old
+    /// ceiling, so a pre-#1211 build would show each one to a *different*
+    /// fraction of its own length rather than the same absolute window.
+    /// #1211 makes `K` a function of the strip's geometry alone, so the
+    /// window's absolute size (in buffer lines) must be identical
+    /// regardless of which of the two files is open.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s `k` to `total_buffer_lines.div_ceil(target_lines)`
+    /// (#1186's pre-#1211 formula) makes the `assert_eq!` below fail: a
+    /// bottom-of-strip click resolves to line 1,780 on the 2,000-line file
+    /// but line 4,588 on the 20,000-line file — two different absolute
+    /// windows, not the identical value this test requires.
+    #[test]
+    fn minimap_scale_is_constant_across_file_length_via_shell_app() {
+        fn top_line(screen: &str) -> Option<usize> {
+            screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .filter(|w| w[0] == "line")
+                .filter_map(|w| w[1].parse::<usize>().ok())
+                .min()
+        }
+
+        /// Click the strip's own top and bottom rows (located by its own
+        /// painted braille, never hardcoded) and report the resulting
+        /// scroll positions, plus the strip's own measured row count.
+        fn click_top_and_bottom(total_lines: usize) -> (usize, usize, usize) {
+            let mut driver =
+                driver_with_shell(app_with_plain_lines(total_lines), config(), 100, 24);
+            let before = driver.screen();
+            assert_eq!(
+                top_line(&before),
+                Some(0),
+                "fixture must start at the top of the file; screen:\n{before}"
+            );
+            let rows = minimap_painted_rows(&before);
+            assert!(
+                rows.len() >= 4,
+                "precondition: the strip must paint at least 4 rows; got \
+                 {rows:?}; screen:\n{before}"
+            );
+            let strip_top = *rows.first().unwrap();
+            let strip_bottom = *rows.last().unwrap();
+
+            let top_x = braille_col(&before, strip_top).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {strip_top}; screen:\n{before}")
+            });
+            driver.click(top_x as f32 + 1.0, strip_top as f32);
+            driver.render();
+            let top_click_line = top_line(&driver.screen()).unwrap_or_else(|| {
+                panic!(
+                    "the editor must still paint line numbers:\n{}",
+                    driver.screen()
+                )
+            });
+
+            let bottom_x = braille_col(&before, strip_bottom).unwrap_or_else(|| {
+                panic!("the minimap must paint braille on row {strip_bottom}; screen:\n{before}")
+            });
+            driver.click(bottom_x as f32 + 1.0, strip_bottom as f32);
+            driver.render();
+            let bottom_click_line = top_line(&driver.screen()).unwrap_or_else(|| {
+                panic!(
+                    "the editor must still paint line numbers:\n{}",
+                    driver.screen()
+                )
+            });
+
+            (top_click_line, bottom_click_line, rows.len())
+        }
+
+        const SMALLER_LINES: usize = 2_000;
+        const LARGER_LINES: usize = 20_000;
+        let (top_small, bottom_small, strip_rows_small) = click_top_and_bottom(SMALLER_LINES);
+        let (top_large, bottom_large, strip_rows_large) = click_top_and_bottom(LARGER_LINES);
+
+        assert_eq!(
+            strip_rows_small, strip_rows_large,
+            "both fixtures use identical terminal/strip geometry — the \
+             strip's own painted row count must not differ by file length"
+        );
+
+        assert_eq!(
+            top_small, 0,
+            "a top-of-strip click must resolve to line 0 regardless of \
+             file length"
+        );
+        assert_eq!(
+            top_large, 0,
+            "a top-of-strip click must resolve to line 0 regardless of \
+             file length"
+        );
+
+        // The core #1211 property: the window's own absolute size (in
+        // buffer lines), measured as the bottom-of-strip click's resolved
+        // line with the cursor still at the top, must be identical for the
+        // two fixtures — a `K` derived from the strip's geometry alone,
+        // never from `total_buffer_lines`.
+        assert_eq!(
+            bottom_small, bottom_large,
+            "the strip's own painted window must cover the exact same \
+             number of buffer lines for a {SMALLER_LINES}-line file and a \
+             {LARGER_LINES}-line file at identical strip geometry — got \
+             {bottom_small} vs {bottom_large}; a window that differs by \
+             file length means K is still derived from total_buffer_lines"
+        );
+
+        // Sanity: both fixtures are genuinely longer than the strip's own
+        // window (otherwise this test would trivially pass by both files
+        // fitting entirely, which proves nothing about #1211's fix).
+        assert!(
+            bottom_small < SMALLER_LINES / 2,
+            "the {SMALLER_LINES}-line fixture must be longer than the \
+             strip's own window (a bottom-of-strip click must NOT resolve \
+             anywhere near EOF) or this test cannot distinguish the fixed \
+             (post-#1211) window from the whole file — got line \
+             {bottom_small} of {SMALLER_LINES}"
         );
     }
 
@@ -13117,27 +23091,30 @@ mod tests {
         app
     }
 
-    /// #723 acceptance (TUI half): with the minimap on and a file longer
-    /// than the viewport, the pane shows **exactly one** vertical scroll
-    /// affordance, and it sits *beside* the strip rather than on top of it —
-    /// one column of `'█'`/`'░'` (quadraui's `tui::draw_editor` scrollbar),
-    /// with the minimap's braille starting in the very next column.
+    /// #723 acceptance (TUI half), updated by #1094: with the minimap on and
+    /// a file longer than the viewport, the pane shows **exactly one**
+    /// vertical scroll affordance, and it sits *beside* the strip rather
+    /// than on top of it — one column of `'█'`/`'░'` (quadraui's
+    /// `tui::draw_editor` scrollbar). The strip's own scroll feedback is
+    /// quadraui's `viewport_highlight` band — a *background* accent across
+    /// the visible rows, painted by both rasterisers — not a second
+    /// foreground bar, so "beside, not doubled" is still the invariant this
+    /// guards (the defect `render_impl::tests::
+    /// test_tui_two_groups_single_boundary_scrollbar_481` independently
+    /// covers for the `:vsplit` case).
     ///
-    /// This is the invariant the first attempt at #723 broke: painting
-    /// `MinimapLayout.scrollbar` over the strip via `Backend::draw_scrollbar`
-    /// put a second solid bar in the strip's leftmost column, directly
-    /// against the editor's own — two bars jammed together, which is exactly
-    /// the operator-visible defect
-    /// `render_impl::tests::test_tui_two_groups_single_boundary_scrollbar_481`
-    /// exists to prevent (it went from 2 scrollbar columns to 4). The strip's
-    /// own scroll feedback is quadraui's `viewport_highlight` band — a
-    /// *background* accent across the visible rows, painted by both
-    /// rasterisers — not a second foreground bar.
+    /// #1094 changed *which* side: VS Code's `editor.minimap.side: right`
+    /// order is text, then the strip, then the scroll column outermost —
+    /// so the scrollbar column is now the pane's rightmost column (99 at
+    /// this driver's 100-col width), with the strip's braille ending in the
+    /// column immediately to its *left*, not starting to its right as
+    /// before this issue.
     ///
-    /// RED against the reverted state: with `draw_minimap_strip` calling
-    /// `draw_scrollbar`, the column right of the editor's scrollbar is a
-    /// second `'░'`/`'█'` instead of braille, and the "exactly one" count is
-    /// 2. Verified by hand by restoring that call.
+    /// RED against develop pre-#1094: the scrollbar painted at column 87
+    /// (immediately left of the strip, sandwiched between it and the text)
+    /// rather than at the pane's true right edge (99); this test's
+    /// `sb_cols[0] == line.len() - 1` assertion below fails against that
+    /// unfixed geometry. Verified by hand against the pre-fix `render.rs`.
     #[test]
     fn minimap_strip_does_not_double_the_scrollbar_via_shell_app() {
         let mut driver = driver_with_shell(app_with_shaped_buffer_no_sidebar(), config(), 100, 24);
@@ -13176,13 +23153,22 @@ mod tests {
             "a pane with the minimap on must show exactly one vertical \
              scrollbar column on row {row}, got {sb_cols:?}; screen:\n{screen}"
         );
+        assert_eq!(
+            sb_cols[0],
+            line.len() - 1,
+            "#1094: the scroll column must be the pane's outermost column \
+             (VS Code's order is text, strip, scrollbar) — got column \
+             {} of {}; screen:\n{screen}",
+            sb_cols[0],
+            line.len()
+        );
 
-        let next = line.get(sb_cols[0] + 1).copied();
+        let prev = sb_cols[0].checked_sub(1).and_then(|i| line.get(i).copied());
         assert!(
-            next.is_some_and(is_braille),
-            "the minimap strip must begin in the column immediately right of \
+            prev.is_some_and(is_braille),
+            "the minimap strip must end in the column immediately left of \
              the scrollbar ({}), painting braille rather than a second bar; \
-             got {next:?}; screen:\n{screen}",
+             got {prev:?}; screen:\n{screen}",
             sb_cols[0]
         );
     }
@@ -13232,15 +23218,33 @@ mod tests {
     /// confirmed by hand, reverted before landing this test.
     #[test]
     fn minimap_strip_width_matches_the_formula_at_narrow_and_wide_terminal_widths_via_shell_app() {
-        /// One row's real, painted strip width in columns: the distance from
-        /// [`braille_col`]'s hit to the row's own right edge (the strip
-        /// paints flush against it, with no sidebar/activity-bar chrome to
-        /// its right — `app_with_shaped_buffer_no_sidebar`).
+        /// One row's real, painted strip width in columns: the span from
+        /// [`braille_col`]'s hit to the last contiguous braille column.
+        ///
+        /// #1094: no longer `total_cols - start` — the strip used to paint
+        /// flush against the row's own right edge (no sidebar/activity-bar
+        /// chrome to its right — `app_with_shaped_buffer_no_sidebar`), but
+        /// now the pane's outermost column is the scroll affordance, one
+        /// column *beyond* the strip's own right edge, so the strip's own
+        /// width has to be measured directly rather than inferred from
+        /// `total_cols`.
         fn painted_strip_width(screen: &str, row: usize, total_cols: usize) -> usize {
-            let start = braille_col(screen, row).unwrap_or_else(|| {
+            let line: Vec<char> = screen
+                .lines()
+                .nth(row)
+                .unwrap_or_else(|| panic!("row {row} must exist; screen:\n{screen}"))
+                .chars()
+                .collect();
+            let is_braille = |c: char| ('\u{2800}'..='\u{28FF}').contains(&c);
+            let start = line.iter().position(|&c| is_braille(c)).unwrap_or_else(|| {
                 panic!("row {row} must paint minimap braille; screen:\n{screen}")
             });
-            total_cols - start
+            let end = line[start..]
+                .iter()
+                .position(|&c| !is_braille(c))
+                .map(|rel| start + rel)
+                .unwrap_or(total_cols.min(line.len()));
+            end - start
         }
 
         for total_cols in [40u16, 160u16] {
@@ -13500,6 +23504,141 @@ mod tests {
         );
     }
 
+    // ── #1056: `FrameOp::TabSwitcher` row-count cap ───────────────────────
+    //
+    // `render.rs`'s `FrameOp::TabSwitcher` arm used to feed
+    // `TabSwitcherGeometry::max_visible` (the uncapped height budget) into
+    // `tab_switcher_to_quadraui_list_view` here, instead of `visible_rows`
+    // (the height-capped row count) GTK's twin arm feeds — flagged as an
+    // unresolved divergence in that doc comment. This is the "more tabs
+    // than fit" reproduction the follow-up asked for.
+
+    /// `count` file tabs, zero-padded (`tab00.txt`..) so no name is a
+    /// substring of another (`tab1` would otherwise match inside `tab10`).
+    /// Opened in order via `new_tab`, which touches the MRU on every call,
+    /// so the resulting MRU order is deterministic: newest first.
+    fn app_with_many_file_tabs_and_switcher_open(count: usize) -> TuiShellApp {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1056_tab_switcher_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<_> = (0..count)
+            .map(|i| dir.join(format!("tab{i:02}.txt")))
+            .collect();
+        for (i, path) in files.iter().enumerate() {
+            std::fs::write(path, format!("line {i}\n")).unwrap();
+        }
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&files[0], crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        for path in &files[1..] {
+            app.engine.new_tab(Some(path));
+        }
+        app.engine.open_tab_switcher();
+        assert!(
+            app.engine.tab_switcher_open,
+            "fixture must actually open the tab switcher"
+        );
+        app
+    }
+
+    /// #1056 reproduction: 12 tabs open in a 12-row terminal.
+    /// `TUI_TAB_SWITCHER_SIZING` caps the visible window at
+    /// `12 - 4 (reserve) = 8` rows, so the popup must paint exactly the 8
+    /// most-recently-used tabs and hide the 4 oldest, on both backends
+    /// (the GTK twin is `tab_switcher_caps_visible_rows_when_more_tabs_than_fit`
+    /// in `src/gtk/testing.rs`).
+    ///
+    /// Per the issue's "reproduce it first" ask: the swap this fixes
+    /// (`max_visible` vs `visible_rows` fed into
+    /// `tab_switcher_to_quadraui_list_view`) turned out **not** to move the
+    /// painted row count — see the updated `FrameOp::TabSwitcher` doc
+    /// comment in `render.rs` for why (the popup's own painted bounds,
+    /// which both backends already size from `visible_rows`, is what
+    /// `ListView::layout` clips rows to; and `tab_switcher_selected` is
+    /// always `< len`, so the `scroll_offset` branch this parameter feeds
+    /// never fires regardless of which field is passed here). Reverting
+    /// the `shell_app.rs` fix and rerunning this test does **not** turn it
+    /// red. It is still added per the issue's explicit ask, as a standing
+    /// regression guard on the cap itself and on the two backends staying
+    /// in sync.
+    #[test]
+    fn driver_tab_switcher_caps_visible_rows_when_more_tabs_than_fit() {
+        let cols: u16 = 100;
+        let rows: u16 = 12;
+        let total_tabs = 12;
+        let driver = driver_with_shell(
+            app_with_many_file_tabs_and_switcher_open(total_tabs),
+            config(),
+            cols,
+            rows,
+        );
+
+        let geo = render::TabSwitcherGeometry::compute(
+            quadraui::Rect::new(0.0, 0.0, cols as f32, rows as f32),
+            total_tabs,
+            &render::TUI_TAB_SWITCHER_SIZING,
+        )
+        .expect("12 items must yield a popup");
+        let expected = geo.visible_rows;
+        assert!(
+            expected < total_tabs,
+            "test setup must actually put more tabs than fit the popup \
+             (computed cap={expected}, tabs={total_tabs})"
+        );
+
+        // Scope the assertion to the popup's own painted rect, not the
+        // whole screen: the tab bar at the top of the frame also paints a
+        // (width-truncated) strip of open-tab names, which would otherwise
+        // make the "scrolled off" half of this assertion pass for the
+        // wrong reason.
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        let (px, py, pw, ph) = (
+            geo.bounds.x as usize,
+            geo.bounds.y as usize,
+            geo.bounds.width as usize,
+            geo.bounds.height as usize,
+        );
+        let mut popup_text = String::new();
+        for line in lines.iter().skip(py).take(ph) {
+            let chars: Vec<char> = line.chars().collect();
+            let end = (px + pw).min(chars.len());
+            if px < end {
+                popup_text.push_str(&chars[px..end].iter().collect::<String>());
+                popup_text.push('\n');
+            }
+        }
+
+        // MRU order is newest-first (tab11 opened last => index 0), so the
+        // visible window is the `expected` most-recently-opened tabs.
+        for i in (total_tabs - expected..total_tabs).rev() {
+            let name = format!("tab{i:02}.txt");
+            assert!(
+                popup_text.contains(&name),
+                "{name} is one of the {expected} most-recently-used tabs \
+                 and must still be visible inside the popup; popup:\n\
+                 {popup_text}\nfull screen:\n{screen}"
+            );
+        }
+        for i in 0..(total_tabs - expected) {
+            let name = format!("tab{i:02}.txt");
+            assert!(
+                !popup_text.contains(&name),
+                "{name} is older than the {expected}-row cap and must have \
+                 scrolled off the popup; popup:\n{popup_text}\nfull \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
     // ── #734 slice 1: the shared modal keyboard rung ─────────────────────
     //
     // `handle_key_pressed`'s top rung is now `render::route_modal_key`, the
@@ -13520,8 +23659,19 @@ mod tests {
     /// `~/.config/vimcode`, so the sidebar boots visible on a box that has
     /// ever opened the explorer and hidden on a bare CI runner. Neither
     /// test here should depend on which.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the sidebar pin above only covers the #634 leak.
+    /// `TuiShellApp::new(None)` also runs `restore_session_files()` against
+    /// this exact checkout's real per-workspace session file, which can
+    /// restore a non-zero scroll offset or extra windows before the fixture's
+    /// own `buffer_mut().insert(0, "teh end\n")` runs — scrolling that marker
+    /// out of the viewport on a dev box that has a saved session for this
+    /// repo path while staying green in CI, where no such session exists.
+    /// `new_for_test` skips the restore, so the starting state matches
+    /// everywhere.
     fn app_with_spell_suggestions_and_activity_bar_focus() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.autohide_panels = false;
         app.engine.app_shell.hide_sidebar();
         app.engine.session.explorer_visible = false;
@@ -13817,6 +23967,103 @@ mod tests {
         );
     }
 
+    /// #1117 (review iteration 2): the companion to
+    /// `click_outside_picker_popup_dismisses_it_via_shell_app` above, for
+    /// exactly the case that test deliberately *avoids* — an outside-click
+    /// that lands inside a **visible sidebar panel's own painted body**.
+    /// That test's own doc comment spells out why it can't cover this: it
+    /// pins the sidebar hidden and clicks plain editor body at column 5,
+    /// because with the sidebar visible the panel's intercept in
+    /// `handle_mouse_event` claims the click before the modal-overlay rung
+    /// ever sees it and the picker never dismisses.
+    ///
+    /// That "claimed by the panel intercept instead" behaviour *was* the
+    /// shipped behaviour until #1117 added `picker_blocks_event`
+    /// (`handle_mouse_event`, ~line 1397) to `intercepts_blocked`. All four
+    /// panel intercepts (debug sidebar, extensions sidebar, debug toolbar,
+    /// explorer `TreeController`) read that one flag, so this test covers
+    /// the shared gate through the Explorer arm — the arm #1117's chevron
+    /// fix made reachable in this configuration in the first place, by
+    /// dropping the stale `app_shell.sidebar_visible()` read that used to
+    /// make the intercept decline here by accident.
+    ///
+    /// Mirrors GTK, where `App::try_route_sidebar_mouse_event` (`app.rs`
+    /// ~6169-6172) returns `false` on `engine.picker_open` *before* it looks
+    /// at the click position at all, for the same reason: falling through is
+    /// what makes dismissal work.
+    ///
+    /// Two identically-seeded drivers (the `app_with_expanded_explorer`
+    /// pattern documented on the #1025 tests above): `TuiDriver` has no
+    /// accessor back to the concrete `TuiShellApp` under `driver_with_shell`,
+    /// so the probe driver locates the painted tree row and the real driver
+    /// clicks the same painted cell. 120x30 keeps the centred picker popup
+    /// clear of the sidebar's columns, and the re-`find` in the second driver
+    /// asserts that directly rather than assuming it — without it the click
+    /// could be landing on the popup itself and the test would pass
+    /// vacuously.
+    ///
+    /// RED-verified: reverting `picker_blocks_event` to `false` (or dropping
+    /// it from `intercepts_blocked`) makes this fail — the Explorer intercept
+    /// claims the `MouseDown`, `route_modal_overlay_click` is never reached,
+    /// and the picker title is still painted after the click.
+    #[test]
+    fn click_on_explorer_tree_dismisses_open_picker_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1117_picker_over_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("zq1117.txt"), "marker").unwrap();
+
+        // Probe driver: same seed, no picker — locates the painted row.
+        let mut probe = driver_with_shell(app_with_expanded_explorer(&dir), config(), 120, 30);
+        probe.render();
+        let (rx, ry) = probe.find("zq1117.txt").unwrap_or_else(|| {
+            panic!(
+                "precondition: the expanded explorer tree must paint the \
+                 seeded file row; screen:\n{}",
+                probe.screen()
+            )
+        });
+
+        // Real driver: identical seed, plus an open picker.
+        let mut app = app_with_expanded_explorer(&dir);
+        app.engine
+            .open_picker(crate::core::engine::PickerSource::LineEndings);
+        let title = app.engine.picker_title.clone();
+        let mut driver = driver_with_shell(app, config(), 120, 30);
+        driver.render();
+
+        assert!(
+            driver.screen_contains(&title),
+            "precondition: the picker's title must paint; screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            driver.find("zq1117.txt"),
+            Some((rx, ry)),
+            "precondition: the click target must still be a painted explorer \
+             tree row with the picker open — if the popup covered it, this \
+             would be an *inside*-the-popup click and the dismissal \
+             assertion below would prove nothing; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.click(rx, ry);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&title),
+            "a click that lands inside the visible explorer panel's own body \
+             must still fall through to the picker's dismiss routing \
+             (`picker_blocks_event` -> `intercepts_blocked`), not be \
+             swallowed by the panel intercept; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Black-box regression for #815 (adopting
     /// `quadraui::FolderPickerController`, replacing the deleted TUI-local
     /// `FolderPickerState`): the open picker must actually *paint* its
@@ -14040,8 +24287,8 @@ mod tests {
     /// Not RED on this backend — TUI's own arm worked. It is here because
     /// that arm is gone: three status arms (per-window, separated, global)
     /// collapsed into one shared band walk, and this is what catches it if
-    /// `window_status_line_zones` or the band's rect arithmetic drifts from
-    /// what `render_window_status_line` paints.
+    /// `status_segment_map`'s paint-time cache (#1250) or the band's rect
+    /// arithmetic drifts from what `render_window_status_line` paints.
     #[test]
     fn window_status_line_segment_click_still_fires_via_shell_app() {
         let mut app = TuiShellApp::new(None);
@@ -14069,6 +24316,212 @@ mod tests {
             screen.contains("Go to Line") || screen.contains("Command"),
             "clicking the cursor-position segment must open the go-to-line \
              palette (`StatusAction::GoToLine`); screen:\n{screen}"
+        );
+    }
+
+    /// #1250: the **separated** status line's segment click routing, with
+    /// the sidebar open so the painted row is *narrower* than the full
+    /// terminal width (`editor_left > 0`) — the case the pre-#1250 click
+    /// handler got wrong.
+    ///
+    /// **RED against unfixed `develop`**: the old handler re-laid the bar's
+    /// text out via `window_status_line_zones(status, bar_width)`, where
+    /// `bar_width` was the *full terminal width*, not the narrower width
+    /// `render_content` actually painted the row at
+    /// (`bar_width - editor_left`). The cursor-position segment is
+    /// right-aligned (pushed last, highest drop priority — see
+    /// `build_window_status_line`), so it is measured from the right edge of
+    /// that too-wide virtual bar: its zone lands at a local x at or beyond
+    /// the *real* rect's width, which `status_bar_zone_hit_test`'s
+    /// `local_x < rect.width` bound can never reach. Every click on the
+    /// segment as it is actually painted therefore missed, silently, with no
+    /// panic and no visible symptom other than "the palette never opens".
+    /// Reverting `render_window_status_line`'s per-window `WidgetId` back to
+    /// the shared `"status:window"` id does *not* reproduce this — the bug is
+    /// the click-time *width*, not the id. Reverting the paint-time cache
+    /// itself (making `TuiShellApp::paint_bottom_band`'s `SeparatedStatus`
+    /// arm lay the bar out at the full terminal width instead of the
+    /// `sb_rect` it actually painted at) does: observed RED — click landed
+    /// nowhere, palette never opened — before this fix, confirmed GREEN
+    /// after restoring it.
+    #[test]
+    fn separated_status_line_segment_click_fires_with_sidebar_open_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        app.engine.session.explorer_visible = true;
+        // `separate_status` (`render.rs::build_screen_layout`) requires
+        // per-window status on, `status_line_above_terminal` off, and some
+        // bottom panel open — exactly the combination that extracts the
+        // active window's status into its own full-width row above the
+        // panel, which is the row this test targets.
+        app.engine.settings.window_status_line = true;
+        app.engine.settings.status_line_above_terminal = false;
+        app.engine.bottom_panel_open = true;
+        app.engine.bottom_panel_kind = render::BottomPanelKind::DebugOutput;
+        app.engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+        // Same pre-existing, unrelated truncation drift `git_branch = None`
+        // sidesteps in the per-window test above.
+        app.engine.git_branch = None;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let (x, y) = driver
+            .find("Ln 1, Col 1")
+            .expect("the separated status line must paint its cursor segment");
+
+        driver.click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Go to Line") || screen.contains("Command"),
+            "clicking the cursor-position segment on the separated status \
+             line (with the sidebar open, so the row is narrower than the \
+             full terminal width) must open the go-to-line palette \
+             (`StatusAction::GoToLine`); screen:\n{screen}"
+        );
+    }
+
+    /// #1206: `'laststatus'` `0` hides the status line entirely, regardless
+    /// of `'windowstatusline'` being on — `render::effective_window_status_line`
+    /// is what every status-visibility read site now goes through instead of
+    /// the raw `window_status_line` field.
+    ///
+    /// RED against unfixed `develop`: `'laststatus'` was still in
+    /// `UNIMPLEMENTED_VALUE_OPTIONS` (`:set laststatus=0` errored with
+    /// "recognised but not implemented yet"), and even ignoring that error,
+    /// nothing consulted the field, so the status line painted regardless.
+    #[test]
+    fn set_laststatus_0_hides_the_status_line_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.window_status_line = true;
+        app.engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+        app.engine.git_branch = None;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: the status line must paint before 'laststatus' is touched; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set laststatus=0");
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the status line entirely; screen:\n{screen}"
+        );
+
+        run_ex_command(&mut driver, ":set laststatus=2");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=2' must bring the status line back; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1235: `bottom_band_row_heights` (TUI frame sizing) and `mouse.rs`'s
+    /// `bottom_chrome` (click-row mapping) read the raw
+    /// `engine.settings.window_status_line` field directly instead of
+    /// `render::effective_window_status_line`, so they disagreed with
+    /// `render::build_screen_layout`/`compute_editor_layout` — which already
+    /// used the effective, `'laststatus'`-narrowed value via #1206 — by one
+    /// row whenever `'laststatus'` narrowed `window_status_line` to `false`:
+    /// `laststatus=0`, or `laststatus=1` with one window. Neither of the two
+    /// broken sites ever looked at window count, so a `laststatus=1` global
+    /// status bar's row stayed reserved after closing back down to a single
+    /// window, and never grew back after a split undid the narrowing.
+    ///
+    /// Global (non-per-window) status mode (`window_status_line = false`) is
+    /// what isolates this from `window_status_row_reserved`, which was
+    /// already correct pre-#1235: with per-window status on, the freed row
+    /// lives *inside* the window's own rect, not in the bottom band these
+    /// two sites size, so the divergence never surfaces there. `'laststatus'`
+    /// narrowing only matters for the shared *global* bar's own row.
+    ///
+    /// Row count is read from **painted content**, never the layout formula:
+    /// a numbered filler buffer long enough to overflow the viewport, so a
+    /// reclaimed row shows up as one more marker line becoming visible
+    /// (`screen_contains` reads the painted cell grid).
+    ///
+    /// **RED-verified against unfixed `develop`**: with a single window and
+    /// `laststatus=1`, `render::build_screen_layout`'s paint decision
+    /// already hid the global bar correctly (effective-value-based since
+    /// #1206), but `bottom_band_row_heights` still reserved its row because
+    /// it read the raw field — so the frame stayed one row short, the global
+    /// bar's text painted into the squeezed sliver instead of vanishing, and
+    /// the filler line that should have reclaimed the row never became
+    /// visible. Observed failing (stale "Ln 1, Col 1" still on screen, row
+    /// count unchanged) before the four-site fix, passing after.
+    #[test]
+    fn laststatus_frame_sizing_matches_shared_layout_across_window_count_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine.settings.window_status_line = false; // global-bar mode
+        app.engine.git_branch = None;
+        for i in 0..40 {
+            let pos = app.engine.buffer().len_chars();
+            app.engine
+                .buffer_mut()
+                .insert(pos, &format!("ZQ1235R{i:02}\n"));
+        }
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let visible_marker_rows = |d: &quadraui::tui::testing::TuiDriver<_>| -> usize {
+            (0..40)
+                .filter(|i| d.screen_contains(&format!("ZQ1235R{i:02}")))
+                .count()
+        };
+
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: single window, default laststatus=2, global-bar mode \
+             -- the global status bar must paint; screen:\n{}",
+            driver.screen()
+        );
+        let rows_with_status = visible_marker_rows(&driver);
+
+        // laststatus=1 + one window: real Vim hides the status line
+        // entirely, and the frame must reclaim exactly the one row it freed.
+        run_ex_command(&mut driver, ":set laststatus=1");
+        assert!(
+            !driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with one window must hide the global status \
+             bar; screen:\n{}",
+            driver.screen()
+        );
+        assert_eq!(
+            visible_marker_rows(&driver),
+            rows_with_status + 1,
+            "hiding the global bar must reclaim exactly the one row it \
+             occupied -- the row `bottom_band_row_heights` mis-reserved \
+             when reading the raw field instead of \
+             `render::effective_window_status_line`; screen:\n{}",
+            driver.screen()
+        );
+
+        // Splitting back to 2+ windows (still global-bar mode -- window_
+        // status_line stayed false) must show the bar again, matching
+        // `effective_window_status_line`'s own `windows.len() > 1` gate,
+        // and cost back exactly the row single-window laststatus=1 freed.
+        run_ex_command(&mut driver, ":split");
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=1' with 2+ windows must show the global status \
+             bar again; screen:\n{}",
+            driver.screen()
+        );
+
+        // laststatus=0 hides the status line unconditionally, even with
+        // 2+ windows still open.
+        run_ex_command(&mut driver, ":set laststatus=0");
+        assert!(
+            !driver.screen_contains("Ln 1, Col 1"),
+            "'laststatus=0' must hide the global status bar even with 2+ \
+             windows open; screen:\n{}",
+            driver.screen()
         );
     }
 
@@ -14158,7 +24611,7 @@ mod tests {
             "opening tab B makes it the active tab"
         );
 
-        // The live config (`TuiShellApp::shell_config`), not the bare
+        // The live config (`TuiShellApp::build_shell_config`), not the bare
         // single-panel `config()` test helper: it seeds
         // `default_sidebar_width` from the same `SIDEBAR_WIDTH` constant
         // `mouse.rs`'s own click math reads back via `self.sidebar_width`
@@ -14169,7 +24622,7 @@ mod tests {
         // disagree by the difference — a test-fixture-only trap, not a
         // production bug (the real runner's `ShellConfig` always goes
         // through `shell_config`).
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
         assert!(
             driver.screen().contains("BBB752"),
             "fixture must start out on tab B's content; screen:\n{}",
@@ -14207,8 +24660,18 @@ mod tests {
     /// A `TuiShellApp` showing an editor hover popup whose body carries a
     /// `command:` link, plus a distinctive body word to assert the popup's
     /// presence on the painted grid with.
+    ///
+    /// Built on [`TuiShellApp::new_for_test`], not `TuiShellApp::new(None)`
+    /// (#976): the latter also runs `restore_session_files()` against this
+    /// exact checkout's real per-workspace session file, which can restore a
+    /// non-zero scroll offset or extra windows before the fixture's own
+    /// `buffer_mut().insert(0, "fn main() {}\n")` runs — scrolling the
+    /// `HOVERBODY755` marker out of the viewport on a dev box with a saved
+    /// session for this repo path while staying green in CI, where no such
+    /// session exists. `new_for_test` skips the restore, so the starting
+    /// state matches everywhere.
     fn app_with_editor_hover_link() -> TuiShellApp {
-        let mut app = TuiShellApp::new(None);
+        let mut app = TuiShellApp::new_for_test();
         app.engine.settings.use_nerd_fonts = Some(false);
         crate::icons::set_nerd_fonts(false);
         app.engine.session.explorer_visible = false;
@@ -14245,7 +24708,7 @@ mod tests {
     fn driver_click_on_editor_hover_command_link_navigates_and_closes_the_popup() {
         let mut driver = driver_with_shell(
             app_with_editor_hover_link(),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -14279,7 +24742,7 @@ mod tests {
     fn driver_click_outside_editor_hover_popup_dismisses_it_and_falls_through() {
         let mut driver = driver_with_shell(
             app_with_editor_hover_link(),
-            TuiShellApp::shell_config(false),
+            TuiShellApp::build_shell_config(false),
             80,
             24,
         );
@@ -14368,7 +24831,7 @@ mod tests {
         // fixed-width, non-wrapping box (horizontal scroll instead), and this
         // test's line is long enough that a plain 80-col terminal clips the
         // trailing URL text before `find` can locate it.
-        let driver = driver_with_shell(app, TuiShellApp::shell_config(false), 160, 24);
+        let driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 160, 24);
 
         // Markdown syntax must be stripped — proves quadraui's parser ran
         // rather than the raw source being painted verbatim.
@@ -14458,26 +24921,32 @@ mod tests {
     /// so Ctrl-L in the toolbar switched panels on TUI and did nothing on
     /// GTK — one table, two behaviours.
     ///
-    /// Asserts on the painted sidebar (does the Settings panel's `SETTINGS`
+    /// Asserts on the painted sidebar (does the Settings panel's `Settings`
     /// header reach the screen?), never on `activity_bar_focused`, and pairs
     /// the negative with a positive: a bare `l` immediately afterwards
     /// *must* activate, so a fixture that simply cannot activate could not
     /// pass this test by accident.
     ///
     /// **Verified RED against unfixed `develop`:** the pre-#757 activity-bar
-    /// tier reaches `activity_bar_activate()` for Ctrl-L, so `SETTINGS`
+    /// tier reaches `activity_bar_activate()` for Ctrl-L, so `Settings`
     /// paints after the first keypress and the first assertion fires.
+    ///
+    /// #1343: the marker is title-case `"Settings"`, not `"SETTINGS"` —
+    /// that all-caps text used to come from `render_settings_panel`'s own
+    /// hand-painted duplicate header, deleted now that the shell's
+    /// `AppShell` (whose `config()`/`build_shell_config` title for this
+    /// bottom item is title-case) owns the sidebar header alone.
     #[test]
     fn activity_bar_ctrl_l_does_not_activate_via_shell_app() {
         use crate::core::engine::sidebar::TOOLBAR_IDX_SETTINGS;
 
         let mut app = TuiShellApp::new(None);
         app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_SETTINGS);
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
-            !before.contains("SETTINGS"),
+            !before.contains("Settings"),
             "precondition: the Settings panel must not already be open; \
              screen:\n{before}"
         );
@@ -14493,7 +24962,7 @@ mod tests {
 
         let after_ctrl = driver.screen();
         assert!(
-            !after_ctrl.contains("SETTINGS"),
+            !after_ctrl.contains("Settings"),
             "Ctrl-L in the activity bar must not activate the selected item \
              (`render::activity_bar_key_action` guards Activate on !ctrl); \
              screen:\n{after_ctrl}"
@@ -14508,7 +24977,7 @@ mod tests {
 
         let after_plain = driver.screen();
         assert!(
-            after_plain.contains("SETTINGS"),
+            after_plain.contains("Settings"),
             "a bare `l` on the Settings slot must still activate it; \
              screen:\n{after_plain}"
         );
@@ -14543,7 +25012,7 @@ mod tests {
             None,
             None,
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -14615,7 +25084,7 @@ mod tests {
         // Park the activity bar's keyboard cursor on the (only) plugin panel.
         app.engine.activity_bar_focus_in_at(TOOLBAR_IDX_EXT_BASE);
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -14704,7 +25173,7 @@ mod tests {
         // untouched default) is still the explorer.
         app.engine.settings_has_focus = true;
 
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 80, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
 
         let before = driver.screen();
         assert!(
@@ -14772,7 +25241,7 @@ mod tests {
     fn alt_right_widens_the_painted_sidebar_via_shell_app() {
         let mut app = app_with_sidebar_open();
         app.engine.buffer_mut().insert(0, "ZQXW759W");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 120, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 120, 24);
 
         let before = driver
             .find_bounds("ZQXW759W")
@@ -14838,7 +25307,8 @@ mod tests {
             } else {
                 crate::core::Mode::Normal
             };
-            let mut driver = driver_with_shell(app, TuiShellApp::shell_config(vscode), 100, 24);
+            let mut driver =
+                driver_with_shell(app, TuiShellApp::build_shell_config(vscode), 100, 24);
 
             alt_press(&mut driver, quadraui::Key::Char('z'), false);
 
@@ -14896,7 +25366,7 @@ mod tests {
         // paint over the command line this test reads. See
         // `TuiShellApp::new_for_test`'s doc comment.
         let app = TuiShellApp::new_for_test();
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         press_with(
             &mut driver,
@@ -14950,7 +25420,7 @@ mod tests {
             render::FocusKeyRoute::Search,
             "precondition: the search panel must own the keyboard"
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         press_with(
             &mut driver,
@@ -15004,7 +25474,7 @@ mod tests {
     fn ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app() {
         let mut app = TuiShellApp::new_for_test();
         app.engine.buffer_mut().insert(0, "ZQXW762CTRLL");
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         // Settle the sidebar width, then enter Insert mode — in that order,
         // so nothing but the Ctrl+L under test can move the marker.
@@ -15095,7 +25565,7 @@ mod tests {
             render::FocusKeyRoute::Search,
             "precondition: the search panel must own the keyboard before the click"
         );
-        let mut driver = driver_with_shell(app, TuiShellApp::shell_config(false), 100, 24);
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 24);
 
         let marker = driver
             .find_bounds("ZQXW823SEARCHFOCUS")
@@ -15374,6 +25844,353 @@ mod tests {
             screen.contains("ZXW887C1") && !screen.contains("ZQXW887C1"),
             "cursor after u must be back at the selection start (column 1), \
              so x deletes 'Q'; screen:\n{screen}"
+        );
+    }
+
+    /// #1156: undo used to be a single linear stack — `u` followed by a
+    /// *different* edit permanently discarded whatever branch `u` had left,
+    /// so no keystroke could ever get back to it. `g-`/`g+` now walk the
+    /// whole undo tree in chronological order, crossing into a branch a
+    /// plain `u` + new edit abandoned. End-to-end through the real
+    /// `driver_with_shell` harness (quadraui's `TuiDriver`), guarding
+    /// against exactly the class of bug #1160 found: a global key
+    /// (`<C-x><C-l>`) silently swallowed above the engine layer, invisible
+    /// to engine-only tests. `g`/`-`/`+` are equally global, so this proves
+    /// the keystrokes reach `Engine::g_earlier`/`g_later` and the crossing
+    /// paints correctly, not just that the engine method works in
+    /// isolation.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old
+    /// `undo_stack`/`redo_stack`/`undo_timeline` linear design, the second
+    /// edit (`ZQXW1156WORLD`) cleared `redo_stack` and `undo_timeline` was
+    /// `truncate`d, so neither `g-` nor any other keystroke could reach
+    /// `ZQXW1156HELLO` again — the first `g-` landed straight on the empty
+    /// root instead of the abandoned branch.
+    #[test]
+    fn g_minus_crosses_undo_branch_abandoned_by_u_then_edit_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "iZQXW1156HELLO".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO"),
+            "the first insert must have landed; screen:\n{screen}"
+        );
+
+        // `u` back to the empty root, then a *different* edit — the point
+        // at which a linear undo_stack design permanently discarded
+        // "ZQXW1156HELLO".
+        driver.type_char('u');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156HELLO"),
+            "u must undo the first insert; screen:\n{screen}"
+        );
+
+        for c in "iZQXW1156WORLD".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156WORLD") && !screen.contains("ZQXW1156HELLO"),
+            "the second, different insert must have replaced the first; \
+             screen:\n{screen}"
+        );
+
+        // A single g- already crosses into the abandoned branch, since
+        // "ZQXW1156HELLO" was recorded before "ZQXW1156WORLD" regardless of
+        // which branch either sits on.
+        driver.type_char('g');
+        driver.type_char('-');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "g- must cross into the branch u + a new edit abandoned; \
+             screen:\n{screen}"
+        );
+
+        // A second g- continues past it to the shared empty root.
+        driver.type_char('g');
+        driver.type_char('-');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "a second g- must reach the empty root past the abandoned \
+             branch; screen:\n{screen}"
+        );
+
+        // g+ retraces the same chronological path forward, landing back on
+        // the abandoned branch and then on "world".
+        driver.type_char('g');
+        driver.type_char('+');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156HELLO") && !screen.contains("ZQXW1156WORLD"),
+            "g+ must retrace back through the abandoned branch first; \
+             screen:\n{screen}"
+        );
+        driver.type_char('g');
+        driver.type_char('+');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156WORLD") && !screen.contains("ZQXW1156HELLO"),
+            "a second g+ must land back on world; screen:\n{screen}"
+        );
+    }
+
+    /// #1156: `:undolist`, `:earlier`, and `:later` are new ex commands with
+    /// no prior driver coverage. Exercises them through the real command
+    /// line (`:` + `Enter`, the same path a user types), checking both that
+    /// `:earlier`/`:later` actually move the buffer across the same
+    /// abandoned branch `g-`/`g+` cross above, and that the status message
+    /// they report says "earlier"/"later" rather than "g-"/"g+" (the
+    /// `ex_earlier_later` count path used to delegate to `g_earlier`/
+    /// `g_later`, which hardcode their own label into the reported
+    /// message).
+    #[test]
+    fn ex_earlier_later_and_undolist_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in "iZQXW1156EARL".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        for c in ":undolist".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("number") && screen.contains("seconds ago"),
+            ":undolist must print its header; screen:\n{screen}"
+        );
+
+        for c in ":earlier 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("ZQXW1156EARL"),
+            ":earlier 1 must undo the only change; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("earlier") && !screen.contains("g-"),
+            ":earlier's status message must say \"earlier\", not \"g-\"; \
+             screen:\n{screen}"
+        );
+
+        for c in ":later 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ZQXW1156EARL"),
+            ":later 1 must redo the change :earlier 1 undid; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("later") && !screen.contains("g+"),
+            ":later's status message must say \"later\", not \"g+\"; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1294 (#1280 follow-up): `:earlier {N}[smhd]` — the time-cutoff spec
+    /// form, as opposed to the count-stepped form the test above already
+    /// covers — must land the cursor on the target undo-tree node's
+    /// `cursor_before` (where its own edit started), not `cursor_after`
+    /// (where it finished), exactly like `g-`/`g+` and the count form were
+    /// fixed to do in #1280 (see the doc comment on `UndoTree::at_or_before`
+    /// in `buffer_manager.rs`). Landing on the tree root (as
+    /// `test_ex_earlier_time_spec_falls_back_to_oldest_state` in
+    /// `core/engine/tests.rs` does) can't catch this — `cursor_before ==
+    /// cursor_after` there by construction — so this drives a *non-root*
+    /// landing through the real command line, end to end through
+    /// `driver_with_shell` (guarding against the same class of bug #1160
+    /// found: a keystroke path silently swallowed above the engine layer,
+    /// invisible to an engine-only test), and asserts on the *painted*
+    /// block-cursor cell rather than internal model state.
+    ///
+    /// The undo-tree node timestamp is backdated directly
+    /// (`app.engine.active_buffer_state_mut().undo_tree.nodes[1].timestamp`)
+    /// rather than through a real `std::thread::sleep`, so the test is
+    /// deterministic and fast — and it has to happen *before* the app is
+    /// handed to `driver_with_shell`, since `ShellAdapter` hides the
+    /// wrapped app afterward (see `tui_ext_panel_reveal_by_short_hash_...`,
+    /// above, for the same constraint). See the doc comment on
+    /// `UndoTree::at_or_before` for the citation of the live-`nvim
+    /// --headless` session this mirrors.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `at_or_before`
+    /// to read `cursor_after` instead of `cursor_before` lands the block
+    /// cursor on "hello"'s trailing "o" (display column 4) instead of its
+    /// leading "h" (display column 0).
+    #[test]
+    fn ex_earlier_time_spec_lands_on_cursor_before_not_after_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+
+        // Node 1 ("hello"): cursor_before = col 0 (start of the empty
+        // buffer), cursor_after = col 4 (Esc lands on the trailing "o").
+        for c in "ihello".chars() {
+            app.engine.handle_key(&c.to_string(), Some(c), false);
+        }
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.view().cursor.col, 4);
+
+        // Node 2: `0ix<Esc>` moves to col 0 *before* starting its own
+        // insert group, so this node's own cursor_before/cursor_after are
+        // both col 0 — it's node 1 ("hello") we're testing the landing on.
+        app.engine.handle_key("0", Some('0'), false);
+        app.engine.handle_key("i", Some('i'), false);
+        app.engine.handle_key("x", Some('x'), false);
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.buffer().to_string(), "xhello");
+
+        // Backdate node 1 (the "hello" commit) far into the past, leaving
+        // the root and node 2 at their real (just-now) timestamps, so a
+        // `1s`-ago cutoff computed once `:earlier 1s` actually runs below
+        // excludes both of those and selects node 1 as the newest node at
+        // or before the cutoff — deterministically, no real sleep needed.
+        {
+            let bs = app.engine.active_buffer_state_mut();
+            let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+            bs.undo_tree.nodes[1].timestamp = far_past;
+        }
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        for c in ":earlier 1s".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello") && !screen.contains("xhello"),
+            ":earlier 1s must land on the \"hello\" node, undoing the \"x\" \
+             insert; screen:\n{screen}"
+        );
+
+        let hello_bounds = driver
+            .find_bounds("hello")
+            .expect("\"hello\" must be painted on screen");
+        let row = hello_bounds.y as u16;
+        let start_col = hello_bounds.x as u16;
+        assert_eq!(
+            driver.style_at(start_col, row).map(|s| s.bg),
+            Some(cursor_bg),
+            ":earlier 1s must land the cursor on cursor_before (col 0, \
+             \"hello\"'s leading \"h\"), not cursor_after (col 4, its \
+             trailing \"o\"); screen:\n{screen}"
+        );
+        assert_ne!(
+            driver.style_at(start_col + 4, row).map(|s| s.bg),
+            Some(cursor_bg),
+            "the cursor must not be sitting on \"hello\"'s trailing \"o\" \
+             (cursor_after); screen:\n{screen}"
+        );
+    }
+
+    /// #1294: the forward counterpart of the test just above — `:later
+    /// {N}[smhd]` must also land on `cursor_before`, not `cursor_after`.
+    /// Same driver-tier rationale; see that test's doc comment. The
+    /// backdating here targets the *root* node (index 0) instead, since
+    /// `:later` needs to jump forward from the root onto "hello".
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `at_or_after`
+    /// to read `cursor_after` instead of `cursor_before` lands the block
+    /// cursor on "hello"'s trailing "o" (display column 4) instead of its
+    /// leading "h" (display column 0).
+    #[test]
+    fn ex_later_time_spec_lands_on_cursor_before_not_after_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+
+        // Node 1 ("hello"): cursor_before = col 0, cursor_after = col 4 —
+        // same distinct pair as the `:earlier` test above.
+        for c in "ihello".chars() {
+            app.engine.handle_key(&c.to_string(), Some(c), false);
+        }
+        app.engine.handle_key("Escape", None, false);
+        assert_eq!(app.engine.view().cursor.col, 4);
+
+        // Back to the root so `:later` has somewhere to jump forward *to*.
+        app.engine.handle_key("u", Some('u'), false);
+        assert_eq!(app.engine.buffer().to_string(), "");
+
+        // Backdate the root far into the past so a `1s`-ago cutoff
+        // excludes it, leaving node 1 (still at its real, just-now
+        // timestamp) as the only live node at or after the cutoff —
+        // deterministically, no real sleep needed.
+        {
+            let bs = app.engine.active_buffer_state_mut();
+            let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+            bs.undo_tree.nodes[0].timestamp = far_past;
+        }
+
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let cursor_bg = quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).cursor);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.render();
+
+        for c in ":later 1s".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello"),
+            ":later 1s must redo forward onto the \"hello\" node; \
+             screen:\n{screen}"
+        );
+
+        let hello_bounds = driver
+            .find_bounds("hello")
+            .expect("\"hello\" must be painted on screen");
+        let row = hello_bounds.y as u16;
+        let start_col = hello_bounds.x as u16;
+        assert_eq!(
+            driver.style_at(start_col, row).map(|s| s.bg),
+            Some(cursor_bg),
+            ":later 1s must land the cursor on cursor_before (col 0, \
+             \"hello\"'s leading \"h\"), not cursor_after (col 4, its \
+             trailing \"o\"); screen:\n{screen}"
+        );
+        assert_ne!(
+            driver.style_at(start_col + 4, row).map(|s| s.bg),
+            Some(cursor_bg),
+            "the cursor must not be sitting on \"hello\"'s trailing \"o\" \
+             (cursor_after); screen:\n{screen}"
         );
     }
 
@@ -15799,6 +26616,328 @@ mod tests {
         );
     }
 
+    /// #1157: `\@=` look-ahead — `/foo\(bar\)\@=` matches "foo" only when
+    /// it's immediately followed by "bar", not the "foo" followed by "baz".
+    /// Drives the real `/` search pipeline and reads the painted command
+    /// line (`"match 1 of 1"` proves exactly one of the two "foo"s
+    /// qualified) plus the buffer after `x` (proves *which* one: the
+    /// lookahead is zero-width, so `x` must delete the leading 'f' of the
+    /// first "foo", not consume any of "bar").
+    ///
+    /// **Verified RED against unfixed `develop`:** `\@=` was rejected
+    /// outright (`vim_regex.rs`'s `'@' => Err(...)` arm), so the command
+    /// line painted the rejection message instead of "match 1 of 1", and `x`
+    /// had no match to land on.
+    #[test]
+    fn search_pattern_lookahead_matches_only_where_the_lookahead_holds_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xx foobar foobaz");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "foo\\(bar\\)\\@=".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only the first \"foo\" (followed by \"bar\") satisfies the \
+             lookahead — the second, followed by \"baz\", must not count; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xx oobar foobaz"),
+            "the lookahead is zero-width, so the cursor lands on the 'f' of \
+             the qualifying \"foo\" and x deletes only that letter, leaving \
+             \"bar\" intact; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\_s` — like `\s`, but end-of-line counts too, so a pattern
+    /// can span a line break. `:%s/…\_s…/X/` on two lines whose only
+    /// separator is the newline between them must match across it and merge
+    /// them into one line.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\_` was rejected outright
+    /// (`vim_regex.rs`'s `'_' => Err(...)` arm), so `:s` failed with that
+    /// rejection message and left the two lines untouched.
+    #[test]
+    fn substitute_pattern_underscore_s_matches_across_the_line_break_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "ZQXAAA\nZQXBBB");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/ZQXAAA\\_sZQXBBB/MERGED/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MERGED"),
+            "\\_s must match the newline between the two lines, so the \
+             substitution fires and paints the replacement; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("ZQXAAA") && !screen.contains("ZQXBBB"),
+            "the match spans both original lines, so neither original \
+             token should remain on screen; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%23l` — absolute line-number position assertion. Three
+    /// lines all start with "foo"; `\%2l` restricts the match to line 2
+    /// only, so only that line's leading 'f' is at risk from a following
+    /// `x`.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%<digits>l` was
+    /// rejected outright (no `\%` position-assertion support existed before
+    /// #1157), so the search failed with a rejection message and the
+    /// cursor never moved.
+    #[test]
+    fn search_pattern_percent_l_restricts_match_to_that_line_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "fooAAA\nfooBBB\nfooCCC");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%2lfoo".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only line 2's \"foo\" satisfies \\%2l, out of three raw \"foo\" \
+             matches in the buffer; screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ooBBB"),
+            "the cursor should have landed on line 2's leading 'f', so x \
+             deletes it, leaving \"ooBBB\"; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("fooAAA") && screen.contains("fooCCC"),
+            "lines 1 and 3 must survive untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%23c` — absolute column position assertion. Two lines put
+    /// "foo" at different columns; `\%2c` restricts the match to column 2
+    /// only, so line 1 (where 'f' sits at column 2) qualifies and line 2
+    /// (where 'f' sits at column 3) does not.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%<digits>c` was
+    /// rejected outright, so the search failed with a rejection message and
+    /// the cursor never moved.
+    #[test]
+    fn search_pattern_percent_c_restricts_match_to_that_column_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xfooAAA\nyyfooBBB");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%2cfoo".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "only line 1's \"foo\" (starting at column 2) satisfies \\%2c; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xooAAA"),
+            "the cursor should have landed on line 1's leading 'f', so x \
+             deletes it, leaving \"xooAAA\"; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("yyfooBBB"),
+            "line 2 must survive untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%d`/`\%x` char-code literals — `\%d65` is decimal 65
+    /// ('A'), `\%x62` is hex 0x62 ('b'), so `\%d65\%x62` matches the
+    /// literal text "Ab" without either character being typed literally in
+    /// the pattern.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%d`/`\%x` were
+    /// rejected outright, so the search failed with a rejection message and
+    /// the cursor never landed on "Ab".
+    #[test]
+    fn search_pattern_percent_d_and_x_char_code_literals_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "xx Ab yy");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char('/');
+        for c in "\\%d65\\%x62".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("match 1 of 1"),
+            "\\%d65\\%x62 should match exactly the literal \"Ab\"; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('x');
+        driver.type_char('x');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("xx  yy"),
+            "the cursor should have landed on \"Ab\", so two x's delete both \
+             characters, leaving \"xx  yy\"; screen:\n{screen}"
+        );
+    }
+
+    /// #1157: `\%V` (charwise) — restricts a match to the last Visual
+    /// selection's exact byte range. Selecting "foo bar" charwise
+    /// (columns 0-6) and running `:%s/\%Vfoo/BAZ/g` must replace only the
+    /// "foo" inside the selection, leaving the second, unselected "foo"
+    /// alone. Drives real `v`/motion/`Escape` keys to set
+    /// `last_visual_anchor`/`last_visual_cursor`, unlike the `vim_regex.rs`
+    /// unit tests, which hand a byte tuple straight to `compile()` and never
+    /// exercise `last_visual_byte_range()` at all.
+    ///
+    /// **Verified RED against unfixed `develop`:** `\%V` was rejected
+    /// outright (no `\%V` support existed before #1157), so `:s` failed
+    /// with a rejection message and neither "foo" changed.
+    #[test]
+    fn substitute_pattern_percent_v_restricts_to_charwise_visual_selection_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "foo bar foo");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // v + 6*l selects columns 0..=6, i.e. "foo bar" (7 chars) — the
+        // first "foo" and the space/"bar" after it, not the second "foo".
+        driver.type_char('v');
+        for _ in 0..6 {
+            driver.type_char('l');
+        }
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/\\%Vfoo/BAZ/g".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BAZ bar foo"),
+            "only the first \"foo\", inside the Visual selection, should be \
+             replaced — the second, outside it, must survive; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1157 review fix: `\%V` restricted to a **linewise** (`V`) Visual
+    /// selection. `last_visual_byte_range()` used to run the charwise
+    /// column formula for *every* Visual kind, which for a linewise
+    /// selection computed an arithmetically-nonsense column-keyed range
+    /// instead of "every byte on the selected lines" — this pins the fix:
+    /// selecting lines 1-2 with `V`/`j` and running `:%s/\%Vfoo/BAZ/g` must
+    /// replace only those two lines' "foo", not line 3's.
+    ///
+    /// **Verified RED against the pre-fix `last_visual_byte_range`:** the
+    /// selection starts on column 3, so the old charwise formula computed
+    /// `lo = 3` (line 1's char offset + column 3) instead of line 1's real
+    /// start at byte 0 — line 1's "foo" (bytes 0..3) fell outside that
+    /// range and was skipped, reporting "1 substitution on 1 line" instead
+    /// of 2 and leaving "fooAAA" unreplaced; the `BAZAAA` assertion below
+    /// failed against it.
+    #[test]
+    fn substitute_pattern_percent_v_restricts_to_linewise_visual_selection_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "fooAAA\nfooBBB\nfooCCC");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        // Move onto column 3 (the first 'A') *before* starting Visual-Line,
+        // so anchor/cursor columns are non-zero and non-equal to line
+        // starts — this is what makes the regression observable: the old
+        // charwise-column formula keyed its range off these columns, so a
+        // non-zero column silently shrank the range and dropped line 1's
+        // match. A selection anchored at column 0 wouldn't have caught it
+        // (the buggy range happens to still cover byte 0 in that case).
+        // V + j then selects lines 1-2 (fooAAA, fooBBB) *linewise* — full
+        // lines regardless of the column the cursor is sitting on — leaving
+        // line 3 (fooCCC) out of the selection.
+        driver.type_char('l');
+        driver.type_char('l');
+        driver.type_char('l');
+        driver.type_char('V');
+        driver.type_char('j');
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "%s/\\%Vfoo/BAZ/g".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BAZAAA") && screen.contains("BAZBBB"),
+            "both selected lines' \"foo\" should be replaced; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("fooCCC"),
+            "the unselected third line must survive untouched; \
+             screen:\n{screen}"
+        );
+    }
+
     /// The editor context menu's "Go to Definition" row advertises a key
     /// that actually invokes the language server. Since #889 gave `gd` back
     /// to Vim's local-declaration motion, that key is the tag jump
@@ -16161,6 +27300,1176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1386 black-box acceptance (the driver-tier proof the
+    /// `lsp_manager.rs`/`lsp_ops.rs` unit tests above don't give on their
+    /// own — CLAUDE.md's Testing section requires rendered-output coverage
+    /// for a user-visible fix, not just engine-state assertions): opening a
+    /// file whose language's LSP server resolves to a broken rustup-style
+    /// proxy (present on disk, fails its `--version` probe — the exact
+    /// shape from the issue) must not block the harness-rendered buffer
+    /// from appearing, and a *second* open of the same language — driven
+    /// through the real `:e` command-line pipeline, the same path a user
+    /// typing in the running TUI takes — must not pay the probe cost
+    /// again.
+    ///
+    /// The first open happens directly on `app.engine` before the driver
+    /// is constructed (matching `no_install_command_error_paints_on_
+    /// command_line_via_shell_app` just above); the second happens through
+    /// `run_ex_command`'s real key-injection path once the driver is live,
+    /// so the regression guard covers both "opens before a driver exists"
+    /// and "opens driven live through the shell".
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the
+    /// `failed_language_resolutions` negative cache in
+    /// `LspManager::ensure_server_for_language` makes
+    /// `probes_after_second_open` read higher than `probes_after_first_open`
+    /// (the broken proxy gets re-invoked by the second `:e`'s did-open +
+    /// semantic-tokens resolution calls) instead of equal. Both opens still
+    /// succeed and paint their content either way — the bug was the
+    /// repeated probe *cost*, not a hard open failure — so only the
+    /// probe-count assertion, not the `screen_contains` ones, distinguishes
+    /// fixed from broken here.
+    #[test]
+    #[cfg(unix)]
+    fn opening_a_file_with_unresolvable_lsp_server_probes_once_across_two_opens_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let binary_name = "vimcode-test-1386-shell-proxy";
+        let unique = format!(
+            "vimcode_test_1386_shell_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(&unique);
+        let home = base.join("home");
+        let cargo_bin = home.join(".cargo").join("bin");
+        let files_dir = base.join("files");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let counter_file = base.join("probes.log");
+
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\necho probe >> {}\nexit 1\n",
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Thread-local, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
+        // version corrupts concurrently-running tests (#957 smoke).
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-test-1386-shell-ext";
+        let file1 = files_dir.join("File1386A.java");
+        let file2 = files_dir.join("File1386B.java");
+        std::fs::write(&file1, "class File1386A { }\n").unwrap();
+        std::fs::write(&file2, "class File1386B { }\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: ext_name.to_string(),
+            language_ids: vec!["java".to_string()],
+            file_extensions: vec![".java".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        app.engine.extension_state.mark_installed(ext_name);
+
+        // First open — direct `Engine` call, before the driver exists, the
+        // same production call path `render.rs`'s `EngineAction::OpenFile`
+        // handler uses.
+        app.engine
+            .open_file_with_mode(&file1, crate::core::engine::OpenMode::Permanent)
+            .unwrap_or_else(|e| panic!("open must succeed despite unresolvable LSP: {e}"));
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("File1386A"),
+            "the harness-rendered buffer must show the opened file's \
+             content even though its language's LSP server is \
+             unresolvable; screen:\n{}",
+            driver.screen()
+        );
+
+        let count_probes = |file: &std::path::Path| {
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        };
+        let probes_after_first_open = count_probes(&counter_file);
+        assert!(
+            probes_after_first_open >= 1,
+            "test setup sanity: opening the first file must have driven \
+             at least one probe of the broken proxy"
+        );
+
+        // Second open, through the real `:e` command-line pipeline this
+        // time (`run_ex_command` → `Engine::execute_command` →
+        // `EngineAction::OpenFile` → `render.rs`'s shared handler →
+        // `open_file_with_mode`) — the same path a user driving the
+        // running TUI takes, not a direct `Engine` call.
+        run_ex_command(&mut driver, &format!(":e {}", file2.display()));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File1386B"),
+            "the second file must also open and paint despite the \
+             still-unresolvable server; screen:\n{screen}"
+        );
+
+        let probes_after_second_open = count_probes(&counter_file);
+        assert_eq!(
+            probes_after_second_open, probes_after_first_open,
+            "opening a second file of the same unresolvable-server \
+             language must not pay the probe cost again; probes after \
+             open 1: {probes_after_first_open}, after open 2: \
+             {probes_after_second_open}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── #1344: extension install exit status / combined LSP+DAP outcome —
+    // black-box coverage ──────────────────────────────────────────────────
+    //
+    // The first review pass on #1344 asserted only on `Engine::message`
+    // directly, via `Engine::new()` + a hand-built `InstallContext` calling
+    // the private `finalize_install_from_terminal` (see the `tests` module
+    // at the bottom of `src/core/engine/terminal_ops.rs`) — internal state,
+    // never anything painted. Exactly the anti-pattern `no_install_command_
+    // error_paints_on_command_line_via_shell_app` (#918) above already
+    // documents CLAUDE.md's Testing section calling out. The two tests
+    // below close that gap for #1344's two user-visible message changes by
+    // driving the *real* install path — `Engine::ext_install_from_registry`
+    // (which sets `pending_terminal_command`/`pending_install_context`,
+    // exactly as `:ExtInstall` does) through a real `TuiShellApp` +
+    // `driver_with_shell`, letting `driver.tick()` spawn the install
+    // terminal pane (a real PTY, `sh -c '...'`) the same way production
+    // does, letting that pane's shell terminate itself (the manifests'
+    // install strings start with `SELF_CLOSING_INSTALL_PREFIX` — see its
+    // doc, and `poll_until_screen`'s, for why synthesising a keypress
+    // instead is unsafe and was the #1345 smoke flake) so `poll_terminal`
+    // calls `finalize_install_from_terminal` for real, and reading the
+    // painted command line back with `driver.screen()`.
+    //
+    // Both commands use `sh` builtins/paths guaranteed present on any Unix
+    // box that can build vimcode (no `curl`/`pip`/network involved), and
+    // `#[cfg(unix)]`-gate for the same reason `tests/terminal_wheel.rs`'s
+    // real-PTY tests do: a Windows wrapper flavour (PowerShell) is covered
+    // separately by the pure-function tests in `terminal_ops.rs`'s own
+    // `tests` module.
+
+    /// Poll `driver.tick()` (which reaches `Engine::poll_idle` →
+    /// `poll_terminal` exactly as a live TUI event loop does) until
+    /// `predicate(driver.screen())` holds or `timeout` elapses. Real
+    /// `thread::sleep` between polls, matching the bounded-not-fixed pattern
+    /// `tick_refreshes_sc_panel_asynchronously_not_on_the_event_loop_thread`
+    /// above already uses for a background thread — this is a real PTY
+    /// child process instead, but the same "don't busy-loop, don't hang the
+    /// suite" tradeoff applies.
+    ///
+    /// # Why this sends no keystrokes (#1345 smoke-failure fix)
+    ///
+    /// It used to. `build_terminal_install_wrapper` ends every install
+    /// script with `echo 'Press Enter to close…'` / `read __dummy` /
+    /// `exit`, so the pane's shell parks on `read` until *something*
+    /// answers it, and only then exits — and only a pane exit makes
+    /// `poll_terminal` call `finalize_install_from_terminal`, which paints
+    /// the messages these tests assert on. This loop therefore used to
+    /// synthesise that answer itself, typing `exit` + Enter into the
+    /// focused pane on a backoff schedule, gated on the terminal panel
+    /// still being painted.
+    ///
+    /// That stimulus is *fundamentally* unsafe here, and the gate could
+    /// only narrow the window, never close it: `Engine::handle_key` clears
+    /// `self.message` on **any** keypress (`keys.rs`, "Clear message on any
+    /// keypress"), so the instant the pane is gone a prod lands in the
+    /// editor and wipes the very message under test — permanently, since
+    /// the install runs once. The gate reads *painted* panel presence,
+    /// which cannot be checked atomically with the key delivery that
+    /// follows it, so a prod issued in the same tick that the pane exits
+    /// and the message appears destroys it before any frame shows it. That
+    /// is the reported #1345 smoke failure, reproduced here at ~3% of runs
+    /// of these four tests (`extension_install*`) in parallel and captured
+    /// twice: a 20s timeout ending in `INSERT  [No Name] [+] … Ln 2` — the
+    /// editor holding our own `exit` keystrokes — with an empty command
+    /// line and the "Installing …" spinner still up.
+    ///
+    /// The fix is to stop needing the stimulus: the install commands these
+    /// tests declare in their manifests define a no-op POSIX `read`
+    /// function (`read() { :; } ; …`) as their first act, so the wrapper's
+    /// own `read __dummy` returns immediately, its trailing `exit` runs,
+    /// and the shell terminates **on its own** ~0.0–0.4s later (verified in
+    /// a real PTY under both `bash` and `zsh`, the two `default_shell`
+    /// candidates, with the wrapper's `$?` capture still recording the real
+    /// exit status — the override is defined *before* the command whose
+    /// status is captured). No keystroke is ever sent, so nothing can clear
+    /// the message, and the tests no longer depend on winning a race.
+    ///
+    /// If one of these tests ever times out again with the terminal panel
+    /// still painted and `Press Enter to close…` on screen, the pane's
+    /// shell ignored that override — fix it there (in the manifest's
+    /// install string), not by reinstating a keystroke prod.
+    fn poll_until_screen(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if tick_and_test(driver, &mut predicate) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Advance the driver one tick, repaint, and report whether `predicate`
+    /// holds on the frame that tick produced.
+    ///
+    /// The explicit `render()` matters: `TuiDriver::tick` only repaints
+    /// when the app's tick returns `Reaction::Redraw`, so after a
+    /// `RedrawAfter`/`Continue` tick `screen()` still shows the *previous*
+    /// frame. Painting unconditionally keeps the predicate reading the
+    /// state the tick just produced.
+    fn tick_and_test(
+        driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        predicate: &mut impl FnMut(&str) -> bool,
+    ) -> bool {
+        driver.tick();
+        driver.render();
+        predicate(&driver.screen())
+    }
+
+    /// Prefix for the `install_*` command strings the #1344 driver tests
+    /// declare in their fake manifests: a no-op POSIX `read` override that
+    /// makes `build_terminal_install_wrapper`'s "Press Enter to close…"
+    /// gate self-satisfying, so the install pane's shell exits without any
+    /// synthetic keystroke. See [`poll_until_screen`] for the flake this
+    /// replaces, and why a keystroke can never be safe here.
+    ///
+    /// A shell *function* (not an alias — aliases are not expanded in
+    /// non-interactive reads of a script, and these are typed into an
+    /// interactive shell that has already parsed the line) takes precedence
+    /// over the `read` builtin in `sh`, `bash` and `zsh` alike. It is
+    /// defined ahead of the command under test so the wrapper's
+    /// `__exit_code=$?` still captures that command's real status.
+    #[cfg(unix)]
+    const SELF_CLOSING_INSTALL_PREFIX: &str = "read() { :; } ; ";
+
+    /// The status bar's in-progress spinner glyphs (`render.rs`'s
+    /// `notification_seg` — `frames = ['⠋', '⠙', ...]`), used by the #1396
+    /// tests below to confirm a `NotificationKind::LspInstall` notification
+    /// has actually flipped from "spinning" to "done" (bell), not just that
+    /// its message text is still on screen (the message is left unchanged by
+    /// `notify_done_by_kind(&NotificationKind::LspInstall, None)`, so text
+    /// alone can't distinguish the two states).
+    #[cfg(unix)]
+    const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    /// #1344 core acceptance case: a non-zero exit code from the install
+    /// command must paint "failed (exit N)" on the command line, and must
+    /// NOT claim "not found on PATH" — the exact confusion #1344 reports
+    /// (a failed install command used to surface only as a misleading
+    /// PATH-lookup miss).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #1344, a non-zero
+    /// exit code was never recorded or read back at all — finalize fell
+    /// straight through to the binary-lookup path and reported "LSP binary
+    /// '...' was not found on PATH" instead, so the `"failed (exit 7)"`
+    /// assertion below failed and the `"not found"` negative assertion
+    /// would have passed for the wrong reason (there was no non-zero-exit
+    /// handling to fail).
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_failure_exit_code_paints_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // Point `Engine::check_settings_reload` — which `TuiShellApp::tick`
+        // runs *after* `poll_idle`, and which assigns
+        // `self.message = "Settings reloaded"` — at a private, nonexistent
+        // path. Without this, anything that touches the real
+        // `~/.config/vimcode/settings.json` while this test is polling (the
+        // integration-test binaries `cargo test` runs in parallel processes
+        // are not covered by this crate's `#[cfg(test)]` overrides) wipes
+        // the "failed (exit 7)" message in the same tick that painted it,
+        // and the poll below then times out with a message it can never
+        // see again — observed as this test failing only in a full
+        // `cargo test`, never when run alone. Same guard the #1345
+        // acquisition tests below use.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_fail_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-fail".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 failure test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-fail".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1344-fail".to_string(),
+                // A subshell exit, not a bare `exit 7` — the latter would
+                // terminate the *outer* interactive shell before the
+                // wrapper's own `$?`-capture line ever ran, so no exit code
+                // would be recorded and there would be nothing to report.
+                //
+                // `SELF_CLOSING_INSTALL_PREFIX` is what lets the pane's
+                // shell then reach that wrapper's trailing `exit` with no
+                // synthetic keypress — see its doc, and
+                // `poll_until_screen`'s, for why a keypress here is what
+                // made this test flake.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}sh -c 'exit 7'"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 7)")
+            }),
+            "command line never painted the failed-install message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            !screen.to_lowercase().contains("not found"),
+            "a failed install must not also claim the binary was 'not \
+             found on PATH' — that points at the wrong problem; screen:\n{screen}"
+        );
+    }
+
+    /// #1344 blocking review finding: a manifest that declares both an LSP
+    /// server and a DAP adapter (the `rust` shape in
+    /// `extensions::sample_manifests()` — `lsp.binary` *and*
+    /// `dap.adapter`/`dap.binary` both set) must not have a successful LSP
+    /// install message wiped out by a DAP binary that isn't resolvable.
+    /// Before this fix, `finalize_install_from_terminal` assigned straight
+    /// into `self.message` for each of the LSP/DAP checks in turn, so the
+    /// DAP block always overwrote whatever the LSP block had just set.
+    ///
+    /// Uses `sh` (guaranteed on any Unix box that can build vimcode) as the
+    /// "LSP binary" so the LSP install-time check finds it already on PATH
+    /// (no install command queued for it), and a nonexistent binary for the
+    /// DAP side so the DAP install runs but its own binary check still
+    /// fails — reproducing the "LSP already there, DAP fresh install
+    /// unresolvable" combination the review flagged as realistic and
+    /// untested.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the `outcomes`
+    /// join back to sequential `self.message = format!(...)` assignments
+    /// makes the DAP block's "was not found" message the final value of
+    /// `self.message`, so the `"installed and started"` assertion below
+    /// fails — the LSP success text never reaches the screen at all.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_lsp_success_survives_dap_not_found_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // See the sibling test above for why `check_settings_reload` is
+        // pointed away from the real settings file: this test asserts on
+        // `self.message` too, and is equally exposed to a concurrent
+        // "Settings reloaded" wiping it mid-poll.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1344_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1344-combined".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1344 combined test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1344-combined".to_string()],
+            lsp: LspConfig {
+                binary: "sh".to_string(),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vimcode-test-dap-adapter-1344-combined".to_string(),
+                binary: "vimcode-test-nonexistent-dap-binary-1344-combined".to_string(),
+                // Succeeds (exit 0, so finalize runs the binary checks
+                // rather than reporting a failed command) and closes its own
+                // pane — see `SELF_CLOSING_INSTALL_PREFIX`.
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}true"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's DAP install command must be queued \
+             (LSP's `sh` binary should already resolve, so only DAP installs)"
+        );
+
+        // Wider than the other #1344 driver tests: the combined LSP+DAP
+        // message is long (extension name repeated, plus every probed tool
+        // directory named in the DAP outcome), and a narrower row would
+        // truncate it before the "was not found" text this test checks for
+        // — a real single-line status-bar constraint, not something the fix
+        // needs to solve.
+        let mut driver = driver_with_shell(app, config(), 400, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("was not found")
+            }),
+            "command line never painted the DAP-not-found message; screen:\n{}",
+            driver.screen()
+        );
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("installed and started"),
+            "the LSP success message must survive alongside the DAP \
+             not-found message, not be overwritten by it; screen:\n{screen}"
+        );
+    }
+
+    // ── #1396: finalize on command exit, not pane exit ──────────────────
+    //
+    // The first two tests below deliberately do NOT use
+    // `SELF_CLOSING_INSTALL_PREFIX` — the wrapper's `read __dummy` really
+    // blocks, so the pane's shell never exits on its own. Before #1396,
+    // `poll_terminal` only called `finalize_install_from_terminal` once
+    // `TerminalSession::is_exited()` fired, so with a real blocking `read`
+    // the install looked permanently hung: the spinner never resolved and
+    // the status message never painted until a human noticed the pane and
+    // pressed Enter. These tests poll for the resolved state and never send
+    // a keystroke at all — a real Enter keypress is deliberately not used to
+    // *close* the pane afterwards either (unlike some #1344 tests' framing
+    // might suggest): `poll_until_screen`'s own doc comment above documents
+    // in detail why synthesising that keystroke against a real interactive
+    // shell is a genuine race, not just unnecessary here — confirmed
+    // in practice while writing these tests, where a `press_named(Enter)`
+    // step here flaked in exactly the way that doc predicts. The third test
+    // below instead exercises the "closing must not double-finalize"
+    // half of the issue via `SELF_CLOSING_INSTALL_PREFIX`, which reaches
+    // the same `poll_terminal` code path deterministically (the shell exits
+    // on its own, no synthetic keystroke needed).
+
+    /// #1396 success case: the "Installing…" spinner and the status message
+    /// must both resolve while the pane is still sitting open at its "Press
+    /// Enter to close…" prompt — i.e. before the shell exits.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `poll_terminal`
+    /// to only finalize on `is_exited()` makes the first `poll_until_screen`
+    /// below time out — the command has already exited 0 and the shell is
+    /// permanently parked on `read`, so nothing ever calls
+    /// `finalize_install_from_terminal` and neither the spinner nor the
+    /// status message ever resolve.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_finalizes_before_enter_pressed_success_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // See `extension_install_failure_exit_code_paints_via_shell_app`
+        // above for why `check_settings_reload` is pointed away from the
+        // real settings file.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_success_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        // A binary name that doesn't exist anywhere yet, so `ext_install_
+        // from_registry` actually queues the terminal install (unlike the
+        // #1344 combined test above, which deliberately used `sh` so the
+        // LSP leg would already be resolved). A fake `~/.local/bin` (see
+        // `fake_home_with_local_bin_binary` in `terminal_ops.rs`'s own
+        // tests) is set up empty first, then populated with the binary
+        // *after* the install is queued but *before* the driver ticks — the
+        // exact "install script created a new binary" shape, without
+        // depending on this fake shell command to actually create anything.
+        let binary_name = "vimcode-test-fake-lsp-1396-success";
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_home_1396_success_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let local_bin = home.join(".local").join("bin");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-success".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 success test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-success".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                install: "sh -c 'exit 0'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued \
+             ({binary_name} must not resolve yet)"
+        );
+
+        let binary_path = local_bin.join(binary_name);
+        std::fs::write(&binary_path, "#!/bin/sh\necho fake\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // Precondition: the spinner notification is already up (`notify`
+        // ran synchronously inside `ext_install_from_registry`, before the
+        // terminal pane was even spawned).
+        assert!(
+            driver.screen().contains("Installing"),
+            "spinner notification never painted before the install ran; screen:\n{}",
+            driver.screen()
+        );
+
+        // No keystroke is sent anywhere in this block: the install command
+        // exits almost immediately, but the wrapper's real (unoverridden)
+        // `read __dummy` keeps the pane's shell alive at its prompt.
+        let resolved_before_exit =
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("installed and started") && screen.contains("Press Enter to close")
+            });
+        assert!(
+            resolved_before_exit,
+            "install must finalize (status message painted) while the pane \
+             is still open at its Enter prompt, without waiting for the \
+             shell to exit; screen:\n{}",
+            driver.screen()
+        );
+
+        // The notification itself must have resolved too (bell, not a spin
+        // frame) — not just the command-line text, which `notify_done_by_
+        // kind(.., None)` deliberately leaves unchanged.
+        let screen = driver.screen();
+        assert!(
+            !SPINNER_FRAMES.iter().any(|f| screen.contains(*f)),
+            "notification must no longer show an active spinner frame once \
+             the install has finalized; screen:\n{screen}"
+        );
+
+        // The pane is still sitting open at its Enter prompt at this point
+        // (asserted above via `resolved_before_exit`'s second half) — no
+        // keystroke is sent to close it. See the module comment above for
+        // why: `driver.press_named(NamedKey::Enter)` against this real,
+        // still-blocked interactive shell is a race (confirmed while
+        // writing this test), not a deterministic "close the pane" signal.
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1396 failure case: a non-zero exit code must resolve (status message
+    /// painted) while the pane is still sitting open at its "Press Enter to
+    /// close…" prompt — i.e. before the shell exits — exactly like the
+    /// success case above.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `poll_terminal`
+    /// to only finalize on `is_exited()` makes `poll_until_screen` below
+    /// time out, identically to the success-case test above.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_finalizes_before_enter_pressed_failure_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_failure_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-failure".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 failure test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-failure".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-failure".to_string(),
+                install: "sh -c 'exit 9'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        let resolved_before_exit =
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 9)") && screen.contains("Press Enter to close")
+            });
+        assert!(
+            resolved_before_exit,
+            "failed install must finalize (status message painted) while \
+             the pane is still open at its Enter prompt, without waiting \
+             for the shell to exit; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().to_lowercase().contains("not found"),
+            "a failed install must not also claim the binary was 'not \
+             found on PATH'; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1396 idempotency half: closing the install pane must not run
+    /// `finalize_install_from_terminal` a second time.
+    ///
+    /// Uses `SELF_CLOSING_INSTALL_PREFIX` (like the #1344 tests above)
+    /// rather than a synthetic Enter keypress, so the pane's shell reaches
+    /// `poll_terminal`'s `is_exited()` branch deterministically — no race
+    /// against a real blocked `read`. With the command exiting almost
+    /// immediately, the very same `poll_terminal` tick typically observes
+    /// both the exit-code file *and* `is_exited()` at once, exercising the
+    /// `TerminalSlot::install_finalized` guard between the two branches
+    /// added by #1396.
+    ///
+    /// The regression is made observable because `read_install_exit_code`
+    /// *consumes* (deletes) the scratch file: an unguarded second finalize
+    /// call would find no file, skip the early "failed (exit N)" return,
+    /// and fall through to the binary-resolution checks — which fail for
+    /// this manifest's nonexistent LSP binary and paint "was not found"
+    /// over the original failure message.
+    ///
+    /// **Verified RED against unfixed `develop`** (checked by hand while
+    /// iterating on the fix): dropping `TerminalSlot::install_finalized`
+    /// while keeping the exit-code-file poll makes the final assertion
+    /// below observe "was not found" once the pane has closed.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_pane_close_does_not_duplicate_finalize_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_dup_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-dup".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 duplicate-finalize test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-dup".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-dup".to_string(),
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}sh -c 'exit 9'"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 9)")
+            }),
+            "command line never painted the failed-install message; screen:\n{}",
+            driver.screen()
+        );
+
+        // Give the pane's shell time to actually exit (it self-closes, no
+        // keystroke needed) and `poll_terminal` a few more ticks to run its
+        // `is_exited()` branch on that now-finalized slot.
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..10 {
+            driver.tick();
+            driver.render();
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("failed (exit 9)"),
+            "the original failure message must still be the last thing \
+             painted once the pane has closed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.to_lowercase().contains("not found"),
+            "the pane closing must not trigger a second finalize — 'not \
+             found' would only appear if finalize ran again after the \
+             exit-code scratch file was already consumed; screen:\n{screen}"
+        );
+    }
+
+    /// #1396 review (blocking finding): a leftover exit-code scratch file from
+    /// an earlier, never-finalized attempt under the same (deterministic,
+    /// per-extension) `install_key` must never be mistaken for the *current*
+    /// run's result. `install_key` is `format!("ext:{ext_name}:lsp")`
+    /// (`lsp_ops.rs`) — reused verbatim on every retry — so this pre-writes a
+    /// stale "succeeded" (`0`) scratch file before the new install even
+    /// starts, matching the reviewer's scenario: the pane from an earlier
+    /// attempt was closed (or the app crashed) in the narrow window after its
+    /// wrapper wrote the file but before the shell exited, leaving the file
+    /// behind. This run's *own* command genuinely fails (exit 9); the
+    /// resolved status must reflect that real outcome, not the stale
+    /// leftover — proving `terminal_run_command` invalidates the scratch
+    /// file before injecting the new wrapper, so `poll_terminal`'s eager
+    /// `install_exit_code_ready` check on its very first idle tick can't
+    /// observe a code that didn't come from this attempt.
+    ///
+    /// **Verified RED against the unfixed eager-finalize path:** removing the
+    /// `invalidate_install_exit_code` call from `terminal_run_command` makes
+    /// the first `poll_until_screen` below observe "installed and started"
+    /// (or a spinner that just clears with no failure message) almost
+    /// instantly instead of "failed (exit 9)" — `poll_terminal`'s very first
+    /// tick sees the pre-existing stale `0` file, finalizes as success, sets
+    /// `install_finalized`, and permanently discards the real exit-9 result
+    /// once the command actually finishes.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_ignores_stale_leftover_exit_code_from_earlier_attempt_via_shell_app() {
+        use crate::core::engine::terminal_ops::install_exit_code_path;
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_stale_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let ext_name = "vimcode-test-ext-1396-stale".to_string();
+        let install_key = format!("ext:{ext_name}:lsp");
+        let stale_path = install_exit_code_path(&install_key);
+        // Simulate the leftover from an earlier, never-finalized attempt: it
+        // recorded a *success* (`0`), unlike this run's real, genuine failure
+        // below — so if the stale file wins, the assertions below can tell.
+        std::fs::write(&stale_path, "0").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 stale-leftover test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-stale".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-stale".to_string(),
+                install: "sh -c 'exit 9'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+        // The stale file must still be sitting there right up until the new
+        // wrapper is injected (below) — otherwise this wouldn't be testing
+        // the race the reviewer described.
+        assert!(
+            stale_path.exists(),
+            "precondition: the stale leftover scratch file must still exist \
+             before the new install pane is spawned"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // No keystroke is sent: same rationale as the success/failure tests
+        // above — the wrapper's real `read __dummy` blocks, so the pane's
+        // shell stays open at its prompt and only `poll_terminal`'s
+        // eager exit-code-file poll can resolve this.
+        let resolved = poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+            screen.contains("failed (exit 9)") && screen.contains("Press Enter to close")
+        });
+        assert!(
+            resolved,
+            "install must resolve with THIS run's real failure (exit 9), \
+             not hang and not silently adopt the stale leftover's success; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().contains("installed and started"),
+            "a stale leftover 'success' scratch file must never be reported \
+             as this run's outcome; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_file(&stale_path);
+    }
+
+    // ── #1345: native tool acquisition — driver-tier black-box coverage ──
+    //
+    // Review finding: the only prior coverage for #1345's user-visible
+    // behaviour (a new "Acquiring X…" notification, a new no-terminal
+    // install path, a new post-install status message) drove `Engine`
+    // directly and asserted on internal state
+    // (`tests/extensions.rs::ext_install_with_acquire_runs_no_terminal_
+    // command_and_registers_lsp`), never on painted output. These two
+    // tests close that gap the same way the #1344 tests above do for the
+    // terminal-install path: real `TuiShellApp` + `driver_with_shell`,
+    // assertions on `driver.screen()`.
+    //
+    // `VIMCODE_TEST_DATA_HOME` is also mutated by `core::paths`' and
+    // `core::tool_acquire`'s own tests in this same shared `--lib` binary,
+    // so this uses `paths::VIMCODE_TEST_DATA_HOME_LOCK` rather than a
+    // module-local mutex — see that lock's doc comment for the race a
+    // module-local one produced in practice (a `tool_acquire::tests` test
+    // observed a real, non-test data dir while a `shell_app::tests` test
+    // using its own separate lock was concurrently restoring the var).
+    use crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK as TOOL_ACQUIRE_ENV_LOCK;
+
+    /// RAII guard: snapshot + restore an environment variable across a test.
+    struct AcquireEnvVarGuard {
+        key: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    impl AcquireEnvVarGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let old = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for AcquireEnvVarGuard {
+        fn drop(&mut self) {
+            match self.old.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Build a throwaway zip fixture containing a single entry — mirrors
+    /// `tests/extensions.rs`'s `make_fixture_zip`, duplicated here rather
+    /// than shared because integration tests and this crate's own `--lib`
+    /// unit tests are separate compilation units.
+    fn make_acquire_fixture_zip(
+        dir: &std::path::Path,
+        entry_name: &str,
+        contents: &[u8],
+    ) -> std::path::PathBuf {
+        let path = dir.join("archive.zip");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+        writer.start_file(entry_name, options).unwrap();
+        std::io::Write::write_all(&mut writer, contents).unwrap();
+        writer.finish().unwrap();
+        path
+    }
+
+    /// #1345 core acceptance, painted: a manifest declaring `[lsp.acquire]`
+    /// and no `install_*` must (1) paint "Acquiring …" immediately — no
+    /// terminal pane opens, confirmed via `pending_terminal_command` before
+    /// the driver is even built — and (2) once the background download/
+    /// verify/unpack completes (driven by `driver.tick()` →
+    /// `Engine::poll_idle` → `poll_tool_acquire`, exactly like a live event
+    /// loop), paint the "installed and started" status line.
+    ///
+    /// Verified RED against unfixed `develop`: reverting #1345's engine
+    /// wiring (no `acquire` branch in `ext_install_from_registry`) leaves
+    /// `status_parts` empty and nothing native ever runs, so neither string
+    /// below is ever painted and `poll_until_screen` times out.
+    #[test]
+    fn extension_install_with_acquire_paints_acquiring_then_installed_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Points `Engine::check_settings_reload` (polled every `tick()`,
+        // see `TuiShellApp::tick`) at a private, nonexistent path instead of
+        // the real `~/.config/vimcode/settings.json` — otherwise a
+        // concurrently-running test elsewhere in this shared `--lib` binary
+        // that legitimately writes the real settings file mid-`poll_until_
+        // screen` can fire a real "Settings reloaded" reload, overwriting
+        // `self.message` out from under this test's own assertions
+        // (observed directly: flaked with the real "installed and started"
+        // message replaced by "Settings reloaded" when run alongside
+        // `terminal_ops`/`lsp_ops` tests). Mirrors `app.rs`'s
+        // `handle_poll_tick_reloads_settings_changed_on_disk` — see
+        // `TestSettingsPathGuard`'s doc for why a thread-local override
+        // rather than a `$HOME` mutation.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_acquire_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let binary_name = "vimcode-test-shell-acquire-lsp-1345";
+        let archive = make_acquire_fixture_zip(&fixture_dir, binary_name, b"#!fake-lsp-server");
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-shell-acquire-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vimcode-test-shell-acquire-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+        assert!(
+            driver.screen().to_lowercase().contains("acquiring"),
+            "status line never painted the 'Acquiring …' message; screen:\n{}",
+            driver.screen()
+        );
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("installed and started")
+            }),
+            "command line never painted the finalize message; screen:\n{}",
+            driver.screen()
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
+    /// #1345 review finding: a manifest with both `[lsp.acquire]` and
+    /// `[dap.acquire]` spawns two concurrent background acquisitions, and
+    /// the second leg's outcome must not silently erase the first's status
+    /// text — whether the two land in the same `poll_tool_acquire` tick
+    /// (common for two near-instant `file://` fixtures spawned back to
+    /// back) or in different ticks, which is what actually happens
+    /// whenever the two threads are scheduled even slightly apart. The
+    /// same "DAP outcome clobbering LSP success" class already
+    /// fixed for the terminal-install path (#1344,
+    /// `extension_install_lsp_success_survives_dap_not_found_via_shell_app`
+    /// above), reproduced here for the native-acquisition path this PR
+    /// adds.
+    ///
+    /// The DAP leg's archive deliberately doesn't contain `binary_path`,
+    /// so its acquisition fails with an `Archive` error while the LSP leg
+    /// succeeds — reproducing the realistic "one leg succeeds, one leg
+    /// fails" combination.
+    ///
+    /// Verified RED against `finalize_tool_acquire_group` reverted to
+    /// per-outcome `self.message = format!(...)` assignments (this PR's
+    /// pre-fix shape): whichever leg's background thread happens to send
+    /// its outcome second overwrites `self.message` outright, so one of
+    /// the two assertions below fails depending on completion order —
+    /// exactly the flake-shaped symptom the review flagged. Also verified
+    /// RED against the intermediate, same-tick-only join (accumulate
+    /// within one `poll_tool_acquire` call, assign straight into
+    /// `self.message`): that shape failed 2 of 4 consecutive full `--lib`
+    /// runs here, because two legs landing one tick apart still clobber.
+    /// `core::engine::lsp_ops::tests::tool_acquire_outcomes_in_separate_
+    /// ticks_keep_both_messages` pins the cross-tick half of that
+    /// deterministically; this test is the painted-output half.
+    #[test]
+    fn extension_install_lsp_acquire_success_survives_dap_acquire_failure_via_shell_app() {
+        use crate::core::extensions::{DapConfig, ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let _lock = TOOL_ACQUIRE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // See the sibling test above for why this points `check_settings_
+        // reload` away from the real settings file.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let data_home =
+            std::env::temp_dir().join(format!("vc_test_acq_combined_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_home);
+        std::fs::create_dir_all(&data_home).unwrap();
+        let _data_home_guard =
+            AcquireEnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+        let fixture_dir = std::env::temp_dir().join(format!(
+            "vc_test_acq_combined_fixture_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+
+        let lsp_binary_name = "vc-acq-lsp-1345";
+        let lsp_archive =
+            make_acquire_fixture_zip(&fixture_dir, lsp_binary_name, b"#!fake-lsp-server");
+
+        // A second, distinct archive whose one entry deliberately does NOT
+        // match the DAP leg's `binary_path` below, so extraction fails with
+        // `AcquireError::Archive("... not found in archive")`.
+        let dap_fixture_dir = fixture_dir.join("dap");
+        std::fs::create_dir_all(&dap_fixture_dir).unwrap();
+        let dap_archive =
+            make_acquire_fixture_zip(&dap_fixture_dir, "unrelated-entry", b"#!fake-dap-adapter");
+        let dap_binary_name = "vc-acq-dap-1345";
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vc-acq-ext-1345".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Acquire Combined Test Extension (shell_app)".to_string(),
+            language_ids: vec!["vc-acq-lang-1345".to_string()],
+            lsp: LspConfig {
+                binary: lsp_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", lsp_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: lsp_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            dap: DapConfig {
+                adapter: "vc-acq-adapter-1345".to_string(),
+                binary: dap_binary_name.to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::UrlTemplate,
+                    url: format!("file://{}", dap_archive.display()),
+                    version: "1.0.0".to_string(),
+                    binary_path: dap_binary_name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_none(),
+            "native acquisition must queue no shell command"
+        );
+
+        // Wide row (mirrors `extension_install_lsp_success_survives_dap_
+        // not_found_via_shell_app` above): the joined LSP+DAP message is
+        // long, and a narrower row would truncate it before the "failed to
+        // acquire" text this test checks for.
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // Wait for *both* legs, not just the first one to paint: the two
+        // background threads are not synchronised, so which of them lands
+        // first — and whether they land in the same `poll_tool_acquire`
+        // tick at all — varies run to run. Polling on the conjunction is
+        // what makes the assertion below order-independent; polling on the
+        // DAP failure alone and then asserting the LSP success was already
+        // on screen is a race that fails whenever the LSP leg is the
+        // slower of the two (observed: 2 of 4 consecutive full `--lib`
+        // runs).
+        let both_painted = poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+            screen.contains("failed to acquire") && screen.contains("installed and started")
+        });
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("failed to acquire"),
+            "command line never painted the DAP acquisition failure; screen:\n{screen}"
+        );
+        assert!(
+            both_painted && screen.contains("installed and started"),
+            "the LSP acquisition success message must survive alongside the \
+             DAP acquisition failure, not be overwritten by it — neither \
+             within one poll tick nor across two; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_home);
+        let _ = std::fs::remove_dir_all(&fixture_dir);
+    }
+
     // ── #990: v0.11.0 TUI minimap rendering bug suite ───────────────────
     //
     // Three separately-gated painted-output scenarios, one per reported
@@ -16238,6 +28547,34 @@ mod tests {
         colors
     }
 
+    /// The minimap strip's real width **in braille cells**, measured off
+    /// the painted frame (the widest run of braille glyphs on any row,
+    /// blank `\u{2800}` cells included — those are cells the rasteriser
+    /// touched too) rather than recomputed from
+    /// `render::minimap_reserved_width`'s formula.
+    ///
+    /// Before quadraui#1032, multiplying this by a fixed `COLS_PER_CELL`
+    /// gave exactly the range of *source character columns* the strip
+    /// could represent, since quadraui's TUI rasteriser mapped braille dot
+    /// columns to source columns at one constant scale. quadraui#1032 made
+    /// that scale adapt to the buffer's own widest sampled line instead, so
+    /// there is no longer a host-side constant to multiply by — a caller
+    /// that needs "how many source columns can this strip show" must read
+    /// the resolved scale back (`quadraui::MinimapLayout::cols_per_cell`,
+    /// which vimcode's own `render::draw_minimap_strip` reads back for
+    /// exactly this reason, #1175) rather than assume one.
+    fn minimap_strip_width_cells(screen: &str) -> usize {
+        screen
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .filter(|c| ('\u{2800}'..='\u{28FF}').contains(c))
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// A `TuiShellApp` with the ambient panel state pinned so the minimap
     /// strip's geometry is the same on every machine — same reasoning as
     /// [`app_with_split_shaped_buffer`]'s own doc comment.
@@ -16250,12 +28587,22 @@ mod tests {
         app
     }
 
-    /// Paint a buffer of `n_lines` plain lines and report which screen rows
-    /// the minimap strip touched.
-    fn minimap_rows_for_line_count(n_lines: usize) -> (Vec<usize>, String) {
+    /// A [`app_for_minimap_test`] app with `n_lines` plain `line N` lines —
+    /// the shared body [`minimap_rows_for_line_count`] and the #1186
+    /// windowed-click tests below both need, split out so the latter can
+    /// keep the driver alive to click on rather than only reading back its
+    /// first screen.
+    fn app_with_plain_lines(n_lines: usize) -> TuiShellApp {
         let mut app = app_for_minimap_test();
         let text: String = (0..n_lines).map(|i| format!("line {i}\n")).collect();
         app.engine.buffer_mut().insert(0, &text);
+        app
+    }
+
+    /// Paint a buffer of `n_lines` plain lines and report which screen rows
+    /// the minimap strip touched.
+    fn minimap_rows_for_line_count(n_lines: usize) -> (Vec<usize>, String) {
+        let app = app_with_plain_lines(n_lines);
         let mut driver = driver_with_shell(app, config(), 100, 24);
         // One benign dispatch so `TuiShellApp::handle`'s end-of-dispatch
         // sidebar/title-bar syncs land before the frame under assertion —
@@ -16351,7 +28698,19 @@ mod tests {
     /// painted frame.
     fn minimap_indent_runs(with_long_line: bool) -> (Vec<(usize, usize, usize, usize)>, String) {
         let mut app = app_for_minimap_test();
-        let mut text = String::from("x\n\n\n\n    x\n\n\n\n        x\n\n\n\n");
+        // #1175: each marker is 8 non-blank characters, not 1. Before
+        // quadraui#1032, TUI's dot scale was a fixed 1-column-per-dot, so a
+        // single character was always dense enough (100% coverage of its
+        // own 1-wide bucket) to survive the ordered-dither threshold
+        // (#1007). quadraui#1032 makes the scale a *per-file* property —
+        // driven by the buffer's own widest sampled line, `with_long_line`'s
+        // 300-character line included — so a lone character can now land
+        // in a much wider dot bucket (several source columns per dot) and
+        // fall below the dither threshold on its own, vanishing entirely
+        // regardless of indentation. An 8-character marker keeps enough
+        // density to survive that widening so this test can still probe
+        // indentation *position*, which is what it is actually about.
+        let mut text = String::from("xxxxxxxx\n\n\n\n    xxxxxxxx\n\n\n\n        xxxxxxxx\n\n\n\n");
         if with_long_line {
             text.push_str(&"y".repeat(300));
             text.push('\n');
@@ -16420,6 +28779,29 @@ mod tests {
     /// than the long line's — got 12 vs 12 cells`. Assertions (a) and (d)
     /// pass today, as this test's doc explains — they are post-fix
     /// properties, not the discriminators.
+    ///
+    /// # #1175 update: markers widened, assertion (d) dropped
+    ///
+    /// quadraui#1032 made `cols_per_cell` a *per-file* property, resolved
+    /// from the buffer's own widest sampled line rather than any one line
+    /// in isolation. Two consequences for this fixture, both intended
+    /// upstream behaviour rather than regressions:
+    ///
+    /// - A single marker character can now land in a dot bucket several
+    ///   source columns wide and fail the ordered-dither threshold (#1007)
+    ///   on its own — the marker widened from `"x"` to `"xxxxxxxx"` (8
+    ///   characters) so each indent level keeps enough density to survive
+    ///   whatever scale the file's widest line (`with_long_line`'s
+    ///   300-character line included) drives.
+    /// - Assertion (d) ("appending a long line must not move where the
+    ///   short lines' marks start") is no longer a valid invariant and was
+    ///   removed: since the scale is per-file, appending a much longer
+    ///   line elsewhere legitimately widens the scale every other line
+    ///   draws at, moving where their marks land. It was already
+    ///   documented above as a non-load-bearing nice-to-have, not the
+    ///   discriminator, so dropping it does not weaken this test's actual
+    ///   coverage — see the removed assertion's own comment for the
+    ///   measured before/after columns.
     #[test]
     fn minimap_indent_marks_track_the_files_own_indentation() {
         let (runs, screen) = minimap_indent_runs(false);
@@ -16435,60 +28817,64 @@ mod tests {
              minimap row; runs={long_runs:?}; screen:\n{long_screen}"
         );
 
-        crate::harness::known_bug_gate(
-            "minimap_indent_marks_track_the_files_own_indentation::tui",
-            || {
-                let [(first0, _, count0, strip_width), (first1, ..), (first2, ..)] = runs[..3]
-                else {
-                    unreachable!("length checked above")
-                };
+        // #1175: this used to run inside `crate::harness::known_bug_gate`,
+        // but its label was dropped from `KNOWN_BUGS` back when #990/
+        // quadraui#993 landed (the fix this test itself guards) — the gate
+        // had already become a pass-through, and an unlisted label just
+        // invites the next reader to think a bug is still parked here.
+        let [(first0, _, count0, strip_width), (first1, ..), (first2, ..)] = runs[..3] else {
+            unreachable!("length checked above")
+        };
 
-                // (a) Indentation ordering: deeper never starts left of
-                // shallower, and the deepest starts strictly right of the
-                // shallowest.
-                assert!(
-                    first0 <= first1 && first1 <= first2 && first0 < first2,
-                    "the three indent levels (0, 4, 8 spaces) must paint their \
-                 marks at non-decreasing columns with the deepest strictly \
-                 right of the shallowest; got first-dot columns \
-                 {first0}, {first1}, {first2}; screen:\n{screen}"
-                );
-
-                // (b) Extent, self-normalisation's direct symptom: one
-                // character cannot reasonably be the whole file's width.
-                assert!(
-                    count0 < strip_width,
-                    "a 1-character line must not paint a mark spanning the \
-                 entire {strip_width}-cell minimap strip — that is the \
-                 painted signature of per-line normalisation \
-                 (quadraui#993); screen:\n{screen}"
-                );
-
-                // (c) The discriminating comparison: in one file, a 1-char line
-                // and a 300-char line must not occupy the same width.
-                let (_, _, short_count, _) = long_runs[0];
-                let (_, _, long_count, _) = long_runs[3];
-                assert!(
-                    short_count < long_count,
-                    "in a file containing both a 1-character line and a \
-                 300-character line, the short line's minimap mark must be \
-                 narrower than the long line's — got {short_count} vs \
-                 {long_count} cells; screen:\n{long_screen}"
-                );
-
-                // (d) The issue's original proposal, kept as a post-fix
-                // property (see this test's doc for why it is not
-                // load-bearing): appending a long line must not shift where the
-                // short lines' marks start.
-                let before: Vec<usize> = runs[..3].iter().map(|r| r.0).collect();
-                let after: Vec<usize> = long_runs[..3].iter().map(|r| r.0).collect();
-                assert_eq!(
-                    before, after,
-                    "appending a long line must not move where the three short \
-                 lines' marks start; screen:\n{long_screen}"
-                );
-            },
+        // (a) Indentation ordering: deeper never starts left of
+        // shallower, and the deepest starts strictly right of the
+        // shallowest.
+        assert!(
+            first0 <= first1 && first1 <= first2 && first0 < first2,
+            "the three indent levels (0, 4, 8 spaces) must paint their \
+             marks at non-decreasing columns with the deepest strictly \
+             right of the shallowest; got first-dot columns \
+             {first0}, {first1}, {first2}; screen:\n{screen}"
         );
+
+        // (b) Extent, self-normalisation's direct symptom: one
+        // character cannot reasonably be the whole file's width.
+        assert!(
+            count0 < strip_width,
+            "a 1-character line must not paint a mark spanning the \
+             entire {strip_width}-cell minimap strip — that is the \
+             painted signature of per-line normalisation \
+             (quadraui#993); screen:\n{screen}"
+        );
+
+        // (c) The discriminating comparison: in one file, a short marker
+        // and a 300-character line must not occupy the same width.
+        let (_, _, short_count, _) = long_runs[0];
+        let (_, _, long_count, _) = long_runs[3];
+        assert!(
+            short_count < long_count,
+            "in a file containing both a short marker and a 300-character \
+             line, the short line's minimap mark must be narrower than the \
+             long line's — got {short_count} vs {long_count} cells; \
+             screen:\n{long_screen}"
+        );
+
+        // (d) [removed by #1175] The issue's original proposal was
+        // "appending a long line must not shift where the short lines'
+        // marks start" — already documented above as a nice-to-have, not
+        // load-bearing. quadraui#1032 makes `cols_per_cell` a *per-file*
+        // property (resolved from the buffer's own widest sampled line,
+        // not any one line in isolation), so appending a much longer line
+        // elsewhere in the same file legitimately widens the scale every
+        // other line is drawn at too — moving where their marks land is
+        // the documented, intended consequence of that design, not a
+        // regression. Measured directly: with the 8-character markers
+        // above, the three short marks start at columns `[87, 89, 91]`
+        // without the long line and `[87, 87, 88]` with it — order is
+        // preserved (assertion (a) still holds on `long_runs` implicitly,
+        // since indentation ordering is what actually matters), but the
+        // exact columns shift. Asserting position-invariance here would
+        // just be asserting quadraui#1032 away.
     }
 
     /// Open `n_lines` of `let value_N = 1;`, each indented by `indent`
@@ -16498,14 +28884,57 @@ mod tests {
     fn minimap_colors_for_indent(
         indent: usize,
     ) -> (std::collections::HashMap<String, usize>, usize, String) {
+        minimap_colors_for_fixture(indent, "colour990.rs")
+    }
+
+    /// The theme-default foreground the TUI rasteriser falls back to for a
+    /// minimap cell with no aggregated syntax span behind it
+    /// (`quadraui::tui::minimap::cell_color`'s `unwrap_or(default_fg)`,
+    /// where `default_fg` is the painting theme's own `foreground`).
+    ///
+    /// **Measured, not hardcoded**, and measured through the same painted
+    /// frame every other assertion here reads: the identical fixture in a
+    /// `.txt` file, which tree-sitter does not highlight at all, so *every*
+    /// dot it paints is by construction a fallback dot. That keeps the
+    /// "this dot carries its own syntax colour, not the fallback"
+    /// assertions below theme-independent — they never name an RGB triple,
+    /// exactly as [`minimap_dot_fg_colors`]'s own doc requires — and it is
+    /// what makes them falsifiable: the #990 symptom was a strip painted
+    /// **entirely** in this one colour.
+    fn minimap_fallback_dot_color() -> String {
+        let (colors, highlights, screen) = minimap_colors_for_fixture(0, "colour990.txt");
+        assert_eq!(
+            highlights, 0,
+            "probe precondition: the `.txt` fixture must produce no \
+             highlights at all, or its painted colours are not purely \
+             fallback ones; screen:\n{screen}"
+        );
+        assert_eq!(
+            colors.len(),
+            1,
+            "probe precondition: an unhighlighted buffer must paint every \
+             minimap dot in exactly one colour (the theme fallback); got \
+             {colors:?}; screen:\n{screen}"
+        );
+        colors.into_keys().next().expect("length checked above")
+    }
+
+    /// Shared body of [`minimap_colors_for_indent`] and
+    /// [`minimap_fallback_dot_color`] — `name`'s extension is what decides
+    /// whether tree-sitter highlights the fixture, and therefore whether
+    /// the painted dots can carry a syntax colour at all.
+    fn minimap_colors_for_fixture(
+        indent: usize,
+        name: &str,
+    ) -> (std::collections::HashMap<String, usize>, usize, String) {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}",
+            "vimcode_test_990_minimap_colour_{}_{:?}_{indent}_{name}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("colour990.rs");
+        let file = dir.join(name);
         let pad = " ".repeat(indent);
         let text: String = (0..100)
             .map(|i| format!("{pad}let value_{i} = 1;\n"))
@@ -16538,60 +28967,78 @@ mod tests {
         (colors, n_highlights, screen)
     }
 
-    /// #990 deliverable 3 — the minimap paints **no** colour for indented
-    /// code. Diagnosed here; the cause is **vimcode's**, not quadraui's.
+    /// #990 deliverable 3, fixed by **#1030**; deliverable 2 (below) closed
+    /// on TUI by **quadraui#1032** / vimcode **#1175**. Originally diagnosed
+    /// as vimcode's own (`render::build_minimap_data` handed
+    /// `quadraui::aggregate_spans` a `MinimapGrid` with a hardcoded
+    /// `cols: MINIMAP_SPAN_COLS` (200) covering character columns 0..400,
+    /// while the TUI strip is only ~11 cells wide) — but that diagnosis
+    /// turned out to be a red herring: `cols: 200` never dropped anything
+    /// the strip's own paint loop would have read anyway (200 cells ⊇ 11),
+    /// so resizing it changes only how much unreachable aggregation work
+    /// happens, never what gets painted.
     ///
-    /// # Diagnosis
+    /// # What was actually entangled (#990/#1030)
     ///
-    /// The issue listed four candidates. Measured against unfixed
-    /// `develop`, with a 100-line `.rs` buffer whose every line is
-    /// `let value_N = 1;` indented by a varying number of spaces:
+    /// Colour lookup (`quadraui::tui::minimap::cell_color`) was *always*
+    /// literal: cell `col` reads real character columns
+    /// `col*cols_per_cell..(col+1)*cols_per_cell`, clipped to the strip's
+    /// own `width_cells` — unaffected by anything vimcode's grid contains.
+    /// The actual bug was quadraui#993: dot rendering
+    /// (`braille_char_for_cell`) normalised each line by its *own*
+    /// `chars.len()`, so a deeply-indented line's content was stretched to
+    /// fill the *entire* visible strip regardless of its real column —
+    /// every cell painted *some* dot. Colour's literal lookup found no
+    /// aggregated span that far out and fell back to the theme default, so
+    /// every one of those stretched-into-view dots painted in the same
+    /// fallback colour. quadraui#993's fix made `braille_char_for_cell`
+    /// literal too — clipped, not stretched — so dots and colour agree: a
+    /// line indented past the strip's real (then-fixed) width painted no
+    /// dots at all, rather than stretched-but-wrongly-coloured ones.
     ///
-    /// | indent | tree-sitter highlights | distinct painted dot colours |
-    /// |---|---|---|
-    /// | 0  | 400 | 5 |
-    /// | 8  | 400 | 3 |
-    /// | 20 | 400 | 2 |
-    /// | 40 | 400 | **1** (the fallback only) |
-    /// | 80 | 400 | **1** (the fallback only) |
+    /// # #1030 deliverable 2, closed by quadraui#1032 / #1175
     ///
-    /// * Candidate 1 (*`buffer_state.highlights` is empty under the TUI*)
-    ///   is **disproven** — 400 highlights in every row of that table, and
-    ///   the colour count still collapses to 1. The test below asserts the
-    ///   highlight count is non-zero explicitly and ungated, so this stays
-    ///   disproven rather than re-guessed.
-    /// * Candidate 2 (*sampling drops spans*) is real but secondary — it
-    ///   makes colour *sparse* on long files (measured: ~68% fallback cells
-    ///   on a deliberately sparse 19 000-line fixture), never absent.
-    /// * Candidate 4 (*grid granularity mismatch*) matches the measured
-    ///   cutoff exactly, and is **vimcode-side**:
-    ///   `render::build_minimap_data` hands `quadraui::aggregate_spans` a
-    ///   `MinimapGrid` with a hardcoded `cols: MINIMAP_SPAN_COLS` (200) and
-    ///   `cols_per_cell: 2` — a 200-cell colour grid covering character
-    ///   columns 0..400 — while the TUI strip the rasteriser paints is only
-    ///   ~12 cells wide. Only grid cells 0..~12 are ever consulted, i.e.
-    ///   character columns 0..~24. Every span on a line indented past that
-    ///   lands in a grid cell nothing reads, which is precisely the
-    ///   observed monotonic collapse and its cutoff between indent 20 and
-    ///   indent 40. Real source is nested, so in practice nearly every
-    ///   token is past the cutoff — hence "no colouring".
+    /// Issue #1030's written deliverable 2 ("colour must survive at indent
+    /// 40 and 80, not only near column 0") used to hold on **GTK only** —
+    /// `gtk::testing::minimap::minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver`
+    /// — because TUI's rasteriser hardcoded a fixed `COLS_PER_CELL = 2`
+    /// (22 source columns for an 11-cell strip), and nothing vimcode passed
+    /// in could widen it. quadraui#1032 made that scale adapt to the
+    /// buffer's own widest sampled line instead (capped at
+    /// [`quadraui::primitives::minimap::COLUMN_CAPACITY`], VS Code's own
+    /// `minimap.maxColumn`), and vimcode#1175 wired the *colour* grid to
+    /// read the same resolved scale back (`render::draw_minimap_strip`,
+    /// via `Backend::minimap_layout`) instead of a stale hardcoded
+    /// constant — so indents 40 and 80 (well under a 100-line
+    /// `let value_N = 1;` fixture's ~120-column cap) now reach exactly like
+    /// GTK's already did.
     ///
-    /// The fix therefore belongs in vimcode (derive the grid's `cols` /
-    /// `cols_per_cell` from the strip's actual painted width instead of a
-    /// fixed 200), and is **not** attempted here: this issue is test-only,
-    /// and the entangled quadraui#993 defect above means the dots and the
-    /// colours are on two different horizontal scales until that lands too.
-    /// Filed separately as a vimcode issue.
+    /// # What this scenario asserts
     ///
-    /// **RED against unfixed `develop`:** confirmed by running this
-    /// scenario with its `KNOWN_BUGS` entry removed — the gated assertion
-    /// fails with `the minimap must paint more than one distinct
-    /// foreground colour … got 1`.
+    /// 1. **Colour survives at every depth up to and including 80** — not
+    ///    just near column 0 — and is the code's own syntax colour rather
+    ///    than the theme fallback ([`minimap_fallback_dot_color`], measured,
+    ///    not hardcoded). #990's symptom was a strip painted *entirely* in
+    ///    that fallback; #1030's unmet deliverable 2 was TUI clipping
+    ///    colour at indent 40/80 that GTK could already show.
+    /// 2. **Content genuinely past `COLUMN_CAPACITY` still clips** — VS
+    ///    Code parity, not unbounded widening. This is also the scenario
+    ///    that discriminates #1175's actual fix: if the colour grid is
+    ///    built with a stale `cols_per_cell` that undershoots what the
+    ///    rasteriser resolves, colour can vanish (or land on the wrong
+    ///    cell) well *before* this boundary too — property 1 at indent 80
+    ///    is that discriminator (see this test's sibling
+    ///    [`minimap_colour_grid_tracks_the_resolved_dot_scale`] for the
+    ///    RED-confirmed, more surgical version of that same failure mode).
     #[test]
     fn minimap_paints_syntax_colour_for_indented_code() {
-        // Ungated, and the reason this test can't be green for the wrong
-        // reason: un-indented code *is* coloured today, so the probe works
-        // and the gated failure below is about indentation alone.
+        // Ungated (#1030 deleted this scenario's `KNOWN_BUGS` entry, and
+        // fix iteration 2 dropped the now-vestigial `known_bug_gate`
+        // wrapper with it — an unlisted label's gate is just a plain
+        // assertion with extra indirection). The reason it can't be green
+        // for the wrong reason: un-indented code *is* coloured today, so
+        // the probe demonstrably works, and every assertion below is about
+        // indentation alone.
         let (flat_colors, flat_highlights, flat_screen) = minimap_colors_for_indent(0);
         assert!(
             flat_highlights > 0,
@@ -16605,27 +29052,451 @@ mod tests {
              {flat_colors:?}; screen:\n{flat_screen}"
         );
 
-        let (colors, highlights, screen) = minimap_colors_for_indent(40);
-        // Ungated: candidate 1 stays disproven — the highlights are there.
+        let fallback = minimap_fallback_dot_color();
+        let strip_cells = minimap_strip_width_cells(&flat_screen);
         assert!(
-            highlights > 0,
-            "precondition: indenting the fixture must not stop tree-sitter \
-             highlighting it (candidate 1 of this issue's diagnosis); got \
-             {highlights} highlights"
+            strip_cells >= 4,
+            "precondition: the minimap strip must be at least 4 braille \
+             cells wide for the indent sweep below to have any depth to \
+             sweep; got {strip_cells}; screen:\n{flat_screen}"
         );
 
-        crate::harness::known_bug_gate(
-            "minimap_paints_syntax_colour_for_indented_code::tui",
-            || {
-                assert!(
-                    colors.len() > 1,
-                    "the minimap must paint more than one distinct foreground \
-                 colour for syntax-highlighted code, even when that code is \
-                 indented ({highlights} highlights exist for this buffer) — \
-                 got {}: {colors:?}; screen:\n{screen}",
-                    colors.len()
-                );
-            },
+        // Property 1 — colour survives at every depth up to 80 (the #1030
+        // deliverable 2 depths), not just near column 0. Each of these
+        // buffers' widest line (`indent + len("let value_N = 1;")`, ~98 at
+        // most) sits comfortably under `COLUMN_CAPACITY`, so
+        // quadraui#1032's adaptive scale widens enough to keep the whole
+        // line in view — no `covered` arithmetic needed here, just the
+        // measured outcome.
+        for indent in [0, 4, 8, 40, 80] {
+            let (colors, highlights, screen) = minimap_colors_for_indent(indent);
+            // Candidate 1 of the issue's diagnosis ("highlights are empty
+            // under the TUI") stays disproven at every depth, ungated.
+            assert!(
+                highlights > 0,
+                "precondition: indenting the fixture by {indent} must not \
+                 stop tree-sitter highlighting it (candidate 1 of this \
+                 issue's diagnosis); got {highlights} highlights"
+            );
+            let syntax_coloured: Vec<&String> = colors.keys().filter(|c| **c != fallback).collect();
+            assert!(
+                !syntax_coloured.is_empty(),
+                "indent {indent} is well under COLUMN_CAPACITY, so the code \
+                 painted there must still carry its own syntax colour — a \
+                 strip painted *only* in the theme fallback ({fallback}) is \
+                 #990's symptom, and colour vanishing specifically at 40/80 \
+                 is #1030 deliverable 2 regressing. Got {colors:?}; \
+                 screen:\n{screen}"
+            );
+        }
+
+        // Property 2 — content genuinely past COLUMN_CAPACITY still
+        // clips, VS Code parity rather than unbounded widening. The
+        // margin covers the adaptive scale's own rounding overshoot
+        // (`resolve_cols_per_cell` can cover a little past the cap; see
+        // that function's doc upstream), so this indent is unambiguously
+        // beyond anything the strip could ever be widened to reach.
+        let column_capacity = quadraui::primitives::minimap::COLUMN_CAPACITY;
+        let past_cap_indent = column_capacity + strip_cells * 2 + 20;
+        let (far_colors, far_highlights, far_screen) = minimap_colors_for_indent(past_cap_indent);
+        assert!(
+            far_highlights > 0,
+            "precondition: indenting the fixture by {past_cap_indent} must \
+             not stop tree-sitter highlighting it (candidate 1 of this \
+             issue's diagnosis); got {far_highlights} highlights"
+        );
+        assert!(
+            far_colors.is_empty(),
+            "indent {past_cap_indent} is well past COLUMN_CAPACITY \
+             ({column_capacity}), so it must paint NO dots at all — not \
+             dots stretched into view (quadraui#993) and painted in a \
+             fallback colour that does not belong to them. \
+             {far_highlights} highlights exist for this buffer. Got {} \
+             distinct colour(s) on painted dots: {far_colors:?}; \
+             screen:\n{far_screen}",
+            far_colors.len()
+        );
+    }
+
+    /// #1175 (quadraui#1032 host-side wiring): the minimap's colour grid
+    /// must track whichever `cols_per_cell` quadraui's TUI rasteriser
+    /// actually resolves for the buffer's own width, not a hardcoded
+    /// constant — otherwise a cell's *dots* and its *syntax colour*
+    /// describe different buffer columns, the exact desync
+    /// quadraui#993's own review flagged as a risk ("would quietly desync
+    /// the dot grid from `cell_color`'s colour grid again").
+    ///
+    /// # Mechanism
+    ///
+    /// `quadraui::aggregate_spans` weighs a histogram bucket by a span's
+    /// **full** length, not the length of its overlap with that bucket —
+    /// so a long span that merely *touches* a wide cell can still
+    /// out-weigh a short span that starts exactly at that cell's own
+    /// column 0. This fixture puts a short `keyword` token (`let`, weight
+    /// 3) at literal columns 0..3 and a long `comment` token (weight
+    /// ~150) that starts at column 9 — both inside cell 0's real column
+    /// range once the buffer's own width forces `cols_per_cell` to widen
+    /// past ~10 (quadraui#1032). Correctly aggregated (bucket width ==
+    /// the real resolved scale), cell 0's dominant colour is the
+    /// **comment's** (far more total weight). If the host aggregates with
+    /// a stale, narrower `cols_per_cell` instead, `aggregate_spans`
+    /// produces many narrow sub-buckets instead of one wide one, and
+    /// `cell_color`'s lookup (`.find()`, first match by ascending
+    /// `start_col`) returns whichever sub-bucket comes *first* — the
+    /// **keyword's**, since it starts at column 0 and the comment's own
+    /// sub-bucket doesn't begin until column 9. Same dots, wrong colour:
+    /// exactly the desync this issue closes.
+    ///
+    /// **RED against unfixed `render.rs`:** confirmed by reverting
+    /// `draw_minimap_strip`'s backend-resolved `cols_per_cell` read-back
+    /// (hardcoding the old fixed constant straight into the colour-grid
+    /// construction instead, with the pin still bumped to quadraui#1032's
+    /// rev) and re-running this test: cell 0 paints the `keyword` colour
+    /// instead of the `comment` colour that should dominate it.
+    #[test]
+    fn minimap_colour_grid_tracks_the_resolved_dot_scale() {
+        crate::core::buffer_manager::set_syntax_max_lines(20_000);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1175_minimap_colour_scale_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("wide1175.rs");
+        // `let x=1; // zzzz...` (a long trailing comment): "let" is a
+        // short `keyword` span at columns 0..3; the comment (`comment`
+        // scope) starts at column 9 and runs to the end of a ~160-column
+        // line, forcing quadraui#1032's adaptive scale to widen well past
+        // 10 for an ordinary ~11-cell TUI strip (see this test's doc for
+        // the exact mechanism this fixture is built to trigger).
+        let text = format!("let x=1; // {}\n", "z".repeat(150));
+        std::fs::write(&file, &text).unwrap();
+
+        let mut app = app_for_minimap_test();
+        app.engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        let win_id = app.engine.active_window_id();
+        let buf_id = app.engine.windows.get(&win_id).unwrap().buffer_id;
+        let highlights = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .unwrap()
+            .highlights
+            .clone();
+        let keyword_span = highlights
+            .iter()
+            .find(|(_, _, scope)| scope == "keyword")
+            .expect("precondition: 'let' must highlight as a keyword, or this fixture's own construction is broken");
+        let comment_span = highlights
+            .iter()
+            .find(|(_, _, scope)| scope == "comment")
+            .expect("precondition: the trailing '//' text must highlight as a comment, or this fixture's own construction is broken");
+        assert_eq!(
+            keyword_span.0, 0,
+            "precondition: 'let' must start at column 0, or cell 0's \
+             range no longer contains it; got {keyword_span:?}"
+        );
+        assert!(
+            comment_span.1 - comment_span.0 > (keyword_span.1 - keyword_span.0) * 10,
+            "precondition: the comment must far outweigh the keyword by \
+             total span length, or aggregate_spans's weighting cannot be \
+             expected to favour it; keyword={keyword_span:?} \
+             comment={comment_span:?}"
+        );
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let row = (0..screen.lines().count())
+            .find(|&r| minimap_dot_run(&screen, r).is_some())
+            .expect("the fixture line must paint at least one minimap row with a set dot");
+        let (_, _, _, strip_width) =
+            minimap_dot_run(&screen, row).expect("checked by find() above");
+        assert!(
+            strip_width >= 10,
+            "precondition: the minimap strip must be at least 10 cells \
+             wide for quadraui#1032's adaptive scale to plausibly widen \
+             cell 0 out to column 9 (the comment's start); got \
+             {strip_width}; screen:\n{screen}"
+        );
+
+        // Cell 0 is the leftmost braille glyph on the row — every cell in
+        // `draw_minimap`'s row loop gets a resolved `fg`, whether or not
+        // its own dot bits are set, so this is well-defined regardless of
+        // the dither threshold's outcome for cell 0 itself.
+        let cell0_col = screen
+            .lines()
+            .nth(row)
+            .expect("row exists, checked above")
+            .chars()
+            .enumerate()
+            .find(|(_, c)| ('\u{2800}'..='\u{28FF}').contains(c))
+            .map(|(i, _)| i)
+            .expect("precondition: the row must paint at least one braille cell");
+        let cell0_fg = driver
+            .style_at(cell0_col as u16, row as u16)
+            .expect("precondition: cell 0 must paint some style")
+            .fg;
+
+        // Onedark (the TUI's default theme) gives `keyword` and `comment`
+        // distinct RGB values — read directly off the theme rather than
+        // hardcoding a literal, so this stays correct if either preset
+        // colour is ever retuned.
+        let theme = crate::render::Theme::onedark();
+        let keyword_rgb =
+            ratatui::style::Color::Rgb(theme.keyword.r, theme.keyword.g, theme.keyword.b);
+        let comment_rgb =
+            ratatui::style::Color::Rgb(theme.comment.r, theme.comment.g, theme.comment.b);
+        assert_ne!(
+            keyword_rgb, comment_rgb,
+            "precondition: onedark's keyword and comment colours must \
+             differ, or this fixture cannot discriminate anything"
+        );
+
+        assert_eq!(
+            cell0_fg, comment_rgb,
+            "cell 0 covers real buffer columns [0, cols_per_cell) — wide \
+             enough, once quadraui#1032's scale resolves for this ~160-\
+             column line, to contain both the 3-column 'let' keyword and \
+             the ~150-column trailing comment that starts at column 9. \
+             quadraui::aggregate_spans weighs a cell by each span's full \
+             length, so the comment (far more total weight) must win the \
+             colour for that whole cell. Getting the keyword's colour \
+             ({keyword_rgb:?}) instead of the comment's ({comment_rgb:?}) \
+             means the colour grid was built at a different \
+             (narrower/stale) cols_per_cell than the dots were actually \
+             painted at; screen:\n{screen}"
+        );
+    }
+
+    // ── #1085: point-sample → block-aggregation ────────────────────────
+
+    /// Rightmost screen column, on `row`, carrying a *non-blank* braille
+    /// glyph (`\u{2801}'..='\u{28FF}`), or `None` if the row paints no
+    /// braille at all.
+    fn rightmost_braille_col(screen: &str, row: usize) -> Option<usize> {
+        screen
+            .lines()
+            .nth(row)?
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| ('\u{2801}'..='\u{28FF}').contains(c))
+            .map(|(i, _)| i)
+            .last()
+    }
+
+    /// #1093 retired the black-box scenario that used to live here
+    /// (`a_stride_skipped_distinctive_line_still_paints_via_shell_app`): it
+    /// drove #1085's cross-line block aggregation by handing the whole
+    /// buffer to a strip many times smaller. `build_minimap_data` can no
+    /// longer take that path at all — the strip now holds a fixed-scale
+    /// *window* onto the buffer (one buffer line per `lines` entry, VS
+    /// Code's `minimap.size: proportional`) rather than the whole file
+    /// squeezed to fit, so `quadraui::primitives::minimap::block_bounds`
+    /// always takes its "never upscales" branch once the window can never
+    /// exceed `target_lines` — true by construction on every call now.
+    /// #1098 lifted the aggregation/dither arithmetic itself into
+    /// quadraui (quadraui#1012), which carries its own unit-level
+    /// coverage for that mechanism now — see
+    /// `quadraui::primitives::minimap::tests::sample_blocks_*` upstream —
+    /// so there is no vimcode-side white-box equivalent left to point to
+    /// here any more.
+    ///
+    /// This test instead covers what #1093 is actually about: the window
+    /// slides to follow the editor's own scroll position. A distinctive
+    /// line placed several strip-windows deep into the file must not paint
+    /// while the cursor is still at the top, and must paint once the
+    /// editor scrolls down far enough to bring it into the window.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `build_minimap_data`'s windowing (handing
+    /// `quadraui::primitives::minimap::block_bounds` the whole
+    /// `total_buffer_lines` again) makes the "must not paint yet"
+    /// assertion fail: the old code squeezed the entire file into the
+    /// strip on every frame regardless of scroll position, so the
+    /// distinctive line (and the resulting off-first-cell dot) was already
+    /// visible before any scroll happened.
+    #[test]
+    fn minimap_window_slides_to_show_a_distinctive_line_once_scrolled_to_it() {
+        // Measure the strip's real row capacity at this test's own
+        // terminal size first — never hardcode the sampling geometry.
+        let (probe_rows, probe_screen) = minimap_rows_for_line_count(2000);
+        assert!(
+            probe_rows.len() >= 4,
+            "precondition: the strip must paint at least 4 rows; got \
+             {probe_rows:?}; screen:\n{probe_screen}"
+        );
+        let strip_rows = probe_rows.len();
+        // Mirrors `render::MINIMAP_LINES_PER_ROW` (4 buffer lines per
+        // braille row) — not imported (it's module-private), measured
+        // instead via the probe above.
+        let target_lines = strip_rows * 4;
+        // #1186 let the strip's window grow past `target_lines` to fit a
+        // whole file when it can, up to a `MINIMAP_MAX_COMPRESSION *
+        // target_lines` ceiling. #1211 changed how that growth factor `K`
+        // is derived — from the strip's own geometry, never from
+        // `total_buffer_lines` (see `MINIMAP_VIEWPORT_MULTIPLE` in
+        // `render.rs`) — so on the TUI `K` now lands at a small constant
+        // (`3`, not a value that grows with the file) for every file longer
+        // than its own geometry-only window. `* 100` comfortably exceeds
+        // that window regardless of which `K` produced it, so the strip
+        // still has to slide to reach the distinctive line.
+        let total_lines = target_lines * 100;
+        // Deep enough into the second half of the file that it cannot be
+        // inside the strip's window while the cursor is still at the top.
+        //
+        // #1186/#1211: a single distinctive line is no longer a reliable
+        // marker once `K > 1` —
+        // `quadraui::primitives::minimap::block_sample_indices` only reads
+        // up to `BLOCK_LINE_SAMPLE_CAP` (8) lines per block, spaced
+        // across the block's real width, so a single marker line can land
+        // in a gap that never gets sampled. A `DISTINCTIVE_BAND_WIDTH`-line
+        // band, wider than that worst-case sampling gap, is guaranteed to
+        // contain a sampled line regardless of where it falls inside a
+        // block or how wide the block is.
+        const DISTINCTIVE_BAND_WIDTH: usize = 32;
+        let distinctive_line = total_lines - target_lines / 2;
+
+        // `ShellAdapter<TuiShellApp>`'s inner app is crate-private once
+        // wrapped by `driver_with_shell` (see
+        // `tui_ext_panel_reveal_by_short_hash_selects_the_commit_row_not_the_separator`'s
+        // own doc comment), so `scroll_top` has to be pinned on the engine
+        // *before* construction — two separate drivers, not one mutated
+        // mid-test.
+        let build = |scroll_top: Option<usize>| {
+            let mut app = app_for_minimap_test();
+            let mut text = String::with_capacity(total_lines * 2);
+            for i in 0..total_lines {
+                if (distinctive_line..distinctive_line + DISTINCTIVE_BAND_WIDTH).contains(&i) {
+                    text.push_str(&"z".repeat(20));
+                } else {
+                    text.push('x');
+                }
+                text.push('\n');
+            }
+            app.engine.buffer_mut().insert(0, &text);
+            if let Some(scroll_top) = scroll_top {
+                let wid = app.engine.active_window_id();
+                if let Some(w) = app.engine.windows.get_mut(&wid) {
+                    // The cursor must move too — otherwise the render
+                    // pipeline's own `ensure_cursor_visible` (cursor still
+                    // at line 0 < a scroll_top this far down) snaps
+                    // `scroll_top` straight back to the top before the
+                    // first paint.
+                    w.view.scroll_top = scroll_top;
+                    w.view.cursor.line = scroll_top;
+                }
+            }
+            let mut driver = driver_with_shell(app, config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver
+        };
+
+        let before = build(None).screen();
+
+        let strip_start = (0..24)
+            .filter_map(|row| braille_col(&before, row))
+            .min()
+            .unwrap_or_else(|| panic!("the minimap must paint braille; screen:\n{before}"));
+        let farthest_before = (0..24)
+            .filter_map(|row| rightmost_braille_col(&before, row))
+            .max()
+            .unwrap_or(strip_start);
+        assert_eq!(
+            farthest_before, strip_start,
+            "at the top of the file, the strip's window must not yet \
+             reach the distinctive line placed deep in the second half of \
+             the file — got a dot past the strip's own first cell; \
+             screen:\n{before}"
+        );
+
+        let after = build(Some(total_lines - 1)).screen();
+
+        let strip_start_after = (0..24)
+            .filter_map(|row| braille_col(&after, row))
+            .min()
+            .unwrap_or_else(|| panic!("the minimap must paint braille; screen:\n{after}"));
+        let farthest_after = (0..24)
+            .filter_map(|row| rightmost_braille_col(&after, row))
+            .max()
+            .unwrap_or(strip_start_after);
+        assert!(
+            farthest_after > strip_start_after,
+            "scrolled to the bottom, the distinctive line must now be \
+             inside the strip's slid window — expected a dot past the \
+             strip's own first cell; screen:\n{after}"
+        );
+    }
+
+    /// #1096 black-box acceptance (CLAUDE.md: drive the running app, not
+    /// only unit tests on the helpers): a real highlighted file, opened and
+    /// painted through the full `TuiShellApp`/`TuiDriver` stack, must not
+    /// cost proportionally more minimap work than a 10x-smaller one at the
+    /// same strip geometry. `render.rs`'s own
+    /// `minimap_line_fetch_count_tracks_target_lines_not_buffer_size` pins
+    /// the same invariant by calling `build_minimap_data` directly; this is
+    /// its through-the-app twin, proving the fix reaches the path a real
+    /// keystroke/redraw actually takes (`TuiShellApp::render_content` ->
+    /// `build_screen_layout` -> `build_minimap_data`), not just the
+    /// function in isolation.
+    ///
+    /// **RED against the #1096 regression:** confirmed by hand against the
+    /// unfixed highlight-mapping loop (no `sampled_at`/binary-search
+    /// early-out, a `line_text_cache: HashMap<usize, String>` fetching
+    /// every distinct highlighted line instead) — `large_fetches` grew
+    /// with the buffer instead of staying pinned to the small fixture's
+    /// count, failing the equality assertion below. Reverted before
+    /// landing this test.
+    #[test]
+    fn minimap_line_fetches_do_not_scale_with_buffer_size_via_shell_app() {
+        fn highlighted_app(n_lines: usize) -> TuiShellApp {
+            let mut app = app_for_minimap_test();
+            let mut text = String::with_capacity(n_lines * 24);
+            for i in 0..n_lines {
+                text.push_str(&format!("fn line_{i}() {{ do_something({i}); }}\n"));
+            }
+            app.engine.buffer_mut().insert(0, &text);
+            let state = app.engine.active_buffer_state_mut();
+            state.syntax = Some(crate::core::syntax::Syntax::new_for_language(
+                crate::core::syntax::SyntaxLanguage::Rust,
+            ));
+            // Explicit, generous limit rather than the process-wide
+            // `SYNTAX_MAX_LINES` atomic, which other tests write (see
+            // `render.rs`'s `large_minimap_engine` doc comment for why).
+            state.update_syntax_with_limit(n_lines.saturating_add(1));
+            assert!(
+                !state.highlights.is_empty(),
+                "fixture must produce real highlights or this test doesn't \
+                 exercise the #1096 regression class at all"
+            );
+            app
+        }
+
+        const SMALL_LINES: usize = 2_000;
+        const LARGE_LINES: usize = 20_000;
+
+        let small_fetches = crate::render::count_minimap_line_fetches(|| {
+            let mut driver = driver_with_shell(highlighted_app(SMALL_LINES), config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            let _ = driver.screen();
+        });
+        let large_fetches = crate::render::count_minimap_line_fetches(|| {
+            let mut driver = driver_with_shell(highlighted_app(LARGE_LINES), config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            let _ = driver.screen();
+        });
+
+        assert_eq!(
+            small_fetches, large_fetches,
+            "minimap line fetches through the real app must depend only on \
+             strip geometry, not buffer length ({SMALL_LINES}-line buffer: \
+             {small_fetches} fetches, {LARGE_LINES}-line buffer: \
+             {large_fetches} fetches)"
         );
     }
 
@@ -16729,7 +29600,46 @@ mod tests {
         // before the editor ever sees it.
         app.engine.settings.panel_keys.toggle_sidebar = String::new();
 
-        let height = app.engine.viewport_lines();
+        // #1248: `Engine::viewport_lines()` is no longer trustworthy here on
+        // its own — `tick()`'s own per-frame estimate (which used to make it
+        // accurate immediately, with no paint required) is gone, and the
+        // sole sync mechanism left, `render::run_shared_tick_chores`'s
+        // `set_viewport_for_window` loop, only runs from a *previous* paint.
+        // Derive the real editor row count from the same composer
+        // `TuiShellApp::render_content` calls — `build_screen_for_shell_content`
+        // — then seed `last_layout` with it and `tick()` again so the sync
+        // loop primes `Engine::viewport_lines` for real before any of the
+        // driver interaction below, exactly as a live paint followed by a
+        // live tick would (mirrors
+        // `tick_syncs_viewport_from_the_last_paint_now_the_estimate_is_gone`,
+        // this file's dedicated coverage of that same mechanism).
+        let height = {
+            let theme = app.theme();
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 40,
+            };
+            let tui_backend = super::super::backend::TuiBackend::new();
+            let screen = build_screen_for_shell_content(&app.engine, &theme, area, &tui_backend);
+            let rows = screen
+                .windows
+                .iter()
+                .find(|w| w.window_id == screen.active_window_id)
+                .expect("build_screen_for_shell_content must paint the active window")
+                .lines
+                .len();
+            *app.last_layout.borrow_mut() = Some(screen);
+            app.tick(&mut backend);
+            rows
+        };
+        assert_eq!(
+            app.engine.viewport_lines(),
+            height,
+            "priming tick() did not sync Engine::viewport_lines from the \
+             seeded layout"
+        );
         assert!(
             height >= 7,
             "this fixture's arithmetic needs a real editor viewport of at \
@@ -16807,6 +29717,1924 @@ mod tests {
              topline (the pre-#1008 formula landed on \"Ln 6, Col 1\" here); \
              screen:\n{}",
             driver.screen()
+        );
+    }
+
+    /// #1293: `ensure_cursor_visible_wrap` — the `'wrap'`-on vertical
+    /// scroll-to-cursor path — never read `self.settings.scrolloff`, unlike
+    /// the `'wrap'`-off path right next to it (`ensure_cursor_visible`).
+    /// `nvim_conformance`'s `"scroll:so=5 30G H"`/`"...L"` cases only
+    /// compare buffer+cursor *state*, never a rendered screen, so this
+    /// drives the same reproduction (`:set so=5<CR>`, jump past the bottom
+    /// of the first window, then `H`) through a real `TuiShellApp` +
+    /// `TuiDriver` and asserts on the painted status line — the
+    /// driver-tier black-box coverage CLAUDE.md's "Testing (CRITICAL)"
+    /// section requires for a user-visible scroll-to-cursor fix.
+    ///
+    /// Arithmetic (mirrors `test_ensure_cursor_visible_wrap_respects_
+    /// scrolloff_downward` in `core/engine/tests.rs`, driven through real
+    /// keys instead of calling `ensure_cursor_visible()` directly): jumping
+    /// to buffer line `height + 5` (1-indexed) with `scroll_top` starting
+    /// at 0 exercises the "scroll down to satisfy the *bottom* margin"
+    /// branch. Both the resulting topline and `H`'s landing line reduce to
+    /// values that are independent of `height` (the `+5`/`-5` cancel it
+    /// out), so the assertions below hold for any terminal size the
+    /// fixture's `height >= 7` guard allows:
+    ///
+    /// - 0-indexed cursor line = `height + 4`.
+    /// - Fixed: `scroll_top = cursor_line + scrolloff + 1 - height = 10`,
+    ///   i.e. topline (1-indexed) `11`.
+    /// - `H`'s target (`screen_top_target`, unaffected by this fix — it
+    ///   already read `scrolloff`) is `scroll_top + scrolloff = 15`
+    ///   (0-indexed), i.e. line `16` (1-indexed) — the status bar reads
+    ///   `"Ln 16, Col 1"`.
+    ///
+    /// **RED against unfixed `develop` (confirmed by hand-reverting
+    /// `ensure_cursor_visible_wrap` to the pre-#1293 formula and
+    /// re-running this exact test):** the unfixed path ignores
+    /// `scrolloff` entirely, landing `scroll_top` on `cursor_line - height
+    /// + 1 = 5` (topline `6`) instead of `11`, five lines short — matching
+    /// the `KNOWN_DEVIATIONS` entries' description of landing "one
+    /// scrolloff-margin short of Neovim". `H` then lands on line `11`
+    /// (`"Ln 11, Col 1"`) instead of `16`.
+    #[test]
+    fn h_after_jump_respects_scrolloff_under_wrap_via_shell_app() {
+        fn visible_l_markers(screen: &str) -> Vec<usize> {
+            screen
+                .lines()
+                .flat_map(|line| line.split_whitespace())
+                .filter_map(|tok| tok.strip_prefix('L').and_then(|n| n.parse::<usize>().ok()))
+                .collect()
+        }
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, &(1..=300).map(|n| format!("L{n}\n")).collect::<String>());
+
+        let mut backend = backend_at(100.0, 40.0);
+        app.setup(&mut backend);
+        // See the identical comment on `ctrl_b_clamped_scroll_lands_
+        // cursor_on_new_window_bottom_via_shell_app` above: `tick()`'s
+        // settings reload has to happen before any settings override below,
+        // or the real on-disk `~/.config/vimcode/settings.json` stomps it.
+        app.tick(&mut backend);
+        app.engine.settings.panel_keys.toggle_sidebar = String::new();
+
+        let height = app.engine.viewport_lines();
+        assert!(
+            height >= 7,
+            "this fixture's arithmetic needs a real editor viewport of at \
+             least 7 rows; got {height}"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 40);
+
+        // Click-to-focus guardrail, same rationale as the CTRL-B test above.
+        let (cx, cy) = driver
+            .find("L1")
+            .expect("the buffer's first line must paint before the click");
+        driver.click(cx, cy);
+
+        // `'wrap'` defaults to off in vimcode (`Settings::default().wrap`);
+        // Neovim's default (and the oracle's, per #1280) is on, which is
+        // what this bug needs to reproduce. `:set so=5` is the same
+        // abbreviation `nvim_conformance`'s cases use.
+        driver.press_named(quadraui::NamedKey::Escape);
+        for ch in ":set wrap so=5".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        // Jump 5 lines past the bottom of the first window (1-indexed
+        // target `height + 5`), the same shape of jump the CTRL-B test uses
+        // to force a downward scroll.
+        let target = height + 5;
+        driver.type_char(':');
+        for ch in target.to_string().chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let after_jump = visible_l_markers(&driver.screen());
+        assert_eq!(
+            after_jump.iter().min().copied(),
+            Some(11),
+            "with scrolloff=5, jumping to line {target} must leave a \
+             5-line margin below the cursor within the new window, landing \
+             the topline on 11 (unfixed `ensure_cursor_visible_wrap` \
+             ignores scrolloff entirely and would land on 6 instead); \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('H');
+
+        let expected_status = "Ln 16, Col 1";
+        assert!(
+            driver.screen_contains(expected_status),
+            "H must land 'scrolloff' (5) lines below the new topline (11), \
+             i.e. line 16 (\"{expected_status}\") — unfixed `ensure_cursor_\
+             visible_wrap`'s un-margined topline (6) would have put H on \
+             line 11 (\"Ln 11, Col 1\") instead; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    // ── #1060: converge GTK's 4 kept-GTK-spelled keys onto the shared
+    // `render::engine_key_from_ui` ─────────────────────────────────────
+    //
+    // TUI's own decode of `BackTab`/`PageUp`/`PageDown` was already routed
+    // through `render::engine_key_from_ui` before this issue (`Insert` was
+    // not — see `render::engine_key_from_ui_tests::
+    // insert_key_decodes_to_the_gtk_terminal_pty_spelling`). What #1060
+    // actually changed on the TUI side is three consumers that only ever
+    // recognised `"BackTab"` (`search.rs`'s `handle_search_input_key`,
+    // `source_control.rs`'s `sc_sidebar_navigate` nav-key table,
+    // `ext_panel.rs`'s `dispatch_ext_sidebar_key_unified`) gaining an
+    // `"ISO_Left_Tab"` alias — the spelling TUI has sent all along. Before
+    // this fix, Shift+Tab in those three places was a silent TUI no-op.
+    //
+    // The GTK half of both tests below (proving PageUp/PageDown already
+    // worked and BackTab now does too) is
+    // `gtk::testing::engine_key_from_ui_gtk_tests::
+    // page_down_and_page_up_navigate_the_sc_sidebar_on_gtk` /
+    // `ctrl_shift_tab_opens_the_tab_switcher_on_gtk`.
+
+    /// PageUp/PageDown navigating the Source Control sidebar already worked
+    /// on TUI before #1060 (TUI always sent `"Page_Up"`/`"Page_Down"`, the
+    /// only spelling `sc_sidebar_navigate`'s nav-key table ever recognised).
+    /// This is the required TUI-side half of "driver test on both backends
+    /// for each of the four [keys]" — proving the behaviour the GTK fix
+    /// (which *did* change) now matches, not a TUI regression.
+    #[test]
+    fn page_down_and_page_up_navigate_the_sc_sidebar_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // Staged, not unstaged: `SC_SECTION_STAGED` is the SidebarSystem's
+        // default active section, and PageUp/PageDown navigate *within the
+        // active section* (see the GTK twin's identical fixture comment).
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "zqxw1060_a.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxw1060_b.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxw1060_c.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+        ];
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        app.engine.sc_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+
+        fn row_bounds<A: quadraui::AppLogic>(
+            d: &mut quadraui::tui::testing::TuiDriver<A>,
+            text: &str,
+        ) -> quadraui::Rect {
+            d.find_bounds(text)
+                .unwrap_or_else(|| panic!("row {text:?} must paint; screen:\n{}", d.screen()))
+        }
+        fn sample<A: quadraui::AppLogic>(
+            d: &mut quadraui::tui::testing::TuiDriver<A>,
+            rows: &[quadraui::Rect],
+        ) -> Vec<Option<quadraui::tui::testing::CellStyle>> {
+            rows.iter()
+                .map(|r| d.style_at(r.x as u16, r.y as u16))
+                .collect()
+        }
+
+        let rows: Vec<_> = ["zqxw1060_a.rs", "zqxw1060_b.rs", "zqxw1060_c.rs"]
+            .iter()
+            .map(|t| row_bounds(&mut driver, t))
+            .collect();
+
+        let nothing_selected = sample(&mut driver, &rows);
+
+        // First PageDown: nothing selected -> row 0 (verified empirically
+        // while writing the GTK twin — quadraui's SidebarSystem selects the
+        // first row of the active section rather than the last).
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageDown),
+            quadraui::Modifiers::default(),
+        );
+        let at_row_0 = sample(&mut driver, &rows);
+        assert_ne!(
+            nothing_selected,
+            at_row_0,
+            "PageDown must move the SC sidebar's selection and repaint the \
+             highlight; screen:\n{}",
+            driver.screen()
+        );
+
+        // Second PageDown: row 0 -> row 2 (the last row — all three rows
+        // fit in one page at this window height).
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageDown),
+            quadraui::Modifiers::default(),
+        );
+        let at_row_2 = sample(&mut driver, &rows);
+        assert_ne!(
+            at_row_0,
+            at_row_2,
+            "a second PageDown must move the selection further (row 0 -> \
+             row 2), not clamp back to where the first PageDown already \
+             landed; screen:\n{}",
+            driver.screen()
+        );
+
+        // PageUp: row 2 -> row 0, the return trip.
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::PageUp),
+            quadraui::Modifiers::default(),
+        );
+        let after_up = sample(&mut driver, &rows);
+        assert_eq!(
+            after_up,
+            at_row_0,
+            "PageUp must move the selection back to row 0, matching the \
+             highlight the first PageDown produced; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1060: `source_control.rs`'s `sc_sidebar_navigate` nav-key table used
+    /// to recognise only `"BackTab"` — TUI always sent `"ISO_Left_Tab"` (via
+    /// `render::engine_key_from_ui`), so Shift+Tab silently did nothing in
+    /// the Source Control sidebar on unfixed `develop`. Tab/BackTab cycle
+    /// which section (Staged/Changes/…) is active
+    /// (`quadraui::SidebarSystem::handle_inner`'s `cycle_active`), so this
+    /// drives Tab forward then BackTab back and asserts the header rows
+    /// repaint each time.
+    ///
+    /// **Verified RED against unfixed `develop`:** with `"ISO_Left_Tab"`
+    /// removed from `sc_sidebar_navigate`'s nav-key match (restoring the
+    /// pre-#1060 `"BackTab"`-only arm), the second `assert_ne!` below fails
+    /// — Tab still cycles forward (GTK's spelling was never TUI's problem),
+    /// but BackTab's `"ISO_Left_Tab"` no longer reaches `Key::Named(NamedKey
+    /// ::BackTab)`, so the section never cycles back and the header styles
+    /// after BackTab equal the styles right after Tab.
+    #[test]
+    fn back_tab_cycles_the_sc_sidebar_section_backward_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // One file in each of the two always-shown sections (Staged,
+        // Changes) so both headers paint.
+        app.engine.sc_file_statuses = vec![
+            crate::core::git::FileStatus {
+                path: "zqxwbts.rs".to_string(),
+                staged: Some(crate::core::git::StatusKind::Modified),
+                unstaged: None,
+                unmerged: None,
+            },
+            crate::core::git::FileStatus {
+                path: "zqxwbtc.rs".to_string(),
+                staged: None,
+                unstaged: Some(crate::core::git::StatusKind::Modified),
+                unmerged: None,
+            },
+        ];
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_GIT));
+        app.engine.sc_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+
+        // `render::populate_sc_sidebar_system` auto-selects `SC_SECTION_
+        // STAGED` as the active section whenever `sc_has_focus` is true and
+        // nothing is active yet, and quadraui's multi-section view paints
+        // the active section's header prefixed with "▶ " (see the screen
+        // dump this test's `assert!`s below quote on failure) — a *content*
+        // difference between sections, not just a style one, so
+        // `screen_contains` reads it directly with no substring-collision
+        // risk ("▶ CHANGES" cannot appear inside "▶ STAGED CHANGES", unlike
+        // the bare header names).
+        assert!(
+            driver.screen_contains("▶ STAGED CHANGES"),
+            "precondition: Staged must be the initially active section; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::Tab),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen_contains("▶ CHANGES") && !driver.screen_contains("▶ STAGED CHANGES"),
+            "Tab must cycle the SC sidebar's active section forward, from \
+             Staged to Changes; screen:\n{}",
+            driver.screen()
+        );
+
+        press_with(
+            &mut driver,
+            quadraui::Key::Named(quadraui::NamedKey::BackTab),
+            quadraui::Modifiers::default(),
+        );
+        assert!(
+            driver.screen_contains("▶ STAGED CHANGES"),
+            "BackTab (TUI's `\"ISO_Left_Tab\"` spelling) must cycle the \
+             active section back to Staged, proving `sc_sidebar_navigate` \
+             recognises it — before #1060 this was a silent no-op and the \
+             active section would have stayed on Changes; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1067: the panel-hover popup's link-click-to-copy rung moved out of
+    /// an inline hit test in `mouse::handle_mouse` into the shared
+    /// `render::route_panel_hover_popup_click` +
+    /// `render::apply_panel_hover_popup_route` — the same rung GTK's
+    /// `App::route_and_apply_panel_hover_popup` now calls too (previously a
+    /// complete no-op there). This is the first driver-tier coverage this
+    /// TUI-only feature ever had.
+    ///
+    /// Drives the real painted geometry (`driver.find_bounds`), not a
+    /// hardcoded cell, then asserts on two independently observable painted
+    /// effects: the popup's own body text disappearing (dismissed), and the
+    /// engine's message line showing the "Copied: <url>" text
+    /// `tui_copy_to_clipboard` writes — proving the click actually reached
+    /// the copy step, not just some unrelated dismissal.
+    ///
+    /// **RED against unfixed `develop`:** comment out the `render::
+    /// route_panel_hover_popup_click` call in `mouse.rs`'s panel-hover-popup
+    /// arm and the click below lands but nothing consumes it — the popup
+    /// stays open and no "Copied:" message appears.
+    #[test]
+    fn panel_hover_popup_link_click_copies_and_dismisses_via_shell_app() {
+        let mut app = app_with_sidebar_open();
+        app.engine.show_panel_hover(
+            "source_control",
+            "item0",
+            0,
+            "PANELHOVER1067TUI [commit1067tui](https://example.com/panelhover1067tui)",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+        assert!(
+            driver.screen_contains("PANELHOVER1067TUI"),
+            "precondition: the panel hover popup body must paint; screen:\n{}",
+            driver.screen()
+        );
+
+        let (lx, ly) = driver
+            .find("commit1067tui")
+            .expect("the popup's markdown link text must paint");
+
+        driver.dispatch(UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Left,
+            position: quadraui::Point::new(lx, ly),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        driver.render();
+
+        assert!(
+            !driver.screen_contains("PANELHOVER1067TUI"),
+            "a click on the panel-hover popup's link must dismiss the popup; \
+             screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            driver.screen_contains("Copied: https://example.com/panelhover1067tui"),
+            "the click must copy the link's URL to the clipboard and surface \
+             that on the message line; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1087: the ext-panel hover card anchors to `hover.item_index`, a
+    /// **flat** index across the whole panel list
+    /// (`route_sidebar_hover`'s `ExtPanel` arm: `flat_idx =
+    /// ext_panel_scroll_top + row`). The old anchor code added
+    /// `ext_panel_scroll_top` back into the index at hover time but never
+    /// subtracted it out again at paint time, so once the panel was
+    /// scrolled the card was anchored dozens of rows below the hovered
+    /// item — off the bottom of the viewport.
+    ///
+    /// Scrolls the "Log" section 20 rows down, then injects a hover
+    /// (`Engine::show_panel_hover`, the same direct-state approach
+    /// `panel_hover_popup_link_click_copies_and_dismisses_via_shell_app`
+    /// above uses — real dwell requires a round trip through a plugin
+    /// host this test has none of) for the item at screen row 3 of the
+    /// scrolled viewport. Asserts on **painted** geometry only — the
+    /// hovered item's row (`find_bounds` on its label) and the popup's own
+    /// body text (`find_bounds` on its markdown) — never on
+    /// `engine.panel_hover.item_index` alone, which is exactly the state
+    /// that was already correct while the paint step ignored it.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting this issue's
+    /// `panels.rs` change (restoring `ph.item_index as u16 + 1` as the ext
+    /// panel's `item_row`) anchors the popup at row `23 + 1 = 24` instead
+    /// of the correct row `4` (chrome row 1 + on-screen row 3) — over 20
+    /// rows off — so the distance assertion below fails.
+    #[test]
+    fn tui_ext_panel_hover_card_anchors_to_the_scrolled_row_not_the_flat_index() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("hover1087item{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+
+        // Scroll well past the first screenful. `tree.rows[0]` is the "Log"
+        // section header, `tree.rows[1 + i]` is item `i` — so with
+        // `scroll_top == 20`, the item painted at on-screen row 3 (0-based,
+        // relative to the panel's own content rows) is `tree.rows[23]`,
+        // i.e. item 22.
+        app.engine.ext_panel_scroll_top = 20;
+        let flat_idx = 23usize;
+        app.engine.show_panel_hover(
+            "git-insights",
+            "item22",
+            flat_idx,
+            "HOVERCARD1087 body text",
+        );
+
+        let mut driver = driver_with_shell(app, config(), 100, 30);
+        driver.render();
+
+        let item_row = driver.find_bounds("hover1087item22").expect(
+            "precondition: the hovered item must be painted on screen after \
+             scrolling — it should sit at on-screen row 3 of the panel body",
+        );
+        let popup_row = driver
+            .find_bounds("HOVERCARD1087")
+            .expect("the hover popup body must paint somewhere on screen");
+
+        assert!(
+            (popup_row.y - item_row.y).abs() <= 2.0,
+            "the hover card must anchor next to the hovered row (painted at \
+             y={}), not dozens of rows below it — the popup painted at \
+             y={}; screen:\n{}",
+            item_row.y,
+            popup_row.y,
+            driver.screen()
+        );
+        assert!(
+            popup_row.y >= 0.0 && popup_row.y < 30.0,
+            "the popup must land inside the 30-row viewport, not be pushed \
+             off it; popup y={}; screen:\n{}",
+            popup_row.y,
+            driver.screen()
+        );
+    }
+
+    /// #200: an extension-provided sidebar panel with more rows than fit in
+    /// the viewport must paint a scrollbar column, the same way the mouse
+    /// drag handling at `mouse.rs`'s `ext_panel:sb` arm already assumes one
+    /// exists. Black-box through `driver_with_shell`: asserts on the
+    /// *painted* `'█'`/`'░'` glyphs in `render_ext_panel`'s scrollbar block
+    /// (panels.rs, `ext_panel_scrollbar`), never on
+    /// `engine.ext_panel_scroll_top` or any other state field being
+    /// populated — see this file's CLAUDE.md "rendered output, not state"
+    /// rule; a state-only assertion would have passed throughout #587/#592.
+    ///
+    /// 30 items in a single "Log" section, rendered into a deliberately
+    /// short (15-row) terminal so the panel body (well under 30 visible
+    /// rows once chrome is subtracted) cannot show every item —
+    /// `render_ext_panel`'s `total > track_h` guard must trip.
+    ///
+    /// Verified RED by hand: commenting out the `ext_panel_scrollbar` block
+    /// in `render_ext_panel` (panels.rs) so only `draw_tree` paints (no
+    /// scrollbar column) makes this test's glyph-presence assertion fail —
+    /// confirming it actually exercises the scrollbar paint path and isn't
+    /// vacuously true.
+    #[test]
+    fn tui_ext_panel_scrollbar_paints_when_content_overflows_viewport() {
+        let mut app = TuiShellApp::new(None);
+        app.engine.settings.use_nerd_fonts = Some(false);
+        crate::icons::set_nerd_fonts(false);
+        app.engine.ext_panels.clear();
+        app.engine.ext_panels.insert(
+            "git-insights".to_string(),
+            crate::core::plugin::PanelRegistration {
+                name: "git-insights".to_string(),
+                title: "Git Insights".to_string(),
+                icon: '\u{f113}',
+                fallback_icon: Some(EXT_ICON),
+                sections: vec!["Log".to_string()],
+            },
+        );
+        let items: Vec<crate::core::plugin::ExtPanelItem> = (0..30)
+            .map(|i| crate::core::plugin::ExtPanelItem {
+                text: format!("sbitem200{i:02}"),
+                id: format!("item{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.engine
+            .ext_panel_items
+            .insert(("git-insights".to_string(), "Log".to_string()), items);
+        app.engine.ext_panel_active = Some("git-insights".to_string());
+        app.sidebar.ext_panel_name = Some("git-insights".to_string());
+
+        // 15 rows total leaves far fewer than the 31 body rows (1 section
+        // header + 30 items) needed to show everything — the panel content
+        // overflows its viewport.
+        let mut driver = driver_with_shell(app, config(), 100, 15);
+        driver.render();
+        let screen = driver.screen();
+
+        fn is_scrollbar_glyph(c: char) -> bool {
+            c == '\u{2588}' || c == '\u{2591}'
+        }
+
+        // Restrict to the sidebar's own columns (well left of `SIDEBAR_WIDTH
+        // == 30` plus the activity bar) so a coincidental editor/minimap
+        // scrollbar elsewhere on the row can't produce a false pass.
+        let has_sidebar_scrollbar = screen
+            .lines()
+            .any(|line| line.chars().take(35).any(is_scrollbar_glyph));
+        assert!(
+            has_sidebar_scrollbar,
+            "ext panel content overflows the viewport (30 items in a \
+             15-row window) but no scrollbar column painted in the \
+             sidebar; screen:\n{screen}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:startinsert` must actually flip the
+    /// mode a real `i` key press would, visible in the per-window status
+    /// line's `"INSERT"` badge (same signal
+    /// `ctrl_l_is_consumed_and_never_edits_the_buffer_via_shell_app` reads),
+    /// not just `Engine::mode` inspected directly. A real character typed
+    /// afterwards must land as literal insertion, not a Normal-mode
+    /// command, confirming Insert mode was genuinely entered rather than
+    /// just labelled.
+    ///
+    /// RED against unfixed `develop`: `:startinsert` fell through to the
+    /// unknown-ex-command fallback, so the mode never changed, the
+    /// `"INSERT"` badge never appeared, and the typed `Z` would have run as
+    /// a Normal-mode command instead of inserting text.
+    #[test]
+    fn ex_startinsert_enters_insert_mode_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen().contains("INSERT"),
+            "sanity: must start in Normal mode; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "startinsert".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen().contains("INSERT"),
+            ":startinsert must enter Insert mode; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('Z');
+        driver.render();
+        assert!(
+            driver.screen().contains("Zhello"),
+            "a character typed right after :startinsert must land as \
+             literal insertion, proving Insert mode was really entered; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:stopinsert` while already in Normal
+    /// mode is documented as a no-op, not an error — the only `:stopinsert`
+    /// scenario reachable by *typing* a colon command at all: real Vim
+    /// (confirmed by hand against `nvim --headless -u NONE`) does not let a
+    /// bare `:` open the command line from Insert mode either (it inserts a
+    /// literal `:` character there — reaching `:stopinsert` from genuine
+    /// Insert mode needs `i_CTRL-O`, or a mapping/script context, which
+    /// vimcode does not implement), so this is the one path this driver can
+    /// actually exercise. `src/core/engine/tests.rs`'s
+    /// `test_ex_stopinsert_returns_to_normal_mode_1154` covers the
+    /// from-Insert transition directly against `Engine::execute_command`.
+    ///
+    /// RED against unfixed `develop`: `:stopinsert` fell through to the
+    /// unknown-ex-command fallback (`"Not an editor command: stopinsert"`),
+    /// which painted an error message on the status/command row instead of
+    /// silently doing nothing.
+    #[test]
+    fn ex_stopinsert_is_a_noop_in_normal_mode_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        driver.type_char(':');
+        for c in "stopinsert".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("INSERT"),
+            ":stopinsert in Normal mode must stay in Normal mode; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Not an editor command"),
+            ":stopinsert must be a recognised no-op in Normal mode, not an \
+             unknown-command error; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("hello"),
+            "the buffer must be untouched; screen:\n{screen}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:tabonly` must actually collapse the
+    /// painted tab bar to a single `"[No Name]"` label, mirroring the
+    /// `starts.len()` assertion `render_content_paints_single_group_tab_bar_via_shell_app`
+    /// makes for the unsplit case — not just `active_group().tabs.len()`
+    /// inspected on the `Engine` directly.
+    ///
+    /// RED against unfixed `develop`: `:tabonly` fell through to the
+    /// unknown-ex-command fallback, so all 3 tabs would still show in the
+    /// tab row.
+    #[test]
+    fn ex_tabonly_collapses_tab_bar_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "tabnew".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.type_char(':');
+        for c in "tabnew".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let tab_row = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            tab_row.matches("[No Name]").count(),
+            3,
+            "sanity: 3 tabs must be open before :tabonly; row:\n{tab_row}"
+        );
+
+        driver.type_char(':');
+        for c in "tabonly".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let tab_row = driver
+            .screen()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            tab_row.matches("[No Name]").count(),
+            1,
+            ":tabonly must close every tab but the active one; row:\n{tab_row}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:tabfirst`/`:tablast` must switch which
+    /// tab's buffer is actually painted in the editor body, not just move
+    /// `active_group().active_tab` on the `Engine`.
+    ///
+    /// RED against unfixed `develop`: both commands fell through to the
+    /// unknown-ex-command fallback, so the screen would keep showing
+    /// `TABFL_C_1154` (the tab active when the driver was built) through
+    /// both assertions below.
+    #[test]
+    fn ex_tabfirst_tablast_switch_active_tab_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.hide_single_tab = false;
+        app.engine.buffer_mut().insert(0, "TABFL_A_1154");
+        app.engine.new_tab(None);
+        app.engine.buffer_mut().insert(0, "TABFL_B_1154");
+        app.engine.new_tab(None);
+        app.engine.buffer_mut().insert(0, "TABFL_C_1154");
+        assert_eq!(app.engine.active_group().active_tab, 2);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+        assert!(
+            driver.screen().contains("TABFL_C_1154"),
+            "sanity: last-created tab must be active before any :tab* \
+             command; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "tabfirst".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TABFL_A_1154") && !screen.contains("TABFL_C_1154"),
+            ":tabfirst must switch to the first tab's buffer; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "tablast".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("TABFL_C_1154") && !screen.contains("TABFL_A_1154"),
+            ":tablast must switch to the last tab's buffer; screen:\n{screen}"
+        );
+    }
+
+    /// #1154 driver-tier coverage: `:hide` must close the active pane's
+    /// painted window without ever prompting about unsaved changes (unlike
+    /// `:quit`), leaving the other pane's own content as the only thing on
+    /// screen — the black-box twin of the engine-level
+    /// `test_ex_hide_closes_window_without_dirty_check_1154` /
+    /// `test_ex_hide_refuses_to_close_the_last_window_1154`.
+    ///
+    /// RED against unfixed `develop`: `:hide` fell through to the
+    /// unknown-ex-command fallback, so both panes (and the dirtied buffer's
+    /// text) would still be on screen after it ran.
+    #[test]
+    fn ex_hide_closes_active_pane_without_dirty_prompt_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_hide_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154hide.txt");
+        let file_b = dir.join("b1154hide.txt");
+        std::fs::write(&file_a, "AAA1154HIDE\n").unwrap();
+        std::fs::write(&file_b, "BBB1154HIDE\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.settings.autohide_panels = false;
+        app.engine.app_shell.hide_sidebar();
+        app.engine.session.explorer_visible = false;
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .split_window(SplitDirection::Horizontal, Some(&file_b));
+        // Dirty the (about-to-be-hidden) active buffer B — :hide must never
+        // prompt about unsaved changes, unlike :quit.
+        app.engine.buffer_mut().insert(0, "DIRTY1154");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154HIDE") && screen.contains("BBB1154HIDE"),
+            "sanity: the split must paint both panes before :hide; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "hide".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Unsaved Changes"),
+            ":hide must never prompt about unsaved changes; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("BBB1154HIDE") && !screen.contains("DIRTY1154"),
+            ":hide must close the active pane (buffer B); screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("AAA1154HIDE"),
+            ":hide must leave the other pane's content on screen; \
+             screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:bfirst`/`:blast` must switch which
+    /// buffer the single window actually paints, not just move
+    /// `Engine::goto_buffer`'s internal pointer.
+    ///
+    /// RED against unfixed `develop`: both commands fell through to the
+    /// unknown-ex-command fallback, so the screen would keep showing
+    /// `CCC1154BFL` (the most recently opened buffer) through both
+    /// assertions below.
+    #[test]
+    fn ex_bfirst_blast_switch_active_buffer_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_bfirst_blast_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154bfl.txt");
+        let file_b = dir.join("b1154bfl.txt");
+        let file_c = dir.join("c1154bfl.txt");
+        std::fs::write(&file_a, "AAA1154BFL\n").unwrap();
+        std::fs::write(&file_b, "BBB1154BFL\n").unwrap();
+        std::fs::write(&file_c, "CCC1154BFL\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        // `TuiShellApp::new_for_test` seeds one empty "[No Name]" scratch
+        // buffer before any file is opened. `open_file_with_mode` reuses
+        // that still-pristine buffer in place for the first file opened
+        // into it (#1298, matching Neovim's `:edit`), so `file_a` becomes
+        // buffer #1 rather than leaving a numbered phantom behind — no
+        // manual cleanup needed here.
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_c, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        assert_eq!(app.engine.buffer_manager.len(), 3);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CCC1154BFL") && !screen.contains("AAA1154BFL"),
+            "sanity: the single window shows only the most recently \
+             opened buffer before any :b* command; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "bfirst".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154BFL") && !screen.contains("CCC1154BFL"),
+            ":bfirst must switch the active window to the lowest-numbered \
+             buffer; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "blast".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("CCC1154BFL") && !screen.contains("AAA1154BFL"),
+            ":blast must switch the active window to the highest-numbered \
+             buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:bwipeout`/`:bw` must actually remove
+    /// the buffer and repaint the window with whatever buffer
+    /// `delete_buffer` fell back to — the observable effect a user sees —
+    /// not just `buffer_manager.list()` inspected directly.
+    ///
+    /// RED against unfixed `develop`: `:bwipeout`/`:bw` fell through to the
+    /// unknown-ex-command fallback, so the screen would still show
+    /// `BBB1154BW` after the command ran.
+    #[test]
+    fn ex_bwipeout_removes_buffer_and_repaints_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_bwipeout_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154bw.txt");
+        let file_b = dir.join("b1154bw.txt");
+        std::fs::write(&file_a, "AAA1154BW\n").unwrap();
+        std::fs::write(&file_b, "BBB1154BW\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        // See the sibling `:bfirst`/`:blast` test above: `open_file_with_mode`
+        // reuses the seeded initial "[No Name]" buffer in place for `file_a`
+        // (#1298), so exactly the two files below are the only buffers with
+        // no manual cleanup needed.
+        app.engine
+            .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        app.engine
+            .open_file_with_mode(&file_b, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        assert_eq!(app.engine.buffer_manager.len(), 2);
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            driver.screen().contains("BBB1154BW"),
+            "sanity: buffer B must be active before :bw; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "bw".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1154BW") && !screen.contains("BBB1154BW"),
+            ":bw must wipe out the active buffer and repaint the window \
+             with the remaining one; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1298 driver-tier coverage: `:edit` from the still-pristine startup
+    /// scratch buffer must rename/reuse that buffer in place (matching
+    /// Neovim) rather than leaving it behind as a numbered phantom — driven
+    /// entirely through typed ex commands and asserted on painted screen
+    /// content, not `buffer_manager` state.
+    ///
+    /// RED against unfixed `develop`: `open_file_with_mode_impl` always
+    /// allocated a fresh `BufferId`, so after `:e {file_a}` then
+    /// `:e {file_b}` the empty pristine buffer was still buffer #1 and
+    /// `file_a` was buffer #2 — `:b 1` would repaint the window with the
+    /// *empty* buffer (screen would not contain `AAA1298BUF`), not
+    /// `file_a`'s content.
+    #[test]
+    fn ex_edit_reuses_pristine_scratch_buffer_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1298_edit_reuse_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1298buf.txt");
+        let file_b = dir.join("b1298buf.txt");
+        std::fs::write(&file_a, "AAA1298BUF\n").unwrap();
+        std::fs::write(&file_b, "BBB1298BUF\n").unwrap();
+
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+
+        // `:e {file_a}` from the pristine startup buffer.
+        driver.type_char(':');
+        for c in "e".chars() {
+            driver.type_char(c);
+        }
+        driver.type_char(' ');
+        for c in file_a.to_string_lossy().chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1298BUF"),
+            "sanity: :e must open file_a into the current window; \
+             screen:\n{screen}"
+        );
+
+        // `:e {file_b}` from a no-longer-pristine buffer must create a
+        // genuinely new buffer.
+        driver.type_char(':');
+        for c in "e".chars() {
+            driver.type_char(c);
+        }
+        driver.type_char(' ');
+        for c in file_b.to_string_lossy().chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen().contains("BBB1298BUF"),
+            "sanity: :e must open file_b into the current window; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // `:b 1` must land on `file_a` -- the reused pristine buffer -- not
+        // an orphaned empty scratch buffer left behind by the first `:e`.
+        driver.type_char(':');
+        for c in "b 1".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AAA1298BUF") && !screen.contains("BBB1298BUF"),
+            ":b 1 must repaint the window with file_a's content -- the \
+             pristine startup buffer renamed in place by the first :e, not \
+             a leftover empty phantom buffer; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: bare `:cc` must actually jump the
+    /// painted editor to the currently selected quickfix entry's file, not
+    /// just leave `quickfix.selected` untouched on the `Engine`.
+    ///
+    /// RED against unfixed `develop`: bare `:cc` fell through to the
+    /// unknown-ex-command fallback (only `:cc {N}` existed), so the screen
+    /// would never show `BBB1154CC` after the command ran.
+    #[test]
+    fn ex_bare_cc_jumps_to_current_quickfix_entry_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1154_cc_shell_app_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_a = dir.join("a1154cc.txt");
+        let file_b = dir.join("b1154cc.txt");
+        std::fs::write(&file_a, "AAA1154CC\n").unwrap();
+        std::fs::write(&file_b, "BBB1154CC\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.quickfix.items = vec![
+            crate::core::project_search::ProjectMatch {
+                file: file_a.clone(),
+                line: 0,
+                col: 0,
+                line_text: String::new(),
+            },
+            crate::core::project_search::ProjectMatch {
+                file: file_b.clone(),
+                line: 0,
+                col: 0,
+                line_text: String::new(),
+            },
+        ];
+        app.engine.quickfix.selected = 1;
+        app.engine.quickfix.open = true;
+        app.engine.quickfix.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        assert!(
+            !driver.screen().contains("BBB1154CC"),
+            "sanity: must not already be looking at file B before :cc; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "cc".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("BBB1154CC"),
+            ":cc must jump the editor to the currently selected quickfix \
+             entry; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1154 driver-tier coverage: `:delmarks {marks}` must actually remove
+    /// the mark so a subsequent `` `{mark} `` jump reports "not set" and
+    /// leaves the cursor untouched — the observable behaviour a user sees —
+    /// not just `Engine::marks`'s map inspected directly (the engine-level
+    /// `test_ex_delmarks_removes_named_marks_1154` twin).
+    ///
+    /// Reads the status line's `"Ln {n}, Col {n}"` position readout (same
+    /// signal the pre-existing `right_text.contains("Ln 1")` render test
+    /// uses) to prove the cursor never moved, and the `"Mark `a` not set"`
+    /// message `keys.rs`'s backtick-jump handler emits when a mark is
+    /// absent.
+    ///
+    /// RED against unfixed `develop`: `:delmarks a` fell through to the
+    /// unknown-ex-command fallback, so mark `a` would still be set and
+    /// `` `a `` would silently jump to line 2 instead of reporting it
+    /// unset.
+    #[test]
+    fn ex_delmarks_removes_mark_so_backtick_jump_fails_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "L1154_1\nL1154_2\nL1154_3\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // Move to line 2 and set mark 'a'.
+        driver.type_char('j');
+        driver.type_char('m');
+        driver.type_char('a');
+        driver.render();
+        assert!(
+            driver.screen().contains("Ln 2, Col 1"),
+            "sanity: mark 'a' must be set on line 2; screen:\n{}",
+            driver.screen()
+        );
+
+        // Back to line 1.
+        driver.type_char('k');
+        driver.render();
+        assert!(
+            driver.screen().contains("Ln 1, Col 1"),
+            "sanity: cursor must be back on line 1 before :delmarks; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "delmarks a".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        // Attempt to jump to the now-deleted mark.
+        driver.type_char('`');
+        driver.type_char('a');
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("not set"),
+            ":delmarks a must remove mark 'a' so a backtick-jump reports \
+             it unset; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Ln 1, Col 1"),
+            "cursor must not have moved, since the mark no longer exists; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: `:iabbrev` must actually expand the typed
+    /// word into the *painted* buffer content the moment the trigger
+    /// character lands, not just `Engine::buffer()` inspected directly —
+    /// the black-box twin of `tests/ex_commands.rs`'s
+    /// `vim_abbrev_iabbrev_full_id_expands_on_trigger_char`.
+    ///
+    /// RED against unfixed `develop`: `:iabbrev` fell through to the
+    /// unknown-ex-command fallback (no abbreviation was ever defined), so
+    /// typing `teh ` would leave the literal text `"teh "` on screen
+    /// instead of expanding it to `"the "`.
+    #[test]
+    fn abbrev_iabbrev_expands_full_id_on_trigger_char_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "teh ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("the "),
+            ":iabbrev teh the must expand \"teh \" to \"the \" as it is \
+             typed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("teh "),
+            "the unexpanded abbreviation must not remain on screen; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: a full-id abbreviation must NOT expand
+    /// when it is not preceded by a word boundary — the black-box twin of
+    /// `tests/ex_commands.rs`'s `vim_abbrev_does_not_fire_mid_word`.
+    ///
+    /// RED against unfixed `develop`: with no abbreviation-expansion hook at
+    /// all, this assertion would spuriously pass (nothing ever expands), so
+    /// this test alone doesn't prove the fix — it's paired with
+    /// `abbrev_iabbrev_expands_full_id_on_trigger_char_via_shell_app` above,
+    /// which fails outright against `develop`, to pin the "whole word only"
+    /// boundary rule specifically.
+    #[test]
+    fn abbrev_iabbrev_does_not_fire_mid_word_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "ateh ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("ateh "),
+            "\"teh\" preceded by the word character 'a' is not a whole \
+             word and must not expand; screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: an end-id abbreviation (`"#i"` — ends in
+    /// a keyword character but has a non-keyword one earlier) must expand
+    /// the same as a full-id one, with no word-boundary check required —
+    /// the black-box twin of `tests/ex_commands.rs`'s
+    /// `vim_abbrev_iabbrev_end_id_expands_on_trigger_char`.
+    ///
+    /// RED against unfixed `develop`: `:iabbrev` was unrecognised, so
+    /// typing `#i ` would leave the literal text on screen instead of
+    /// expanding to `"#include "`.
+    #[test]
+    fn abbrev_iabbrev_expands_end_id_on_trigger_char_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev #i #include".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        for c in "#i ".chars() {
+            driver.type_char(c);
+        }
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("#include "),
+            ":iabbrev #i #include must expand \"#i \" to \"#include \"; \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: `<C-v>` (Vim's literal-insert /
+    /// abbreviation-suppression trigger, `:h i_CTRL-V`) is what a *paste*
+    /// looks like in this app's real input path — a `<C-v>` keypress never
+    /// reaches `Engine::handle_key`'s dedicated Ctrl-V branch at all.
+    /// `quadraui::runtime::preprocess_event` (quadraui#813) intercepts every
+    /// Ctrl+V ahead of `AppLogic::handle` on every backend and redelivers it
+    /// as `UiEvent::ClipboardPaste`, exactly as
+    /// `ctrl_v_paste_reaches_the_search_panel_via_clipboard_paste_event`
+    /// above documents empirically (a raw `KeyPressed(Char('v'), ctrl)`
+    /// dispatched through the driver reads the machine's *actual* system
+    /// clipboard instead, which is what a first attempt at this test hit).
+    /// `Engine::route_paste`'s `Mode::Insert` arm (`paste_in_insert_mode`)
+    /// bulk-inserts the pasted text directly and never calls
+    /// `try_expand_insert_abbrev` — so the black-box, driver-reachable
+    /// proof of "`<C-v>` suppresses expansion" is that a `ClipboardPaste`
+    /// ending in a matching abbreviation does not expand. The Engine-level
+    /// `tests/ex_commands.rs::vim_abbrev_ctrl_v_suppresses_expansion` covers
+    /// the literal `insert_ctrl_v_pending` mechanism directly via
+    /// `Engine::handle_key`, which the real app also *has*, but which no
+    /// live keypress can reach given the interception above.
+    ///
+    /// RED against unfixed `develop`: N/A for the paste path specifically
+    /// (paste never called the abbreviation hook even before this PR); this
+    /// is a regression guard pinning that pasted text keeps bypassing
+    /// expansion now that the hook exists elsewhere in the Insert-mode key
+    /// path, paired with the trigger-char tests above which do fail RED.
+    #[test]
+    fn abbrev_pasted_text_does_not_expand_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "iabbrev teh the".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('i');
+        driver.dispatch(UiEvent::ClipboardPaste("teh ".to_string()));
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("teh "),
+            "pasted text ending in a defined abbreviation must not expand \
+             (the real-app equivalent of <C-v> suppression); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1152 driver-tier coverage: `:cabbrev` must expand on the real
+    /// command line and the *expanded* command must be the one that runs on
+    /// `<CR>`, visibly changing the buffer content — the black-box twin of
+    /// `tests/ex_commands.rs`'s `vim_abbrev_cabbrev_expands_and_runs_on_return`.
+    ///
+    /// RED against unfixed `develop`: `:cabbrev` was unrecognised, so typing
+    /// `:X<CR>` would report "Not an editor command: X" and leave the
+    /// buffer's `"foo"` untouched instead of substituting it to `"bar"`.
+    #[test]
+    fn abbrev_cabbrev_expands_and_runs_on_return_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "foo\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            driver.screen().contains("foo"),
+            "sanity: fixture buffer must show \"foo\" before the abbreviated \
+             substitution; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "cabbrev X %s/foo/bar/".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char(':');
+        driver.type_char('X');
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("bar"),
+            ":cabbrev X %s/foo/bar/ then :X<CR> must expand and run the \
+             substitution, replacing \"foo\" with \"bar\"; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("foo"),
+            "the original \"foo\" text must be gone after the substitution; \
+             screen:\n{screen}"
+        );
+    }
+
+    // ─── #1190: 'ruler' / 'showcmd' / 'list' ────────────────────────────────
+
+    /// `:set noruler` must remove the `Ln N, Col N` readout from the status
+    /// line, and `:set ruler` must bring it back — the driver-tier twin of
+    /// the `build_status_line`/`build_window_status_line` gating in
+    /// `render.rs`.
+    ///
+    /// RED against unfixed `develop`: `'ruler'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS`, so `:set noruler` errored with
+    /// "recognised but not implemented yet" and the readout never moved —
+    /// this assertion would have failed on the very first `noruler` check.
+    #[test]
+    fn set_noruler_hides_and_ruler_restores_the_cursor_position_readout_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            "sanity: 'ruler' defaults on; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set noruler".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            !driver.screen().contains("Ln 1, Col 1"),
+            ":set noruler must remove the cursor-position readout; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set ruler".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen_contains("Ln 1, Col 1"),
+            ":set ruler must bring the readout back; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// A partially-typed Normal-mode count+operator (`2d`, still pending a
+    /// motion) must show up in the status line while `'showcmd'` is on, and
+    /// disappear once `:set noshowcmd` turns it off.
+    ///
+    /// RED against unfixed `develop`: `'showcmd'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS` (`:set noshowcmd` errored), and nothing
+    /// rendered `Engine::showcmd_text` at all, so `"2d"` never appeared on
+    /// screen regardless of the setting.
+    #[test]
+    fn showcmd_shows_pending_count_and_operator_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "hello world\n");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("2d"),
+            "sanity: no pending command yet; screen:\n{}",
+            driver.screen()
+        );
+
+        // `2d` — count then operator, still waiting on a motion.
+        driver.type_char('2');
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            driver.screen_contains("2d"),
+            "'showcmd' defaults on, so the pending \"2d\" must be visible; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // Finish the command so nothing is left pending, then turn showcmd
+        // off and repeat — it must no longer appear.
+        driver.type_char('w');
+        driver.render();
+
+        driver.type_char(':');
+        for c in "set noshowcmd".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        driver.type_char('2');
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            !driver.screen_contains("2d"),
+            ":set noshowcmd must hide the pending-command readout; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// `:set list` must render a tab as literal `^I` instead of expanding it
+    /// to `'tabstop'` width, and disappear again on `:set nolist` — the
+    /// driver-tier twin of `apply_list_glyphs`'s unit tests in `render.rs`.
+    ///
+    /// RED against unfixed `develop`: `'list'` was still in
+    /// `UNIMPLEMENTED_BOOL_OPTIONS` (`:set list` errored with "recognised
+    /// but not implemented yet"), so the tab painted as normal whitespace
+    /// and `^I` never appeared on screen.
+    #[test]
+    fn set_list_renders_tab_as_caret_i_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "a\tb");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("^Ib"),
+            "sanity: 'list' defaults off; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set list".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        // #1206: Neovim's real default 'listchars' ("tab:> ,trail:-,nbsp:+")
+        // renders a tab as a fill of '>' + spaces, not literal ^I — clear it
+        // so this test keeps exercising the documented "no tab: item"
+        // fallback (`^I`) it's named for, independent of that default.
+        driver.type_char(':');
+        for c in "set listchars=".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            driver.screen_contains("^Ib"),
+            ":set list must render the tab as literal ^I; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(':');
+        for c in "set nolist".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+        assert!(
+            !driver.screen_contains("^Ib"),
+            ":set nolist must go back to normal tab rendering; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1206: `'listchars'` end-to-end through `:set` — a custom `tab:`
+    /// glyph paints instead of the classic `^I` fallback, and disappears
+    /// again once `'list'` is switched off. Neovim's real default
+    /// `'listchars'` (`"tab:> ,trail:-,nbsp:+"`) is exercised directly here
+    /// too, by leaving it untouched.
+    ///
+    /// RED against unfixed `develop`: `'listchars'` was still in
+    /// `UNIMPLEMENTED_VALUE_OPTIONS` (`:set listchars=...` errored with
+    /// "recognised but not implemented yet"), and `'list'`'s own glyph
+    /// rendering was hardcoded to `^I`/`$`, so a `tab:>-` fill could never
+    /// appear on screen at all.
+    #[test]
+    fn set_listchars_custom_tab_glyph_paints_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, "a\tb");
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        run_ex_command(&mut driver, ":set list");
+        // vimcode's default 'tabstop' is 4 — a tab right after "a" (column
+        // 1) fills columns 1..4: '>' then two '-' fill chars.
+        run_ex_command(&mut driver, ":set listchars=tab:>-");
+        assert!(
+            driver.screen_contains("a>--b"),
+            ":set listchars=tab:>- must paint the configured fill glyph; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set nolist");
+        assert!(
+            !driver.screen_contains("a>--b"),
+            ":set nolist must stop painting the configured tab glyph; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1207: `:set linebreak` must change *where* a soft-wrapped line
+    /// breaks — at a word boundary instead of mid-word — without changing
+    /// anything about `'wrap'` itself. Drives the real `:set` pipeline
+    /// (`run_ex_command`) end to end into the painted screen, the
+    /// driver-tier twin of `compute_word_wrap_segments`'s unit tests in
+    /// `render.rs`.
+    ///
+    /// The exact wrap column depends on this window's viewport width, which
+    /// this repo computes from pixel/cell geometry rather than exposing as a
+    /// constant — so this test *measures* it first with a boundary-free
+    /// calibration line (a run of `'X'` has no word boundary at all, so
+    /// `'linebreak'` cannot change anything about how it wraps), then
+    /// builds the real fixture positioned relative to that measured column,
+    /// per this file's own "measure, don't hardcode" convention (see
+    /// `:retab`'s tests above).
+    ///
+    /// **Verified RED against unfixed `develop`:** before #1207,
+    /// `compute_word_wrap_segments` had no `linebreak` parameter and always
+    /// sought a word boundary — i.e. the `false` (hard-cut) expectation
+    /// below, `!driver.screen_contains("BBBBBBBBBB")`, would have failed:
+    /// the ten-`B` run would already have been contiguous with `'linebreak'`
+    /// still unset.
+    #[test]
+    fn set_linebreak_wraps_at_word_boundary_instead_of_mid_word_via_shell_app() {
+        let vp = {
+            let mut probe = TuiShellApp::new_for_test();
+            probe.engine.buffer_mut().insert(0, &"X".repeat(300));
+            probe.engine.settings.wrap = true;
+            let mut driver = driver_with_shell(probe, config(), 100, 24);
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.render();
+            let screen = driver.screen();
+            let first_row = screen
+                .lines()
+                .find(|l| l.contains('X'))
+                .expect("the calibration line of 'X's must appear on screen");
+            first_row.matches('X').count()
+        };
+        assert!(
+            vp > 15,
+            "viewport too narrow for this test's fixture (measured {vp})"
+        );
+
+        // The A-run ends 3 columns before the measured hard-wrap column,
+        // then one space, then a contiguous 10-char B-run. A hard cut at
+        // exactly `vp` (linebreak off) lands 2 columns into the B-run,
+        // splitting it across two screen rows; seeking the nearest word
+        // boundary (linebreak on) backs up to the space instead, so the
+        // whole B-run lands together on the second row.
+        let content = format!("{} BBBBBBBBBB", "A".repeat(vp - 3));
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.buffer_mut().insert(0, &content);
+        app.engine.settings.wrap = true;
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+        assert!(
+            !driver.screen_contains("BBBBBBBBBB"),
+            "sanity: 'linebreak' defaults off, so the B-run must be hard-cut \
+             mid-word; screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set linebreak");
+        assert!(
+            driver.screen_contains("BBBBBBBBBB"),
+            ":set linebreak must wrap at the space, keeping the B-run whole; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        run_ex_command(&mut driver, ":set nolinebreak");
+        assert!(
+            !driver.screen_contains("BBBBBBBBBB"),
+            ":set nolinebreak must go back to hard-cutting mid-word; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1207 review fix: `'showmatch'` was engine-state-only — `Engine::
+    /// showmatch_flash` got set by `handle_insert_key` but nothing in
+    /// `render.rs`/`src/gtk`/`src/tui_main` ever read it, so a user running
+    /// `:set showmatch` saw *no* difference from `:set noshowmatch` (a
+    /// closing bracket, and nothing else, ever appeared). This drives the
+    /// real `:set showmatch` → type `(foo)` pipeline end to end into the
+    /// painted screen and asserts on the **painted background colour** of
+    /// the opening `(`, not on `showmatch_flash` being `Some` (`CLAUDE.md`
+    /// rule 1 — the `ScreenLayout.picker` failure mode this repo's Testing
+    /// section names by number).
+    ///
+    /// **Verified RED against unfixed `develop`:** before this fix,
+    /// `bracket_match_positions` in `render.rs` only ever read
+    /// `engine.bracket_match` (gated on `'matchpairs'`/normal mode), never
+    /// `engine.showmatch_flash`; typing `)` in Insert mode with `'showmatch'`
+    /// on left every cell's background exactly as it painted with
+    /// `'showmatch'` off, so the first `assert_eq!` below (open-paren cell
+    /// carries `bracket_match_bg` right after the closing `)` is typed)
+    /// would have failed.
+    #[test]
+    fn set_showmatch_flashes_the_matching_open_paren_via_shell_app() {
+        let app = TuiShellApp::new_for_test();
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+        let bracket_bg =
+            quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).bracket_match_bg);
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        run_ex_command(&mut driver, ":set showmatch");
+
+        driver.type_char('i');
+        for ch in "(foo".chars() {
+            driver.type_char(ch);
+        }
+        driver.render();
+
+        let bounds = driver
+            .find_bounds("(foo")
+            .expect("the typed text must paint before the closing ')'");
+        let open_paren_col = bounds.x as u16;
+        let row = bounds.y as u16;
+
+        assert_ne!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "sanity: before the closing ')' is typed, the open paren must \
+             not yet carry the bracket-match background; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char(')');
+        driver.render();
+
+        assert_eq!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "typing the matching ')' with 'showmatch' on must flash the \
+             open paren's background for this frame; screen:\n{}",
+            driver.screen()
+        );
+
+        // The flash is cleared at the top of the *next* key (`handle_insert_
+        // key`'s doc comment on `Engine::showmatch_flash`), so one more
+        // keystroke must make it disappear again.
+        driver.type_char('x');
+        driver.render();
+
+        assert_ne!(
+            driver.style_at(open_paren_col, row).map(|s| s.bg),
+            Some(bracket_bg),
+            "the flash must be gone by the very next keystroke; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1208 bug 1: `apply_list_glyphs` remapped byte-offset `spans` for a
+    /// tab's expansion to `^I` (#1190) but left char-index `DiagnosticMark`s
+    /// unremapped, so with `'list'` on, a diagnostic positioned after a tab
+    /// painted its underline one column left of the text it was meant to
+    /// mark — landing on the second half of the `^I` glyph instead of on
+    /// the diagnosed word.
+    ///
+    /// **Verified RED against unfixed `develop`:** before the fix, the
+    /// underline landed at `find_bounds("foo").x - 1` (the `I` of `^I`)
+    /// rather than across all three columns of `"foo"`.
+    #[test]
+    fn driver_list_mode_does_not_shift_diagnostic_mark_past_a_tab_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1208_list_diag_tab_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("zqxw1208.txt");
+        // A leading tab followed by "foo" — the diagnostic sits on "foo",
+        // strictly after the tab that 'list' will expand to the 2-char `^I`.
+        std::fs::write(&file_path, "\tfoo\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.new_tab(Some(&file_path));
+        let buf_id = app.engine.active_buffer_id();
+        let canonical = app
+            .engine
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.canonical_path.clone())
+            .expect("a file opened from disk must cache a canonical path");
+        app.engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange {
+                    start: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 1,
+                    },
+                    end: crate::core::lsp::LspPosition {
+                        line: 0,
+                        character: 4,
+                    },
+                },
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: "zqxw1208 diagnostic".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+        app.engine.settings.list = true;
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+
+        let bounds = driver.find_bounds("foo").expect(
+            "'list' expands the leading tab to ^I but must still paint \
+             \"foo\" right after it",
+        );
+        let (fx, fy, fw) = (bounds.x as u16, bounds.y as u16, bounds.width as u16);
+
+        for dx in 0..fw {
+            let style = driver
+                .style_at(fx + dx, fy)
+                .unwrap_or_else(|| panic!("no cell painted at ({}, {})", fx + dx, fy));
+            assert!(
+                style
+                    .modifiers
+                    .contains(quadraui::tui::testing::Modifier::UNDERLINED),
+                "the diagnostic underline must cover all of \"foo\" (column \
+                 {} of it did not); screen:\n{}",
+                dx,
+                driver.screen()
+            );
+        }
+        // The cell immediately before "foo" is the second half of the tab's
+        // `^I` glyph. It must NOT be underlined — that's exactly the
+        // one-column-left shift bug 1 describes.
+        let before = driver
+            .style_at(fx - 1, fy)
+            .expect("the ^I glyph's second cell must be painted");
+        assert!(
+            !before
+                .modifiers
+                .contains(quadraui::tui::testing::Modifier::UNDERLINED),
+            "the diagnostic underline must not bleed onto the '^I' tab \
+             glyph; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1208 bug 2: the non-wrapped render path applied `apply_list_glyphs`
+    /// (which appends a trailing `$`) to a fold-header line unconditionally
+    /// whenever `'list'` was on — even though real vim's `'list'` never
+    /// marks a closed fold's display text. #1159 made a `marker` fold
+    /// reachable with `:set fdm=marker` (no manual `zf` needed), so this is
+    /// now a plain `:set list` away from a real fold.
+    ///
+    /// **Verified RED against unfixed `develop`:** the fold-header row
+    /// ("if x: # {{{") painted with a trailing `$` before the fix.
+    #[test]
+    fn driver_list_mode_does_not_mark_fold_header_eol_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .buffer_mut()
+            .insert(0, "if x: # {{{\n    a\n    b\n# }}}\nelse:\n    c\n");
+        app.engine.update_syntax();
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.render();
+
+        run_ex_command(&mut driver, ":set fdm=marker");
+        run_ex_command(&mut driver, ":set list");
+        // #1206: Neovim's real default 'listchars' has no `eol` item, so
+        // this test's "an ordinary line still gets marked" sanity check
+        // needs one configured explicitly — independent of the fold-header
+        // exclusion behavior this test actually exists to cover.
+        run_ex_command(&mut driver, ":set listchars=eol:$");
+
+        let screen = driver.screen();
+        let header_row = screen
+            .lines()
+            .find(|l| l.contains("if x: # {{{"))
+            .unwrap_or_else(|| {
+                panic!("the closed marker fold must still paint its own header text; screen:\n{screen}")
+            });
+        assert!(
+            !header_row.contains('$'),
+            "'list' must not mark a fold-header line's EOL with `$` — real \
+             vim's 'list' does not apply to closed-fold display text; \
+             row: {header_row:?}"
+        );
+
+        let else_row = screen
+            .lines()
+            .find(|l| l.contains("else:"))
+            .expect("the line right after the fold must still be visible");
+        assert!(
+            else_row.contains('$'),
+            "sanity check: 'list' must still mark EOL on an ordinary \
+             (non-fold-header) line, or this test isn't exercising list \
+             mode at all; row: {else_row:?}"
         );
     }
 }

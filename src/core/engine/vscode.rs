@@ -895,7 +895,7 @@ impl Engine {
             return self.handle_command_key(key_name, unicode, ctrl);
         }
 
-        // User-defined keymaps (`:map n <key> :command`) work in VSCode mode too.
+        // User-defined keymaps (`:nnoremap <key> :command`) work in VSCode mode too.
         // Mode "n" maps are matched since VSCode has no modal distinction.
         if !self.user_keymaps.is_empty() {
             let mut km_changed = false;

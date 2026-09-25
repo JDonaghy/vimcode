@@ -136,6 +136,37 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     quadraui::macos::shell_runner::run_with_shell(app, config)
 }
 
+/// The `MacDriver` instantiation of [`crate::harness::ConformanceHarness`]
+/// — the macOS twin of `crate::gtk::testing::conformance_harness` and
+/// `crate::tui_main::testing::conformance_harness`, lifted out of
+/// [`mac_driver_tests`]'s own private `conformance_proof_slice` module
+/// (#1090) so a shared scenario registered outside this file can reach it.
+///
+/// Thin wiring only, per this module's own "no decision lives here" bar:
+/// the concrete driver type is the one thing a backend module has to
+/// supply, and [`crate::harness::build_app_and_config`] owns everything
+/// above it. `#[cfg(test)]` because it is test-only plumbing and the
+/// `macos` feature already gates the whole module.
+#[cfg(test)]
+pub(crate) fn conformance_harness(
+    engine: crate::core::Engine,
+    width: u32,
+    height: u32,
+) -> crate::harness::ConformanceHarness<quadraui::macos::testing::MacDriver<impl quadraui::AppLogic>>
+{
+    use quadraui::macos::testing::driver_with_shell;
+    use quadraui::macos::MacBackend;
+
+    let paint = crate::test_paint::PaintGuard::acquire();
+    let cwd = crate::test_cwd::CwdReadGuard::acquire();
+    let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Box::new(MacBackend::new())));
+    let (app, config) = crate::harness::build_app_and_config(std::rc::Rc::clone(&engine), backend);
+    let driver = driver_with_shell(app, config, width, height);
+    crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
+}
+
 #[cfg(test)]
 mod mac_driver_tests {
     //! Driver-tier coverage for the native macOS GUI (#896, closing #859's
@@ -427,6 +458,92 @@ mod mac_driver_tests {
         assert!(
             !driver.screen_contains("line 0 "),
             "the viewport should have scrolled away from the top of the buffer"
+        );
+    }
+
+    /// #1069: on macOS, `Settings::default().font_family` must resolve a
+    /// *real* CoreText font, not silently fail. Before that issue,
+    /// `default_font_family()` (`src/core/settings.rs`) returned
+    /// `"Monospace"` on every platform — a fontconfig *generic alias*
+    /// `MacBackend::set_editor_font` -> `make_font_exact` couldn't resolve
+    /// at the time. `App::render_content` pushes it onto the paint backend
+    /// every frame via `backend.set_editor_font(family, size)`
+    /// unconditionally (#947, no gate), so `current_font` stayed `None`
+    /// forever and `char_width`/`line_height` stuck at quadraui's
+    /// placeholder seed values (`MacBackend::new`'s `current_char_width:
+    /// 8.0`, `current_line_height: 16.0`) regardless of `font_size` — the
+    /// editor was laid out against numbers no installed font actually has.
+    ///
+    /// #1129: `default_font_family()` went back to the single shared
+    /// `"Monospace"` value once quadraui#1023 taught
+    /// `MacBackend::set_editor_font` to resolve that Pango alias directly
+    /// to `system_monospace_font` (CoreText's
+    /// `kCTFontUserFixedPitchFontType`) instead of routing it through
+    /// `make_font_exact`'s installed-family lookup — so the positive
+    /// control below now compares against `system_monospace_font`, not
+    /// `make_font_exact`.
+    ///
+    /// RED-verified against unfixed `develop`: temporarily reverting
+    /// `default_font_family()` to the pre-#1129 `cfg!(target_os =
+    /// "macos")` branch (`"Menlo"`) and re-running this test with `cargo
+    /// test --no-default-features --features macos` fails — the resolved
+    /// metrics no longer match `system_monospace_font`'s (they match
+    /// Menlo's instead).
+    ///
+    /// Goes straight through `Backend::set_editor_font` on a bare
+    /// `MacBackend` — same shape as the sibling
+    /// `mac_backend_applies_line_height_and_char_width` above — rather than
+    /// through a full `driver()`/`App` frame: this is specifically about
+    /// `default_font_family()` resolving on CoreText, not about paint or
+    /// dispatch, and a full frame drags in `install_menu_bar`'s unrelated
+    /// (and here, harmless) main-thread panic noise.
+    #[test]
+    fn editor_font_family_default_resolves_a_real_font_on_macos() {
+        use quadraui::Backend;
+
+        let settings = crate::core::settings::Settings::default();
+        let mut backend = MacBackend::new();
+        backend.set_editor_font(&settings.font_family, settings.font_size as f32);
+
+        // The exact 8.0/16.0 placeholders `MacBackend::new` seeds
+        // `current_char_width`/`current_line_height` with before any font is
+        // successfully installed — a real font's metrics landing on these
+        // exact values is not a realistic coincidence.
+        assert_ne!(
+            backend.char_width(),
+            8.0,
+            "current_char_width is still quadraui's placeholder seed value \
+             — Settings::default().font_family ({:?}) never resolved a real \
+             font",
+            settings.font_family
+        );
+        assert_ne!(
+            backend.line_height(),
+            16.0,
+            "current_line_height is still quadraui's placeholder seed value \
+             — Settings::default().font_family ({:?}) never resolved a real \
+             font",
+            settings.font_family
+        );
+
+        // Positive control: the resolved metrics must be
+        // `system_monospace_font`'s own — the CoreText face
+        // `quadraui::GenericFamily::Monospace` (the Pango alias
+        // `"Monospace"` parses to) resolves to on this backend — not some
+        // other font silently substituted.
+        let expected_font = quadraui::macos::text::system_monospace_font(settings.font_size as f64);
+        let expected = quadraui::macos::text::font_metrics(&expected_font);
+        assert!(
+            (backend.char_width() as f64 - expected.char_width).abs() < 0.01,
+            "char_width {} does not match system_monospace_font's metrics {}",
+            backend.char_width(),
+            expected.char_width
+        );
+        assert!(
+            (backend.line_height() as f64 - expected.line_height).abs() < 0.01,
+            "line_height {} does not match system_monospace_font's metrics {}",
+            backend.line_height(),
+            expected.line_height
         );
     }
 
@@ -1188,123 +1305,22 @@ mod mac_driver_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A plugin ext-panel engine: `ext_panel_active` is set directly
-    /// (bypassing `AppShell` registration, which real ext panels also
-    /// bypass — see `render::apply_activity_panel_switch`'s own doc) and
-    /// the sidebar shown via the raw `AppShell::toggle_sidebar`, not
-    /// `Engine::toggle_sidebar` — the latter persists to the developer's
-    /// real session file, the exact reason `crate::gtk::testing::
-    /// sidebar_panel_clicks::panel_harness` avoids it too.
-    ///
-    /// One "available" (not-installed) extension in `ext_registry` gives
-    /// the "AVAILABLE" section content, while "INSTALLED" stays empty —
-    /// pushing the target header down a row, the same filler technique
-    /// [`engine_with_sc_recent_commits`] uses.
-    fn engine_with_marketplace_as_ext_panel() -> Engine {
-        let mut engine = plain_engine();
-        engine.ext_registry = Some(vec![crate::core::extensions::ExtensionManifest {
-            name: "zqxw971-avail".to_string(),
-            display_name: "ZQXW971 Available Ext".to_string(),
-            ..Default::default()
-        }]);
-        engine.ext_panel_active = Some("zqxw971-marketplace-via-ext-panel".to_string());
-        engine.ext_panel_has_focus = true;
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine
-    }
-
-    /// #971: the ext-panel body's "AVAILABLE" section header, clicked
-    /// anywhere inside its own painted glyphs, must always toggle *that*
-    /// section — never the row painted immediately below it.
-    ///
-    /// This exercises `Engine::handle_ext_sidebar_ui_event` ->
-    /// `ext_sidebar_system.handle_cached`, the same cached-`SidebarSystem`
-    /// pattern the SC panel test above pins. It does **not** exercise
-    /// `render::SidebarBodyGeometry::content_row` — #971's own
-    /// "highest-suspicion" independent row formula — because that formula
-    /// is wired *only* to `render::route_sidebar_hover`'s `ExtPanel` arm
-    /// (a `MouseMoved`-only path, never a click), and the hover it drives
-    /// only ever produces a *delayed* (350ms dwell) popup gated on a
-    /// second, currently-disconnected registry
-    /// (`Engine::resolve_panel_hover_item_id` reads `ext_panels`/
-    /// `ext_panel_items`, populated only for a plugin with a live
-    /// registration — unrelated to what `ext_sidebar_system` actually
-    /// paints here). Neither half produces an immediately-painted signal a
-    /// headless driver can read without first fixing that unrelated
-    /// mismatch, which is out of this issue's scope. See this issue's PR
-    /// notes for the follow-up this gap needs.
-    ///
-    /// Uses `sweep_hit_band_integrity_resetting`, not
-    /// `sweep_hit_band_integrity` — see
-    /// `sc_panel_header_click_hit_band_matches_the_painted_row`'s own
-    /// comment on the double-click coalescing this sidesteps. "AVAILABLE"
-    /// is section 1 (`ext_sidebar_system`'s own `SidebarSectionDef` order:
-    /// `["installed", "available"]`, `Engine::new`).
-    ///
-    /// Fingerprint: is the one available extension's distinctive display
-    /// name still painted? A correct hit collapses the "available"
-    /// section, hiding its one row; a mis-hit lands on the row itself
-    /// (`SidebarEvent::RowSelected`), which changes nothing painted,
-    /// disagreeing with the header-hit baseline.
-    #[test]
-    fn ext_panel_header_click_hit_band_matches_the_painted_row() {
-        use quadraui::testing::ConformanceDriver;
-
-        let (_guards, engine, mut driver) =
-            driver_with_engine(engine_with_marketplace_as_ext_panel());
-
-        assert!(
-            driver.screen_contains("AVAILABLE") && driver.screen_contains("ZQXW971 Available Ext"),
-            "precondition: the ext panel must paint the AVAILABLE header \
-             and its one row; painted text was {:?}",
-            driver.painted_texts()
-        );
-
-        // Sanity — see `sc_panel_header_click_hit_band_matches_the_painted_row`'s
-        // own comment on why this is needed before trusting the sweep below.
-        let center = center_of(&driver, "AVAILABLE");
-        driver.click(center.0, center.1);
-        assert!(
-            !driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity: a header click must actually collapse the AVAILABLE \
-             section, hiding its one row; painted text was {:?}",
-            driver.painted_texts()
-        );
-        engine
-            .borrow_mut()
-            .ext_sidebar_system
-            .borrow_mut()
-            .set_collapsed(1, false);
-        driver.render();
-        assert!(
-            driver.screen_contains("ZQXW971 Available Ext"),
-            "sanity restore: re-expanding the section directly must bring \
-             its row back; painted text was {:?}",
-            driver.painted_texts()
-        );
-
-        crate::harness::sweep_hit_band_integrity_resetting(
-            &mut driver,
-            "AVAILABLE",
-            5,
-            |d| {
-                // Break `MacBackend`'s `DoubleClickDetector` position match
-                // before every real probe — see
-                // `sc_panel_header_click_hit_band_matches_the_painted_row`'s
-                // identical comment for the full story.
-                d.click(W as f32 - 20.0, H as f32 - 20.0);
-                engine
-                    .borrow_mut()
-                    .ext_sidebar_system
-                    .borrow_mut()
-                    .set_collapsed(1, false);
-                d.render();
-            },
-            |d| ConformanceDriver::inventory(d).screen_has("ZQXW971 Available Ext"),
-        );
-    }
+    // #1089's own retirement: `ext_panel_header_click_hit_band_matches_the_
+    // painted_row` and its fixture (`engine_with_marketplace_as_ext_panel`)
+    // used to live here. That fixture set `ext_panel_active` to a name with
+    // **no** `PanelRegistration` — a hack that only made sense while
+    // `App::paint_sidebar_panel_rung`'s `ext:` arm unconditionally painted
+    // the extension marketplace regardless of which plugin id was active.
+    // Now that the arm paints a real `PanelRegistration`'s own sections
+    // (#1089), that fixture paints nothing and the test fails on its own
+    // precondition. The property it existed to pin — a section-header
+    // click, swept across its whole painted band, always toggles *that*
+    // header and no other — is now covered against a genuine plugin panel,
+    // on this backend too, by `crate::harness::plugin_panel`'s
+    // `plugin_panel_section_header_hit_band_on_macos`
+    // (`src/harness/plugin_panel/tests.rs`), built on
+    // `engine_with_plugin_panel` (a real registration + `ext_panel_items`)
+    // per that issue's own "Shape of the work" item 3.
 
     /// #971: a unified-picker (fuzzy file finder) result row, clicked
     /// anywhere inside its own painted glyphs, must always select *that*

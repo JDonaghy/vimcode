@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use super::ai::AiMessage;
 use super::buffer::{Buffer, BufferId};
-use super::buffer_manager::{BufferManager, BufferState, UndoEntry};
+use super::buffer_manager::{BufferManager, BufferState};
 use super::comment;
 use super::dap::{BreakpointInfo, DapEvent, DapVariable, StackFrame};
 use super::dap_manager::{
@@ -26,7 +26,9 @@ use super::lsp::{
 use super::lsp_manager::LspManager;
 use super::paths;
 use super::plugin;
-use super::project_search::{self, ProjectMatch, ReplaceResult, SearchError, SearchOptions};
+use super::project_search::{
+    self, ProjectMatch, QuickfixList, ReplaceResult, SearchError, SearchOptions,
+};
 use super::registry;
 use super::session::{ExtensionState, HistoryState, SessionGroupLayout, SessionState};
 use super::settings::{EditorMode, Settings};
@@ -65,6 +67,19 @@ pub struct TerminalSlot {
     pub session: TerminalSession,
     /// `Some` only for panes opened by `terminal_run_command` (extension installs).
     pub install_ctx: Option<InstallContext>,
+    /// `true` only for the pane opened by `Engine::acp_launch_terminal_login`
+    /// (#957, ACP-6) — an ACP `type: "terminal"` auth login, re-running the
+    /// agent's own command interactively. `poll_terminal`'s exit handling
+    /// and `terminal_close_active_tab` both read this to know an
+    /// exiting/closed pane was a login flow (never a regular shell or an
+    /// extension install) and route to `Engine::acp_finish_terminal_login`.
+    pub acp_auth_pending: bool,
+    /// #1396: set once `poll_terminal` has finalized this pane's install
+    /// (registered the LSP/DAP server or reported a failure) from the exit-code
+    /// scratch file, so the pane can keep running its "Press Enter to close…"
+    /// prompt without a second `finalize_install_from_terminal` firing when the
+    /// shell itself exits afterwards. Meaningless when `install_ctx` is `None`.
+    pub install_finalized: bool,
 }
 
 /// How a register's contents were captured, and therefore how `p`/`P` put them
@@ -272,33 +287,68 @@ pub enum SettingsRow {
 // Each entry is (canonical_name, min_prefix_length).
 // `normalize_ex_command("sor foo")` → `"sort foo"`.
 static EX_ABBREVS: &[(&str, usize)] = &[
+    ("abbreviate", 2),
+    ("abclear", 3),
     ("bdelete", 2),
+    ("bfirst", 2),
+    ("blast", 2),
     ("bnext", 2),
     ("bprevious", 2),
     ("buffer", 1),
+    ("bwipeout", 2),
+    ("cabbrev", 2),
     ("cclose", 3),
+    ("cdo", 3),
+    ("cfdo", 4),
+    ("cfirst", 4),
+    ("clast", 3),
+    ("clist", 2),
     ("close", 3),
+    ("cnewer", 4),
     ("cnext", 2),
+    ("cnoreabbrev", 6),
+    ("colder", 3),
     ("colorscheme", 4),
     ("copen", 4),
     ("copy", 2),
     ("cprevious", 2),
     ("cquit", 2),
+    ("cwindow", 2),
     ("delete", 1),
+    ("delmarks", 4),
+    ("digraphs", 3),
     ("display", 2),
+    ("earlier", 2),
     ("echo", 2),
     ("edit", 1),
     ("enew", 3),
     ("file", 1),
     ("grep", 2),
     ("help", 1),
+    ("hide", 3),
     ("history", 3),
+    ("iabbrev", 2),
+    ("inoreabbrev", 6),
     ("join", 1),
     ("jumps", 2),
+    ("later", 3),
+    ("lclose", 3),
+    ("ldo", 3),
+    ("lfdo", 4),
+    ("lfirst", 4),
+    ("lgrep", 2),
+    ("llast", 3),
+    ("llist", 3),
+    ("lnext", 2),
+    ("lopen", 3),
+    ("lprevious", 2),
+    ("lvimgrep", 3),
+    ("lwindow", 2),
     ("make", 3),
     ("mark", 2),
     ("move", 1),
     ("nohlsearch", 3),
+    ("noreabbrev", 5),
     ("number", 2),
     ("only", 2),
     ("print", 1),
@@ -314,12 +364,20 @@ static EX_ABBREVS: &[(&str, usize)] = &[
     ("set", 2),
     ("sort", 3),
     ("split", 2),
+    ("startinsert", 4),
+    ("stopinsert", 5),
     ("tabclose", 4),
+    ("tabfirst", 6),
+    ("tablast", 4),
     ("tabmove", 4),
     ("tabnext", 4),
+    ("tabonly", 4),
     ("tabprevious", 4),
     ("terminal", 2),
+    ("unabbreviate", 3),
     ("undo", 1),
+    ("undojoin", 5),
+    ("undolist", 5),
     ("update", 2),
     ("version", 2),
     ("vimgrep", 3),
@@ -335,10 +393,28 @@ static EX_ABBREVS: &[(&str, usize)] = &[
 
 /// Split an ex-command string into (command_word, bang, rest).
 /// Example: `"q!"` → `("q", "!", "")`, `"sor foo"` → `("sor", "", " foo")`
+///
+/// `_` counts as part of the word, not a boundary (#1125): no real Vim
+/// ex-command name contains an underscore, but `execute_command` also
+/// doubles as the dispatch target for menu/palette action-id strings like
+/// `"save_workspace_as_dialog"` (`Engine::dispatch_menu_action`,
+/// `Engine::picker_confirm`'s `other => self.execute_command(other)`
+/// fallback — see #634). Splitting at `_` treated those as a short
+/// abbreviation-eligible word ("save") glued to an unrecognised
+/// "argument" ("_workspace_as_dialog"), so [`normalize_ex_command`]'s
+/// abbreviation table rewrote `cmd_word` (`"save"` → `"saveas"`, since
+/// `"saveas"` is in [`EX_ABBREVS`]) and reassembled a garbled command —
+/// `"saveas_workspace_as_dialog"` — that matches nothing, silently
+/// breaking the menu/palette entry instead of reaching
+/// `execute_command`'s own `cmd == "save_workspace_as_dialog"` equality
+/// check a few lines down. Keeping `_` in the word makes `cmd_word` the
+/// whole action-id string, which is always longer than every
+/// [`EX_ABBREVS`] canonical name, so the abbreviation loop never matches
+/// and the string reaches that equality check unmodified.
 fn split_ex_command(input: &str) -> (&str, &str, &str) {
-    // Find end of alphabetic command word
+    // Find end of alphabetic (+ underscore) command word
     let cmd_end = input
-        .find(|c: char| !c.is_ascii_alphabetic())
+        .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
         .unwrap_or(input.len());
     let cmd_word = &input[..cmd_end];
     let rest = &input[cmd_end..];
@@ -425,6 +501,16 @@ pub struct DialogInput {
     pub label: String,
     pub value: String,
     pub is_password: bool,
+}
+
+/// A resolved provider-declared board action (#523) awaiting the user's
+/// "yes" on the `"confirm_board_action"` dialog `Engine::run_board_action_
+/// by_name` opens for any action the provider marked `confirm`. `argv` is
+/// already `{id}`-substituted — nothing left to resolve once this fires.
+#[derive(Debug, Clone)]
+pub struct PendingBoardAction {
+    pub argv: Vec<String>,
+    pub label: String,
 }
 
 /// A single entry in the command palette.
@@ -988,6 +1074,38 @@ pub struct EngineToast {
     pub body: String,
     pub severity: quadraui::ToastSeverity,
     pub created_at: std::time::Instant,
+    /// Optional action button. `None` = plain toast — only the dismiss
+    /// "×" (`quadraui::ToastHit::Dismiss`) is clickable. `Some` wires the
+    /// button's `ToastHit::Action` to a semantic follow-up, dispatched by
+    /// `Engine::handle_toast_hit`.
+    pub action: Option<ToastActionKind>,
+    /// If true, `prune_toasts` never auto-expires this toast via
+    /// `TOAST_LIFETIME` — it stays until the user acts (the action
+    /// button) or explicitly dismisses it (×). Used for offers that need
+    /// a decision: disappearing after 5s would silently revert to
+    /// "never asked", with no record the user ever saw it (#1397).
+    pub sticky: bool,
+}
+
+/// Semantic action wired to a toast's action button
+/// (`quadraui::ToastAction`). `Engine::handle_toast_hit` matches on this
+/// to decide what `ToastHit::Action` actually does — previously the
+/// engine had no consumer for action-button taps at all (#1397 is the
+/// first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastActionKind {
+    /// Install the named extension via `ext_install_from_registry`. Shown
+    /// from `lsp_did_open`'s "recommended extension" offer.
+    InstallExtension(String),
+}
+
+impl ToastActionKind {
+    /// Label painted on the toast's action button.
+    pub(crate) fn button_label(&self) -> &'static str {
+        match self {
+            ToastActionKind::InstallExtension(_) => "Install",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1428,12 +1546,32 @@ pub enum TerminalKeyAction {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum ContextMenuTarget {
-    Tab { group_id: GroupId, tab_idx: usize },
-    ExplorerFile { path: PathBuf },
-    ExplorerDir { path: PathBuf },
+    Tab {
+        group_id: GroupId,
+        tab_idx: usize,
+    },
+    ExplorerFile {
+        path: PathBuf,
+    },
+    ExplorerDir {
+        path: PathBuf,
+    },
     Editor,
-    EditorActionMenu { group_id: GroupId },
-    ExtPanel { panel_name: String, item_id: String },
+    EditorActionMenu {
+        group_id: GroupId,
+    },
+    ExtPanel {
+        panel_name: String,
+        item_id: String,
+    },
+    /// A Board-panel card (#523) — right-clicked, or opened via a future
+    /// keyboard binding. `context_menu_confirm`'s items are the provider's
+    /// own declared actions for this card's stage
+    /// (`Engine::open_board_context_menu`); confirming one runs
+    /// `Engine::run_board_action_by_name`.
+    Board {
+        card_id: quadraui::WidgetId,
+    },
 }
 
 /// A single item in a context menu popup.
@@ -1613,40 +1751,34 @@ pub fn is_safe_url(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://") || lower.starts_with("command:")
 }
 
-/// Open a URL in the platform's default browser. Validates the URL scheme
-/// first via `is_safe_url`. This is shared across all backends (GTK, TUI,
-/// Win-GUI) to avoid duplicating platform-specific logic.
-pub fn open_url_in_browser(url: &str) {
-    if !is_safe_url(url) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        // `cmd /c start "" "url"` — empty title needed for start.
-        let mut cmd = crate::core::git::hidden_command("cmd");
-        cmd.args(["/c", "start", "", url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        cmd.spawn().ok();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .ok();
-    }
+/// A platform action requested by engine logic that must be carried out via
+/// the runner-owned `backend`'s `quadraui::PlatformServices` (#1134) — see
+/// [`Engine::pending_platform_actions`]'s doc for why this can't happen
+/// inline in `core/engine/`.
+///
+/// Before #1134, `core/engine/` hand-rolled four separate per-OS opener
+/// implementations (`open_url_in_browser` here, `gx` in `keys.rs`,
+/// `Engine::open_url` in `ext_panel.rs`, `reveal_in_file_manager` in
+/// `windows.rs`) — each its own `#[cfg(target_os = ...)]` triple of
+/// `Command::new` calls out to `open`, the Linux freedesktop.org opener, or
+/// `cmd`, and one of the four (`gx`) had no `target_os` guard at all, so it
+/// ran the Linux opener unconditionally on every platform including macOS
+/// and Windows. `quadraui::PlatformServices` (quadraui#956) already carries
+/// a correct, tested opener per backend (`gio::AppInfo::launch_default_for_uri`
+/// on GTK, `ShellExecuteW` on Win-GUI, `open`/`open -R` on macOS, and TUI's
+/// own shell-out-with-OSC-8-fallback, quadraui#969) — this enum plus
+/// [`Engine::pending_platform_actions`] is the one place all four call
+/// sites now route through instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingPlatformAction {
+    /// Open a URL in the platform's default browser/handler
+    /// (`PlatformServices::open_url_result`). Always `is_safe_url`-validated
+    /// *before* being queued (at each push site — `Engine::open_url`, `gx`),
+    /// never here, so an unsafe scheme can never even enter the queue.
+    OpenUrl(String),
+    /// Reveal a path in the platform's file manager, selected
+    /// (`PlatformServices::reveal_in_file_manager`).
+    Reveal(PathBuf),
 }
 
 /// Convert a hex ASCII byte to its numeric value (0–15), or `None`.
@@ -1750,19 +1882,125 @@ impl EditorGroup {
 
 // ─── User keymaps ────────────────────────────────────────────────────────────
 
+/// Vim's `maxmapdepth` default — the recursion ceiling for `:map`-style
+/// (non-`noremap`) key-to-keys expansion. Vim errors with `E223: recursive
+/// mapping` past this depth rather than hanging on a cycle like `nmap a b` +
+/// `nmap b a`; vimcode does the same (#1151).
+pub(crate) const MAXMAPDEPTH: usize = 1000;
+
+/// What a [`UserKeymap`] does when its `keys` (lhs) match: run an ex command,
+/// or feed a raw key sequence (rhs) back through the normal key path.
+///
+/// The `:`-prefix on the persisted string distinguishes them: `":join"`
+/// parses as `Ex("join")`, anything else (`"<Esc>"`, `"<C-w>h"`, …) parses as
+/// `Keys([...])`. This is what makes vim's single most common mapping line,
+/// `inoremap jk <Esc>`, expressible — before #1151 every `UserKeymap` target
+/// was an ex command, so key-to-keys remapping did not exist.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UserKeymapAction {
+    /// Ex command to run (without leading `:`), e.g. `"Commentary"`.
+    Ex(String),
+    /// Key sequence to feed back through `Engine::handle_key`, in the same
+    /// encoded-token form as `UserKeymap::keys` (e.g. `["<Esc>"]`).
+    Keys(Vec<String>),
+}
+
+impl std::fmt::Display for UserKeymapAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserKeymapAction::Ex(cmd) => write!(f, ":{cmd}"),
+            UserKeymapAction::Keys(keys) => write!(f, "{}", keys.join("")),
+        }
+    }
+}
+
 /// A parsed user-defined key mapping from settings.json.
 #[derive(Debug, Clone)]
 pub struct UserKeymap {
-    /// Mode: "n", "v", "i", "c".
+    /// Mode: "n", "v", "x", "o", "i", "c", "s" (vim's `:map-modes` letters;
+    /// "s" — Select mode — is accepted for parsing/listing but never active,
+    /// since vimcode has no separate Select mode from Visual).
     pub mode: String,
+    /// `true` for a `noremap`-family definition: the rhs is fed through
+    /// `handle_key` with user-keymap matching disabled, so it cannot recurse
+    /// into another mapping. `false` (`map`-family) allows recursion, guarded
+    /// by [`MAXMAPDEPTH`].
+    pub noremap: bool,
     /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
     pub keys: Vec<String>,
-    /// The ex command to run (without leading `:`), e.g. `"Commentary"`.
-    pub action: String,
+    /// What firing this mapping does.
+    pub action: UserKeymapAction,
+}
+
+/// Normalize one `<...>` key-notation token to vimcode's canonical encoded
+/// form (the format `encode_keypress`/`decode_keypress` use), accepting
+/// vim's common spellings case-insensitively. `<leader>` is left as a literal
+/// marker — it is expanded against `Settings::leader` in
+/// `Engine::rebuild_user_keymaps`, since this free function has no settings
+/// access. Unrecognised tokens (`<F1>`, `<Up>`, `<Plug>foo`, …) pass through
+/// unchanged, since those are also vimcode's own storage format.
+fn normalize_key_token(tok: &str) -> String {
+    if tok.len() < 3 || !tok.starts_with('<') || !tok.ends_with('>') {
+        return tok.to_string();
+    }
+    let inner = &tok[1..tok.len() - 1];
+    let lower = inner.to_ascii_lowercase();
+    // `encode_keypress` special-cases the two *named* keys that can follow
+    // Ctrl with a mixed-case canonical spelling (`<C-Space>`, `<C-Tab>` —
+    // capital S/T), rather than the plain lowercasing every other `<C-x>`
+    // combo gets. `<C-Space>` is also the literal default completion-trigger
+    // keybinding (`Settings::completion_trigger_key`, settings.rs). If this
+    // function lowercased those two like everything else, a keymap lhs/rhs
+    // written as `<C-Space>`/`<C-Tab>` (verbatim vim spelling, or matching
+    // that default) would normalize to `<C-space>`/`<C-tab>` and then never
+    // match a real keypress's `<C-Space>`/`<C-Tab>` encoding again (#1151
+    // review).
+    if let Some(rest) = lower.strip_prefix("c-") {
+        return match rest {
+            "space" => "<C-Space>".to_string(),
+            "tab" => "<C-Tab>".to_string(),
+            _ => format!("<C-{rest}>"),
+        };
+    }
+    if let Some(rest) = lower
+        .strip_prefix("a-")
+        .or_else(|| lower.strip_prefix("m-"))
+    {
+        return format!("<A-{rest}>");
+    }
+    match lower.as_str() {
+        "esc" | "escape" => "<Escape>".to_string(),
+        "cr" | "return" | "enter" => "<Return>".to_string(),
+        "tab" => "<Tab>".to_string(),
+        "bs" | "backspace" => "<BS>".to_string(),
+        "space" => "<Space>".to_string(),
+        "leader" => "<leader>".to_string(),
+        "plug" => "<Plug>".to_string(),
+        _ => tok.to_string(),
+    }
+}
+
+/// Substitute the literal `<leader>` marker `parse_key_sequence` leaves in
+/// place (see [`normalize_key_token`]) with the configured leader key.
+/// Shared by `Engine::rebuild_user_keymaps` and the `:map`-family ex-command
+/// handlers in `execute.rs`, both of which need it applied to freshly parsed
+/// key tokens before they're matched or stored (#1151).
+pub(crate) fn expand_leader_tokens(toks: Vec<String>, leader: &str) -> Vec<String> {
+    toks.into_iter()
+        .map(|t| {
+            if t == "<leader>" {
+                leader.to_string()
+            } else {
+                t
+            }
+        })
+        .collect()
 }
 
 /// Parse a key notation string into individual key specs.
 /// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
+/// Recognises vim's `<Esc> <CR> <Tab> <C-x> <A-x> <leader> <Plug>` notation
+/// (case-insensitively) via [`normalize_key_token`] (#1151).
 fn parse_key_sequence(s: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let chars: Vec<char> = s.chars().collect();
@@ -1772,7 +2010,7 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
             // Find matching '>'
             if let Some(end) = chars[i..].iter().position(|&c| c == '>') {
                 let token: String = chars[i..=i + end].iter().collect();
-                keys.push(token);
+                keys.push(normalize_key_token(&token));
                 i += end + 1;
             } else {
                 keys.push(chars[i].to_string());
@@ -1786,29 +2024,167 @@ fn parse_key_sequence(s: &str) -> Vec<String> {
     keys
 }
 
-/// Parse a keymap definition string: `"n gcc :Commentary"` → `UserKeymap`.
+/// Parse a keymap definition string, vimcode's persisted `settings.json`
+/// `keymaps` entry format: `"{mode}[!] {lhs} {rhs}"`.
+///
+/// `{mode}` is one of `n v x o i c s`; a trailing `!` marks the entry
+/// `noremap` (e.g. `"i! jk <Esc>"` is `inoremap jk <Esc>`, `"i jk <Esc>"` is
+/// `imap jk <Esc>`). `{rhs}` is `Ex` when `:`-prefixed (`"n gcc :Commentary"`,
+/// the pre-#1151 form — still parses identically, so existing `settings.json`
+/// keeps working unmigrated) and `Keys` otherwise (`"i! jk <Esc>"`).
 fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
     let s = s.trim();
-    // Split: mode (first char or token), keys, :action
+    // Split: mode[!] (first token), keys, rhs
     let mut parts = s.splitn(3, ' ');
-    let mode = parts.next()?.to_string();
-    if !matches!(mode.as_str(), "n" | "v" | "i" | "c") {
+    let mode_tok = parts.next()?;
+    let (mode, noremap) = match mode_tok.strip_suffix('!') {
+        Some(base) => (base.to_string(), true),
+        None => (mode_tok.to_string(), false),
+    };
+    if !matches!(mode.as_str(), "n" | "v" | "x" | "o" | "i" | "c" | "s") {
         return None;
     }
     let keys_str = parts.next()?;
     let action_str = parts.next()?.trim();
-    if !action_str.starts_with(':') {
-        return None;
-    }
-    let action = action_str[1..].to_string();
-    if action.is_empty() {
+    if action_str.is_empty() {
         return None;
     }
     let keys = parse_key_sequence(keys_str);
     if keys.is_empty() {
         return None;
     }
-    Some(UserKeymap { mode, keys, action })
+    let action = if let Some(cmd) = action_str.strip_prefix(':') {
+        if cmd.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Ex(cmd.to_string())
+    } else {
+        let rhs_keys = parse_key_sequence(action_str);
+        if rhs_keys.is_empty() {
+            return None;
+        }
+        UserKeymapAction::Keys(rhs_keys)
+    };
+    Some(UserKeymap {
+        mode,
+        noremap,
+        keys,
+        action,
+    })
+}
+
+// ─── User abbreviations (#1152) ───────────────────────────────────────────────
+
+/// A parsed user-defined abbreviation from settings.json (`:h abbreviations`).
+///
+/// An abbreviation is a key-to-keys substitution like [`UserKeymap`], but
+/// triggered by typing a non-keyword character (or leaving Insert / running
+/// the command line) immediately after the `lhs`, rather than by typing the
+/// `lhs` as a command in its own right.
+#[derive(Debug, Clone)]
+pub struct UserAbbrev {
+    /// `"i"` (Insert-mode only, `:iabbrev`), `"c"` (Command-line only,
+    /// `:cabbrev`), or `"a"` (both, `:abbreviate`/`:noreabbrev`).
+    pub mode: String,
+    /// The abbreviation itself, e.g. `"teh"` or `"#i"`.
+    pub lhs: String,
+    /// The replacement text, e.g. `"the"`. May itself contain spaces.
+    pub rhs: String,
+}
+
+/// Parse one `settings.abbreviations` entry: `"mode lhs rhs..."` → `UserAbbrev`.
+/// Mirrors [`parse_keymap_def`]'s storage convention, but `rhs` may contain
+/// spaces (`"i @@ John Doe <jd@example.com>"`), so only the first two tokens
+/// are split off; everything after that is `rhs` verbatim.
+fn parse_abbrev_def(s: &str) -> Option<UserAbbrev> {
+    let s = s.trim();
+    let mut parts = s.splitn(3, ' ');
+    let mode = parts.next()?.to_string();
+    if !matches!(mode.as_str(), "i" | "c" | "a") {
+        return None;
+    }
+    let lhs = parts.next()?.to_string();
+    let rhs = parts.next()?.trim().to_string();
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    Some(UserAbbrev { mode, lhs, rhs })
+}
+
+/// An abbreviation's `lhs` falls into one of three classes (`:h
+/// abbreviations`), which determine what may precede a match for it to count
+/// as triggered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AbbrevClass {
+    /// full-id: every character is a keyword character (`'iskeyword'`):
+    /// `"foo"`.
+    Full,
+    /// end-id: ends in a keyword character, but has a non-keyword one
+    /// earlier: `"#i"`.
+    End,
+    /// non-id: does not end in a keyword character: `"def:"`.
+    Symbol,
+}
+
+fn classify_abbrev_lhs(lhs: &[char]) -> AbbrevClass {
+    match lhs.last() {
+        Some(&last) if is_word_char(last) => {
+            if lhs.iter().all(|&c| is_word_char(c)) {
+                AbbrevClass::Full
+            } else {
+                AbbrevClass::End
+            }
+        }
+        _ => AbbrevClass::Symbol,
+    }
+}
+
+/// Does `prefix` (the text immediately before the cursor / trigger, on one
+/// line) end with `lhs` in a position `:h abbreviations` counts as a match?
+///
+/// `full-id` abbreviations must be a whole word — preceded by a non-keyword
+/// character or the start of line — so `"teh"` matches in `"a teh"` but not
+/// in `"ateh"` (the "does not fire mid-word" rule, #1152). `end-id` and
+/// `non-id` abbreviations need no such boundary check: their own leading
+/// character is already non-keyword, so it can never be a continuation of a
+/// keyword run.
+fn abbrev_matches_at_end(prefix: &[char], lhs: &[char], class: AbbrevClass) -> bool {
+    if lhs.is_empty() || lhs.len() > prefix.len() {
+        return false;
+    }
+    let start = prefix.len() - lhs.len();
+    if prefix[start..] != *lhs {
+        return false;
+    }
+    match class {
+        AbbrevClass::Full => start == 0 || !is_word_char(prefix[start - 1]),
+        AbbrevClass::End | AbbrevClass::Symbol => true,
+    }
+}
+
+/// Find the best (longest) abbreviation match ending at `prefix`'s end,
+/// among `abbrevs` eligible for `mode` (`"i"` or `"c"`; entries stored as
+/// `"a"` match either). Longest-`lhs` wins when several could match, mirroring
+/// Vim's own preference for the longest word before the cursor.
+fn find_abbrev_match<'a>(
+    abbrevs: &'a [UserAbbrev],
+    prefix: &[char],
+    mode: &str,
+) -> Option<(usize, &'a str)> {
+    let mut best: Option<(usize, &str)> = None;
+    for ab in abbrevs {
+        if ab.mode != "a" && ab.mode != mode {
+            continue;
+        }
+        let lhs_chars: Vec<char> = ab.lhs.chars().collect();
+        let class = classify_abbrev_lhs(&lhs_chars);
+        if abbrev_matches_at_end(prefix, &lhs_chars, class)
+            && best.map(|(len, _)| lhs_chars.len() > len).unwrap_or(true)
+        {
+            best = Some((lhs_chars.len(), ab.rhs.as_str()));
+        }
+    }
+    best
 }
 
 // ── Keybinding reference generators ──────────────────────────────────────────
@@ -1818,7 +2194,7 @@ pub(super) fn keybindings_reference_vim() -> String {
 VimCode — Vim Mode Keybinding Reference
 ========================================
 Use / to search.  :Keymaps to add custom overrides.
-Commands shown on the right (e.g. :def) can be remapped via :map n <key> :command
+Commands shown on the right (e.g. :def) can be remapped via :nnoremap <key> :command
 
 ── Movement ────────────────────────────────────────────
 h j k l             Left / down / up / right
@@ -2077,7 +2453,7 @@ pub(super) fn keybindings_reference_vscode() -> String {
 VimCode — VSCode Mode Keybinding Reference
 ===========================================
 Use Ctrl+F or / to search.
-Remap keys: F1 → \"Open Keyboard Shortcuts\", or :map n <key> :command
+Remap keys: F1 → \"Open Keyboard Shortcuts\", or :nnoremap <key> :command
 
 ── Editing ─────────────────────────────────────────────
 Ctrl+Z              Undo
@@ -2348,6 +2724,12 @@ pub struct Engine {
     pub wildmenu_selected: Option<usize>,
     /// Original command buffer before wildmenu was opened (for cycling back).
     pub wildmenu_original: String,
+    /// How many `<Tab>` presses into the current wildmenu completion round
+    /// we are — indexes into `'wildmode'`'s comma-separated stages
+    /// (`Settings::wildmode_stage_at`, #1206). Reset by `wildmenu_clear`.
+    /// Only consulted for `'wildmode'` configurations other than the bare
+    /// default `"full"` — see `Settings::wildmode_is_plain_full`.
+    pub wildmenu_press: usize,
     /// Status message shown in the command line area (e.g. "written", errors).
     pub message: String,
     /// Current search query (from last `/` or `?` search).
@@ -2389,10 +2771,20 @@ pub struct Engine {
     pub pending_key: Option<char>,
     /// Parsed user keymaps from settings (rebuilt on settings change).
     pub user_keymaps: Vec<UserKeymap>,
+    /// Parsed user abbreviations from settings (rebuilt on settings change).
+    pub user_abbrevs: Vec<UserAbbrev>,
     /// Accumulated keypress buffer for multi-key user keymap matching.
     pub keymap_buf: Vec<String>,
     /// Guard: true while replaying buffered keys through handle_key.
     pub keymap_replaying: bool,
+    /// When `keymap_buf` is a non-empty, still-ambiguous prefix of some
+    /// mapping's lhs, the instant `'timeoutlen'` ms after the *last*
+    /// keystroke — refreshed on every keypress that extends the buffer,
+    /// consulted by `tick_keymap_timeout` (`poll_idle`, #1206, `:h
+    /// 'timeoutlen'`). `None` when the buffer is empty, or when
+    /// `'timeoutlen'` is `0` (the pre-#1206 behavior: wait indefinitely for
+    /// a resolving keystroke, never auto-flush on idle).
+    pub keymap_buf_deadline: Option<std::time::Instant>,
     /// Set by `focus_window_direction` when navigation overflows the window list.
     /// `Some(false)` = tried to go left past first window, `Some(true)` = right past last.
     /// Consumed by the UI backend to move focus to sidebar/toolbar.
@@ -2858,15 +3250,39 @@ pub struct Engine {
     /// True when navigating via back/forward (suppresses pushing to history).
     tab_nav_navigating: bool,
 
-    // --- Quickfix state ---
-    /// Quickfix list populated by :grep / :vimgrep.
-    pub quickfix_items: Vec<ProjectMatch>,
-    /// Currently selected quickfix item (0-based).
-    pub quickfix_selected: usize,
-    /// Whether the quickfix panel is visible.
-    pub quickfix_open: bool,
-    /// Whether the quickfix panel has keyboard focus.
-    pub quickfix_has_focus: bool,
+    // --- Quickfix / location-list state (#1155) ---
+    /// The global quickfix list, populated by :grep / :vimgrep / :cexpr-style
+    /// producers and driven by the `:c*` family.
+    pub quickfix: QuickfixList,
+    /// History of previous global quickfix lists for `:colder`/`:cnewer`,
+    /// always including the currently-loaded list at `quickfix_stack
+    /// [quickfix_stack_pos]`. Capped at 10 entries, matching Vim's default
+    /// quickfix-stack depth. Vim's location lists don't get their own
+    /// `:lolder`/`:lnewer` stack here — out of scope for #1155.
+    pub quickfix_stack: Vec<QuickfixList>,
+    /// Index of the currently active list within `quickfix_stack`.
+    pub quickfix_stack_pos: usize,
+    /// Per-window location lists — the `:l*` family's target. A window with
+    /// no entry here behaves like Vim's "no location list" (`E776`).
+    pub location_lists: HashMap<WindowId, QuickfixList>,
+    /// Real `WindowLayout` leaves opened by `qf_open`/`qf_window` for a
+    /// quickfix/location-list panel (#1307) — keyed by `qf_get`'s own `win`
+    /// shape (`None` = the global quickfix panel, `Some(owner)` = window
+    /// `owner`'s location-list panel). Matches Neovim's own `:copen`/`:lopen`:
+    /// the panel is a genuine split window, so `winnr("$")` grows and
+    /// `CTRL-W` navigation reaches it, unlike the sidebar/terminal overlay
+    /// panels. Advisory, not authoritative — an entry can outlive the window
+    /// it names if that window closed through a path other than `qf_close`
+    /// (`CTRL-W q`, `:only`, ...); every reader checks `self.windows` before
+    /// trusting it, and `forget_closed_panel_window` prunes the entry the
+    /// next time any window-close path removes that id. `QuickfixList::open`/
+    /// `has_focus` remain the flags most existing code reads/writes — a
+    /// target with no entry here (e.g. `qf_set_list`'s implicit `:grep`
+    /// auto-open, or any test that pokes `open`/`has_focus` directly without
+    /// going through `qf_open`) still renders via the legacy overlay band in
+    /// `render.rs`, which only self-suppresses for a target that *does* have
+    /// a real window here.
+    pub qf_panel_windows: HashMap<Option<WindowId>, WindowId>,
     /// Whether the debug sidebar has keyboard focus.
     pub dap_sidebar_has_focus: bool,
 
@@ -2897,6 +3313,14 @@ pub struct Engine {
     pub picker_history_index: Option<usize>,
     /// Saves the user's in-progress query when they start browsing history.
     pub picker_history_typing_buffer: String,
+    /// When `Some`, [`PickerSource::Grep`] searches under this directory
+    /// instead of [`Engine::cwd`] — set by the explorer context menu's
+    /// "Find in Folder..." action (`open_grep_picker_scoped`) so the
+    /// picker's search is actually scoped to the folder the menu label
+    /// names, not the whole workspace (#1418). Reset to `None` by
+    /// [`Engine::open_picker`] like every other picker-session field, so a
+    /// plain `<leader>fg`/Command-Center grep never inherits a stale scope.
+    pub picker_grep_scope: Option<std::path::PathBuf>,
 
     // --- Find/Replace overlay (Ctrl+F) ---
     /// Whether the find/replace overlay is open.
@@ -2922,6 +3346,12 @@ pub struct Engine {
     /// Used by `build_selection()` to render the original selection without it
     /// changing as the cursor jumps to search matches.
     pub find_replace_visual_end: Option<crate::core::cursor::Cursor>,
+
+    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    /// `Some` while a `:s///c` confirm prompt is awaiting an answer;
+    /// intercepts all keys (see `handle_key`) until `y`/`n`/`a`/`q`/`l` (or
+    /// `<Esc>`) resolves it. `<C-e>`/`<C-y>` scroll without consuming it.
+    pub(crate) confirm_sub: Option<execute::ConfirmSubState>,
 
     // --- Breadcrumb focus mode ---
     /// Whether breadcrumb keyboard navigation is active (entered via `<leader>b`).
@@ -3035,6 +3465,57 @@ pub struct Engine {
     /// #695). Empty rect (`width`/`height` 0) means "not currently painted",
     /// matching GTK's `unwrap_or_default()` convention.
     pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
+    /// #1029 (review, fix iteration 1): one-shot guard for
+    /// `TuiShellApp::handle`'s "stale hamburger-corner" interception.
+    /// Armed `true` exactly on a genuine `false -> true` transition of
+    /// [`Self::menu_bar_visible`] caused by the hamburger reveal (not on
+    /// the `PanelChanged` echoes `ShellAdapter` re-fires after every
+    /// `handle()`/`tick()` poll — see `on_shell_event`'s hamburger arm,
+    /// which only arms this on the transition, so an echo of an
+    /// already-true flag is a no-op here too).
+    ///
+    /// **Spent (set back to `false`) by the very next user interaction,
+    /// on every path** — not just by events that happen to reach
+    /// `TuiShellApp::handle` (review, #1029 iteration 2). Two spenders,
+    /// one per path:
+    ///
+    /// - `TuiShellApp::consume_hamburger_stale_click_guard`, called at
+    ///   the top of `handle` before its `'dispatch` block, for every
+    ///   event that reaches the app directly: a `MouseDown` (the one the
+    ///   corner check is for), a keystroke, a scroll, a paste …
+    ///   Pointer/window plumbing — `MouseUp` (the release half of the
+    ///   reveal's own click!), `MouseMoved`, focus/resize/DPI — is
+    ///   deliberately excluded, since none of it is the user moving on.
+    /// - `TuiShellApp::disarm_hamburger_stale_click_guard`, called from
+    ///   `on_shell_event`, for every click `ShellAdapter` hit-tests and
+    ///   consumes *upstream* of `handle` — a real activity-bar panel icon
+    ///   (Explorer/Search/Git/an extension panel), the Settings cog, a
+    ///   divider drag. Those never reach `handle` at all, so without this
+    ///   half the guard survived them and then mis-fired on the next
+    ///   genuine `File` click.
+    ///
+    /// The one exception is the `suppress_shell_panel_echo` reconciliation
+    /// echo `take_requested_panel` provokes right after every hamburger
+    /// reveal: it is the app steering the runner back onto the shadow's
+    /// panel, not user input, and spending the guard on it would disable
+    /// this fix entirely.
+    ///
+    /// Purely positional matching (the click lands where the activity
+    /// bar used to be, before the reveal shifted it down a row) can't
+    /// tell the one stale muscle-memory click a reveal leaves behind
+    /// apart from a later, deliberate click on `File` — which paints at
+    /// the exact same columns once the menu bar is open (review, #1029
+    /// iteration 1: "it fires identically for every left-click landing
+    /// on the `File` label for as long as the menu bar stays visible").
+    /// Bounding the corner-check to the single click immediately
+    /// following a reveal fixes the one stale click without permanently
+    /// stealing mouse access to `File` — but only if "immediately
+    /// following" is literally true, which is why the spend has to cover
+    /// the shell-consumed path too (review, #1029 iteration 2: "it's
+    /// consumed by the next `MouseDown` that happens not to be a
+    /// recognized activity-bar panel click, which can be arbitrarily
+    /// later").
+    pub hamburger_stale_click_guard: bool,
     /// Cached global (bottom-of-screen) status bar rect from the last paint
     /// (#752) — the exact twin of [`Self::menu_bar_rect`] one band lower, and
     /// for the same reason.
@@ -3113,10 +3594,159 @@ pub struct Engine {
     /// True while a DAP debug session is active.
     pub dap_session_active: bool,
 
-    // --- ACP (Agent Client Protocol) state (#951, ACP-0 — transport only, no UI) ---
+    // --- ACP (Agent Client Protocol) state ---
     /// The live ACP agent subprocess + session, if one has been started.
-    /// `None` until a later slice starts one; `poll_acp` is a no-op then.
+    /// `None` until `ai_send_message` starts one (#952, ACP-1); `poll_acp`
+    /// is a no-op until then.
     pub acp_client: Option<crate::core::acp::AcpClient>,
+    /// The agent's `session/new` `sessionId`, once the handshake
+    /// (`initialize` -> `session/new`) has completed. `None` while a fresh
+    /// `acp_client` is still initializing.
+    pub acp_session_id: Option<String>,
+    /// A user prompt queued because `ai_send_message` was called before
+    /// `acp_session_id` was known (spawning the agent and running the
+    /// handshake takes at least one `poll_acp` round trip). Drained by
+    /// `poll_acp` the moment `AcpEvent::SessionCreated` lands.
+    pub acp_pending_prompt: Option<String>,
+    /// The `ai_messages` index + role of the transcript turn currently
+    /// being streamed via `session/update` chunks, so consecutive chunks
+    /// of the same kind (`AcpChunkKind`) append to it instead of each
+    /// starting a new turn. Reset to `None` on `PromptStopped`/
+    /// `RequestFailed`/`AgentExited` so the next chunk of a later turn
+    /// starts fresh rather than appending to a finished one.
+    pub acp_streaming_turn: Option<(usize, crate::core::acp::AcpChunkKind)>,
+    /// A parked `session/request_permission` request, if the dialog tagged
+    /// `"acp_permission"` is currently open for it (#953, ACP-2). Holds the
+    /// JSON-RPC request id (needed to reply) alongside the parsed request
+    /// (needed to interpret which button the human picked, and to key
+    /// `acp_remembered_decisions`). `None` whenever no permission dialog is
+    /// open — every path that closes that dialog must clear this at the
+    /// same time it sends the reply, so the two never drift apart; see
+    /// `Engine::acp_cancel_pending_permission` and the `"acp_permission"`
+    /// arm of `process_dialog_result`, the only two places that do either.
+    pub acp_pending_permission: Option<(i64, crate::core::acp::AcpPermissionRequest)>,
+    /// Session-scoped remembered `allow_always`/`reject_always` answers to
+    /// `session/request_permission`, keyed by the tool call's ACP `kind`
+    /// (`AcpToolCallInfo::kind` — e.g. `"edit"`, `"execute"`; *not* the
+    /// per-option `kind`). `true` = always allow, `false` = always reject.
+    /// Cleared whenever the session itself ends (`ai_clear`, `AgentExited`)
+    /// — never persisted across sessions, per #953's non-goal #1 (no
+    /// blanket/global auto-approve).
+    pub acp_remembered_decisions: std::collections::HashMap<String, bool>,
+    /// The agent's current task-plan breakdown (`session/update`'s `plan`
+    /// variant, #956 ACP-5). Each update is a **full replacement**, not a
+    /// delta — this holds only the latest one, never an accumulated
+    /// history, so `render::populate_ai_chat_controller` always renders
+    /// exactly one plan checklist regardless of how many `plan` updates
+    /// have streamed by. Source-agnostic shape (`crate::core::acp::
+    /// AcpPlanEntry`) shared with #529's future remote-worker
+    /// plan preview — "same renderer, different feeder" per that issue's
+    /// note. Cleared on `ai_clear`/`AgentExited` (session-scoped).
+    pub acp_plan: Vec<crate::core::acp::AcpPlanEntry>,
+    /// Slash commands the agent declared via `available_commands_update`
+    /// (#956, ACP-5) — full replacement each update, same policy as
+    /// `acp_plan`. Surfaced as completions in the AI panel's input via
+    /// `Engine::ai_command_completions`.
+    pub acp_available_commands: Vec<crate::core::acp::AcpAvailableCommand>,
+    /// Selected index into the slash-command completions currently
+    /// matching the AI panel's input (`Engine::ai_command_completions`).
+    /// Reset to 0 whenever `acp_available_commands` changes so a stale
+    /// selection never points past a shrunk list's end.
+    pub acp_command_completion_idx: usize,
+    /// The agent's declared modes (`session/new`'s `modes.availableModes`,
+    /// #956 ACP-5). The set itself only ever comes from the handshake —
+    /// `current_mode_update` changes which one is current, not this list.
+    pub acp_modes: Vec<crate::core::acp::AcpSessionMode>,
+    /// Which of `acp_modes` is current. Driven **only** by the agent's own
+    /// `current_mode_update` notification (never set optimistically by
+    /// `Engine::acp_set_mode` on request) — see that method's doc for why.
+    pub acp_current_mode_id: Option<String>,
+    /// Latest `usage_update` telemetry, if the agent has sent one this
+    /// session (#956, ACP-5). Rendered as a compact status-header suffix —
+    /// never a separate widget, so it can't steal focus or churn layout.
+    pub acp_usage: Option<crate::core::acp::AcpUsage>,
+    /// The `authMethods` from the live agent's `initialize` response
+    /// (#957, ACP-6) — cached so the `"acp_auth_choice"` dialog and
+    /// `Engine::acp_launch_terminal_login` can look a chosen method back up
+    /// by id after the dialog closes. Session-scoped: cleared alongside
+    /// `acp_client` (`AgentExited`, `ai_clear`).
+    pub acp_auth_methods: Vec<crate::core::acp::AcpAuthMethod>,
+    /// Whether auth has been resolved (skipped, a `type: "agent"` method
+    /// succeeded, or a `type: "terminal"` login exited `0`) for the
+    /// *current* `acp_client`'s lifetime. Gates whether `poll_acp`'s
+    /// `Initialized` handler shows the `"acp_auth_choice"` dialog again —
+    /// without this, the re-`initialize()` that
+    /// `Engine::acp_finish_terminal_login` sends after a successful
+    /// terminal login would immediately reopen the same dialog, since a
+    /// real agent's `authMethods` list does not empty out just because a
+    /// previous login already succeeded. Reset to `false` alongside
+    /// `acp_client`/`acp_auth_methods` (new client, new handshake, new
+    /// choice) — never persisted across sessions.
+    pub acp_authenticated: bool,
+    /// Tool calls the agent has announced this session (#955, ACP-4),
+    /// upserted by `toolCallId` — an addressable collection, not an
+    /// append-only log, so a `tool_call_update`'s status transition or
+    /// appended content lands on the same entry `tool_call` created.
+    /// Rendered as collapsed one-line summaries after the real
+    /// conversation (`render::populate_ai_chat_controller`), same
+    /// "synthetic turn appended after" treatment as `acp_plan`.
+    /// Session-scoped: cleared on `ai_clear`/`AgentExited`.
+    pub acp_tool_calls: Vec<crate::core::acp::AcpToolCall>,
+    /// The change-review surface (#955, shared with #525): opened
+    /// automatically when a tool call's content includes a `diff` block.
+    /// Source-agnostic (`crate::core::review::ChangeReviewState`) — this
+    /// field just holds whichever review is currently open, regardless of
+    /// what fed it. Session-scoped: cleared on `ai_clear`/`AgentExited`,
+    /// same as `acp_tool_calls`.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
+    /// The diff-pane rect (excludes the status footer)
+    /// `render::paint_change_review_rung` last painted the current entry's
+    /// `DiffView` into — ABSOLUTE, backend-native units, same "paint
+    /// writes it, click routing reads it" convention as
+    /// `command_line_rect`. Both backends' mouse-click arms resolve a
+    /// click through `entry.view.layout(this_rect, line_height).hit_test`
+    /// before calling `Engine::change_review_jump_to_hit`, so paint and
+    /// hit-test can never disagree about geometry.
+    pub change_review_diff_rect: std::cell::Cell<quadraui::Rect>,
+    /// Which branch/base a still-open-or-since-closed [`Self::
+    /// open_branch_review`] resolved (#528, Track A Phase 3) — set when
+    /// the review opens and left in place after the human closes the diff
+    /// surface (`Esc`/`q`) to keep editing files, since that's exactly
+    /// when the provenance this field exists for matters most: nothing
+    /// else on screen says "this workspace is the agent's branch
+    /// checkout, not your own" once the diff view is gone. Read by
+    /// `render::branch_review_provenance_line` (both backends' status
+    /// chrome) and by [`Self::finalize_review_edits`], which refuses to
+    /// push if the worktree has since moved off `branch` — the "must know
+    /// which branch/worktree they're editing" footgun the issue calls out
+    /// as the main risk. Cleared only by opening a *different* branch
+    /// review; a plain `Esc` out of the diff surface must not clear it.
+    pub review_target: Option<crate::core::tool_client::BranchReviewTarget>,
+    /// The board card id the currently (or most recently) open
+    /// `change_review` was opened *for*, if any (#526). Set by
+    /// `Engine::open_review_card` right after a successful
+    /// `open_branch_review`; always reset to `None` at the top of
+    /// `Engine::open_change_review` so an ACP tool-call diff (which never
+    /// goes through a board card) never inherits a stale id from an
+    /// earlier board review. `Engine::start_review_verdict` reads this to
+    /// know which card a reported verdict belongs to — a review with no
+    /// card id (an ACP diff) simply has no verdict to report.
+    pub review_card_id: Option<String>,
+    /// Which pinned comment a still-open `"review_comment"` [`Dialog`] is
+    /// editing (#527, Track A Phase 3) — set by
+    /// [`Self::change_review_start_comment`], read and cleared by
+    /// [`Self::apply_review_comment_dialog_result`] once the dialog is
+    /// dismissed. See [`ReviewCommentTarget`]'s own doc for why this lives
+    /// on `Engine` rather than inside `Dialog` itself.
+    pub review_comment_target: Option<ReviewCommentTarget>,
+    /// The [`crate::core::review::FindingsSerializer`] used to prefill a
+    /// verdict-composer buffer's body from the current review's pinned
+    /// comments (#527) — a plain function pointer, defaulting to
+    /// [`crate::core::review::markdown_findings_serializer`]. Swappable
+    /// (`#[cfg(test)]` setter below) so the findings layout stays
+    /// pluggable per #527's own acceptance bar rather than hardcoded to
+    /// one provider's format.
+    pub review_findings_serializer: crate::core::review::FindingsSerializer,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -3178,9 +3808,18 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
-    /// Cached layout for the debug sidebar action-button row.
-    /// Paint fills; click reads via `hit_test()` (paint↔click pattern).
-    pub dap_sidebar_action_hits: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
+    /// Hit regions for the debug sidebar's title + action-button chrome
+    /// (`SidebarPanelChrome::StatusBars`, quadraui#1061), in whatever
+    /// absolute space the frame's `SidebarPanelBody::render_with` call
+    /// painted them into (TUI cells, GTK pixels) — straight from
+    /// `SidebarPanelBodyLayout::status_bar_hit_regions`, not re-derived.
+    /// Paint fills (`render::debug_sidebar_chrome`'s two callers); click
+    /// reads via `render::dap_sidebar_action_click_at` (paint↔click
+    /// pattern, issue #1392: previously GTK also cached a separate
+    /// bar-local `StatusBarLayout` plus its own `action_rect` to translate
+    /// into it — two independently-derived values for the same geometry,
+    /// which is exactly what let paint and click disagree).
+    pub dap_sidebar_action_hits: std::cell::RefCell<Vec<(quadraui::Rect, quadraui::StatusBarHit)>>,
     /// Forward-indexed scroll offset for the debug output panel (0 = top/oldest).
     pub debug_output_scroll: usize,
     /// When true, debug output auto-scrolls to show newest lines.
@@ -3331,6 +3970,13 @@ pub struct Engine {
     /// Last executed ex command (for @: repeat).
     pub last_ex_command: Option<String>,
 
+    /// Set by `:undojoin` (#1156): the undo-tree `seq` to fold the *next*
+    /// committed undo group back into, so the change `:undojoin` precedes
+    /// and the one that follows it undo as a single `u`. Consumed (cleared)
+    /// by the next `Engine::finish_undo_group` call, whether or not it
+    /// actually commits anything.
+    pub pending_undojoin: Option<usize>,
+
     // --- Last substitute (&) ---
     /// Last substitute (pattern, replacement, flags) for & repeat.
     pub last_substitute: Option<(String, String, String)>,
@@ -3347,14 +3993,62 @@ pub struct Engine {
     /// Updated at the end of `handle_key()`.
     pub bracket_match: Option<(usize, usize)>,
 
+    /// `'showmatch'` (#1207): the (line, col) of the opening bracket a just-
+    /// typed closing bracket in Insert mode matched, while the momentary
+    /// "flash" is active. Deliberately never moves `view.cursor` — Vim's own
+    /// `'showmatch'` is a *display* trick (it repaints the cursor over the
+    /// match, waits, then repaints it back) that does not touch where the
+    /// next typed character lands; representing that as a display-only
+    /// cursor move would need a real timer (`'matchtime'`, out of scope,
+    /// #1207), so this is a transient side channel instead — analogous to
+    /// `yank_highlight` above. Set by `Engine::handle_insert_key` when a
+    /// closing `)`/`]`/`}` has a match; cleared at the very top of the same
+    /// fn on the *next* key, so a test can observe it True for exactly the
+    /// one key that triggered it. Painted by `build_rendered_window` in
+    /// `render.rs`, which folds this into `bracket_match_positions` (the
+    /// same `bracket_match_bg`-themed channel `bracket_match` above already
+    /// used) whenever `'showmatch'` is on — so this is user-visible, not
+    /// just engine state; see
+    /// `set_showmatch_flashes_the_matching_open_paren_via_shell_app` in
+    /// `src/tui_main/shell_app.rs` for the driver-tier proof.
+    pub showmatch_flash: Option<(usize, usize)>,
+
     // --- Insert mode Ctrl+r pending ---
     /// When true, the next keypress in Insert (or Replace) mode inserts a register's content.
     pub insert_ctrl_r_pending: bool,
     pub insert_ctrl_g_pending: bool,
+    /// `<C-k>` digraph entry (`:h digraphs`, #1160). `None` when not
+    /// entering a digraph; `Some(None)` right after `<C-k>` itself (waiting
+    /// for the first of the two digraph characters); `Some(Some(c1))` after
+    /// the first character has been typed (waiting for the second).
+    pub insert_ctrl_k_pending: Option<Option<char>>,
+    /// `<C-x>` completion submode (`:h i_CTRL-X`, #1160): true right after
+    /// `<C-x>` while waiting for the sub-mode selector key
+    /// (`<C-x><C-n>`/`<C-x><C-f>`/etc).
+    pub insert_ctrl_x_pending: bool,
+    /// User-defined digraphs added via `:digraph {char1}{char2} {number}`
+    /// (`:h digraph-usage`). Consulted before the builtin table so a user
+    /// override wins; keyed in the order the two characters were typed.
+    pub custom_digraphs: HashMap<(char, char), char>,
     /// When true, after one Normal-mode command, auto-return to Insert mode (Ctrl-O).
     pub insert_ctrl_o_active: bool,
-    /// Column where insert mode was entered (for Ctrl-U to delete only typed text).
+    /// Column of the `'backspace'` `"start"` / Ctrl-U boundary (`:h
+    /// i_CTRL-U`, `:h 'backspace'`'s `"start"` token, #1206). Set when
+    /// Insert mode is entered, then **re-anchored to the cursor's new
+    /// position by `split_insert_undo_group`** every time an insert-mode
+    /// cursor-movement key (arrow/Home/End) fires — mirroring real Vim's
+    /// `stop_arrow()`, which resets `Insstart` on exactly those keys. This
+    /// is why it is *not* simply "where insert mode was entered" after the
+    /// first cursor move.
     pub insert_enter_col: usize,
+    /// Line counterpart to `insert_enter_col` — `insert_enter_col` alone
+    /// can't tell "BackSpace is about to delete text that predates this
+    /// Insert session" from "the cursor moved to a different line since"
+    /// (e.g. after `<CR>`, or after an arrow key re-anchored both fields to
+    /// a pre-existing line); this pairs with it so the `"start"` gate only
+    /// fires relative to the *current* anchor line, which moves with
+    /// `insert_enter_col` (see there for when).
+    pub insert_enter_line: usize,
     /// Line index of a freshly created, still-untouched autoindent-only line
     /// (`:h 'autoindent'`), or `None`. Set when `<CR>`/`o`/`O` create a line
     /// whose only content is the copied indent; cleared by any key other
@@ -3422,6 +4116,21 @@ pub struct Engine {
     pub ext_registry_rx:
         Option<std::sync::mpsc::Receiver<Option<Vec<extensions::ExtensionManifest>>>>,
 
+    // --- Native tool acquisition (#1345) ---
+    /// In-flight background acquisitions (`tool_acquire::acquire_and_install`),
+    /// keyed by the same `install_key` scheme `lsp_installing` uses (e.g.
+    /// `"ext:{ext}:lsp"`, `"dap:{adapter}"`) so an LSP leg and a DAP leg of
+    /// the same `:ExtInstall` can run concurrently without clobbering each
+    /// other — mirrors `async_shell_tasks`'s `HashMap<String, Receiver<_>>`
+    /// pattern (`plugins.rs`).
+    pub(crate) tool_acquire_tasks:
+        HashMap<String, std::sync::mpsc::Receiver<lsp_ops::ToolAcquireOutcome>>,
+    /// Per-extension status-text accumulator for those acquisitions, keyed
+    /// by extension name. Keeps a leg that finishes in a *later* tick from
+    /// erasing the status text of one that finished earlier — see
+    /// `lsp_ops::ToolAcquireGroup`.
+    pub(crate) tool_acquire_groups: HashMap<String, lsp_ops::ToolAcquireGroup>,
+
     // --- Extensions sidebar state ---
     /// quadraui SidebarSystem — owns extensions sidebar (2 sections:
     /// Installed, Available) selection, scroll, keyboard nav, and mouse
@@ -3457,6 +4166,83 @@ pub struct Engine {
     /// `Some(path)` for a single file, `Some("")` for discard-all.
     pub pending_sc_discard: Option<String>,
 
+    // --- Board panel state (#521) ---
+    //
+    // Generic host for the shared `quadraui::Board` component — sourced from
+    // whatever provider an extension declares via the #522 seam
+    // (`ExtensionManifest::board`). No coordinator (or any other specific
+    // provider) vocabulary lives here; see `crate::core::tool_client`'s
+    // module doc.
+    /// Whether the Board panel has keyboard focus.
+    pub board_has_focus: bool,
+    /// The last successfully fetched board, or `None` before the first
+    /// fetch completes (or when no provider is configured at all).
+    /// Host-owned thereafter — `Engine::apply_board_action` mutates
+    /// selection/scroll fields on it directly, the same way `BoardApp`
+    /// does in quadraui's own reference example.
+    pub board_model: Option<quadraui::BoardModel>,
+    /// User-facing message from the last failed fetch, if any. Cleared on
+    /// the next successful fetch. `None` with `board_model: None` and a
+    /// configured provider means a fetch is in flight or hasn't started
+    /// yet; `None` with no provider configured is the panel's normal
+    /// "nothing to show" state, not an error.
+    pub board_error: Option<String>,
+    /// True while a background refresh thread is running.
+    pub board_fetching: bool,
+    /// Channel for receiving the background refresh's result.
+    pub board_rx: Option<
+        std::sync::mpsc::Receiver<
+            Result<quadraui::BoardModel, crate::core::tool_client::ToolError>,
+        >,
+    >,
+    /// When the last refresh was *started* (fetch-in-flight or completed) —
+    /// drives the provider's declared `poll_interval_secs` cadence in
+    /// [`Self::tick_board`]. `None` means "never fetched", which always
+    /// counts as due.
+    pub board_last_refresh: Option<std::time::Instant>,
+    /// When the provider's opt-in `tick_command` (#523's "freshness" nudge)
+    /// last ran — drives `BoardProviderConfig::tick_interval_secs`'s
+    /// cadence in `Engine::tick_board_provider_freshness`. Independent of
+    /// `board_last_refresh`: this fires whether or not the Board panel is
+    /// currently visible, gated only on `Settings::board_tick_enabled`.
+    pub board_last_tick: Option<std::time::Instant>,
+    /// Cached layout from the last paint, used for click hit-testing
+    /// (`quadraui::BoardLayout::hit_test`) — the same "paint caches, click
+    /// reads" pattern as `explorer_tree_rect` / `ext_panel_tree_layout`.
+    pub board_layout: std::cell::RefCell<Option<quadraui::BoardLayout>>,
+    /// The [`crate::core::tool_client::ToolClient`] used to run the
+    /// provider's `refresh_command`. Real subprocess by default;
+    /// test-swappable via [`Self::set_board_client_for_test`] so every
+    /// consumer is testable with no provider binary installed anywhere.
+    pub(crate) board_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
+    /// A provider-declared board action awaiting confirmation (#523) — set
+    /// by `Engine::run_board_action_by_name` when the action's `confirm`
+    /// flag is set, consumed by `process_dialog_result`'s
+    /// `"confirm_board_action"` arm.
+    pub pending_board_action: Option<PendingBoardAction>,
+    /// True while a dispatched board action's background subprocess is
+    /// running — `Engine::dispatch_board_action_command` refuses to start a
+    /// second one concurrently (#523: metered actions shouldn't stack).
+    pub board_action_running: bool,
+    /// Channel for receiving a dispatched board action's result: the
+    /// action's display label (captured at dispatch time, so the result
+    /// message reads correctly even if the board refreshes out from under
+    /// it) paired with its raw stdout on success. Polled by
+    /// `Engine::poll_board_action`.
+    pub board_action_rx: Option<std::sync::mpsc::Receiver<board_ops::BoardActionResult>>,
+
+    // --- Provider document buffers (#524, Phase 1) ---
+    //
+    // Author/refine a provider's documents as real markdown buffers —
+    // sourced from whatever provider an extension declares via the #522
+    // seam (`ExtensionManifest::document`). No coordinator vocabulary
+    // lives here; see `crate::core::tool_client`'s module doc.
+    /// The [`crate::core::tool_client::ToolClient`] used to run the
+    /// document provider's read/write/follow-up commands. Real subprocess
+    /// by default; test-swappable via
+    /// [`Self::set_document_client_for_test`].
+    pub(crate) document_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
+
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
     pub settings_has_focus: bool,
@@ -3466,6 +4252,14 @@ pub struct Engine {
     pub settings_scroll_top: usize,
     /// Form scroll/scrollbar controller for the settings panel.
     pub settings_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// Cached content rect from the last render frame — the same rect
+    /// `render_settings_panel` (TUI) / the GTK `PANEL_SETTINGS` arm passed to
+    /// `FormController::render_and_cache`. Hit-testing must reuse this exact
+    /// rect (mirrors `explorer_tree_rect` / `dap_sidebar_body_rect`) rather
+    /// than re-deriving it by hand — see #1238, where a hand-derived
+    /// `y = 2` TUI rect drifted from the real painted origin the moment the
+    /// menu bar (or any other chrome above the sidebar) shifted it.
+    pub settings_form_rect: std::cell::Cell<quadraui::Rect>,
     /// Search/filter query typed in the settings panel.
     pub settings_query: String,
     /// Whether the search input is active (user typing a filter).
@@ -3599,6 +4393,40 @@ pub struct Engine {
     pub ext_panel_help_open: bool,
     /// Extension panel help bindings: panel_name -> [(key, description)]
     pub ext_panel_help_bindings: HashMap<String, Vec<(String, String)>>,
+    /// The `AppShellLayout::sidebar_content_bounds` rect `render_ext_panel`
+    /// was last painted into — i.e. its own `area` parameter, verbatim,
+    /// *before* subtracting the panel's own header/search chrome. #1086:
+    /// originally read by click routing to avoid re-deriving the sidebar
+    /// content's top row from the menu-bar row count by hand — that
+    /// hand-rolled arithmetic never budgeted for `AppShellLayout`'s own
+    /// one-row sidebar header *above* `sidebar_content_bounds`, landing every
+    /// click one row low. #1089/#1236 moved both click and hover routing onto
+    /// `ext_panel_tree_layout` below (a real multi-section panel has no
+    /// single row height for this field's rect to divide by), so this is now
+    /// unread; kept in case a future rung wants "the exact rect that was
+    /// painted" without the tree-layout hit-test machinery. Mirrors
+    /// `explorer_tree_rect` / `dap_sidebar_body_rect`'s "cache what was
+    /// actually painted" pattern.
+    pub ext_panel_content_rect: std::cell::Cell<quadraui::Rect>,
+    /// The `Backend::tree_layout` result for the plugin panel's tree body,
+    /// paired with the body rect (chrome excluded) it was computed
+    /// against — cached by whichever paint arm ran this frame
+    /// (`tui_main::panels::render_ext_panel` or `App::
+    /// paint_sidebar_panel_rung`'s `ext:` arm) so a later click resolves
+    /// against the *exact* geometry that was painted (#1089).
+    ///
+    /// Why not extend `ext_panel_content_rect` + `SidebarBodyGeometry`'s
+    /// uniform-row-height formula instead: GTK/macOS/Win pitch a tree's
+    /// `Decoration::Header` rows at `line_height` and every other row at
+    /// `line_height * 1.4` (`quadraui::TreeStyle::row_height`'s own doc).
+    /// Every real plugin panel has more than one section, so it has no
+    /// single row height a linear formula could hit-test against on those
+    /// backends — only `Backend::tree_layout`'s own per-row bounds (the
+    /// same ones `Backend::draw_tree` painted with) resolve correctly.
+    /// `None` when nothing is currently painted (no live registration, or
+    /// the panel's body has zero height this frame).
+    pub ext_panel_tree_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::TreeViewLayout)>>,
 
     // --- Notifications (background operation progress) ---
     /// Active notifications (spinner/bell indicators in status bar).
@@ -3657,6 +4485,20 @@ pub struct Engine {
     /// Set to true when a file move completes; backends should refresh the explorer tree
     /// and clear this flag.
     pub explorer_needs_refresh: bool,
+
+    /// Platform actions (open a URL, reveal a path in the file manager)
+    /// queued by engine logic for the runner to carry out via the
+    /// runner-owned `backend`'s `PlatformServices` (#1134). `Engine` has no
+    /// `Backend` handle of its own — see `PendingFileDialog` (#572, `app.rs`)
+    /// for the identical reason file dialogs are deferred rather than
+    /// actioned inline. Drained every frame by `App::tick_dispatch` (GTK)
+    /// and `TuiShellApp::tick` (TUI), in FIFO order, via
+    /// `backend.services().open_url_result(..)` /
+    /// `.reveal_in_file_manager(..)`. A `Vec` rather than a single `Option`
+    /// (unlike `PendingFileDialog`) because a single frame can legitimately
+    /// queue more than one — e.g. `Engine::open_plugin_context`'s `for url in
+    /// ctx.open_urls { self.open_url(&url); }` loop.
+    pub pending_platform_actions: Vec<PendingPlatformAction>,
 
     /// Inline rename state for the explorer sidebar.  When `Some`, the
     /// sidebar row matching `path` should render an editable text input
@@ -3779,6 +4621,7 @@ impl Engine {
             wildmenu_items: Vec::new(),
             wildmenu_selected: None,
             wildmenu_original: String::new(),
+            wildmenu_press: 0,
             message: String::new(),
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -3793,8 +4636,10 @@ impl Engine {
             replace_flags: String::new(),
             pending_key: None,
             user_keymaps: Vec::new(),
+            user_abbrevs: Vec::new(),
             keymap_buf: Vec::new(),
             keymap_replaying: false,
+            keymap_buf_deadline: None,
             window_nav_overflow: None,
             activity_bar_focused: false,
             activity_bar_selected: 1,
@@ -3909,6 +4754,7 @@ impl Engine {
             find_replace_options: FindReplaceOptions::default(),
             find_replace_selection_range: None,
             find_replace_visual_end: None,
+            confirm_sub: None,
             workspace_file: None,
             workspace_root: Some(cwd.clone()),
             base_settings: None,
@@ -3972,10 +4818,11 @@ impl Engine {
             tab_nav_history: vec![(GroupId(0), TabId(1))],
             tab_nav_index: 0,
             tab_nav_navigating: false,
-            quickfix_items: Vec::new(),
-            quickfix_selected: 0,
-            quickfix_open: false,
-            quickfix_has_focus: false,
+            quickfix: QuickfixList::default(),
+            quickfix_stack: Vec::new(),
+            quickfix_stack_pos: 0,
+            location_lists: HashMap::new(),
+            qf_panel_windows: HashMap::new(),
             dap_sidebar_has_focus: false,
             picker_open: false,
             picker_source: PickerSource::Files,
@@ -3990,6 +4837,7 @@ impl Engine {
             picker_history: std::collections::HashMap::new(),
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),
+            picker_grep_scope: None,
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
@@ -4030,6 +4878,7 @@ impl Engine {
                 Vec::new(),
             ))),
             menu_bar_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            hamburger_stale_click_guard: false,
             global_status_rect: std::cell::Cell::new(quadraui::Rect::default()),
             command_line_rect: std::cell::Cell::new(quadraui::Rect::default()),
             cmd_sel: std::cell::Cell::new(None),
@@ -4065,6 +4914,26 @@ impl Engine {
             debug_button_pressed: None,
             dap_session_active: false,
             acp_client: None,
+            acp_session_id: None,
+            acp_pending_prompt: None,
+            acp_streaming_turn: None,
+            acp_pending_permission: None,
+            acp_remembered_decisions: HashMap::new(),
+            acp_plan: Vec::new(),
+            acp_available_commands: Vec::new(),
+            acp_command_completion_idx: 0,
+            acp_modes: Vec::new(),
+            acp_current_mode_id: None,
+            acp_usage: None,
+            acp_auth_methods: Vec::new(),
+            acp_authenticated: false,
+            acp_tool_calls: Vec::new(),
+            change_review: None,
+            change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            review_target: None,
+            review_card_id: None,
+            review_comment_target: None,
+            review_findings_serializer: crate::core::review::markdown_findings_serializer,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -4087,7 +4956,7 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
-            dap_sidebar_action_hits: std::cell::RefCell::new(None),
+            dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
             debug_output_scroll: 0,
             debug_output_auto_scroll: true,
             scroll_surfaces: std::cell::RefCell::new(Vec::new()),
@@ -4125,14 +4994,20 @@ impl Engine {
             change_list_pos: 0,
             last_inserted_text: String::new(),
             last_ex_command: None,
+            pending_undojoin: None,
             last_substitute: None,
             last_sub_replacement: String::new(),
             yank_highlight: None,
             bracket_match: None,
+            showmatch_flash: None,
             insert_ctrl_r_pending: false,
             insert_ctrl_g_pending: false,
+            insert_ctrl_k_pending: None,
+            insert_ctrl_x_pending: false,
+            custom_digraphs: HashMap::new(),
             insert_ctrl_o_active: false,
             insert_enter_col: 0,
+            insert_enter_line: 0,
             insert_indent_only_line: None,
             insert_last_key_char: None,
             insert_ctrl_v_pending: false,
@@ -4149,6 +5024,8 @@ impl Engine {
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
+            tool_acquire_tasks: HashMap::new(),
+            tool_acquire_groups: HashMap::new(),
             ext_sidebar_system: {
                 let mut s = quadraui::SidebarSystem::new(vec![
                     quadraui::SidebarSectionDef::new("installed", "INSTALLED"),
@@ -4169,12 +5046,26 @@ impl Engine {
             pending_ext_remove: None,
             pending_git_remote_op: None,
             pending_sc_discard: None,
+            board_has_focus: false,
+            board_model: None,
+            board_error: None,
+            board_fetching: false,
+            board_rx: None,
+            board_last_refresh: None,
+            board_last_tick: None,
+            board_layout: std::cell::RefCell::new(None),
+            board_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
+            pending_board_action: None,
+            board_action_running: false,
+            board_action_rx: None,
+            document_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
             settings_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
                 "settings".to_string(),
             )),
+            settings_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             settings_query: String::new(),
             settings_input_active: false,
             settings_editing: None,
@@ -4224,6 +5115,8 @@ impl Engine {
             ext_panel_focus_pending: None,
             ext_panel_help_open: false,
             ext_panel_help_bindings: HashMap::new(),
+            ext_panel_content_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            ext_panel_tree_layout: std::cell::RefCell::new(None),
             notifications: Vec::new(),
             next_notification_id: 1,
             toasts: Vec::new(),
@@ -4246,72 +5139,32 @@ impl Engine {
             pending_move: None,
             pending_delete: None,
             explorer_needs_refresh: false,
+            pending_platform_actions: Vec::new(),
             explorer_rename: None,
             explorer_new_entry: None,
-            app_shell: {
-                use quadraui::{AppShell, PanelDefinition, WidgetId};
-                AppShell::new(
-                    vec![
-                        PanelDefinition {
-                            id: WidgetId::new("panel:explorer"),
-                            icon: "".to_string(),
-                            tooltip: "Explorer".to_string(),
-                            title: "EXPLORER".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:search"),
-                            icon: "".to_string(),
-                            tooltip: "Search".to_string(),
-                            title: "SEARCH".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:debug"),
-                            icon: "".to_string(),
-                            tooltip: "Run and Debug".to_string(),
-                            title: "RUN AND DEBUG".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:git"),
-                            icon: "".to_string(),
-                            tooltip: "Source Control".to_string(),
-                            title: "SOURCE CONTROL".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:extensions"),
-                            icon: "".to_string(),
-                            tooltip: "Extensions".to_string(),
-                            title: "EXTENSIONS".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("panel:ai"),
-                            icon: "".to_string(),
-                            tooltip: "AI".to_string(),
-                            title: "AI".to_string(),
-                        },
-                        PanelDefinition {
-                            id: WidgetId::new("bottom:settings"),
-                            icon: "".to_string(),
-                            tooltip: "Settings".to_string(),
-                            title: "SETTINGS".to_string(),
-                        },
-                    ],
-                    30.0,
-                )
-            },
+            // #1166: the panel list — order, ids, titles, tooltips — is
+            // built from `sidebar::engine_app_shell_panel_definitions`
+            // rather than a hand-transcribed literal, so this shadow
+            // `AppShell` (which `App::shell_config` reads through
+            // `app_shell.panels()` on every GUI backend) can no longer
+            // silently drift out of order with `sidebar::FIXED_ACTIVITY_PANEL_IDS`
+            // — the same constant `TuiShellApp::build_shell_config` iterates
+            // directly. See that function's doc for the two-sources-of-truth
+            // history this replaces.
+            app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0),
             file_watcher: None,
             file_watcher_rx: None,
             file_watcher_pending: HashSet::new(),
             accelerators: Vec::new(),
             idle_last_file_check: std::time::Instant::now(),
         };
-        let show_sidebar = if engine.settings.autohide_panels {
-            false
-        } else {
-            engine.session.explorer_visible || engine.settings.explorer_visible_on_startup
-        };
-        if !show_sidebar {
-            engine.app_shell.hide_sidebar();
-        }
+        // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
+        // so this only ever needs to *hide* it here — but it's expressed via
+        // the same bidirectional `Engine::sync_app_shell_sidebar_visibility`
+        // every other caller uses (`TuiShellApp::from_engine`, #1117) rather
+        // than a second copy of the `autohide_panels` / `explorer_visible`
+        // derivation, so the formula lives in exactly one place.
+        engine.sync_app_shell_sidebar_visibility();
         engine.init_file_watcher();
         // Register Phase B.2 accelerators (terminal maximize for now).
         engine.register_default_accelerators();
@@ -4321,11 +5174,19 @@ impl Engine {
             engine.menu_bar_visible = true;
         }
         engine.rebuild_user_keymaps();
+        engine.rebuild_user_abbrevs();
         engine.ensure_spell_checker();
         // Sync the syntax-highlighting line-count threshold before any file
         // is opened via restore_session_files / CLI args, so huge buffers
         // skip the expensive initial tree-sitter parse.
         crate::core::buffer_manager::set_syntax_max_lines(engine.settings.syntax_max_lines);
+        // Sync undo-tree settings (#1156) the same way, before any file is
+        // opened: `undolevels` bounds tree growth on every commit,
+        // `undofile`/`undodir` decide whether/where a freshly-opened file's
+        // undo history gets loaded from.
+        crate::core::buffer_manager::set_undo_levels(engine.settings.undolevels);
+        crate::core::undofile::set_enabled(engine.settings.undofile);
+        crate::core::undofile::set_dir(&engine.settings.undodir);
         engine.explorer_rebuild_rows();
         // Record the startup position for `seed_jump_list_if_line_left` —
         // see that function's doc comment (#806).
@@ -4421,6 +5282,17 @@ impl Engine {
     /// - `explorer_needs_refresh` — GTK calls `App::refresh_file_tree`
     /// - SC/explorer periodic auto-refresh — gated on sidebar visibility
     /// - Settings file auto-reload (#376)
+    /// - `post_draw_apply_widths` — paint-time, not idle-time; both backends
+    ///   call it once per tick anyway (see that method's own doc for exactly
+    ///   where — #1165 added the GTK call, which had been missing entirely)
+    /// - `tab_switcher_confirm`'s hold-to-cycle auto-confirm timer — both
+    ///   backends *call* it from `tick` (TUI has since #595, GTK does not —
+    ///   #1165 audit), but neither backend ever arms the deadline it checks
+    ///   (`tab_switcher_cycle`, the only writer, is `#[allow(dead_code)]` and
+    ///   unreachable from either key-dispatch path — #448-C follow-on). Not
+    ///   a tick asymmetry to converge: it is equally dead on both backends
+    ///   today, and wiring the real hold-to-cycle gesture is separate,
+    ///   pre-existing feature work, not part of this method's contract.
     pub fn poll_idle(&mut self) -> bool {
         let mut redraw = false;
         redraw |= self.process_pending_sidebar();
@@ -4436,7 +5308,12 @@ impl Engine {
         redraw |= self.poll_terminal();
         redraw |= self.poll_dap();
         redraw |= self.poll_ext_registry();
+        redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
+        self.tick_board();
+        self.tick_board_provider_freshness();
+        redraw |= self.poll_board();
+        redraw |= self.poll_board_action();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
         redraw |= self.poll_panel_hover();
@@ -4444,6 +5321,7 @@ impl Engine {
         redraw |= self.poll_blame();
         redraw |= self.tick_ai_completion();
         redraw |= self.tick_syntax_debounce();
+        redraw |= self.tick_keymap_timeout();
         self.tick_swap_files();
         self.tick_file_watcher();
         redraw |= self.tick_git_branch();
@@ -4523,7 +5401,6 @@ impl Engine {
 
     /// Mark a notification as done (switches from spinner to bell).
     /// If `new_message` is `Some`, updates the display text.
-    #[allow(dead_code)]
     pub fn notify_done(&mut self, id: u64, new_message: Option<&str>) {
         if let Some(n) = self.notifications.iter_mut().find(|n| n.id == id) {
             n.done = true;
@@ -4592,6 +5469,31 @@ impl Engine {
         body: &str,
         severity: quadraui::ToastSeverity,
     ) -> u64 {
+        self.push_toast_inner(title, body, severity, None, false)
+    }
+
+    /// Push a toast with an action button and no auto-expiry (#1397): the
+    /// offer stays until the user picks the action or dismisses it (×) —
+    /// see `EngineToast::sticky`'s doc for why a 5s auto-expiry is wrong
+    /// for a decision the user might not have looked up from yet.
+    pub fn push_sticky_action_toast(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+        action: ToastActionKind,
+    ) -> u64 {
+        self.push_toast_inner(title, body, severity, Some(action), true)
+    }
+
+    fn push_toast_inner(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+        action: Option<ToastActionKind>,
+        sticky: bool,
+    ) -> u64 {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
         self.toasts.push(EngineToast {
@@ -4600,16 +5502,20 @@ impl Engine {
             body: body.to_string(),
             severity,
             created_at: std::time::Instant::now(),
+            action,
+            sticky,
         });
         id
     }
 
-    /// Drop toasts older than `TOAST_LIFETIME`. Returns true if any were
-    /// removed (so the caller can request a redraw).
+    /// Drop toasts older than `TOAST_LIFETIME`. Sticky toasts (#1397) are
+    /// never auto-dropped here — only an explicit dismiss or action can
+    /// remove them. Returns true if any were removed (so the caller can
+    /// request a redraw).
     pub fn prune_toasts(&mut self) -> bool {
         let before = self.toasts.len();
         self.toasts
-            .retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
+            .retain(|t| t.sticky || t.created_at.elapsed() < TOAST_LIFETIME);
         self.toasts.len() != before
     }
 
@@ -4624,10 +5530,14 @@ impl Engine {
                 self.dismiss_toast_by_widget(&widget_id);
                 true
             }
-            quadraui::ToastHit::Action(_) | quadraui::ToastHit::Body(_) => {
-                // Currently no consumers use action buttons or body
-                // clicks; treat as consumed so the click doesn't leak
-                // through to the editor under the toast.
+            quadraui::ToastHit::Action(widget_id) => {
+                self.run_toast_action(&widget_id);
+                true
+            }
+            quadraui::ToastHit::Body(_) => {
+                // No consumer reacts to a body click; treat as consumed so
+                // the click doesn't leak through to the editor under the
+                // toast.
                 true
             }
             quadraui::ToastHit::Empty => false,
@@ -4641,6 +5551,33 @@ impl Engine {
         let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
         if let Some(id) = target_id {
             self.toasts.retain(|t| t.id != id);
+        }
+    }
+
+    /// Run the semantic action behind an action-button tap. Action button
+    /// widget ids are formatted as `toast-action-{id}` by
+    /// `build_toast_stack`, matching the toast's own `toast-{id}` scheme.
+    /// The toast is removed once its action has run — the offer has been
+    /// answered (#1397).
+    fn run_toast_action(&mut self, widget_id: &quadraui::WidgetId) {
+        let key = widget_id.as_str();
+        let Some(target_id) = key
+            .strip_prefix("toast-action-")
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let Some(toast) = self.toasts.iter().find(|t| t.id == target_id) else {
+            return;
+        };
+        let Some(action) = toast.action.clone() else {
+            return;
+        };
+        self.toasts.retain(|t| t.id != target_id);
+        match action {
+            ToastActionKind::InstallExtension(name) => {
+                self.ext_install_from_registry(&name);
+            }
         }
     }
 
@@ -4814,9 +5751,6 @@ fn is_word_char(ch: char) -> bool {
 }
 
 /// Return the number of visual rows a buffer line of `line_char_len` characters
-/// Returns true if `binary` is found anywhere on the current process PATH.
-/// Walks PATH directories directly (no subprocess) so it works even when
-/// the user's shell aliases or profile scripts are not sourced.
 /// List custom VSCode theme names from `~/.config/vimcode/themes/*.json`.
 fn list_custom_theme_names() -> Vec<String> {
     let mut names = Vec::new();
@@ -4837,41 +5771,42 @@ fn list_custom_theme_names() -> Vec<String> {
     names
 }
 
+/// Returns true if `binary` is found and runnable.
+///
+/// Delegates to [`super::lsp_manager::resolve_command`] — the exact resolver
+/// `LspManager` uses to launch servers — rather than walking `PATH` on its own
+/// (#1344). Before this, install-time checks (this function) and server launch
+/// used two different lookups: this one scanned only the process `PATH`, while
+/// `resolve_command` also probes the Mason bin dir, `~/.local/bin`,
+/// `~/.cargo/bin`, `~/go/bin`, `~/.dotnet/tools`, `~/.npm-global/bin` and the
+/// Homebrew prefixes — directories a desktop-launched vimcode needs because it
+/// doesn't inherit a login shell's `PATH`. The mismatch meant a successful
+/// install into e.g. `~/.local/bin` was reported as "not found on PATH" and the
+/// extensions sidebar kept re-offering an install for a tool that was already
+/// present. One shared function means install checks, install finalization,
+/// and server launch always agree on where a tool lives.
 fn binary_on_path(binary: &str) -> bool {
-    let path_var = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path_var) {
-        let full = dir.join(binary);
-        if full.exists() {
-            if !super::lsp_manager::cargo_bin_probe_ok(&full, binary) {
-                continue;
-            }
+    match super::lsp_manager::resolve_command(binary) {
+        Some(path) => {
             super::lsp_manager::install_log(&format!(
                 "[ext-check] FOUND {binary} at {}",
-                full.display()
+                path.display()
             ));
-            return true;
+            true
         }
-        // On Windows, also check with .exe suffix
-        #[cfg(target_os = "windows")]
-        if !binary.ends_with(".exe") {
-            let exe = dir.join(format!("{binary}.exe"));
-            if exe.exists() {
-                if !super::lsp_manager::cargo_bin_probe_ok(&exe, binary) {
-                    continue;
-                }
-                super::lsp_manager::install_log(&format!(
-                    "[ext-check] FOUND {binary}.exe at {}",
-                    exe.display()
-                ));
-                return true;
-            }
+        None => {
+            // Names every probed directory (not just `PATH`, unlike the
+            // pre-#1344 log line) since `resolve_command` now spans the
+            // Mason bin dir, `~/.local/bin`, and friends too — a bare
+            // "NOT FOUND {binary}" would otherwise regress the diagnostic
+            // detail this line used to carry.
+            super::lsp_manager::install_log(&format!(
+                "[ext-check] NOT FOUND {binary} — looked in {}",
+                super::lsp_manager::probed_tool_dirs_description(binary)
+            ));
+            false
         }
     }
-    super::lsp_manager::install_log(&format!(
-        "[ext-check] NOT FOUND {binary} in PATH={}",
-        path_var.to_string_lossy()
-    ));
-    false
 }
 
 // ── Auto-pair helpers ────────────────────────────────────────────────────────
@@ -5129,9 +6064,17 @@ pub(crate) fn diff_state_from_hunks(
 
 mod accessors;
 mod acp_ops;
+mod board_ops;
+/// Re-exported so the GTK black-box harness's board test can share the one
+/// deadline-bounded wait for a backgrounded provider command instead of
+/// growing its own (flaky) copy.
+#[cfg(test)]
+pub(crate) use board_ops::wait_for_provider_command;
 mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
+mod digraph_ops;
+mod document_ops;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;
@@ -5145,6 +6088,10 @@ mod picker;
 mod plugins;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
+mod review_comment_ops;
+pub use review_comment_ops::ReviewCommentTarget;
+mod review_ops;
+mod review_verdict_ops;
 pub mod sidebar;
 mod source_control;
 pub use source_control::ScKeyResult;
@@ -5154,7 +6101,11 @@ pub use source_control::{
     SC_SECTION_WORKTREES,
 };
 mod spell_ops;
-mod terminal_ops;
+// `pub(crate)` (rather than plain `mod`) so black-box tests outside `engine`
+// (`src/tui_main/shell_app.rs`) can reach `terminal_ops::install_exit_code_path`
+// to set up a stale leftover scratch file for the #1396 review's
+// invalidate-on-new-run regression test.
+pub(crate) mod terminal_ops;
 mod visual;
 mod vscode;
 mod windows;

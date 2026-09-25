@@ -4,10 +4,12 @@ Load this file when the work touches quadraui — migrations, new primitives, cr
 
 ## Working with the quadraui dep
 
-vimcode's `quadraui` dep is a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }` — and `[patch.crates-io] vt100` is pinned the same way, to the same rev. There is no publish step; `Cargo.lock` records the fully-resolved 40-char SHA for both, which is the authoritative answer to "which quadraui?".
+vimcode's `quadraui` dep is a **git dependency pinned to a `rev`** in `Cargo.toml` — `quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "<sha>", ... }`. There is no publish step; `Cargo.lock` records the fully-resolved 40-char SHA, which is the authoritative answer to "which quadraui?".
+
+> **Corrected 2026-09-19 (#1168): there is no longer a `[patch.crates-io] vt100` entry.** This guide used to say vt100 was pinned the same way, to the same rev, and that the two "must always match". That stopped being true once quadraui#795 dropped the vendored shim; `Cargo.toml` now carries only a comment recording why the patch used to be there. **There is exactly one rev to bump.**
 
 - **Build against the pin (default):** just `cargo build` — Cargo clones the pinned rev into `~/.cargo/git/` itself. `~/src/quadraui` is irrelevant to a normal build.
-- **Bump the pin:** edit the `rev = "..."` in `Cargo.toml` (both the `quadraui` dependency and the `[patch.crates-io] vt100` entry — they must always match), then run `cargo test` so `Cargo.lock` updates and any rendering/behaviour change lands as part of the same reviewable commit. `cargo update -p quadraui` alone will **not** move a rev-pinned git dep — the manifest edit is the bump.
+- **Bump the pin:** edit the single `rev = "..."` on the `quadraui` dependency in `Cargo.toml`, then run `cargo test` so `Cargo.lock` updates and any rendering/behaviour change lands as part of the same reviewable commit. `cargo update -p quadraui` alone will **not** move a rev-pinned git dep — the manifest edit is the bump. *(There is no second entry to keep in sync — see the note above.)*
 - **Co-develop / test a quadraui branch:** copy `cargo-config-local-quadraui.toml.example` to `.cargo/config.toml` (git-ignored). Cargo's `paths` override redirects the build to your local `~/src/quadraui` checkout by package name, regardless of what rev is pinned or what commit the checkout is on. Delete `.cargo/config.toml` to go back to the pinned rev. Never leave it in place for a `cargo test` run whose result you intend to trust — an off-pin diff still looks exactly like a real regression.
 - **Which quadraui is this binary?** `vcd --version` / `vimcode --version` print the resolved rev (`src/quadraui_pin.rs`, sourced from `Cargo.lock` by `build.rs`).
 - **Branching model:** same as vimcode (`develop` = integration, `main` = release-only).

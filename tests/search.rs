@@ -352,19 +352,35 @@ fn test_invalid_pattern_is_rejected_not_matched_literally() {
     // #801 acceptance: a pattern the engine cannot translate must produce an
     // error, never a silent fall-back to literal matching.
     //
-    // #1004 moved back-references out of the untranslatable set (they now
-    // compile via `fancy_regex` — see the two tests below), so this uses
-    // look-around, which stays genuinely unsupported. The buffer contains the
-    // pattern verbatim, so a literal fall-back *would* find a match here.
-    let mut e = engine_with("a foo\\@= b\n");
-    search_fwd(&mut e, "foo\\@=");
+    // The untranslatable set keeps shrinking, so this test has to keep moving
+    // to an atom that is still in it: #1004 took back-references out (they
+    // compile via `fancy_regex`), and #1157 took look-around out for the same
+    // reason. `\&` (branch concat) stays — neither `regex` nor `fancy_regex`
+    // exposes a "match this branch but report the last one" primitive. The
+    // buffer contains the pattern verbatim, so a literal fall-back *would*
+    // find a match here.
+    let mut e = engine_with("a foo\\&f b\n");
+    search_fwd(&mut e, "foo\\&f");
     assert!(
-        e.message.contains("look-around"),
+        e.message.contains("branch concat"),
         "expected a rejection message, got {:?}",
         e.message
     );
     // The cursor did not move to a bogus "literal" match.
     assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_lookaround_pattern_is_no_longer_rejected() {
+    // #1157: the counterpart to the test above — look-around used to be in
+    // the untranslatable set, and now compiles via `fancy_regex`. `\@=` is
+    // zero-width, so `/foo\(bar\)\@=` lands on the 'f' of the "foo" that is
+    // followed by "bar" and nowhere else. Searching from col 0 skips the
+    // match under the cursor, so the qualifying "foo" here is the second one.
+    let mut e = engine_with("foobaz x foobar\n");
+    search_fwd(&mut e, "foo\\(bar\\)\\@=");
+    assert_eq!(e.message, "match 1 of 1");
+    assert_cursor(&e, 0, 9);
 }
 
 #[test]
@@ -405,14 +421,175 @@ fn test_substitute_with_pattern_backreference() {
 }
 
 #[test]
-fn test_substitute_confirm_flag_is_rejected_not_silently_dropped() {
+fn test_substitute_confirm_flag_prompts_before_touching_the_buffer() {
+    // #1031 (#801 Phase 2): the `c` flag used to be rejected outright
+    // ("not implemented"). It now opens a confirm prompt — and, critically,
+    // nothing is substituted behind the user's back before they answer.
     let mut e = engine_with("a a\n");
     exec(&mut e, "%s/a/b/gc");
     assert!(
-        e.message.contains("confirm"),
-        "expected the c flag to be rejected, got {:?}",
+        e.message
+            .contains("replace with b? (y)es/(n)o/(a)ll/(q)uit/(l)ast"),
+        "expected the :s_c prompt, got {:?}",
         e.message
     );
-    // Nothing was substituted behind the user's back.
     assert_eq!(buf(&e).trim_end(), "a a");
+    // The prompt parks the cursor on the pending match, not the line's
+    // first non-blank.
+    assert_cursor(&e, 0, 0);
+}
+
+#[test]
+fn test_substitute_confirm_y_and_n_replace_only_the_confirmed_matches() {
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    // y on the first match — applied immediately (see the dedicated
+    // mid-loop test below for proof it doesn't wait for the loop to end).
+    press(&mut e, 'y');
+    // n skips the second, y takes the third.
+    press(&mut e, 'n');
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b a b");
+    // Prompt is gone and a report replaced it.
+    assert!(
+        !e.message.contains("replace with"),
+        "prompt should be dismissed, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn test_substitute_confirm_y_applies_immediately_not_at_loop_end() {
+    // #1031 review (blocking): the confirm loop used to only fold each
+    // answer into an in-memory string, splicing every confirmed match into
+    // the real buffer in one shot only once the *whole* loop ended (`a`,
+    // `q`/`<Esc>`, or running off the end). That's backwards from the
+    // entire point of an interactive confirm prompt: real Vim/Neovim
+    // applies (and paints) each confirmed match right away, so the user
+    // watches it change before deciding on the next one. A test that only
+    // checks the buffer after the loop finishes can't tell "applied
+    // per-answer" from "applied all at once at the end" — this one asserts
+    // on the buffer *mid-loop*, between individual answers.
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    assert_eq!(
+        buf(&e).trim_end(),
+        "a a a",
+        "nothing is substituted before the first answer"
+    );
+    press(&mut e, 'y');
+    assert_eq!(
+        buf(&e).trim_end(),
+        "b a a",
+        "the confirmed match must already be visible in the buffer right \
+         after 'y', while the other two candidates are still pending"
+    );
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b b a");
+    press(&mut e, 'n');
+    assert_eq!(buf(&e).trim_end(), "b b a", "'n' must not touch the buffer");
+}
+
+#[test]
+fn test_substitute_confirm_next_prompt_cursor_tracks_earlier_length_change() {
+    // #1031 review: every candidate's position is precomputed once against
+    // the *original*, unmodified buffer text, but each confirmed answer is
+    // now spliced into the live buffer immediately (previous test). A
+    // replacement that's a different length than what it replaced shifts
+    // every later match's actual position in the live buffer -- the next
+    // prompt must land on the real match, not on the original (now-stale)
+    // column.
+    let mut e = engine_with("aa aa\n");
+    exec(&mut e, "%s/aa/bbbb/gc");
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "bbbb aa");
+    // The first match's replacement grew the line by 2 chars ("aa" ->
+    // "bbbb"), so the second "aa" -- originally at column 3 -- now lives at
+    // column 5.
+    assert_cursor(&e, 0, 5);
+    assert!(
+        e.message.contains("replace with bbbb?"),
+        "expected the prompt for the second match, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn test_substitute_confirm_loop_undoes_as_a_single_step() {
+    // #1031 review: applying each answer live (instead of one combined
+    // splice at the end) must not turn `:s///gc` into several separate
+    // undo steps -- `u` still undoes the whole confirm loop's worth of
+    // confirmed substitutions at once, exactly like a plain `:s///g` would.
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'y');
+    press(&mut e, 'y');
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b b b");
+    press(&mut e, 'u');
+    assert_eq!(
+        buf(&e).trim_end(),
+        "a a a",
+        "a single 'u' must undo every confirmed match from the loop, not \
+         just the last one"
+    );
+}
+
+#[test]
+fn test_substitute_confirm_a_replaces_the_rest_and_q_stops() {
+    // `a` answers "all remaining".
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'n');
+    press(&mut e, 'a');
+    assert_eq!(buf(&e).trim_end(), "a b b");
+
+    // `q` quits, keeping only what was already confirmed.
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'y');
+    press(&mut e, 'q');
+    assert_eq!(buf(&e).trim_end(), "b a a");
+}
+
+#[test]
+fn test_substitute_confirm_ctrl_c_quits_like_escape() {
+    // #1031 review (non-blocking): `<C-c>`/`<C-[>` aren't in `:h :s_c`'s
+    // documented answer set, but they're the same "get me out of here"
+    // aliases for `<Esc>` this codebase already recognizes in Insert mode
+    // (#804) -- a stuck confirm prompt should quit on them too, not
+    // silently re-prompt the same candidate forever.
+    let mut e = engine_with("a a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'y');
+    ctrl(&mut e, 'c');
+    assert_eq!(
+        buf(&e).trim_end(),
+        "b a a",
+        "<C-c> must quit the loop, keeping only what was already confirmed"
+    );
+    assert!(
+        !e.message.contains("replace with"),
+        "prompt should be dismissed after <C-c>, got {:?}",
+        e.message
+    );
+}
+
+#[test]
+fn test_substitute_confirm_prompt_swallows_normal_mode_keys() {
+    // While the prompt is up, an unrelated key must not fall through to
+    // Normal mode and edit the buffer — it re-prompts the same candidate.
+    let mut e = engine_with("a a\n");
+    exec(&mut e, "%s/a/b/gc");
+    press(&mut e, 'x');
+    assert_eq!(buf(&e).trim_end(), "a a");
+    assert!(
+        e.message.contains("replace with b?"),
+        "expected the prompt to persist, got {:?}",
+        e.message
+    );
+    // The loop is still live: y still answers the first match.
+    press(&mut e, 'y');
+    press(&mut e, 'y');
+    assert_eq!(buf(&e).trim_end(), "b b");
 }

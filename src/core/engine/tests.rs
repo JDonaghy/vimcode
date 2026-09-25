@@ -123,6 +123,95 @@ fn test_insert_tab() {
 }
 
 #[test]
+fn test_ex_startinsert_enters_insert_mode_at_cursor_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 1;
+
+    engine.execute_command("startinsert");
+
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.col, 1);
+    for ch in "XY".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.buffer().to_string(), "aXYbc");
+}
+
+#[test]
+fn test_ex_startinsert_bang_appends_at_end_of_line_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0;
+
+    engine.execute_command("startinsert!");
+
+    assert_eq!(engine.mode, Mode::Insert);
+    assert_eq!(engine.view().cursor.col, 3);
+    press_char(&mut engine, 'Z');
+    assert_eq!(engine.buffer().to_string(), "abcZ");
+}
+
+/// #1154 review: `:startinsert` (no bang) must call `start_undo_group`
+/// *before* `clamp_cursor_col`, exactly like plain `i` does (`keys.rs`'s
+/// `#1003` comment) — not after, which is what the bang form (mirroring
+/// `A`, `#886`) correctly does. `start_undo_group` snapshots the pre-clamp
+/// cursor as `u`'s restore point, so getting the order backwards would only
+/// show up in the narrow edge case `clamp_cursor_col` exists for: the cursor
+/// sitting one column past end-of-line while nominally in Normal mode.
+/// Constructs that exact edge case by hand (`cursor.col = 2` on a 2-char
+/// line) and asserts `:startinsert` produces the identical post-`u` cursor
+/// and buffer as pressing `i` does from the same starting state.
+#[test]
+fn test_ex_startinsert_undo_restores_same_cursor_as_i_key_1154() {
+    fn make() -> Engine {
+        let mut engine = Engine::new();
+        engine.buffer_mut().insert(0, "ab");
+        engine.update_syntax();
+        engine.view_mut().cursor.col = 2; // one past 'b' — the #1003 edge case
+        engine
+    }
+
+    let mut via_i = make();
+    press_char(&mut via_i, 'i');
+    press_char(&mut via_i, 'X');
+    press_special(&mut via_i, "Escape");
+    press_char(&mut via_i, 'u');
+
+    let mut via_startinsert = make();
+    via_startinsert.execute_command("startinsert");
+    press_char(&mut via_startinsert, 'X');
+    press_special(&mut via_startinsert, "Escape");
+    press_char(&mut via_startinsert, 'u');
+
+    assert_eq!(
+        via_i.buffer().to_string(),
+        via_startinsert.buffer().to_string()
+    );
+    assert_eq!(via_i.view().cursor, via_startinsert.view().cursor);
+}
+
+#[test]
+fn test_ex_stopinsert_returns_to_normal_mode_1154() {
+    let mut engine = Engine::new();
+    press_char(&mut engine, 'i');
+    for ch in "hi".chars() {
+        press_char(&mut engine, ch);
+    }
+    assert_eq!(engine.mode, Mode::Insert);
+
+    engine.execute_command("stopinsert");
+
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.buffer().to_string(), "hi");
+    // ':stopinsert' on an already-Normal-mode engine is a no-op, not an error.
+    engine.execute_command("stopinsert");
+    assert_eq!(engine.mode, Mode::Normal);
+}
+
+#[test]
 fn test_backspace_joins_lines() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "AB\nCD");
@@ -299,6 +388,39 @@ fn test_q_blocks_when_single_buffer_dirty() {
     engine.set_dirty(true);
     type_command(&mut engine, "q");
     assert!(engine.message.contains("No write since last change"));
+}
+
+// #1038: `:q`'s "another window still shows this buffer" check moved into
+// the shared `Engine::buffer_has_other_views` helper (also now used by
+// `handle_tab_bar_click`'s `CloseTab` arm). This pins `:q`'s own behavior
+// unchanged by that extraction: a dirty buffer with a second view open
+// must still close quietly rather than blocking with "No write since last
+// change".
+#[test]
+fn test_q_does_not_block_when_dirty_buffer_has_another_view() {
+    let mut engine = Engine::new();
+    engine.open_editor_group(SplitDirection::Vertical);
+    engine.buffer_mut().insert(0, "dirty");
+    engine.set_dirty(true);
+
+    let groups_before = engine.editor_groups.len();
+    let action = type_command_action(&mut engine, "q");
+    assert_eq!(
+        action,
+        EngineAction::None,
+        "another view of the buffer survives, so `:q` must not block with \
+         \"No write since last change\""
+    );
+    assert!(
+        !engine.message.contains("No write since last change"),
+        "unexpected block message: {}",
+        engine.message
+    );
+    assert_eq!(
+        engine.editor_groups.len(),
+        groups_before - 1,
+        "the closed group should be gone"
+    );
 }
 
 #[test]
@@ -1226,6 +1348,71 @@ fn test_word_forward_does_not_split_on_cyrillic() {
     );
 }
 
+// #1191: `'iskeyword'` is a real input to `w`/`b`/`e`, `*`/`#`, and `iw`/`aw`
+// — before this issue, `:set iskeyword+=-` was flatly rejected
+// ("recognised but not implemented yet"), so these cases could not even be
+// set up, let alone pass: every one of them is red against unfixed
+// `develop`.
+#[test]
+fn test_iskeyword_plus_hyphen_makes_dashed_word_one_word_for_w() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        8,
+        "with iskeyword+=-, 'foo-bar' is one word, so w lands on 'baz'"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_makes_dashed_word_one_word_for_default_w() {
+    // Sanity check that the *default* iskeyword still splits on '-' the
+    // old way, so the case above is really exercising the new option and
+    // not some other change to word motions.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+
+    press_char(&mut engine, 'w');
+    assert_eq!(
+        engine.view().cursor.col,
+        3,
+        "without customizing iskeyword, '-' still splits 'foo' from 'bar'"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_extends_star_word_under_cursor() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar foo-bar");
+
+    let word = engine.word_under_cursor();
+    assert_eq!(
+        word,
+        Some("foo-bar".to_string()),
+        "iskeyword+=- makes '-' a keyword char, so word_under_cursor (which\
+         backs `*`/`#`) returns the whole hyphenated identifier"
+    );
+}
+
+#[test]
+fn test_iskeyword_plus_hyphen_extends_iw_text_object() {
+    let mut engine = Engine::new();
+    engine.settings.parse_set_option("iskeyword+=-").unwrap();
+    engine.buffer_mut().insert(0, "foo-bar baz");
+    engine.view_mut().cursor.col = 5; // inside "bar"
+
+    let obj = engine.find_word_object('i', 5, 1);
+    assert_eq!(
+        obj,
+        Some((0, 7)),
+        "iw should select the whole 'foo-bar' run, not just 'bar'"
+    );
+}
+
 #[test]
 fn test_word_backward_stops_at_cjk_boundary() {
     let mut engine = Engine::new();
@@ -1686,6 +1873,35 @@ fn test_tab_navigation() {
 }
 
 #[test]
+fn test_ex_tabonly_closes_every_other_tab_1154() {
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    // Middle tab (index 1) is active; :tabonly should keep only it.
+    engine.goto_tab(1);
+
+    engine.execute_command("tabonly");
+
+    assert_eq!(engine.active_group().tabs.len(), 1);
+}
+
+#[test]
+fn test_ex_tabfirst_tablast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    engine.new_tab(None);
+    engine.new_tab(None);
+    assert_eq!(engine.active_group().tabs.len(), 3);
+    assert_eq!(engine.active_group().active_tab, 2);
+
+    engine.execute_command("tabfirst");
+    assert_eq!(engine.active_group().active_tab, 0);
+
+    engine.execute_command("tablast");
+    assert_eq!(engine.active_group().active_tab, 2);
+}
+
+#[test]
 fn test_buffer_navigation() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "buffer 1");
@@ -1716,6 +1932,78 @@ fn test_list_buffers() {
 }
 
 #[test]
+fn test_ex_bfirst_blast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    let path2 = std::env::temp_dir().join("vimcode_test_bfirst_blast_2.txt");
+    let path3 = std::env::temp_dir().join("vimcode_test_bfirst_blast_3.txt");
+    std::fs::write(&path2, "two").unwrap();
+    std::fs::write(&path3, "three").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path2));
+    engine.split_window(SplitDirection::Vertical, Some(&path3));
+    let buf3_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, buf3_id);
+
+    engine.execute_command("bfirst");
+    assert_eq!(engine.active_buffer_id(), buf1_id);
+
+    engine.execute_command("blast");
+    assert_eq!(engine.active_buffer_id(), buf3_id);
+
+    let _ = std::fs::remove_file(&path2);
+    let _ = std::fs::remove_file(&path3);
+}
+
+#[test]
+fn test_ex_bwipeout_deletes_buffer_like_bdelete_1154() {
+    let mut engine = Engine::new();
+    let path = std::env::temp_dir().join("vimcode_test_bwipeout.txt");
+    std::fs::write(&path, "wipe me").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path));
+    let target_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, target_id);
+    let num = engine
+        .buffer_manager
+        .list()
+        .iter()
+        .position(|&id| id == target_id)
+        .unwrap()
+        + 1;
+
+    engine.execute_command(&format!("bwipeout {}", num));
+
+    assert!(engine.message.contains("wiped out"));
+    assert!(!engine.buffer_manager.list().contains(&target_id));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn test_ex_bw_abbreviation_wipes_active_buffer_1154() {
+    // ':bw' is the documented minimal abbreviation for ':bwipeout' (EX_ABBREVS
+    // entry) — exercise the abbreviation wiring, not just the canonical
+    // spelling, against the *active* buffer (no explicit N argument).
+    let mut engine = Engine::new();
+    let path = std::env::temp_dir().join("vimcode_test_bw_abbrev.txt");
+    std::fs::write(&path, "wipe me too").unwrap();
+
+    let buf1_id = engine.active_buffer_id();
+    engine.split_window(SplitDirection::Vertical, Some(&path));
+    let target_id = engine.active_buffer_id();
+    assert_ne!(buf1_id, target_id);
+
+    engine.execute_command("bw");
+
+    assert!(engine.message.contains("wiped out"));
+    assert!(!engine.buffer_manager.list().contains(&target_id));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn test_ctrl_w_commands() {
     let mut engine = Engine::new();
 
@@ -1739,6 +2027,158 @@ fn test_ctrl_w_commands() {
     press_ctrl(&mut engine, 'w');
     press_char(&mut engine, 'c');
     assert_eq!(engine.windows.len(), 2);
+}
+
+/// #1162: `CTRL-W W` ("focus previous window", `:h CTRL-W_W`) used to be
+/// aliased to `CTRL-W w` (`'w' | 'W' => self.focus_next_window()` in
+/// `execute_wincmd`) — pressing it cycled *forward* like `w`, same as
+/// pressing `w` twice, instead of cycling back to where `w` started.
+/// RED against the pre-fix alias: with only two windows, `w` then `w` again
+/// (what the bug made `W` do) lands back on the *same* window `w` started
+/// from, which happens to equal the correct `W` answer here — so this uses
+/// three windows, where forward-twice and backward-once land on different
+/// windows, to actually distinguish the two.
+#[test]
+fn test_ctrl_w_shift_w_cycles_backward_1162() {
+    let mut engine = Engine::new();
+    let w0 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w1 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w2 = engine.active_window_id();
+    assert_eq!(engine.windows.len(), 3);
+    assert_ne!(w0, w1);
+    assert_ne!(w1, w2);
+
+    // Layout order (most-recently-split-first): w2, w1, w0. `W` from w2
+    // must cycle *backward* to w0, not forward to w1.
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'W');
+    assert_eq!(
+        engine.active_window_id(),
+        w0,
+        "CTRL-W W must cycle backward, landing on the window before the current one"
+    );
+}
+
+/// #1162: `CTRL-W t`/`CTRL-W b` ("go to top-left"/"bottom-right window",
+/// `:h CTRL-W_t`/`:h CTRL-W_b`) used to walk `self.group_layout` — the
+/// VSCode-style editor-group tree — which is a no-op whenever there is a
+/// single editor group, the common case a plain `<C-w>s`/`<C-w>v` split
+/// lives in. RED against the pre-fix version: focus never left the
+/// most-recently-split window (`group_layout` is a single leaf, so `t`/`b`
+/// always "went to" the already-active group).
+#[test]
+fn test_ctrl_w_t_and_b_use_the_window_layout_1162() {
+    let mut engine = Engine::new();
+    let w0 = engine.active_window_id();
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let w1 = engine.active_window_id();
+    assert_ne!(w0, w1);
+    assert_eq!(engine.windows.len(), 2);
+
+    // Layout order (new-first): w1 (top-left), w0 (bottom-right).
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.active_window_id(),
+        w0,
+        "CTRL-W b must go to the bottom-right window in the current tab's layout"
+    );
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 't');
+    assert_eq!(
+        engine.active_window_id(),
+        w1,
+        "CTRL-W t must go to the top-left window in the current tab's layout"
+    );
+}
+
+/// #1162 follow-up: `CTRL-W t`/`b` must descend **both** layout levels.
+///
+/// The first cut of the fix above replaced the old `group_layout` walk with
+/// an active-tab window walk — which fixed the single-group split case but
+/// regressed the multi-group one (`tests/vim_compat_batch2.rs::
+/// test_ctrl_w_t_first_group` went red): focus could no longer leave the
+/// current editor group at all. `Engine::corner_window` now picks the
+/// first/last *group* in `group_layout` order and then the first/last
+/// *window* inside that group's active tab, which is what "the window in
+/// the screen's corner" means when the screen nests a vim split layout
+/// inside each VSCode-style editor group.
+///
+/// RED against the window-layout-only version: both assertions below stay
+/// on the second group, since each group's own tab is walked in isolation.
+#[test]
+fn test_ctrl_w_t_and_b_span_groups_and_windows_1162() {
+    use crate::core::window::SplitDirection;
+
+    let mut engine = Engine::new();
+    let g0 = engine.active_group;
+    // Group 0: two windows (`<C-w>s`), new-first layout order.
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let g0_first = engine.active_tab().window_ids()[0];
+
+    // Group 1: its own tab, split into two windows as well.
+    engine.open_editor_group(SplitDirection::Vertical);
+    let g1 = engine.active_group;
+    assert_ne!(g0, g1);
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 's');
+    let g1_last = *engine.active_tab().window_ids().last().unwrap();
+
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 't');
+    assert_eq!(
+        engine.active_group, g0,
+        "CTRL-W t must cross back into the first editor group"
+    );
+    assert_eq!(
+        engine.active_window_id(),
+        g0_first,
+        "CTRL-W t must land on the first group's own top-left window"
+    );
+
+    press_ctrl(&mut engine, 'w');
+    press_char(&mut engine, 'b');
+    assert_eq!(
+        engine.active_group, g1,
+        "CTRL-W b must cross into the last editor group"
+    );
+    assert_eq!(
+        engine.active_window_id(),
+        g1_last,
+        "CTRL-W b must land on the last group's own bottom-right window"
+    );
+}
+
+#[test]
+fn test_ex_hide_closes_window_without_dirty_check_1154() {
+    let mut engine = Engine::new();
+    engine.split_window(SplitDirection::Horizontal, None);
+    assert_eq!(engine.windows.len(), 2);
+    // Dirty the buffer in the (about-to-be-hidden) active window — unlike
+    // :quit, :hide must never complain about unsaved changes because the
+    // buffer stays loaded, just no longer shown here.
+    engine.buffer_mut().insert(0, "unsaved");
+
+    engine.execute_command("hide");
+
+    assert_eq!(engine.windows.len(), 1);
+}
+
+#[test]
+fn test_ex_hide_refuses_to_close_the_last_window_1154() {
+    let mut engine = Engine::new();
+    assert_eq!(engine.windows.len(), 1);
+
+    engine.execute_command("hide");
+
+    assert_eq!(engine.windows.len(), 1);
+    assert!(engine.message.contains("Cannot close last window"));
 }
 
 #[test]
@@ -1957,6 +2397,247 @@ fn test_redo_cleared_on_new_edit() {
     press_ctrl(&mut engine, 'r');
     assert_eq!(engine.buffer().to_string(), "world");
     assert!(engine.message.contains("Already at newest"));
+}
+
+// --- Undo tree tests (#1156) ---
+//
+// Before #1156, `redo_stack`/`undo_timeline` were both cleared/truncated on
+// every new edit, so an edit made after `u` permanently discarded the branch
+// it moved off — `test_redo_cleared_on_new_edit` above locks in that a plain
+// `<C-r>` correctly does *not* resurrect it, but `g-`/`:earlier`/`:undolist`
+// must still be able to reach it. These tests were run against unfixed
+// `develop` (the linear `undo_stack`/`undo_timeline` design) and observed
+// RED — `g-` only walked the single surviving branch, so it never saw the
+// abandoned "hello" state at all.
+
+#[test]
+fn test_g_minus_reaches_branch_abandoned_by_undo_then_edit() {
+    let mut engine = Engine::new();
+
+    // First edit: "hello".
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.buffer().to_string(), "hello");
+
+    // Undo it, then make a *different* edit — the point at which a linear
+    // undo_stack design permanently discards "hello".
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "");
+    send_keys(&mut engine, "iworld<Esc>");
+    assert_eq!(engine.buffer().to_string(), "world");
+
+    // g- walks chronologically across every branch: "world" -> "hello" (the
+    // abandoned branch) -> "" (root). A single g- already crosses into it,
+    // since "hello" was recorded before "world" regardless of which branch
+    // either sits on.
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello",
+        "g- must cross into the branch `u` + a new edit abandoned"
+    );
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(engine.buffer().to_string(), "");
+}
+
+#[test]
+fn test_g_plus_walks_back_across_an_abandoned_branch() {
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+
+    // Two steps back reaches the root; two steps forward must retrace the
+    // same chronological path, landing back on "world".
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '-');
+    assert_eq!(engine.buffer().to_string(), "");
+
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '+');
+    assert_eq!(engine.buffer().to_string(), "hello");
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, '+');
+    assert_eq!(engine.buffer().to_string(), "world");
+}
+
+#[test]
+fn test_ctrl_r_after_branch_switch_follows_the_branch_actually_taken() {
+    // <C-r> is not "the newest thing ever recorded" (that's g+'s job) — it's
+    // "redo whatever *this* undo just undid". After u-ing back past the
+    // branch point, <C-r> must return to "world" (the live branch), not the
+    // earlier, abandoned "hello" branch.
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+    send_keys(&mut engine, "u");
+    assert_eq!(engine.buffer().to_string(), "");
+
+    press_ctrl(&mut engine, 'r');
+    assert_eq!(engine.buffer().to_string(), "world");
+}
+
+#[test]
+fn test_undolist_shows_every_live_branch() {
+    let mut engine = Engine::new();
+    send_keys(&mut engine, "ihello<Esc>");
+    send_keys(&mut engine, "u");
+    send_keys(&mut engine, "iworld<Esc>");
+
+    engine.execute_command("undolist");
+    let lines: Vec<&str> = engine.message.lines().collect();
+    // Header + one row per live node (the abandoned "hello" branch's node
+    // and the current "world" node) — the root, which is never a change in
+    // its own right, is not listed, matching Vim.
+    assert_eq!(
+        lines.len(),
+        3,
+        ":undolist must list both branches, not just the active one: {:?}",
+        lines
+    );
+}
+
+#[test]
+fn test_ex_earlier_later_step_by_count() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abcdef");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x');
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "cdef");
+
+    engine.execute_command("earlier 2");
+    assert_eq!(engine.buffer().to_string(), "abcdef");
+
+    engine.execute_command("later 1");
+    assert_eq!(engine.buffer().to_string(), "bcdef");
+}
+
+#[test]
+fn test_ex_earlier_time_spec_falls_back_to_oldest_state() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+    press_char(&mut engine, 'x');
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    // "1h" ago predates every recorded node, so this falls back to the
+    // oldest live state (the pre-edit buffer).
+    engine.execute_command("earlier 1h");
+    assert_eq!(engine.buffer().to_string(), "abc");
+}
+
+/// #1294 (#1280 follow-up): `:earlier {N}[smhd]` must land on the target
+/// node's `cursor_before` (where *its own* edit started), not `cursor_after`
+/// (where it finished) — same fix, and same reasoning, as `g-`/`g+` got in
+/// #1280. `test_ex_earlier_time_spec_falls_back_to_oldest_state`, just above,
+/// can't catch this: it lands on the root, where `cursor_before ==
+/// cursor_after` by construction (exactly the pitfall #1280's own doc
+/// comment on `older`/`newer` describes for the count-based form's one
+/// pre-#1280 corpus case). This test instead lands on a *non-root* node with
+/// deliberately distinct `cursor_before`/`cursor_after`, so reading the wrong
+/// field produces a visibly wrong column. Verified by hand against a live
+/// `nvim --headless --listen`/`--remote-send` session (not automatable
+/// through this suite's key-replay oracle harness — `:sleep` is
+/// unimplemented in vimcode, and the real bug here needs a genuine wall-clock
+/// gap between two commits): `ihello<Esc>`, a ~2s real pause, then
+/// `0ix<Esc>`, then `:earlier 1s` landed on the `"hello"` node with the
+/// cursor at col 0 (where that edit started), not col 4 (where it finished).
+/// The node timestamps are backdated directly here (rather than a real
+/// `thread::sleep`) so the test is deterministic and fast; see the doc
+/// comment on `UndoTree::at_or_before` for the citation of that live-nvim
+/// session.
+#[test]
+fn test_ex_earlier_time_spec_lands_on_cursor_before_not_after() {
+    let mut engine = Engine::new();
+    // Node 1: cursor_before = col 0 (start of the empty buffer), cursor_after
+    // = col 4 (Esc lands on the trailing "o" of "hello").
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.view().cursor.col, 4);
+    // Node 2: `0` moves the cursor to col 0 *before* the insert group starts,
+    // so this node's own cursor_before/cursor_after are both col 0 — it's
+    // node 1 we're testing the landing on, not this one.
+    send_keys(&mut engine, "0ix<Esc>");
+    assert_eq!(engine.buffer().to_string(), "xhello");
+
+    // Backdate node 1 (the "hello" commit) far into the past, and leave the
+    // root and node 2 at their real (just-now) timestamps. A `1s` cutoff
+    // computed at the `execute_command` call below is only ever a fraction
+    // of a second after this test started, so it excludes the root and node
+    // 2 (both "younger" than the cutoff) and selects node 1 as the newest
+    // node at or before the cutoff — deterministically, with no real sleep.
+    {
+        let bs = engine.active_buffer_state_mut();
+        let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        bs.undo_tree.nodes[1].timestamp = far_past;
+    }
+
+    engine.execute_command("earlier 1s");
+    assert_eq!(engine.buffer().to_string(), "hello");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`:earlier {{N}}s` must land on the target node's cursor_before (where its own edit started), not cursor_after"
+    );
+}
+
+/// #1294: the forward counterpart of the test just above — `:later
+/// {N}[smhd]` must also land on `cursor_before`, not `cursor_after`. Verified
+/// the same way against live `nvim --headless`: from the "hello" node,
+/// `u` back to the root, then `:later 1s` landed back on "hello" with the
+/// cursor at col 0, not col 4.
+#[test]
+fn test_ex_later_time_spec_lands_on_cursor_before_not_after() {
+    let mut engine = Engine::new();
+    // Node 1: cursor_before = col 0, cursor_after = col 4 — same distinct
+    // pair as the `:earlier` test above.
+    send_keys(&mut engine, "ihello<Esc>");
+    assert_eq!(engine.view().cursor.col, 4);
+
+    // Back to the root so `:later` has somewhere to jump forward *to*.
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "");
+
+    // Backdate the root far into the past so a `1s`-ago cutoff excludes it,
+    // leaving node 1 (still at its real, just-now timestamp) as the only
+    // live node at or after the cutoff — deterministically, no real sleep.
+    {
+        let bs = engine.active_buffer_state_mut();
+        let far_past = std::time::SystemTime::now() - std::time::Duration::from_secs(10_000);
+        bs.undo_tree.nodes[0].timestamp = far_past;
+    }
+
+    engine.execute_command("later 1s");
+    assert_eq!(engine.buffer().to_string(), "hello");
+    assert_eq!(
+        engine.view().cursor.col,
+        0,
+        "`:later {{N}}s` must land on the target node's cursor_before (where its own edit started), not cursor_after"
+    );
+}
+
+#[test]
+fn test_undojoin_merges_next_change_into_previous_undo_step() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'x'); // "bc" — its own undo step
+    assert_eq!(engine.buffer().to_string(), "bc");
+
+    engine.execute_command("undojoin");
+    press_char(&mut engine, 'x'); // "c" — fused onto the previous step
+    assert_eq!(engine.buffer().to_string(), "c");
+
+    // A single `u` reverts both x's, since :undojoin fused them.
+    press_char(&mut engine, 'u');
+    assert_eq!(engine.buffer().to_string(), "abc");
 }
 
 #[test]
@@ -6385,6 +7066,89 @@ fn test_mark_multiple_marks() {
 }
 
 #[test]
+fn test_ex_delmarks_removes_named_marks_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+    engine.update_syntax();
+
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, 'j');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'b');
+
+    let buf_id = engine.active_buffer_id();
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+
+    engine.execute_command("delmarks a");
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+
+    // ':delmarks b' clears the last one; bare ':delmarks!' below has
+    // nothing left to prove beyond "doesn't error" at that point, so
+    // re-set 'a' to exercise the bang form meaningfully.
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    engine.execute_command("delmarks!");
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(!engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+}
+
+#[test]
+fn test_ex_delmarks_range_deletes_every_mark_in_range_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc\nd\ne");
+    engine.update_syntax();
+
+    for (i, name) in ['a', 'b', 'c'].iter().enumerate() {
+        engine.view_mut().cursor.line = i;
+        press_char(&mut engine, 'm');
+        press_char(&mut engine, *name);
+    }
+    let buf_id = engine.active_buffer_id();
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'b'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'c'));
+
+    engine.execute_command("delmarks a-c");
+    let marks = engine.marks.get(&buf_id).unwrap();
+    assert!(!marks.contains_key(&'a'));
+    assert!(!marks.contains_key(&'b'));
+    assert!(!marks.contains_key(&'c'));
+}
+
+/// #1154 review nit: real Vim's `E475: Invalid argument` for a malformed
+/// `:delmarks` range — an inverted range (`c-a`) or a range spanning two
+/// different mark categories (`a-C`, lowercase to uppercase) — must be
+/// reported as an error, not silently reinterpreted as three individual
+/// one-character mark names (`c`, `-`, `a`). Neither range endpoint's mark
+/// may be touched when the command errors.
+#[test]
+fn test_ex_delmarks_invalid_range_errors_1154() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a\nb\nc");
+    engine.update_syntax();
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, 'm');
+    press_char(&mut engine, 'c');
+    let buf_id = engine.active_buffer_id();
+
+    let action = engine.execute_command("delmarks c-a");
+    assert!(matches!(action, EngineAction::Error));
+    assert!(engine.message.contains("E475"));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'c'));
+
+    let action = engine.execute_command("delmarks a-C");
+    assert!(matches!(action, EngineAction::Error));
+    assert!(engine.message.contains("E475"));
+    assert!(engine.marks.get(&buf_id).unwrap().contains_key(&'a'));
+}
+
+#[test]
 fn test_mark_overwrite() {
     let mut engine = Engine::new();
     engine.buffer_mut().insert(0, "a\nb\nc");
@@ -10055,7 +10819,97 @@ fn test_jump_list_ctrl_o_reopens_file_when_buffer_swapped_in_place() {
         engine.active_buffer_state().file_path.as_deref(),
         Some(file_a.as_path())
     );
-    assert_eq!(engine.view().cursor.line, 0);
+    // Not line 0: `:e file_b` is itself jump-worthy (#1158), so it records
+    // A's position at the time of the switch -- line 29, where `G` had left
+    // the cursor -- as a *second* entry, on top of the one `G` itself
+    // pushed for line 0. A single Ctrl-O from the live end lands on the
+    // more recent of the two. Verified against real Neovim: `nvim a30.txt
+    // -c 'normal! G' -c 'edit b1.txt'` then `<C-o>` reports `line('.')` ==
+    // 30 (1-indexed), i.e. this engine's 0-indexed line 29.
+    assert_eq!(engine.view().cursor.line, 29);
+}
+
+/// `:split <currently-open-path>` must NOT push a jump entry: real Neovim
+/// records nothing when the file opened into the split is the same file
+/// already active (verified against Neovim v0.12.5: `nvim a.txt -c 'split
+/// a.txt' -c jumps` prints an empty jumplist, vs. `split b.txt` which
+/// records one entry for a.txt). `buffer_manager.open_file` dedups by
+/// canonical path, so `split_window_with_new_first` must gate its
+/// `push_jump_location` call on the resulting buffer actually differing
+/// from the one being left -- not just on `file_path.is_some()`. Fails
+/// against the unfixed code (jump entry pushed for a same-file split): the
+/// jump_list length assertion sees 1 instead of 0.
+#[test]
+fn test_split_same_file_does_not_push_jump_entry() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_split_same_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_split_same.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert!(engine.jump_list.is_empty());
+
+    // Splitting into the *same already-open file* is not jump-worthy.
+    engine.split_window(SplitDirection::Vertical, Some(&file_a));
+    assert!(
+        engine.jump_list.is_empty(),
+        "split into the currently-open file must not record a jump entry, got {:?}",
+        engine.jump_list
+    );
+
+    // Contrast: splitting into a genuinely different file IS jump-worthy.
+    let file_b = dir.join("file_b_split_same.txt");
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+    engine.split_window(SplitDirection::Vertical, Some(&file_b));
+    assert_eq!(
+        engine.jump_list.len(),
+        1,
+        "split into a different file must record exactly one jump entry"
+    );
+}
+
+/// Same as `test_split_same_file_does_not_push_jump_entry`, but for
+/// `:tabnew <currently-open-path>` / `new_tab`. Verified against real
+/// Neovim v0.12.5: `nvim a.txt -c 'tabnew a.txt' -c jumps` prints an empty
+/// jumplist. Fails against the unfixed code, which pushed a jump entry
+/// whenever `file_path.is_some()` regardless of whether the new tab's
+/// buffer was actually different from the one being left.
+#[test]
+fn test_new_tab_same_file_does_not_push_jump_entry() {
+    let dir = std::env::temp_dir().join("vimcode_jumplist_tab_same_file");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a_tab_same.txt");
+    let content_a: String = (0..30).map(|i| format!("AAA line {}\n", i)).collect();
+    std::fs::write(&file_a, &content_a).unwrap();
+
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert!(engine.jump_list.is_empty());
+
+    // Opening a new tab on the *same already-open file* is not jump-worthy.
+    engine.new_tab(Some(&file_a));
+    assert!(
+        engine.jump_list.is_empty(),
+        "tabnew into the currently-open file must not record a jump entry, got {:?}",
+        engine.jump_list
+    );
+
+    // Contrast: opening a new tab on a genuinely different file IS
+    // jump-worthy.
+    let file_b = dir.join("file_b_tab_same.txt");
+    std::fs::write(&file_b, "BBB only line\n").unwrap();
+    engine.new_tab(Some(&file_b));
+    assert_eq!(
+        engine.jump_list.len(),
+        1,
+        "tabnew into a different file must record exactly one jump entry"
+    );
 }
 
 /// Closing a tab that appears in the jumplist must not resurrect it: the
@@ -10113,43 +10967,122 @@ fn test_jump_list_prunes_entry_on_tab_close() {
     );
 }
 
-/// `:jumps` must reflect the widened entries: a `tab` column showing the
-/// still-alive pane's `TabId`, or `x` once that pane has been closed.
+/// `:jumps` must match Neovim's real columns (#1301): no vimcode-invented
+/// `tab` column, and a `file/text` column previewing the target line's text
+/// when the jump is within the *current* buffer, or the file path when it's
+/// a different buffer (confirmed against a live oracle).
 #[test]
-fn test_ex_jumps_shows_tab_identity() {
-    let mut engine = Engine::new();
-    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
-    press_char(&mut engine, 'G');
-    let tab_a_id = engine.active_tab().id;
+fn test_ex_jumps_drops_tab_column_and_shows_file_text_preview() {
+    let dir = std::env::temp_dir().join("vimcode_jumps_file_text_preview");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("file_a.txt");
+    std::fs::write(&file_a, "one\ntwo\nthree\n").unwrap();
+    let file_b = dir.join("file_b.txt");
+    std::fs::write(&file_b, "four\nfive\nsix\n").unwrap();
 
-    engine.new_tab(None);
-    engine.buffer_mut().insert(0, "four\nfive\nsix\n");
-    press_char(&mut engine, 'G');
+    let mut engine = Engine::new();
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    press_char(&mut engine, 'G'); // pushes (file_a, line 0) onto the jumplist
+
+    engine.new_tab(Some(&file_b)); // switching buffer is jump-worthy too
+    press_char(&mut engine, 'G'); // cursor now on "six" (file_b's last line)
+    press_char(&mut engine, 'g');
+    press_char(&mut engine, 'g'); // gg pushes (file_b, "six") onto the jumplist
 
     engine.execute_command("jumps");
+    let header = engine.message.lines().next().unwrap();
     assert!(
-        engine.message.contains(&format!("{}", tab_a_id.0)),
-        ":jumps should list tab A's TabId while it's alive; message:\n{}",
+        !header.contains("tab"),
+        ":jumps header must not contain vimcode's invented tab column; message:\n{}",
         engine.message
     );
-
-    // A pane that's gone (normally pruned away entirely on close — see
-    // `test_jump_list_prunes_entry_on_tab_close`) must still render safely
-    // as "x" rather than crashing or claiming a dead pane is reachable.
-    // Fabricate one directly to pin down that defensive display path.
-    engine.jump_list.push(JumpEntry {
-        file: None,
-        line: 0,
-        col: 0,
-        group_id: GroupId(9999),
-        tab_id: TabId(9999),
-        window_id: WindowId(9999),
-    });
-    engine.execute_command("jumps");
     assert!(
-        engine.message.contains(" x  "),
-        ":jumps should mark an unreachable pane's entry as dead; message:\n{}",
+        engine.message.contains("file_a.txt"),
+        ":jumps should preview a cross-buffer entry with its file name; message:\n{}",
         engine.message
+    );
+    assert!(
+        engine.message.contains("six"),
+        ":jumps should preview a same-buffer entry with the target line's text; message:\n{}",
+        engine.message
+    );
+}
+
+/// `:changes` must match Neovim's real columns and numbering (#1303): a
+/// `text` column previewing the changed line, the change number counting
+/// *distance from the current position* in the list (not the raw 0-based
+/// index — `i.abs_diff(change_list_pos)`, same as `:jumps`' relative
+/// numbering), and the current-entry marker (`>`) landing on the entry at
+/// `change_list_pos` rather than always trailing the list (confirmed
+/// against a live oracle).
+#[test]
+fn test_ex_changes_shows_text_column_and_relative_numbering() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+
+    // Two changes on different lines build a real multi-entry list.
+    send_keys(&mut engine, "ceONE<Esc>"); // change_list: [(0, col)]
+    send_keys(&mut engine, "jceTWO<Esc>"); // change_list: [(0, col), (1, col)]
+    assert_eq!(
+        engine.change_list.len(),
+        2,
+        "two changes on different lines must both be recorded"
+    );
+
+    engine.execute_command("changes");
+    let header = engine.message.lines().next().unwrap();
+    assert!(
+        header.contains("text"),
+        ":changes header must contain Neovim's `text` column; message:\n{}",
+        engine.message
+    );
+    assert!(
+        engine.message.contains("TWO"),
+        ":changes should preview the changed line's text; message:\n{}",
+        engine.message
+    );
+    // No `g;` has been done since the last change, so `change_list_pos ==
+    // change_list.len()` and Neovim trails the list with a bare `>` line
+    // instead of marking either real entry (confirmed against a live
+    // oracle) — vimcode used to mark the newest real entry instead.
+    let last_line = engine.message.lines().last().unwrap();
+    assert_eq!(
+        last_line, ">",
+        ":changes must trail with a bare `>` line when no g; has been done; message:\n{}",
+        engine.message
+    );
+    let entry_lines: Vec<&str> = engine.message.lines().collect();
+    for line in &entry_lines[1..entry_lines.len() - 1] {
+        assert!(
+            !line.starts_with('>'),
+            "no real entry should carry the marker before any g; navigation; message:\n{}",
+            engine.message
+        );
+    }
+
+    // g; steps back to the newest change — now its row (not the header or a
+    // trailing line) must carry the marker, with change number 0.
+    send_keys(&mut engine, "g;");
+    engine.execute_command("changes");
+    let marked_row = engine
+        .message
+        .lines()
+        .find(|l| l.starts_with('>'))
+        .unwrap_or_else(|| panic!("expected a marked row; message:\n{}", engine.message));
+    assert!(
+        marked_row.contains("TWO"),
+        "the marked row after g; must be the newest change (TWO's line); row: {:?}",
+        marked_row
+    );
+    assert!(
+        marked_row
+            .trim_start_matches('>')
+            .trim_start()
+            .starts_with('0'),
+        "the current entry's change number must be 0 (distance from itself); row: {:?}",
+        marked_row
     );
 }
 
@@ -12396,9 +13329,31 @@ fn test_grep_word_command_no_word() {
     assert!(engine.message.contains("No word"));
 }
 
+// #1282: Neovim's default `'ruler'` is on (`Settings::ruler`'s own doc
+// comment), and with it on CTRL-G omits the cursor position — `:h CTRL-G`,
+// "the cursor position (unless the 'ruler' option is set)" — printing just
+// the line count instead. Two cases, one per setting, so a future change to
+// either branch has to keep both true rather than only the one someone
+// happened to be looking at.
 #[test]
-fn test_ctrl_g_shows_file_info() {
+fn test_ctrl_g_shows_file_info_ruler_on() {
     let mut engine = Engine::new();
+    assert!(engine.settings.ruler, "precondition: ruler defaults on");
+    engine.buffer_mut().insert(0, "hello\nworld\n");
+
+    press_ctrl(&mut engine, 'g');
+
+    assert!(
+        engine.message.contains("2 lines") && !engine.message.contains("col "),
+        "msg: {}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ctrl_g_shows_file_info_ruler_off() {
+    let mut engine = Engine::new();
+    engine.settings.ruler = false;
     engine.buffer_mut().insert(0, "hello\nworld\n");
 
     press_ctrl(&mut engine, 'g');
@@ -12421,82 +13376,431 @@ fn make_qf_item(path: &str) -> ProjectMatch {
     }
 }
 
-#[test]
-fn test_copen_requires_items() {
-    let mut engine = Engine::new();
-    engine.execute_command("copen");
-    assert!(
-        !engine.quickfix_open,
-        "copen should not open with empty list"
-    );
-    assert!(engine.message.contains("empty"));
-}
+// #1283: `test_copen_requires_items` used to live here, asserting `:copen`
+// *refuses* on an empty quickfix list ("copen should not open with empty
+// list" + a message containing "empty"). Both halves were vimcode-only
+// invention: re-probed against a live `nvim --headless -u NONE`, `:copen`
+// on a totally empty list opens the quickfix window unconditionally —
+// `winnr('$')` goes 1 -> 2 with no error and an empty `v:errmsg` — and the
+// global list always exists so there is nothing for it to refuse about.
+// The oracle-true behaviour is asserted by
+// `test_ex_copen_opens_even_on_empty_quickfix_list_1283` below (with
+// `test_ex_cwindow_stays_closed_on_empty_quickfix_list_1283` pinning the
+// contrast against `:cwindow`, which *does* stay closed when empty), so
+// this test is not renamed-in-place but deleted: keeping a second copy of
+// the same claim under the old name would only invite reinstating the old
+// expectation.
 
 #[test]
 fn test_copen_cclose() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![make_qf_item("test.rs")];
+    engine.quickfix.items = vec![make_qf_item("test.rs")];
     engine.execute_command("copen");
-    assert!(engine.quickfix_open);
-    assert!(engine.quickfix_has_focus);
+    assert!(engine.quickfix.open);
+    assert!(engine.quickfix.has_focus);
     engine.execute_command("cclose");
-    assert!(!engine.quickfix_open);
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.open);
+    assert!(!engine.quickfix.has_focus);
+}
+
+/// #1307 review: `:cclose` (or `:copen` again) run from a *different* tab
+/// than the one that owns the quickfix panel window must not corrupt that
+/// other tab's window state. `qf_panel_windows` has no per-tab scoping, so
+/// `qf_close_panel_window` used to always mutate `active_tab_mut()` — the
+/// *currently* active tab, not necessarily the one actually holding the
+/// panel window — leaving the owning tab's `active_window` pointing at a
+/// removed `WindowId`. The very next `Engine::active_window()` call once
+/// that tab becomes active again used to panic.
+///
+/// **Verified RED against unfixed `develop`** (confirmed by hand: reverting
+/// `qf_close_panel_window` to unconditionally use `self.active_tab_mut()`
+/// reproduces the crash below via exactly this `:copen` / `:tabnew` /
+/// `:cclose` / `:tabprevious` sequence — `active_window()`'s explicit `BUG:
+/// active_window ... not in windows map` panic fires on the final call).
+#[test]
+fn test_cclose_from_a_different_tab_does_not_corrupt_owning_tab_1307() {
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![make_qf_item("test.rs")];
+
+    // `:copen` in tab 1 — auto-focuses the new panel window, so tab 1's
+    // `active_window` becomes the panel window's id.
+    engine.execute_command("copen");
+    assert!(engine.quickfix.open);
+    let tab1_idx = engine.active_group().active_tab;
+
+    // Switch to a brand-new tab 2.
+    engine.execute_command("tabnew");
+    assert_ne!(engine.active_group().active_tab, tab1_idx);
+
+    // `:cclose` from tab 2 — must remove the panel window from *tab 1*'s
+    // layout (where it actually lives), not silently no-op against tab 2's
+    // layout and leave tab 1's `active_window` dangling.
+    engine.execute_command("cclose");
+    assert!(!engine.quickfix.open);
+
+    // Switching back to tab 1 and reading its active window must not panic.
+    engine.execute_command("tabprevious");
+    assert_eq!(engine.active_group().active_tab, tab1_idx);
+    let _ = engine.active_window(); // must not panic (#1307 review)
+    assert!(
+        engine.windows.contains_key(&engine.active_window_id()),
+        "tab 1's active_window must resolve to a live window after the \
+         cross-tab :cclose"
+    );
 }
 
 #[test]
 fn test_cn_cp_navigation() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_selected = 0;
-    engine.quickfix_open = true;
+    engine.quickfix.selected = 0;
+    engine.quickfix.open = true;
 
     // cn moves forward
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 1);
+    assert_eq!(engine.quickfix.selected, 1);
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 2);
+    assert_eq!(engine.quickfix.selected, 2);
 
     // cn at end clamps
     engine.execute_command("cn");
-    assert_eq!(engine.quickfix_selected, 2, "cn should clamp at last item");
+    assert_eq!(engine.quickfix.selected, 2, "cn should clamp at last item");
 
     // cp moves back
     engine.execute_command("cp");
-    assert_eq!(engine.quickfix_selected, 1);
+    assert_eq!(engine.quickfix.selected, 1);
 
     // cp at start clamps
     engine.execute_command("cp");
     engine.execute_command("cp");
-    assert_eq!(engine.quickfix_selected, 0, "cp should clamp at first item");
+    assert_eq!(engine.quickfix.selected, 0, "cp should clamp at first item");
 }
 
 #[test]
 fn test_cc_jump() {
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_open = true;
+    engine.quickfix.open = true;
 
     engine.execute_command("cc 2");
     assert_eq!(
-        engine.quickfix_selected, 1,
+        engine.quickfix.selected, 1,
         ":cc 2 should select index 1 (1-based)"
     );
+}
+
+#[test]
+fn test_ex_bare_cc_jumps_to_current_entry_1154() {
+    // #1154: bare `:cc` (no count) was entirely unimplemented — only
+    // `:cc {N}` existed — despite VIM_COMPATIBILITY.md marking `:cc` ✅.
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    engine.quickfix.selected = 1;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
+
+    engine.execute_command("cc");
+
+    // Bare :cc re-jumps to whatever is currently selected, without moving
+    // the selection, and returns focus to the editor.
+    assert_eq!(engine.quickfix.selected, 1);
+    assert!(!engine.quickfix.has_focus);
+}
+
+#[test]
+fn test_ex_cc_on_empty_quickfix_list_errors_1154() {
+    let mut engine = Engine::new();
+    engine.execute_command("cc");
+    // #1283: real Neovim's message is "E42: No Errors" (capital `E` in
+    // `Errors`) — confirmed against a live `nvim --headless -u NONE`. This
+    // assertion used to read `.contains("No errors")` (lowercase), which
+    // passed against vimcode's own wrong casing without ever comparing it to
+    // the oracle; nothing in the buffer/cursor-only `Case` harness that
+    // retired `ex::cc` from `COVERAGE_EXEMPT` looks at `message` at all.
+    assert!(engine.message.contains("No Errors"));
+}
+
+// ─── #1283: quickfix/location-list family (`ex::cn`..`ex::lfdo`, 23 ids) ───
+//
+// See the `tests/nvim_conformance.rs` module doc's "#1283 population seam"
+// section for why every case below drives an *empty* (or, for the location
+// list, altogether absent) list rather than a populated one: no key sequence
+// can populate an identical list on both sides through the shared harness
+// (`:vimgrep` requires real file arguments Neovim errors without, `E683`,
+// while vimcode's `:vimgrep`/`:grep` take no file argument at all and search
+// the whole cwd instead — two incompatible command grammars, not two
+// implementations of the same one). The empty/absent-list refusal and no-op
+// paths below are the real, comparable behaviour that *is* reachable, same
+// precedent as `ex:cc on empty quickfix list` above (#1154).
+
+#[test]
+fn test_ex_cnext_cprevious_on_empty_quickfix_list_error_1283() {
+    // #1283 finding: before this fix, `qf_next`/`qf_prev` had no empty-list
+    // guard at all — `qf_jump` silently declined to move (no item at index 0
+    // of an empty `Vec`), so `:cnext`/`:cprevious` left `engine.message`
+    // untouched instead of setting Neovim's real `E42: No Errors` (confirmed
+    // against a live oracle). The buffer/cursor-only oracle `Case` harness
+    // can't see this gap — cursor position matches either way — which is
+    // exactly why this needs an engine-level pairing.
+    let mut engine = Engine::new();
+    engine.execute_command("cnext");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cnext on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("cprevious");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cprevious on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ex_cfirst_clast_on_empty_quickfix_list_error_1283() {
+    // #1283 review: `ex::cfirst`/`ex::clast` were retired from
+    // `COVERAGE_EXEMPT` on the strength of `Case`s that only assert the
+    // cursor didn't move on an empty quickfix list — a `Case` that passes
+    // identically against a build where these commands don't exist at all
+    // (execute_command's unknown-command fallback also leaves the cursor
+    // untouched). This engine-level pairing closes that gap by asserting on
+    // `engine.message` directly, same precedent as `test_ex_cc_on_empty_
+    // quickfix_list_errors_1154` and `test_ex_cnext_cprevious_on_empty_
+    // quickfix_list_error_1283` above.
+    let mut engine = Engine::new();
+    engine.execute_command("cfirst");
+    assert!(
+        engine.message.contains("No Errors"),
+        "cfirst on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("clast");
+    assert!(
+        engine.message.contains("No Errors"),
+        "clast on an empty quickfix list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ex_lfirst_llast_without_location_list_error_1283() {
+    // #1283 review: same gap as `test_ex_cfirst_clast_on_empty_quickfix_
+    // list_error_1283` above, but for the location-list variants — real
+    // Neovim's message on a window with no location list is "E776: No
+    // location list" (confirmed against a live oracle).
+    let mut engine = Engine::new();
+    engine.execute_command("lfirst");
+    assert!(
+        engine.message.contains("No location list"),
+        "lfirst without a location list should error like Neovim, got {:?}",
+        engine.message
+    );
+
+    engine.message.clear();
+    engine.execute_command("llast");
+    assert!(
+        engine.message.contains("No location list"),
+        "llast without a location list should error like Neovim, got {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_ex_lnext_lprevious_without_location_list_error_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("lnext");
+    assert!(engine.message.contains("No location list"));
+
+    engine.message.clear();
+    engine.execute_command("lprevious");
+    assert!(engine.message.contains("No location list"));
+}
+
+#[test]
+fn test_ex_ll_llist_without_location_list_error_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("ll");
+    assert!(engine.message.contains("No location list"));
+
+    engine.message.clear();
+    engine.execute_command("llist");
+    assert!(engine.message.contains("No location list"));
+}
+
+#[test]
+fn test_ex_clist_on_empty_quickfix_list_errors_1283() {
+    let mut engine = Engine::new();
+    engine.execute_command("clist");
+    assert!(engine.message.contains("No Errors"));
+}
+
+#[test]
+fn test_ex_colder_cnewer_at_stack_ends_error_1283() {
+    // Confirmed against a live oracle: `:colder` on a fresh (empty-history)
+    // quickfix stack is "E380: At bottom of quickfix stack"; `:cnewer` is
+    // "E381: At top of quickfix stack". Neither moves the stack position.
+    let mut engine = Engine::new();
+    engine.execute_command("colder");
+    assert!(engine.message.contains("E380"));
+
+    engine.message.clear();
+    engine.execute_command("cnewer");
+    assert!(engine.message.contains("E381"));
+}
+
+#[test]
+fn test_ex_cdo_cfdo_ldo_lfdo_without_argument_error_1283() {
+    // Confirmed against a live oracle: all four require an argument
+    // ("E471: Argument required: {cmd}") and touch neither list nor buffer
+    // when bare.
+    for cmd in ["cdo", "cfdo", "ldo", "lfdo"] {
+        let mut engine = Engine::new();
+        engine.execute_command(cmd);
+        assert!(
+            engine.message.contains("E471"),
+            "{cmd} with no argument should require one, got {:?}",
+            engine.message
+        );
+    }
+}
+
+#[test]
+fn test_ex_cclose_lclose_are_silent_noops_1283() {
+    // Confirmed against a live oracle: `:cclose`/`:lclose` never error,
+    // window-count or not — real Neovim's are a no-op when nothing is open.
+    let mut engine = Engine::new();
+    engine.message.clear();
+    engine.execute_command("cclose");
+    assert!(engine.message.is_empty());
+
+    engine.execute_command("lclose");
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_copen_opens_even_on_empty_quickfix_list_1283() {
+    // #1283 finding: before this fix, `qf_open` refused (like `qf_get_mut`'s
+    // `entry(..).or_default()` made "no location list" and "empty list"
+    // indistinguishable) whenever the target list had zero items — but real
+    // Neovim's `:copen` opens the quickfix window unconditionally, even
+    // empty (confirmed against a live oracle: `winnr('$')` goes from 1 to 2
+    // with no error). The global list always exists, so `win == None` must
+    // never refuse.
+    let mut engine = Engine::new();
+    assert!(engine.quickfix.items.is_empty());
+    engine.execute_command("copen");
+    assert!(engine.quickfix.open, "copen must open even an empty list");
+    assert!(engine.quickfix.has_focus);
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_lopen_errors_only_when_no_location_list_exists_1283() {
+    // Confirmed against a live oracle: `:lopen` errors `E776: No location
+    // list` only when the window has *never* had one; once a location list
+    // exists — even with zero items (`setloclist(0, [])` on the Neovim side)
+    // — `:lopen` opens it exactly like `:copen`.
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    engine.execute_command("lopen");
+    assert!(
+        engine.message.contains("No location list"),
+        "lopen must refuse when the window has never had a location list"
+    );
+    assert!(engine.qf_get(Some(win)).is_none());
+
+    // Give the window an empty-but-existing location list, the same way
+    // `qf_set_list` would after a zero-match `:lvimgrep`.
+    engine.qf_set_list(Some(win), Vec::new());
+    engine.qf_get_mut(Some(win)).open = false;
+    engine.qf_get_mut(Some(win)).has_focus = false;
+    engine.message.clear();
+
+    engine.execute_command("lopen");
+    assert!(
+        engine.message.is_empty(),
+        "lopen must open an existing-but-empty location list without erroring, got {:?}",
+        engine.message
+    );
+    assert!(engine.qf_get(Some(win)).unwrap().open);
+}
+
+#[test]
+fn test_ex_cwindow_stays_closed_on_empty_quickfix_list_1283() {
+    // Confirmed against a live oracle: `:cwindow` never errors and never
+    // opens when the list is empty — unlike `:copen` above.
+    let mut engine = Engine::new();
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+    assert!(engine.message.is_empty());
+}
+
+#[test]
+fn test_ex_lwindow_errors_only_when_no_location_list_exists_1283() {
+    // #1283 finding: before this fix, `qf_window` never set an error message
+    // at all — `:lwindow` on a window with no location list silently stayed
+    // closed instead of the real `E776: No location list` refusal (confirmed
+    // against a live oracle). Once a location list exists (even empty),
+    // `:lwindow` goes back to its ordinary silent-no-op-when-empty behaviour.
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    engine.execute_command("lwindow");
+    assert!(
+        engine.message.contains("No location list"),
+        "lwindow must refuse when the window has never had a location list"
+    );
+
+    engine.qf_set_list(Some(win), Vec::new());
+    engine.qf_get_mut(Some(win)).open = false;
+    engine.message.clear();
+
+    engine.execute_command("lwindow");
+    assert!(
+        engine.message.is_empty(),
+        "lwindow on an existing-but-empty location list must be a silent no-op, got {:?}",
+        engine.message
+    );
+    assert!(!engine.qf_get(Some(win)).unwrap().open);
+}
+
+#[test]
+fn test_ex_cfirst_clast_jump_to_ends_1154() {
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    engine.quickfix.selected = 1;
+    engine.quickfix.open = true;
+
+    engine.execute_command("clast");
+    assert_eq!(engine.quickfix.selected, 2);
+
+    engine.execute_command("cfirst");
+    assert_eq!(engine.quickfix.selected, 0);
 }
 
 #[test]
 fn test_grep_empty_pattern() {
     let mut engine = Engine::new();
     engine.execute_command("grep ");
-    assert!(engine.quickfix_items.is_empty());
+    assert!(engine.quickfix.items.is_empty());
     assert!(engine.message.contains("Usage"));
 }
 
@@ -12507,7 +13811,7 @@ fn test_grep_no_matches() {
     let mut engine = Engine::new();
     engine.cwd = dir.clone();
     engine.execute_command("grep xyzzy_no_match_anywhere_qf_test");
-    assert_eq!(engine.quickfix_items.len(), 0);
+    assert_eq!(engine.quickfix.items.len(), 0);
     assert!(engine.message.contains("0 match"));
 }
 
@@ -12526,12 +13830,12 @@ fn test_grep_populates_quickfix() {
     engine.execute_command("grep qfmain_unique_marker");
 
     assert!(
-        !engine.quickfix_items.is_empty(),
+        !engine.quickfix.items.is_empty(),
         "grep should find matches"
     );
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
     assert!(
-        engine.quickfix_has_focus,
+        engine.quickfix.has_focus,
         ":grep should focus the quickfix panel so j/k/Enter drive the results"
     );
     assert!(engine.message.contains("match"));
@@ -12552,10 +13856,10 @@ fn test_vimgrep_alias() {
     engine.execute_command("vimgrep vghello_unique_marker");
 
     assert!(
-        !engine.quickfix_items.is_empty(),
+        !engine.quickfix.items.is_empty(),
         "vimgrep should work same as grep"
     );
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
 }
 
 // ─── rename_file / move_file tests ────────────────────────────────────────
@@ -13727,37 +15031,37 @@ fn test_quickfix_j_k_q_work_with_tui_key_encoding() {
     // unlike GTK which sends `key_name="j"`. The quickfix intercept
     // must normalise so j/k/q/n/p behave identically in both backends.
     let mut engine = Engine::new();
-    engine.quickfix_items = vec![
+    engine.quickfix.items = vec![
         make_qf_item("a.rs"),
         make_qf_item("b.rs"),
         make_qf_item("c.rs"),
     ];
-    engine.quickfix_open = true;
-    engine.quickfix_has_focus = true;
-    engine.quickfix_selected = 0;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
+    engine.quickfix.selected = 0;
 
     // j (TUI encoding) → selection advances
     engine.handle_key("", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 1, "j should advance selection");
+    assert_eq!(engine.quickfix.selected, 1, "j should advance selection");
 
     // j again → 2
     engine.handle_key("", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 2);
+    assert_eq!(engine.quickfix.selected, 2);
 
     // k (TUI encoding) → selection retreats
     engine.handle_key("", Some('k'), false);
-    assert_eq!(engine.quickfix_selected, 1, "k should retreat selection");
+    assert_eq!(engine.quickfix.selected, 1, "k should retreat selection");
 
     // GTK encoding of j/k still works (regression guard)
     engine.handle_key("j", Some('j'), false);
-    assert_eq!(engine.quickfix_selected, 2, "GTK-style j still works");
+    assert_eq!(engine.quickfix.selected, 2, "GTK-style j still works");
     engine.handle_key("k", Some('k'), false);
-    assert_eq!(engine.quickfix_selected, 1, "GTK-style k still works");
+    assert_eq!(engine.quickfix.selected, 1, "GTK-style k still works");
 
     // q (TUI encoding) → close panel
     engine.handle_key("", Some('q'), false);
-    assert!(!engine.quickfix_open, "q should close the panel");
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.open, "q should close the panel");
+    assert!(!engine.quickfix.has_focus);
 }
 
 #[test]
@@ -13769,15 +15073,427 @@ fn test_mouse_click_clears_quickfix_focus() {
     engine.update_syntax();
 
     // Simulate a focused quickfix panel.
-    engine.quickfix_open = true;
-    engine.quickfix_has_focus = true;
+    engine.quickfix.open = true;
+    engine.quickfix.has_focus = true;
 
     let wid = engine.active_window_id();
     engine.mouse_click(wid, 0, 3);
 
-    assert!(!engine.quickfix_has_focus);
+    assert!(!engine.quickfix.has_focus);
     // Panel stays open — click only releases focus, it doesn't close.
-    assert!(engine.quickfix_open);
+    assert!(engine.quickfix.open);
+}
+
+// ─── Location list + quickfix completion tests (#1155) ─────────────────────
+
+#[test]
+fn test_lopen_with_no_location_list_errors() {
+    let mut engine = Engine::new();
+    engine.execute_command("lopen");
+    let win = engine.active_window_id();
+    assert!(!engine.location_lists.get(&win).is_some_and(|l| l.open));
+    assert!(engine.message.contains("E776"));
+}
+
+#[test]
+fn test_lopen_lclose_are_per_window_and_independent_of_quickfix() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("loc_a.rs"));
+
+    engine.execute_command("lopen");
+    assert!(engine.location_lists[&win].open);
+    assert!(engine.location_lists[&win].has_focus);
+    // The global quickfix list is untouched.
+    assert!(!engine.quickfix.open);
+    assert!(engine.quickfix.items.is_empty());
+
+    engine.execute_command("lclose");
+    assert!(!engine.location_lists[&win].open);
+    assert!(!engine.location_lists[&win].has_focus);
+}
+
+#[test]
+fn test_location_lists_are_scoped_per_window() {
+    let mut engine = Engine::new();
+    let win_a = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win_a)
+        .or_default()
+        .items
+        .push(make_qf_item("a.rs"));
+
+    engine.split_window(SplitDirection::Vertical, None);
+    let win_b = engine.active_window_id();
+    assert_ne!(win_a, win_b, "split must create a second window");
+
+    // Window B has no location list of its own yet.
+    engine.execute_command("lopen");
+    assert!(engine.message.contains("E776"));
+    assert!(engine.location_lists.get(&win_b).is_none_or(|l| !l.open));
+
+    // Window A's list is untouched by window B's failed :lopen.
+    assert!(!engine.location_lists[&win_a].items.is_empty());
+}
+
+#[test]
+fn test_lnext_lprevious_lfirst_llast_navigate_location_list() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    list.open = true;
+
+    engine.execute_command("lnext");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    engine.execute_command("lnext");
+    assert_eq!(engine.location_lists[&win].selected, 2);
+    engine.execute_command("lnext");
+    assert_eq!(
+        engine.location_lists[&win].selected, 2,
+        "lnext should clamp at the last entry"
+    );
+
+    engine.execute_command("lprevious");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+
+    engine.execute_command("lfirst");
+    assert_eq!(engine.location_lists[&win].selected, 0);
+    engine.execute_command("llast");
+    assert_eq!(engine.location_lists[&win].selected, 2);
+
+    // The global quickfix list never moved.
+    assert!(engine.quickfix.items.is_empty());
+}
+
+#[test]
+fn test_bare_ll_and_ll_count_jump_like_cc() {
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+
+    // No location list at all yet.
+    engine.execute_command("ll");
+    assert!(engine.message.contains("E776"));
+
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    list.selected = 1;
+    list.has_focus = true;
+
+    // Bare :ll re-jumps to the current entry and drops panel focus.
+    engine.execute_command("ll");
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    assert!(!engine.location_lists[&win].has_focus);
+
+    // :ll {count} is 1-based, like :cc.
+    engine.execute_command("ll 1");
+    assert_eq!(engine.location_lists[&win].selected, 0);
+}
+
+#[test]
+fn test_lgrep_populates_the_active_window_location_list_not_quickfix() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("vimcode_loclist_lgrep_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("lgreptest.rs");
+    let mut f = std::fs::File::create(&file_path).unwrap();
+    writeln!(f, "fn lgrep_unique_marker_1155() {{}}").unwrap();
+    drop(f);
+
+    let mut engine = Engine::new();
+    engine.cwd = dir.clone();
+    let win = engine.active_window_id();
+    engine.execute_command("lgrep lgrep_unique_marker_1155");
+
+    assert!(
+        !engine.location_lists[&win].items.is_empty(),
+        "lgrep should populate the active window's location list"
+    );
+    assert!(engine.location_lists[&win].open);
+    assert!(
+        engine.quickfix.items.is_empty(),
+        "lgrep must not touch quickfix"
+    );
+
+    engine.execute_command("lgrep");
+    assert!(engine.message.contains("Usage: :lgrep"));
+}
+
+#[test]
+fn test_cwindow_lwindow_open_only_when_non_empty() {
+    let mut engine = Engine::new();
+
+    // Empty: :cwindow is a no-op, never errors, never opens.
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+
+    engine.quickfix.items = vec![make_qf_item("a.rs")];
+    engine.execute_command("cwindow");
+    assert!(engine.quickfix.open);
+    assert!(engine.quickfix.has_focus);
+
+    // Emptying the list and re-running :cwindow closes it again.
+    engine.quickfix.items.clear();
+    engine.execute_command("cwindow");
+    assert!(!engine.quickfix.open);
+
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("b.rs"));
+    engine.execute_command("lwindow");
+    assert!(engine.location_lists[&win].open);
+}
+
+#[test]
+fn test_clist_llist_print_every_entry() {
+    let mut engine = Engine::new();
+    engine.quickfix.items = vec![make_qf_item("a.rs"), make_qf_item("b.rs")];
+    engine.quickfix.selected = 1;
+    engine.execute_command("clist");
+    assert!(engine.message.contains("a.rs"));
+    assert!(engine.message.contains("b.rs"));
+    // The selected entry is marked.
+    assert!(engine.message.lines().nth(1).unwrap().starts_with('>'));
+
+    engine.quickfix.items.clear();
+    engine.execute_command("clist");
+    // #1283: this used to assert `.contains("empty")`, matching vimcode's own
+    // invented "Quickfix list is empty" prose. Re-probed against a live
+    // `nvim --headless -u NONE`, `:clist` on an empty quickfix list raises
+    // `Vim(clist):E42: No Errors` — the same `E42` every other `:c*` command
+    // uses on an empty list, which is why `Engine::qf_empty_msg` is now the
+    // single place that spelling lives.
+    assert!(
+        engine.message.contains("E42: No Errors"),
+        "clist on an empty quickfix list must report Neovim's E42, got {:?}",
+        engine.message
+    );
+
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("loc.rs"));
+    engine.execute_command("llist");
+    assert!(engine.message.contains("loc.rs"));
+}
+
+#[test]
+fn test_colder_cnewer_walk_the_quickfix_stack() {
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![make_qf_item("first.rs")]);
+    engine.qf_set_list(
+        None,
+        vec![make_qf_item("second.rs"), make_qf_item("second2.rs")],
+    );
+
+    assert_eq!(
+        engine.quickfix.items.len(),
+        2,
+        "current list is the newest one"
+    );
+
+    engine.execute_command("colder");
+    assert_eq!(engine.quickfix.items.len(), 1);
+    assert_eq!(
+        engine.quickfix.items[0].file,
+        std::path::PathBuf::from("first.rs")
+    );
+
+    // Already at the bottom.
+    engine.execute_command("colder");
+    assert!(engine.message.contains("E380"));
+
+    engine.execute_command("cnewer");
+    assert_eq!(engine.quickfix.items.len(), 2);
+
+    // Already at the top.
+    engine.execute_command("cnewer");
+    assert!(engine.message.contains("E381"));
+
+    // A fresh list truncates any "newer" history beyond where we're parked.
+    engine.execute_command("colder"); // back to the 1-item list
+    engine.qf_set_list(None, vec![make_qf_item("branched.rs")]);
+    engine.execute_command("cnewer");
+    assert!(
+        engine.message.contains("E381"),
+        "the 2-item list should have been discarded by the new branch"
+    );
+}
+
+#[test]
+fn test_cdo_runs_command_once_per_entry_cfdo_once_per_file() {
+    let entry = |p: &std::path::Path| ProjectMatch {
+        file: p.to_path_buf(),
+        line: 0,
+        col: 0,
+        line_text: String::new(),
+    };
+    let read_line0 = |engine: &mut Engine, path: &std::path::Path| -> String {
+        let buf = engine.buffer_manager.open_file(path).unwrap();
+        engine
+            .buffer_manager
+            .get(buf)
+            .unwrap()
+            .buffer
+            .content
+            .line(0)
+            .chars()
+            .collect()
+    };
+
+    // :cdo touches every entry — two entries in file_a (same line) plus one
+    // in file_b means file_a's line is appended to twice, file_b's once.
+    let dir = std::env::temp_dir().join("vimcode_qf_cdo_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("cdo_a.txt");
+    let file_b = dir.join("cdo_b.txt");
+    std::fs::write(&file_a, "alpha\n").unwrap();
+    std::fs::write(&file_b, "beta\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![entry(&file_a), entry(&file_a), entry(&file_b)]);
+    engine.execute_command("cdo normal! A!");
+    assert!(engine.message.contains("3 quickfix entries"));
+    assert_eq!(read_line0(&mut engine, &file_a).trim(), "alpha!!");
+    assert_eq!(read_line0(&mut engine, &file_b).trim(), "beta!");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // :cfdo visits each distinct file once, in first-seen order — a fresh
+    // engine/directory so there's no already-open buffer left over from the
+    // :cdo run above to shadow the on-disk reset.
+    let dir = std::env::temp_dir().join("vimcode_qf_cfdo_1155");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file_a = dir.join("cfdo_a.txt");
+    let file_b = dir.join("cfdo_b.txt");
+    std::fs::write(&file_a, "alpha\n").unwrap();
+    std::fs::write(&file_b, "beta\n").unwrap();
+
+    let mut engine = Engine::new();
+    engine.qf_set_list(None, vec![entry(&file_a), entry(&file_a), entry(&file_b)]);
+    engine.execute_command("cfdo normal! A!");
+    assert!(engine.message.contains("2 file(s)"));
+    assert_eq!(
+        read_line0(&mut engine, &file_a).trim(),
+        "alpha!",
+        "cfdo must visit file_a only once despite two entries"
+    );
+    assert_eq!(read_line0(&mut engine, &file_b).trim(), "beta!");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_cdo_on_empty_list_is_silent_no_op() {
+    // #1308: real Neovim's `:cdo`/`:cfdo`/`:ldo`/`:lfdo` on an empty
+    // quickfix/location list are a *silent* no-op (`pcall` succeeds,
+    // `v:errmsg` stays empty) — confirmed against a live
+    // `nvim --headless -u NONE` oracle. This is unlike `:cc`/`:cnext`/
+    // `:clist`/`:cfirst`/`:clast`, which all do raise `E42: No Errors`.
+    //
+    // This scenario has no oracle `Case` (the harness can't reach it), so it
+    // can't be a `KNOWN_DEVIATIONS_XFILE` entry — this engine-level test is
+    // the only regression guard. It used to assert the opposite (that vimcode
+    // set the shared `E42: No Errors` message); narrowing to a true no-op
+    // means no message is set at all, and nothing runs.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello\n");
+    engine.update_syntax();
+    engine.execute_command("cdo normal! Ax");
+    assert_eq!(
+        engine.message, "",
+        "cdo on an empty quickfix list must be a silent no-op, got message {:?}",
+        engine.message
+    );
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(
+        line.trim_end_matches('\n'),
+        "hello",
+        "cdo on an empty quickfix list must not run the command against anything"
+    );
+
+    // :cfdo / :ldo / :lfdo on their respective empty lists are the same.
+    engine.execute_command("cfdo normal! Ax");
+    assert_eq!(engine.message, "");
+    engine.execute_command("ldo normal! Ax");
+    assert_eq!(engine.message, "");
+    engine.execute_command("lfdo normal! Ax");
+    assert_eq!(engine.message, "");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.trim_end_matches('\n'), "hello");
+
+    // Bare `:cdo` (no argument) still raises E471 — that's an argument-count
+    // error, not the "list is empty" case this test covers.
+    engine.execute_command("cdo");
+    assert!(engine.message.contains("E471"));
+}
+
+#[test]
+fn test_ctrl_w_close_window_drops_its_location_list() {
+    let mut engine = Engine::new();
+    engine.split_window(SplitDirection::Vertical, None);
+    let win = engine.active_window_id();
+    engine
+        .location_lists
+        .entry(win)
+        .or_default()
+        .items
+        .push(make_qf_item("a.rs"));
+    assert!(engine.location_lists.contains_key(&win));
+
+    engine.close_window();
+
+    assert!(
+        !engine.location_lists.contains_key(&win),
+        "closing a window must drop its location list — it has no meaning \
+         once the window it was scoped to is gone"
+    );
+}
+
+#[test]
+fn test_loclist_j_k_q_key_routing_is_independent_of_quickfix_focus() {
+    // Mirrors `test_quickfix_j_k_q_work_with_tui_key_encoding`, but for the
+    // active window's location list — the two panels must never cross-talk
+    // (#1155).
+    let mut engine = Engine::new();
+    let win = engine.active_window_id();
+    let list = engine.location_lists.entry(win).or_default();
+    list.items = vec![
+        make_qf_item("a.rs"),
+        make_qf_item("b.rs"),
+        make_qf_item("c.rs"),
+    ];
+    list.open = true;
+    list.has_focus = true;
+    list.selected = 0;
+    // The global quickfix panel is not focused.
+    assert!(!engine.quickfix.has_focus);
+
+    engine.handle_key("", Some('j'), false);
+    assert_eq!(engine.location_lists[&win].selected, 1);
+    assert_eq!(
+        engine.quickfix.selected, 0,
+        "the global quickfix selection must not move"
+    );
+
+    engine.handle_key("", Some('q'), false);
+    assert!(!engine.location_lists[&win].open);
+    assert!(!engine.location_lists[&win].has_focus);
 }
 
 #[test]
@@ -15026,6 +16742,113 @@ fn test_ensure_cursor_visible_wrap_scrolls_up() {
     engine.view_mut().cursor.col = 0;
     engine.ensure_cursor_visible();
     assert_eq!(engine.view().scroll_top, 5);
+}
+
+/// #1293: `ensure_cursor_visible_wrap` must honor `'scrolloff'` on the
+/// downward scroll, the same as the `'wrap'`-off path (`ensure_cursor_visible`
+/// a few lines above it in `search.rs`) already does. Mirrors the no-wrap
+/// path's own arithmetic on a buffer of single-row lines (no soft-wrap in
+/// play), so this is the direct regression test for the "one scrolloff-margin
+/// short of Neovim" bug `nvim_conformance`'s "scroll:so=5 30G H"/"...L" cases
+/// reproduced. Confirmed RED against unfixed `develop`: without this fix,
+/// `ensure_cursor_visible_wrap` never reads `scrolloff` at all, so scroll_top
+/// lands at 20 here (the same as the `scrolloff = 0` case), not 25.
+#[test]
+fn test_ensure_cursor_visible_wrap_respects_scrolloff_downward() {
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 5;
+    let text = (0..60).map(|i| format!("line {i}\n")).collect::<String>();
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 10;
+    engine.view_mut().viewport_cols = 80;
+    engine.view_mut().scroll_top = 0;
+    // Cursor at buffer line 29 (30th line, matching the "30G" conformance
+    // case), same as the no-wrap path's own scrolloff test would use.
+    engine.view_mut().cursor.line = 29;
+    engine.view_mut().cursor.col = 0;
+    engine.ensure_cursor_visible();
+    // Matches `ensure_cursor_visible`'s no-wrap formula for the same inputs:
+    // minimal = cursor_line + scrolloff + 1 - viewport_lines = 29+5+1-10 = 25.
+    assert_eq!(engine.view().scroll_top, 25);
+}
+
+/// #1293 companion: the upward direction of the same fix. Confirmed RED
+/// against unfixed `develop`: without the fix, scroll_top lands at 10
+/// (`cursor_line`, no margin), not 5.
+#[test]
+fn test_ensure_cursor_visible_wrap_respects_scrolloff_upward() {
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 5;
+    let text = (0..60).map(|i| format!("line {i}\n")).collect::<String>();
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 10;
+    engine.view_mut().viewport_cols = 80;
+    engine.view_mut().scroll_top = 20;
+    // Cursor entirely above the current viewport.
+    engine.view_mut().cursor.line = 10;
+    engine.view_mut().cursor.col = 0;
+    engine.ensure_cursor_visible();
+    // Matches the no-wrap formula: minimal = cursor_line.saturating_sub(scrolloff) = 10-5 = 5.
+    assert_eq!(engine.view().scroll_top, 5);
+}
+
+/// #1293: the margin must be counted in *visual* rows, not buffer lines —
+/// the reason this needed a real fix rather than copying the no-wrap path's
+/// line-count arithmetic verbatim. Buffer line 4 is a long line that
+/// soft-wraps into 3 screen rows at `viewport_cols = 10`; the cursor sits on
+/// its last (3rd) wrapped segment. With `scrolloff = 1` the one buffer line
+/// after the cursor's line (line 5) must remain visible below it. A
+/// buffer-line-counting implementation (equivalent to ignoring wrap, or to
+/// this same code with `scrolloff = 0`) instead lands scroll_top on 2, one
+/// line short — confirmed by asserting the `scrolloff = 0` control case
+/// below lands there, which is exactly what unfixed `ensure_cursor_visible_wrap`
+/// (ignoring scrolloff entirely) would also produce for the `scrolloff = 1`
+/// case, making this RED against unfixed `develop`.
+#[test]
+fn test_ensure_cursor_visible_wrap_scrolloff_counts_visual_rows_not_buffer_lines() {
+    let lines: Vec<String> = (0..10)
+        .map(|i| {
+            if i == 4 {
+                // 25 chars -> ceil(25/10) = 3 wrapped rows.
+                "wwwwwwwwwwwwwwwwwwwwwwwww".to_string()
+            } else {
+                format!("l{i}")
+            }
+        })
+        .collect();
+    let text = lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+
+    let mut engine = Engine::new();
+    engine.settings.wrap = true;
+    engine.settings.scrolloff = 1;
+    engine.buffer_mut().content = ropey::Rope::from_str(&text);
+    engine.view_mut().viewport_lines = 5;
+    engine.view_mut().viewport_cols = 10;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 4;
+    engine.view_mut().cursor.col = 22; // third wrapped segment (chars 20..25)
+    engine.ensure_cursor_visible();
+    assert_eq!(
+        engine.view().scroll_top,
+        3,
+        "scrolloff=1 must reserve one *visual* row (line 5) below the cursor's \
+         last wrapped segment, landing scroll_top on line 3 (short line 3, then \
+         line 4's 3 wrapped rows fill the rest of the 5-row viewport, leaving \
+         line 5 as the single row of margin)"
+    );
+
+    // Control: with scrolloff = 0 (no margin required) the same layout
+    // lands one line earlier — this is the value unfixed
+    // `ensure_cursor_visible_wrap` (which never reads scrolloff at all)
+    // would also produce for the scrolloff=1 case above, i.e. one row short.
+    engine.settings.scrolloff = 0;
+    engine.view_mut().scroll_top = 0;
+    engine.view_mut().cursor.line = 4;
+    engine.view_mut().cursor.col = 22;
+    engine.ensure_cursor_visible();
+    assert_eq!(engine.view().scroll_top, 2);
 }
 
 #[test]
@@ -17629,6 +19452,102 @@ fn test_is_safe_url_rejects_dangerous_schemes() {
     assert!(!is_safe_url("ftp://example.com"));
     assert!(!is_safe_url("ssh://evil.com"));
     assert!(!is_safe_url(""));
+}
+
+// ─── #1134: platform actions queued instead of hand-rolled per-OS openers ──
+//
+// Before #1134, `Engine::open_url`, `reveal_in_file_manager`, and `gx` each
+// shelled out directly (`std::process::Command::new`, spawning `open`, the
+// Linux freedesktop.org opener, or `cmd`), gated only by `#[cfg(not(test))]`
+// — meaning none of this was ever exercised by `cargo test` at all,
+// hand-rolled or otherwise. Now they
+// push a `PendingPlatformAction` onto `Engine::pending_platform_actions`
+// instead of touching the process table, so these *are* testable: assert on
+// the queue, the same way `PendingFileDialog` (#572) callers assert on
+// `pending_file_dialog` rather than mocking a file chooser.
+
+#[test]
+fn test_engine_open_url_queues_platform_action_for_safe_scheme() {
+    let mut e = engine_with_text("hello\n");
+    assert!(e.pending_platform_actions.is_empty());
+    e.open_url("https://example.com/1134");
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl(
+            "https://example.com/1134".to_string()
+        )]
+    );
+}
+
+#[test]
+fn test_engine_open_url_does_not_queue_for_unsafe_scheme() {
+    let mut e = engine_with_text("hello\n");
+    e.open_url("javascript:alert(1)");
+    assert!(
+        e.pending_platform_actions.is_empty(),
+        "an unsafe scheme must never reach the platform-action queue"
+    );
+}
+
+#[test]
+fn test_reveal_in_file_manager_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    let path = std::path::PathBuf::from("/tmp/vimcode-1134-test-file.txt");
+    e.reveal_in_file_manager(&path);
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::Reveal(path)]
+    );
+}
+
+/// Exercises the editor-action-menu "reveal" item's real `context_menu_confirm`
+/// call site in `windows.rs` (`reveal_in_file_manager`'s 3rd of 3 in-tree
+/// callers) end-to-end, not just the method in isolation above.
+#[test]
+fn test_editor_action_menu_reveal_queues_platform_action() {
+    let mut e = engine_with_text("hello\n");
+    let path = std::path::PathBuf::from("/tmp/vimcode-1134-menu-file.txt");
+    e.active_buffer_state_mut().file_path = Some(path.clone());
+    let gid = e.active_group;
+    e.open_editor_action_menu(gid, 0, 0, 1.0);
+    {
+        let cm = e.context_menu.as_mut().expect("menu must be open");
+        assert_eq!(cm.items[7].action, "reveal");
+        cm.selected = 7;
+    }
+    let action = e.context_menu_confirm();
+    assert_eq!(action.as_deref(), Some("reveal"));
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::Reveal(path)]
+    );
+}
+
+/// **RED-verified against unfixed `develop`:** before #1134, `gx`'s body was
+/// `#[cfg(not(test))] { Command::new(...) }`, shelling out to the Linux
+/// freedesktop.org opener with no `target_os` guard — a bare Linux-only
+/// shell-out with nothing gating it on macOS or Windows. That whole block
+/// was also `#[cfg(not(test))]`, i.e. structurally
+/// unreachable from `cargo test`, which is exactly why the cross-platform
+/// bug shipped unnoticed: there was no queue, no field, nothing this test
+/// (or any test) could assert on. This test fails to compile against
+/// unfixed `develop` (no `pending_platform_actions` field exists at all),
+/// which is as RED as a reproduction of a "does nothing observable" bug can
+/// get.
+#[test]
+fn test_gx_queues_open_url_platform_action_for_word_under_cursor() {
+    let mut e = engine_with_text("README\n");
+    // Cursor starts at (0, 0), on "README" — a single `is_word_char` token,
+    // matching what `word_under_cursor` can actually return (see the `gx`
+    // handler's own comment on why it can't require `is_safe_url`: no
+    // scheme can survive that tokenizer intact).
+    e.handle_key("g", Some('g'), false);
+    e.handle_key("x", Some('x'), false);
+    assert_eq!(
+        e.pending_platform_actions,
+        vec![PendingPlatformAction::OpenUrl("README".to_string())]
+    );
+    assert!(e.message.contains("Opening: README"), "got: {}", e.message);
 }
 
 #[test]
@@ -20525,6 +22444,219 @@ fn test_auto_outdent_closing_brace() {
     );
 }
 
+// ── #1207: 'smartindent' / 'cindent' / 'showmatch' ──────────────────────────
+//
+// RED against unfixed `develop`: before #1207, `smart_indent_for_newline`
+// and `auto_outdent_for_closing` were gated on `auto_indent` alone —
+// `smartindent`/`cindent` didn't exist as fields at all, so every test
+// below that sets `auto_indent = false` and relies on `smartindent`/
+// `cindent` alone would have seen zero indent (the fields wouldn't even
+// have compiled), and every `showmatch_flash` assertion would have failed
+// to compile (`Engine` had no such field).
+
+#[test]
+fn test_smartindent_alone_without_autoindent_indents_after_brace() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    assert_eq!(e.mode, Mode::Insert);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "'smartindent' alone (no 'autoindent') must still indent after '{{'"
+    );
+}
+
+#[test]
+fn test_neither_autoindent_nor_smartindent_nor_cindent_does_not_indent() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = false;
+    e.settings.cindent = false;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        0,
+        "with all three off, no auto-indenting at all"
+    );
+}
+
+#[test]
+fn test_cindent_alone_without_autoindent_indents_after_brace() {
+    let mut e = engine_with_lang("fn main() {\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        e.settings.shift_width as usize,
+        "'cindent' alone (no 'autoindent') must still indent after '{{'"
+    );
+}
+
+#[test]
+fn test_cindent_supersedes_smartindent_language_trigger() {
+    // Python `:` is one of `line_triggers_indent`'s language-aware
+    // triggers — real `smartindent` alone would indent after it (like
+    // `test_smart_indent_python_colon` above), but `:h 'cindent'` says
+    // "'cindent' ... overrules 'smartindent'", and this repo's `cindent`
+    // is deliberately the simple C-only subset (brace-based, no language
+    // triggers) — so with both set, the python `:` trigger must NOT fire.
+    let mut e = engine_with_lang("def foo():\n", "py");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.settings.cindent = true;
+    e.view_mut().cursor.line = 0;
+    e.handle_key("A", Some('A'), false);
+    e.handle_key("Return", None, false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        0,
+        "'cindent' must supersede 'smartindent': no brace, no indent"
+    );
+}
+
+#[test]
+fn test_cindent_outdent_closing_brace_without_autoindent() {
+    let mut e = engine_with_lang("fn main() {\n        \n}\n", "rs");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 1;
+    e.view_mut().cursor.col = 8;
+    e.handle_key("}", Some('}'), false);
+    let indent = e.get_line_indent_str(1);
+    assert_eq!(
+        indent.len(),
+        4,
+        "'cindent' alone must still outdent a lone closing brace by one shiftwidth"
+    );
+}
+
+#[test]
+fn test_smartindent_hash_moves_to_column_zero() {
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = false;
+    e.settings.smartindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    let line_text: String = e.buffer().content.line(0).chars().collect();
+    assert_eq!(line_text.trim_end_matches(['\n', '\r']), "#");
+    assert_eq!(e.get_line_indent_str(0).len(), 0);
+}
+
+#[test]
+fn test_cindent_hash_moves_to_column_zero() {
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = false;
+    e.settings.cindent = true;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    let line_text: String = e.buffer().content.line(0).chars().collect();
+    assert_eq!(line_text.trim_end_matches(['\n', '\r']), "#");
+    assert_eq!(e.get_line_indent_str(0).len(), 0);
+}
+
+#[test]
+fn test_hash_is_untouched_without_smartindent_or_cindent() {
+    // Plain 'autoindent' (neither 'smartindent' nor 'cindent') must NOT
+    // move a typed '#' to column 0 — real Vim's preprocessor special case
+    // belongs to 'smartindent'/'cindent' only.
+    let mut e = engine_with_lang("    \n", "c");
+    e.settings.auto_indent = true;
+    e.settings.smartindent = false;
+    e.settings.cindent = false;
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key("#", Some('#'), false);
+    assert_eq!(e.get_line_indent_str(0).len(), 4);
+}
+
+#[test]
+fn test_showmatch_flashes_matching_open_paren() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.buffer().to_string(), "(foo)");
+    // Cursor must land right after the typed ')', never at the match.
+    assert_eq!(e.view().cursor.col, 5);
+    assert_eq!(
+        e.showmatch_flash,
+        Some((0, 0)),
+        "flash must record the opening paren's (line, col)"
+    );
+}
+
+#[test]
+fn test_showmatch_flash_clears_on_the_next_key() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert!(e.showmatch_flash.is_some());
+    e.handle_key("x", Some('x'), false);
+    assert_eq!(
+        e.showmatch_flash, None,
+        "the flash must end as soon as the next key arrives"
+    );
+    assert_eq!(e.buffer().to_string(), "(foo)x");
+}
+
+#[test]
+fn test_showmatch_off_by_default_never_flashes() {
+    let mut e = Engine::new();
+    assert!(!e.settings.showmatch, "'showmatch' defaults off");
+    e.buffer_mut().insert(0, "(foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 4;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.showmatch_flash, None);
+}
+
+#[test]
+fn test_showmatch_with_no_match_does_not_flash() {
+    let mut e = Engine::new();
+    e.settings.showmatch = true;
+    e.buffer_mut().insert(0, "foo");
+    e.start_undo_group();
+    e.mode = Mode::Insert;
+    e.view_mut().cursor.line = 0;
+    e.view_mut().cursor.col = 3;
+    e.handle_key(")", Some(')'), false);
+    assert_eq!(e.showmatch_flash, None);
+}
+
 #[test]
 fn test_auto_indent_equals_operator_with_brace() {
     let mut e = engine_with_lang("fn main() {\nlet x = 1;\n}\n", "rs");
@@ -20677,6 +22809,41 @@ fn test_command_center_chat_with_key_shows_open_panel() {
             .iter()
             .any(|i| i.display.contains("Open AI Panel")),
         "Should show 'Open AI Panel' when configured"
+    );
+}
+
+/// Review regression (#952): an ACP-only user (no `ai_api_key` set,
+/// `ai_provider` left at its default) must reach the palette's chat flow
+/// through `acp_agent_command` alone — `ai_send_message` already routes
+/// there, but `picker_populate_chat`'s `configured` gate didn't check it,
+/// so this exact setup showed "Configure AI provider first" and could
+/// never reach the `chat_send:` action.
+///
+/// RED verified: reverting `picker_populate_chat`'s `configured` check to
+/// only look at `ai_api_key`/`ai_provider == "ollama"` makes this test
+/// fail — the picker shows "Configure AI provider first" instead of "Open
+/// AI Panel" even though `settings.acp_agent_command` is set.
+#[test]
+fn test_command_center_chat_with_acp_agent_configured_shows_open_panel() {
+    let mut e = engine_with_text("hello");
+    e.settings.acp_agent_command = "claude-code-acp".to_string();
+    e.open_picker(PickerSource::CommandCenter);
+    e.picker_query = "chat".to_string();
+    e.picker_filter();
+    assert!(
+        e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Open AI Panel")),
+        "Should show 'Open AI Panel' when only acp_agent_command is set: {:?}",
+        e.picker_items
+    );
+    assert!(
+        !e.picker_items
+            .iter()
+            .any(|i| i.display.contains("Configure AI")),
+        "Must not prompt to configure AI when an ACP agent is already \
+         configured: {:?}",
+        e.picker_items
     );
 }
 
@@ -24488,6 +26655,7 @@ fn test_set_option_round_trip() {
         ("spelllang", "en_GB"),
         ("ai_provider", "openai"),
         ("ai_model", "gpt-4"),
+        ("acp_agent_command", "claude-code-acp"),
         ("ctrl_f_action", "page_down"),
         ("hide_single_tab", "true"),
         ("breadcrumbs", "false"),
@@ -28188,6 +30356,459 @@ fn test_nvim_search_backward_question() {
     assert_eq!(engine.view().cursor.col, 8);
 }
 
+// -- #1153: 'wrapscan' --
+
+#[test]
+fn test_1153_wrapscan_off_does_not_wrap_forward_search() {
+    // `:h 'wrapscan'`: off, `/` past the last match stays put instead of
+    // wrapping to the top (verified against `nvim --headless`).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 2;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("/alpha<CR>");
+    // Stayed on line 2 (gamma) — did not wrap to line 0 (alpha).
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_1153_wrapscan_off_incremental_preview_does_not_wrap() {
+    // `:h 'wrapscan'`: the live preview-while-typing path
+    // (`perform_incremental_search`) must respect 'wrapscan' the same way
+    // the final `<CR>`-confirmed search already does — with no match ahead
+    // of the cursor, typing the pattern must not preview a wrapped-around
+    // match (review follow-up on #1153; this path is invisible to the
+    // nvim_conformance harness, which only diffs post-`<CR>` state, so it's
+    // covered here at the engine level instead).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foo xxx\nyyy\n");
+    engine.update_syntax();
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+
+    press_char(&mut engine, '/');
+    assert_eq!(engine.mode, Mode::Search);
+    press_char(&mut engine, 'f');
+    press_char(&mut engine, 'o');
+    press_char(&mut engine, 'o');
+    // Still parked at the pre-search cursor — did not preview a wrap to the
+    // "foo" on line 0.
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_1153_wrapscan_on_still_wraps_forward_search() {
+    // Default (wrapscan on) — unchanged from `test_nvim_search_wraps_around`,
+    // pinned again here so a regression in the new `nowrapscan` branch is
+    // caught by the same option's own test group.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha\nbeta\ngamma\n");
+    engine.update_syntax();
+    engine.view_mut().cursor.line = 2;
+    engine.feed_keys("/alpha<CR>");
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 0);
+}
+
+#[test]
+fn test_1153_gn_respects_wrapscan_off_no_match_forward() {
+    // `:h gn`: "like the `n` command" — so with 'wrapscan' off and no match
+    // after the cursor, `gn` stays put in Normal mode (no wrap, no visual
+    // selection) instead of wrapping to the first match — verified against
+    // `nvim --headless` v0.12.5 (review follow-up on #1153).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha beta alpha\nxxx\n");
+    engine.update_syntax();
+    engine.feed_keys("/alpha<CR>"); // establishes search_query + matches
+    engine.feed_keys(":set nowrapscan<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+    engine.feed_keys("gn");
+    assert_eq!(engine.mode, Mode::Normal);
+    assert_eq!(engine.view().cursor.line, 1);
+    assert_eq!(engine.view().cursor.col, 1);
+}
+
+#[test]
+fn test_1153_gn_wraps_when_wrapscan_on() {
+    // Default (wrapscan on) — `gn` past the last match wraps to the first
+    // one and enters Visual mode selecting it, unchanged from before this
+    // fix (pinned here so a regression in the new `nowrapscan` branch is
+    // caught by the same option's own test group).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "alpha beta alpha\nxxx\n");
+    engine.update_syntax();
+    engine.feed_keys("/alpha<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 1;
+    engine.feed_keys("gn");
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.view().cursor.line, 0);
+    assert_eq!(engine.view().cursor.col, 4); // end of the wrapped-to first "alpha"
+}
+
+// -- #1153: 'gdefault' --
+
+#[test]
+fn test_1153_gdefault_makes_plain_sub_replace_every_match_on_the_line() {
+    // `:h 'gdefault'`: on, plain `:s/a/x/` (no `g` flag) behaves like
+    // `:s/a/x/g` — verified against `nvim --headless`.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n");
+    engine.update_syntax();
+    engine.feed_keys(":set gdefault<CR>");
+    engine.feed_keys(":s/a/x/<CR>");
+    assert_eq!(engine.buffer().to_string(), "xxx\n");
+}
+
+#[test]
+fn test_1153_gdefault_g_flag_toggles_back_to_first_match_only() {
+    // `:h 'gdefault'`: on, a `g` flag on the command toggles the meaning
+    // back off — replaces only the first match per line.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "aaa\n");
+    engine.update_syntax();
+    engine.feed_keys(":set gdefault<CR>");
+    engine.feed_keys(":s/a/x/g<CR>");
+    assert_eq!(engine.buffer().to_string(), "xaa\n");
+}
+
+// -- #1153: 'shiftround' --
+
+#[test]
+fn test_1153_shiftround_rounds_indent_up_to_shiftwidth_multiple() {
+    // `:h 'shiftround'`: `>>` lands on the next multiple of 'shiftwidth'
+    // instead of always adding exactly one — verified against
+    // `nvim --headless` (cols=5, sw=4 → 8, not 5+4=9).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set shiftround sw=4 expandtab<CR>");
+    engine.feed_keys(">>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 8);
+}
+
+#[test]
+fn test_1153_noshiftround_indent_adds_exactly_one_shiftwidth() {
+    // Default (shiftround off) — `>>` always adds exactly 'shiftwidth',
+    // regardless of the existing indent's alignment.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set noshiftround sw=4 expandtab<CR>");
+    engine.feed_keys(">>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 9);
+}
+
+#[test]
+fn test_1153_shiftround_rounds_dedent_down_to_shiftwidth_multiple() {
+    // `:h 'shiftround'`: `<<` lands on the *previous* multiple of
+    // 'shiftwidth', computed from the line's own indent directly — verified
+    // against `nvim --headless` (cols=5, sw=4 → 4, not 5-4=1 rounded again).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set shiftround sw=4 expandtab<CR>");
+    engine.feed_keys("<<");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 4);
+}
+
+// -- #1153: 'softtabstop' --
+
+#[test]
+fn test_1153_softtabstop_tab_advances_to_sts_stop_not_tabstop() {
+    // `:h 'softtabstop'`: with 'expandtab' on and 'smarttab' off, <Tab>
+    // advances to the next 'softtabstop' stop instead of 'tabstop' —
+    // verified against `nvim --headless` (ts=8, sts=2 → 1 space from col 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "ab\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("li"); // cursor onto 'b', insert before it — between a/b
+    engine.feed_keys("<Tab><Esc>");
+    assert_eq!(engine.buffer().to_string(), "a b\n");
+}
+
+#[test]
+fn test_1153_softtabstop_backspace_removes_a_whole_soft_tab() {
+    // `:h 'softtabstop'`: BackSpace over a run of spaces removes up to
+    // 'softtabstop' of them at once, "feeling like" a tab was deleted —
+    // verified against `nvim --headless` (empty line, sts=3, nosmarttab:
+    // two <Tab>s give 6 spaces, one <BS> removes 3, not 1).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=3 nosmarttab<CR>");
+    engine.feed_keys("i<Tab><Tab>");
+    assert_eq!(engine.buffer().to_string(), "      \n"); // 6 spaces
+    engine.feed_keys("<BS>");
+    // Removed one whole soft-tab (3 spaces), not just one space.
+    assert_eq!(engine.buffer().to_string(), "   \n"); // 3 spaces
+    engine.feed_keys("<Esc>");
+}
+
+#[test]
+fn test_1153_softtabstop_backspace_rounds_column_not_run_length() {
+    // `:h 'softtabstop'`: BackSpace rounds the *absolute column* down to the
+    // previous multiple of 'softtabstop' — it does NOT simply cap the
+    // contiguous blank run length at 'softtabstop'. Those two formulas only
+    // coincide when the run starts on a column that's already a multiple of
+    // sts; this case (5-space indent, sts=2, run starts at col 0 which is a
+    // multiple, but the run length 5 is not) exercises the divergence —
+    // verified against `nvim --headless` v0.12.5 (set et ts=8 sts=2
+    // nosmarttab, "     x", <BS> before 'x' removes only 1 space, leaving 4).
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "     x\n"); // 5-space indent
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("li"); // cursor onto 'x', insert before it
+    engine.feed_keys("<BS>");
+    let line = engine.buffer().content.line(0).to_string();
+    assert_eq!(line.chars().take_while(|&c| c == ' ').count(), 4);
+    engine.feed_keys("<Esc>");
+}
+
+#[test]
+fn test_1153_softtabstop_backspace_mid_line_run_rounds_column() {
+    // Same divergence as above, but for a non-leading run of blanks (not
+    // preceded only by spaces, so 'smarttab' leading-blanks handling never
+    // applies) — verified against `nvim --headless` v0.12.5 (set et ts=8
+    // sts=2 nosmarttab, "a  b", <BS> before 'b' removes only 1 space,
+    // leaving "a b").
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "a  b\n");
+    engine.update_syntax();
+    engine.feed_keys(":set expandtab ts=8 sts=2 nosmarttab<CR>");
+    engine.feed_keys("$i"); // cursor onto 'b', insert before it
+    engine.feed_keys("<BS>");
+    assert_eq!(engine.buffer().to_string(), "a b\n");
+    engine.feed_keys("<Esc>");
+}
+
+// -- #1153: 'virtualedit' --
+
+#[test]
+fn test_1153_virtualedit_all_lets_l_move_past_dollar() {
+    // `:h 'virtualedit'`: with "all", `$` still lands on the last
+    // character, but a following `l` moves one column further, into
+    // virtual space past the end of the line — verified against
+    // `nvim --headless`.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.feed_keys(":set virtualedit=all<CR>");
+    engine.feed_keys("$");
+    assert_eq!(engine.view().cursor.col, 2); // on 'c', matches ve=off too
+    engine.feed_keys("l");
+    assert_eq!(engine.view().cursor.col, 3); // one past 'c'
+}
+
+#[test]
+fn test_1153_virtualedit_off_blocks_l_past_dollar() {
+    // Default (virtualedit off) — `l` at the last character is a no-op.
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "abc\n");
+    engine.update_syntax();
+    engine.feed_keys("$");
+    assert_eq!(engine.view().cursor.col, 2);
+    engine.feed_keys("l");
+    assert_eq!(engine.view().cursor.col, 2);
+}
+
+// -- #1153: 'foldmethod'/'foldlevel' settable via :set --
+
+#[test]
+fn test_1153_set_foldmethod_indent_folds_take_effect_immediately() {
+    // #1153: foldmethod/foldlevel existed as Settings fields but were
+    // unreachable from `:set` before this issue. `:set fdm=indent` should
+    // immediately compute + close the indent-fold hierarchy, the same way
+    // the nvim-conformance harness's `apply_setup` already does when a case
+    // sets it via Lua.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "if x:\n    a\n    b\nelse:\n    c\n");
+    engine.update_syntax();
+    engine.feed_keys(":set fdm=indent<CR>");
+    // Cursor still on line 0; `j` from a closed fold at line 1 should skip
+    // straight to line 3 ("else:") since lines 1-2 are folded away.
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 1);
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 3);
+}
+
+// -- #1159: 'foldmethod=marker', 'foldmarker', 'foldnestmax', ':fold*' --
+
+#[test]
+fn test_1159_set_foldmethod_marker_folds_take_effect_immediately() {
+    // Mirrors test_1153_set_foldmethod_indent_folds_take_effect_immediately
+    // above, but for the new "marker" method: `:set fdm=marker` should
+    // immediately compute + close the marker-fold hierarchy, not wait for a
+    // `zf`/z-command.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "if x: # {{{\n    a\n    b\n# }}}\nelse:\n    c\n");
+    engine.update_syntax();
+    engine.feed_keys(":set fdm=marker<CR>");
+    engine.view_mut().cursor.line = 0;
+    // Lines 1-3 (0-indexed) are hidden inside the closed marker fold, so `j`
+    // from line 0 should skip straight to line 4 ("else:").
+    engine.feed_keys("j");
+    assert_eq!(engine.view().cursor.line, 4);
+}
+
+#[test]
+fn test_1159_foldmarker_rejects_malformed_values() {
+    let mut engine = Engine::new();
+    for bad in ["", "noComma", ",", "open,", ",close", "a,b,c"] {
+        let result = engine
+            .settings
+            .parse_set_option(&format!("foldmarker={bad}"));
+        assert!(result.is_err(), "expected {bad:?} to be rejected");
+    }
+    // A well-formed pair is accepted and round-trips through the query form.
+    engine
+        .settings
+        .parse_set_option("foldmarker=[[[,]]]")
+        .expect("well-formed pair is accepted");
+    assert_eq!(
+        engine.settings.parse_set_option("foldmarker?").unwrap(),
+        "foldmarker=[[[,]]]"
+    );
+}
+
+#[test]
+fn test_1159_foldnestmax_rejects_zero_and_non_numeric() {
+    let mut engine = Engine::new();
+    assert!(engine.settings.parse_set_option("foldnestmax=0").is_err());
+    assert!(engine.settings.parse_set_option("foldnestmax=abc").is_err());
+    engine
+        .settings
+        .parse_set_option("foldnestmax=5")
+        .expect("a positive integer is accepted");
+    assert_eq!(
+        engine.settings.parse_set_option("foldnestmax?").unwrap(),
+        "foldnestmax=5"
+    );
+}
+
+#[test]
+fn test_1159_ex_fold_creates_and_ex_foldopen_reopens() {
+    // `:2,4fold` (1-indexed ex addressing) creates and closes a manual fold
+    // over 0-indexed lines 1..=3; `:2,4foldopen` then reopens it.
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,4fold<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("jj");
+    // Lines 1-3 hidden: two `j` from line 0 lands on line 4 ("five").
+    assert_eq!(engine.view().cursor.line, 4);
+
+    engine.feed_keys(":2,4foldopen<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.feed_keys("jj");
+    // Now nothing is hidden: two `j` from line 0 lands on line 2 ("three").
+    assert_eq!(engine.view().cursor.line, 2);
+}
+
+#[test]
+fn test_1159_ex_foldclose_on_bare_line_reports_e490() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+    engine.update_syntax();
+    engine.feed_keys(":foldclose<CR>");
+    assert!(
+        engine.message.contains("E490"),
+        "unexpected message: {}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_1159_ex_folddoopen_skips_the_closed_fold_folddoclosed_only_touches_it() {
+    let mut engine = Engine::new();
+    engine
+        .buffer_mut()
+        .insert(0, "one\ntwo\nthree\nfour\nfive\n");
+    engine.update_syntax();
+    engine.feed_keys(":2,4fold<CR>");
+    engine.feed_keys(":folddoopen s/^/X/<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "Xone\ntwo\nthree\nfour\nXfive\n"
+    );
+    engine.feed_keys(":folddoclosed s/^/Z/<CR>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "Xone\nZtwo\nZthree\nZfour\nXfive\n"
+    );
+}
+
+// -- #1153: option table extended, not hard-erroring --
+
+#[test]
+fn test_1153_unimplemented_recognised_option_is_not_unknown_option() {
+    // A real vim option vimcode doesn't implement yet must not read as an
+    // unrecognised typo (`Unknown option`) — it gets a distinct
+    // "recognised but not implemented" rejection instead.
+    //
+    // #1190 implemented 'hidden' (this test's original example), #1207
+    // implemented 'magic' (this test's second example) — 'clipboard' is
+    // the sole remaining entry, in `UNIMPLEMENTED_VALUE_OPTIONS`.
+    let mut engine = Engine::new();
+    let result = engine.settings.parse_set_option("clipboard=unnamed");
+    let err = result.expect_err("clipboard is not yet implemented");
+    assert!(
+        err.contains("recognised but not implemented"),
+        "unexpected message: {err}"
+    );
+    assert!(!err.contains("Unknown option"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_1153_still_unknown_option_is_unknown_option() {
+    // A genuine typo still gets the original "Unknown option" message.
+    let mut engine = Engine::new();
+    let result = engine.settings.parse_set_option("totallybogusoption");
+    let err = result.expect_err("bogus option name");
+    assert!(err.contains("Unknown option"), "unexpected message: {err}");
+}
+
+#[test]
+fn test_1153_wildmenu_accepted_as_noop_not_rejected() {
+    // Unlike the genuinely-missing options above, vimcode already has an
+    // unconditional command-line completion menu (`wildmenu_items` in
+    // keys.rs), so `set wildmenu` must be accepted (as a no-op), not
+    // rejected with "recognised but not implemented" — review follow-up on
+    // #1153.
+    let mut engine = Engine::new();
+    assert_eq!(
+        engine.settings.parse_set_option("wildmenu"),
+        Ok("wildmenu".to_string())
+    );
+    assert_eq!(
+        engine.settings.parse_set_option("wmnu"),
+        Ok("wmnu".to_string())
+    );
+    assert_eq!(
+        engine.settings.parse_set_option("wildmenu?"),
+        Ok("wildmenu".to_string())
+    );
+}
+
 #[test]
 fn test_nvim_search_no_match_noop() {
     // Search for non-existent pattern leaves cursor in place
@@ -29388,6 +32009,133 @@ fn test_nvim_enew_creates_empty_buffer() {
     assert_ne!(before, after, ":enew should switch to a new buffer");
 }
 
+// -- 'hidden' (#1190): abandoning a dirty buffer via :edit/:bnext/:bprevious/
+// :bfirst/:blast/:buffer/:enew must refuse (mirroring the existing `:quit`
+// guard) unless another window still shows the buffer, the command carries
+// a `!`, or 'hidden' is set. See `Engine::check_buffer_abandon`
+// (accessors.rs) and its call sites in execute.rs.
+//
+// `Settings::default()` has `hidden: true` — confirmed by hand against
+// `nvim --headless -u NONE -c 'set hidden?'`, Neovim's own default is ON
+// (historical Vim's is off). So the "blocks"/"bang overrides" scenarios
+// below explicitly `set hidden = false` to exercise the guard at all;
+// `test_default_settings_allow_enew_over_dirty_buffer_1190` pins the
+// default-on behavior on its own.
+
+#[test]
+fn test_default_settings_allow_enew_over_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    assert!(
+        engine.settings.hidden,
+        "Settings::default() must match Neovim's 'hidden' default"
+    );
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(
+        engine.active_buffer_id(),
+        before,
+        "default 'hidden' (on) should let :enew abandon the dirty buffer"
+    );
+}
+
+#[test]
+fn test_set_nohidden_blocks_enew_on_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    type_command(&mut engine, "set nohidden");
+    assert!(!engine.settings.hidden);
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew");
+    assert_eq!(action, EngineAction::Error);
+    assert!(engine.message.contains("No write since last change"));
+    assert_eq!(
+        engine.active_buffer_id(),
+        before,
+        "dirty buffer must not be abandoned once 'hidden' is off"
+    );
+}
+
+#[test]
+fn test_enew_bang_forces_past_dirty_buffer_even_with_nohidden_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+    let action = type_command_action(&mut engine, "enew!");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(engine.active_buffer_id(), before);
+}
+
+#[test]
+fn test_bnext_blocks_on_dirty_buffer_then_bang_overrides_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys(":enew<CR>"); // second buffer so :bnext has somewhere to go
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let before = engine.active_buffer_id();
+
+    type_command(&mut engine, "bnext");
+    assert!(engine.message.contains("No write since last change"));
+    assert_eq!(engine.active_buffer_id(), before);
+
+    let action = type_command_action(&mut engine, "bnext!");
+    assert_eq!(action, EngineAction::None);
+    assert_ne!(
+        engine.active_buffer_id(),
+        before,
+        ":bnext! must force through a dirty buffer"
+    );
+}
+
+#[test]
+fn test_bnext_does_not_block_when_dirty_buffer_has_another_view_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys(":enew<CR>"); // second buffer so :bnext has somewhere to go
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    engine.open_editor_group(SplitDirection::Vertical); // second view of the dirty buffer
+    let before = engine.active_buffer_id();
+
+    let action = type_command_action(&mut engine, "bnext");
+    assert_eq!(
+        action,
+        EngineAction::None,
+        "another view of the dirty buffer survives, so :bnext must not block"
+    );
+    assert_ne!(engine.active_buffer_id(), before);
+}
+
+#[test]
+fn test_edit_blocks_on_dirty_buffer_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let action = type_command_action(&mut engine, "edit somefile_1190.txt");
+    assert_eq!(action, EngineAction::Error);
+    assert!(engine.message.contains("No write since last change"));
+}
+
+#[test]
+fn test_edit_bang_bypasses_dirty_guard_1190() {
+    let mut engine = Engine::new();
+    engine.settings.hidden = false;
+    engine.feed_keys("ihello<Esc>");
+    assert!(engine.dirty());
+    let action = type_command_action(&mut engine, "edit! somefile_1190.txt");
+    assert_eq!(
+        action,
+        EngineAction::OpenFile(std::path::PathBuf::from("somefile_1190.txt"))
+    );
+}
+
 // -- Window move (<C-w>H/J/K/L) --
 
 #[test]
@@ -30245,6 +32993,54 @@ fn test_gf_open_file_with_line_and_col_suffix() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- "# (alternate-file register): `:e other.txt`, <C-^>, "#p (#1161) ---
+
+#[test]
+fn test_alternate_file_register_hash() {
+    let dir = std::env::temp_dir().join("vimcode_test_alt_reg_1161");
+    let _ = std::fs::create_dir_all(&dir);
+    let file_a = dir.join("first.txt");
+    let file_b = dir.join("other.txt");
+    std::fs::write(&file_a, "x").unwrap();
+    std::fs::write(&file_b, "y").unwrap();
+
+    let mut engine = Engine::new();
+    // `:e first.txt` — no alternate yet (only one file has ever been opened).
+    engine
+        .open_file_with_mode(&file_a, OpenMode::Permanent)
+        .unwrap();
+    assert_eq!(
+        engine.get_register_content('#'),
+        Some((String::new(), RegType::Charwise))
+    );
+
+    // `:e other.txt` — first.txt becomes the alternate file.
+    engine
+        .open_file_with_mode(&file_b, OpenMode::Permanent)
+        .unwrap();
+
+    // <C-^> — swap back to first.txt; other.txt is now the alternate.
+    press_ctrl(&mut engine, '6');
+    assert_eq!(
+        engine.active_buffer_state().file_path.as_deref(),
+        Some(file_a.as_path()),
+        "Ctrl-^ should have switched back to first.txt"
+    );
+
+    // "#p should paste "other.txt" (the alternate file's name), matching
+    // what <C-^> itself would switch to.
+    press_char(&mut engine, '"');
+    press_char(&mut engine, '#');
+    press_char(&mut engine, 'p');
+    assert!(
+        engine.buffer().to_string().contains("other.txt"),
+        "\"#p should have pasted the alternate filename \"other.txt\"; buffer is: {:?}",
+        engine.buffer().to_string()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_gf_no_file_shows_message() {
     let mut engine = Engine::new();
@@ -30475,6 +33271,104 @@ fn test_tab_bar_handle_click_close_dirty_tab_returns_true() {
     assert_eq!(engine.active_group().tabs.len(), 2);
 }
 
+// #1038: closing one of several views of a dirty buffer must not prompt —
+// only closing the *last* view should. `Engine::dirty()` is buffer-level and
+// has no idea how many windows display that buffer, so the tab-bar close
+// path used to prompt on every close, however many views remained. The `:q`
+// path already got this right (see `execute.rs`'s "quit" handler); this test
+// covers the tab-bar path sharing the same `buffer_has_other_views` check.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_other_view_does_not_confirm() {
+    let mut engine = Engine::new();
+    // Split into a second editor group showing the *same* buffer.
+    engine.open_editor_group(SplitDirection::Vertical);
+    let group_a = engine.prev_active_group.unwrap();
+    let group_b = engine.active_group;
+    assert_ne!(group_a, group_b);
+
+    // Dirty the shared buffer.
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    // Closing group B's tab must NOT prompt — group A still shows the buffer.
+    let needs_confirm = engine.handle_tab_bar_click(group_b, TabBarClickTarget::CloseTab(0));
+    assert!(!needs_confirm, "another view remains — must not prompt");
+    assert!(
+        !engine.editor_groups.contains_key(&group_b),
+        "the closed group should be gone"
+    );
+    assert!(
+        engine.editor_groups.contains_key(&group_a),
+        "the other view's group must survive"
+    );
+    // The buffer is still open (and still dirty) in the surviving group.
+    assert!(engine
+        .buffer_manager
+        .get(engine.active_buffer_id())
+        .is_some());
+    assert!(engine.dirty());
+
+    // Negative case: closing the *last* remaining view of the still-dirty
+    // buffer must still prompt. Without the other-views check this would
+    // also pass trivially — the check has to actually gate on something.
+    engine.active_group = group_a;
+    let needs_confirm = engine.handle_tab_bar_click(group_a, TabBarClickTarget::CloseTab(0));
+    assert!(
+        needs_confirm,
+        "last view of a dirty buffer must still prompt"
+    );
+}
+
+// #1038 regression: the tab-bar close path's "does another view survive"
+// check must exclude the *entire* set of windows the closing tab owns, not
+// just the currently-focused window. An in-tab split (`:split`/`:vsplit`
+// with no file argument, i.e. `Engine::split_window`) puts a second
+// `Window` on the *same* buffer inside the *same* tab that's about to be
+// closed — that sibling window is destroyed along with the rest of the tab
+// by `close_tab`, so it must not count as a surviving view. Before this
+// fix, the check excluded only the active window, found the
+// about-to-be-destroyed sibling split, and concluded (wrongly) that
+// another view survives — so no confirmation was shown and the whole tab
+// (both windows) closed silently, discarding the dirty buffer's only copy.
+#[test]
+fn test_tab_bar_handle_click_close_dirty_tab_with_in_tab_split_still_confirms() {
+    let mut engine = Engine::new();
+    // Split the *current* tab (not a new editor group) so both windows
+    // belong to the same tab and share the same buffer.
+    engine.split_window(SplitDirection::Vertical, None);
+    assert_eq!(
+        engine.active_tab().window_ids().len(),
+        2,
+        "setup: the split must land in the current tab, not a new group"
+    );
+
+    engine.buffer_mut().insert(0, "dirty");
+    engine
+        .buffer_manager
+        .get_mut(engine.active_buffer_id())
+        .unwrap()
+        .dirty = true;
+
+    let group_id = engine.active_group;
+    let tab_idx = engine.active_group().active_tab;
+    let needs_confirm = engine.handle_tab_bar_click(group_id, TabBarClickTarget::CloseTab(tab_idx));
+    assert!(
+        needs_confirm,
+        "closing a tab whose only other view is an in-tab split being \
+         destroyed in the same operation must still prompt — that split is \
+         not a surviving view (#1038)"
+    );
+    // Confirmation was requested, so the caller (not this call) is
+    // responsible for actually closing — the tab and both its windows
+    // must still be open.
+    assert_eq!(engine.active_group().tabs.len(), 1);
+    assert_eq!(engine.active_tab().window_ids().len(), 2);
+}
+
 // --- Explorer reveal on tab switch (#232) ---
 
 fn explorer_selected_file(engine: &Engine) -> Option<std::path::PathBuf> {
@@ -30692,7 +33586,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
             sections: vec![],
         },
     );
-    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 9).
+    // Simulate "beta" ext panel being focused (sorted index 1 → toolbar idx 10).
     engine.ext_panel_has_focus = true;
     engine.ext_panel_active = Some("beta".to_string());
 
@@ -30706,10 +33600,11 @@ fn test_ext_panel_h_focuses_activity_bar() {
         engine.activity_bar_focused,
         "activity_bar_focused should be set"
     );
-    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 9.
+    // "beta" is sorted index 1 (["alpha", "beta"]) → toolbar index 10 (#521
+    // added Board as a 7th fixed panel, moving TOOLBAR_IDX_EXT_BASE 8 -> 9).
     assert_eq!(
-        engine.activity_bar_selected, 9,
-        "toolbar index should be 8 + sorted_idx"
+        engine.activity_bar_selected, 10,
+        "toolbar index should be TOOLBAR_IDX_EXT_BASE + sorted_idx"
     );
 }
 
@@ -30717,7 +33612,7 @@ fn test_ext_panel_h_focuses_activity_bar() {
 fn test_ext_panel_left_focuses_activity_bar() {
     use crate::core::plugin::PanelRegistration;
     let mut engine = Engine::new();
-    // Register one ext panel (sorted index 0 → toolbar idx 8).
+    // Register one ext panel (sorted index 0 → toolbar idx 9).
     engine.ext_panels.insert(
         "mypanel".to_string(),
         PanelRegistration {
@@ -30735,7 +33630,130 @@ fn test_ext_panel_left_focuses_activity_bar() {
 
     assert!(!engine.ext_panel_has_focus);
     assert!(engine.activity_bar_focused);
-    assert_eq!(engine.activity_bar_selected, 8);
+    assert_eq!(engine.activity_bar_selected, 9);
+}
+
+// --- #1088: ext panel reveal-by-id match rule ---
+
+/// Registers a "test-panel" extension panel with a single "Log" section
+/// carrying `items`, mirroring how `git_log_panel.lua` populates
+/// `engine.ext_panel_items` via `panel.set_items`.
+fn engine_with_ext_panel_items(items: Vec<crate::core::plugin::ExtPanelItem>) -> Engine {
+    use crate::core::plugin::PanelRegistration;
+    let mut engine = Engine::new();
+    engine.ext_panels.insert(
+        "test-panel".to_string(),
+        PanelRegistration {
+            name: "test-panel".to_string(),
+            title: "Test Panel".to_string(),
+            icon: 'T',
+            fallback_icon: Some('T'),
+            sections: vec!["Log".to_string()],
+        },
+    );
+    engine
+        .ext_panel_items
+        .insert(("test-panel".to_string(), "Log".to_string()), items);
+    engine
+}
+
+/// Rule 1: an exact `id` match wins outright, even when a longer id would
+/// also satisfy the (now gone) fuzzy `starts_with` arms.
+#[test]
+fn ext_panel_find_flat_index_matches_exact_id() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: "abc".to_string(),
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: "abcdef".to_string(),
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 is the "Log" section header; items start at 1.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "abc"),
+        Some(1),
+        "an exact id match must win, landing on the \"abc\" row (flat index 1)"
+    );
+}
+
+/// Rule 2: a short-hash query with no exact match falls back to a hash-prefix
+/// match against the one row whose full id starts with it.
+#[test]
+fn ext_panel_find_flat_index_matches_unambiguous_hash_prefix() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![ExtPanelItem {
+        id: "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ..Default::default()
+    }]);
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(1),
+        "a short-hash query must prefix-match the one full-hash commit row"
+    );
+}
+
+/// #1088 regression: `git_log_panel.lua` gives separators (and some other
+/// rows) an empty `id`. The old three-way-fuzzy match
+/// (`item_id.starts_with(&items[vi].id)`) treated an empty id as a prefix of
+/// *every* query, so a separator listed ahead of the target commit won the
+/// match instead. Empty ids must never match, exact or prefix.
+#[test]
+fn ext_panel_find_flat_index_never_matches_an_empty_id() {
+    use crate::core::plugin::ExtPanelItem;
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: String::new(),
+            is_separator: true,
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 = section header, 1 = separator, 2 = the commit row.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(2),
+        "the empty-id separator (flat index 1) must never match; the query \
+         must resolve to the commit row (flat index 2) instead"
+    );
+}
+
+/// #1088 regression: a `<hash>:<path>` file-child row shares its parent
+/// commit's hash prefix and must never satisfy a hash-prefix match itself —
+/// only a top-level (non-child) row can. Ordered with the child *before* its
+/// parent in the backing `Vec` to prove the exclusion isn't just an accident
+/// of list order.
+#[test]
+fn ext_panel_find_flat_index_prefix_match_excludes_hash_path_children() {
+    use crate::core::plugin::ExtPanelItem;
+    let hash = "26cf7ef8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let engine = engine_with_ext_panel_items(vec![
+        ExtPanelItem {
+            id: format!("{hash}:src/main.rs"),
+            parent_id: hash.to_string(),
+            ..Default::default()
+        },
+        ExtPanelItem {
+            id: hash.to_string(),
+            expandable: true,
+            expanded: true,
+            ..Default::default()
+        },
+    ]);
+    // flat index 0 = section header, 1 = the child row, 2 = the commit row.
+    assert_eq!(
+        engine.ext_panel_find_flat_index("test-panel", "Log", "26cf7ef8"),
+        Some(2),
+        "the hash-prefix match must land on the commit row (flat index 2), \
+         never on its file child (flat index 1) even though the child's id \
+         also starts with the queried hash"
+    );
 }
 
 // --- Context menu hit regions ---
@@ -31380,4 +34398,633 @@ fn test_x_count_counts_cells_not_codepoints() {
         "z",
         "2x must delete 2 cells (4 codepoints), not 2 codepoints"
     );
+}
+
+// ── normalize_key_token: <C-Space>/<C-Tab> case preservation (#1151 review) ──
+//
+// `encode_keypress` spells these two named keys with capital S/T
+// (`<C-Space>`, `<C-Tab>`) when it turns a live keypress into the string used
+// for keymap matching — unlike every other `<C-x>` combo, which it
+// lowercases. Before this fix, `normalize_key_token` lowercased everything
+// after `C-` unconditionally, so a keymap token written `<C-Space>` (vim's
+// own spelling, and vimcode's own default completion-trigger key,
+// `Settings::completion_trigger_key` in settings.rs) normalized to
+// `<C-space>` and could never match a real Ctrl+Space keypress again.
+
+#[test]
+fn normalize_key_token_preserves_ctrl_space_case() {
+    assert_eq!(normalize_key_token("<C-Space>"), "<C-Space>");
+    assert_eq!(normalize_key_token("<c-space>"), "<C-Space>");
+    assert_eq!(normalize_key_token("<C-SPACE>"), "<C-Space>");
+}
+
+#[test]
+fn normalize_key_token_preserves_ctrl_tab_case() {
+    assert_eq!(normalize_key_token("<C-Tab>"), "<C-Tab>");
+    assert_eq!(normalize_key_token("<c-tab>"), "<C-Tab>");
+    assert_eq!(normalize_key_token("<C-TAB>"), "<C-Tab>");
+}
+
+#[test]
+fn normalize_key_token_still_lowercases_ordinary_ctrl_combos() {
+    // Every other <C-x> combo is a single character and stays lowercased —
+    // only the two named keys above get the mixed-case treatment.
+    assert_eq!(normalize_key_token("<C-J>"), "<C-j>");
+    assert_eq!(normalize_key_token("<C-X>"), "<C-x>");
+}
+
+#[test]
+fn normalized_ctrl_space_round_trips_through_encode_keypress() {
+    // The whole point: a keymap token normalized from user input must equal
+    // what a live Ctrl+Space keypress encodes to, so `try_user_keymap`'s
+    // exact-match comparison actually fires.
+    assert_eq!(
+        normalize_key_token("<C-Space>"),
+        encode_keypress("Space", None, true)
+    );
+    assert_eq!(
+        normalize_key_token("<C-Tab>"),
+        encode_keypress("Tab", None, true)
+    );
+}
+
+// ── #1206: 'whichwrap' ───────────────────────────────────────────────────
+
+#[test]
+fn test_1206_whichwrap_h_does_not_wrap_by_default() {
+    // Default 'whichwrap' is "b,s" — h/l must NOT wrap, matching vimcode's
+    // pre-#1206 hardcoded (never-wrap) `h`/`l` behavior.
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("h");
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_h_wraps_to_previous_line_when_configured() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=h<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("h");
+    assert_eq!(
+        engine.cursor().line,
+        0,
+        "h must wrap onto the previous line"
+    );
+    assert_eq!(
+        engine.cursor().col,
+        4,
+        "lands on 'first''s last char (index 4)"
+    );
+}
+
+#[test]
+fn test_1206_whichwrap_l_wraps_to_next_line_when_configured() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=l<CR>");
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 4; // last char of "first"
+    engine.feed_keys("l");
+    assert_eq!(engine.cursor().line, 1, "l must wrap onto the next line");
+    assert_eq!(engine.cursor().col, 0);
+}
+
+/// RED against unfixed `develop` (#1206): before this change, Normal-mode
+/// `<BS>` had no handling at all (silently no-op'd) — this fails against
+/// that dead binding. Default `'whichwrap'` includes `b`, so this wraps out
+/// of the box.
+#[test]
+fn test_1206_whichwrap_backspace_key_wraps_by_default() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("<BS>");
+    assert_eq!(
+        engine.cursor().line,
+        0,
+        "<BS> must wrap by default (b in whichwrap)"
+    );
+    assert_eq!(engine.cursor().col, 4);
+}
+
+/// RED against unfixed `develop` (#1206): Normal-mode `<Space>` had no
+/// handling at all before this change either.
+///
+/// `settings.leader` defaults to `' '` (space) too (vimcode's own
+/// pre-existing, unrelated choice — matches the common modern-vimrc
+/// `<Space>`-as-leader convention), and the leader-key check in
+/// `handle_normal_key` runs *before* this motion, so it must be changed
+/// here or a plain `<Space>` will never reach `whichwrap`'s `s` handling at
+/// all under vimcode's real defaults — that's a pre-existing precedence
+/// choice, not something #1206 changes.
+#[test]
+fn test_1206_whichwrap_space_key_wraps_by_default() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.settings.leader = ',';
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 4;
+    // `feed_keys(" ")` synthesizes a literal-char keypress (key_name " "),
+    // not the real "Space" named key `tui_main::shell_app` actually sends
+    // for the space bar — call `handle_key` directly with that real name
+    // (matches the existing `handle_key("space", Some(' '), false)`
+    // convention other tests in this file already use).
+    engine.handle_key("space", Some(' '), false);
+    assert_eq!(
+        engine.cursor().line,
+        1,
+        "<Space> must wrap by default (s in whichwrap)"
+    );
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_left_right_arrows_normal_mode() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=<,><CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.feed_keys("<Left>");
+    assert_eq!(engine.cursor().line, 0);
+    assert_eq!(engine.cursor().col, 4);
+    engine.feed_keys("<Right>");
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+}
+
+#[test]
+fn test_1206_whichwrap_insert_mode_left_right_use_bracket_tokens() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set whichwrap+=[,]<CR>");
+    engine.feed_keys("gg0i"); // insert mode, line 0 col 0
+    engine.feed_keys("<Left>");
+    // Insert-mode Left at col 0 of the first line has no previous line to
+    // wrap to — must stay put, not panic/underflow.
+    assert_eq!(engine.cursor().line, 0);
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 5; // end of "first" in insert-mode terms
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<Right>");
+    assert_eq!(engine.cursor().line, 1, "] must let Insert-mode Right wrap");
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+}
+
+// ── #1206: 'backspace' ───────────────────────────────────────────────────
+
+#[test]
+fn test_1206_backspace_default_still_joins_lines_at_col_zero() {
+    // Default "indent,eol,start" must reproduce vimcode's pre-#1206
+    // hardcoded (always-join) BackSpace behavior exactly.
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<BS>");
+    assert_eq!(engine.buffer().to_string(), "firstsecond\n");
+    engine.feed_keys("<Esc>");
+}
+
+/// RED against unfixed `develop` (#1206): before this option existed,
+/// BackSpace always joined lines at column 0 regardless of any setting —
+/// this fails against that hardcoded behavior.
+#[test]
+fn test_1206_backspace_without_eol_does_not_join_lines() {
+    let mut engine = engine_with_text("first\nsecond\n");
+    engine.feed_keys(":set backspace-=eol<CR>");
+    engine.view_mut().cursor.line = 1;
+    engine.view_mut().cursor.col = 0;
+    engine.set_mode(crate::core::Mode::Insert);
+    engine.feed_keys("<BS>");
+    assert_eq!(
+        engine.buffer().to_string(),
+        "first\nsecond\n",
+        "without 'eol', BackSpace at column 0 must not join lines"
+    );
+    assert_eq!(engine.cursor().line, 1);
+    assert_eq!(engine.cursor().col, 0);
+    engine.feed_keys("<Esc>");
+}
+
+/// RED against unfixed `develop` (#1206): before this option existed,
+/// BackSpace could always delete back through pre-existing text with no
+/// concept of "where this Insert session started" — this fails against
+/// that unrestricted behavior.
+#[test]
+fn test_1206_backspace_without_start_stops_at_insert_start() {
+    let mut engine = engine_with_text("hello world\n");
+    engine.feed_keys(":set backspace=indent,eol<CR>"); // no 'start'
+    engine.view_mut().cursor.line = 0;
+    engine.view_mut().cursor.col = 6; // just before "world"
+    engine.set_mode(crate::core::Mode::Insert);
+    // insert_enter_line/col are only recorded by the mode-transition
+    // tracked in `handle_key` — enter Insert via a real command so that
+    // bookkeeping runs, rather than poking `self.mode` directly above.
+    engine.set_mode(crate::core::Mode::Normal);
+    engine.view_mut().cursor.col = 6;
+    engine.feed_keys("i");
+    engine.feed_keys("X"); // type one char — cursor now at col 7
+    assert_eq!(engine.buffer().to_string(), "hello Xworld\n");
+    engine.feed_keys("<BS>"); // deletes the typed "X" — col back to 6
+    assert_eq!(engine.buffer().to_string(), "hello world\n");
+    engine.feed_keys("<BS>"); // at insert-start boundary, 'start' absent: no-op
+    assert_eq!(
+        engine.buffer().to_string(),
+        "hello world\n",
+        "without 'start', BackSpace must not delete past where Insert began"
+    );
+    engine.feed_keys("<Esc>");
+}
+
+// ── #1206: 'sidescrolloff' / 'scrolljump' ─────────────────────────────────
+
+#[test]
+fn test_1206_sidescrolloff_keeps_columns_visible() {
+    let mut engine = Engine::new();
+    let long_line = "x".repeat(200);
+    engine.buffer_mut().insert(0, &format!("{long_line}\n"));
+    engine.update_syntax();
+    engine.settings.wrap = false;
+    engine.settings.sidescrolloff = 10;
+    engine.view_mut().viewport_cols = 40;
+
+    engine.view_mut().cursor.col = 150;
+    engine.ensure_cursor_visible();
+    let scroll_left = engine.view().scroll_left;
+    assert!(
+        engine.cursor().col >= scroll_left + 10,
+        "sidescrolloff=10: cursor should keep >= 10 cols from the left edge ({scroll_left})"
+    );
+    assert!(
+        engine.cursor().col + 10 <= scroll_left + 40,
+        "sidescrolloff=10: cursor should keep >= 10 cols from the right edge ({scroll_left})"
+    );
+}
+
+#[test]
+fn test_1206_scrolljump_scrolls_at_least_the_configured_amount() {
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..100 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.update_syntax();
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+    engine.settings.scrolljump = 10;
+
+    // Cursor moves one line past the bottom edge (would need scroll_top=1
+    // with scrolljump's default of 1) — with scrolljump=10 the scroll must
+    // jump by at least 10 lines instead of the bare minimum.
+    engine.view_mut().cursor.line = 20;
+    engine.ensure_cursor_visible();
+    assert!(
+        engine.view().scroll_top >= 10,
+        "scrolljump=10: a bottom-edge scroll must move at least 10 lines ({})",
+        engine.view().scroll_top
+    );
+}
+
+#[test]
+fn test_1206_scrolljump_default_matches_pre_existing_minimal_scroll() {
+    // scrolljump=1 (the default) must reproduce vimcode's pre-#1206 exact
+    // "scroll the minimal amount" behavior.
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..100 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.update_syntax();
+    engine.view_mut().viewport_lines = 20;
+    engine.view_mut().scroll_top = 0;
+
+    engine.view_mut().cursor.line = 20;
+    engine.ensure_cursor_visible();
+    assert_eq!(engine.view().scroll_top, 1);
+}
+
+// ── #1206: 'timeoutlen' ────────────────────────────────────────────────
+
+#[test]
+fn test_1206_timeoutlen_flushes_ambiguous_keymap_prefix_after_elapsed_time() {
+    let mut engine = engine_with_text("hello\n");
+    engine.settings.keymaps.push("n! ab dd".to_string());
+    engine.rebuild_user_keymaps();
+    engine.settings.timeoutlen = 50;
+
+    engine.feed_keys("a");
+    // 'a' alone is an ambiguous prefix of "ab" — must be buffered, not
+    // executed as plain `a` (append) yet.
+    assert!(
+        !engine.keymap_buf.is_empty(),
+        "a lone ambiguous prefix keystroke must be buffered while waiting"
+    );
+    assert!(engine.keymap_buf_deadline.is_some());
+
+    // Simulate the deadline having already elapsed, then run the same idle
+    // tick both backends call periodically.
+    engine.keymap_buf_deadline =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+    let redrew = engine.tick_keymap_timeout();
+    assert!(redrew);
+    assert!(
+        engine.keymap_buf.is_empty(),
+        "the buffer must be flushed once the deadline passes"
+    );
+    // The lone 'a' must have been dispatched as the plain Normal-mode `a`
+    // command (enter Insert mode after the cursor), not silently dropped.
+    assert_eq!(engine.mode, crate::core::Mode::Insert);
+}
+
+#[test]
+fn test_1206_timeoutlen_zero_disables_the_timed_wait() {
+    let mut engine = engine_with_text("hello\n");
+    engine.settings.keymaps.push("n! ab dd".to_string());
+    engine.rebuild_user_keymaps();
+    engine.settings.timeoutlen = 0;
+
+    engine.feed_keys("a");
+    assert!(!engine.keymap_buf.is_empty());
+    assert!(
+        engine.keymap_buf_deadline.is_none(),
+        "'timeoutlen'=0 must not arm a timed flush — matches vimcode's pre-#1206 \
+         (wait indefinitely for a resolving keystroke) behavior"
+    );
+    assert!(!engine.tick_keymap_timeout());
+}
+
+// ── #1160: insert-mode digraphs (<C-k>) and the <C-x> completion submode ──
+
+#[test]
+fn test_1160_ctrl_k_inserts_digraph() {
+    let mut engine = engine_with_text("");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'a');
+    press_char(&mut engine, ':');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "ä");
+}
+
+#[test]
+fn test_1160_ctrl_k_unknown_pair_leaves_buffer_untouched_and_reports() {
+    let mut engine = engine_with_text("");
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'q');
+    press_char(&mut engine, 'q');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "");
+    assert!(engine.message.contains("E790"), "{}", engine.message);
+}
+
+#[test]
+fn test_1160_ctrl_k_custom_digraph_from_ex_command() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraph zz 9733"); // ★
+    press_char(&mut engine, 'i');
+    press_ctrl(&mut engine, 'k');
+    press_char(&mut engine, 'z');
+    press_char(&mut engine, 'z');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "★");
+}
+
+#[test]
+fn test_1160_digraphs_ex_command_via_min_abbreviation() {
+    // `:dig` is Vim's minimum abbreviation for `:digraphs`.
+    let mut engine = engine_with_text("");
+    engine.execute_command("dig");
+    assert!(engine.message.contains("a: ä"), "{}", engine.message);
+}
+
+/// #1302: `Engine::ex_digraphs`'s no-argument listing must match Neovim's
+/// real `listdigraphs` output — `engine.message` should be the same string
+/// `digraphs::format_digraph_table` produces for the builtin table (a
+/// leading blank line, then the `NU ^@  10 ...` grid), reached through the
+/// real ex-command path rather than calling `format_digraph_table`
+/// directly (the in-module `digraphs.rs` unit tests already pin that
+/// formatter's byte-for-byte output; this is the engine-tier twin that
+/// proves `ex_digraphs` actually wires it up).
+///
+/// **Verified RED against unfixed `develop`:** before #1302, `ex_digraphs`
+/// built its own Vim-shaped, one-entry-per-line message via a hand-rolled
+/// loop instead of calling `format_digraph_table`, so `engine.message`
+/// didn't start with `"\nNU ^@  10"` and the assertion below failed.
+#[test]
+fn test_1302_ex_digraphs_lists_builtin_table_matching_format_digraph_table() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraphs");
+    assert!(
+        engine.message.starts_with("\nNU ^@  10"),
+        "`:digraphs` message should start with Neovim's leading blank line \
+         then the `NU ^@  10 ...` row; got: {:?}",
+        &engine.message[..engine.message.len().min(80)]
+    );
+}
+
+/// #1302: `ex_digraphs`'s no-argument listing must list the builtin table
+/// before any `:digraph`-defined custom entries, reached through the real
+/// `self.custom_digraphs` map (not a hand-built iterator, unlike
+/// `digraphs.rs`'s `ex_digraphs_lists_builtin_before_custom` unit test).
+#[test]
+fn test_1302_ex_digraphs_lists_builtin_before_custom_via_real_map() {
+    let mut engine = engine_with_text("");
+    engine.execute_command("digraph zz 9733"); // ★, defines a custom digraph
+    engine.execute_command("digraphs");
+    let nu_pos = engine
+        .message
+        .find("NU ^@")
+        .expect("builtin entry present in the listing");
+    let zz_pos = engine
+        .message
+        .find("zz ★")
+        .expect("custom entry present in the listing");
+    assert!(
+        nu_pos < zz_pos,
+        "the builtin table must precede the custom `:digraph zz` entry; \
+         message: {:?}",
+        engine.message
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_l_completes_whole_line() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "hello world\nhel");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'l');
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert_eq!(line1, "hello world");
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_n_completes_keyword_in_current_buffer() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\nfoo");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'n');
+    let line1: String = engine.buffer().content.line(1).chars().collect();
+    assert!(
+        line1.starts_with("foobar"),
+        "<C-x><C-n> should complete to foobar, got: {line1}"
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_k_completes_from_bundled_dictionary() {
+    let mut engine = engine_with_text("hous");
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'k');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    // Candidates are sorted byte-wise, so a capitalized proper noun already
+    // in the bundled dictionary (e.g. "House", "Houston") can sort ahead of
+    // the plain lowercase word — case-insensitive compare is the real
+    // assertion here, not "which candidate happened to sort first".
+    assert!(
+        line0.eq_ignore_ascii_case("house"),
+        "expected a case-insensitive match for house, got {line0:?}"
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_s_suggests_spelling_fix() {
+    let mut engine = engine_with_text("helo");
+    engine.settings.spell = true;
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 's');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_ne!(
+        line0, "helo",
+        "spelling-suggestion completion should replace the misspelled word"
+    );
+    assert!(!line0.is_empty());
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_s_without_spell_option_reports_message() {
+    let mut engine = engine_with_text("helo");
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 's');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "helo");
+    assert!(engine.message.contains("Spell checking is off"));
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_o_delegates_to_manual_completion_trigger() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "foobar\nfoo");
+    press_char(&mut engine, 'G');
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'o');
+    assert!(
+        engine.completion_candidates.iter().any(|c| c == "foobar"),
+        "{:?}",
+        engine.completion_candidates
+    );
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_e_and_ctrl_y_scroll_the_window() {
+    let mut engine = Engine::new();
+    let mut buf = String::new();
+    for i in 0..50 {
+        buf.push_str(&format!("line {i}\n"));
+    }
+    engine.buffer_mut().insert(0, &buf);
+    engine.view_mut().viewport_lines = 10;
+    // Put the cursor inside the intended scrolled viewport *before* entering
+    // Insert mode: entering Insert calls `ensure_cursor_visible`, which would
+    // otherwise snap a scroll position chosen independently of the cursor
+    // straight back to wherever the cursor already is.
+    engine.view_mut().cursor.line = 8;
+    engine.view_mut().scroll_top = 5;
+    press_char(&mut engine, 'i');
+    assert_eq!(
+        engine.view().scroll_top,
+        5,
+        "sanity: entering Insert must not itself have moved the viewport"
+    );
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'e');
+    assert_eq!(engine.view().scroll_top, 6);
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'y');
+    assert_eq!(engine.view().scroll_top, 5);
+}
+
+#[test]
+fn test_1160_ctrl_x_unbacked_submodes_report_and_do_not_panic() {
+    for (key, needle) in [
+        ('t', "E756"),
+        (']', "E433"),
+        ('i', "E387"),
+        ('v', "Command-line completion not supported"),
+    ] {
+        let mut engine = engine_with_text("");
+        press_char(&mut engine, 'i');
+        press_ctrl(&mut engine, 'x');
+        press_ctrl(&mut engine, key);
+        assert!(
+            engine.message.contains(needle),
+            "key {key:?}: message was {:?}",
+            engine.message
+        );
+    }
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_f_completes_filename_in_cwd() {
+    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vimcode_ctrlxf_target.txt"), "").unwrap();
+
+    let mut engine = engine_with_text("vimcode_ctrlxf_targ");
+    engine.cwd = dir.clone();
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'f');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "vimcode_ctrlxf_target.txt");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_1160_ctrl_x_ctrl_f_wins_over_ctrl_f_find_replace_binding() {
+    // VSCode-mode's default `ctrl_f_action` is "find" (opens find/replace on
+    // a bare `<C-f>` in Insert mode) — `<C-x><C-f>` must still reach filename
+    // completion instead of being swallowed by that global binding (#1160).
+    let dir = std::env::temp_dir().join("vimcode_test_1160_ctrl_x_ctrl_f_vscode");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("vimcode_ctrlxf_vscode_target.txt"), "").unwrap();
+
+    let mut engine = engine_with_text("vimcode_ctrlxf_vscode_targ");
+    engine.cwd = dir.clone();
+    engine.settings.ctrl_f_action = Some("find".to_string());
+    press_char(&mut engine, 'A');
+    press_ctrl(&mut engine, 'x');
+    press_ctrl(&mut engine, 'f');
+    let line0: String = engine.buffer().content.line(0).chars().collect();
+    assert_eq!(line0, "vimcode_ctrlxf_vscode_target.txt");
+    assert!(
+        !engine.find_replace_open,
+        "find/replace must not have opened"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

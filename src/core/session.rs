@@ -24,6 +24,30 @@ pub fn saves_suppressed() -> bool {
     SUPPRESS_SAVES.load(Ordering::Relaxed)
 }
 
+/// When set to `true`, `load()` methods that opt in (currently just
+/// [`HistoryState::load`]) return `Default` instead of reading the real
+/// `~/.config/vimcode/` files. Companion to `SUPPRESS_SAVES` — that flag
+/// only stops *writes*, so `Engine::new()` in a test process still picked up
+/// whatever command history happened to be sitting in the developer
+/// machine's real config directory (#1304).
+static SUPPRESS_LOADS: AtomicBool = AtomicBool::new(false);
+
+/// Permanently suppress opted-in disk loads for the remaining lifetime of
+/// this process. Thread-safe: uses `AtomicBool`; safe to call from multiple
+/// threads. Intended for integration tests only.
+#[allow(dead_code)]
+pub fn suppress_disk_loads() {
+    SUPPRESS_LOADS.store(true, Ordering::Relaxed);
+}
+
+/// Returns `true` if disk loads have been suppressed (i.e. we are running in
+/// an integration-test process). Used by `HistoryState::load()` to avoid
+/// reading the user's real history when called from integration test code
+/// that is compiled without `#[cfg(test)]`.
+pub fn loads_suppressed() -> bool {
+    SUPPRESS_LOADS.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // HistoryState — command/search history in its own file
 // ---------------------------------------------------------------------------
@@ -62,38 +86,80 @@ impl HistoryState {
     /// Load history from history.json.
     /// If history.json is absent, attempts a one-time migration from session.json.
     pub fn load() -> Self {
-        let path = Self::history_path();
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(state) = serde_json::from_str(&contents) {
-                return state;
+        // In-crate unit tests (`cargo test --lib`) never call
+        // `suppress_disk_loads()` — that runtime flag exists for *integration*
+        // tests, which are compiled without `#[cfg(test)]`. So the `#1304`
+        // hazard `save()` already guards against (below) still applied in the
+        // read direction here: `Engine::new()` inside a lib unit test seeded
+        // `engine.history` from whatever was sitting in the developer
+        // machine's real `~/.config/vimcode/history.json`. On a machine whose
+        // history had reached the 100-entry cap that made
+        // `q_colon_opens_a_split_not_a_new_tab_via_shell_app` fail: the marker
+        // command the test appends landed at line 101 of the `[Command
+        // History]` buffer and scrolled off the rendered cmdline window.
+        // Mirror `save()`'s `#[cfg(test)]` no-op so the in-crate lane is
+        // hermetic too, regardless of the host's config dir.
+        #[cfg(test)]
+        return Self::default();
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            if loads_suppressed() {
+                return Self::default();
             }
-        }
-        // history.json not found — try migrating from legacy session.json
-        let session_path = Self::legacy_session_path();
-        if let Ok(contents) = std::fs::read_to_string(&session_path) {
-            if let Ok(legacy) = serde_json::from_str::<LegacySession>(&contents) {
-                if !legacy.command_history.is_empty() || !legacy.search_history.is_empty() {
-                    return Self {
-                        command_history: legacy.command_history,
-                        search_history: legacy.search_history,
-                    };
+            let path = Self::history_path();
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(state) = serde_json::from_str(&contents) {
+                    return state;
                 }
             }
+            // history.json not found — try migrating from legacy session.json
+            let session_path = Self::legacy_session_path();
+            if let Ok(contents) = std::fs::read_to_string(&session_path) {
+                if let Ok(legacy) = serde_json::from_str::<LegacySession>(&contents) {
+                    if !legacy.command_history.is_empty() || !legacy.search_history.is_empty() {
+                        return Self {
+                            command_history: legacy.command_history,
+                            search_history: legacy.search_history,
+                        };
+                    }
+                }
+            }
+            Self::default()
         }
-        Self::default()
     }
 
     /// Save history to history.json using an atomic write.
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::history_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        // Unlike `SessionState::save()`/`ExtensionState::save()`, this used
+        // to have no `SUPPRESS_SAVES` guard at all (#1304): every `:command`
+        // or search that hit `handle_key`'s Enter path called this
+        // unconditionally, so the *entire* test suite was silently
+        // appending every test's typed commands to the real
+        // `~/.config/vimcode/history.json` on whatever machine ran
+        // `cargo test` — confirmed: this repo's own dev machine's real
+        // history.json had accumulated stray `echo hello`/`echo one`/
+        // `echo two` entries from earlier test runs before this fix.
+        #[cfg(test)]
+        return Ok(());
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        if SUPPRESS_SAVES.load(Ordering::Relaxed) {
+            return Ok(());
         }
-        let json = serde_json::to_string_pretty(self)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+
+        #[cfg_attr(test, allow(unreachable_code))]
+        {
+            let path = Self::history_path();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(self)?;
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, &json)?;
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        }
     }
 
     /// Add a command to history (max 100, removes duplicates, moves to end).

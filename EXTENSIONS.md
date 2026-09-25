@@ -128,10 +128,54 @@ refresh_command = ["my-tool", "board", "--json"]  # Argv run to refresh the Boar
                                                    # must print a BoardModel JSON document
                                                    # on stdout and exit zero
 poll_interval_secs = 30                     # Seconds between automatic refreshes
-[board.actions]
-OpenIssue = ["my-tool", "open", "{id}"]     # BoardAction variant name -> argv;
-                                             # "{id}" is replaced with the card id
+tick_command = ["my-tool", "notify"]        # Optional: argv run periodically to nudge a
+                                             # daemon-less pipeline forward, opt-in via the
+                                             # "Board Auto-Tick" setting (default off, #523)
+tick_interval_secs = 300                    # Seconds between tick_command runs (default 300)
+
+# Provider-declared, named board actions (#523) — the card context menu's
+# contents, a stage keybinding table, and (via `OpenIssue`/`OpenReview`-
+# named entries) what `quadraui::BoardAction`'s corresponding variants
+# dispatch to.
+[[board.actions]]
+name = "assign"                             # Action id (also the :context menu key)
+label = "Dispatch Work"                     # Shown in the menu / confirmation dialog
+command = ["my-tool", "assign", "{id}"]     # Argv; "{id}" is replaced with the card id
+# stages = ["col:ready"]                    # Optional: column ids this is valid in
+                                             # (omit/empty = valid in every stage)
+# key = "d"                                 # Optional: single-key binding for the stage
+confirm = true                              # Confirm before running (irreversible/metered)
+
+[[board.actions]]
+name = "OpenReview"                         # Matches a `quadraui::BoardAction::OpenReview`
+label = "Start Review"
+command = ["my-tool", "review", "{id}"]     # Must print a review target as JSON — see below
+
+[board.verdict_commands]                    # Review verdicts (#526), keyed by the
+approve = ["my-tool", "verdict", "{id}",    # generic "approve"/"request-changes"/
+  "--ok", "--body-file", "{body_file}"]     # "comment" tokens; "{body_file}" is a
+request-changes = ["my-tool", "verdict",    # temp file holding the composed review
+  "{id}", "--changes", "--body-file",       # body (never inline)
+  "{body_file}"]
 ```
+
+**`OpenReview` is the one special-cased action name (#525).** Every other
+action is fire-and-forget: vimcode runs the argv, surfaces its exit status
+and trimmed stdout on the status line, and refreshes the board.
+`OpenReview` instead expects its command to print a **review target** as
+JSON on stdout, which vimcode resolves into a local git diff and opens as
+an in-editor multi-file review (the same surface `:Review` uses):
+
+```json
+{ "branch": "issue-42-my-work", "base": "develop", "host": "worker-3" }
+```
+
+`branch` and `base` are required — both are resolved as **local** git
+revisions (three-dot diff), so the branch must already exist in the
+workspace vimcode has open. `host` is optional provenance: when the
+provider's roster spans more than one machine, it is painted in the review
+footer alongside the branch and worktree path, so a human editing files
+there can tell it isn't their own checkout.
 
 ### Field Reference
 
@@ -177,7 +221,7 @@ Override comment style for languages handled by this extension.
 | `block_open` | String | Block comment open (e.g., `"/*"`) |
 | `block_close` | String | Block comment close (e.g., `"*/"`) |
 
-#### `[board]` Section (#522)
+#### `[board]` Section (#522, actions #523)
 
 Declares this extension as a data provider for the Board panel. Generic — no
 particular provider is named or assumed; any external tool that emits
@@ -188,7 +232,21 @@ status badges, matching quadraui's `Board` component) on stdout works here.
 |-------|------|-------------|
 | `refresh_command` | String[] | Argv run for a board refresh. `refresh_command[0]` is the binary, the rest are arguments. Must print a `BoardModel` JSON document to stdout and exit zero. |
 | `poll_interval_secs` | Integer | Seconds between automatic background refreshes (default `30`). |
-| `actions` | Table | Maps a `BoardAction` variant name (e.g. `"OpenIssue"`, `"OpenReview"`) to an argv template run when that action fires. The literal token `{id}` in any argument is substituted with the acted-on card's id. Actions with no entry are simply not runnable. |
+| `verdict_commands` | Table | Maps a review verdict — `"approve"`, `"request-changes"`, or `"comment"` (generic code-review terms, #526) — to an argv template run when that verdict is reported from the change-review surface. `{id}` substitutes the reviewed card's id; `{body_file}` substitutes the path to a temp file holding the composed review body (never sent inline — review bodies contain newlines, code fences and quotes unsafe to splice into an argv). A verdict with no entry is simply not offered. |
+| `tick_command` | String[] | Optional argv run periodically as a fire-and-forget nudge to a daemon-less pipeline (e.g. a "notify" command) — so it doesn't stall just because vimcode is the only client with the board open. Opt-in: only runs when the user enables the "Board Auto-Tick" setting (`board_tick_enabled`, **default off** — a passive viewer must not silently dispatch metered work). |
+| `tick_interval_secs` | Integer | Seconds between `tick_command` runs, when enabled (default `300`). |
+| `actions` | Array of tables (`[[board.actions]]`) | Provider-declared named actions a card can be dispatched through — the right-click context menu's contents, a stage keybinding table, and the target of `quadraui::BoardAction::OpenIssue`/`OpenReview` (matched by `name`) when no more specific handling applies. See the field reference below. |
+
+Each `[[board.actions]]` entry:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | String | Action id. Also matched against `OpenIssue`/`OpenReview` to wire those `BoardAction` variants to a provider command. |
+| `label` | String | Optional human-readable label for the context menu / confirmation dialog (falls back to `name`). |
+| `command` | String[] | Argv to run. The literal token `{id}` in any argument is substituted with the acted-on card's id. An entry with an empty `command` is declared-but-not-runnable. Stdout is surfaced on the status line, **except** for `name = "OpenReview"`, whose stdout must be a review-target JSON document (see above). |
+| `stages` | String[] | Optional column ids this action is valid in. Empty/omitted means valid in every stage. |
+| `key` | String | Optional single-key binding while the Board panel has focus and a card matching one of `stages` is selected (e.g. `"P"`/`"S"`/`"F"` for Test verdicts). `R` is reserved by the host for "open the review for the selected card" and cannot be rebound. |
+| `confirm` | Bool | Whether firing this action needs a Yes/No confirmation first (default `false`) — set this for irreversible or metered actions (dispatch work, merge). |
 
 If no provider extension is installed/configured, the Board panel reports
 "no board provider configured" — every other part of the editor is

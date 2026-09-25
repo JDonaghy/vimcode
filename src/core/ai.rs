@@ -4,7 +4,24 @@
 /// A single message in an AI conversation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AiMessage {
-    pub role: String, // "user" or "assistant"
+    /// "user" or "assistant" for the direct-provider (curl) transport.
+    ///
+    /// The ACP transport (#952, `Engine::poll_acp` in
+    /// `src/core/engine/acp_ops.rs`) also pushes `"assistant-thought"` —
+    /// reused for two different things that happen to render the same way
+    /// (quadraui's "System" role label): genuine `agent_thought_chunk`
+    /// reasoning text, *and* unrelated system/error notices (agent failed
+    /// to start, a request failed, a turn stopped early). That conflation
+    /// satisfies ACP-1's "thoughts are visually distinct from messages"
+    /// bar but is a minor design smell — a follow-up slice may want a
+    /// distinct role (e.g. `"system"`) for the notice case so it isn't
+    /// visually indistinguishable from real agent reasoning.
+    ///
+    /// Only `"user"`/`"assistant"` are ever sent to a direct-provider API
+    /// (`ai_send_message_via_curl` filters the rest) — ACP-only roles like
+    /// `"assistant-thought"` aren't recognised request shapes for
+    /// Anthropic/OpenAI/Ollama.
+    pub role: String,
     pub content: String,
 }
 

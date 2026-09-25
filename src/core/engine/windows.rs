@@ -1,5 +1,145 @@
 use super::*;
 
+/// A window's own `View::viewport_lines`/`viewport_cols` are content-space —
+/// chrome (each window's own status line) already subtracted, per
+/// `Engine::set_viewport_lines`'s doc. `WindowLayout`'s ratio tree, by
+/// contrast, divides *raw* axis space — a Horizontal split's two windows'
+/// raw row counts sum to the tree's full axis size, each then losing one row
+/// to its own status line for display; a Vertical split's two windows' raw
+/// column counts sum to the tree's axis size *minus one* (`WindowLayout::
+/// layout_snapped`'s reserved divider column, #1326), not the full size.
+/// Vertical splits have no equivalent *per-window* row/column chrome column
+/// here (see `resize_window_split`'s `#1288` doc) — the divider column is a
+/// cost the *split* pays once, not each window individually — so a single
+/// window's own `raw_axis_extent` still round-trips through `viewport_cols`
+/// unchanged; only the *pair's* total is one column short of the bounds
+/// width. Used by `split_window_with_new_first` and `resize_window_split` to
+/// convert between the two spaces when recovering or redistributing a
+/// split's axis size (#1288).
+fn raw_axis_extent(view: &View, direction: SplitDirection) -> f64 {
+    match direction {
+        SplitDirection::Horizontal => view.viewport_lines as f64 + 1.0,
+        SplitDirection::Vertical => view.viewport_cols as f64,
+    }
+}
+
+/// Inverse of [`raw_axis_extent`] — writes a raw axis size back into a
+/// window's content-space viewport field.
+fn set_raw_axis_extent(view: &mut View, direction: SplitDirection, raw: f64) {
+    let raw_rounded = raw.round().max(1.0) as usize;
+    match direction {
+        SplitDirection::Horizontal => view.viewport_lines = raw_rounded.saturating_sub(1),
+        SplitDirection::Vertical => view.viewport_cols = raw_rounded,
+    }
+}
+
+/// The current raw axis size (see [`raw_axis_extent`]) a `WindowLayout`
+/// subtree occupies along `direction`, read straight from the leaf
+/// windows' own currently-tracked content sizes — used by
+/// `Engine::resize_window_split` (#1288) to recover a split's total axis
+/// size without reintroducing integer-rounding error (see that function's
+/// doc for why `leaf_size / share` can't be trusted for this).
+fn subtree_raw_extent(
+    layout: &WindowLayout,
+    direction: SplitDirection,
+    windows: &std::collections::HashMap<WindowId, Window>,
+) -> f64 {
+    match layout {
+        WindowLayout::Leaf(id) => windows
+            .get(id)
+            .map(|w| raw_axis_extent(&w.view, direction))
+            .unwrap_or(0.0),
+        WindowLayout::Split {
+            direction: split_dir,
+            first,
+            second,
+            ..
+        } => {
+            if *split_dir == direction {
+                // Stacked along the resize axis: the two children's own
+                // extents add up to the whole.
+                subtree_raw_extent(first, direction, windows)
+                    + subtree_raw_extent(second, direction, windows)
+            } else {
+                // Side-by-side relative to `direction`: both children share
+                // the same extent along it, so either one is representative
+                // (fall back to the other if the first subtree is somehow
+                // empty, e.g. a window not yet in `windows`).
+                let f = subtree_raw_extent(first, direction, windows);
+                if f > 0.0 {
+                    f
+                } else {
+                    subtree_raw_extent(second, direction, windows)
+                }
+            }
+        }
+    }
+}
+
+/// Compute the split's new first-child raw size after an absolute
+/// `[count]` lines/columns resize, given that split's *current* first-child
+/// raw size (see [`subtree_raw_extent`]) and whether the active window is
+/// the first or second child (#1288). Stays entirely in integer-valued raw
+/// space — see `resize_window_split`'s doc for why converting through a
+/// continuous ratio delta instead reintroduces a rounding tie.
+fn resize_new_first_raw(first_raw: f64, is_first: bool, increase: bool, count: usize) -> f64 {
+    let signed_count = if increase {
+        count as f64
+    } else {
+        -(count as f64)
+    };
+    // Active window is the first child → growing it grows `first_raw`
+    // directly; the second child → growing it *shrinks* `first_raw` (the
+    // axis size is fixed, so the second child eats into the first's share).
+    if is_first {
+        first_raw + signed_count
+    } else {
+        first_raw - signed_count
+    }
+}
+
+/// Convert an absolute `[count]` lines/columns resize into the ratio delta
+/// to apply to a split, given that split's current total `axis_size` (see
+/// [`subtree_raw_extent`]) and whether the active window is the split's
+/// first child (#1288 — Neovim moves the window *boundary* by `[count]`
+/// screen lines/columns, not by some fraction of the split). Used only by
+/// the editor-group fallback in `resize_window_split`, whose `axis_size` is
+/// itself already approximate — see that function's doc.
+fn resize_delta_ratio(is_first: bool, increase: bool, count: usize, axis_size: f64) -> f64 {
+    if count == 0 || axis_size <= 0.0 {
+        return 0.0;
+    }
+    let magnitude = count as f64 / axis_size;
+    let signed = if increase { magnitude } else { -magnitude };
+    // Active window is the first child → increasing its share makes it
+    // bigger; the second child → the opposite.
+    if is_first {
+        signed
+    } else {
+        -signed
+    }
+}
+
+/// Neovim's `'winminheight'`/`'winminwidth'` floor — the smallest raw axis
+/// size (see [`raw_axis_extent`]) a window may be shrunk to — used by
+/// `Engine::maximize_window_split` (#1289) to shrink the *other* window down
+/// to its real floor instead of applying a fixed 0.9/0.1 ratio. Neither
+/// setting is wired up as a real `Settings` field yet (both are
+/// `NotImplemented` in `tests/nvim_conformance.rs`'s settings table), so this
+/// hardcodes their shared Neovim default of 1 (one content row for height,
+/// one column for width) rather than reading a field that doesn't exist —
+/// once those settings land, this should read them instead.
+fn min_raw_extent(direction: SplitDirection) -> f64 {
+    match direction {
+        // 1 content row, plus the 1-row status-line chrome `raw_axis_extent`
+        // always adds back for Horizontal splits.
+        SplitDirection::Horizontal => 2.0,
+        // 1 column; Vertical splits have no per-window chrome column here
+        // (see `resize_window_split`'s #1288 doc), so it round-trips as-is.
+        SplitDirection::Vertical => 1.0,
+    }
+}
+
 impl Engine {
     // =======================================================================
     // Window operations
@@ -59,6 +199,22 @@ impl Engine {
             current_buffer_id
         };
 
+        // Opening a file into a split is jump-worthy in Neovim regardless
+        // of line (#1158) -- record the pre-switch position while `self`
+        // still points at the window being left. Skip when leaving a
+        // still-pristine scratch buffer, which real Neovim doesn't record
+        // either (`is_pristine_scratch_buffer`'s doc comment), and skip
+        // when the "new" buffer is actually the same one already open
+        // (e.g. `:split <currently-open-path>`, which `buffer_manager`
+        // dedups by canonical path) -- a same-file reload is not "another
+        // file" in Neovim either (see `open_file_with_mode_impl`).
+        if file_path.is_some()
+            && new_buffer_id != current_buffer_id
+            && !self.is_pristine_scratch_buffer(current_buffer_id)
+        {
+            self.push_jump_location();
+        }
+
         let new_window_id = self.new_window_id();
         let mut new_window = Window::new(new_window_id, new_buffer_id);
 
@@ -71,7 +227,49 @@ impl Engine {
         let tab = self.active_tab_mut();
         tab.layout
             .split_at(current_window_id, direction, new_window_id, new_first);
-        tab.active_window = new_window_id;
+        tab.focus_window(new_window_id);
+
+        // #1288: `WindowLayout::split_at` always starts a fresh split at an
+        // exact 0.5 ratio; give both new sibling windows an immediately
+        // accurate viewport size for the split axis (round-tripped through
+        // `raw_axis_extent`/`set_raw_axis_extent`, mirroring the rounding
+        // `calculate_rects` — via quadraui's `SplitTree` — uses) rather than
+        // leaving both holding the old, undivided size until the next
+        // repaint's `set_viewport_for_window` sync corrects it.
+        // `resize_window_split` needs an accurate *current* size the moment
+        // a resize follows a split in the same breath (e.g.
+        // `<C-w>s5<C-w>-`), and nothing else refreshes it in between.
+        let total_raw = self
+            .windows
+            .get(&current_window_id)
+            .map(|w| raw_axis_extent(&w.view, direction))
+            .unwrap_or(0.0);
+        if total_raw > 0.0 {
+            // #1326: a fresh `Vertical` split reserves one screen column for
+            // the divider bar itself, matching `WindowLayout::layout_snapped`
+            // (a fresh 80-column `<C-w>v` gives `40`/`39`, not `40`/`40`) —
+            // `content_total` is what the 0.5 split actually divides.
+            // `Horizontal` reserves nothing (each window's own status line
+            // already supplies the visual separation), so it round-trips
+            // unchanged.
+            let content_total = match direction {
+                SplitDirection::Vertical => (total_raw - 1.0).max(0.0),
+                SplitDirection::Horizontal => total_raw,
+            };
+            let first_raw = (content_total * 0.5).round();
+            let second_raw = (content_total - first_raw).max(0.0);
+            let (new_raw, old_raw) = if new_first {
+                (first_raw, second_raw)
+            } else {
+                (second_raw, first_raw)
+            };
+            if let Some(w) = self.windows.get_mut(&current_window_id) {
+                set_raw_axis_extent(&mut w.view, direction, old_raw);
+            }
+            if let Some(w) = self.windows.get_mut(&new_window_id) {
+                set_raw_axis_extent(&mut w.view, direction, new_raw);
+            }
+        }
 
         if file_path.is_some() {
             self.message = String::new();
@@ -103,16 +301,41 @@ impl Engine {
             tab.layout = new_layout;
             // Set new active window
             if let Some(new_active) = tab.layout.window_ids().first().copied() {
-                tab.active_window = new_active;
+                tab.focus_window(new_active);
             }
         }
 
         // Remove window from windows map and any scroll-bind pairs that referenced it.
         let closed_buf_id = self.windows.get(&window_id).map(|w| w.buffer_id);
         self.windows.remove(&window_id);
+        // #1307: keep `QuickfixList::open`/`has_focus` honest if `window_id`
+        // was itself a quickfix/location-list panel window closed via this
+        // generic path (e.g. `CTRL-W q`) rather than `qf_close`.
+        self.forget_closed_panel_window(window_id);
+        // #1155: CTRL-W window-close drops the window's location list — it
+        // has no meaning once the window it was scoped to is gone.
+        self.location_lists.remove(&window_id);
         self.prune_jump_list_windows(&[window_id]);
         self.scroll_bind_pairs
             .retain(|&(a, b)| a != window_id && b != window_id);
+        // #1297: closing an ordinary (non-diff) window can orphan a scratch
+        // buffer — e.g. the command-line window (`q:`/`q/`/`q?`) — with no
+        // other window left referencing it. `close_tab()` evicts unreferenced
+        // buffers via `remove_tab_raw`, but this generic single-window-removal
+        // path had no equivalent sweep, so such scratch buffers leaked into
+        // `buffer_manager` forever (visible in `:ls`, cycled by `:bn`/`:bp`).
+        // Mirror the diff-window-pair cleanup below: delete the buffer only
+        // if it's an unlisted scratch buffer and no window still uses it.
+        if let Some(buf_id) = closed_buf_id {
+            let still_used = self.windows.values().any(|w| w.buffer_id == buf_id);
+            if !still_used {
+                if let Some(state) = self.buffer_manager.get(buf_id) {
+                    if state.scratch_name.is_some() {
+                        let _ = self.buffer_manager.delete(buf_id, true);
+                    }
+                }
+            }
+        }
         if let Some((a, b)) = self.diff_window_pair.take() {
             if a == window_id || b == window_id {
                 self.clear_diff_labels(a, b);
@@ -128,10 +351,12 @@ impl Engine {
                     if let Some(new_layout) = tab.layout.remove(partner) {
                         tab.layout = new_layout;
                         if let Some(first) = tab.layout.window_ids().first().copied() {
-                            tab.active_window = first;
+                            tab.focus_window(first);
                         }
                     }
                     self.windows.remove(&partner);
+                    self.forget_closed_panel_window(partner);
+                    self.location_lists.remove(&partner);
                     self.prune_jump_list_windows(&[partner]);
                     self.scroll_bind_pairs
                         .retain(|&(x, y)| x != partner && y != partner);
@@ -170,6 +395,227 @@ impl Engine {
         true
     }
 
+    // ─── Quickfix/location-list panel windows (#1307) ─────────────────────
+    //
+    // `qf_open`/`qf_window` (`src/core/engine/picker.rs`) call these to make
+    // the quickfix/location-list panel a real `WindowLayout` leaf instead of
+    // the sidebar/terminal-style overlay it used to be — so `winnr("$")`
+    // grows and `CTRL-W` navigation reaches it, matching Neovim. Mechanics
+    // live here, alongside `close_window`/`split_window_with_new_first`;
+    // `QuickfixList`-level bookkeeping (`open`/`has_focus`/`items`) stays in
+    // `picker.rs`.
+
+    /// Open (or reuse) the real split window that shows a quickfix/
+    /// location-list panel's content. `target` is `qf_get`'s own `win` shape
+    /// (`None` = global quickfix, `Some(owner)` = window `owner`'s location
+    /// list); `lines` is the panel's current formatted content. Returns the
+    /// window's id.
+    ///
+    /// If `target` already has a real window *in the active tab*, this just
+    /// refreshes its buffer text and returns the existing id — `:copen`
+    /// twice in a row must not open a second window. ("In the active tab"
+    /// because `qf_panel_windows` is a single engine-wide map with no
+    /// per-tab awareness — a known, deliberately out-of-scope simplification
+    /// for #1307: re-running `:copen` from a *different* tab than the one
+    /// the panel was opened in opens a second, independently-tracked window
+    /// rather than reusing the first, the same way most of this codebase's
+    /// window bookkeeping doesn't attempt full cross-tab tracking.)
+    pub(crate) fn qf_ensure_panel_window(
+        &mut self,
+        target: Option<WindowId>,
+        lines: &[String],
+        scratch_name: &'static str,
+    ) -> WindowId {
+        if let Some(&win_id) = self.qf_panel_windows.get(&target) {
+            if self.active_tab().layout.window_ids().contains(&win_id) {
+                self.qf_refresh_panel_window(win_id, lines);
+                return win_id;
+            }
+            // Stale (closed through some other path, or lives in a
+            // different tab — see this method's doc) — recreate below.
+            self.qf_panel_windows.remove(&target);
+        }
+
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&lines.join("\n"));
+            state.dirty = false;
+            state.scratch_name = Some(scratch_name.to_string());
+        }
+        let win_id = self.new_window_id();
+        self.windows.insert(win_id, Window::new(win_id, buf_id));
+
+        // Real Vim's default quickfix/location-list window height (`:h
+        // copen`), confirmed against a live oracle (#1307).
+        const QF_DEFAULT_ROWS: f64 = 10.0;
+
+        match target {
+            None => {
+                // The global quickfix window spans the *entire* tabpage,
+                // full width, at the bottom (`:h copen`) — confirmed against
+                // a live oracle: `:vsplit` then `:copen` still puts the
+                // quickfix window across the full width beneath both vsplit
+                // panes, not nested inside whichever was active. `wrap_full`
+                // (not `split_at`) is what gives it that shape.
+                let total_raw = self
+                    .windows
+                    .get(&self.active_window_id())
+                    .map(|w| raw_axis_extent(&w.view, SplitDirection::Horizontal))
+                    .unwrap_or(0.0);
+                let ratio = if total_raw > QF_DEFAULT_ROWS {
+                    (total_raw - QF_DEFAULT_ROWS) / total_raw
+                } else {
+                    0.5
+                };
+                let tab = self.active_tab_mut();
+                tab.layout
+                    .wrap_full(SplitDirection::Horizontal, win_id, false, ratio);
+                tab.focus_window(win_id);
+            }
+            Some(owner) => {
+                // A location-list window is scoped to its owner window's
+                // own subtree — an ordinary split, same shape as the
+                // command-line window (#1297) — not a full-tab wrap.
+                // Confirmed against a live oracle (#1307).
+                let total_raw = self
+                    .windows
+                    .get(&owner)
+                    .map(|w| raw_axis_extent(&w.view, SplitDirection::Horizontal))
+                    .unwrap_or(0.0);
+                let tab = self.active_tab_mut();
+                tab.layout
+                    .split_at(owner, SplitDirection::Horizontal, win_id, false);
+                tab.focus_window(win_id);
+                if total_raw > 1.0 {
+                    let qf_raw = QF_DEFAULT_ROWS.min(total_raw - 1.0).max(1.0);
+                    let owner_raw = (total_raw - qf_raw).max(1.0);
+                    if let Some(w) = self.windows.get_mut(&owner) {
+                        set_raw_axis_extent(&mut w.view, SplitDirection::Horizontal, owner_raw);
+                    }
+                    if let Some(w) = self.windows.get_mut(&win_id) {
+                        set_raw_axis_extent(&mut w.view, SplitDirection::Horizontal, qf_raw);
+                    }
+                }
+            }
+        }
+
+        self.qf_panel_windows.insert(target, win_id);
+        win_id
+    }
+
+    /// Overwrite an already-open panel window's buffer text — called
+    /// whenever the underlying `QuickfixList`'s items change while its
+    /// window is open (`:grep` re-run, `:colder`/`:cnewer`, ...), so the
+    /// window stays live the way Neovim's own quickfix buffer does.
+    pub(crate) fn qf_refresh_panel_window(&mut self, win_id: WindowId, lines: &[String]) {
+        let Some(window) = self.windows.get(&win_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.buffer.content = ropey::Rope::from_str(&lines.join("\n"));
+            state.dirty = false;
+        }
+    }
+
+    /// Move a panel window's own cursor to line `selected` (clamped to the
+    /// buffer's line count) — keeps the window's visible cursor row in sync
+    /// with `QuickfixList::selected` the way a real Neovim quickfix window's
+    /// cursor always sits on the current entry.
+    pub(crate) fn qf_set_panel_cursor(&mut self, win_id: WindowId, selected: usize) {
+        let Some(window) = self.windows.get(&win_id) else {
+            return;
+        };
+        let buf_id = window.buffer_id;
+        let len_lines = self
+            .buffer_manager
+            .get(buf_id)
+            .map(|s| s.buffer.content.len_lines())
+            .unwrap_or(1);
+        let line = selected.min(len_lines.saturating_sub(1));
+        if let Some(w) = self.windows.get_mut(&win_id) {
+            w.view.cursor.line = line;
+            w.view.cursor.col = 0;
+        }
+    }
+
+    /// Close the real split window for `target` (see
+    /// [`Self::qf_ensure_panel_window`]), restoring focus to whichever
+    /// window was active *before* the panel was opened (`Tab::prev_window`)
+    /// when the panel window was itself the active one — confirmed against a
+    /// live oracle (#1307): `:cclose` returns to the window that was current
+    /// before `:copen`, not simply "the first window in the layout" the way
+    /// the generic `close_window`'s fallback does. A no-op if `target` has
+    /// no real window (the common case — most `:cclose`/`:lclose` calls
+    /// target an already-closed or never-opened panel).
+    ///
+    /// #1307 review: `target`'s panel window can be a different *tab* than
+    /// whichever one is currently active — e.g. `:copen` in tab 1
+    /// (auto-focusing the panel there), `:tabnew` to tab 2, then `:cclose`
+    /// from tab 2. `qf_panel_windows` has no per-tab scoping, so this must
+    /// look up the (group, tab) that actually contains `win_id` via
+    /// `find_window_tab` and mutate *that* tab's layout/`active_window` —
+    /// never blindly `self.active_tab_mut()`, which would silently no-op
+    /// against the wrong tab's layout and leave the owning tab's
+    /// `active_window` dangling (a later panic in `Engine::active_window`
+    /// once that tab becomes active again).
+    pub(crate) fn qf_close_panel_window(&mut self, target: Option<WindowId>) {
+        let Some(win_id) = self.qf_panel_windows.remove(&target) else {
+            return;
+        };
+        if !self.windows.contains_key(&win_id) {
+            return;
+        }
+        let Some((group_id, tab_idx)) = self.find_window_tab(win_id) else {
+            // Not in any tab's layout (shouldn't happen for a live panel
+            // window, but stay defensive rather than mutate the wrong tab).
+            self.windows.remove(&win_id);
+            self.location_lists.remove(&win_id);
+            self.prune_jump_list_windows(&[win_id]);
+            self.scroll_bind_pairs
+                .retain(|&(a, b)| a != win_id && b != win_id);
+            return;
+        };
+        let tab_ref = &self.editor_groups[&group_id].tabs[tab_idx];
+        let was_active = tab_ref.active_window == win_id;
+        let prev = tab_ref.prev_window;
+        {
+            let tab = &mut self.editor_groups.get_mut(&group_id).unwrap().tabs[tab_idx];
+            if let Some(new_layout) = tab.layout.remove(win_id) {
+                tab.layout = new_layout;
+            }
+        }
+        if was_active {
+            let ids = self.editor_groups[&group_id].tabs[tab_idx]
+                .layout
+                .window_ids();
+            let restore = prev
+                .filter(|p| ids.contains(p))
+                .or_else(|| ids.first().copied());
+            if let Some(id) = restore {
+                self.editor_groups.get_mut(&group_id).unwrap().tabs[tab_idx].focus_window(id);
+            }
+        }
+        let buf_id = self.windows.get(&win_id).map(|w| w.buffer_id);
+        self.windows.remove(&win_id);
+        // `target`'s `qf_panel_windows` entry is already gone (removed
+        // above) — no `forget_closed_panel_window` call needed here, unlike
+        // the generic window-close paths, since the caller (`Engine::
+        // qf_close`) sets `list.open`/`has_focus` itself right after this
+        // returns.
+        self.location_lists.remove(&win_id);
+        self.prune_jump_list_windows(&[win_id]);
+        self.scroll_bind_pairs
+            .retain(|&(a, b)| a != win_id && b != win_id);
+        if let Some(buf_id) = buf_id {
+            let still_used = self.windows.values().any(|w| w.buffer_id == buf_id);
+            if !still_used {
+                let _ = self.buffer_manager.delete(buf_id, true);
+            }
+        }
+        self.repair_window_in_tab(group_id, tab_idx);
+    }
+
     /// Close all windows except the active one in the current tab.
     pub fn close_other_windows(&mut self) {
         let active_window_id = self.active_window_id();
@@ -190,6 +636,8 @@ impl Engine {
         self.prune_jump_list_windows(&windows_to_close);
         for id in windows_to_close {
             self.windows.remove(&id);
+            self.forget_closed_panel_window(id);
+            self.location_lists.remove(&id);
             self.scroll_bind_pairs.retain(|&(a, b)| a != id && b != id);
             if let Some((a, b)) = self.diff_window_pair {
                 if a == id || b == id {
@@ -252,6 +700,14 @@ impl Engine {
     }
 
     /// Switch `active_group` to whichever group owns `window_id`.
+    ///
+    /// Does **not** make `window_id` itself the active window within that
+    /// group — a group's own `active_window` is a separate field (the intra-
+    /// group vim-split pane, e.g. after `:vsplit`), untouched here. Most
+    /// callers pair this with something that also sets `active_window` as a
+    /// side effect (`set_cursor_for_window`, `Engine::mouse_click`); a caller
+    /// that wants "become the active pane" with no other side effect (no
+    /// cursor move, no scroll) wants [`Self::activate_window`] instead.
     pub(crate) fn focus_group_for_window(&mut self, window_id: WindowId) {
         for (&gid, group) in &self.editor_groups {
             for (ti, tab) in group.tabs.iter().enumerate() {
@@ -269,12 +725,63 @@ impl Engine {
         }
     }
 
+    /// Make `window_id` the active window — switches `active_group` first
+    /// via [`Self::focus_group_for_window`] (a no-op if it's already
+    /// active), then points that group's own `active_window` at it, without
+    /// touching cursor or scroll position.
+    ///
+    /// #1187: the minimap's own thumb-drag press needs exactly this — a
+    /// press on a background pane's strip must focus that pane like any
+    /// other click, but a press *inside* the viewport-highlight band must
+    /// not also jump/centre the view (that's `apply_minimap_click`'s job,
+    /// reserved for a press on the bare track). Every existing "make this
+    /// window active" call site bundles that with a cursor move
+    /// (`set_cursor_for_window`) or a buffer click
+    /// (`Engine::mouse_click`); this is the first that needs the activation
+    /// alone.
+    pub(crate) fn activate_window(&mut self, window_id: WindowId) {
+        self.focus_group_for_window(window_id);
+        if self.windows.contains_key(&window_id) {
+            self.active_tab_mut().focus_window(window_id);
+        }
+    }
+
+    /// The window occupying the screen's top-left (`last == false`) or
+    /// bottom-right (`last == true`) corner — the target of `CTRL-W t` /
+    /// `CTRL-W b`.
+    ///
+    /// #1162: vimcode's screen has *two* nested layout levels where Vim has
+    /// one. The outer level is `group_layout` (VSCode-style editor groups);
+    /// each group's active tab then owns its own `WindowLayout` of vim
+    /// splits. "Corner window" therefore means: first/last group in
+    /// `group_layout` order, then first/last window inside that group's
+    /// active tab. Looking at only one level gets a no-op in the other
+    /// level's common case — walking only `group_layout` never moves with a
+    /// single group (a plain `<C-w>s` split), and walking only the active
+    /// tab never leaves the current group when several groups exist.
+    pub(crate) fn corner_window(&self, last: bool) -> Option<WindowId> {
+        let group_ids = self.group_layout.group_ids();
+        let gid = if last {
+            *group_ids.last()?
+        } else {
+            *group_ids.first()?
+        };
+        let group = self.editor_groups.get(&gid)?;
+        let tab = group.tabs.get(group.active_tab)?;
+        let win_ids = tab.window_ids();
+        if last {
+            win_ids.last().copied()
+        } else {
+            win_ids.first().copied()
+        }
+    }
+
     /// Set cursor position for a specific window and make it active.
     /// Clamps line and col to valid buffer positions.
     pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
         // Make the window active
         if self.windows.contains_key(&window_id) {
-            self.active_tab_mut().active_window = window_id;
+            self.active_tab_mut().focus_window(window_id);
 
             // Get buffer and clamp line
             let buffer = self.buffer();
@@ -310,6 +817,7 @@ impl Engine {
 
     /// Create a new tab with an optional file.
     pub fn new_tab(&mut self, file_path: Option<&Path>) {
+        let current_buffer_id = self.active_buffer_id();
         let buffer_id = if let Some(path) = file_path {
             match self.buffer_manager.open_file(path) {
                 Ok(id) => {
@@ -325,6 +833,22 @@ impl Engine {
         } else {
             self.buffer_manager.create()
         };
+
+        // Opening a file into a new tab is jump-worthy in Neovim regardless
+        // of line (#1158) -- record the pre-switch position while `self`
+        // still points at the tab/window being left. Skip when leaving a
+        // still-pristine scratch buffer, which real Neovim doesn't record
+        // either (`is_pristine_scratch_buffer`'s doc comment), and skip
+        // when the "new" buffer is actually the same one already open
+        // (e.g. `:tabnew <currently-open-path>`, which `buffer_manager`
+        // dedups by canonical path) -- a same-file reload is not "another
+        // file" in Neovim either (see `open_file_with_mode_impl`).
+        if file_path.is_some()
+            && buffer_id != current_buffer_id
+            && !self.is_pristine_scratch_buffer(current_buffer_id)
+        {
+            self.push_jump_location();
+        }
 
         let window_id = self.new_window_id();
         let window = Window::new(window_id, buffer_id);
@@ -362,6 +886,8 @@ impl Engine {
         // Remove all windows in this tab
         for window_id in &window_ids {
             self.windows.remove(window_id);
+            self.forget_closed_panel_window(*window_id);
+            self.location_lists.remove(window_id);
             self.scroll_bind_pairs
                 .retain(|&(a, b)| a != *window_id && b != *window_id);
             if let Some((a, b)) = self.diff_window_pair {
@@ -523,6 +1049,7 @@ impl Engine {
                 self.prune_jump_list_windows(&window_ids);
                 for wid in window_ids {
                     self.windows.remove(&wid);
+                    self.forget_closed_panel_window(wid);
                 }
             }
             self.editor_groups.remove(&group_id);
@@ -674,35 +1201,21 @@ impl Engine {
         bs.file_path.clone()
     }
 
-    /// Open the system file manager at the given path's parent directory.
-    pub fn reveal_in_file_manager(&self, path: &Path) {
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("open")
-                .arg("-R")
-                .arg(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
-        // `dir` is only consulted by the xdg-open leg — macOS's `open -R`
-        // takes the file itself and reveals it in its parent.  Binding it
-        // outside this block made it an unused variable on macOS, i.e. a
-        // `-D warnings` failure that only ever fired on the platform #896
-        // is about (Linux CI uses it, so CI stayed green).
-        #[cfg(not(target_os = "macos"))]
-        {
-            let dir = if path.is_dir() {
-                path
-            } else {
-                path.parent().unwrap_or(path)
-            };
-            let _ = std::process::Command::new("xdg-open")
-                .arg(dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+    /// Open the system file manager at the given path's parent directory,
+    /// with it selected. Queues a [`PendingPlatformAction::Reveal`] for the
+    /// runner to carry out through `PlatformServices::reveal_in_file_manager`
+    /// (#1134) — see `Engine::pending_platform_actions`'s doc for why this
+    /// can't shell out directly from here. That method takes the target
+    /// path itself (not its parent) on every backend that implements it for
+    /// real (GTK, macOS, Win-GUI all resolve the parent-and-select
+    /// themselves), so no `path.is_dir()`/`path.parent()` split is needed
+    /// here any more — that used to live in this function only because the
+    /// old macOS leg (`open -R`) and the old Linux fallback leg (the
+    /// freedesktop.org opener, given `<dir>`) disagreed about which one they
+    /// wanted.
+    pub fn reveal_in_file_manager(&mut self, path: &Path) {
+        self.pending_platform_actions
+            .push(PendingPlatformAction::Reveal(path.to_path_buf()));
     }
 
     /// Return the path relative to cwd.
@@ -1480,6 +1993,16 @@ impl Engine {
                 let arg = format!("{}||{}|{}|", panel_name, item_id, action);
                 self.plugin_event("panel_context_menu", &arg);
             }
+            ContextMenuTarget::Board { card_id } => {
+                // #523: `action` is one of the provider-declared action
+                // names `open_board_context_menu` populated the menu from
+                // for this exact card/stage, so it's already known-valid —
+                // `run_board_action_by_name` re-resolving it (rather than
+                // this call site caching the argv) keeps the menu-vs-run
+                // lookup as the single source of truth.
+                let card_id = card_id.clone();
+                self.run_board_action_by_name(&action, card_id);
+            }
         }
 
         Some(action)
@@ -1713,7 +2236,7 @@ impl Engine {
     ) {
         self.active_group = group_id;
         self.active_group_mut().active_tab = tab_idx;
-        self.active_tab_mut().active_window = window_id;
+        self.active_tab_mut().focus_window(window_id);
         self.line_annotations.clear();
         self.blame_annotations_active = false;
         self.tab_mru_touch();
@@ -1945,8 +2468,25 @@ impl Engine {
                     g.active_tab = idx;
                 }
                 self.line_annotations.clear();
+                // Only prompt when closing this tab would remove the last
+                // view of the buffer — another view can still save it, so
+                // silently closing this one loses nothing (#1038). A tab can
+                // own more than one window (an in-tab split on the same
+                // buffer), and `close_tab` destroys all of them together, so
+                // the whole set of the tab's windows — not just the
+                // currently-focused one — must be excluded when looking for
+                // a surviving view.
                 if self.dirty() {
-                    return true; // Caller should show confirmation
+                    let buf_id = self.active_buffer_id();
+                    let closing_windows: Vec<WindowId> = self
+                        .editor_groups
+                        .get(&group_id)
+                        .and_then(|g| g.tabs.get(idx))
+                        .map(|t| t.window_ids())
+                        .unwrap_or_default();
+                    if !self.buffer_has_views_outside(buf_id, &closing_windows) {
+                        return true; // Caller should show confirmation
+                    }
                 }
                 self.close_tab();
             }
@@ -1997,7 +2537,6 @@ impl Engine {
     }
 
     /// Switch to a specific tab (0-indexed).
-    #[allow(dead_code)]
     pub fn goto_tab(&mut self, index: usize) {
         if index < self.active_group().tabs.len() {
             self.active_group_mut().active_tab = index;
@@ -2128,15 +2667,21 @@ impl Engine {
     /// after layout changes (window resize, sidebar toggle, new file open)
     /// and stay there until something else triggers a draw.
     ///
-    /// Where each backend calls it:
-    /// - **TUI** (`tui_main/mod.rs`): inline after `terminal.draw(...)`.
-    /// - **Win-GUI** (`win_gui/mod.rs`): inline after `EndDraw`.
-    /// - **GTK** (`gtk/mod.rs`): inside the `set_draw_func` closure after
-    ///   the immutable engine borrow is dropped. If the call returns true,
-    ///   schedule one more draw via `glib::idle_add_local_once(|| da.queue_draw())`
-    ///   — that's the GTK equivalent of TUI/Win-GUI re-running the paint
-    ///   loop, deferred by one idle tick because GTK's borrow rules don't
-    ///   allow a synchronous re-render from inside a draw callback.
+    /// Where each backend calls it (both post-#540 ShellApp migration —
+    /// `tui_main/mod.rs`'s pre-migration `event_loop`/`win_gui/mod.rs` this
+    /// doc used to cite are both gone):
+    /// - **TUI** (`TuiShellApp::tick`, `tui_main/shell_app.rs`): drains
+    ///   `tab_visible_counts`, populated by the same frame's `TabBars` rung
+    ///   in `render_content`. Setting `Reaction::Redraw` is the async
+    ///   twin of the "schedule one more draw" GTK does below — quadraui's
+    ///   TUI runner is a synchronous per-frame loop, so there is no separate
+    ///   idle handle to defer through.
+    /// - **GTK** (`App::handle_poll_tick`, `src/app.rs`): drains the GTK
+    ///   twin, `App::tab_visible_counts`, same cadence (#1165 — this call
+    ///   was missing entirely before, the exact gap this doc's own
+    ///   "skipping it after a draw is a bug" warns about). If the call
+    ///   returns true, `self.draw_needed.set(true)` schedules the next
+    ///   `tick_dispatch` to return `Reaction::Redraw`.
     ///
     /// The width/scroll change-tracking lets backends avoid an unconditional
     /// extra paint per frame; the feedback loop converges in ≤2 frames
@@ -2203,6 +2748,7 @@ impl Engine {
             self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
+                self.forget_closed_panel_window(wid);
             }
         }
         self.editor_groups.remove(&closing);
@@ -2363,11 +2909,11 @@ impl Engine {
     /// Apply a resolved tab-drag [`DropZone`] to the engine.
     ///
     /// This is the single, backend-agnostic entry point for committing a tab
-    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone with
-    /// `quadraui::compute_drop_zone` (via `render::compute_tab_drop_zone`) and
-    /// then call this method, so the mutation semantics live in exactly one
-    /// place. `source_gid` / `source_tab_idx` identify the dragged tab, captured
-    /// when the drag started.
+    /// drag-and-drop. Both the GTK and TUI backends resolve the drop zone via
+    /// `quadraui::compose::resolve_tab_drop` (through `render::resolve_tab_drop_zone`,
+    /// #1370) and then call this method, so the mutation semantics live in
+    /// exactly one place. `source_gid` / `source_tab_idx` identify the dragged
+    /// tab, captured when the drag started.
     pub fn apply_tab_drop_zone(
         &mut self,
         source_gid: GroupId,
@@ -2432,6 +2978,7 @@ impl Engine {
             self.prune_jump_list_windows(&window_ids);
             for wid in window_ids {
                 self.windows.remove(&wid);
+                self.forget_closed_panel_window(wid);
             }
         }
         self.editor_groups.remove(&group_id);
@@ -2516,6 +3063,35 @@ impl Engine {
     ///
     /// This is the correct handler for sidebar file clicks — it never replaces
     /// the current tab's contents.
+    /// Open `path` into a *specific* window, replacing its buffer in place —
+    /// unlike [`Engine::open_file_in_tab`], this never creates a new tab or
+    /// window. Used by location-list jumps (`qf_jump` in
+    /// `src/core/engine/picker.rs`), which must stay in the window that owns
+    /// the list rather than scattering each entry across new tabs the way
+    /// the window-agnostic global quickfix list does (#1155).
+    pub fn open_file_in_window(&mut self, window_id: WindowId, path: &Path) {
+        let buffer_id = match self.buffer_manager.open_file(path) {
+            Ok(id) => id,
+            Err(e) => {
+                self.message = format!("Error: {}", e);
+                return;
+            }
+        };
+        self.buffer_manager
+            .apply_language_map(buffer_id, &self.settings.language_map);
+        let view = self.restore_file_position(buffer_id);
+        if let Some(w) = self.windows.get_mut(&window_id) {
+            w.buffer_id = buffer_id;
+            w.view = view;
+        }
+        self.refresh_git_diff(buffer_id);
+        if self.dialog.is_none() {
+            self.message = format!("\"{}\"", path.display());
+        }
+        self.lsp_did_open(buffer_id);
+        self.explorer_reveal_path(path);
+    }
+
     pub fn open_file_in_tab(&mut self, path: &Path) {
         // Clear per-buffer virtual text annotations when switching files.
         self.line_annotations.clear();
@@ -2955,6 +3531,11 @@ impl Engine {
         let initial_id = self.active_buffer_id();
         let mut any_opened = false;
         let mut first = true;
+        // `open_file_with_mode` may itself reuse `initial_id` in place for
+        // the first file if it's still the pristine startup scratch buffer
+        // (#1298) -- in which case it's no longer an empty scratch buffer to
+        // clean up below, it *is* one of the restored file buffers.
+        let mut initial_id_reused = false;
 
         for path in &paths {
             if !path.exists() {
@@ -2965,6 +3546,7 @@ impl Engine {
                 if self.open_file_with_mode(path, OpenMode::Permanent).is_ok() {
                     any_opened = true;
                     first = false;
+                    initial_id_reused = self.active_buffer_id() == initial_id;
                 }
             } else {
                 // Each subsequent file gets its own tab.
@@ -2983,8 +3565,13 @@ impl Engine {
             return;
         }
 
-        // Remove the initial empty scratch buffer now that real files are open.
-        let _ = self.delete_buffer(initial_id, true);
+        // Remove the initial empty scratch buffer now that real files are
+        // open -- unless `open_file_with_mode` already renamed it in place
+        // for the first file (#1298), in which case deleting it here would
+        // delete that file's buffer too.
+        if !initial_id_reused {
+            let _ = self.delete_buffer(initial_id, true);
+        }
 
         // Switch focus to the tab showing the previously-active file.
         if let Some(ref ap) = active {
@@ -3155,6 +3742,7 @@ impl Engine {
     pub fn list_buffers(&self) -> String {
         let active = self.active_buffer_id();
         let alternate = self.buffer_manager.alternate_buffer;
+        let active_window = self.active_window_id();
 
         let mut lines = Vec::new();
         for (i, id) in self.buffer_manager.list().iter().enumerate() {
@@ -3165,10 +3753,36 @@ impl Engine {
             let dirty_flag = if state.dirty { "+" } else { " " };
             let name = state.display_name();
             let preview_flag = if state.preview { " [Preview]" } else { "" };
-            lines.push(format!(
-                "{:3} {}{}{} \"{}\"{}",
-                num, active_flag, alt_flag, dirty_flag, name, preview_flag
-            ));
+            // #1282: Neovim's `:ls`/`:buffers` appends `line N` (the cursor
+            // line of whichever window is showing this buffer) for every
+            // buffer that's currently in a window — verified against a live
+            // `nvim --headless -u NONE` `msg_show` event. Not shown for a
+            // buffer with no window at all. Prefer the active window's own
+            // cursor when it's showing this buffer (the common case, and
+            // what a single-window fixture always hits); otherwise fall
+            // back to the first window found displaying it.
+            let line_suffix = self
+                .windows
+                .get(&active_window)
+                .filter(|w| w.buffer_id == *id)
+                .or_else(|| self.windows.values().find(|w| w.buffer_id == *id))
+                .map(|w| format!("line {}", w.view.cursor.line + 1))
+                .unwrap_or_default();
+            lines.push(
+                format!(
+                    "{:3} {}{}{} \"{}\"{}{}{}",
+                    num,
+                    active_flag,
+                    alt_flag,
+                    dirty_flag,
+                    name,
+                    preview_flag,
+                    if line_suffix.is_empty() { "" } else { "  " },
+                    line_suffix,
+                )
+                .trim_end()
+                .to_string(),
+            );
         }
         lines.join("\n")
     }
@@ -3181,9 +3795,51 @@ impl Engine {
     // Window resize (CTRL-W +/-/</>=/|/_)
     // =======================================================================
 
-    /// Resize the active window's parent split by delta steps.
+    /// Resize the active window's parent split by an absolute `[count]`
+    /// lines (Horizontal) or columns (Vertical) — matching Neovim's own
+    /// `CTRL-W -`/`+`/`<`/`>`, which move the window *boundary* by
+    /// `[count]` screen lines/columns, not by some fraction of the split.
     /// `direction`: which split direction to look for (Horizontal for +/-, Vertical for </>).
     /// `increase`: true = make active window/group bigger, false = smaller.
+    ///
+    /// #1288: vimcode used to move the split *ratio* by a fixed 5% per
+    /// count step (`delta_per_step = 0.05`) — the two only ever agreed by
+    /// accident (`CTRL-W +`/`_` happen to land on the same cell as
+    /// Neovim's absolute-count resize for `[count]=5` on a fixed 80x24
+    /// two-window 50/50 split; `-`/`<`/`>` do not).
+    ///
+    /// The window-split branch below instead works entirely in the same
+    /// *integer* raw-line/column space Neovim's own window-frame model
+    /// uses: it reads both child subtrees' current sizes
+    /// (`subtree_raw_extent`), adds or subtracts `count` from whichever
+    /// side the active window is on, and only converts back to a ratio at
+    /// the very end. This — not `ratio + count / axis_size`, which looked
+    /// algebraically equivalent — is required to avoid landing back on a
+    /// fresh `.5`-line rounding tie: `WindowLayout`'s `ratio` field is a
+    /// continuous ideal fraction (a fresh 50/50 split is `ratio = 0.5`
+    /// exactly), but the two windows' *actual* rendered sizes are already
+    /// integers rounded away from that ideal (an odd 23-row split's two
+    /// sides are 12/11 raw, not 11.5/11.5). Computing the delta against the
+    /// idealized `ratio` and only rounding at render time re-derives a new
+    /// idealized ratio that, for plenty of `[count]`s, is *itself* exactly
+    /// on a `.5` tie (verified against #1290's independent-per-side
+    /// rounding for this exact fixture) — reproducing #1290's bug on a
+    /// resize it was never filed against. Anchoring the arithmetic on the
+    /// already-integer current sizes instead means the result is only ever
+    /// `count` away from an already-resolved integer, never a fresh tie.
+    ///
+    /// #1326: `[count]` converts against `axis_size = first_raw + second_raw`
+    /// (`subtree_raw_extent`'s own doc), the sum of both children's *actual*
+    /// current content widths — which, thanks to `split_window_with_new_
+    /// first` and `WindowLayout::layout_snapped` both reserving `Vertical`'s
+    /// one-column divider consistently, already equals the split's content
+    /// width (raw axis size minus one), never the raw bounds width. No
+    /// separate divider-column subtraction is needed here: `new_ratio =
+    /// new_first_raw / axis_size`, and `layout_snapped` multiplies that same
+    /// ratio back by the identical content width, so the two cancel back out
+    /// to exactly `new_first_raw` — the same invariant a `Horizontal` split
+    /// (zero divider thickness, `axis_size` and content width always equal)
+    /// has always relied on.
     ///
     /// #582: tries the active *window*'s split within its tab's
     /// `WindowLayout` first (vim `:split`/`:vsplit` panes) — this was
@@ -3195,29 +3851,45 @@ impl Engine {
     /// `tests/vim_compat_batch.rs::test_ctrl_w_plus_resize`) when the active
     /// tab has no window split in the requested direction, matching vim's
     /// "operate on the current window, or whatever's locally splittable"
-    /// convention.
+    /// convention. The group-layout fallback keeps the simpler (and, for
+    /// the reason above, occasionally imprecise) continuous `ratio +
+    /// count / axis_size` conversion — no test pins its exact resulting
+    /// numbers (only that the ratio changes at all), and giving it the
+    /// same integer-anchored treatment would need walking `GroupLayout`
+    /// subtrees down into each group's *own* `WindowLayout`, a bigger
+    /// change than this fallback's existing test coverage asks for.
     pub(crate) fn resize_window_split(
         &mut self,
         direction: SplitDirection,
         increase: bool,
         count: usize,
     ) {
-        let delta_per_step = 0.05;
-        let delta = if increase {
-            delta_per_step * count as f64
-        } else {
-            -(delta_per_step * count as f64)
-        };
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =
             self.active_tab().layout.parent_split_of(active_window)
         {
             if split_dir == direction {
-                // Active window is in first child → increasing ratio makes it bigger
-                let delta = if is_first { delta } else { -delta };
-                self.active_tab_mut()
-                    .layout
-                    .adjust_ratio_at_index(split_idx, delta);
+                let sizes =
+                    self.active_tab()
+                        .layout
+                        .children_at_index(split_idx)
+                        .map(|(first, second)| {
+                            (
+                                subtree_raw_extent(first, direction, &self.windows),
+                                subtree_raw_extent(second, direction, &self.windows),
+                            )
+                        });
+                if let Some((first_raw, second_raw)) = sizes {
+                    let axis_size = first_raw + second_raw;
+                    if axis_size > 0.0 {
+                        let new_first_raw =
+                            resize_new_first_raw(first_raw, is_first, increase, count);
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.1, 0.9);
+                        self.active_tab_mut()
+                            .layout
+                            .set_ratio_at_index(split_idx, new_ratio);
+                    }
+                }
                 return;
             }
         }
@@ -3225,8 +3897,16 @@ impl Engine {
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                let delta = if is_first { delta } else { -delta };
-                self.group_layout.adjust_ratio_at_index(split_idx, delta);
+                if let Some(ratio) = self.group_layout.ratio_at_index(split_idx) {
+                    let share = if is_first { ratio } else { 1.0 - ratio };
+                    let axis_size = if share > 0.0 {
+                        raw_axis_extent(self.view(), direction) / share
+                    } else {
+                        0.0
+                    };
+                    let delta = resize_delta_ratio(is_first, increase, count, axis_size);
+                    self.group_layout.adjust_ratio_at_index(split_idx, delta);
+                }
             }
         }
     }
@@ -3245,16 +3925,54 @@ impl Engine {
     /// Maximize window in a given direction (CTRL-W _ for height, CTRL-W | for width).
     /// Same window-split-first, group-split-fallback preference as
     /// `resize_window_split` (#582).
+    ///
+    /// #1289: used to set a fixed 0.9/0.1 ratio regardless of split size —
+    /// Neovim instead shrinks the *other* window down to its
+    /// `'winminheight'`/`'winminwidth'` floor ([`min_raw_extent`]) and gives
+    /// everything else to the active window. The two only ever agreed for
+    /// height (`CTRL-W _`), and only by accident: 10% of this harness's
+    /// fixed 23-row budget happens to round down to the same 1-content-row
+    /// floor Neovim uses. Works in the same integer raw-line/column space as
+    /// `resize_window_split` (#1288) for the same reason — see that
+    /// function's doc, including #1326's note on why `axis_size` here is
+    /// already the divider-reserved content width for `Vertical` splits and
+    /// needs no separate adjustment.
     pub(crate) fn maximize_window_split(&mut self, direction: SplitDirection) {
         let active_window = self.active_window_id();
         if let Some((split_idx, split_dir, is_first)) =
             self.active_tab().layout.parent_split_of(active_window)
         {
             if split_dir == direction {
-                let ratio = if is_first { 0.9 } else { 0.1 };
-                self.active_tab_mut()
-                    .layout
-                    .set_ratio_at_index(split_idx, ratio);
+                let sizes =
+                    self.active_tab()
+                        .layout
+                        .children_at_index(split_idx)
+                        .map(|(first, second)| {
+                            (
+                                subtree_raw_extent(first, direction, &self.windows),
+                                subtree_raw_extent(second, direction, &self.windows),
+                            )
+                        });
+                if let Some((first_raw, second_raw)) = sizes {
+                    let axis_size = first_raw + second_raw;
+                    if axis_size > 0.0 {
+                        let other_min_raw = min_raw_extent(direction).min(axis_size);
+                        let new_first_raw = if is_first {
+                            axis_size - other_min_raw
+                        } else {
+                            other_min_raw
+                        };
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.0, 1.0);
+                        // #1289: use the size-derived bound, not the generic
+                        // 0.1..0.9 per-step-resize clamp `set_ratio_at_index`
+                        // applies by default — that clamp would silently
+                        // re-widen the other window straight back out past
+                        // its real floor.
+                        self.active_tab_mut()
+                            .layout
+                            .set_ratio_at_index_bounded(split_idx, new_ratio, 0.0, 1.0);
+                    }
+                }
                 return;
             }
         }
@@ -3262,8 +3980,25 @@ impl Engine {
             self.group_layout.parent_split_of(self.active_group)
         {
             if split_dir == direction {
-                let ratio = if is_first { 0.9 } else { 0.1 };
-                self.group_layout.set_ratio_at_index(split_idx, ratio);
+                if let Some(ratio) = self.group_layout.ratio_at_index(split_idx) {
+                    let share = if is_first { ratio } else { 1.0 - ratio };
+                    let axis_size = if share > 0.0 {
+                        raw_axis_extent(self.view(), direction) / share
+                    } else {
+                        0.0
+                    };
+                    if axis_size > 0.0 {
+                        let other_min_raw = min_raw_extent(direction).min(axis_size);
+                        let new_first_raw = if is_first {
+                            axis_size - other_min_raw
+                        } else {
+                            other_min_raw
+                        };
+                        let new_ratio = (new_first_raw / axis_size).clamp(0.0, 1.0);
+                        self.group_layout
+                            .set_ratio_at_index_bounded(split_idx, new_ratio, 0.0, 1.0);
+                    }
+                }
             }
         }
     }
@@ -3276,9 +4011,31 @@ impl Engine {
             'j' => self.focus_window_direction(SplitDirection::Horizontal, true),
             'k' => self.focus_window_direction(SplitDirection::Horizontal, false),
             'l' => self.focus_window_direction(SplitDirection::Vertical, true),
-            'w' | 'W' => self.focus_next_window(),
+            // #1162: `w` and `W` used to both call `focus_next_window` — `W`
+            // (cycle *backward*, per `:h CTRL-W_W` and this repo's own
+            // VIM_COMPATIBILITY.md row) was silently aliased to `w`. Caught by
+            // the oracle-backed `win:CTRL-W W` case.
+            'w' => self.focus_next_window(),
+            'W' => self.focus_prev_window(),
+            // #1292: real Vim's "previously active window" is tab/split
+            // scoped — `Tab::prev_window`, updated at every focus-changing
+            // call site (see `Tab::focus_window`). Prefer that; a window
+            // that's since been closed or moved out of this tab reads back
+            // as `None`/stale, so re-validate against the *current* tab
+            // layout rather than reviving a dead id. Only when there's no
+            // usable window-level target (single-window tab) does `p` fall
+            // back to the pre-existing VSCode-style editor-group toggle —
+            // this repo's own layer beneath real Vim, which has no such
+            // concept and so cannot arbitrate it.
             'p' => {
-                if let Some(prev) = self.prev_active_group {
+                let win_target = self.active_tab().prev_window.filter(|&w| {
+                    w != self.active_tab().active_window
+                        && self.windows.contains_key(&w)
+                        && self.active_tab().layout.window_ids().contains(&w)
+                });
+                if let Some(prev) = win_target {
+                    self.activate_window(prev);
+                } else if let Some(prev) = self.prev_active_group {
                     if self.editor_groups.contains_key(&prev) {
                         let cur = self.active_group;
                         self.active_group = prev;
@@ -3286,21 +4043,23 @@ impl Engine {
                     }
                 }
             }
+            // #1162: `t`/`b` ("go to top-left"/"bottom-right window", `:h
+            // CTRL-W_t`/`:h CTRL-W_b`) used to walk *only* `self.group_layout`
+            // — the VSCode-style editor-group tree — which is a no-op whenever
+            // there is exactly one editor group, the common case a plain
+            // `<C-w>s`/`<C-w>v` split lives in. Real Vim has no editor groups:
+            // its `t`/`b` name the corner *window* of the whole screen, which
+            // here means descending both levels of the layout — outer group
+            // tree first, then that group's own window tree. See
+            // [`Self::corner_window`].
             't' => {
-                if let Some(first) = self.group_layout.nth_leaf(0) {
-                    if first != self.active_group {
-                        self.prev_active_group = Some(self.active_group);
-                    }
-                    self.active_group = first;
+                if let Some(first) = self.corner_window(false) {
+                    self.activate_window(first);
                 }
             }
             'b' => {
-                let ids = self.group_layout.group_ids();
-                if let Some(&last) = ids.last() {
-                    if last != self.active_group {
-                        self.prev_active_group = Some(self.active_group);
-                    }
-                    self.active_group = last;
+                if let Some(last) = self.corner_window(true) {
+                    self.activate_window(last);
                 }
             }
             // Move
@@ -3496,37 +4255,33 @@ impl Engine {
 
     /// Ctrl-W r/R: rotate windows in the current tab.
     /// `forward=true` rotates downward/rightward, `forward=false` rotates upward/leftward.
+    ///
+    /// Rotates window *identity* through the fixed tree slots (#1291), not
+    /// each slot's content: Neovim's CTRL-W r/R moves which window (buffer +
+    /// view + `winid`) occupies each screen position, so a window that was
+    /// focused before the rotate stays focused after it, just in its new
+    /// position. `Tab::active_window` is a `WindowId`, and no `WindowId`
+    /// here ever changes which `Window` (`self.windows[id]`) it names — only
+    /// which tree leaf holds it — so leaving `active_window` untouched is
+    /// exactly "focus follows the window it was on".
     pub(crate) fn rotate_windows(&mut self, forward: bool) {
         let tab = self.active_tab();
-        let ids = tab.layout.window_ids();
+        let mut ids = tab.layout.window_ids();
         if ids.len() < 2 {
             return;
         }
-        // Collect (buffer_id, view) for each window in layout order
-        let mut data: Vec<_> = ids
-            .iter()
-            .map(|&id| {
-                let w = &self.windows[&id];
-                (w.buffer_id, w.view.clone())
-            })
-            .collect();
-        // Rotate the data
         if forward {
-            // Last element moves to front
-            let last = data.pop().unwrap();
-            data.insert(0, last);
+            // Last window moves to the first slot; every other window
+            // shifts down/right by one slot.
+            let last = ids.pop().unwrap();
+            ids.insert(0, last);
         } else {
-            // First element moves to back
-            let first = data.remove(0);
-            data.push(first);
+            // First window moves to the last slot; every other window
+            // shifts up/left by one slot.
+            let first = ids.remove(0);
+            ids.push(first);
         }
-        // Apply rotated data back
-        for (i, &id) in ids.iter().enumerate() {
-            if let Some(w) = self.windows.get_mut(&id) {
-                w.buffer_id = data[i].0;
-                w.view = data[i].1.clone();
-            }
-        }
+        self.active_tab_mut().layout.set_window_ids_in_order(&ids);
     }
 
     /// Jump to end of C-style comment block (]*  or  ]/).
@@ -3538,9 +4293,13 @@ impl Engine {
             let trimmed = line.trim();
             if trimmed.contains("*/") {
                 self.view_mut().cursor.line = line_idx;
-                // Position cursor at the '*' of '*/'
+                // Position cursor on the '/' of '*/' — Neovim lands on the
+                // *last* character of the closing marker, the mirror image
+                // of `[*`/`[/` landing on the first character of `/*`
+                // (#1280: this used to point at the '*' instead, one column
+                // short of Neovim).
                 if let Some(pos) = line.find("*/") {
-                    let col = line[..pos].chars().count();
+                    let col = line[..pos].chars().count() + 1;
                     self.view_mut().cursor.col = col;
                 } else {
                     self.view_mut().cursor.col = 0;

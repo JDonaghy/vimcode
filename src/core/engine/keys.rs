@@ -91,6 +91,14 @@ impl Engine {
         // this call returns, by `advance_macro_playback`.
         self.command_failed = false;
 
+        // `:s///c` confirm-loop prompt intercepts all keys while a match is
+        // pending an answer (#1031, #801 Phase 2) — highest priority, same
+        // as the other modal-input interceptions below, since none of
+        // Normal/Insert/Command-mode dispatch makes sense mid-prompt.
+        if self.confirm_sub.is_some() {
+            return self.handle_confirm_sub_key(key_name, unicode, ctrl);
+        }
+
         // Spell suggestion selection intercepts all keys.
         if self.spell_suggestions.is_some() {
             self.handle_spell_suggestion_key(key_name, unicode);
@@ -251,6 +259,13 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Change-review surface (#955, ACP-4/#525) intercepts all keys
+        // while open — same "modal overlay owns the keyboard" policy as
+        // diff peek above.
+        if self.change_review.is_some() && self.handle_change_review_key(key_name, unicode) {
+            return EngineAction::None;
+        }
+
         // Editor hover popup intercepts keys when it has focus.
         if self.editor_hover_has_focus {
             // Use unicode char for printable keys (TUI sends key_name="" for them)
@@ -263,8 +278,80 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Quickfix panel intercepts all keys when it has focus.
-        if self.quickfix_has_focus {
+        // Quickfix / active window's location-list panel intercepts all keys
+        // while it has focus. Two ways that can be true: the legacy
+        // `has_focus` flag (#1155; still how any caller that flips
+        // `open`/`has_focus` directly without a real window signals it —
+        // see `Engine::qf_open`'s #1307 doc comment), or — since #1307 —
+        // the active window simply *being* the panel's own real
+        // `WindowLayout` leaf, the same way any other Neovim window has
+        // focus by being current, with no separate flag at all.
+        // `qf_panel_target` resolves that second case; at most one of the
+        // three can name a *different* target than the others in practice
+        // (`qf_open`/`qf_close` keep them in lock-step), so any one being
+        // `Some`/`true` is enough to intercept.
+        let panel_target = self.qf_panel_target(self.active_window_id());
+        let loc_has_focus = self
+            .location_lists
+            .get(&self.active_window_id())
+            .is_some_and(|l| l.has_focus);
+
+        // #1307 review: when the active window *is* a quickfix/location-list
+        // panel's own real `WindowLayout` leaf, `CTRL-W` must be able to
+        // leave it exactly the way it can enter it — a real Neovim quickfix
+        // window is an ordinary window as far as `CTRL-W` navigation is
+        // concerned, even though the block below intercepts everything else
+        // (j/k/Enter/Escape/q/...) as panel-specific navigation. Handle the
+        // chord here, before that catch-all, using the same `pending_key`
+        // sentinel and `execute_wincmd` dispatch `handle_normal_key` uses for
+        // every other window — otherwise `qf_handle_key`'s `_ => None`
+        // fallback silently swallows it and the panel becomes a one-way
+        // door (enterable, not leaveable). Scoped to `panel_target.is_some()`
+        // (a *real* window) rather than the legacy `has_focus`-only overlay
+        // case, which has no `WindowLayout` leaf for `CTRL-W` to reach.
+        if panel_target.is_some() {
+            if ctrl && (key_name == "w" || unicode == Some('w')) {
+                self.pending_key = Some('\x17');
+                return EngineAction::None;
+            }
+            if self.pending_key == Some('\x17') {
+                self.pending_key = None;
+                // Clear the legacy `has_focus` flag for whichever list this
+                // panel window serves *before* dispatching: the sub-command
+                // below can move focus off the panel (or close it outright)
+                // without going through `qf_close`/`Engine::mouse_click` —
+                // otherwise the only two places that clear it — which is
+                // exactly what left it stale and swallowing every
+                // subsequent keystroke system-wide even after focus had
+                // genuinely moved elsewhere (#1307 review). Harmless when
+                // the sub-command keeps focus in the panel (e.g. a resize):
+                // the intercept check below re-derives from `panel_target`
+                // independently, using whichever window ends up active.
+                match panel_target {
+                    Some(None) => self.quickfix.has_focus = false,
+                    Some(Some(owner)) => {
+                        if let Some(list) = self.location_lists.get_mut(&owner) {
+                            list.has_focus = false;
+                        }
+                    }
+                    None => {}
+                }
+                if let Some(ch) = unicode {
+                    let count = self.take_count().max(1);
+                    return self.execute_wincmd(ch, count);
+                }
+                match key_name {
+                    "Left" => self.focus_window_direction(SplitDirection::Vertical, false),
+                    "Down" => self.focus_window_direction(SplitDirection::Horizontal, true),
+                    "Up" => self.focus_window_direction(SplitDirection::Horizontal, false),
+                    "Right" => self.focus_window_direction(SplitDirection::Vertical, true),
+                    _ => {}
+                }
+                return EngineAction::None;
+            }
+        }
+
+        if self.quickfix.has_focus || loc_has_focus || panel_target.is_some() {
             // TUI sends printable keys as `key_name=""` + `unicode=Some(c)`;
             // GTK sends `key_name="j"`. Normalise so `j`/`k`/`q` close and
             // navigate consistently across backends (mirrors the pattern
@@ -274,7 +361,12 @@ impl Engine {
             } else {
                 key_name.to_string()
             };
-            return self.handle_quickfix_key(&qf_key, ctrl);
+            let win = match panel_target {
+                Some(target) => target,
+                None if loc_has_focus => Some(self.active_window_id()),
+                None => None,
+            };
+            return self.qf_handle_key(win, &qf_key, ctrl);
         }
 
         // Debug sidebar intercepts all keys when it has focus
@@ -318,8 +410,11 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Ctrl-S: save in any mode (does not change mode).
-        if ctrl && key_name == "s" {
+        // Ctrl-S: save in any mode (does not change mode) — except right
+        // after `<C-x>` in Insert mode, where `<C-x><C-s>` is the
+        // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`,
+        // #1160), not save.
+        if ctrl && key_name == "s" && !(self.mode == Mode::Insert && self.insert_ctrl_x_pending) {
             if let Err(e) = self.save_with_format(false) {
                 self.message = format!("Save failed: {}", e);
             }
@@ -349,13 +444,22 @@ impl Engine {
             }
         }
 
-        // N-to-dismiss extension hint: intercept 'N' in Normal mode when a hint is visible.
-        // Only active while the hint is still the current status message (cleared on any edit).
+        // N-to-dismiss extension hint (#1397 keyboard parity with the toast's
+        // action button / dismiss "×" — see `lsp_did_open`): intercept 'N' in
+        // Normal mode while the install-offer toast for `name` is still up.
+        // Gated on the toast itself (not `self.message`, which the toast no
+        // longer writes to) so it stays live for as long as the toast does —
+        // i.e. until acted on or dismissed, not just until the next status
+        // message.
         if let Some(ref name) = self.ext_hint_pending_name.clone() {
-            if !self.message.contains(name.as_str()) {
-                // Message was overwritten — forget the pending name silently.
+            let toast_still_shown = self.toasts.iter().any(
+                |t| matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == name),
+            );
+            if !toast_still_shown {
+                // Toast was dismissed/acted on some other way — forget the
+                // pending name silently.
                 self.ext_hint_pending_name = None;
-            } else if key_name == "N"
+            } else if (key_name == "N" || unicode == Some('N'))
                 && !ctrl
                 && matches!(self.mode, Mode::Normal)
                 && self.pending_key.is_none()
@@ -364,6 +468,9 @@ impl Engine {
                 let name = self.ext_hint_pending_name.take().unwrap();
                 self.extension_state.mark_dismissed(&name);
                 let _ = self.extension_state.save();
+                self.toasts.retain(|t| {
+                    !matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == &name)
+                });
                 self.message =
                     format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
                 return EngineAction::None;
@@ -419,6 +526,8 @@ impl Engine {
         }
 
         // Ctrl+F: open find/replace from any mode (Visual captures the selection)
+        // — except right after `<C-x>` in Insert mode, where `<C-x><C-f>` is
+        // filename completion (`:h i_CTRL-X_CTRL-F`, #1160), not find/replace.
         if ctrl
             && key_name == "f"
             && self.settings.ctrl_f_action() == "find"
@@ -426,6 +535,7 @@ impl Engine {
                 self.mode,
                 Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::Insert
             )
+            && !(self.mode == Mode::Insert && self.insert_ctrl_x_pending)
         {
             self.open_find_replace();
             return EngineAction::None;
@@ -443,7 +553,7 @@ impl Engine {
         // established, DRY source of truth for that question in this codebase
         // (see `BufferState::has_unsaved_changes`), and unlike `changed` it
         // can't be missed by a handler that forgets to set the out-param.
-        let dot_pre_undo_len = self.active_buffer_state().undo_stack.len();
+        let dot_pre_undo_len = self.active_buffer_state().undo_commit_count();
 
         // A count typed immediately before this `.` (the "2" of "2.") was
         // buffered into `dot_scratch` as a *pending* count-prefix — by
@@ -595,14 +705,17 @@ impl Engine {
                 // or every later command would be dropped from the candidate.
                 self.dot_skip_command = false;
             } else {
-                let dot_did_change = self.active_buffer_state().undo_stack.len() > dot_pre_undo_len;
+                let dot_did_change =
+                    self.active_buffer_state().undo_commit_count() != dot_pre_undo_len;
                 self.record_dot_keystroke(key_name, unicode, ctrl, dot_was_neutral, dot_did_change);
             }
         }
 
-        // Track where insert mode was entered (for Ctrl-U boundary)
+        // Track where insert mode was entered (for Ctrl-U boundary, and
+        // 'backspace''s "start" token, #1206)
         if !matches!(pre_mode, Mode::Insert) && self.mode == Mode::Insert {
             self.insert_enter_col = self.view().cursor.col;
+            self.insert_enter_line = self.view().cursor.line;
         }
 
         if changed {
@@ -885,7 +998,9 @@ impl Engine {
                 return self.cmdline_window_execute();
             }
             if unicode == Some('q') && self.pending_key.is_none() {
-                self.close_tab();
+                // #1297: the cmdline window is a split in the current tab,
+                // not a whole tab — close just the window.
+                self.close_window();
                 return EngineAction::None;
             }
         }
@@ -1003,7 +1118,18 @@ impl Engine {
                     return EngineAction::None;
                 }
                 "g" => {
-                    // Ctrl-G: show file info (Vim compat)
+                    // Ctrl-G: show file info (Vim compat).
+                    //
+                    // #1282: verified against a live `nvim --headless -u
+                    // NONE` `msg_show` event that Neovim's default
+                    // `'ruler'` — on, unlike classic Vim's `'noruler'`
+                    // default (`settings.ruler`'s own doc comment) — makes
+                    // CTRL-G print `"name" [flags] N line(s) --pct%--`
+                    // instead of this command's un-conditional `line L of N
+                    // ... col C` form. `:h CTRL-G`: "the cursor position
+                    // (unless the 'ruler' option is set)" — with 'ruler' on,
+                    // the position is already in the ruler, so CTRL-G leaves
+                    // it out.
                     let name = self
                         .file_path()
                         .map(|p| p.to_string_lossy().into_owned())
@@ -1013,9 +1139,14 @@ impl Engine {
                     let cur_line = self.view().cursor.line + 1;
                     let col = self.view().cursor.col + 1;
                     let pct = (cur_line * 100).checked_div(total).unwrap_or(0);
-                    self.message = format!(
-                        "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
-                    );
+                    self.message = if self.settings.ruler {
+                        let noun = if total == 1 { "line" } else { "lines" };
+                        format!("\"{name}\"{modified} {total} {noun} --{pct}%--")
+                    } else {
+                        format!(
+                            "\"{name}\"{modified} line {cur_line} of {total} --{pct}%-- col {col}"
+                        )
+                    };
                     return EngineAction::None;
                 }
                 "e" => {
@@ -1044,8 +1175,14 @@ impl Engine {
                     self.increment_number_at_cursor(-(count as i64), &mut false);
                     return EngineAction::None;
                 }
-                "6" => {
-                    // Ctrl-^ (Ctrl-6): edit alternate file
+                "6" | "^" => {
+                    // Ctrl-^ (Ctrl-6): edit alternate file. #1281: some
+                    // backends report this combo as the base key ("6",
+                    // physical Ctrl+6) and some as the shifted glyph
+                    // Ctrl+Shift+6 actually types ("^") — Neovim's own
+                    // `<C-^>` termcode decodes to the same control byte
+                    // either way (`:h CTRL-^`), so both spellings dispatch
+                    // here rather than only one silently doing nothing.
                     // Takes priority over Ctrl+6 focus group
                     self.alternate_buffer();
                     return EngineAction::None;
@@ -1139,7 +1276,7 @@ impl Engine {
             Some('h') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_left();
+                    self.move_left_whichwrap('h');
                 }
             }
             Some('j') => {
@@ -1167,7 +1304,7 @@ impl Engine {
             Some('l') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_right();
+                    self.move_right_whichwrap('l');
                 }
             }
             Some('i') => {
@@ -1371,6 +1508,11 @@ impl Engine {
                 let max_line = self.buffer().len_lines().saturating_sub(1);
                 let line = (self.view().cursor.line + count - 1).min(max_line);
                 self.view_mut().cursor.line = line;
+                // `$` itself still lands on the last character even under
+                // `'virtualedit'` "all"/"onemore" (verified against `nvim
+                // --headless`: `$` alone stays put, only a *subsequent*
+                // motion like `l` goes past it) — the bonus column belongs
+                // to `move_right`, not here (#1153).
                 self.view_mut().cursor.col = self.get_max_cursor_col(line);
                 self.curswant = Some(CURSWANT_EOL);
             }
@@ -2008,7 +2150,7 @@ impl Engine {
                 "Left" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_left();
+                        self.move_left_whichwrap('<');
                     }
                 }
                 "Down" => {
@@ -2026,7 +2168,28 @@ impl Engine {
                 "Right" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_right();
+                        self.move_right_whichwrap('>');
+                    }
+                }
+                // `:h 'whichwrap'`: `<BS>`/`<Space>` as Normal-mode motions
+                // (`b`/`s` tokens — the *default* `'whichwrap'` value, so
+                // these wrap into the previous/next line out of the box).
+                // There was no Normal-mode handling for either key at all
+                // before #1206 — both silently no-op'd.
+                "BackSpace" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left_whichwrap('b');
+                    }
+                }
+                // Both spellings: real key events use "Space" (see
+                // `tui_main::shell_app`'s `Key::Char(' ')` mapping) but
+                // `encode_keypress`/`decode_keypress` and existing tests
+                // also use lowercase "space" interchangeably (#1206).
+                "space" | "Space" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right_whichwrap('s');
                     }
                 }
                 "Home" => self.view_mut().cursor.col = 0,
@@ -2169,11 +2332,48 @@ impl Engine {
                 }
                 Some('_') => {
                     // g_: last non-blank character of line (count: Nth line below)
-                    let count = self.take_count();
-                    let line = (self.view().cursor.line + count - 1)
-                        .min(self.buffer().len_lines().saturating_sub(1));
-                    self.view_mut().cursor.line = line;
-                    self.view_mut().cursor.col = self.last_non_blank_col(line);
+                    if let Some(op) = self.pending_operator.take() {
+                        // dg_: delete to the last non-blank character (#1279 —
+                        // this arm used to ignore `pending_operator` entirely,
+                        // so `dg_` moved the cursor and left the buffer
+                        // untouched instead of deleting).
+                        let count = self.take_count();
+                        let start_cursor = self.view().cursor;
+                        let start_pos =
+                            self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
+                        let line = (start_cursor.line + count - 1)
+                            .min(self.buffer().len_lines().saturating_sub(1));
+                        let end_pos =
+                            self.buffer().line_to_char(line) + self.last_non_blank_col(line);
+                        // g_ is inclusive of its landing character (:help
+                        // g_); swap the endpoints when the cursor starts past
+                        // the last non-blank (e.g. sitting in trailing
+                        // whitespace), same as the `ge`/`gE` arms above. In
+                        // that swapped case `lo` is `end_pos`, not
+                        // `start_pos` — the cursor must land on `lo`, not
+                        // unconditionally back on `start_cursor`, or a `dg_`
+                        // from mid-trailing-whitespace leaves the cursor one
+                        // column right of where Neovim puts it (#1279).
+                        let (lo, hi) = if end_pos >= start_pos {
+                            (start_pos, end_pos)
+                        } else {
+                            (end_pos, start_pos)
+                        };
+                        let lo_line = self.buffer().content.char_to_line(lo);
+                        let lo_col = lo - self.buffer().line_to_char(lo_line);
+                        self.view_mut().cursor = Cursor {
+                            line: lo_line,
+                            col: lo_col,
+                        };
+                        let hi = (hi + 1).min(self.buffer().len_chars());
+                        self.apply_charwise_operator_inclusive(op, lo, hi, changed);
+                    } else {
+                        let count = self.take_count();
+                        let line = (self.view().cursor.line + count - 1)
+                            .min(self.buffer().len_lines().saturating_sub(1));
+                        self.view_mut().cursor.line = line;
+                        self.view_mut().cursor.col = self.last_non_blank_col(line);
+                    }
                 }
                 Some('*') => {
                     // g*: forward search for word under cursor (no word boundaries)
@@ -2482,8 +2682,13 @@ impl Engine {
                     if char_idx < self.buffer().content.len_chars() {
                         let ch = self.buffer().content.char(char_idx);
                         let code = ch as u32;
-                        self.message =
-                            format!("<{}>  {},  Hex {:02x},  Oct {:03o}", ch, code, code, code);
+                        // #1282: Neovim spells this "Octal", not "Oct" —
+                        // verified against a live `nvim --headless -u NONE`
+                        // `msg_show` event for `ga`.
+                        self.message = format!(
+                            "<{}>  {},  Hex {:02x},  Octal {:03o}",
+                            ch, code, code, code
+                        );
                     }
                 }
                 Some('8') => {
@@ -2548,17 +2753,31 @@ impl Engine {
                     self.clamp_cursor_col();
                 }
                 Some('x') => {
-                    // gx: open URL or file path under cursor externally
-                    if let Some(url) = self.word_under_cursor() {
-                        #[cfg(not(test))]
-                        {
-                            let _ = std::process::Command::new("xdg-open")
-                                .arg(&url)
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .spawn();
-                        }
-                        self.message = format!("Opening: {}", url);
+                    // gx: open the word/URL under cursor externally. #1134:
+                    // this used to shell out to a bare call to the Linux
+                    // freedesktop.org opener with no `target_os` guard at
+                    // all — the most severe of the four hand-rolled per-OS
+                    // openers this issue removed, since it ran that Linux
+                    // opener even on macOS and Windows.
+                    //
+                    // No `is_safe_url` gate here, deliberately, unlike
+                    // `Engine::open_url`'s markdown-link callers: this was
+                    // never gated before (any word went straight to the
+                    // opener) and `word_under_cursor` only ever returns a
+                    // run of `'iskeyword'` characters (`Engine::is_word_char`,
+                    // #1191) — with the default `'iskeyword'`, `:` and `/`
+                    // are never keyword characters, so a scheme like
+                    // `https://…` can never survive that tokenizer intact,
+                    // and an `is_safe_url` check here would reject every
+                    // input and make `gx` permanently inert. Queuing
+                    // unconditionally preserves the exact pre-#1134
+                    // behavior; only the opener mechanism changed, from a
+                    // raw per-OS `Command::new` to
+                    // `PlatformServices::open_url_result` via the queue.
+                    if let Some(word) = self.word_under_cursor() {
+                        self.message = format!("Opening: {}", word);
+                        self.pending_platform_actions
+                            .push(PendingPlatformAction::OpenUrl(word));
                     }
                 }
                 Some('\'') => {
@@ -2826,7 +3045,7 @@ impl Engine {
                 // Register selection: "x sets selected_register for next operation.
                 // Uppercase A-Z appends to lowercase register. `_` is the black
                 // hole (reads/writes go nowhere — `:h quote_`); `.`, `/`, `%`,
-                // `:`, `-` are the read-mostly special registers (`:h
+                // `#`, `:`, `-` are the read-mostly special registers (`:h
                 // registers`); `=` opens the expression-register prompt (#806).
                 if let Some(ch) = unicode {
                     if ch == '=' {
@@ -2841,6 +3060,7 @@ impl Engine {
                         || ch == '.'
                         || ch == '/'
                         || ch == '%'
+                        || ch == '#'
                         || ch == ':'
                         || ch == '-'
                         || ch.is_ascii_digit()
@@ -3281,14 +3501,21 @@ impl Engine {
                             }
                         }
                         _ if ch.is_ascii_uppercase() => {
-                            if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
-                                let max_line = self.buffer().len_lines().saturating_sub(1);
-                                let target_line = line.min(max_line);
-                                let pre_cursor = self.view().cursor;
+                            // `` `A ``: exact position, across files if the
+                            // mark was set in a different one (#1281 —
+                            // `resolve_global_mark`'s own doc comment has the
+                            // full history of why this used to be a same-
+                            // buffer-only no-op for a cross-file mark).
+                            let pre_cursor = self.view().cursor;
+                            if let Some(((target_line, target_col), switched)) =
+                                self.resolve_global_mark(ch, true)
+                            {
                                 self.view_mut().cursor.line = target_line;
-                                self.view_mut().cursor.col = col;
+                                self.view_mut().cursor.col = target_col;
                                 self.clamp_cursor_col();
-                                self.record_jump_from(pre_cursor);
+                                if !switched {
+                                    self.record_jump_from(pre_cursor);
+                                }
                             } else {
                                 self.message = format!("Mark `{}` not set", ch);
                             }
@@ -3300,26 +3527,32 @@ impl Engine {
                 }
             }
             '\x07' => {
-                // g': jump to mark line WITHOUT adding to jump list
+                // g': jump to mark line WITHOUT adding to jump list. Like
+                // `'{mark}`, lands on the first non-blank — #1281 fixed this
+                // from a hardcoded column 0 (already documented as a
+                // `Partial` row in REGMARK_AUDIT's `g'{mark}` entry).
                 if let Some(ch) = unicode {
                     if ch.is_ascii_lowercase() {
                         let buffer_id = self.active_window().buffer_id;
-                        if let Some(buffer_marks) = self.marks.get(&buffer_id) {
-                            if let Some(mark_cursor) = buffer_marks.get(&ch) {
-                                self.view_mut().cursor.line = mark_cursor.line;
-                                self.view_mut().cursor.col = 0;
-                                self.clamp_cursor_col();
-                            } else {
-                                self.message = format!("Mark '{}' not set", ch);
-                            }
+                        let target_line = self
+                            .marks
+                            .get(&buffer_id)
+                            .and_then(|m| m.get(&ch))
+                            .map(|c| c.line);
+                        if let Some(target_line) = target_line {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = self.first_non_blank_col(target_line);
+                            self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark '{}' not set", ch);
                         }
                     } else if ch.is_ascii_uppercase() {
-                        if let Some(&(_, line, _)) = self.global_marks.get(&ch) {
-                            let max_line = self.buffer().len_lines().saturating_sub(1);
-                            self.view_mut().cursor.line = line.min(max_line);
-                            self.view_mut().cursor.col = 0;
+                        // g'A: across files if the mark was set in a
+                        // different one, same fix as `` `A `` above but
+                        // never recording a jump (#1281).
+                        if let Some(((target_line, _), _)) = self.resolve_global_mark(ch, false) {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = self.first_non_blank_col(target_line);
                             self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark '{}' not set", ch);
@@ -3343,10 +3576,13 @@ impl Engine {
                             self.message = format!("Mark `{}` not set", ch);
                         }
                     } else if ch.is_ascii_uppercase() {
-                        if let Some(&(_, line, col)) = self.global_marks.get(&ch) {
-                            let max_line = self.buffer().len_lines().saturating_sub(1);
-                            self.view_mut().cursor.line = line.min(max_line);
-                            self.view_mut().cursor.col = col;
+                        // g`A: across files if the mark was set in a
+                        // different one, never recording a jump (#1281).
+                        if let Some(((target_line, target_col), _)) =
+                            self.resolve_global_mark(ch, false)
+                        {
+                            self.view_mut().cursor.line = target_line;
+                            self.view_mut().cursor.col = target_col;
                             self.clamp_cursor_col();
                         } else {
                             self.message = format!("Mark `{}` not set", ch);
@@ -3410,11 +3646,16 @@ impl Engine {
                         self.pending_operator = Some('Z');
                     }
                     Some('F') => {
-                        // zF: create fold for N lines from cursor
+                        // zF: create fold covering `count` lines total from
+                        // the cursor (default 1, i.e. no-op — there is
+                        // nothing to hide). #1280: this used to fold
+                        // `count + 1` lines (`line + count`, not
+                        // `line + count - 1`), off by one against Neovim —
+                        // `3zF` folded 4 lines instead of 3.
                         let count = self.take_count();
                         let line = self.view().cursor.line;
                         let total = self.buffer().len_lines();
-                        let end = (line + count).min(total.saturating_sub(1));
+                        let end = (line + count.saturating_sub(1)).min(total.saturating_sub(1));
                         if end > line {
                             self.cmd_fold_create(line, end);
                         }
@@ -4734,7 +4975,15 @@ impl Engine {
         self.force_motion_mode = None;
         let count = end_line - start_line + 1;
         self.view_mut().cursor.line = start_line;
-        self.view_mut().cursor.col = 0;
+        // #1279: this used to also force `cursor.col = 0` here, but real Vim
+        // leaves the cursor on its original column for `d`/`y` through this
+        // path (verified against `nvim --headless`: `dj`/`y}` from col 2
+        // land back on col 2, matching plain `dd`'s own `delete_lines` —
+        // see that function's doc comment, which this preamble was
+        // silently overriding for every *other* linewise motion routed
+        // through here). The operator arms below that need a specific
+        // column (`c`, `~`/`u`/`U`/`R`, `@`) already set one explicitly, so
+        // they are unaffected.
         match operator {
             'y' => {
                 self.yank_lines(count);
@@ -4920,18 +5169,44 @@ impl Engine {
             .iter()
             .position(|&(start, end)| cursor_char >= start && cursor_char < end);
 
+        // `:h gn`: "like the `n` command" — so it honours `'wrapscan'` the
+        // same way `search_next`/`search_prev` do: off, and no match in the
+        // requested direction, stay put with the matching E384/E385 message
+        // instead of wrapping (#1153 review).
         let idx = if let Some(i) = on_match {
             i
         } else if backward {
-            self.search_matches
+            match self
+                .search_matches
                 .iter()
                 .rposition(|(start, _)| *start < cursor_char)
-                .unwrap_or(self.search_matches.len() - 1)
+            {
+                Some(i) => i,
+                None if self.settings.wrapscan => self.search_matches.len() - 1,
+                None => {
+                    self.message = format!(
+                        "E384: search hit TOP without match for: {}",
+                        self.search_query
+                    );
+                    return;
+                }
+            }
         } else {
-            self.search_matches
+            match self
+                .search_matches
                 .iter()
                 .position(|(start, _)| *start >= cursor_char)
-                .unwrap_or(0)
+            {
+                Some(i) => i,
+                None if self.settings.wrapscan => 0,
+                None => {
+                    self.message = format!(
+                        "E385: search hit BOTTOM without match for: {}",
+                        self.search_query
+                    );
+                    return;
+                }
+            }
         };
 
         let (match_start, match_end) = self.search_matches[idx];
@@ -5231,15 +5506,15 @@ impl Engine {
                 while end < total && !self.buffer().content.char(end).is_whitespace() {
                     end += 1;
                 }
-            } else if is_word_char(self.buffer().content.char(end)) {
-                while end < total && is_word_char(self.buffer().content.char(end)) {
+            } else if self.is_word_char(self.buffer().content.char(end)) {
+                while end < total && self.is_word_char(self.buffer().content.char(end)) {
                     end += 1;
                 }
             } else {
                 // Punctuation run: scan to its end (stop at a word char or whitespace).
                 while end < total {
                     let c = self.buffer().content.char(end);
-                    if is_word_char(c) || c.is_whitespace() {
+                    if self.is_word_char(c) || c.is_whitespace() {
                         break;
                     }
                     end += 1;
@@ -5744,9 +6019,23 @@ impl Engine {
     /// saved cursor is the position the next edit will actually start from.
     /// `finish_undo_group`/`start_undo_group` are no-ops on an empty group,
     /// so this is free when nothing was typed yet.
+    ///
+    /// Also re-anchors the `'backspace'` `"start"` / Ctrl-U boundary
+    /// (`insert_enter_line`/`insert_enter_col`) to the cursor's post-move
+    /// position. This mirrors real Vim's `stop_arrow()` (`edit.c`), which
+    /// resets `Insstart` on exactly these cursor-movement keys — confirmed
+    /// against real Neovim 0.12.5: `:set backspace=indent,eol` (no
+    /// `start`), enter Insert, type multi-line text, arrow onto a
+    /// pre-existing line and BackSpace is refused outright even though
+    /// that line is nowhere near the line Insert was originally entered on
+    /// (#1206 review). Without this, `line != insert_enter_line` alone
+    /// would wrongly treat *any* non-entry line — including one the user
+    /// merely arrow-navigated to — as "typed this session".
     fn split_insert_undo_group(&mut self) {
         self.finish_undo_group();
         self.start_undo_group();
+        self.insert_enter_line = self.view().cursor.line;
+        self.insert_enter_col = self.view().cursor.col;
     }
 
     /// `:h 'autoindent'`: "If you do not type anything on the new line
@@ -5860,6 +6149,14 @@ impl Engine {
         ctrl: bool,
         changed: &mut bool,
     ) {
+        // `'showmatch'` (#1207): the flash from a previous key (if any) ends
+        // as soon as another key arrives — matching real Vim, where the
+        // momentary jump to the matching bracket lasts only until the next
+        // key or `'matchtime'` elapses (`'matchtime'` itself is out of
+        // scope; "ends on next key" is this fn's stand-in). Set again below
+        // if *this* key is a closing bracket with a match.
+        self.showmatch_flash = None;
+
         // ── Terminal ctrl-key aliases (#804) ──────────────────────────────────
         // In a real terminal, crossterm delivers `<C-h>` as ctrl+'h' (byte
         // 0x08), `<C-j>`/`<C-m>` as ctrl+'j'/'m' (bytes 0x0A/0x0D), and
@@ -5913,6 +6210,94 @@ impl Engine {
         // key ends the run.
         if key_name != "Down" && key_name != "Up" {
             self.insert_vertical_want_col = None;
+        }
+
+        // ── Ctrl-X: completion submode dispatch (`:h i_CTRL-X`, #1160) ───────
+        // Checked before Ctrl-K digraph entry below so `<C-x><C-k>`
+        // (dictionary completion) isn't swallowed by the digraph-entry
+        // trigger, which also fires on a bare `<C-k>`.
+        if ctrl && key_name == "x" && !self.insert_ctrl_x_pending {
+            self.insert_ctrl_x_pending = true;
+            return;
+        }
+        if self.insert_ctrl_x_pending {
+            self.insert_ctrl_x_pending = false;
+            if ctrl {
+                match key_name {
+                    "n" => self.ctrl_x_keyword_completion(true, changed),
+                    "p" => self.ctrl_x_keyword_completion(false, changed),
+                    "l" => self.ctrl_x_line_completion(changed),
+                    "f" => self.ctrl_x_filename_completion(changed),
+                    "k" => self.ctrl_x_dictionary_completion(changed),
+                    "s" => self.ctrl_x_spell_completion(changed),
+                    "o" => {
+                        // Omni completion: no separate omni source exists in
+                        // vimcode, so this delegates to the same manual
+                        // completion trigger Ctrl-Space uses (buffer words +
+                        // async LSP candidates), matching `i_CTRL-X_CTRL-O`'s
+                        // usual real-world behavior (LSP-backed omnifunc).
+                        self.trigger_completion(true);
+                    }
+                    "t" => {
+                        // Thesaurus: no `'thesaurus'` file is bundled or
+                        // configurable yet.
+                        self.message = "E756: No thesaurus file".to_string();
+                    }
+                    "bracketright" | "]" => {
+                        // Tags: no ctags/tag-jump subsystem exists yet.
+                        self.message = "E433: No tags file".to_string();
+                    }
+                    "i" => {
+                        // Included files: no include-path resolution exists yet.
+                        self.message = "E387: No included files".to_string();
+                    }
+                    "v" => {
+                        // Command-line completion: not supported.
+                        self.message = "Command-line completion not supported".to_string();
+                    }
+                    "e" => {
+                        // `:h i_CTRL-X_CTRL-E`: "like using CTRL-E in Normal
+                        // mode" — scroll the window down one line (fold-aware)
+                        // without changing the selected completion match.
+                        let count = self.take_count();
+                        self.scroll_viewport_with_cursor(1, count);
+                    }
+                    "y" => {
+                        // `:h i_CTRL-X_CTRL-Y`: mirrors Normal-mode Ctrl-Y —
+                        // scroll the window up one line.
+                        let count = self.take_count();
+                        self.scroll_viewport_with_cursor(-1, count);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        // ── Ctrl-K: digraph entry (`:h i_CTRL-K`, #1160) ──────────────────────
+        // Checked after the Ctrl-X block above (see its comment) so
+        // `<C-x><C-k>` reaches dictionary completion rather than digraph
+        // entry. Otherwise takes priority over everything else so the two
+        // characters typed after `<C-k>` (often themselves punctuation like
+        // `:`, `'`, `>`) aren't intercepted by an unrelated binding below.
+        if ctrl && key_name == "k" && self.insert_ctrl_k_pending.is_none() {
+            self.insert_ctrl_k_pending = Some(None);
+            return;
+        }
+        if let Some(state) = self.insert_ctrl_k_pending {
+            match state {
+                None => {
+                    // Waiting for the first of the two digraph characters.
+                    self.insert_ctrl_k_pending = unicode.map(Some);
+                }
+                Some(c1) => {
+                    self.insert_ctrl_k_pending = None;
+                    if let Some(c2) = unicode {
+                        self.insert_digraph(c1, c2, changed);
+                    }
+                }
+            }
+            return;
         }
 
         // ── Configured completion trigger (e.g. Ctrl-Space) ──────────────────
@@ -6071,7 +6456,7 @@ impl Engine {
         // extension) or clear (new word) after the char is inserted. Any
         // non-word key (space, punctuation, navigation) means the user
         // has left the current word, so the popup should dismiss.
-        let extends_word = unicode.is_some_and(Self::is_word_char) && !ctrl;
+        let extends_word = unicode.is_some_and(|c| self.is_word_char(c)) && !ctrl;
         if self.completion_idx.is_some() && !extends_word {
             self.dismiss_completion();
         }
@@ -6242,11 +6627,11 @@ impl Engine {
                 }
                 // Skip one run of same-class (keyword vs. punctuation) chars.
                 if i > 0 {
-                    let is_word = Self::is_word_char(chars[i - 1]);
+                    let is_word = self.is_word_char(chars[i - 1]);
                     while i > 0
                         && chars[i - 1] != ' '
                         && chars[i - 1] != '\t'
-                        && Self::is_word_char(chars[i - 1]) == is_word
+                        && self.is_word_char(chars[i - 1]) == is_word
                     {
                         i -= 1;
                     }
@@ -6258,8 +6643,9 @@ impl Engine {
                     self.view_mut().cursor.col = i;
                     *changed = true;
                 }
-            } else if line > 0 {
-                // At column 1: join with the previous line, same as BackSpace.
+            } else if line > 0 && self.settings.backspace_allows("eol") {
+                // At column 1: join with the previous line, same as BackSpace
+                // — including the `'backspace'` `"eol"` gate (#1206).
                 let prev_line_len = self.buffer().line_len_chars(line - 1);
                 let new_col = prev_line_len.saturating_sub(1);
                 let char_idx = self.buffer().line_to_char(line);
@@ -6472,6 +6858,13 @@ impl Engine {
 
         match key_name {
             "Escape" => {
+                // Vim abbreviation expansion (#1152): <Esc> is one of the
+                // trigger events, and must run before the autoindent-strip
+                // below — it operates on the same "text before cursor" that
+                // an abbreviation match consumes.
+                if self.try_expand_insert_abbrev(0) {
+                    *changed = true;
+                }
                 // `:h 'autoindent'` — leaving a line that's still nothing but
                 // the auto-inserted indent removes that indent (#804).
                 self.strip_blank_current_line_indent(changed);
@@ -6600,6 +6993,25 @@ impl Engine {
                     self.view_mut().cursor.col = col;
                     self.clamp_cursor_col();
                 }
+                // `changed` (line ~708) pushes a `:changes`/`g;` entry on
+                // every insert-mode keystroke, recorded *before* the
+                // cursor-one-left adjustment just above — so it's left
+                // pointing one column past where Neovim's own changelist
+                // entry lands (confirmed against a live oracle, #1303).
+                // Sync the list's tail entry to the now-final cursor
+                // position, but only when this session actually inserted
+                // text (`insert_text_buffer` non-empty, same proxy used for
+                // `last_inserted_text` above) — an insert session with no
+                // typing (e.g. bare `i<Esc>`) must not retouch whatever
+                // change list entry happens to already be on this line.
+                if !self.insert_text_buffer.is_empty() {
+                    let cur = self.view().cursor;
+                    if let Some(last) = self.change_list.last_mut() {
+                        if last.0 == cur.line {
+                            *last = (cur.line, cur.col);
+                        }
+                    }
+                }
                 // Dismiss signature help when leaving insert mode
                 self.lsp_signature_help = None;
                 // Collapse all extra cursors.
@@ -6628,6 +7040,42 @@ impl Engine {
                         && self.settings.expand_tab
                         && self.settings.smarttab
                         && (0..col).all(|i| self.buffer().content.char(line_start + i) == ' ');
+                    // `:h 'softtabstop'`: with 'softtabstop' set (and
+                    // 'expandtab' on), BackSpace over a run of spaces
+                    // "feels like" deleting a tab — the cursor's absolute
+                    // column is rounded down to the previous multiple of
+                    // 'softtabstop' (clamped to the start of the contiguous
+                    // blank run so it never eats non-blank text), wherever
+                    // the run is on the line (not just at the front of it)
+                    // — verified against `nvim --headless` (#1153). Distinct
+                    // from the 'smarttab'-driven `leading_blanks` rule
+                    // above: that one always uses 'shiftwidth' and only
+                    // fires when *every* character before the cursor is
+                    // blank; this one is driven purely by 'softtabstop' and
+                    // only requires the character immediately before the
+                    // cursor to be a space. Mirrors the same
+                    // round-down-to-a-stop arithmetic the Tab-insert side
+                    // uses, rather than capping the raw run length at `sts`
+                    // — capping diverges from real Vim whenever the run
+                    // doesn't start on a column that's itself a multiple of
+                    // `sts` (e.g. an indent of 5 spaces with sts=2 removes
+                    // only 1 space, not 2; a mid-line run of 2 spaces
+                    // starting at column 1 with sts=2 removes only 1 space,
+                    // not 2).
+                    let sts = self.effective_softtabstop();
+                    let sts_run_start = if !leading_blanks && sts > 0 && self.settings.expand_tab {
+                        let mut n = 0usize;
+                        while n < col && self.buffer().content.char(char_idx - 1 - n) == ' ' {
+                            n += 1;
+                        }
+                        if n > 0 {
+                            Some(col - n)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     if leading_blanks {
                         // `:h smarttab`: with 'smarttab' on (checked above),
                         // backspacing within leading indentation removes a
@@ -6640,25 +7088,48 @@ impl Engine {
                         self.delete_with_undo(line_start + new_col, char_idx);
                         self.view_mut().cursor.col = new_col;
                         *changed = true;
+                    } else if let Some(run_start) = sts_run_start {
+                        let new_col = run_start.max(((col - 1) / sts) * sts);
+                        self.delete_with_undo(line_start + new_col, char_idx);
+                        self.view_mut().cursor.col = new_col;
+                        *changed = true;
                     } else if col > 0 {
-                        // Auto-pair backspace: delete both opener and closer
-                        let prev_char = self.buffer().content.char(char_idx - 1);
-                        let next_char_matches =
-                            if self.settings.auto_pairs() && char_idx < self.buffer().len_chars() {
+                        // `:h 'backspace'`: without the `"start"` token,
+                        // BackSpace refuses to delete at or before the
+                        // position where the current Insert session began
+                        // (#1206). This has to be its own `col > 0` arm
+                        // rather than folded into the condition — falling
+                        // through to `else if` here would hit the
+                        // `line > 0` line-join branch below even though
+                        // `col > 0`, which is wrong (it isn't the "at
+                        // column 0" case at all, it's "blocked mid-line").
+                        if self.backspace_may_delete_before(line, col) {
+                            // Auto-pair backspace: delete both opener and closer
+                            let prev_char = self.buffer().content.char(char_idx - 1);
+                            let next_char_matches = if self.settings.auto_pairs()
+                                && char_idx < self.buffer().len_chars()
+                            {
                                 let next = self.buffer().content.char(char_idx);
                                 auto_pair_closer(prev_char) == Some(next)
                             } else {
                                 false
                             };
-                        if next_char_matches {
-                            // Delete both the opener (before cursor) and closer (after cursor)
-                            self.delete_with_undo(char_idx - 1, char_idx + 1);
-                        } else {
-                            self.delete_with_undo(char_idx - 1, char_idx);
+                            if next_char_matches {
+                                // Delete both the opener (before cursor) and closer (after cursor)
+                                self.delete_with_undo(char_idx - 1, char_idx + 1);
+                            } else {
+                                self.delete_with_undo(char_idx - 1, char_idx);
+                            }
+                            self.view_mut().cursor.col -= 1;
+                            *changed = true;
                         }
-                        self.view_mut().cursor.col -= 1;
-                        *changed = true;
-                    } else if line > 0 {
+                    } else if line > 0 && self.settings.backspace_allows("eol") {
+                        // `:h 'backspace'`: crossing into the previous line
+                        // (joining it with this one) requires the `"eol"`
+                        // token — gated here rather than earlier so every
+                        // other BackSpace behavior (auto-pair, softtabstop,
+                        // smarttab) stays available up to the true start of
+                        // the line regardless of `'backspace'` (#1206).
                         let prev_line_len = self.buffer().line_len_chars(line - 1);
                         let new_col = if prev_line_len > 0 {
                             prev_line_len - 1
@@ -6696,6 +7167,11 @@ impl Engine {
                     self.insert_text_buffer.push('\n');
                     *changed = true;
                 } else {
+                    // Vim abbreviation expansion (#1152): <CR> is a trigger
+                    // event, run before the newline split below so the split
+                    // sees the expanded text (matches Vim, and lines up with
+                    // the same ordering used for the <Esc> trigger above).
+                    self.try_expand_insert_abbrev(0);
                     let line = self.view().cursor.line;
                     // Compute the new line's indent from the *current* line's
                     // content before any stripping below touches it — the
@@ -6786,8 +7262,15 @@ impl Engine {
                             && (0..col).all(|i| {
                                 matches!(self.buffer().content.char(line_start + i), ' ' | '\t')
                             });
+                        // `:h 'softtabstop'`: when set (and not overridden by
+                        // 'smarttab' at the front of the line, which always
+                        // uses 'shiftwidth'), Tab advances to the next
+                        // 'softtabstop' stop instead of 'tabstop' (#1153).
+                        let sts = self.effective_softtabstop();
                         let stop = if front_of_line {
                             self.effective_shift_width().max(1)
+                        } else if sts > 0 {
+                            sts
                         } else {
                             (self.settings.tabstop as usize).max(1)
                         };
@@ -6807,12 +7290,12 @@ impl Engine {
             }
             "Left" => {
                 self.cancel_insert_repeat_count();
-                self.move_left();
+                self.move_left_insert_whichwrap('[');
                 self.split_insert_undo_group();
             }
             "Right" => {
                 self.cancel_insert_repeat_count();
-                self.move_right_insert();
+                self.move_right_insert_whichwrap(']');
                 self.split_insert_undo_group();
             }
             "Up" => {
@@ -6954,10 +7437,70 @@ impl Engine {
                             }
                         }
                     }
+                    // `'smartindent'`/`'cindent'` (#1207): typing '#' as the
+                    // first non-blank character on a line moves it to
+                    // column 0.
+                    if ch == '#' {
+                        let line = self.view().cursor.line;
+                        if let Some(new_indent) = self.auto_outdent_for_hash(line) {
+                            let old_indent = self.get_line_indent_str(line);
+                            if new_indent != old_indent {
+                                let line_start = self.buffer().line_to_char(line);
+                                let old_len = old_indent.chars().count();
+                                self.delete_with_undo(line_start, line_start + old_len);
+                                if !new_indent.is_empty() {
+                                    self.insert_with_undo(line_start, &new_indent);
+                                }
+                                let diff = old_len - new_indent.chars().count();
+                                self.view_mut().cursor.col =
+                                    self.view().cursor.col.saturating_sub(diff);
+                            }
+                        }
+                    }
+                    // `'showmatch'` (#1207): briefly flag the matching
+                    // opening bracket after typing a closer, reusing `%`'s
+                    // own `find_matching_bracket` rather than reimplementing
+                    // bracket search. This deliberately does not move
+                    // `view.cursor` — only `showmatch_flash` — so it can
+                    // never perturb where the *next* typed character lands;
+                    // see that field's doc comment for the full rationale.
+                    if self.settings.showmatch {
+                        if let Some(open_char) = match ch {
+                            ')' => Some('('),
+                            ']' => Some('['),
+                            '}' => Some('{'),
+                            _ => None,
+                        } {
+                            let line = self.view().cursor.line;
+                            let col = self.view().cursor.col;
+                            if col > 0 {
+                                let closer_pos = self.buffer().line_to_char(line) + col - 1;
+                                if let Some(match_pos) =
+                                    self.find_matching_bracket(closer_pos, open_char, ch, false)
+                                {
+                                    let match_line = self.buffer().content.char_to_line(match_pos);
+                                    let match_col =
+                                        match_pos - self.buffer().line_to_char(match_line);
+                                    self.showmatch_flash = Some((match_line, match_col));
+                                }
+                            }
+                        }
+                    }
                     // Trigger signature help after '(' or ','
                     if ch == '(' || ch == ',' {
                         self.ensure_lsp_manager();
                         self.lsp_request_signature_help();
+                    }
+                    // Vim abbreviation expansion (#1152): any typed
+                    // non-keyword character is a trigger — the character
+                    // itself was already inserted above and stays put
+                    // (`trailing = 1`), only the word/sequence before it may
+                    // be replaced. A char inserted via literal `<C-v>{c}`
+                    // (handled in its own early-return branch above, never
+                    // reaching this match arm) deliberately does not reach
+                    // here, which is what makes `<C-v>` suppress expansion.
+                    if !is_word_char(ch) && self.try_expand_insert_abbrev(1) {
+                        *changed = true;
                     }
                 }
                 if *changed {
@@ -7042,6 +7585,113 @@ impl Engine {
         self.wildmenu_items.clear();
         self.wildmenu_selected = None;
         self.wildmenu_original.clear();
+        self.wildmenu_press = 0;
+    }
+
+    /// `<Tab>`/`<S-Tab>` completion for every `'wildmode'` configuration
+    /// other than the bare default `"full"` (that legacy path stays in
+    /// `handle_command_key`'s `"Tab"` arm unchanged — see
+    /// `Settings::wildmode_is_plain_full`). Builds the candidate list on
+    /// the first press of a round, then applies the flags active for each
+    /// press per `Settings::wildmode_stage_at` (#1206).
+    fn wildmode_tab_press(&mut self, is_backtab: bool) {
+        if is_backtab {
+            // `:h 'wildmode'` doesn't special-case Shift-Tab per stage —
+            // it just cycles backwards through whatever list is already
+            // showing, same as the legacy default path.
+            if !self.wildmenu_items.is_empty() {
+                match self.wildmenu_selected {
+                    None | Some(0) => {
+                        self.wildmenu_selected = Some(self.wildmenu_items.len() - 1);
+                    }
+                    Some(i) => self.wildmenu_selected = Some(i - 1),
+                }
+                if let Some(idx) = self.wildmenu_selected {
+                    self.command_buffer = self.wildmenu_items[idx].clone();
+                    self.command_cursor = self.command_buffer.chars().count();
+                }
+            }
+            return;
+        }
+
+        if self.wildmenu_items.is_empty() {
+            // Fresh completion round — compute candidates once; every
+            // later press in this round reuses this list rather than
+            // recomputing it (the typed prefix doesn't change while the
+            // wildmenu is open, only which stage is applied to it).
+            let partial = self.command_buffer.clone();
+            let completions = self.complete_command(&partial);
+            if completions.is_empty() {
+                return;
+            }
+            if completions.len() == 1 {
+                // Single match: auto-complete, no wildmenu, no stages.
+                self.command_buffer = completions[0].clone();
+                self.command_cursor = self.command_buffer.chars().count();
+                return;
+            }
+            self.wildmenu_original = partial;
+            self.wildmenu_items = completions;
+            self.wildmenu_selected = None;
+            self.wildmenu_press = 0;
+        }
+
+        let stage = self.settings.wildmode_stage_at(self.wildmenu_press);
+        self.wildmenu_press += 1;
+        self.apply_wildmode_stage(stage);
+    }
+
+    /// Apply one `'wildmode'` stage's flags to the already-populated
+    /// `wildmenu_items` (#1206). `longest` takes priority over a
+    /// co-occurring `full` on the same stage (`:h 'wildmode'`:
+    /// `"longest:full"` "does not cycle through full matches").
+    fn apply_wildmode_stage(&mut self, stage: crate::core::settings::WildmodeStage) {
+        if stage.only_first {
+            // `""` — complete the first match once; never cycle or list
+            // further presses of this stage.
+            self.command_buffer = self.wildmenu_items[0].clone();
+            self.command_cursor = self.command_buffer.chars().count();
+        } else if stage.longest {
+            let common = Self::find_common_prefix(&self.wildmenu_items);
+            if common.chars().count() > self.command_buffer.chars().count() {
+                self.command_buffer = common;
+                self.command_cursor = self.command_buffer.chars().count();
+                self.wildmenu_selected = None;
+            } else {
+                // `:h 'wildmode'`: "If this doesn't extend the input, the
+                // next 'wildmode' part is used" — apply it immediately,
+                // within this same press, rather than waiting for another
+                // keypress. Only recurse if the next stage would actually
+                // do something different, to avoid looping forever on a
+                // config that holds on a stuck "longest" stage.
+                let next = self.settings.wildmode_stage_at(self.wildmenu_press);
+                if next.only_first || next.full || (next.longest != stage.longest) {
+                    self.wildmenu_press += 1;
+                    self.apply_wildmode_stage(next);
+                }
+            }
+        } else if stage.full {
+            match self.wildmenu_selected {
+                None => self.wildmenu_selected = Some(0),
+                Some(i) if i + 1 >= self.wildmenu_items.len() => {
+                    self.wildmenu_selected = Some(0);
+                }
+                Some(i) => self.wildmenu_selected = Some(i + 1),
+            }
+            if let Some(idx) = self.wildmenu_selected {
+                self.command_buffer = self.wildmenu_items[idx].clone();
+                self.command_cursor = self.command_buffer.chars().count();
+                // If selected item ends with space, it takes an argument —
+                // clear wildmenu so next Tab triggers argument completion.
+                if self.command_buffer.ends_with(' ') {
+                    self.wildmenu_clear();
+                }
+            }
+        }
+        // Else: `stage.list`-only (or an unwired flag alone, e.g. bare
+        // "lastused") — the item list is already populated above; real
+        // Vim's plain "list" doesn't touch the command line at all, so
+        // there is nothing left to do.
     }
 
     pub(crate) fn handle_command_key(
@@ -7129,6 +7779,12 @@ impl Engine {
                 EngineAction::None
             }
             "Return" => {
+                // Vim abbreviation expansion (#1152): <CR> is a trigger event
+                // for `:cabbrev`/`:abbreviate` on the command line, run
+                // before the buffer is captured so the expanded text is what
+                // actually executes (`:cabbrev W w` then typing `:W<CR>`
+                // must run `:w`).
+                self.try_expand_command_abbrev(0);
                 self.wildmenu_clear();
                 self.mode = Mode::Normal;
                 // If in history search, the matched command is already in command_buffer
@@ -7255,6 +7911,16 @@ impl Engine {
 
                 let is_backtab = key_name == "ISO_Left_Tab";
 
+                // `'wildmode'` != the bare default "full" drives a
+                // genuinely different, stage-based completion sequence
+                // (#1206) — see `wildmode_tab_press` and
+                // `Settings::wildmode_is_plain_full`'s doc comment for why
+                // the default itself keeps this legacy path unchanged.
+                if !self.settings.wildmode_is_plain_full() {
+                    self.wildmode_tab_press(is_backtab);
+                    return EngineAction::None;
+                }
+
                 if !self.wildmenu_items.is_empty() {
                     // Wildmenu already open — cycle through items
                     if is_backtab {
@@ -7362,6 +8028,13 @@ impl Engine {
                                 cmd_char_to_byte(&self.command_buffer, self.command_cursor);
                             self.command_buffer.insert(byte_off, ch);
                             self.command_cursor += 1;
+                            // Vim abbreviation expansion (#1152): any typed
+                            // non-keyword character on the command line is a
+                            // trigger for `:cabbrev`/`:abbreviate`, same rule
+                            // as Insert mode.
+                            if !is_word_char(ch) {
+                                self.try_expand_command_abbrev(1);
+                            }
                         }
                     } else {
                         // Try plugin command-mode keymaps for unhandled special keys
@@ -8117,6 +8790,7 @@ impl Engine {
                         || ch == '.'
                         || ch == '/'
                         || ch == '%'
+                        || ch == '#'
                         || ch == ':'
                         || ch == '-'
                     {
@@ -8390,7 +9064,7 @@ impl Engine {
             Some('h') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_left();
+                    self.move_left_whichwrap('h');
                 }
             }
             Some('j') => {
@@ -8418,7 +9092,7 @@ impl Engine {
             Some('l') => {
                 let count = self.take_count();
                 for _ in 0..count {
-                    self.move_right();
+                    self.move_right_whichwrap('l');
                 }
             }
             Some('w') => {
@@ -8529,7 +9203,7 @@ impl Engine {
                 "Left" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_left();
+                        self.move_left_whichwrap('<');
                     }
                 }
                 "Down" => {
@@ -8547,7 +9221,23 @@ impl Engine {
                 "Right" => {
                     let count = self.take_count();
                     for _ in 0..count {
-                        self.move_right();
+                        self.move_right_whichwrap('>');
+                    }
+                }
+                // `:h 'whichwrap'`: `<BS>`/`<Space>` as motions in Visual
+                // mode too, same `b`/`s` tokens as the Normal-mode arms
+                // above (#1206 review — these were still silent no-ops
+                // here after the Normal-mode arms landed).
+                "BackSpace" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_left_whichwrap('b');
+                    }
+                }
+                "space" | "Space" => {
+                    let count = self.take_count();
+                    for _ in 0..count {
+                        self.move_right_whichwrap('s');
                     }
                 }
                 "Home" => self.view_mut().cursor.col = 0,
@@ -8603,9 +9293,9 @@ impl Engine {
         }
         replay.push_str(&keys);
 
-        let pre_undo_len = self.active_buffer_state().undo_stack.len();
+        let pre_undo_len = self.active_buffer_state().undo_commit_count();
         self.replay_dot_keys(&replay);
-        *changed = self.active_buffer_state().undo_stack.len() > pre_undo_len;
+        *changed = self.active_buffer_state().undo_commit_count() != pre_undo_len;
     }
 
     /// `:h redo-register`: `"1p . .` pastes register 1, then 2, then 3, …
@@ -8921,6 +9611,8 @@ impl Engine {
             // AI
             "AI ",
             "AiClear",
+            "AiMode",
+            "AiAgent",
             // Markdown
             "MarkdownPreview",
             "MdPreview",
@@ -9114,14 +9806,146 @@ impl Engine {
     // ─── User keymaps ────────────────────────────────────────────────────────
 
     /// Rebuild the parsed user_keymaps cache from settings.keymaps.
-    /// Call after loading or changing settings.
+    /// Call after loading or changing settings. Expands the `<leader>`
+    /// notation marker against `Settings::leader` here (rather than in the
+    /// free-standing `parse_keymap_def`, which has no settings access), on
+    /// both the lhs and any key-to-keys rhs (#1151).
     pub fn rebuild_user_keymaps(&mut self) {
+        let leader = self.settings.leader.to_string();
         self.user_keymaps = self
             .settings
             .keymaps
             .iter()
             .filter_map(|s| parse_keymap_def(s))
+            .map(|mut km| {
+                km.keys = expand_leader_tokens(km.keys, &leader);
+                if let UserKeymapAction::Keys(rhs) = km.action {
+                    km.action = UserKeymapAction::Keys(expand_leader_tokens(rhs, &leader));
+                }
+                km
+            })
             .collect();
+    }
+
+    /// Modes active for user-keymap matching in the engine's current state.
+    /// Multiple letters can be simultaneously active — Visual mode matches
+    /// both `v` (vim's combined Visual+Select letter) and `x` (Visual-only),
+    /// since vimcode has no separate Select mode to tell them apart. `o`
+    /// (operator-pending) replaces `n` while an operator awaits its motion,
+    /// matching vim: only o-mode maps (and built-in motions) apply then, not
+    /// plain Normal-mode maps (#1151).
+    fn active_keymap_modes(&self) -> &'static [&'static str] {
+        if self.is_vscode_mode() {
+            // VSCode mode has no modal distinction; "n" keymaps apply.
+            return &["n"];
+        }
+        match self.mode {
+            Mode::Normal => {
+                if self.pending_operator.is_some()
+                    || self.pending_find_operator.is_some()
+                    || self.pending_text_object.is_some()
+                {
+                    &["o"]
+                } else {
+                    &["n"]
+                }
+            }
+            Mode::Visual | Mode::VisualLine | Mode::VisualBlock => &["v", "x"],
+            Mode::Insert => &["i"],
+            Mode::Command => &["c"],
+            _ => &[],
+        }
+    }
+
+    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+
+    /// Rebuild the parsed user_abbrevs cache from settings.abbreviations.
+    /// Call after loading or changing settings (mirrors `rebuild_user_keymaps`).
+    pub fn rebuild_user_abbrevs(&mut self) {
+        self.user_abbrevs = self
+            .settings
+            .abbreviations
+            .iter()
+            .filter_map(|s| parse_abbrev_def(s))
+            .collect();
+    }
+
+    /// Attempt Vim abbreviation expansion in Insert mode (`:h abbreviations`).
+    ///
+    /// `trailing` is how many characters already sitting at the cursor should
+    /// be left untouched and re-positioned after the replacement: `1` for a
+    /// just-typed non-keyword trigger character (which is inserted first, and
+    /// stays right after the expansion), `0` for `<Esc>`/`<CR>` — which
+    /// trigger on the word itself, with nothing typed after it yet.
+    ///
+    /// Abbreviations never span a line break, so only the current line's text
+    /// is considered (`:h abbreviations`). Multi-cursor inserts are not
+    /// expanded — `mc_insert` bulk-inserts identical text at every cursor
+    /// through a different path this hook does not see.
+    ///
+    /// Returns `true` if an expansion happened.
+    pub(crate) fn try_expand_insert_abbrev(&mut self, trailing: usize) -> bool {
+        if self.user_abbrevs.is_empty() || !self.view().extra_cursors.is_empty() {
+            return false;
+        }
+        let line = self.view().cursor.line;
+        let col = self.view().cursor.col;
+        if col < trailing {
+            return false;
+        }
+        let check_col = col - trailing;
+        let line_text: Vec<char> = self
+            .buffer()
+            .content
+            .line(line)
+            .chars()
+            .take(check_col)
+            .collect();
+        let Some((lhs_len, rhs)) = find_abbrev_match(&self.user_abbrevs, &line_text, "i")
+            .map(|(len, rhs)| (len, rhs.to_string()))
+        else {
+            return false;
+        };
+        let line_start = self.buffer().line_to_char(line);
+        let match_end = line_start + check_col;
+        let match_start = match_end - lhs_len;
+        self.delete_with_undo(match_start, match_end);
+        self.insert_with_undo(match_start, &rhs);
+        let new_check_col = check_col - lhs_len + rhs.chars().count();
+        self.view_mut().cursor.col = new_check_col + trailing;
+        true
+    }
+
+    /// Attempt Vim abbreviation expansion on the command line (`:h
+    /// abbreviations`, `c`-mode: `:cabbrev`/`:abbreviate`). Same `trailing`
+    /// convention as [`Engine::try_expand_insert_abbrev`] — `1` for a
+    /// just-typed non-keyword trigger character, `0` for `<CR>` (the command
+    /// about to run).
+    ///
+    /// Returns `true` if an expansion happened.
+    pub(crate) fn try_expand_command_abbrev(&mut self, trailing: usize) -> bool {
+        if self.user_abbrevs.is_empty() {
+            return false;
+        }
+        let full: Vec<char> = self.command_buffer.chars().collect();
+        if self.command_cursor < trailing || self.command_cursor > full.len() {
+            return false;
+        }
+        let check_col = self.command_cursor - trailing;
+        let prefix = &full[..check_col];
+        let Some((lhs_len, rhs)) = find_abbrev_match(&self.user_abbrevs, prefix, "c")
+            .map(|(len, rhs)| (len, rhs.to_string()))
+        else {
+            return false;
+        };
+        let match_start = check_col - lhs_len;
+        let mut new_full: Vec<char> = Vec::with_capacity(full.len() + rhs.chars().count());
+        new_full.extend_from_slice(&full[..match_start]);
+        new_full.extend(rhs.chars());
+        new_full.extend_from_slice(&full[check_col..]);
+        self.command_cursor = match_start + rhs.chars().count() + trailing;
+        self.command_buffer = new_full.into_iter().collect();
+        true
     }
 
     /// Check user keymaps for the current keypress. Returns `Some(action)` if
@@ -9138,31 +9962,23 @@ impl Engine {
             return None;
         }
 
-        let mode_str = if self.is_vscode_mode() {
-            // VSCode mode has no modal distinction; "n" keymaps apply.
-            "n"
-        } else {
-            match self.mode {
-                Mode::Normal => "n",
-                Mode::Visual | Mode::VisualLine | Mode::VisualBlock => "v",
-                Mode::Insert => "i",
-                Mode::Command => "c",
-                _ => return None,
-            }
-        };
+        let active_modes = self.active_keymap_modes();
+        if active_modes.is_empty() {
+            return None;
+        }
 
         let encoded = encode_keypress(key_name, unicode, ctrl);
         self.keymap_buf.push(encoded);
 
-        let mut exact_match_action = None;
+        let mut exact_match: Option<(UserKeymapAction, bool)> = None;
         let mut has_prefix = false;
 
         for km in &self.user_keymaps {
-            if km.mode != mode_str {
+            if !active_modes.contains(&km.mode.as_str()) {
                 continue;
             }
             if km.keys == self.keymap_buf {
-                exact_match_action = Some(km.action.clone());
+                exact_match = Some((km.action.clone(), km.noremap));
             } else if km.keys.len() > self.keymap_buf.len()
                 && km.keys[..self.keymap_buf.len()] == self.keymap_buf[..]
             {
@@ -9170,34 +9986,75 @@ impl Engine {
             }
         }
 
-        if let Some(action) = exact_match_action {
+        if let Some((action, noremap)) = exact_match {
             self.keymap_buf.clear();
+            self.keymap_buf_deadline = None;
+            let explicit_count = self.peek_count();
             let count = self.take_count();
-            // Substitute {count} in the action, or append count as argument
-            let cmd = if action.contains("{count}") {
-                action.replace("{count}", &count.to_string())
-            } else if count > 1 {
-                format!("{action} {count}")
-            } else {
-                action
-            };
             *changed = true;
-            return Some(self.execute_command(&cmd));
+            return Some(match action {
+                UserKeymapAction::Ex(cmd) => {
+                    // Substitute {count} in the action, or append count as argument
+                    let cmd = if cmd.contains("{count}") {
+                        cmd.replace("{count}", &count.to_string())
+                    } else if count > 1 {
+                        format!("{cmd} {count}")
+                    } else {
+                        cmd
+                    };
+                    self.execute_command(&cmd)
+                }
+                UserKeymapAction::Keys(rhs) => {
+                    // Vim: a count typed before a key-to-keys mapping is
+                    // inserted before the rhs's own keys, not used to repeat
+                    // the whole rhs — `nnoremap X dw` + `3X` types "3dw", so
+                    // the built-in count+operator handling (not this code)
+                    // consumes it.
+                    let mut feed: Vec<String> = Vec::new();
+                    if let Some(n) = explicit_count {
+                        feed.extend(n.to_string().chars().map(|c| c.to_string()));
+                    }
+                    feed.extend(rhs);
+                    self.feed_keymap_rhs(&feed, noremap)
+                }
+            });
         }
 
         if has_prefix {
-            // More keys needed — consume this keypress
+            // More keys needed — consume this keypress. Arm/refresh the
+            // 'timeoutlen' deadline (#1206): each keystroke that extends an
+            // still-ambiguous buffer gets its own full 'timeoutlen' window,
+            // matching Vim's "waited... for a key code or mapped key
+            // sequence to complete" (`:h 'timeoutlen'`). `0` means "no
+            // timed wait" — leave `keymap_buf_deadline` unset so
+            // `tick_keymap_timeout` never fires and the buffer only
+            // resolves on the next keystroke, exactly like before #1206.
+            self.keymap_buf_deadline = (self.settings.timeoutlen > 0).then(|| {
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(self.settings.timeoutlen as u64)
+            });
             return Some(EngineAction::None);
         }
 
         // No match and no prefix. Replay buffered keys.
+        self.keymap_buf_deadline = None;
         let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
+        self.replay_keymap_buf(buf)
+    }
+
+    /// Replay a buffered (encoded) keypress sequence that turned out not to
+    /// match any user keymap because the *next* keystroke ruled it out
+    /// (`try_user_keymap`'s own fallthrough — not used by
+    /// [`Self::tick_keymap_timeout`], which has no such live keystroke and
+    /// so dispatches unconditionally, including a 1-key buffer, instead).
+    /// A single buffered key with no match is left alone here — the
+    /// still-in-progress `handle_key` call for that same keystroke falls
+    /// through to built-in handling for it rather than this re-dispatching
+    /// it, since a lone key can't have been "replayed" from anywhere.
+    fn replay_keymap_buf(&mut self, buf: Vec<String>) -> Option<EngineAction> {
         if buf.len() <= 1 {
-            // Single key, no match — fall through to built-in handling
             return None;
         }
-
-        // Multi-key sequence that didn't match any keymap: replay all keys
         self.keymap_replaying = true;
         let mut last_action = EngineAction::None;
         for encoded_key in buf {
@@ -9206,6 +10063,148 @@ impl Engine {
         }
         self.keymap_replaying = false;
         Some(last_action)
+    }
+
+    /// Idle-tick companion to [`Self::try_user_keymap`] (`poll_idle`,
+    /// #1206): if a keypress buffer has been sitting as an unresolved
+    /// mapping prefix for `'timeoutlen'` ms with no further keystroke, give
+    /// up waiting and dispatch it as the individual keys it contains.
+    ///
+    /// Unlike [`Self::replay_keymap_buf`] (used when a *keystroke* proves
+    /// the buffer has no match — that keystroke's own `handle_key` call is
+    /// still on the stack and falls through to built-in handling for a
+    /// lone buffered key itself), a 1-key buffer here gets dispatched too:
+    /// there is no live keystroke left to fall through on, and a 1-key
+    /// buffer is the *common* case (typing the first key of a 2-key mapping
+    /// and then pausing) — dropping it would silently eat that keystroke
+    /// instead of letting it act as the plain key it is (`:h 'timeoutlen'`).
+    /// Returns `true` if a redraw is needed (the replay changed something).
+    pub fn tick_keymap_timeout(&mut self) -> bool {
+        let Some(deadline) = self.keymap_buf_deadline else {
+            return false;
+        };
+        if std::time::Instant::now() < deadline {
+            return false;
+        }
+        self.keymap_buf_deadline = None;
+        let buf: Vec<String> = std::mem::take(&mut self.keymap_buf);
+        if buf.is_empty() {
+            return false;
+        }
+        self.keymap_replaying = true;
+        for encoded_key in buf {
+            let (rk_name, rk_unicode, rk_ctrl) = decode_keypress(&encoded_key);
+            self.handle_key(&rk_name, rk_unicode, rk_ctrl);
+        }
+        self.keymap_replaying = false;
+        // `EngineAction::None` is also the return value for most ordinary,
+        // state-changing key handling (not just genuine no-ops), so it
+        // can't distinguish "changed something" here — always report a
+        // redraw when a replay actually ran, same as the live-keystroke
+        // path (`try_user_keymap`'s caller sets `*changed = true`
+        // unconditionally once it decides to replay).
+        true
+    }
+
+    /// Feed a key-to-keys mapping's rhs back through `handle_key`.
+    ///
+    /// A `noremap` mapping's rhs is taken literally and never re-expanded —
+    /// that's what `noremap` means — so this just replays it.
+    ///
+    /// A `map`-family (recursive) mapping's rhs can itself contain lhs text
+    /// that matches *another* user keymap, which vim expands too (up to
+    /// `maxmapdepth`). A cycle (`nmap a b` + `nmap b a`) must eventually stop
+    /// with `E223: recursive mapping` rather than hang. Earlier versions of
+    /// this expanded recursively by calling `handle_key` → `try_user_keymap`
+    /// → `feed_keymap_rhs` again for each nested mapping — one Rust stack
+    /// frame per expansion level, which overflowed the thread's real stack on
+    /// a cyclic map (`handle_key` is a large function) *before* any depth
+    /// counter got a chance to fire. This instead resolves the whole chain
+    /// with an explicit work queue in a loop, so [`MAXMAPDEPTH`] expansions
+    /// cost one stack frame total, not 1000 (#1151 review).
+    fn feed_keymap_rhs(&mut self, rhs: &[String], top_noremap: bool) -> EngineAction {
+        if top_noremap {
+            return self.replay_keys_literal(rhs);
+        }
+
+        let mut queue: std::collections::VecDeque<String> = rhs.iter().cloned().collect();
+        let mut last = EngineAction::None;
+        let mut expansions = 0usize;
+
+        while let Some(first) = queue.front().cloned() {
+            let active_modes = self.active_keymap_modes();
+            let mut best: Option<(usize, UserKeymapAction, bool)> = None;
+            if !active_modes.is_empty() {
+                for km in &self.user_keymaps {
+                    if !active_modes.contains(&km.mode.as_str()) {
+                        continue;
+                    }
+                    if km.keys.is_empty() || km.keys.len() > queue.len() {
+                        continue; // not enough lookahead to ever match
+                    }
+                    if queue.iter().take(km.keys.len()).eq(km.keys.iter()) {
+                        let better = best.as_ref().is_none_or(|(len, _, _)| km.keys.len() > *len);
+                        if better {
+                            best = Some((km.keys.len(), km.action.clone(), km.noremap));
+                        }
+                    }
+                }
+            }
+
+            let Some((len, action, noremap)) = best else {
+                // No mapping matches at this position — dispatch exactly one
+                // token literally and move on.
+                queue.pop_front();
+                last = self.replay_keys_literal(std::slice::from_ref(&first));
+                continue;
+            };
+
+            for _ in 0..len {
+                queue.pop_front();
+            }
+            expansions += 1;
+            if expansions > MAXMAPDEPTH {
+                self.message = "E223: recursive mapping".to_string();
+                return EngineAction::None;
+            }
+            match action {
+                UserKeymapAction::Ex(cmd) => {
+                    last = self.execute_command(&cmd);
+                }
+                UserKeymapAction::Keys(sub_rhs) => {
+                    if noremap {
+                        last = self.replay_keys_literal(&sub_rhs);
+                    } else {
+                        // Push the expansion back onto the front of the queue
+                        // so it's resolved (and can itself be expanded
+                        // further) before anything already queued after it.
+                        for tok in sub_rhs.into_iter().rev() {
+                            queue.push_front(tok);
+                        }
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    /// Replay a fixed list of already-resolved keys through `handle_key` with
+    /// user-keymap matching disabled, so none of them can be re-expanded —
+    /// used both for a `noremap` rhs (never expands, by definition) and for a
+    /// single token `feed_keymap_rhs` has already decided has no mapping
+    /// match (dispatching it through `handle_key` normally would run
+    /// `try_user_keymap`'s own prefix-buffering on it a second time, against
+    /// `self.keymap_buf` state that belongs to live typing, not this replay).
+    fn replay_keys_literal(&mut self, toks: &[String]) -> EngineAction {
+        let was_replaying = self.keymap_replaying;
+        self.keymap_replaying = true;
+        let mut last = EngineAction::None;
+        for tok in toks {
+            let (name, uni, ctrl) = decode_keypress(tok);
+            last = self.handle_key(&name, uni, ctrl);
+        }
+        self.keymap_replaying = was_replaying;
+        last
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
@@ -9274,10 +10273,13 @@ impl Engine {
         self.mouse_drag_active = false;
         self.mouse_drag_origin_window = None;
         // Clicking into the editor returns keyboard focus to the buffer, so
-        // any bottom-panel focus (currently just quickfix) must be released
-        // — otherwise the panel keeps the `[FOCUS]` marker and j/k keep
-        // routing to the panel until Esc is pressed.
-        self.quickfix_has_focus = false;
+        // any bottom-panel focus (quickfix, or this window's location list)
+        // must be released — otherwise the panel keeps the `[FOCUS]` marker
+        // and j/k keep routing to the panel until Esc is pressed (#1155).
+        self.quickfix.has_focus = false;
+        if let Some(list) = self.location_lists.get_mut(&window_id) {
+            list.has_focus = false;
+        }
         // Switch to the group that owns this window.
         self.focus_group_for_window(window_id);
         self.set_cursor_for_window(window_id, line, col);
@@ -9300,7 +10302,7 @@ impl Engine {
         // Ensure this window's group and tab are active.
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
-            self.active_tab_mut().active_window = window_id;
+            self.active_tab_mut().focus_window(window_id);
         }
 
         if !self.mouse_drag_active {
@@ -9343,8 +10345,8 @@ impl Engine {
                 if drag_before_origin {
                     // Dragging before the original word — anchor at word end, cursor at word start
                     let mut word_start = clamped_col.min(line_text.len().saturating_sub(1));
-                    if word_start < line_text.len() && Self::is_word_char(line_text[word_start]) {
-                        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+                    if word_start < line_text.len() && self.is_word_char(line_text[word_start]) {
+                        while word_start > 0 && self.is_word_char(line_text[word_start - 1]) {
                             word_start -= 1;
                         }
                     }
@@ -9358,9 +10360,9 @@ impl Engine {
                 } else {
                     // Dragging after the original word — anchor at word start, cursor at word end
                     let mut word_end = clamped_col.min(line_text.len().saturating_sub(1));
-                    if word_end < line_text.len() && Self::is_word_char(line_text[word_end]) {
+                    if word_end < line_text.len() && self.is_word_char(line_text[word_end]) {
                         while word_end + 1 < line_text.len()
-                            && Self::is_word_char(line_text[word_end + 1])
+                            && self.is_word_char(line_text[word_end + 1])
                         {
                             word_end += 1;
                         }
@@ -9400,20 +10402,20 @@ impl Engine {
         let cursor_col = self.view().cursor.col;
         let line_text: Vec<char> = self.buffer().content.line(cursor_line).chars().collect();
 
-        if cursor_col >= line_text.len() || !Self::is_word_char(line_text[cursor_col]) {
+        if cursor_col >= line_text.len() || !self.is_word_char(line_text[cursor_col]) {
             // Clicked on non-word character — don't select
             return;
         }
 
         // Find word start
         let mut word_start = cursor_col;
-        while word_start > 0 && Self::is_word_char(line_text[word_start - 1]) {
+        while word_start > 0 && self.is_word_char(line_text[word_start - 1]) {
             word_start -= 1;
         }
 
         // Find word end (inclusive)
         let mut word_end = cursor_col;
-        while word_end + 1 < line_text.len() && Self::is_word_char(line_text[word_end + 1]) {
+        while word_end + 1 < line_text.len() && self.is_word_char(line_text[word_end + 1]) {
             word_end += 1;
         }
         // Exclude trailing newline from word end

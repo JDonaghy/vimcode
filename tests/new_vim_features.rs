@@ -1,6 +1,6 @@
 mod common;
 use common::*;
-use vimcode_core::Mode;
+use vimcode_core::{EngineAction, Mode};
 
 // ── ^ first non-blank ────────────────────────────────────────────────────────
 
@@ -659,12 +659,152 @@ fn test_changes_shows_change_list() {
 
 // ── :history ─────────────────────────────────────────────────────────────────
 
+/// #1327: `:history`'s no-argument listing must match Neovim's own
+/// `      #  cmd history` header and column layout (confirmed against a
+/// live oracle) instead of the vimcode-invented `--- Command History ---`
+/// header this used to assert on.
 #[test]
 fn test_history_shows_command_history() {
     let mut e = engine_with("hello\n");
     run_cmd(&mut e, "echo hello");
     exec(&mut e, "history");
-    assert!(e.message.contains("History") || e.message.contains("echo"));
+    assert!(
+        e.message.starts_with("      #  cmd history\n"),
+        "{:?}",
+        e.message
+    );
+    assert!(e.message.contains("echo hello"));
+}
+
+/// Hermeticity regression for #1304: `Engine::new()` used to read the real
+/// `~/.config/vimcode/history.json` unconditionally, so `:history` printed
+/// whatever the developer machine's config had lying around (confirmed:
+/// this repo's own dev machine had ~100 stale entries) instead of only the
+/// commands this test itself typed. `engine_with` now calls
+/// `suppress_disk_loads()` before `Engine::new()`, so `HistoryState::load()`
+/// returns `Default` instead of touching disk. Assert the exact rendered
+/// `:history` output — not just that *a* history entry is present, which
+/// would pass just as well with real disk history leaked in ahead of it.
+///
+/// #1327 rewrote the expected string to match Neovim's real `:history`
+/// format: the `      #  cmd history` header (not vimcode's invented
+/// `--- Command History ---`) and a leading `>` marker on the newest entry
+/// (`echo two`, the last one added — `exec` calls `execute_command`
+/// directly, bypassing the command-line UI path that would otherwise also
+/// add `"history"` itself to `command_history`, so the newest entry stays
+/// `echo two`). Both confirmed against a live oracle.
+#[test]
+fn test_history_is_hermetic_and_shows_only_this_tests_commands() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    run_cmd(&mut e, "echo two");
+    exec(&mut e, "history");
+    assert_eq!(
+        e.message, "      #  cmd history\n      1  echo one\n>     2  echo two",
+        "message should contain exactly this test's two commands, not any \
+         real ~/.config/vimcode/history.json entries from the machine \
+         running the test"
+    );
+}
+
+/// #1327: `:history /` (and its `?`/`search` spellings, `:h :history`)
+/// selects the *search* history rather than the command one — confirmed
+/// against a live oracle. Before #1327, any argument to `:history` fell
+/// through to "not an editor command" (the old match arm matched only the
+/// bare `"history"` string), so this is new behavior, not a reformat.
+#[test]
+fn test_history_slash_selects_search_history() {
+    let mut e = engine_with("hello\nworld\n");
+    search_fwd(&mut e, "hello");
+    search_fwd(&mut e, "world");
+    exec(&mut e, "history /");
+    assert_eq!(
+        e.message,
+        "      #  search history\n      1  hello\n>     2  world"
+    );
+}
+
+/// #1327: `:history all` lists every history kind's table back to back —
+/// `cmd`, `search`, then the always-empty `expr`/`input`/`debug` headers
+/// (vimcode tracks none of those three) — with no separator line between
+/// sections, confirmed against a live oracle.
+#[test]
+fn test_history_all_lists_every_kind() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo hi");
+    search_fwd(&mut e, "hello");
+    exec(&mut e, "history all");
+    assert_eq!(
+        e.message,
+        "      #  cmd history\n>     1  echo hi\n      #  search history\n>     1  hello\n      #  expr history\n      #  input history\n      #  debug history"
+    );
+}
+
+/// #1327: a trailing `{first}[,{last}]` index range (`:h
+/// :history-indexing`) restricts which rows of the selected history print —
+/// confirmed against a live oracle, including that `first` and `last` are
+/// each entries' *absolute* position, unaffected by the filter (row `1` is
+/// omitted here, but the surviving row still says `2`, not renumbered `1`).
+#[test]
+fn test_history_range_filters_rows() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    run_cmd(&mut e, "echo two");
+    exec(&mut e, "history 2,2");
+    assert_eq!(e.message, "      #  cmd history\n>     2  echo two");
+}
+
+/// #1327: on a totally fresh session — nothing ever recorded in *any*
+/// history kind — every one of `:history`, `:history {name}` and
+/// `:history all` errors with Neovim's own `'history' option is zero`
+/// message (`:h :history`) rather than printing an empty table. Confirmed
+/// against a live oracle.
+#[test]
+fn test_history_named_empty_kind_errors() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "'history' option is zero");
+    assert!(matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the `'history' option is zero` gate is session-wide, not
+/// per-requested-kind — confirmed against a live oracle. Once *any* kind has
+/// recorded something (here, only `cmd` via `run_cmd`), requesting a
+/// *different*, still-empty kind (`search`) must print that kind's empty
+/// table, not error. Before this fix, `ex_history` checked only the
+/// requested kind's own entries, so this exact case incorrectly errored.
+#[test]
+fn test_history_other_kind_empty_prints_empty_table_when_something_recorded() {
+    let mut e = engine_with("hello\n");
+    run_cmd(&mut e, "echo one");
+    let action = exec(&mut e, "history search");
+    assert_eq!(e.message, "      #  search history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: the symmetric case of the test above — only `search`
+/// history has ever been recorded, `cmd` history (the bare `:history`
+/// default, `:h :history`) is empty. Must print an empty table, not error.
+/// Confirmed against a live oracle.
+#[test]
+fn test_history_bare_default_prints_empty_table_when_only_search_recorded() {
+    let mut e = engine_with("hello\nworld\n");
+    search_fwd(&mut e, "hello");
+    let action = exec(&mut e, "history");
+    assert_eq!(e.message, "      #  cmd history");
+    assert!(!matches!(action, EngineAction::Error));
+}
+
+/// #1327 review: `:history all` on a totally fresh session — nothing ever
+/// recorded in any kind — errors exactly like a single named kind does,
+/// rather than printing five empty headers. Confirmed against a live
+/// oracle.
+#[test]
+fn test_history_all_errors_on_totally_fresh_session() {
+    let mut e = engine_with("hello\n");
+    let action = exec(&mut e, "history all");
+    assert_eq!(e.message, "'history' option is zero");
+    assert!(matches!(action, EngineAction::Error));
 }
 
 // ── :reg ─────────────────────────────────────────────────────────────────────
@@ -675,7 +815,25 @@ fn test_reg_shows_registers() {
     press(&mut e, 'y');
     press(&mut e, 'w'); // yank 'hello'
     exec(&mut e, "reg");
-    assert!(e.message.contains("Registers") || e.message.contains('"'));
+    // #1299: Neovim's real `Type Name Content` table. The old assertion here
+    // was `contains("Registers") || contains('"')`, which passed against any
+    // listing at all — including the pre-#1299 invented header.
+    assert!(
+        e.message.starts_with("Type Name Content\n"),
+        ":reg header: {:?}",
+        e.message
+    );
+    // `yw` is charwise, so the unnamed and `0` rows both use the `c` type.
+    assert!(
+        e.message.contains("  c  \"\"   hello"),
+        ":reg unnamed row: {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("  c  \"0   hello"),
+        ":reg yank row: {:?}",
+        e.message
+    );
 }
 
 // ── :tabmove ────────────────────────────────────────────────────────────────

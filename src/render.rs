@@ -24,12 +24,13 @@
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
 use crate::core::engine::sidebar::{
-    PANEL_AI, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+    PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
 };
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
-use crate::core::settings::LineNumberMode;
+use crate::core::project_search::QuickfixList;
+use crate::core::settings::{LineNumberMode, Settings};
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -930,18 +931,20 @@ const NERD_FONT_FALLBACK_FAMILY: &str = "Symbols Nerd Font";
 ///
 /// `sync_nerd_fonts` above only ever toggles the glyph-vs-fallback *flag*
 /// (`Backend::set_nerd_fonts`) — it never tells a backend which font to
-/// resolve a glyph against. On GTK that's enough: fontconfig cascades to a
-/// system-installed Nerd Font automatically. It is not enough on macOS
-/// (Core Text) or Windows (DirectWrite): neither cascades to an arbitrary
-/// installed font for Private-Use-Area codepoints without an explicit
-/// per-font fallback list, which is exactly what
-/// `Backend::register_font_from_memory` +
-/// `Backend::set_nerd_font_fallback` install. Both are defaulted no-ops per
-/// quadraui's rule that the *app* must call them (quadraui#929) — GTK and
-/// TUI take the default harmlessly (GTK already has its own hardcoded
-/// fallback; TUI is a fixed-cell backend with no font concept), so this one
-/// call is platform-neutral: no `#[cfg(target_os)]` needed here or at either
-/// call site.
+/// resolve a glyph against. Core Text (macOS) and DirectWrite (Windows)
+/// never cascade to an arbitrary installed font for Private-Use-Area
+/// codepoints without an explicit per-font fallback list, which is exactly
+/// what `Backend::register_font_from_memory` + `Backend::
+/// set_nerd_font_fallback` install. GTK used to get this for free from a
+/// vimcode-side fontconfig filesystem install (`install_bundled_icon_font`,
+/// deleted in #1130); now that quadraui#1013 gives `GtkBackend` a real
+/// `register_font_from_memory` override (in-process, no filesystem write and
+/// no font-cache-refresh shell-out), this one call registers the font for
+/// GTK too — the same call
+/// that already covered macOS/Windows. TUI takes the trait's no-op default
+/// harmlessly (a fixed-cell backend has no font concept), so this call is
+/// platform-neutral: no `#[cfg(target_os)]` needed here or at either call
+/// site.
 ///
 /// Call once, from `setup()` — **not** the per-frame
 /// `sync_nerd_fonts`/`sync_per_frame_backend_state` path. Unlike the
@@ -1083,7 +1086,14 @@ pub struct WindowStatusLine {
 #[derive(Debug)]
 pub struct RenderedWindow {
     pub window_id: WindowId,
-    /// Pixel-space rectangle for the GTK backend (ignored by TUI).
+    /// Window rectangle. GTK reads it directly as sub-pixel float geometry
+    /// (Cairo paints exactly what's here). TUI reads it too — for popup
+    /// positioning (`tui_main::render_impl`'s completion/hover popup
+    /// clamping, #420) and, truncated to whole cells first via
+    /// [`tui_window_paint_rect`], for click/drag/hover column resolution
+    /// (#1040) — but is *not* the geometry TUI's own paint path draws
+    /// into; see [`tui_window_paint_rect`]'s doc for why TUI code must
+    /// truncate before using it.
     pub rect: WindowRect,
     /// Visible lines, one per row.
     pub lines: Vec<RenderedLine>,
@@ -1109,6 +1119,18 @@ pub struct RenderedWindow {
     /// to `Engine::set_viewport_for_window` so `ensure_cursor_visible`
     /// uses accurate geometry.
     pub text_viewport_cols: usize,
+    /// Width reserved to the right of the text for the minimap strip plus
+    /// the scroll-affordance gutter it always leaves clear alongside it
+    /// (#1094 review), in the caller's own unit — `0.0` when the strip is
+    /// off/self-suppressed for this window. `rect` reaches the pane's true
+    /// right edge (#1094's own fix), so `window_zone_hit_test` needs this
+    /// to find the strip's boundary and exclude it from `TextArea`/gutter
+    /// click routing without re-deriving `scroll_gutter_width` (a private,
+    /// backend-`scrollbar_reserve`-dependent quantity) a second time from
+    /// scratch. Mirrors exactly what `build_rendered_window` already
+    /// subtracted to produce `text_viewport_cols` above, so the two can
+    /// never drift from each other.
+    pub minimap_reserved_w: f64,
     /// Whether this is the focused window.
     pub is_active: bool,
     /// Whether to render with the slightly-different active-window background
@@ -1549,19 +1571,21 @@ pub fn editor_hover_to_quadraui_rich_text(
 /// `src/gtk/draw.rs::draw_editor_hover_popup`, with an added Pango-exact
 /// link-width measure; that precision isn't reachable from
 /// `render_content`'s `&mut dyn Backend`-only signature (no raw
-/// `pango::Layout`, same class of gap TUI's own `render_editor_hover_popup`
-/// hit for the raw `Frame` — see `PLAN.md`), so both backends now use the
-/// same char-count-based `link_widths` closure, scaled by `unit_w`. This
-/// only affects link *hit-region* precision, not paint — the rasteriser
-/// re-measures glyphs itself when drawing.
+/// `pango::Layout`, same class of gap TUI's now-deleted
+/// `render_editor_hover_popup` wrapper hit for the raw `Frame` — see
+/// `PLAN.md`), so both backends now use the same char-count-based
+/// `link_widths` closure, scaled by `unit_w`. This only affects link
+/// *hit-region* precision, not paint — the rasteriser re-measures glyphs
+/// itself when drawing.
 ///
 /// `unit_w` / `unit_h` are `1.0, 1.0` for TUI (cell-native) or
 /// `char_width, line_height` in pixels for GTK. `popup_x` / `popup_y` /
 /// `viewport` must already be expressed in that same space.
 ///
 /// Returns `(link_rects, popup_bounds, scrollbar_hit)` — all `quadraui::Rect`,
-/// in the caller's units — for mouse hit-testing. TUI calls this directly
-/// too (`render_impl.rs::paint_editor_popups`, unit_w/unit_h = 1.0); there is
+/// in the caller's units — for mouse hit-testing. Called by the shared
+/// [`paint_editor_popups`] (#1167), which both `render_impl.rs`'s TUI
+/// wrapper and GTK's `App::paint_editor_popups_rung` call through; there is
 /// no per-backend copy of this geometry any more (#831).
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn editor_hover_popup_paint(
@@ -1628,6 +1652,294 @@ pub fn editor_hover_popup_paint(
         total: popup.lines.len(),
     });
     (link_rects, popup_rect, scrollbar_hit)
+}
+
+/// A single editor-anchored popup's already-resolved paint position: the
+/// on-screen anchor point plus the viewport it clamps into, both expressed
+/// in the caller's native units (TUI cell columns/rows, GTK pixels).
+#[derive(Debug, Clone, Copy)]
+pub struct PopupAnchor {
+    pub x: f32,
+    pub y: f32,
+    pub viewport: quadraui::Rect,
+}
+
+/// Convert a character-index column to a tab-expanded display column.
+///
+/// Moved here from `tui_main::render_impl` (#1237) so both backends' popup-
+/// anchor math can share it: TUI already expanded tabs before placing the
+/// completion popup, but GTK's equivalent (`App::paint_editor_popups_rung`)
+/// used the raw character column as if it were a display column, which
+/// drifted the popup left of the cursor on tab-indented lines, proportional
+/// to the tab count preceding it. `RenderedWindow::scroll_left` is itself
+/// already in display columns (see `display_col_to_buffer_col`'s doc), so
+/// this must run before any `scroll_left` subtraction, not after.
+pub fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
+    let tabstop = tabstop.max(1);
+    let mut vis = 0usize;
+    for (i, ch) in raw_text.chars().enumerate() {
+        if ch == '\n' || ch == '\r' {
+            break;
+        }
+        if i >= char_col {
+            break;
+        }
+        if ch == '\t' {
+            vis = ((vis / tabstop) + 1) * tabstop;
+        } else {
+            vis += 1;
+        }
+    }
+    vis
+}
+
+/// Resolved `(x, y)` anchor points for each of the five editor-anchored
+/// popups, in the caller's unit scale (`cw`/`lh`: `1.0`/`1.0` for TUI's
+/// cell-native space, the actual pixel char-width/line-height for GTK).
+/// `None` when that popup isn't open or there's no active window.
+///
+/// Deliberately does *not* carry the viewport each anchor clamps into —
+/// see `paint_editor_popups`'s doc for the one pre-existing, intentional
+/// per-backend difference (`editor_hover`'s clip viewport: TUI clamps into
+/// the whole frame, GTK into the active window's own rect) that callers
+/// still own so this mechanical extraction doesn't silently fold it away.
+pub struct EditorPopupPoints {
+    pub completion: Option<(f32, f32)>,
+    pub hover: Option<(f32, f32)>,
+    pub editor_hover: Option<(f32, f32)>,
+    pub diff_peek: Option<(f32, f32)>,
+    pub signature_help: Option<(f32, f32)>,
+}
+
+/// Compute [`EditorPopupPoints`] from the active window in `screen`.
+///
+/// `win_origin` is the active window's own `(x, y)` in the caller's unit
+/// scale — `None` when there's no active window. Taken as a parameter
+/// rather than read from `RenderedWindow::rect` directly because TUI must
+/// snap it to the whole-cell grid its paint path actually truncated to
+/// first (via [`tui_window_paint_rect`]; `RenderedWindow` rects come from
+/// continuous float split math and are not integer-valued in general,
+/// #1040), while GTK uses its raw sub-pixel float rect as-is — exactly the
+/// same origin each backend already independently derives for its own
+/// `win_viewport`.
+///
+/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
+/// (`App::paint_editor_popups_rung`) as of #1237 — before that each backend
+/// re-derived every one of these five anchor points itself (gutter width,
+/// scroll offset, tab-aware column resolution), and only TUI's completion
+/// anchor happened to call [`char_col_to_visual`] first; the other four
+/// anchors on *both* backends, and GTK's completion anchor specifically,
+/// used the raw character column as a display column outright.
+pub fn editor_popup_anchors(
+    screen: &ScreenLayout,
+    win_origin: Option<(f32, f32)>,
+    cw: f32,
+    lh: f32,
+) -> EditorPopupPoints {
+    let active_win = screen
+        .windows
+        .iter()
+        .find(|w| w.window_id == screen.active_window_id);
+
+    // `view_row` is already relative to the top of the visible window (as
+    // `CursorPos::view_line` is), so every caller below that starts from an
+    // absolute buffer line (`anchor_line`) subtracts its own scroll offset
+    // first.
+    let anchor_xy = |view_row: usize, char_col: usize, scroll_left: usize| -> Option<(f32, f32)> {
+        let win = active_win?;
+        let (win_x, win_y) = win_origin?;
+        let raw = win
+            .lines
+            .get(view_row)
+            .map(|l| l.raw_text.as_str())
+            .unwrap_or("");
+        let vis_col =
+            char_col_to_visual(raw, char_col, win.tabstop).saturating_sub(scroll_left) as f32;
+        let x = win_x + win.gutter_char_width as f32 * cw + vis_col * cw;
+        let y = win_y + view_row as f32 * lh;
+        Some((x, y))
+    };
+
+    let completion = active_win.and_then(|win| {
+        let (cursor_pos, _) = win.cursor.as_ref()?;
+        anchor_xy(cursor_pos.view_line, cursor_pos.col, win.scroll_left)
+    });
+
+    let hover = screen.hover.as_ref().and_then(|h| {
+        let win = active_win?;
+        anchor_xy(
+            h.anchor_line.saturating_sub(win.scroll_top),
+            h.anchor_col,
+            win.scroll_left,
+        )
+    });
+
+    let editor_hover = screen.editor_hover.as_ref().and_then(|eh| {
+        anchor_xy(
+            eh.anchor_line.saturating_sub(eh.frozen_scroll_top),
+            eh.anchor_col,
+            eh.frozen_scroll_left,
+        )
+    });
+
+    let signature_help = screen.signature_help.as_ref().and_then(|sig| {
+        let win = active_win?;
+        anchor_xy(
+            sig.anchor_line.saturating_sub(win.scroll_top),
+            sig.anchor_col,
+            win.scroll_left,
+        )
+    });
+
+    // Diff-peek anchors at the cursor's own row, left edge — no column
+    // offset, so no tab expansion needed.
+    let diff_peek = screen.diff_peek.as_ref().and_then(|peek| {
+        let win = active_win?;
+        let (win_x, win_y) = win_origin?;
+        let view_row = peek.anchor_line.saturating_sub(win.scroll_top);
+        let x = win_x + win.gutter_char_width as f32 * cw;
+        let y = win_y + view_row as f32 * lh;
+        Some((x, y))
+    });
+
+    EditorPopupPoints {
+        completion,
+        hover,
+        editor_hover,
+        diff_peek,
+        signature_help,
+    }
+}
+
+/// Paint the editor-anchored popups: completion menu, LSP hover, the rich
+/// "editor hover" markdown popup, diff-peek, and signature-help.
+///
+/// Shared by TUI (`tui_main::render_impl::paint_editor_popups`) and GTK
+/// (`App::paint_editor_popups_rung`) as of #1167 — before that the two were
+/// ~160/~164-line near-verbatim copies of the same five
+/// build-adapter → `.layout()` → `backend.draw_*` → cache-output-for-hit-
+/// testing blocks, differing only in coordinate units and in exactly how
+/// each anchor point is derived from the active window (gutter width,
+/// scroll offsets, tab-aware column resolution for the cursor).
+///
+/// This function owns everything from "given a resolved anchor + viewport"
+/// onward. Resolving the anchor point itself now goes through the shared
+/// [`editor_popup_anchors`] (#1237 — see its doc for why GTK's completion
+/// anchor and *all four* non-completion anchors on both backends used to
+/// drift left on tab-indented lines), so only viewport selection and the
+/// completion popup's width/height clamp remain per-backend wiring. One
+/// deliberate *pre-existing* per-backend difference survives that
+/// convergence too — the editor-hover popup's clip viewport: TUI clamps
+/// into the whole frame `area`, GTK clamps into the active window's own
+/// rect. Folding that one together would be a behavior change needing its
+/// own issue + black-box test, not something to smuggle into this
+/// refactor.
+///
+/// The four output caches are cleared unconditionally at the top (matching
+/// GTK's existing per-frame behavior) rather than only-on-`Some` (TUI's
+/// prior behavior for `completion_layout`/`editor_hover_link_rects`) —
+/// verified safe, not a behavior change: every consumer
+/// (`render::route_modal_overlay_click`'s `completion_open` /
+/// `editor_hover_*` routing) already gates on live engine state before ever
+/// reading the cached layout, so a stale cache was unreachable dead data,
+/// never a click-routing hazard.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_editor_popups(
+    backend: &mut dyn quadraui::Backend,
+    screen: &ScreenLayout,
+    theme: &Theme,
+    unit_w: f32,
+    unit_h: f32,
+    completion: Option<(PopupAnchor, f32, f32)>,
+    hover: Option<PopupAnchor>,
+    editor_hover: Option<PopupAnchor>,
+    diff_peek: Option<PopupAnchor>,
+    signature_help: Option<PopupAnchor>,
+    completion_layout_out: &mut Option<quadraui::CompletionsLayout>,
+    editor_hover_link_rects_out: &mut Vec<(quadraui::Rect, String)>,
+    editor_hover_popup_rect_out: &mut Option<quadraui::Rect>,
+    editor_hover_scrollbar_out: &mut Option<PopupScrollbarHit>,
+) {
+    *completion_layout_out = None;
+    editor_hover_link_rects_out.clear();
+    *editor_hover_popup_rect_out = None;
+    *editor_hover_scrollbar_out = None;
+
+    // ── Completion popup (rendered on top of editor) ───────────────────────
+    if let (Some(menu), Some((anchor, popup_width, max_popup_height))) =
+        (&screen.completion, completion)
+    {
+        let completions = completion_menu_to_quadraui_completions(menu);
+        let layout = completions.layout(
+            anchor.x,
+            anchor.y,
+            unit_h,
+            anchor.viewport,
+            popup_width,
+            max_popup_height,
+            |_| quadraui::CompletionItemMeasure::new(unit_h),
+        );
+        backend.draw_completions(&completions, &layout);
+        *completion_layout_out = Some(layout);
+    }
+
+    // ── Hover popup (rendered on top of editor) ──────────────────────────────
+    if let (Some(hv), Some(anchor)) = (&screen.hover, hover) {
+        let (tooltip, layout) = hover_popup_to_quadraui_tooltip(
+            hv,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
+
+    // ── Editor hover popup (rich markdown, triggered by gh or mouse dwell) ─
+    if let (Some(eh), Some(anchor)) = (&screen.editor_hover, editor_hover) {
+        let (links, rect, sb) = editor_hover_popup_paint(
+            backend,
+            eh,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        *editor_hover_link_rects_out = links;
+        *editor_hover_popup_rect_out = rect;
+        *editor_hover_scrollbar_out = sb;
+    }
+
+    // ── Diff peek popup (inline git hunk preview) ──────────────────────────
+    if let (Some(peek), Some(anchor)) = (&screen.diff_peek, diff_peek) {
+        let (tooltip, layout) = diff_peek_to_quadraui_tooltip(
+            peek,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
+
+    // ── Signature-help popup (shown in insert mode when cursor is inside a call) ─
+    if let (Some(sig), Some(anchor)) = (&screen.signature_help, signature_help) {
+        let (tooltip, layout) = signature_help_to_quadraui_tooltip(
+            sig,
+            anchor.x,
+            anchor.y,
+            anchor.viewport,
+            theme,
+            unit_w,
+            unit_h,
+        );
+        backend.draw_tooltip(&tooltip, &layout);
+    }
 }
 
 // ─── SignatureHelp ────────────────────────────────────────────────────────────
@@ -2915,13 +3227,20 @@ pub fn engine_key_from_ui(
             NamedKey::PageUp => Some(("Page_Up".to_string(), None, false)),
             NamedKey::PageDown => Some(("Page_Down".to_string(), None, false)),
             NamedKey::F(n) => Some((format!("F{n}"), None, false)),
+            // #1060: GTK used to bypass this decoder for `Insert` entirely
+            // (returning `None` here would have silently dropped its
+            // terminal PTY passthrough, which reads the literal `"Insert"`
+            // name — see `terminal_ops::key_to_pty_bytes`). Naming it here
+            // instead lets GTK route through the shared decoder like the
+            // other named keys, and gives TUI a working `Insert` key (routed
+            // through the same `"Insert"`-accepting PTY passthrough) instead
+            // of the silent no-op it got before, since TUI already decodes
+            // crossterm's `KeyCode::Insert` into this same `NamedKey::Insert`
+            // (quadraui `tui/events.rs`) but had nowhere for it to go.
+            NamedKey::Insert => Some(("Insert".to_string(), None, false)),
             // No engine binding today — same set `translate_key` (via
             // crossterm's reverse `KeyCode` mapping) used to drop.
-            NamedKey::Insert
-            | NamedKey::CapsLock
-            | NamedKey::NumLock
-            | NamedKey::ScrollLock
-            | NamedKey::Menu => None,
+            NamedKey::CapsLock | NamedKey::NumLock | NamedKey::ScrollLock | NamedKey::Menu => None,
         },
     }
 }
@@ -3142,10 +3461,13 @@ mod engine_key_from_ui_tests {
 
     /// Named keys carry no engine binding today for the handful crossterm
     /// can decode but the engine never asked for.
+    ///
+    /// `NamedKey::Insert` used to be in this list — see
+    /// `insert_key_decodes_to_the_gtk_terminal_pty_spelling` below for why
+    /// #1060 gave it a real arm instead.
     #[test]
     fn unbound_named_keys_return_none() {
         for named in [
-            NamedKey::Insert,
             NamedKey::CapsLock,
             NamedKey::NumLock,
             NamedKey::ScrollLock,
@@ -3153,6 +3475,28 @@ mod engine_key_from_ui_tests {
         ] {
             assert!(engine_key_from_ui(&Key::Named(named), Modifiers::default(), false).is_none());
         }
+    }
+
+    /// #1060: GTK's `handle_dispatch` used to special-case `NamedKey::Insert`
+    /// to `"Insert"` *outside* this decoder specifically because routing it
+    /// through here used to return `None` — which would have silently
+    /// dropped the key (nothing reaches `handle_key_press`, so GTK's
+    /// terminal PTY passthrough — `terminal_ops::key_to_pty_bytes`'s
+    /// `"Insert"` arm, reached via `canonical_terminal_key_name`'s
+    /// pass-through — would never see it). Now that this decoder names it
+    /// directly, GTK's special case was deleted with no change in the
+    /// string it hands `handle_key_press` (still `"Insert"`), and TUI gains
+    /// a working `Insert` key (it already decodes crossterm's
+    /// `KeyCode::Insert` to this same `NamedKey::Insert` — quadraui's
+    /// `tui/events.rs` — but had nowhere for it to go before this arm
+    /// existed).
+    #[test]
+    fn insert_key_decodes_to_the_gtk_terminal_pty_spelling() {
+        let (name, unicode, ctrl) =
+            engine_key_from_ui(&Key::Named(NamedKey::Insert), Modifiers::default(), true).unwrap();
+        assert_eq!(name, "Insert");
+        assert_eq!(unicode, None);
+        assert!(!ctrl);
     }
 
     /// Shift+Up (no ctrl): VSCode-mode selection-extension spelling, shared
@@ -3248,7 +3592,20 @@ pub enum ModalKeyRoute {
 pub fn route_modal_key(engine: &Engine) -> ModalKeyRoute {
     // Spell-suggestion selection intercepts all keys (`keys.rs`'s first
     // branch); a dialog is modal and intercepts everything below it.
-    if engine.spell_suggestions.is_some() || engine.dialog.is_some() {
+    // The change-review surface (#955, shared with #525) is the same
+    // shape: a full-viewport overlay that must own every keypress
+    // regardless of which panel would otherwise have focus — in
+    // particular, the AI panel's own focus route sends keys straight to
+    // `render::route_ai_chat_event`, bypassing `Engine::handle_key`
+    // entirely, so without this a keypress meant for a diff opened
+    // *while* the AI panel has focus (exactly when a tool-call diff
+    // arrives) would type into the chat input instead.
+    // `handle_change_review_key` (inside `Engine::handle_key`, same place
+    // as the other two) is the actual interception.
+    if engine.spell_suggestions.is_some()
+        || engine.dialog.is_some()
+        || engine.change_review.is_some()
+    {
         return ModalKeyRoute::Engine;
     }
 
@@ -3353,6 +3710,8 @@ pub enum FocusKeyRoute {
     Ai,
     /// The source-control panel — `dispatch_sc_sidebar_key_unified`.
     SourceControl,
+    /// The Board panel (#521) — `Engine::dispatch_board_key_unified`.
+    Board,
     /// The file explorer — `Engine::dispatch_explorer_key`. Also the
     /// terminal fallback: a key that reaches the sidebar band and matches no
     /// other panel lands here rather than falling through to the editor,
@@ -3419,6 +3778,9 @@ pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyR
     }
     if engine.sc_has_focus || engine.active_panel_is(PANEL_GIT) {
         return FocusKeyRoute::SourceControl;
+    }
+    if engine.board_has_focus || engine.active_panel_is(PANEL_BOARD) {
+        return FocusKeyRoute::Board;
     }
 
     // The explorer is the unguarded fallback, not a guarded arm — see the
@@ -4049,6 +4411,7 @@ pub fn dispatch_sidebar_panel_key(
             engine.dispatch_sc_sidebar_key_unified(key_name, ctrl, sc_unicode);
             engine.sc_has_focus
         }
+        FocusKeyRoute::Board => engine.dispatch_board_key_unified(key_name),
         FocusKeyRoute::Debug | FocusKeyRoute::Explorer | FocusKeyRoute::Ai => return None,
         FocusKeyRoute::ActivityBar | FocusKeyRoute::None => return None,
     })
@@ -4060,14 +4423,112 @@ pub fn dispatch_sidebar_panel_key(
 /// the legacy TUI loop had and GTK never did — GTK carried no Ctrl+L tier at
 /// all, so the chord was dispatched like any other Ctrl-modified `l`.
 ///
-/// Neither backend can honour the *full* semantics yet — the TUI shell runner
-/// owns the `ratatui::Terminal` whose previous-frame buffer would have to be
-/// reset, and neither `Backend` nor `ShellApp` exposes a
-/// `request_full_repaint`-shaped hook. Tracked as an upstream gap alongside
-/// the popup-disappearance clear in `TuiShellApp::render_content`; until it
-/// lands, both backends do the honest thing and request an ordinary redraw.
-pub fn is_force_redraw_key(key_name: &str, unicode: Option<char>, ctrl: bool) -> bool {
+/// #1243: TUI now honours the *full* semantics via
+/// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
+/// `TuiShellApp::handle_key_pressed` calls it on this chord before returning
+/// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
+/// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
+/// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
+/// to desync in the first place), so `GtkBackend` never overrides the hook
+/// and `App::handle_key_press` requests only an ordinary redraw — see
+/// `Backend::request_full_repaint`'s own doc for why that default is
+/// correct rather than a gap. The same hook also covers the
+/// popup-disappearance clear this comment used to point at —
+/// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
+///
+/// **#1393 (quadraui#1060 consume side): the Ctrl+L call site now has a
+/// driver test that proves the repaint itself**, not just the decision
+/// logic — `tui_main::shell_app`'s
+/// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`,
+/// RED-verified by disabling this rung's `backend.request_full_repaint()`
+/// call. A `TestBackend`-based driver (`quadraui::tui::testing::TuiDriver`)
+/// genuinely cannot observe this — see [`popup_overlay_closed_this_frame`]'s
+/// doc for the full proof — so that test uses the vt100-backed
+/// `quadraui::tui::vt_testing::TuiVtDriver` instead (quadraui#1060,
+/// `driver_with_shell` + `inject_raw`, landed at this repo's pinned rev).
+/// The decision logic here is additionally unit-tested in
+/// `slice7_router_tests` below; the wiring at the call site is a one-line
+/// delegation.
+///
+/// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
+/// in the one-keystroke window right after `<C-x>` in Insert mode): right
+/// after `<C-x>`, `<C-x><C-l>` is the whole-line completion sub-mode
+/// (`:h i_CTRL-X_CTRL-L`, #1160), not a repaint request. This rung runs
+/// *before* `Engine::handle_key` is ever called on either backend
+/// (`app.rs`/`shell_app.rs`), so without this carve-out the keystroke never
+/// reaches the engine at all for `<C-x><C-l>` to see it — the same shape of
+/// bug the `<C-x><C-f>` (find/replace) and `<C-x><C-s>` (save) carve-outs
+/// fix inside `Engine::handle_key` itself, just one layer further out.
+pub fn is_force_redraw_key(
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+    insert_ctrl_x_pending: bool,
+) -> bool {
+    if insert_ctrl_x_pending {
+        return false;
+    }
     ctrl && (matches!(unicode, Some('l') | Some('L')) || key_name == "l" || key_name == "L")
+}
+
+/// Did an editor-anchored popup (the completions/hover-doc picker or the
+/// modal folder picker) that was visible last frame close this frame?
+/// (#1243, TUI-only — `TuiShellApp::render_content`'s `had_popup_overlay`.)
+///
+/// The transition that must call `quadraui::Backend::request_full_repaint`
+/// (quadraui#1037): a popup staying open, staying closed, or newly opening
+/// all paint their own content this frame regardless of ratatui's diff
+/// cache, so only the *closing* transition can leave stale glyphs — ones
+/// the popup itself painted last frame, in cells nothing repaints this
+/// frame — for that cache to wrongly believe are still correct and skip.
+/// Pulled out as its own pure function (mirroring [`is_force_redraw_key`]
+/// just above) because it is the one piece of this wiring that *is*
+/// directly unit-testable from here.
+///
+/// **Why `tui_main::shell_app`'s `TestBackend`-driven
+/// `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app` cannot
+/// assert on the *repaint* itself, only on this edge-detection predicate —
+/// verified directly against quadraui checkout rev `215e9e4`
+/// (`Cargo.toml`'s pin), not assumed:**
+/// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
+/// consumes `request_full_repaint` in its own `render()` (it calls
+/// `Terminal::clear()` when the flag is set, exactly like the live
+/// runner) — that part isn't the blocker. The blocker is that
+/// `ratatui`'s `Terminal::clear()` is *provably output-identical* under a
+/// `TestBackend`: it blanks the backend buffer and resets the back
+/// buffer, so the following `draw` diffs a fully-desired frame against a
+/// blank previous frame and writes every non-blank cell — landing on
+/// byte-for-byte the same buffer the incremental path lands on, because
+/// `Terminal::draw`'s own contract already requires the render callback
+/// to repaint the whole frame. There is therefore no stale cell for a
+/// `TestBackend`-based driver to observe, and no `screen()` /
+/// `style_at()` / `terminal_cursor_position()` assertion that can
+/// distinguish the two paths. Only content written *outside* ratatui's
+/// `Buffer`/diff tracking (e.g. an embedded PTY writing raw bytes
+/// straight into the terminal) can produce the "diff believes this cell
+/// is unchanged" condition the hook exists to fix, and only
+/// [`TuiVtDriver`] (vt100-backed, real ANSI byte stream) can model that —
+/// see its own `render_actually_clears_stale_content_outside_the_diff_cache`
+/// test, which proves the *mechanism* works upstream.
+///
+/// **#1393 (quadraui#1060 consume side) closed the two seams that used to
+/// block reusing `TuiVtDriver` from a vimcode `ShellApp` impl**:
+/// `quadraui::tui::vt_testing::driver_with_shell` (mirroring
+/// `quadraui::tui::testing::driver_with_shell`) now wraps a `ShellApp` in
+/// the same `ShellAdapter` stack the live runner uses, and the public
+/// `TuiVtDriver::inject_raw` hook exposes the out-of-band byte injection
+/// that test's technique relies on — both landed at this repo's pinned
+/// rev. `tui_main::shell_app`'s
+/// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+/// and
+/// `popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+/// use them to assert on the actual repaint this function's transition
+/// exists to trigger, RED-verified against unfixed `develop`-shaped wiring
+/// by disabling each call site in turn.
+///
+/// [`TuiVtDriver`]: https://github.com/JDonaghy/quadraui/blob/215e9e4/quadraui/src/tui/vt_testing.rs
+pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
+    was_open && !is_open_now
 }
 
 /// Popup rect for the folder-picker modal (`quadraui::FolderPickerController`,
@@ -4158,6 +4619,49 @@ pub fn set_folder_picker_selected(picker: &mut quadraui::FolderPickerController,
     }
     while picker.selected() > idx {
         picker.move_up();
+    }
+}
+
+/// Where a mouse press against the open change-review surface (#955,
+/// shared with #525) lands, resolved against the *exact* geometry
+/// [`paint_change_review_rung`] last painted
+/// (`diff_rect`/`line_height` — both backends read these from
+/// `Engine::change_review_diff_rect`/`Backend::line_height`, same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`).
+///
+/// Deliberately *not* folded into [`route_modal_overlay_click`] /
+/// [`MOUSE_ARBITRATION_ORDER`] — same call [`route_folder_picker_click`]
+/// makes and for the same reason: this surface swallows every click while
+/// open (like a modal dialog) rather than competing for z-order with the
+/// other overlays, so both backends check it first and return early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeReviewClickRoute {
+    /// Landed on a real diff row — jump to the file/line it represents
+    /// (`Engine::change_review_jump_to_hit`).
+    Jump(quadraui::DiffViewHit),
+    /// Landed inside the surface but not on a row (a unified hunk header,
+    /// the status footer, or empty space) — swallow, no navigation.
+    Consume,
+}
+
+/// Resolve a click at `(x, y)` (ABSOLUTE, backend-native units) against the
+/// currently-shown entry's `DiffView`, re-deriving the same geometry
+/// [`paint_change_review_rung`] painted from (`entry.view.layout(diff_rect,
+/// line_height)`) rather than trusting a cached one, so paint and
+/// hit-testing can never disagree (`DiffViewGeometry::hit_test`'s own
+/// contract).
+pub fn route_change_review_click(
+    diff_rect: quadraui::Rect,
+    view: &quadraui::DiffView,
+    line_height: f32,
+    x: f32,
+    y: f32,
+) -> ChangeReviewClickRoute {
+    let geometry = view.layout(diff_rect, line_height);
+    match geometry.hit_test(x, y) {
+        hit @ quadraui::DiffViewHit::Row { .. } => ChangeReviewClickRoute::Jump(hit),
+        _ => ChangeReviewClickRoute::Consume,
     }
 }
 
@@ -4373,14 +4877,26 @@ pub fn post_key_epilogue(
         engine.explorer_rebuild_rows();
     }
 
-    // Keep the selected quickfix entry inside the six-row window.
+    // Keep the selected entry inside the six-row window — the active
+    // window's location list shares this same scroll state when it (rather
+    // than the global quickfix list) is the one occupying the bottom "list
+    // rung" (#1155).
     if let Some(scroll_top) = quickfix_scroll_top {
-        if engine.quickfix_open {
+        let selected = if engine.quickfix.open {
+            Some(engine.quickfix.selected)
+        } else {
+            engine
+                .location_lists
+                .get(&engine.active_window_id())
+                .filter(|l| l.open)
+                .map(|l| l.selected)
+        };
+        if let Some(selected) = selected {
             const QF_VISIBLE: usize = 5; // 6 rows − 1 header
-            if engine.quickfix_selected < *scroll_top {
-                *scroll_top = engine.quickfix_selected;
-            } else if engine.quickfix_selected >= *scroll_top + QF_VISIBLE {
-                *scroll_top = engine.quickfix_selected + 1 - QF_VISIBLE;
+            if selected < *scroll_top {
+                *scroll_top = selected;
+            } else if selected >= *scroll_top + QF_VISIBLE {
+                *scroll_top = selected + 1 - QF_VISIBLE;
             }
         } else {
             *scroll_top = 0;
@@ -4389,6 +4905,61 @@ pub fn post_key_epilogue(
 
     out.arm_yank_highlight = engine.yank_highlight.is_some();
     out
+}
+
+/// Sync the system clipboard from the engine's registers
+/// (`clipboard=unnamedplus` semantics), if the mirrored content changed.
+///
+/// Checks the explicit `+` register first — an explicit write (`"+yy`, a
+/// plugin's `vimcode.state.set_register('+', ...)`) always wins — and falls
+/// back to the unnamed `"` register so a plain `yy` still reaches the
+/// clipboard. `last` is the caller's cache of what was last pushed, so an
+/// unchanged register is a no-op rather than a clipboard write on every call.
+///
+/// #1239: GTK (`App::sync_plus_register_to_clipboard`) and TUI
+/// (`sync_tui_clipboard`) used to be two near-identical copies of this that
+/// had drifted — TUI mirrored `"` only, so on TUI a subsequent plain
+/// yank/delete (which only ever touches `"`, never `+`) could clobber the
+/// clipboard mirror of an earlier explicit `+` write instead of leaving it
+/// alone (see the `..._1239` tests in `gtk/testing.rs` and
+/// `tui_main/shell_app.rs` for the exact repro). Both now call this one
+/// function; each backend's own name survives only as a thin wrapper (GTK:
+/// `App::sync_plus_register_to_clipboard`; TUI: `sync_tui_clipboard`) so
+/// their existing call sites don't need to change. (The issue that raised
+/// this bug illustrated the explicit-write case as `:let @+='...'` — that
+/// ex command isn't actually implemented in vimcode, `VIM_COMPATIBILITY.md`
+/// marks `:let` N/A; every real write path to `+`, from `"+yy` to the Lua
+/// plugin API, goes through `Engine::set_register_typed`, which this
+/// function's `+`-first priority now matches on both backends.)
+///
+/// Cadence: called after every editor keypress that might have yanked/cut
+/// text, plus a few early-return tiers that skip the main post-key epilogue
+/// (terminal-focused keys, an ext-panel key, TUI's bracketed-paste event) —
+/// same reason on both backends: whichever tier consumes the key returns
+/// before reaching the shared epilogue tail, so it syncs for itself on the
+/// way out. That per-keypress cadence is still needed now that the register
+/// priority is fixed; it isn't a workaround for the priority bug, so there's
+/// nothing to collapse into a single trigger.
+pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>) {
+    let new_content = engine
+        .registers
+        .get(&'+')
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, _)| s.clone())
+        .or_else(|| {
+            engine
+                .registers
+                .get(&'"')
+                .filter(|(s, _)| !s.is_empty())
+                .map(|(s, _)| s.clone())
+        });
+
+    if new_content != *last {
+        if let (Some(ref content), Some(ref cb)) = (&new_content, &engine.clipboard_write) {
+            let _ = cb(content.as_str());
+        }
+        *last = new_content;
+    }
 }
 
 // ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
@@ -4587,6 +5158,629 @@ pub fn dispatch_panel_accelerator(
         PanelAccelerator::NavForward => engine.tab_nav_forward(),
     }
     Some(action)
+}
+
+// ─── Menu-action `EngineAction` applier rung (#1063) ────────────────────────
+//
+// `Engine::dispatch_menu_action` (`core/engine/vscode.rs`) turns a fired
+// `quadraui::MenuEvent::Activated` id into an `EngineAction` the caller still
+// has to apply. Most variants are pure bookkeeping the engine already
+// finished (`None`/`Error`, and every menu item whose own `execute_command`
+// arm does its work and returns `None` — `sidebar`'s toggle, for instance,
+// happens inside the engine itself). The dozen or so that remain name an
+// effect `Engine` cannot finish alone: opening a terminal needs the live
+// pane's column/row count, a dialog needs to write into backend-local dialog
+// state, quitting needs the backend's own shutdown sequence.
+//
+// Before this rung, GTK's `App::handle_menu_action` restated a *subset* of
+// this match by hand — five variants named explicitly behind a bare `_ =>
+// {}` catch-all — instead of reusing `App::dispatch_engine_action`, its own
+// already-exhaustive general-purpose applier (used by the keyboard/macro
+// paths). That catch-all is exactly the shape that hid #984 for months: a
+// future menu item wired to a variant nobody had added an arm for would
+// silently no-op instead of failing to compile. TUI's menu arm
+// (`tui_main/shell_app.rs`) already routed through its own general-purpose
+// applier (`dispatch_post_key_action`) — exhaustive, but a *different*
+// function from GTK's, so the two could still drift independently even
+// though neither, on its own, had a reachability gap today.
+//
+// [`apply_engine_action`] is the one function both now call: an exhaustive
+// match (no `_ =>` arm — a new `EngineAction` variant fails to compile here
+// until every caller decides what it means), with a `host: &mut impl
+// EngineActionHost` seam for the effects each backend must supply itself —
+// follows [`dispatch_panel_accelerator`]'s shape above, not a new one.
+pub trait EngineActionHost {
+    /// Open a new terminal tab (needs the live pane's column/row count).
+    fn open_terminal(&mut self, engine: &mut Engine);
+    /// Toggle terminal-panel maximize (needs the live viewport's row count).
+    fn toggle_terminal_maximize(&mut self, engine: &mut Engine);
+    /// Run `cmd` in a new terminal tab (extension-install flow).
+    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String);
+    /// Show the "Open Folder" dialog/picker.
+    fn open_folder_dialog(&mut self, engine: &mut Engine);
+    /// Finish an "Open Workspace" action already run inside the engine.
+    fn open_workspace_dialog(&mut self, engine: &mut Engine);
+    /// Show the "Save Workspace As" dialog.
+    fn save_workspace_as_dialog(&mut self, engine: &mut Engine);
+    /// Show the "Open Recent" workspace picker.
+    fn open_recent_dialog(&mut self, engine: &mut Engine);
+    /// Re-sync/redraw after the engine toggled sidebar visibility internally.
+    fn sidebar_toggled(&mut self, engine: &mut Engine);
+    /// Show the "unsaved changes" quit-confirmation UI.
+    fn quit_with_unsaved(&mut self, engine: &mut Engine);
+    /// Save session state and request a clean shutdown.
+    fn quit(&mut self, engine: &mut Engine);
+    /// Save session state and exit the process with a non-zero code
+    /// (`:cquit`). Never returns.
+    fn quit_with_error(&mut self, engine: &mut Engine) -> !;
+}
+
+/// Apply the [`crate::core::engine::EngineAction`] produced by
+/// `Engine::dispatch_menu_action` (a fired `MenuEvent::Activated`). Returns
+/// `true` when the action means the caller should exit — `Quit`/`SaveQuit`;
+/// `QuitWithError` never returns at all.
+///
+/// `OpenFile`/`OpenUrl`/`None`/`Error` need no backend help — `Engine`
+/// already did (or need do) everything for those — so they're handled
+/// inline rather than through `host`.
+pub fn apply_engine_action(
+    action: crate::core::engine::EngineAction,
+    engine: &mut Engine,
+    host: &mut impl EngineActionHost,
+) -> bool {
+    use crate::core::engine::{EngineAction, PendingPlatformAction};
+    match action {
+        EngineAction::None | EngineAction::Error => false,
+        EngineAction::Quit | EngineAction::SaveQuit => {
+            host.quit(engine);
+            true
+        }
+        EngineAction::QuitWithError => host.quit_with_error(engine),
+        EngineAction::QuitWithUnsaved => {
+            host.quit_with_unsaved(engine);
+            false
+        }
+        EngineAction::OpenFile(path) => {
+            if let Err(e) = engine.open_file_with_mode(&path, crate::core::OpenMode::Permanent) {
+                engine.message = e;
+            }
+            false
+        }
+        EngineAction::OpenTerminal => {
+            host.open_terminal(engine);
+            false
+        }
+        EngineAction::ToggleTerminalMaximize => {
+            host.toggle_terminal_maximize(engine);
+            false
+        }
+        EngineAction::RunInTerminal(cmd) => {
+            host.run_in_terminal(engine, cmd);
+            false
+        }
+        EngineAction::OpenFolderDialog => {
+            host.open_folder_dialog(engine);
+            false
+        }
+        EngineAction::OpenWorkspaceDialog => {
+            host.open_workspace_dialog(engine);
+            false
+        }
+        EngineAction::SaveWorkspaceAsDialog => {
+            host.save_workspace_as_dialog(engine);
+            false
+        }
+        EngineAction::OpenRecentDialog => {
+            host.open_recent_dialog(engine);
+            false
+        }
+        EngineAction::ToggleSidebar => {
+            host.sidebar_toggled(engine);
+            false
+        }
+        EngineAction::OpenUrl(url) => {
+            // #1134: queue rather than shell out here — `apply_engine_action`
+            // is shared by both backends via `EngineActionHost` and has no
+            // `backend` handle of its own. `App::tick_dispatch` (GTK) /
+            // `TuiShellApp::tick` (TUI) drain `pending_platform_actions`
+            // through `PlatformServices` (`is_safe_url` was already applied
+            // by whichever engine path produced this `EngineAction`).
+            engine
+                .pending_platform_actions
+                .push(PendingPlatformAction::OpenUrl(url));
+            false
+        }
+    }
+}
+
+// ─── Explorer context-menu applier (#1418) ─────────────────────────────────
+//
+// The explorer context menu's *decision* — which item is highlighted, which
+// key/click confirms it — was already shared (`Engine::handle_context_menu_key`
+// / `Engine::context_menu_target_path`), but what happened with the
+// confirmed action *string* was written once per backend: TUI's
+// `handle_explorer_context_action` (`tui_main/mod.rs`) and GTK's
+// `App::dispatch_explorer_ctx_action` (`app.rs`). They had already drifted —
+// TUI's `"delete"` used the context menu's own explicit target path
+// (`Engine::confirm_delete_file`); GTK's routed through
+// `dispatch_explorer_crud(Delete)`, which acts on the explorer tree's
+// *selected* row instead, picking the wrong file whenever a right-click
+// target and the tree's selection disagree. `"find_in_folder"` was worse:
+// TUI opened the (workspace-wide, not folder-scoped) Grep picker, GTK just
+// focused the Search sidebar panel — a different feature entirely, despite
+// both being wired to a menu item labelled "Find in Folder...".
+//
+// [`apply_explorer_context_action`] is the one function both backends now
+// call. It picks TUI's explicit-target behavior for `"delete"`/`"move_file"`
+// (`Engine::confirm_delete_file`/`Engine::start_move_file_dialog` take the
+// path directly — no tree-selection ambiguity possible), and gives
+// `"find_in_folder"` one real behavior on both backends:
+// `Engine::open_grep_picker_scoped`, a live-grep search restricted to the
+// clicked folder (#1418), matching the menu label for the first time on
+// either backend.
+//
+// `new_file`/`new_folder`/`rename` keep routing through
+// `dispatch_explorer_crud` (selected-row-based) — both backends already
+// agreed on that subset before this issue, so it is not a divergence this
+// rung needs to resolve, only preserve.
+//
+// `host: &mut impl ExplorerContextHost` covers the one action that
+// genuinely needs backend-specific plumbing: `"open_terminal"` needs the
+// live terminal pane's column count, which only each backend's own runner
+// has in scope. Every other action is a plain `Engine` call with no
+// backend seam — including the caller's own post-action redraw/refresh
+// bookkeeping (`explorer_needs_refresh`, `draw_needed`), which stays at
+// each call site exactly as before since it is generic "something changed"
+// plumbing already shared across far more than context-menu actions, not
+// specific to this rung.
+pub trait ExplorerContextHost {
+    /// Open a new terminal tab rooted at `dir` (needs the live pane's
+    /// column count, which only the backend's own runner has in scope).
+    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf);
+}
+
+/// Resolve the "open_terminal"/"find_in_folder" target directory: `target`
+/// itself when it is already a directory, its parent otherwise (falling
+/// back to `engine.cwd` for a target with no parent).
+fn explorer_ctx_action_dir(
+    engine: &Engine,
+    target: &std::path::Path,
+    is_dir: bool,
+) -> std::path::PathBuf {
+    if is_dir {
+        target.to_path_buf()
+    } else {
+        target.parent().unwrap_or(&engine.cwd).to_path_buf()
+    }
+}
+
+/// Apply the action string [`Engine::context_menu_confirm`] returned for an
+/// explorer context menu (`target`/`is_dir` are that same confirm's
+/// `Engine::context_menu_target_path`, captured by the caller *before*
+/// confirming — see e.g. `crate::app::App::dispatch_context_menu_key`).
+///
+/// `copy_path`/`copy_relative_path`/`reveal`/`open_side`/`open_side_vsplit`/
+/// `select_for_diff`/`diff_with_selected` are engine-owned — already fully
+/// handled inside `context_menu_confirm` itself — so they (and any other
+/// unrecognised action) are a deliberate no-op here.
+pub fn apply_explorer_context_action(
+    engine: &mut Engine,
+    action: &str,
+    target: &std::path::Path,
+    is_dir: bool,
+    host: &mut impl ExplorerContextHost,
+) {
+    match action {
+        "new_file" | "new_folder" | "rename" => {
+            if let Some(crud_action) =
+                crate::core::settings::ExplorerAction::from_action_str(action)
+            {
+                engine.dispatch_explorer_crud(crud_action);
+            }
+        }
+        "delete" => engine.confirm_delete_file(target),
+        "move_file" => {
+            let root = engine.cwd.clone();
+            engine.start_move_file_dialog(target, &root);
+        }
+        "open_terminal" => {
+            let dir = explorer_ctx_action_dir(engine, target, is_dir);
+            host.open_terminal_at(engine, dir);
+        }
+        "find_in_folder" => {
+            let dir = explorer_ctx_action_dir(engine, target, is_dir);
+            engine.open_grep_picker_scoped(&dir);
+        }
+        _ => {}
+    }
+}
+
+// ─── Native file-dialog rung (#1125) ────────────────────────────────────────
+//
+// TUI's `save_workspace_as_dialog` used to hardcode `engine.cwd.join(
+// ".vimcode-workspace")` and write it unconditionally — no prompt, no way to
+// cancel, and silently ignoring whatever path the user actually wanted. GTK
+// already did this right (`App::run_pending_file_dialog`, driven by
+// `PendingFileDialog`/`tick()` because its `backend` handle is only reachable
+// there — see that type's doc comment for why). quadraui#965 shipped the TUI
+// half of the same primitive — `TuiPlatformServices::show_file_open_dialog` /
+// `show_file_save_dialog`, a nested draw-and-read loop over
+// `FilePickerController` — so TUI can call it too.
+//
+// TUI doesn't need GTK's `tick()` deferral: `TuiShellApp::handle` already has
+// `backend: &mut dyn quadraui::Backend` in scope at both call sites that can
+// open one of these dialogs (the `open_file_dialog` menu action, and
+// `EngineAction::SaveWorkspaceAsDialog` via `TuiEngineActionHost`, which now
+// carries a `backend` field for exactly this). [`run_open_file_dialog`] and
+// [`run_save_workspace_as_dialog`] are the one shared body both GTK's
+// deferred call site and TUI's synchronous ones call — the point of this rung
+// is one implementation, two thin call sites, not a parallel TUI-only copy.
+
+/// Show a native "Open File" dialog via `backend`'s `PlatformServices` and
+/// open the chosen file in `engine`. Returns the opened path (`None` if the
+/// user cancelled) so a caller can refresh backend-local UI — e.g. GTK's
+/// file-tree selection — only when something was actually opened.
+pub fn run_open_file_dialog(
+    engine: &mut Engine,
+    backend: &mut dyn quadraui::Backend,
+) -> Option<std::path::PathBuf> {
+    let path = backend
+        .services()
+        .show_file_open_dialog(quadraui::FileDialogOptions {
+            title: Some("Open File".to_string()),
+            // Browse from the current workspace root, not wherever the OS
+            // process happened to start (`FileDialogOptions::initial_dir`
+            // defaults to `std::env::current_dir()` when `None` — see
+            // `TuiPlatformServices::show_file_open_dialog`'s doc — which can
+            // diverge from `engine.cwd` after an in-app `Open Folder`/`:cd`
+            // that never actually `chdir`s the process).
+            initial_dir: Some(engine.cwd.clone()),
+            ..Default::default()
+        })?;
+    let _ = engine.open_file_with_mode(&path, crate::core::engine::OpenMode::Permanent);
+    Some(path)
+}
+
+/// Show a native "Save Workspace As" dialog via `backend`'s
+/// `PlatformServices` and save the workspace to the chosen path. Does
+/// nothing when the user cancels — the #1125 fix.
+pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadraui::Backend) {
+    if let Some(path) = backend
+        .services()
+        .show_file_save_dialog(quadraui::FileDialogOptions {
+            title: Some("Save Workspace As".to_string()),
+            initial_filename: Some(".vimcode-workspace".to_string()),
+            // See `run_open_file_dialog`'s identical `initial_dir` comment.
+            initial_dir: Some(engine.cwd.clone()),
+            ..Default::default()
+        })
+    {
+        engine.save_workspace_as(&path);
+    }
+}
+
+// ─── Shell-event shadow-sync rung (#1062) ────────────────────────────────────
+//
+// `AppShellEvent::PanelChanged`/`SidebarHidden`/`SidebarResized` all report a
+// decision the *runner's* own `AppShell` already made — an activity-bar
+// click, a divider drag. Both backends mirror that decision into
+// `engine.app_shell`, the "shadow" copy every engine-side consumer actually
+// reads (`render_sidebar_content`'s panel dispatch, `active_panel_is`,
+// `sidebar_visible()` hit-test gates, session persistence): the runner's own
+// `AppShell` is what the *paint* geometry comes from, but `Engine` itself
+// never consults it directly.
+//
+// #988 was one of these three forgetting the mirror entirely:
+// `PanelChanged { hamburger }` returned early, before any shadow-sync
+// statement ran, because the sync was spelled out fresh at each call site
+// instead of owned by one function every call site is required to reach.
+// [`sync_shell_event_shadow`] is that one function. Both `App::on_shell_event`
+// (GTK) and `TuiShellApp::on_shell_event` (TUI) now call it unconditionally,
+// as the first thing they do, before any of their own id-specific branching —
+// so the shadow mutation itself can no longer be skipped by an early
+// `return` reached before it. The only door left for a backend to exclude an
+// id from the shadow sync is [`ShellShadowSyncHost::panel_absent_from_shadow`],
+// a declarative predicate with no side effects of its own, answered inside
+// this function rather than around it.
+
+/// Host hook for [`sync_shell_event_shadow`] — same shape as
+/// [`PanelAcceleratorHost`] and for the same reason: the sync itself is one
+/// shared body, but *which* panel ids even have a shadow `PanelDefinition`
+/// to sync differs per backend.
+pub trait ShellShadowSyncHost {
+    /// True when `panel_id` has no matching `PanelDefinition` in the shadow
+    /// `engine.app_shell`, so a `PanelChanged` for it must skip the generic
+    /// sync below rather than call `show_panel` on an id the shadow doesn't
+    /// know (a silent no-op) or clobber state a different subsystem owns.
+    ///
+    /// `ext:`-prefixed plugin panels qualify on *both* backends —
+    /// `render::apply_activity_panel_switch`'s `ext:` branch already handles
+    /// them through `engine.ext_panel_active`, not a shadow
+    /// `PanelDefinition` — so [`sync_shell_event_shadow`] checks that case
+    /// itself rather than asking the host. TUI's hamburger id is the one
+    /// case that genuinely needs a host answer: the shadow `AppShell`
+    /// (built in `Engine::new` from only the real content panels) has no
+    /// hamburger `PanelDefinition` at all, for reasons specific enough to
+    /// TUI that GTK's impl is simply `false`.
+    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool;
+}
+
+/// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
+/// `engine.app_shell` (#1062). Shared by `App::on_shell_event` (GTK) and
+/// `TuiShellApp::on_shell_event` (TUI) — call this first, unconditionally,
+/// before any of the event's other id-specific handling; see the rung's
+/// header comment above for why the call must come first.
+pub fn sync_shell_event_shadow(
+    event: &quadraui::AppShellEvent,
+    engine: &mut Engine,
+    host: &impl ShellShadowSyncHost,
+) {
+    match event {
+        quadraui::AppShellEvent::PanelChanged { panel_id } => {
+            if crate::app_support::is_ext_panel_id(panel_id.as_str())
+                || host.panel_absent_from_shadow(panel_id)
+            {
+                return;
+            }
+            engine.app_shell.show_panel(panel_id);
+            engine.ext_panel_active = None;
+            engine.ext_panel_has_focus = false;
+        }
+        quadraui::AppShellEvent::SidebarHidden => {
+            engine.app_shell.hide_sidebar();
+            engine.ext_panel_active = None;
+            engine.ext_panel_has_focus = false;
+        }
+        quadraui::AppShellEvent::SidebarResized { new_width } => {
+            engine.app_shell.set_sidebar_width(*new_width);
+        }
+        _ => {}
+    }
+}
+
+// ─── Shared tick-chore rung (#1248) ──────────────────────────────────────────
+//
+// `App::handle_poll_tick`/`tick_dispatch` (GTK) and `TuiShellApp::tick` (TUI)
+// each ran the *same* dozen-item background chore list every frame, written
+// out twice: sync each window's viewport from the last paint, re-check
+// tab-bar scroll offsets against what that paint measured, clear an expired
+// yank highlight, poll LSP/DAP/search idle work, refresh source control on a
+// timer, finish a deferred format-then-quit, run a queued terminal command,
+// focus a just-revealed extension panel, drain queued platform actions, and
+// sync the OS window title — a byte-identical `format!("VimCode \u{2014}
+// {}", ...)` on both sides. [`run_shared_tick_chores`] is the one function
+// both `tick()`s now call for all of it.
+//
+// The handful of effects that genuinely differ per backend — how each stores
+// its "last paint" cache (`RefCell<Option<ScreenLayout>>` under two different
+// field names), how quitting actually ends the process (GTK sets a
+// `Cell<bool>` the runner polls next frame; TUI returns `Reaction::Exit`
+// directly), whether a terminal command needs a live `backend` handle for
+// sizing — live behind [`TickHost`], following [`PanelAcceleratorHost`] /
+// [`EngineActionHost`]'s established shape (a small per-backend host struct
+// holding `&mut App`/its own fields plus `backend`, constructed fresh at each
+// call site) rather than a new one. [`TickHost::tab_switcher_gate`] is the
+// one TUI-only hook with a default: TUI skips the rest of the chore list
+// entirely while the tab-switcher popup is mid-cycle (`event_loop`'s legacy
+// behavior, preserved as-is); GTK has no such popup, so the default no-op
+// (`None`) applies.
+
+/// Host hook for [`run_shared_tick_chores`] — see the rung's header comment
+/// above for why these, and only these, differ per backend.
+pub trait TickHost {
+    /// Run `f` against the `ScreenLayout` the last paint produced, if any.
+    fn with_last_layout(&self, f: &mut dyn FnMut(&ScreenLayout));
+
+    /// The per-group tab-bar widths this frame's `TabBars` rung painted
+    /// (#1165) — a clone, since both backends clear the real field at the
+    /// *start* of the next paint, not here.
+    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)>;
+
+    /// The yank-highlight clear deadline armed by `run_post_key_epilogue`
+    /// (#813).
+    fn yank_highlight_deadline(&self) -> Option<std::time::Instant>;
+
+    /// Clear the armed yank highlight — both the engine-side highlight state
+    /// and this host's own deadline field.
+    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine);
+
+    /// TUI-only: while the tab-switcher popup is mid-cycle, run *only* its
+    /// own 500ms auto-confirm timer and skip every other chore below this
+    /// point in the list — `Some(needs_redraw)` short-circuits
+    /// [`run_shared_tick_chores`] with that verdict. `None` (GTK's default,
+    /// and TUI's own answer whenever the popup isn't open) means "no gate,
+    /// keep going."
+    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
+        let _ = engine;
+        None
+    }
+
+    /// Extra work when `Engine::poll_idle` reports dirty state (LSP/DAP/
+    /// search finished something this tick) — GTK re-syncs sidebar widgets
+    /// from `engine.app_shell`; TUI needs nothing extra here (its sidebar
+    /// repaints from engine state every frame regardless).
+    fn on_idle_dirty(&mut self, engine: &mut Engine) {
+        let _ = engine;
+    }
+
+    /// True once >= 2s has elapsed since the last periodic sidebar/SC
+    /// refresh, resetting the timer as a side effect when it has. Each
+    /// backend owns its own `Instant`/`Cell<Instant>` field (different
+    /// storage shapes), so the elapsed check can't live in `Engine` itself.
+    fn sidebar_refresh_due(&mut self) -> bool;
+
+    /// TUI-only: rebuild the explorer row cache on the same 2s tick,
+    /// regardless of which panel is active (mirrors the legacy `event_loop`
+    /// behavior). No-op on GTK, which refreshes the file tree from
+    /// `Engine::explorer_needs_refresh` instead.
+    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
+        let _ = engine;
+    }
+
+    /// Run a queued terminal command in a freshly-sized pane — needs a live
+    /// column/row count only available per-backend.
+    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String);
+
+    /// Give a just-revealed extension panel focus, in whatever backend-local
+    /// sidebar-focus state each backend tracks.
+    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String);
+
+    /// Finish the format-on-save-then-quit flow (`:wq`/`:x` deferred
+    /// quit) — each backend's own session-save + shutdown/exit sequence.
+    fn quit_after_format_save(&mut self, engine: &mut Engine);
+
+    /// Carry out one queued platform action (open URL / reveal in file
+    /// manager) via this host's own `backend` handle.
+    fn run_platform_action(
+        &mut self,
+        engine: &mut Engine,
+        action: crate::core::engine::PendingPlatformAction,
+    );
+
+    /// Sync the OS window title/chrome from `engine`'s state — [`window_title`]
+    /// supplies the shared string both backends format identically; each
+    /// decides when/whether to apply it (TUI gates on its own `live` field —
+    /// no real terminal under the test driver — and GTK additionally caches
+    /// the window bounds for session-restore).
+    fn sync_window_title(&mut self, engine: &Engine);
+}
+
+/// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
+/// <buffer name>"`, or the bare app name with none open. Used to be
+/// formatted identically, and independently, in `App::handle_poll_tick` and
+/// `TuiShellApp::tick`; now the one string both [`TickHost::sync_window_title`]
+/// impls format (#1248).
+pub fn window_title(engine: &Engine) -> String {
+    engine
+        .active_buffer_name()
+        .map(|n| format!("VimCode \u{2014} {}", n))
+        .unwrap_or_else(|| "VimCode".to_string())
+}
+
+/// Carry out a queued [`crate::core::engine::PendingPlatformAction`] (open
+/// URL / reveal in file manager) via `backend`'s `PlatformServices`. Was
+/// `App::run_pending_platform_action` / `TuiShellApp::run_pending_platform_action`
+/// — two copies differing only in how each reaches its `Engine` (#1248).
+pub fn run_pending_platform_action(
+    engine: &mut Engine,
+    action: crate::core::engine::PendingPlatformAction,
+    backend: &mut dyn quadraui::Backend,
+) {
+    use crate::core::engine::PendingPlatformAction;
+    match action {
+        PendingPlatformAction::OpenUrl(url) => {
+            if let Err(e) = backend.services().open_url_result(&url) {
+                engine.message = format!("Could not open URL: {e:?}");
+            }
+        }
+        PendingPlatformAction::Reveal(path) => {
+            if let Err(e) = backend.services().reveal_in_file_manager(&path) {
+                engine.message = format!("Could not reveal in file manager: {e:?}");
+            }
+        }
+    }
+}
+
+/// Run the tick-time background chore list both backends share (#1248) —
+/// see the rung's header comment above for the full list and why the
+/// backend-specific bits live behind `host` instead of here. Returns `true`
+/// when anything changed this tick that warrants a redraw.
+pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> bool {
+    let mut needs_redraw = false;
+
+    // Exact per-window viewport dimensions from the last paint, so
+    // `ensure_cursor_visible` uses real geometry rather than a whole-screen
+    // approximation that can't see splits.
+    host.with_last_layout(&mut |layout| {
+        for rw in &layout.windows {
+            engine.set_viewport_for_window(
+                rw.window_id,
+                rw.lines.len().max(1),
+                rw.text_viewport_cols.max(1),
+            );
+        }
+    });
+
+    // Re-check every group's active tab is still on-screen against the
+    // widths this frame's `TabBars` rung actually painted (#1165).
+    let counts = host.tab_visible_counts();
+    if !counts.is_empty() && engine.post_draw_apply_widths(&counts) {
+        needs_redraw = true;
+    }
+
+    // Sync the OS window title before any chore below could plausibly change
+    // the active buffer name (mirrors the legacy TUI ordering).
+    host.sync_window_title(engine);
+
+    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
+    if let Some(deadline) = host.yank_highlight_deadline() {
+        if std::time::Instant::now() >= deadline {
+            host.clear_yank_highlight_deadline(engine);
+            needs_redraw = true;
+        }
+    }
+
+    // TUI-only early exit — see `TickHost::tab_switcher_gate`'s doc.
+    if let Some(redraw) = host.tab_switcher_gate(engine) {
+        return needs_redraw || redraw;
+    }
+
+    // Periodic background work: LSP, DAP, git, search, etc.
+    if engine.poll_idle() {
+        needs_redraw = true;
+        host.on_idle_dirty(engine);
+    }
+
+    // Auto-refresh source control periodically, gated on sidebar visibility
+    // and the active panel actually being one SC touches — resolved through
+    // `sidebar_owner` rather than a bare panel-id string compare so an
+    // extension panel shown over Git/Explorer doesn't spuriously re-trigger
+    // this (mirrors the legacy GTK gate exactly; TUI's own prior gate missed
+    // the ext-panel-priority case `sidebar_owner` already handles).
+    if engine.app_shell.sidebar_visible() && host.sidebar_refresh_due() {
+        host.on_sidebar_refresh_tick(engine);
+        if matches!(
+            sidebar_owner(engine),
+            SidebarOwner::Git | SidebarOwner::Explorer
+        ) {
+            engine.sc_refresh_async();
+        }
+        needs_redraw = true;
+    }
+    if engine.poll_sc_refresh() {
+        needs_redraw = true;
+    }
+
+    // Format-on-save + :wq/:x deferred quit.
+    if engine.format_save_quit_ready {
+        engine.format_save_quit_ready = false;
+        host.quit_after_format_save(engine);
+    }
+
+    // Run a pending terminal command (needs a live column/row count).
+    if let Some(cmd) = engine.pending_terminal_command.take() {
+        host.run_terminal_command(engine, cmd);
+        needs_redraw = true;
+    }
+
+    // Focus a panel revealed by plugin logic this frame.
+    if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
+        host.ext_panel_focus(engine, panel_name);
+        needs_redraw = true;
+    }
+
+    // Drain platform actions (open URL / reveal in file manager) queued by
+    // engine logic this frame — needs `backend`'s `PlatformServices`, which
+    // `core/engine/` has no handle to (#1134).
+    let actions = std::mem::take(&mut engine.pending_platform_actions);
+    if !actions.is_empty() {
+        for action in actions {
+            host.run_platform_action(engine, action);
+        }
+        needs_redraw = true;
+    }
+
+    needs_redraw
 }
 
 // ─── Chrome mouse rung (#752 / #733 slice 2) ─────────────────────────────────
@@ -4845,32 +6039,73 @@ pub fn status_bar_zones_from_layout(layout: &quadraui::StatusBarLayout) -> Statu
         .collect()
 }
 
-/// Minimum inter-segment gap, in cells, every status-bar layout is measured
-/// with. Named because the *draw* path (`render_window_status_line`) and the
-/// *hit-test* path must pass the same number or clicks land on the wrong
-/// segment.
-pub const STATUS_BAR_MIN_GAP_CELLS: f32 = 2.0;
-
-/// Lay a `quadraui::StatusBar` out in **character cells** and recover its hit
-/// zones.
+/// Assemble this frame's [`StatusBand`]s, in the order [`route_chrome_click`]
+/// arbitrates them: the separated status line (if painted this frame), then
+/// each window's own status line, then the global bar last.
 ///
-/// The cell-unit twin of [`status_bar_zones_from_layout`], for the TUI — which
-/// has no persistent pixel cache to consult and so re-derives the bar's layout
-/// on each click, exactly as `render_window_status_line` /
-/// `TuiBackend::draw_status_bar` derive it on each paint. Segment widths are
-/// `chars().count()`, the monospace cell count, matching the draw path.
-pub fn status_bar_zones_in_cells(bar: &quadraui::StatusBar, width_cells: usize) -> StatusZones {
-    let layout = bar.layout(width_cells as f32, 1.0, STATUS_BAR_MIN_GAP_CELLS, |seg| {
-        quadraui::StatusSegmentMeasure::new(seg.text.chars().count() as f32)
-    });
-    status_bar_zones_from_layout(&layout)
-}
+/// #1250: both backends now cache their status-bar layouts at **paint**
+/// time — GTK's `status_segment_map` since #672, TUI's own copy since this
+/// function's introduction — rather than one of them (TUI) re-deriving the
+/// separated-status row's rect arithmetically and re-laying the bar's text
+/// out from scratch on every click via the now-deleted
+/// `window_status_line_zones`/`status_bar_zones_in_cells`. This is the one
+/// place that turns "a painted rect + its cached hit zones" into the
+/// `StatusBand` slice the router consumes, so the geometry (`rw.rect.y +
+/// rw.rect.height - lh`, `rw.rect.height <= lh` skip, and the arbitration
+/// order itself) is written once instead of transcribed per backend.
+///
+/// `windows`/`lh` are the same painted geometry [`ChromeState::line_height`]
+/// documents (`1.0` for TUI cells, the painted line height for GTK).
+/// `segment_map` is keyed by [`WindowId`] (`.0`), as populated by each
+/// backend's own per-window and separated-status paint sites.
+/// `separated`/`global` are `None` whenever that band did not paint this
+/// frame — the empty/absent convention [`ChromeState`] documents.
+pub fn status_bands<'a>(
+    windows: &[RenderedWindow],
+    lh: f64,
+    segment_map: &'a crate::app_support::StatusSegmentMap,
+    separated: Option<(quadraui::Rect, WindowId)>,
+    global: Option<(quadraui::Rect, &'a StatusZones)>,
+) -> Vec<StatusBand<'a>> {
+    let mut bands = Vec::new();
 
-/// [`status_bar_zones_in_cells`] for a [`WindowStatusLine`], which has to be
-/// converted to the primitive first.
-pub fn window_status_line_zones(status: &WindowStatusLine, width_cells: usize) -> StatusZones {
-    let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:window"));
-    status_bar_zones_in_cells(&bar, width_cells)
+    // The separated status line is listed first: it is painted in its own
+    // full-width band *outside* every window's rect, so it can never be
+    // reached through the per-window bars' geometry, and a click in that band
+    // must not fall through to whatever sits underneath it.
+    if let Some((rect, window_id)) = separated {
+        if let Some(zones) = segment_map.get(&window_id.0) {
+            bands.push(StatusBand { rect, zones });
+        }
+    }
+
+    for rw in windows {
+        if rw.status_line.is_none() || rw.rect.height <= lh {
+            continue;
+        }
+        let Some(zones) = segment_map.get(&rw.window_id.0) else {
+            continue;
+        };
+        // The status line occupies the window's bottom row — the same
+        // `rect.height - lh` both paint paths subtract before drawing it.
+        bands.push(StatusBand {
+            rect: quadraui::Rect::new(
+                rw.rect.x as f32,
+                (rw.rect.y + rw.rect.height - lh) as f32,
+                rw.rect.width as f32,
+                lh as f32,
+            ),
+            zones,
+        });
+    }
+
+    // The global bar last, spatially and in arbitration: it is the bottom
+    // band of the shell, below every window.
+    if let Some((rect, zones)) = global {
+        bands.push(StatusBand { rect, zones });
+    }
+
+    bands
 }
 
 /// Apply a resolved [`StatusAction`], including the follow-up both backends
@@ -5236,6 +6471,92 @@ pub fn apply_editor_hover_popup_route(
     effect
 }
 
+/// Is a panel-hover link "native" (source-control, trusted, open directly)
+/// or extension-provided? Mirrors `panel_hover_popup_paint`'s own
+/// `is_native` derivation so the paint step and any future confirm-before-
+/// open policy can't independently drift on what counts as trusted. Neither
+/// backend currently branches on this — see [`PanelHoverPopupRoute`]'s doc.
+pub fn panel_hover_link_is_native(panel_name: &str) -> bool {
+    panel_name == "source_control"
+}
+
+/// What a left-press on a painted panel-hover-popup link means (the
+/// sidebar-item dwell tooltip — source-control / extension-panel item
+/// hover, [`panel_hover_popup_paint`]).
+///
+/// #1067: TUI hand-rolled this hit test inline in `mouse.rs`; GTK never
+/// wired one at all after the #540 Relm4->ShellApp migration retired
+/// `Msg::PanelHoverClick` (see `panel_hover_popup_paint`'s doc for the two
+/// retired branches) — clicking a link in the panel-hover popup was a
+/// complete no-op on GTK. This is the shared rung both now call, the same
+/// shape as [`route_editor_hover_popup_click`] minus the scrollbar/focus/
+/// selection arms the panel-hover popup (a pure tooltip) never had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelHoverPopupRoute {
+    /// A `command:` URI link — run it, then dismiss.
+    Command(String),
+    /// A plain URL link — the backend opens or copies it, then dismisses.
+    Link(String),
+    /// The press didn't land on a link.
+    None,
+}
+
+/// Arbitrate a left-press against the panel-hover popup's painted link
+/// rects. `links` carries the trailing `is_native` flag
+/// [`panel_hover_popup_paint`] produces; unused for now (see
+/// [`panel_hover_link_is_native`]'s doc) but kept so both backends' caches
+/// share one shape instead of TUI silently dropping the field.
+pub fn route_panel_hover_popup_click(
+    links: &[(quadraui::Rect, String, bool)],
+    x: f64,
+    y: f64,
+) -> PanelHoverPopupRoute {
+    let (cx, cy) = (x as f32, y as f32);
+    for (rect, uri, _is_native) in links {
+        if rect_contains(*rect, cx, cy) {
+            return if uri.starts_with("command:") {
+                PanelHoverPopupRoute::Command(uri.clone())
+            } else {
+                PanelHoverPopupRoute::Link(uri.clone())
+            };
+        }
+    }
+    PanelHoverPopupRoute::None
+}
+
+/// What the caller still has to do after [`apply_panel_hover_popup_route`]
+/// has mutated the engine.
+#[derive(Debug, Default)]
+pub struct PanelHoverPopupEffect {
+    /// `true` when the press landed on a link and was consumed here.
+    pub consumed: bool,
+    /// A plain URL to open (GTK) or copy (TUI) — the one genuinely
+    /// per-backend step, same split as [`EditorHoverPopupEffect::open_url`].
+    pub open_url: Option<String>,
+}
+
+/// Apply a [`PanelHoverPopupRoute`] to the engine.
+pub fn apply_panel_hover_popup_route(
+    engine: &mut Engine,
+    route: PanelHoverPopupRoute,
+) -> PanelHoverPopupEffect {
+    let mut effect = PanelHoverPopupEffect::default();
+    match route {
+        PanelHoverPopupRoute::None => {}
+        PanelHoverPopupRoute::Command(uri) => {
+            engine.execute_command_uri(&uri);
+            engine.dismiss_panel_hover_now();
+            effect.consumed = true;
+        }
+        PanelHoverPopupRoute::Link(url) => {
+            effect.open_url = Some(url);
+            engine.dismiss_panel_hover_now();
+            effect.consumed = true;
+        }
+    }
+    effect
+}
+
 /// The painted divider geometry for one frame, plus the caller's grab metrics.
 #[derive(Debug, Clone, Copy)]
 pub struct DividerState<'a> {
@@ -5368,16 +6689,20 @@ pub enum TabDragMove {
 /// invariants checkable: a `source` can only exist while `dragging`, and
 /// `press` and `dragging` are never both set.
 ///
-/// **#822 asks this to be replaced by `quadraui::compose::TabGroupController`.**
-/// That adoption was investigated and correctly declined for now:
+/// **#822 asked this to be replaced by `quadraui::compose::TabGroupController`
+/// wholesale.** That adoption was investigated and correctly declined:
 /// `TabGroupController` owns its own `Vec<Pane>`/`GroupLayout` model, and
 /// vimcode already owns the authoritative model in `Engine` — adopting it
 /// as-is would mean mirroring `Engine`'s editor-group state into a second
-/// source of truth. The upstream gap this implies (an external-model
-/// adoption path for `TabGroupController`) is drafted, not yet filed, in
-/// `docs/PENDING_QUADRAUI_ISSUES.md`. Per `CLAUDE.md`'s Platform-Neutrality
-/// Rule, that filing — not new code here — is the correct next step, and
-/// #822 must stay open behind it, not close on this investigation alone.
+/// source of truth, which this state machine still deliberately does not do.
+/// #1370 landed the upstream gap that made a *partial* adoption possible
+/// instead: `quadraui::compose::resolve_tab_drop` (quadraui#998) takes the
+/// host's own drag-source indices and geometry and returns a position-based
+/// `TabDropInstruction`, with no owned `Vec<Pane>` on either side. This
+/// struct still owns the arm → threshold → track → commit sequencing (that
+/// part has no quadraui equivalent to adopt), but the *geometry resolution*
+/// step in the middle now goes through `resolve_tab_drop_zone`, which calls
+/// straight into `resolve_tab_drop` — see that function's doc comment.
 #[derive(Debug, Clone)]
 pub struct TabDragState {
     /// Where the left button went down inside a tab bar, until either the
@@ -5387,7 +6712,11 @@ pub struct TabDragState {
     source: Option<(GroupId, usize)>,
     /// Latest pointer position, for the drag ghost.
     cursor: Option<(f64, f64)>,
-    /// Latest computed drop zone, for the drop overlay and for the commit.
+    /// Latest computed drop zone, for the commit. #1370: no longer read by
+    /// the drop *overlay* — that's now a pure query recomputed fresh from
+    /// painted geometry each frame ([`tab_drop_overlay`]), independent of
+    /// this cached, mutation-only value (see that function's doc comment
+    /// for why the two must not share one cache).
     zone: crate::core::window::DropZone,
     dragging: bool,
 }
@@ -5440,11 +6769,6 @@ impl TabDragState {
     /// `(group, tab index)` being dragged, for the ghost label's text.
     pub fn source(&self) -> Option<(GroupId, usize)> {
         self.source
-    }
-
-    /// Latest computed drop zone, for the drop overlay.
-    pub fn zone(&self) -> &crate::core::window::DropZone {
-        &self.zone
     }
 
     /// Advance the machine for a left-button move at `(x, y)`.
@@ -5594,7 +6918,14 @@ pub enum MouseDragRoute {
     TerminalSplitDivider,
     /// The bottom panel's top edge is being dragged (panel resize).
     TerminalPanelResize,
-    /// The pointer is over a minimap strip — keep seeking.
+    /// The pointer is over a minimap strip with nothing armed. #1187: this
+    /// used to re-run `apply_minimap_click` (an absolute seek) on every
+    /// move, which is the bug this issue fixes — a real minimap drag now
+    /// always arms a `DragTarget::ScrollbarY` on press
+    /// ([`minimap_press`]/[`minimap_drag_widget`]), so subsequent moves hit
+    /// the [`Self::ArmedTarget`] rung above instead and this arm is a no-op.
+    /// Still reachable in principle for a drag that never pressed on the
+    /// strip at all (started elsewhere, swept over it with nothing armed).
     Minimap,
     /// The pointer is inside the terminal's content rows — extend the
     /// terminal's own selection (or forward the move to the child).
@@ -5936,9 +7267,12 @@ pub fn apply_scroll_offset(
         // Owned by quadraui's `SidebarSystem` — consume without applying.
         "tui:search_results" => true,
         other if other.starts_with("debug_sidebar:") => true,
-        // Editor window scrollbars. TUI encodes both axes as
-        // `tui:editor:<window_id>:<vsb|hsb>`; GTK only paints a horizontal one
-        // and encodes it as `editor:h_sb:<window_id>`.
+        // Editor window scrollbars. TUI's production `mouse.rs` drag path
+        // encodes both axes as `tui:editor:<window_id>:<vsb|hsb>`; the
+        // shared `crate::app::App` dispatch (both backends, via
+        // `handle_mouse_click_msg`'s h/v-scrollbar rungs — #825/#1026)
+        // encodes them as `editor:h_sb:<window_id>` / `editor:v_sb:<window_id>`
+        // instead, one arm per axis below.
         other if other.starts_with("tui:editor:") => {
             let Some((wid_str, axis)) = other["tui:editor:".len()..].split_once(':') else {
                 return false;
@@ -5967,6 +7301,31 @@ pub fn apply_scroll_offset(
             engine.set_scroll_left_for_window(crate::core::WindowId(wid), new_offset);
             true
         }
+        // GTK's own v-scrollbar rung (#1026/#987) — mirrors `editor:h_sb:`
+        // immediately above, one id per axis.
+        other if other.starts_with("editor:v_sb:") => {
+            let Ok(wid) = other["editor:v_sb:".len()..].parse::<usize>() else {
+                return false;
+            };
+            let window_id = crate::core::WindowId(wid);
+            engine.set_scroll_top_for_window(window_id, new_offset);
+            engine.sync_scroll_binds();
+            true
+        }
+        // The minimap's own viewport-highlight thumb (#1187) —
+        // `minimap_press`/`minimap_drag_widget` arm this on press; every
+        // continued drag-move applies here exactly like the editor's own
+        // v-scrollbar, never re-running `apply_minimap_click`'s #1093
+        // centring jump (that only ever happens once, at press time).
+        other if other.starts_with("minimap:") => {
+            let Ok(wid) = other["minimap:".len()..].parse::<usize>() else {
+                return false;
+            };
+            let window_id = crate::core::WindowId(wid);
+            engine.set_scroll_top_for_window(window_id, new_offset);
+            engine.sync_scroll_binds();
+            true
+        }
         _ => false,
     }
 }
@@ -5982,8 +7341,8 @@ pub fn apply_scroll_offset(
 //
 //  1. **The quickfix band height had three different rules in one binary.**
 //     The painter reserves rows only for a quickfix that has something in it
-//     (`compute_editor_layout`: `quickfix_open && !quickfix_items.is_empty()`),
-//     but TUI's mouse handler asked `if engine.quickfix_open { 6 }` in **four**
+//     (`compute_editor_layout`: `quickfix.open && !quickfix.items.is_empty()`),
+//     but TUI's mouse handler asked `if engine.quickfix.open { 6 }` in **four**
 //     separate places. `:copen` on an empty list therefore moved every band
 //     *below* the editor — the terminal strip, the separated status line, the
 //     terminal-resize clamp — six rows away from where they were painted, so
@@ -6023,15 +7382,32 @@ pub fn apply_scroll_offset(
 // the same numbers, rather than re-deriving them from `bottom_panel_geometry`
 // by hand the way both backends historically did with everything else.
 
-/// Rows the quickfix panel occupies, as the **painter** reserves them.
+/// Rows the quickfix/location-list panel occupies, as the **painter**
+/// reserves them.
 ///
 /// The single source of truth for "how tall is the quickfix band" on the
 /// mouse-routing side, matching `compute_editor_layout`'s `quickfix_rows`
-/// exactly — including the `!quickfix_items.is_empty()` term that TUI's four
-/// hand-rolled `if engine.quickfix_open { 6 }` copies all omitted (see this
-/// section's banner, point 1).
+/// exactly — including the `!quickfix.items.is_empty()` term that TUI's four
+/// hand-rolled `if engine.quickfix.open { 6 }` copies all omitted (see this
+/// section's banner, point 1), and, since #1155, also the active window's
+/// location list — the two share one bottom "list rung"
+/// ([`QuickfixPanel::title`]).
 pub fn quickfix_panel_rows(engine: &Engine) -> u16 {
-    if engine.quickfix_open && !engine.quickfix_items.is_empty() {
+    // #1307: a target with a real `WindowLayout` leaf reserves its own
+    // space via the split tree, exactly like any other window — this
+    // overlay band must not *also* reserve rows for it, or the two would
+    // double up. `qf_has_real_window` is `false` for every existing caller
+    // that only ever pokes `open`/`items` directly (see its own doc
+    // comment), so this stays exactly as before for them.
+    if engine.qf_has_real_window(None) || engine.qf_has_real_window(Some(engine.active_window_id()))
+    {
+        return 0;
+    }
+    let loc_open = engine
+        .location_lists
+        .get(&engine.active_window_id())
+        .is_some_and(|l| l.open && !l.items.is_empty());
+    if (engine.quickfix.open && !engine.quickfix.items.is_empty()) || loc_open {
         6
     } else {
         0
@@ -6227,6 +7603,8 @@ pub enum SidebarOwner {
     Extensions,
     Settings,
     Ai,
+    /// The Board panel (#521).
+    Board,
     /// A plugin-provided panel, by bare name (no `ext:` prefix).
     ExtPanel(String),
     /// A panel id nothing paints — a click on it belongs to whatever is
@@ -6247,6 +7625,7 @@ impl SidebarOwner {
             SidebarOwner::Extensions => PANEL_EXTENSIONS,
             SidebarOwner::Settings => PANEL_SETTINGS,
             SidebarOwner::Ai => PANEL_AI,
+            SidebarOwner::Board => PANEL_BOARD,
             SidebarOwner::ExtPanel(_) | SidebarOwner::Unknown => return None,
         })
     }
@@ -6293,6 +7672,7 @@ pub fn sidebar_owner(engine: &Engine) -> SidebarOwner {
         PANEL_EXTENSIONS => SidebarOwner::Extensions,
         PANEL_SETTINGS => SidebarOwner::Settings,
         PANEL_AI => SidebarOwner::Ai,
+        PANEL_BOARD => SidebarOwner::Board,
         other => match other.strip_prefix("ext:") {
             Some(name) => SidebarOwner::ExtPanel(name.to_string()),
             None => SidebarOwner::Unknown,
@@ -6373,14 +7753,16 @@ pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> Activ
     }
 }
 
-/// The painted sidebar body, in the caller's own units, plus the row pitch a
-/// list panel inside it uses.
+/// The painted sidebar body, in the caller's own units.
 ///
-/// TUI passes cells (`row_h == 1.0`); GTK passes the pixel
-/// `ShellContext::layout.sidebar_content_bounds` and its line height. Both
-/// numbers come from the frame that was actually painted — never re-derived —
-/// which is the rule that keeps hover highlight and hover *content* on the same
-/// row (CLAUDE.md rule 1's failure mode, one frame earlier).
+/// `row_h`/`header_rows` used to back a uniform-row-height hit-test
+/// (`content_row`, removed by #1236) for the `ExtPanel` owner; that arm now
+/// routes through [`ext_panel_hit_flat_index`]'s cached `Backend::tree_layout`
+/// instead, since a real multi-section panel has no single row height a
+/// linear formula can hit-test against (see `Engine::ext_panel_tree_layout`'s
+/// doc). The fields stay — both backends still compute them from the frame
+/// that was actually painted, and a future uniform-pitch owner can reuse them
+/// — but only `bounds` (via [`Self::contains_x`]) is read today.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SidebarBodyGeometry {
     pub bounds: quadraui::Rect,
@@ -6393,18 +7775,124 @@ pub struct SidebarBodyGeometry {
 }
 
 impl SidebarBodyGeometry {
-    /// Content-row index under `y`, or `None` when `y` is in the chrome above
-    /// the first content row (or outside the body entirely).
-    fn content_row(&self, y: f32) -> Option<usize> {
-        if self.row_h <= 0.0 || y < self.bounds.y || y >= self.bounds.y + self.bounds.height {
-            return None;
-        }
-        let rel = ((y - self.bounds.y) / self.row_h).floor() - self.header_rows;
-        (rel >= 0.0).then_some(rel as usize)
-    }
-
     fn contains_x(&self, x: f32) -> bool {
         x >= self.bounds.x && x < self.bounds.x + self.bounds.width
+    }
+}
+
+/// Resolve `pos` (absolute, same units the panel was last painted with) to
+/// a flat row index into the plugin panel's tree, or `None` when the point
+/// is outside the painted body, on the chrome above it, or past the last
+/// row (`TreeViewHit::Empty`).
+///
+/// Reads `Engine::ext_panel_tree_layout` — the `Backend::tree_layout` cached
+/// by whichever paint arm ran this frame — rather than re-deriving row
+/// geometry from a uniform `row_h`; see that field's own doc for why
+/// (#1089).
+pub fn ext_panel_hit_flat_index(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    let cached = engine.ext_panel_tree_layout.borrow();
+    let (body_rect, layout) = cached.as_ref()?;
+    if pos.x < body_rect.x
+        || pos.x >= body_rect.x + body_rect.width
+        || pos.y < body_rect.y
+        || pos.y >= body_rect.y + body_rect.height
+    {
+        return None;
+    }
+    match layout.hit_test(pos.x - body_rect.x, pos.y - body_rect.y) {
+        quadraui::TreeViewHit::Row(i) | quadraui::TreeViewHit::Chevron(i) => Some(i),
+        quadraui::TreeViewHit::Empty => None,
+    }
+}
+
+/// Apply a press at `pos` to the plugin panel: select the row it landed on
+/// and perform the same select/toggle action a real `Enter` press (or a
+/// double-click) would. Shared by TUI's `tui_main::mouse::handle_mouse` and
+/// the cross-backend `App::try_route_sidebar_mouse_event` (GTK/macOS/Win)
+/// so the two backends' plugin-panel click geometry can't drift apart the
+/// way their *paint* geometry used to (#1089) — both derive `pos`'s
+/// resolution from [`ext_panel_hit_flat_index`], never a hand-rolled
+/// per-backend formula.
+///
+/// A no-op (selection unchanged) when `pos` doesn't land on a row, or when
+/// the resolved index is past the end of the flat row list (stale cache).
+/// Route a click at `pos` (sidebar-local, same units the last frame painted
+/// the Board with) against the [`quadraui::BoardLayout`] cached at paint
+/// time. Phase 0 (#521) only handles selection + open — a double-click (or
+/// Enter, via [`Engine::dispatch_board_key_unified`]) opens the card, a
+/// single click selects it. A column-header click and a miss are both
+/// no-ops; there is nothing to collapse/expand yet.
+///
+/// Returns whether the click landed on something the panel owns — the same
+/// "consumed" contract [`route_ext_panel_click`]'s callers use.
+pub fn route_board_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) -> bool {
+    let hit = engine
+        .board_layout
+        .borrow()
+        .as_ref()
+        .map(|layout| layout.hit_test(pos.x, pos.y))
+        .unwrap_or(quadraui::BoardHit::Empty);
+    match hit {
+        quadraui::BoardHit::Card(id) => {
+            engine.apply_board_action(quadraui::BoardAction::SelectCard(id.clone()));
+            if is_double_click {
+                engine.apply_board_action(quadraui::BoardAction::OpenIssue(id));
+            }
+            true
+        }
+        quadraui::BoardHit::ColumnHeader(_) | quadraui::BoardHit::Empty => false,
+    }
+}
+
+/// Resolve a right-click at `pos` (board-native units, same convention as
+/// [`route_board_click`]) against the cached [`quadraui::BoardLayout`] to
+/// the card it landed on, if any (#523). A column-header or empty-space
+/// right-click isn't a context-menu trigger. Callers convert `pos` to the
+/// cell units `Engine::open_board_context_menu` expects — mirroring
+/// `App::handle_tab_right_click`/`handle_editor_right_click`'s own
+/// pixel→cell conversion — and are responsible for actually opening the
+/// menu; this function only resolves *which card*, the same "paint caches,
+/// click reads" split [`route_board_click`] uses.
+pub fn board_right_click_card(engine: &Engine, pos: quadraui::Point) -> Option<quadraui::WidgetId> {
+    let layout = engine.board_layout.borrow();
+    match layout.as_ref()?.hit_test(pos.x, pos.y) {
+        quadraui::BoardHit::Card(id) => Some(id),
+        quadraui::BoardHit::ColumnHeader(_) | quadraui::BoardHit::Empty => None,
+    }
+}
+
+/// A one-line status banner for the Board panel — "no provider configured",
+/// "fetching…", or the last fetch error (see [`BoardData::status`]). Shared
+/// by both backends so a status message can't drift in wording or style.
+pub fn board_status_bar(status: &str, theme: &Theme) -> quadraui::StatusBar {
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("board:status"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: format!("  {status}"),
+            fg: theme.status_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }
+}
+
+pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_double_click: bool) {
+    let Some(flat_idx) = ext_panel_hit_flat_index(engine, pos) else {
+        return;
+    };
+    if flat_idx >= engine.ext_panel_flat_len() {
+        return;
+    }
+    engine.ext_panel_selected = flat_idx;
+    if is_double_click {
+        engine.handle_ext_panel_double_click();
+    } else {
+        // Single-click toggles sections/expandable items — suppressed on a
+        // double-click so the second `Down` doesn't un-toggle what the
+        // first one just toggled (#484).
+        engine.handle_ext_panel_key("Return", false, None);
     }
 }
 
@@ -6470,12 +7958,25 @@ pub fn route_sidebar_hover(
         }
         SidebarOwner::ExtPanel(name) if inside => {
             let name = name.clone();
-            match geometry.content_row(y) {
-                Some(row) => {
-                    let flat_idx = engine.ext_panel_scroll_top + row;
+            // Route through the same `Backend::tree_layout`-cached hit-test
+            // `route_ext_panel_click` uses, not `SidebarBodyGeometry::
+            // content_row`'s uniform-row-height formula: a real multi-section
+            // panel pitches header rows and item rows differently on
+            // GTK/macOS/Win (`Engine::ext_panel_tree_layout`'s own doc), so a
+            // linear formula resolves the wrong row near a section boundary
+            // (#1236). `ext_panel_hit_flat_index` already returns an absolute
+            // flat index (matching `ext_panel_to_tree_view`'s own numbering),
+            // so no `ext_panel_scroll_top` offset is added here — adding one
+            // would double-count the scroll the cached layout already baked
+            // in.
+            let flat_idx = ext_panel_hit_flat_index(engine, quadraui::Point { x, y })
+                .filter(|&i| i < engine.ext_panel_flat_len());
+            match flat_idx {
+                Some(flat_idx) => {
                     engine.panel_hover_mouse_move(&name, "", flat_idx);
                 }
-                // Header row: nothing to hover.
+                // Chrome above the body, past the last row, or a stale cache:
+                // nothing to hover.
                 None if !mouse_on_popup => engine.dismiss_panel_hover(),
                 None => {}
             }
@@ -6582,21 +8083,22 @@ pub fn dispatch_dap_sidebar_body_event(
 }
 
 /// Resolve a press against the debug sidebar's title + action-button chrome
-/// row, at a point already translated into that row's own local space (`(0,
-/// 0)` at the row's own top-left — `StatusBar::layout`'s own convention).
-/// GTK translates by subtracting its cached `action_rect`'s origin; TUI's
-/// action row already paints at `y == 0` of its own local frame, so its
-/// local point is the raw column. Returns whether a segment was actually
-/// hit — the caller claims the whole chrome row regardless, matching both
-/// backends' pre-#754 behaviour.
-pub fn dap_sidebar_action_click_at(engine: &mut Engine, local_x: f32, local_y: f32) -> bool {
+/// row, given `pos` in the same absolute space `SidebarPanelBody::
+/// render_with` painted the chrome into — i.e. whatever space the `rect`
+/// passed to that call was in (TUI cell coordinates, GTK pixels). Both
+/// backends now store that same space on `Engine::dap_sidebar_action_hits`
+/// (populated straight from `SidebarPanelBodyLayout::status_bar_hit_regions`
+/// — see that field's doc), so there is no per-backend translation step left
+/// here (issue #1392; GTK used to subtract its own separately-cached
+/// `action_rect`'s origin, which is exactly the "paint and click can
+/// disagree" risk the issue called out). Returns whether a segment was
+/// actually hit — the caller claims the whole chrome row regardless,
+/// matching both backends' pre-#754 behaviour.
+pub fn dap_sidebar_action_click_at(engine: &mut Engine, pos: quadraui::Point) -> bool {
     let matched = {
         let hits = engine.dap_sidebar_action_hits.borrow();
-        hits.as_ref().is_some_and(|l| {
-            matches!(
-                l.hit_test(local_x, local_y),
-                quadraui::StatusBarHit::Segment(_)
-            )
+        hits.iter().any(|(rect, hit)| {
+            rect.contains(pos) && matches!(hit, quadraui::StatusBarHit::Segment(_))
         })
     };
     if matched {
@@ -6701,6 +8203,32 @@ pub fn route_ai_chat_event(
         return engine.ai_has_focus;
     }
     populate_ai_chat_controller(engine, theme);
+
+    // #956 (ACP-5): while the slash-command completion popup is showing,
+    // steal Tab (cycle selection) and Enter (accept) before handing the
+    // event to `ChatController::handle` — the same "intercept the
+    // accept/cycle keys, let everything else fall through unchanged" shape
+    // the editor's own word-completion popup uses
+    // (`Engine::insert_completion_intercepts_key`). This one shared call
+    // site is what makes it zero-backend-specific: GTK and TUI both route
+    // every AI-panel key through here already.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
+        if no_modifiers && engine.ai_command_completions().is_some() {
+            match key {
+                quadraui::Key::Named(quadraui::NamedKey::Tab) => {
+                    engine.ai_command_completion_cycle();
+                    return engine.ai_has_focus;
+                }
+                quadraui::Key::Named(quadraui::NamedKey::Enter) => {
+                    engine.ai_command_accept_selected();
+                    return engine.ai_has_focus;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let chat_event = engine.ai_chat.borrow_mut().handle(event, backend, rect);
     engine.dispatch_ai_chat_event(chat_event)
 }
@@ -6935,6 +8463,188 @@ pub(crate) fn editor_band_fixture(drag: bool) -> Vec<EditorOp> {
         .collect()
 }
 
+/// The unit system one backend composes [`paint_editor_band_rungs`] in —
+/// [`BottomPanelUnits`]'s sibling for the editor band. `metrics` answers the
+/// same "at least one line tall / one column wide" question [`FrameMetrics`]
+/// exists for; `tab_row_h` is a second, independent unit because the tab
+/// strip's own row is *not* one text line on GTK (it runs ~1.6× a line
+/// height there) while it is unconditionally exactly one cell on TUI
+/// regardless of the breadcrumbs setting — see the [`EditorOp::TabTooltip`]
+/// call site below for the one rung that reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EditorBandUnits {
+    pub metrics: FrameMetrics,
+    /// Row height of the tab strip itself, in the caller's units.
+    pub tab_row_h: f32,
+}
+
+impl EditorBandUnits {
+    /// One terminal cell — what `TuiShellApp::paint_editor_band` composes in.
+    pub const CELL: Self = Self {
+        metrics: FrameMetrics::CELL,
+        tab_row_h: 1.0,
+    };
+
+    /// Real pixels — what `gtk::App::compose_editor_band_rungs` composes in.
+    /// `tab_row_h` is the caller's own measured tab-strip row height, not
+    /// derived from `line_height` (see the struct doc for why the two
+    /// disagree on GTK).
+    pub fn px(line_height: f64, char_width: f64, tab_row_h: f64) -> Self {
+        Self {
+            metrics: FrameMetrics::px(line_height, char_width),
+            tab_row_h: tab_row_h as f32,
+        }
+    }
+}
+
+/// Host hook for [`paint_editor_band_rungs`] — the four [`EditorOp`] rungs
+/// whose paint body still differs enough per backend that the shared walk
+/// cannot inline them directly. `Minimap`, `Breadcrumbs` and `TabTooltip`
+/// need no hook at all: their bodies are already byte-identical between GTK
+/// and TUI (see [`paint_editor_band_rungs`]'s match arms), which is exactly
+/// what made them safe to inline into the shared walk instead of leaving
+/// them here as a fifth/sixth/seventh trivial forwarding method.
+///
+/// `'screen` ties every method's `screen` parameter to the *same*
+/// `ScreenLayout` borrow for the whole walk, so a host (GTK's) that needs to
+/// carry a `&'screen quadraui::TabBar` past the `TabBars` call — for the
+/// `FrameHitMap` it builds after the walk returns — can store it in its own
+/// fields without a lifetime mismatch.
+pub trait EditorBandHost<'screen> {
+    /// [`EditorOp::Windows`]: every editor window's text, gutter, per-window
+    /// status line and the `:split`/`:vsplit` divider lines within each
+    /// group.
+    ///
+    /// Genuinely per-backend: GTK accumulates each window's owned
+    /// `quadraui::Editor` into its own `FrameHitMap` (#449) so later click
+    /// routing hit-tests the exact objects just painted, never a second copy
+    /// that could drift; TUI carries no such map (its hit-testing recomputes
+    /// geometry from `ScreenLayout` directly) but instead wants an optional
+    /// raw `ratatui::Frame` for cursor placement that this trait's `&mut dyn
+    /// Backend`-only signature has no room for (see `render_window`'s own
+    /// doc comment for why `frame: Option<&mut Frame>` exists there).
+    fn paint_windows(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabBars`]: one tab bar per editor group.
+    ///
+    /// Genuinely per-backend: GTK recovers the rasteriser's exact *pixel* hit
+    /// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
+    /// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution
+    /// (#515, #703, #764); TUI's hit-testing works in whole cells and needs
+    /// none of that bookkeeping.
+    fn paint_tab_bars(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::GroupDividers`]: the between-*group* `Ctrl+W v`/`Ctrl+W s`
+    /// boundary lines.
+    ///
+    /// Genuinely per-backend: GTK rasterises through quadraui's `Split`
+    /// primitive ([`draw_dividers_as_splits`]); TUI rasterises cell-by-cell
+    /// instead, because it alone carries the #481 guard that suppresses a
+    /// divider column immediately beside a neighbouring window's scrollbar —
+    /// a coalescence problem that exists only in a character grid. See
+    /// [`draw_dividers_as_splits`]'s own doc comment for the full story.
+    fn paint_group_dividers(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+
+    /// [`EditorOp::TabDragOverlay`]: the tab-drag drop-zone highlight,
+    /// insertion bar and dragged-tab ghost.
+    ///
+    /// Genuinely per-backend: GTK's drop geometry is cached every frame
+    /// (`cache_tab_drop_geometry`) so the drag hit-test has it whether or not
+    /// this rung ran that frame; TUI recomputes it inline and additionally
+    /// paints the dragged buffer's name at the ghost position — the decision
+    /// [`paint_tab_drop_overlay`]'s own doc comment already records GTK
+    /// leaves to quadraui's rasteriser instead.
+    fn paint_tab_drag_overlay(
+        &mut self,
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        screen: &'screen ScreenLayout,
+        theme: &Theme,
+    );
+}
+
+/// The shared **editor band** walk (#1251): the single ordered loop both
+/// `TuiShellApp::paint_editor_band` and `App::compose_editor_band_rungs` run
+/// over [`compose_editor_band`], replacing what used to be two hand-written
+/// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
+/// `TabTooltip` paint identically on both backends (modulo `units`) and are
+/// inlined here directly; the four rungs that still need a per-backend body
+/// go through `host` — see [`EditorBandHost`]'s own doc for exactly which
+/// parts of each and why.
+///
+/// `band` is the editor column's bounds in the caller's units (only `x`, `y`
+/// and `width` are read, by the `TabTooltip` rung); `units` carries the
+/// metrics and tab-row height the same rung needs. Returns the rungs actually
+/// composed, in order, for the caller to stash and validate with
+/// [`check_editor_band_order`] — callers do that themselves (rather than this
+/// function doing it) so the assertion message keeps each backend's own
+/// "TUI "/"GTK " prefix, unchanged from before this convergence.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_editor_band_rungs<'screen>(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    screen: &'screen ScreenLayout,
+    theme: &Theme,
+    band: quadraui::Rect,
+    units: EditorBandUnits,
+    drag_active: bool,
+    host: &mut impl EditorBandHost<'screen>,
+) -> Vec<EditorOp> {
+    let mut composed = Vec::new();
+    for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
+        match op {
+            EditorOp::Windows => host.paint_windows(backend, engine, screen, theme),
+            // #35/#722: minimap strips on every window's right edge (one
+            // entry per `WindowId` in `screen.minimap`, not just the active
+            // window's) — one call, the rasteriser is quadraui's.
+            EditorOp::Minimap => draw_minimap_strip(backend, screen),
+            EditorOp::TabBars => host.paint_tab_bars(backend, engine, screen, theme),
+            EditorOp::Breadcrumbs => {
+                paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
+            }
+            EditorOp::GroupDividers => host.paint_group_dividers(backend, screen, theme),
+            EditorOp::TabDragOverlay => host.paint_tab_drag_overlay(backend, engine, screen, theme),
+            // Positioned one *tab row* below the top of the editor column —
+            // `units.tab_row_h`, not `units.metrics.line_height` — mirroring
+            // GTK's `tab_row_h` / TUI's always-one-cell tab strip; see
+            // `EditorBandUnits`'s doc for why the two units genuinely differ.
+            EditorOp::TabTooltip => {
+                if let Some(ref tooltip_text) = screen.tab_tooltip {
+                    tab_hover_tooltip_paint(
+                        backend,
+                        band.x,
+                        band.y + units.tab_row_h,
+                        band.width,
+                        tooltip_text,
+                        theme,
+                        units.metrics.char_width,
+                        units.metrics.line_height,
+                    );
+                }
+            }
+        }
+        composed.push(op);
+    }
+    composed
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // Bottom band (#765, #735 slice 4)
 // ══════════════════════════════════════════════════════════════════════════
@@ -7129,7 +8839,7 @@ pub fn compose_bottom_band(
         .iter()
         .copied()
         .filter(|op| match op {
-            // Already `None` unless `quickfix_open && !quickfix_items
+            // Already `None` unless `quickfix.open && !quickfix.items
             // .is_empty()` (`build_screen_layout`), the same rule
             // `quickfix_panel_rows` reserves height by — so no second copy of
             // that gate here.
@@ -7628,26 +9338,13 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
 /// height; TUI: `1.0` and `2.0` cells).
 pub fn paint_tab_drop_overlay(
     backend: &mut dyn quadraui::Backend,
-    drop_zone: &crate::core::window::DropZone,
-    groups: &[TabDropGroup],
+    ctx: &TabDropCtx,
     cursor: (f32, f32),
-    tab_bar_height: f32,
     bar_thickness: f32,
     ghost_offset: f32,
-) -> Option<TabDropOverlay> {
-    let overlay = compute_tab_drop_overlay(
-        drop_zone,
-        groups,
-        cursor,
-        tab_bar_height,
-        bar_thickness,
-        ghost_offset,
-    )?;
-    backend.draw_drop_overlay(&quadraui::DropOverlay {
-        highlight: overlay.highlight,
-        insertion_bar: overlay.insertion_bar,
-        ghost_position: Some(overlay.ghost_position),
-    });
+) -> Option<quadraui::DropOverlay> {
+    let overlay = tab_drop_overlay(ctx, cursor.0, cursor.1, bar_thickness, ghost_offset)?;
+    backend.draw_drop_overlay(&overlay);
     Some(overlay)
 }
 
@@ -7829,6 +9526,12 @@ pub enum FrameOp {
     TabSwitcher,
     /// `Backend::draw_context_menu`.
     ContextMenu,
+    /// The change-review surface (#955, shared with #525) —
+    /// [`paint_change_review_rung`] on both backends. A full-viewport
+    /// `quadraui::DiffView` for the currently-shown proposed change, so it
+    /// sits above every other overlay except a modal dialog (an
+    /// "agent exited" dialog, say, should still win) and the toast stack.
+    ChangeReview,
     /// `Backend::draw_dialog` — modal, so above every rung but the toasts,
     /// matching [`route_modal_overlay_click`]'s own arbitration.
     Dialog,
@@ -7855,6 +9558,7 @@ impl FrameOp {
                 | FrameOp::UnifiedPicker
                 | FrameOp::TabSwitcher
                 | FrameOp::ContextMenu
+                | FrameOp::ChangeReview
                 | FrameOp::Dialog
                 | FrameOp::ToastStack
         )
@@ -7875,7 +9579,7 @@ impl FrameOp {
 /// The five chrome rungs come first, the eight overlay rungs
 /// ([`FrameOp::is_overlay`]) are the tail: every chrome rung is composed before
 /// the first overlay rung, on both backends.
-pub const FRAME_Z_ORDER: [FrameOp; 14] = [
+pub const FRAME_Z_ORDER: [FrameOp; 15] = [
     // ── chrome ───────────────────────────────────────────────────────────
     FrameOp::MenuRow,
     FrameOp::SidebarPanel,
@@ -7890,6 +9594,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
     FrameOp::UnifiedPicker,
     FrameOp::TabSwitcher,
     FrameOp::ContextMenu,
+    FrameOp::ChangeReview,
     FrameOp::Dialog,
     FrameOp::ToastStack,
 ];
@@ -7901,7 +9606,7 @@ pub const FRAME_Z_ORDER: [FrameOp; 14] = [
 /// exactly these rungs must have been composed, in this order" — the #735
 /// headline acceptance criterion.
 ///
-/// Eleven of the thirteen fields are derived from `ScreenLayout` +
+/// Twelve of the fourteen fields are derived from `ScreenLayout` +
 /// `AppShellLayout` by [`Self::from_screen`]. The two that are not
 /// (`toast_stack`, and any backend-specific suppression) are left to the
 /// caller, because they are engine/geometry state rather than screen state.
@@ -7923,6 +9628,7 @@ pub struct FramePresence {
     pub unified_picker: bool,
     pub tab_switcher: bool,
     pub context_menu: bool,
+    pub change_review: bool,
     pub dialog: bool,
     pub toast_stack: bool,
 }
@@ -7984,6 +9690,7 @@ impl FramePresence {
                 .context_menu
                 .as_ref()
                 .is_some_and(|p| !p.items.is_empty()),
+            change_review: screen.change_review.is_some(),
             dialog: screen.dialog.is_some(),
             toast_stack: false,
         }
@@ -8004,6 +9711,7 @@ impl FramePresence {
             FrameOp::UnifiedPicker => self.unified_picker,
             FrameOp::TabSwitcher => self.tab_switcher,
             FrameOp::ContextMenu => self.context_menu,
+            FrameOp::ChangeReview => self.change_review,
             FrameOp::Dialog => self.dialog,
             FrameOp::ToastStack => self.toast_stack,
         }
@@ -8082,14 +9790,18 @@ pub fn check_frame_order(composed: &[FrameOp]) -> Result<(), String> {
 //     the two arms would mean growing quadraui's `Backend` trait first
 //     (Platform-Neutrality Rule: build the shared capability upstream,
 //     then consume it here) — nothing is filed for that yet.
-//   * `FrameOp::TabSwitcher` — GTK feeds `TabSwitcherGeometry::visible_rows`
-//     (the height-capped row count) into `tab_switcher_to_quadraui_list_view`;
-//     TUI feeds `max_visible` (the uncapped height budget) — see that
-//     struct's doc comment for the distinction. Whether that's a harmless
-//     pre-existing divergence (the list adapter may already clamp by
-//     `items.len()`) or a latent bug is a question a duplication-convergence
-//     pass shouldn't answer by silently picking one field for a shared
-//     function — left for a follow-up with the room to investigate it.
+//   * `FrameOp::TabSwitcher` — both backends now feed
+//     `TabSwitcherGeometry::visible_rows` (the height-capped row count) into
+//     `tab_switcher_to_quadraui_list_view`. TUI used to feed `max_visible`
+//     (the uncapped height budget) instead (#1056); investigating turned up
+//     that the swap was inert in practice — `ListView::layout` clips the
+//     painted row count from the popup's own bounds height, which both
+//     backends already derive from `visible_rows`, and `max_visible`'s only
+//     other use (the adapter's `scroll_offset` calc) can't diverge from
+//     `visible_rows` either, since `tab_switcher_selected` is always a valid
+//     `% len` index into the MRU list. Fixed anyway, since a shared function
+//     taking the wrong field by name is a landmine for the next caller even
+//     when today's invariants happen to save it.
 //
 // `FrameOp::MenuRow`, `SidebarPanel`, `MenuDropdown` and `FolderPicker` are
 // the other four arms; each was already established (by #815/#763/#766) as
@@ -8110,11 +9822,11 @@ pub fn paint_wildmenu_rung(
 /// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
 /// backends.
 ///
-/// Returns the resolved [`quadraui::StatusBarLayout`] so GTK can derive its
-/// click zones from the same measurement the paint produced — mirrors
-/// [`paint_separated_status_rung`]'s reasoning exactly. TUI recomputes zones
-/// statelessly at click time instead (cheap in cell units) and ignores the
-/// return value.
+/// Returns the resolved [`quadraui::StatusBarLayout`] so both backends can
+/// derive their click zones from the same measurement the paint produced —
+/// mirrors [`paint_separated_status_rung`]'s reasoning exactly. #1250: TUI
+/// used to recompute zones statelessly at click time instead; it now caches
+/// this return value the same way GTK always has.
 pub fn paint_global_status_bar_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
@@ -8296,6 +10008,230 @@ pub fn paint_toast_stack_rung(
     engine.toast_layout.replace(Some(layout));
 }
 
+/// The change-review surface's modal-stack id — see
+/// [`reconcile_change_review_modal_stack`].
+fn change_review_modal_id() -> quadraui::WidgetId {
+    quadraui::WidgetId::new("change_review")
+}
+
+/// Keep the change-review surface's full-viewport bounds on the backend's
+/// `quadraui::ModalStack` in step with whether it's open (#955, review fix:
+/// the click-routing test this exists for). Same "reconcile so chrome
+/// hit-testing yields to an open overlay" pattern `app.rs`'s
+/// `reconcile_editor_hover_modal` and `mouse.rs`'s context-menu/picker
+/// reconcile blocks already use — see quadraui's `ShellAdapter::handle`
+/// doc (issue #411) for why an overlay that visually covers shell chrome
+/// but never registers with the modal stack has its clicks silently
+/// swallowed by that chrome instead.
+///
+/// Unlike those precedents, this reconcile has to run from *paint*, not
+/// from `handle_mouse`/`handle_mouse_click_msg`: TUI's
+/// `ShellAdapter::handle` consults the modal stack **before** its own
+/// activity-bar/sidebar hit-test, and before ever calling into
+/// `ShellApp::handle` (where `handle_mouse` lives) — so a stack entry
+/// written only while a mouse event is *already* being dispatched can
+/// never be there in time for the very first click after the surface
+/// opens. The editor-hover popup gets away with reconciling from inside
+/// `handle_mouse` because it only ever opens *from* a `MouseMoved`
+/// already flowing through that same function; the change-review surface
+/// opens from an async ACP `tool_call_update` completing, with no
+/// correlated mouse event to piggyback the reconcile on. Paint is the one
+/// place guaranteed to run before that first click.
+///
+/// Registers the *whole* `viewport` (diff pane + status footer), not just
+/// the diff pane `engine.change_review_diff_rect` caches: a click on the
+/// footer must also bypass chrome rather than being swallowed by whatever
+/// activity-bar icon happens to occupy that row underneath —
+/// `route_change_review_click` still resolves a footer click to
+/// `Consume` on its own, this only decides who gets to see the click at
+/// all.
+///
+/// **Call this unconditionally, once per frame, *before* the
+/// [`compose_frame`] walk** — never from an `else` arm inside the
+/// `FrameOp::ChangeReview` match arm. `presence.change_review` *is* the
+/// gate `compose_frame` uses to decide whether that rung is in the op list
+/// at all, so the arm only ever runs on a frame where the surface is open:
+/// an `else` there is dead code on exactly the frame that needs the pop
+/// (the #1117 `explorer_tree_rect` bug and this file's own
+/// "gates drop rungs, so callers reset before the walk" note above
+/// [`compose_frame`], in miniature). Leaving the entry pushed after the
+/// surface closes hands *every* subsequent click to the app's own
+/// `handle()` — `ShellAdapter::handle` consults `ModalStack::hit_test`
+/// before any chrome dispatch — which silently kills activity-bar panel
+/// switching, sidebar resize and the rest for the remainder of the
+/// session. `app.rs`'s `reconcile_editor_hover_modal` is the shape to
+/// copy: called every time regardless of visibility, with the `false` arm
+/// always reachable.
+pub fn reconcile_change_review_modal_stack(
+    b: &mut dyn quadraui::Backend,
+    open: bool,
+    viewport: quadraui::Rect,
+) {
+    let stack_rc = b.modal_stack_handle();
+    let mut stack = stack_rc.borrow_mut();
+    if open {
+        stack.push(change_review_modal_id(), viewport);
+        // #455: no quadraui rasteriser marks this surface painted — the
+        // three `mark_painted` call sites upstream are wired only for
+        // `draw_palette`/`draw_menu`/`draw_dialog`, and the change-review
+        // surface is a `DiffView` + `StatusBar`, neither of which is
+        // modal-capable there. Without this the entry shows up in
+        // `ModalStack::unpainted_ids()` every frame it is open and each
+        // backend's `end_frame` emits the "registered but invisible"
+        // diagnostic against a surface that is, in fact, painted. Only the
+        // `open` arm marks: a popped id is a no-op for `mark_painted`
+        // anyway.
+        stack.mark_painted(&change_review_modal_id());
+    } else {
+        stack.pop(&change_review_modal_id());
+    }
+}
+
+/// Does the backend's `quadraui::ModalStack` currently hold the
+/// change-review surface's entry? Test-facing: the regression guard for
+/// "the overlay closed but its full-viewport entry stayed registered and
+/// ate every later chrome click" (#955 review) asserts on this directly,
+/// since the symptom is otherwise only observable several clicks later.
+pub fn change_review_modal_registered(b: &mut dyn quadraui::Backend) -> bool {
+    let stack_rc = b.modal_stack_handle();
+    let stack = stack_rc.borrow();
+    let id = change_review_modal_id();
+    let registered = stack.iter_top_down().any(|e| e.id == id);
+    registered
+}
+
+/// The change-review surface's whole paint body (#955, shared with #525):
+/// a full-viewport `quadraui::DiffView` for the currently-shown entry,
+/// plus a one-row status footer ("file i of n", the entry's path, and key
+/// hints). Both backends call this verbatim from their own frame-op walk —
+/// no per-backend diff-rendering logic, matching every other primitive
+/// under `docs/QUADRAUI_GUIDE.md`.
+///
+/// Caches the diff pane's own rect on `engine.change_review_diff_rect` so
+/// a later mouse click can resolve through the *exact* geometry this call
+/// painted (`entry.view.layout(rect, line_height).hit_test`) — same
+/// "paint writes it, click routing reads it" contract as
+/// `command_line_rect`.
+///
+/// Also reconciles the surface's modal-stack entry (see
+/// [`reconcile_change_review_modal_stack`]) — required for click-to-jump
+/// to actually reach `mouse::handle_mouse`/`App::handle_mouse_click_msg`
+/// rather than being swallowed by whatever chrome (activity-bar icon,
+/// sidebar row) happens to occupy those columns underneath the
+/// full-viewport overlay.
+pub fn paint_change_review_rung(
+    b: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    review: &crate::core::review::ChangeReviewState,
+    viewport: quadraui::Rect,
+    theme: &Theme,
+) {
+    let Some(entry) = review.current_entry() else {
+        // Open-but-empty: nothing reaches the canvas, so nothing may
+        // claim the viewport's clicks either (the same
+        // registered-but-invisible defect #455 detects).
+        reconcile_change_review_modal_stack(b, false, viewport);
+        return;
+    };
+    reconcile_change_review_modal_stack(b, true, viewport);
+    let line_height = b.line_height().max(1.0);
+    let footer_h = line_height.min(viewport.height);
+    let diff_rect = quadraui::Rect::new(
+        viewport.x,
+        viewport.y,
+        viewport.width,
+        (viewport.height - footer_h).max(0.0),
+    );
+    // #527: splice any pinned line comments into the rows that get painted
+    // — see `crate::core::review::view_with_inline_comments`'s doc for why
+    // this lives in core rather than as backend-specific text munging.
+    let painted_view = crate::core::review::view_with_inline_comments(&review.comments, entry);
+    let _ = b.draw_diff_view(diff_rect, &painted_view);
+    engine.change_review_diff_rect.set(diff_rect);
+
+    let decision = match entry.decision {
+        crate::core::review::ChangeDecision::Pending => "pending",
+        crate::core::review::ChangeDecision::Accepted => "accepted",
+        crate::core::review::ChangeDecision::Rejected => "rejected",
+    };
+    let msg = format!(
+        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
+         ]/[=hunk n/p=file Esc=close ",
+        review.current + 1,
+        review.entries.len(),
+        entry.change.path,
+    );
+    // Provenance (#528): a git-branch-fed review (`Engine::
+    // open_branch_review`) is showing the human a diff *of a real branch
+    // checked out right here* — the footgun the issue calls out is a human
+    // who edits/finalizes believing this is their own checkout. Right-
+    // aligned so it never competes with the left segment's file/decision
+    // info for the narrow-terminal case. `None` (an ACP tool-call-fed
+    // review has no branch) means no segment at all, not a blank one.
+    let right_segments = branch_review_provenance_segment(engine, theme)
+        .into_iter()
+        .collect();
+    let status = quadraui::StatusBar {
+        id: quadraui::WidgetId::new("change-review-status"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: msg,
+            fg: theme.status_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments,
+    };
+    let footer_rect = quadraui::Rect::new(
+        viewport.x,
+        diff_rect.y + diff_rect.height,
+        viewport.width,
+        footer_h,
+    );
+    let _ = b.draw_status_bar_interactive(footer_rect, &status, &quadraui::InteractionState::new());
+}
+
+/// Build the "you are editing a real branch checkout, not your own" status
+/// segment for a branch-fed change review (#528, Track A Phase 3) — `None`
+/// when `engine.review_target` is unset, which covers both the ACP-fed
+/// review (no git branch at all) and the plain "no review has been opened
+/// this session" case, in which case the footer shows only the left
+/// segment, same as before this field existed.
+///
+/// #530 (Track A Phase 5, the fleet review seat) adds `target.host` to
+/// this line when the provider supplied one: "which worktree" (already
+/// covered by `root`) stops being unambiguous the moment vimcode itself
+/// can be *running on the worker box* rather than a local pull, so a
+/// reviewer needs "which machine" too — this is the whole of that issue's
+/// "provenance is unmistakable" acceptance bar. `host: None` (a provider
+/// with only one checkout, or an external "pull the branch locally
+/// first" flow) paints exactly the pre-#530 line, unchanged.
+fn branch_review_provenance_segment(
+    engine: &Engine,
+    theme: &Theme,
+) -> Option<quadraui::StatusBarSegment> {
+    let target = engine.review_target.as_ref()?;
+    let root = engine
+        .workspace_root
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let text = match &target.host {
+        Some(host) => format!(
+            " reviewing branch '{}' on '{}' in {} ",
+            target.branch, host, root
+        ),
+        None => format!(" reviewing branch '{}' in {} ", target.branch, root),
+    };
+    Some(quadraui::StatusBarSegment {
+        text,
+        fg: theme.status_fg,
+        bg: theme.status_bg,
+        bold: true,
+        action_id: None,
+    })
+}
+
 /// Where the menu bar's labels end, in absolute coordinates.
 ///
 /// `vi.bounds.x` is already absolute — quadraui's `MenuBar::layout` starts its
@@ -8421,11 +10357,12 @@ pub(crate) fn chrome_band_fixture(wildmenu: bool) -> Vec<FrameOp> {
 
 /// The `quadraui::CommandLine` descriptor for this frame's Vim command line.
 ///
-/// GTK's [`FrameOp::CommandLine`] rung built this inline; TUI's rasteriser
-/// composes cells itself (`panels::render_command_line`, which also applies the
-/// `cmd_sel` drag-selection inversion), so only GTK consumes it today — but the
-/// *descriptor* is app state, not geometry, and belongs beside the rest of the
-/// chrome band rather than buried in a backend.
+/// GTK's [`FrameOp::CommandLine`] rung and TUI's `panels::render_command_line`
+/// both build the descriptor this way and hand it (plus `cmd_sel`, converted
+/// via [`command_line_selection_bytes`]) to `Backend::
+/// draw_command_line_selection` (#1185) — the *descriptor* is app state, not
+/// geometry, and belongs beside the rest of the chrome band rather than
+/// buried in either backend.
 pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
     quadraui::CommandLine {
         id: "cmd".into(),
@@ -8511,9 +10448,10 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 ///
 /// It could not be written before #766: until the chrome and overlay halves
 /// were one sequence there was no single artefact to compare, only two that a
-/// backend could get individually right and jointly wrong. Nine of the fourteen
-/// rungs are live and five are not, which is what keeps it *discriminating* —
-/// it must never degenerate into "whatever [`FRAME_Z_ORDER`] contains".
+/// backend could get individually right and jointly wrong. Nine of the
+/// fifteen rungs are live and six are not, which is what keeps it
+/// *discriminating* — it must never degenerate into "whatever
+/// [`FRAME_Z_ORDER`] contains".
 #[cfg(test)]
 pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
     compose_frame(&FramePresence {
@@ -8531,6 +10469,7 @@ pub(crate) fn frame_sequence_fixture() -> Vec<FrameOp> {
         unified_picker: false,
         tab_switcher: false,
         context_menu: true,
+        change_review: false,
         dialog: true,
         toast_stack: false,
     })
@@ -8556,7 +10495,14 @@ pub(crate) fn overlay_band_title_bar_only_fixture() -> Vec<FrameOp> {
 
 // ─── QuickfixPanel ────────────────────────────────────────────────────────────
 
-/// Data needed to render the quickfix bottom panel.
+/// Data needed to render the quickfix (or location-list) bottom panel.
+///
+/// The same bottom "list rung" renders either the global quickfix list or
+/// the active window's location list — never both at once, matching how
+/// most Vim users actually work with them, and keeping the fixed
+/// `BOTTOM_Z_ORDER` band stack this repo's rendering doc comments describe
+/// (see the comment above [`BOTTOM_Z_ORDER`]) from having to grow a second
+/// independent slot for #1155.
 #[derive(Debug, Clone)]
 pub struct QuickfixPanel {
     /// Formatted display strings: "file.rs:12: line text"
@@ -8567,6 +10513,30 @@ pub struct QuickfixPanel {
     pub total_items: usize,
     /// Whether the quickfix panel has keyboard focus.
     pub has_focus: bool,
+    /// `"QUICKFIX"` for the global list, `"LOCATION LIST"` when this panel
+    /// is showing the active window's `:l*` list instead (#1155).
+    pub title: &'static str,
+}
+
+/// Build a [`QuickfixPanel`] from a [`QuickfixList`] (global quickfix or a
+/// per-window location list — see [`QuickfixPanel::title`]).
+fn quickfix_list_to_panel(list: &QuickfixList, title: &'static str) -> QuickfixPanel {
+    let items = list
+        .items
+        .iter()
+        .map(|m| {
+            let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+            let snippet: String = m.line_text.trim().chars().take(80).collect();
+            format!("{}:{}: {}", f, m.line + 1, snippet)
+        })
+        .collect();
+    QuickfixPanel {
+        items,
+        selected_idx: list.selected,
+        total_items: list.items.len(),
+        has_focus: list.has_focus,
+        title,
+    }
 }
 
 /// A single item rendered in the debug sidebar. Used by win-gui;
@@ -8712,6 +10682,26 @@ pub struct ExtSidebarData {
     pub panel_scroll: f32,
 }
 
+// ─── BoardData ─────────────────────────────────────────────────────────────────
+
+/// Rendering data for the Board panel (#521) — a generic host for the shared
+/// `quadraui::Board` component. `model` comes straight from vimcode's board
+/// contract (`Engine::board_model`, populated via the #522 `ToolClient`
+/// seam); this type adds only what the panel's own chrome needs on top of
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoardData {
+    /// Whether the panel currently has keyboard focus.
+    pub has_focus: bool,
+    /// The last successfully fetched board, or `None` before the first
+    /// fetch completes (or when no provider is configured).
+    pub model: Option<quadraui::BoardModel>,
+    /// A one-line status to show in place of the board when `model` is
+    /// `None`: "no provider configured", "fetching…", or the last error.
+    /// `None` alongside a `Some(model)` means nothing needs to be said.
+    pub status: Option<String>,
+}
+
 // ─── ExtPanelData (extension-provided sidebar panels) ────────────────────────
 
 /// Rendering data for a single extension-provided sidebar panel.
@@ -8796,6 +10786,46 @@ pub fn panel_hover_to_quadraui_rich_text(
     }
 }
 
+/// On-screen content row (0-based, relative to the ext panel's own chrome)
+/// for an ext-panel hover's flat `item_index` — the inverse of
+/// `route_sidebar_hover`'s `SidebarOwner::ExtPanel` arm, which sets
+/// `flat_idx = engine.ext_panel_scroll_top + row` (`render.rs`, just above
+/// [`route_sidebar_hover`]). #1087: the anchor code used to skip this
+/// subtraction entirely and anchor to the flat index as if it were a screen
+/// row, so anything scrolled past the first screenful painted dozens of rows
+/// below the viewport.
+///
+/// Returns `None` when `item_index` is behind the current scroll offset,
+/// which can happen for one stale frame immediately after a scroll (the
+/// hover popup should simply not paint that frame — an `f32` cast of a
+/// wrapped `usize` subtraction would otherwise park it at infinity).
+pub(crate) fn ext_panel_hover_screen_row(panel: &ExtPanelData, item_index: usize) -> Option<usize> {
+    item_index.checked_sub(panel.scroll_top)
+}
+
+/// Chrome rows an ext panel paints above its first content row: the header,
+/// plus the search-input row when it's visible. Mirrors `render_ext_panel`'s
+/// own `chrome_h` (`tui_main/panels.rs`) — the same condition
+/// `mouse.rs`'s `SidebarOwner::ExtPanel` click arm uses for
+/// `SidebarBodyGeometry::header_rows` (#1086) — so hover and click can't
+/// drift on what counts as chrome, *except* in the degenerate case
+/// `render_ext_panel` guards and this doesn't: its `chrome_h` is
+/// `.min(area.height)`, clamped to whatever the panel's viewport actually
+/// has room for, while this always returns 1 or 2 regardless of viewport
+/// size. Only matters for an ext-panel area under 2 rows tall (an
+/// unusably narrow sidebar), where a hover anchor could drift by a row
+/// from what was actually painted — not worth threading `area.height`
+/// through the hover path for that corner case today, but a future
+/// `SidebarBodyGeometry`-style unification (#1086) should derive both from
+/// one place.
+pub(crate) fn ext_panel_chrome_rows(panel: &ExtPanelData) -> usize {
+    if panel.input_active || !panel.input_text.is_empty() {
+        2
+    } else {
+        1
+    }
+}
+
 /// Vertical anchor (top of the hovered row, in the caller's line units) for
 /// [`panel_hover_popup_paint`]. Lifted from the now-dead
 /// `src/gtk/draw.rs::draw_panel_hover_popup`'s source-control section walk
@@ -8805,14 +10835,27 @@ pub fn panel_hover_to_quadraui_rich_text(
 /// true in the pre-#552 single-DA GTK architecture that dead code was
 /// written against, no longer true now that a title-bar row can sit above
 /// the sidebar.
+///
+/// Returns `None` when the anchor can't be computed this frame (#1087's
+/// scroll-underflow guard, or no `screen.ext_panel` yet) — callers should
+/// skip painting the popup for that frame rather than clamp to a garbage
+/// position.
 fn panel_hover_anchor_y(
     screen: &ScreenLayout,
     hover: &PanelHoverPopupData,
     sidebar_top_y: f32,
     unit_h: f32,
-) -> f32 {
+) -> Option<f32> {
     if hover.panel_name != "source_control" {
-        return sidebar_top_y + unit_h + hover.item_index as f32 * unit_h;
+        // #1087: `hover.item_index` is a flat index across the whole panel
+        // list, not a screen row — subtract the scroll offset back out, and
+        // use the chrome rows this panel actually painted (1 or 2,
+        // depending on whether the search input row is showing) instead of
+        // the literal `1` this used to hardcode.
+        let panel = screen.ext_panel.as_ref()?;
+        let screen_row = ext_panel_hover_screen_row(panel, hover.item_index)?;
+        let chrome_rows = ext_panel_chrome_rows(panel);
+        return Some(sidebar_top_y + chrome_rows as f32 * unit_h + screen_row as f32 * unit_h);
     }
     // SC layout: `section_top` is read from the cached `SidebarPanelLayout`
     // (`sc_sections_start_y`, already an absolute coordinate — see its own
@@ -8834,7 +10877,7 @@ fn panel_hover_anchor_y(
             unit_h + gap + commit_rows * unit_h + unit_h
         });
     let Some(ref sc) = screen.source_control else {
-        return section_top + hover.item_index as f32 * unit_h;
+        return Some(section_top + hover.item_index as f32 * unit_h);
     };
     // Walk sections to find the accumulated Y offset for the hovered flat
     // index. Headers occupy one row; expanded items occupy `item_height`
@@ -8880,7 +10923,7 @@ fn panel_hover_anchor_y(
             }
         }
     }
-    y_off
+    Some(y_off)
 }
 
 /// Paint the sidebar-item hover popup (source-control / extension-panel item
@@ -8924,7 +10967,7 @@ pub fn panel_hover_popup_paint(
     if hover.line_text.is_empty() {
         return (vec![], None);
     }
-    let is_native = hover.panel_name == "source_control";
+    let is_native = panel_hover_link_is_native(&hover.panel_name);
     let popup = panel_hover_to_quadraui_rich_text(hover, theme);
     let max_len = popup
         .line_text
@@ -8936,7 +10979,12 @@ pub fn panel_hover_popup_paint(
     let content_w = ((max_len + 2.0) * unit_w)
         .max(10.0 * unit_w)
         .min((avail_w - 2.0 * unit_w).max(10.0 * unit_w));
-    let anchor_y = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h);
+    // #1087: `None` means the anchor can't be trusted this frame (e.g. the
+    // scroll-underflow guard in `ext_panel_hover_screen_row`) — skip
+    // painting rather than fall back to a stale/garbage position.
+    let Some(anchor_y) = panel_hover_anchor_y(screen, hover, sidebar_top_y, unit_h) else {
+        return (vec![], None);
+    };
     let measure = quadraui::RichTextPopupMeasure::new(content_w, unit_h);
     // `Placement::Below` adds one row height to the anchor, so subtract it
     // here to land the box's top border exactly on `anchor_y` — same trick
@@ -9313,9 +11361,31 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
-/// Build two `StatusBar` rows for the debug sidebar chrome:
-/// row 0 = title ("DEBUG | config_name"), row 1 = action button (Continue/Stop/Start).
-pub fn debug_sidebar_chrome_to_status_bars(
+/// Build the debug sidebar's `SidebarPanelChrome::StatusBars` (quadraui#1061,
+/// issue #1392) — row 0 = title ("DEBUG | config_name"), row 1 = the
+/// Run/Stop/Continue action button. Both backends now paint this chrome
+/// through `SidebarPanelBody::render_with` (`tui_main::panels::
+/// render_debug_sidebar`, `App::paint_sidebar_panel_rung`'s `PANEL_DEBUG`
+/// arm) instead of slicing two rows off `area` by hand and calling
+/// `Backend::draw_status_bar` on each directly — `StatusBars` reserves one
+/// row per bar and paints each through the same rasteriser the old code
+/// called separately for each row, and surfaces its hit regions on
+/// `SidebarPanelBodyLayout::
+/// status_bar_hit_regions` in the same absolute space the caller's `rect`
+/// was in — the caller stores that directly on `Engine::
+/// dap_sidebar_action_hits` (see its doc) rather than re-deriving the
+/// action row's rect as a second, independently-computed value the way
+/// `cached_dap_action_rect` used to (paint and click could disagree).
+pub fn debug_sidebar_chrome(sidebar: &DebugSidebarData, theme: &Theme) -> SidebarPanelChrome {
+    let (title, action) = debug_sidebar_status_bars(sidebar, theme);
+    SidebarPanelChrome::StatusBars(vec![title, action])
+}
+
+/// Build the debug sidebar's title/action-button `StatusBar` pair. Split out
+/// of [`debug_sidebar_chrome`] only because constructing the two bars is
+/// easier to read un-nested from the `Vec` wrapper; not called directly by
+/// either backend any more (see that function's doc).
+fn debug_sidebar_status_bars(
     sidebar: &DebugSidebarData,
     theme: &Theme,
 ) -> (quadraui::StatusBar, quadraui::StatusBar) {
@@ -10229,6 +12299,9 @@ pub struct ScreenLayout {
     pub group_dividers: Vec<GroupDivider>,
     /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
     pub ext_sidebar: Option<ExtSidebarData>,
+    /// Board panel data (#521) — always `Some` so backends can check
+    /// `has_focus`, mirroring [`ExtSidebarData`]'s own doc.
+    pub board: Option<BoardData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
     pub ext_panel: Option<ExtPanelData>,
     /// Breadcrumb bars for each editor group (empty when breadcrumbs are disabled).
@@ -10239,6 +12312,13 @@ pub struct ScreenLayout {
     pub editor_hover: Option<EditorHoverPopupData>,
     /// Git diff peek popup — `Some` when the user is previewing a diff hunk.
     pub diff_peek: Option<DiffPeekPopup>,
+    /// The change-review surface (#955, shared with #525) — `Some` when a
+    /// tool-call `diff` (or a future #525 git-branch diff feed) is open
+    /// for review. Cloned wholesale from `Engine::change_review` rather
+    /// than converted field-by-field like `DiffPeekPopup`: it already
+    /// carries a fully paint-ready `quadraui::DiffView` per entry, so
+    /// there is nothing this projection needs to compute.
+    pub change_review: Option<crate::core::review::ChangeReviewState>,
     // `diff_toolbar` used to sit here — the single-group mirror of
     // `GroupTabBar::diff_toolbar`.
     //
@@ -10423,47 +12503,161 @@ pub fn gtk_minimap_sizing() -> quadraui::MinimapSizing {
 /// i.e. the ~2–6 px band #35 asks for.
 const MINIMAP_LINES_PER_ROW: usize = 4;
 
-/// Buffer columns folded into one aggregated colour cell — quadraui's TUI
-/// braille cell width, used for both backends for the same reason as
-/// [`MINIMAP_LINES_PER_ROW`].
-const MINIMAP_COLS_PER_CELL: usize = 2;
-
-/// Column ceiling for colour aggregation. Syntax past this column does not
-/// influence any painted cell, so aggregating it would be wasted work.
-const MINIMAP_SPAN_COLS: usize = 200;
-
-/// Character-count ceiling for `build_minimap_data`'s `to_col` closure
-/// (#728). `aggregate_spans` never looks past `MINIMAP_SPAN_COLS` cells of
-/// `MINIMAP_COLS_PER_CELL` raw columns each, so a byte offset past that many
-/// characters always maps to a column `aggregate_spans` discards anyway —
-/// scanning further just to report an exact (and irrelevant) larger number
-/// is wasted, unbounded work on a long line. The `+ 1` keeps the boundary
-/// value itself exact rather than off-by-one short.
-const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_SPAN_COLS * MINIMAP_COLS_PER_CELL + 1;
-
-/// Buffer line numbers `build_minimap_data` will actually sample, computed
-/// **before** any line text is fetched (#728).
+/// Ceiling on the compression factor `K` [`build_minimap_data`] applies —
+/// still a safety clamp (#1186's "compressed scale mode"), but since #1211 no
+/// longer the *load-bearing* knob: `K` is derived from the strip's own
+/// geometry (see [`MINIMAP_VIEWPORT_MULTIPLE`]), never from
+/// `total_buffer_lines`, so `K` stays small and constant for every real
+/// caller and only a pathological `rect`/`editor_visible_rows` pairing (a
+/// strip far shorter than the editor's own viewport) could ever push it this
+/// high.
 ///
-/// Mirrors `quadraui::sample_lines`'s own stride formula exactly (never
-/// upscales — keep every line when `total_lines <= target_lines` — otherwise
-/// stride every `total_lines / target_lines` lines), so handing exactly
-/// these `total_lines.min(target_lines)`-many candidates back into
-/// `sample_lines` with `target_rows` set to that same count always takes its
-/// cheap "keep every candidate, in order" path. That lets the caller fetch
-/// only these lines' text from the rope instead of materialising a `String`
-/// for every line in the buffer, while still going through `sample_lines`
-/// for the actual `MinimapLine` construction.
-fn minimap_sample_indices(total_lines: usize, target_lines: usize) -> Vec<usize> {
-    if total_lines == 0 || target_lines == 0 {
-        return Vec::new();
+/// Chosen empirically against [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`]
+/// (8): once a block is wider than the cap,
+/// `quadraui::primitives::minimap::block_sample_indices` already
+/// spreads exactly `cap` samples across it regardless of how much wider it
+/// gets, so growing `K` past the point where blocks already exceed the cap
+/// costs no extra line fetches — only a larger buffer span per block. A
+/// `K_max` far beyond that point (64, i.e. blocks up to 8x the sample cap)
+/// still keeps each block's aggregated row a meaningful, dithered summary of
+/// real content rather than a coin-flip over the whole file.
+///
+/// `pub(crate)` since #1211 so `src/tui_main/shell_app.rs`'s tests can read
+/// the real ceiling instead of hand-copying a `COMPRESSION_CEILING_MIRROR`
+/// constant that could drift out of sync with this one.
+pub(crate) const MINIMAP_MAX_COMPRESSION: usize = 64;
+
+/// How many editor viewports [`build_minimap_data`]'s window covers at its
+/// default, uncompressed scale (`K == 1`) — VS Code's own default minimap
+/// (`editor.minimap.size: "proportional"`, decoded from the shipped bundle
+/// for #1211): a fixed `BASE_CHAR_HEIGHT * scale` row pitch against a
+/// `lineHeight` roughly 9x taller, independent of the file's length. `K` is
+/// then chosen (see the comment at its own definition, below) so the
+/// window's real line count — `target_lines * K` — comes out to
+/// `editor_visible_rows * MINIMAP_VIEWPORT_MULTIPLE`, regardless of how
+/// `target_lines` itself was derived (GTK's ~2px fixed pitch vs the TUI's
+/// braille-native one): on GTK, `target_lines` already comes out to roughly
+/// `9 * editor_visible_rows` (`gtk_row_capacity`, above), so `K` naturally
+/// falls out to `1` — one buffer line per row, #1093's slide re-engaged. On
+/// the TUI, `target_lines` is only `4 * editor_visible_rows`
+/// (`MINIMAP_LINES_PER_ROW`), so `K` comes out to `ceil(9 / 4) == 3` — three
+/// real buffer lines dithered into each braille row — the TUI's rough
+/// approximation of the same ~9-viewport window, bounded and constant
+/// instead of growing without limit as the file gets longer (#1211's root
+/// cause: the pre-fix `K` was `total_buffer_lines.div_ceil(target_lines)`,
+/// which squeezed the *whole file* into the strip for every file shorter
+/// than `MINIMAP_MAX_COMPRESSION * target_lines` — i.e. essentially every
+/// real file — disabling #1093's slide on both backends and regressing GTK,
+/// which was already at exact VS Code parity at `K == 1`, from correct to
+/// "whole file squeezed in").
+const MINIMAP_VIEWPORT_MULTIPLE: usize = 9;
+
+/// Ceiling on how many characters into a line `build_minimap_data`'s
+/// `to_col` closure ever looks when measuring a highlight's own column.
+/// Past this many characters, `aggregate_spans` would discard the column
+/// anyway (see `grid.cols` below), so counting further is wasted, unbounded
+/// work on a long (e.g. minified) line (#728). Renamed from
+/// `MINIMAP_SPAN_COLS` by #1030, which stopped using it to size
+/// `grid.cols` itself (that now comes from the painted strip's own width)
+/// — it survives purely as this scan cap.
+const MINIMAP_MAX_RELEVANT_COLS: usize = 400;
+
+/// The `+ 1` keeps `to_col`'s boundary value itself exact rather than
+/// off-by-one short (#728).
+const MINIMAP_COL_SCAN_LIMIT: usize = MINIMAP_MAX_RELEVANT_COLS + 1;
+
+// #1098: block partitioning, coverage aggregation and dither arithmetic all
+// moved to quadraui#1012 (`quadraui::primitives::minimap::{block_bounds,
+// block_sample_indices, sample_blocks, dither_threshold_met, BAYER4,
+// BLOCK_LINE_SAMPLE_CAP}`) — this file used to carry byte-identical private
+// copies (`minimap_block_bounds`, `MINIMAP_BLOCK_LINE_SAMPLE_CAP`,
+// `minimap_block_sample_indices`, `MINIMAP_BAYER4`,
+// `minimap_block_dither_threshold_met`, `minimap_block_text`), built here by
+// #1085 before the primitive existed to hold them. `build_minimap_data`
+// below now calls the quadraui functions directly; the arithmetic itself
+// (and its unit tests) live in quadraui, not here.
+
+// #1096: how many times `minimap_line_text` has actually fetched a buffer
+// line's text — a deterministic work counter, not a wall-clock ceiling.
+// `pub(crate)` and `#[cfg(test)]`-only (compiled out of any non-test build)
+// so both this file's own tests and the black-box companion in
+// `tui_main::shell_app` (which only has a `TuiDriver`, not this file's
+// private sampling internals, to assert against) can pin "line fetches per
+// frame is bounded by strip geometry, not buffer length" without the flake
+// risk an absolute-time budget has — the old #728 guard's own doc comment
+// records 517-586ms flakes at a ~20% margin under full-suite contention,
+// and a *constant*-factor regression (e.g. 8x more reads at unchanged strip
+// geometry) cancels out of a same-geometry ratio entirely, which is exactly
+// why that guard stayed green through #1096's regression. Use
+// `count_minimap_line_fetches` rather than touching this directly.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MINIMAP_LINE_FETCH_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Reset [`MINIMAP_LINE_FETCH_COUNT`] and return its value after running
+/// `f` — isolates exactly the line fetches `f` itself triggers (one
+/// `build_minimap_data` call, or one driver redraw).
+#[cfg(test)]
+pub(crate) fn count_minimap_line_fetches(f: impl FnOnce()) -> usize {
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.set(0));
+    f();
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.get())
+}
+
+/// Read buffer line `i`'s text, trimming the trailing newline — the exact
+/// line-fetch `build_minimap_data` used inline before #1085 split it out,
+/// and now hands to `quadraui::sample_blocks` as its `line_at` accessor
+/// (#1098) so a block's aggregated row text is built without vimcode ever
+/// materialising the window as a `Vec<String>`.
+///
+/// #1096: the highlight-mapping loop this doc comment used to say shared
+/// this fetch no longer does — see `minimap_line_content_byte_len` below,
+/// which answers the loop's only real question (a byte offset's character
+/// column within one line) directly against the rope, without ever
+/// materialising the line as a `String`. So every call to this function is
+/// now bounded by `sample_blocks`'s own read budget, which reads at most
+/// [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`] lines per
+/// block — `target_lines * BLOCK_LINE_SAMPLE_CAP` `String`s per frame,
+/// never buffer length (the #728 invariant
+/// `minimap_line_fetch_count_tracks_target_lines_not_buffer_size` pins
+/// with [`MINIMAP_LINE_FETCH_COUNT`], incremented here in tests only).
+fn minimap_line_text(rope: &ropey::Rope, i: usize) -> String {
+    #[cfg(test)]
+    MINIMAP_LINE_FETCH_COUNT.with(|c| c.set(c.get() + 1));
+    rope.line(i)
+        .as_str()
+        .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+        .unwrap_or_else(|| {
+            rope.line(i)
+                .to_string()
+                .trim_end_matches(['\n', '\r'])
+                .to_string()
+        })
+}
+
+/// Byte length of a buffer line's content, excluding any trailing line
+/// terminator (`\n`, `\r\n`, or `\r`) — the same trim `minimap_line_text`
+/// applies, but read directly off the caller's own `RopeSlice` (a single
+/// line, already fetched) so it costs no allocation and no further
+/// whole-rope traversal. Used by `build_minimap_data`'s highlight loop
+/// (#1096) to clamp a highlight span's byte offset to the real line it was
+/// measured against, the same clamp `to_col` used to get for free from
+/// `line_str.len()` before that loop fetched a `String` per line.
+fn minimap_line_content_byte_len(slice: ropey::RopeSlice) -> usize {
+    let mut n = slice.len_chars();
+    let mut len = slice.len_bytes();
+    while n > 0 {
+        let ch = slice.char(n - 1);
+        if ch == '\n' || ch == '\r' {
+            len -= ch.len_utf8();
+            n -= 1;
+        } else {
+            break;
+        }
     }
-    if total_lines <= target_lines {
-        return (0..total_lines).collect();
-    }
-    let stride = total_lines as f64 / target_lines as f64;
-    (0..target_lines)
-        .map(|r| ((r as f64 * stride) as usize).min(total_lines - 1))
-        .collect()
+    len
 }
 
 /// The active window's minimap: a quadraui `Minimap` primitive plus the strip
@@ -10475,8 +12669,46 @@ pub struct RenderedMinimap {
     pub window_id: WindowId,
     /// The strip, in the caller's units (pixels for GTK, cells for TUI).
     pub rect: WindowRect,
-    /// The quadraui descriptor. Already sampled and colour-aggregated.
+    /// The quadraui descriptor. Already sampled — `lines` is final, but
+    /// `syntax_spans` starts **empty**. Colour aggregation can't happen
+    /// here: it needs `cols_per_cell`, and that scale is no longer a host
+    /// constant since quadraui#1032 made TUI's default resolve adaptively
+    /// from the buffer's own width (GTK's stays a fixed `1`). Only the
+    /// backend that is about to paint knows which one it'll use — asking
+    /// via `Backend::minimap_layout` requires a live backend, which this
+    /// struct (built at screen-layout time, before any backend-specific
+    /// call) does not have. `draw_minimap_strip` (`src/render.rs`) does
+    /// have one, reads `cols_per_cell` back from it, aggregates
+    /// `raw_syntax_spans` with a matching [`quadraui::MinimapGrid`], and
+    /// fills this field in immediately before painting — see that
+    /// function's doc comment (#1175).
     pub minimap: quadraui::Minimap,
+    /// Syntax highlight spans in raw, un-aggregated form (real character
+    /// columns, not cells) — [`draw_minimap_strip`] folds these into
+    /// `minimap.syntax_spans` once it knows the real `cols_per_cell` to
+    /// aggregate them at (#1175). Kept separate from `minimap` itself
+    /// (rather than one `RenderedMinimap::raw_spans` living beside an
+    /// eagerly-aggregated `syntax_spans`) so there is exactly one place
+    /// aggregation ever happens, not two that could silently drift.
+    pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
+    /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
+    /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
+    /// and [`minimap_press`] instead of each re-deriving its own
+    /// `layout_with_sizing` call. Mirrors [`BreadcrumbBar::draw_layout`]'s
+    /// same paint-then-read-back shape: `RefCell` because `draw_minimap_strip`
+    /// only ever sees `&ScreenLayout` (this `RenderedMinimap` is already
+    /// behind the shared `cached_screen_layout` `RefCell` by the time
+    /// painting runs) and still needs to fill this field in after paint.
+    ///
+    /// `None` until the first paint of a given frame's `ScreenLayout`, and
+    /// permanently `None` for any `ScreenLayout` a caller builds without ever
+    /// calling `draw_minimap_strip` — most of this module's own unit tests,
+    /// which click-test geometry directly off `build_screen_layout`'s output.
+    /// Both click resolvers fall back to re-deriving via `layout_with_sizing`
+    /// in that case (this field's pre-#1253 behaviour verbatim), so a missing
+    /// paint can only ever cost the recompute this issue exists to skip —
+    /// never a dropped or misrouted click.
+    pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
@@ -10517,20 +12749,70 @@ pub fn minimap_reserved_width(
     quadraui::reserved_width(want as f32, has) as f64
 }
 
+/// Width of the scroll-affordance gutter a pane's rightmost edge must keep
+/// clear of the minimap strip (#1094), in the caller's own unit.
+///
+/// `scrollbar_reserve` (0.0 for TUI) states only GTK's overlay-chrome
+/// concept (`quadraui::Backend::scrollbar_reserve()`, #828/quadraui#776) —
+/// it says nothing about TUI's own vertical scrollbar, which is an inline
+/// column `quadraui::tui::editor::draw_editor` always paints at its own
+/// `area.right - 1` whenever the window overflows (`quadraui`'s `Editor`
+/// primitive, not a value this crate controls — see the doc comment on the
+/// `Surface::Editor` push in `app.rs`). That column is exactly one
+/// `char_width` wide. Taking the larger of the two generalises to both
+/// backends without branching on which one is asking: on TUI
+/// (`scrollbar_reserve == 0.0`, `char_width == 1.0`) this resolves to
+/// exactly one cell; on GTK it resolves to `scrollbar_reserve` whenever
+/// that's already the wider of the two, which is the ordinary case (a GTK
+/// `char_width` in pixels and its 8px overlay reserve are the same order of
+/// magnitude).
+///
+/// `pub(crate)` (not private) since #1094's GTK driver tests
+/// (`gtk::testing::minimap`) need the same formula to predict the real
+/// paint path's column count, not just this module's own tests.
+///
+/// #1094 review: on GTK the `.max` does *not* reliably resolve to
+/// `scrollbar_reserve` — `gtk::testing`'s own
+/// `cols_without_reserve`/`cols_with_reserve` fixture asserts real editor
+/// char widths already exceed the 8px overlay reserve
+/// (`cw_probe > SCROLLBAR_RESERVE_PX`), so `char_width` is the *ordinary*
+/// winner on GTK, not a rare very-large-font edge case. That's still
+/// correct here — reserving a full extra text column's worth of gutter
+/// alongside the strip is a superset of the ~8px the real scrollbar
+/// overlay needs, never a shortfall — but it does mean the strip can end
+/// up a little narrower than `minimap_reserved_width` alone would afford
+/// whenever `char_width > scrollbar_reserve`, everyday on GTK rather than
+/// only at unusually large font sizes. Left as a comment rather than a
+/// `debug_assert!`: there is no threshold here that's actually wrong to
+/// cross, only a width trade-off worth knowing about.
+pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f64 {
+    scrollbar_reserve.max(char_width)
+}
+
 /// Build the quadraui `Minimap` for `window_id` over the strip `rect`.
 ///
 /// Returns `None` when the setting is off (the caller passes a zero-width
 /// strip in that case), when the strip cannot hold a single row, or when the
-/// window/buffer has gone away. All sampling (`sample_lines`) and colour
+/// window/buffer has gone away. All sampling (`sample_blocks`) and colour
 /// reduction (`aggregate_spans`) is quadraui's — this function only maps
 /// vimcode's tree-sitter byte-offset highlights into quadraui's
 /// `SyntaxSpan` input type.
+///
+/// `editor_visible_rows` is the *editor pane's* own visible row count —
+/// deliberately a separate parameter from `rect`/`line_height` (which size
+/// the minimap *strip*, and drive `target_lines`, the sampling budget)
+/// since #1085: the two only coincide because the strip is as tall as the
+/// editor pane today. Passing the editor's own count rather than
+/// re-deriving it from the strip's height keeps the viewport highlight
+/// band correct even if a future layout ever makes the strip shorter than
+/// the editor.
 pub fn build_minimap_data(
     engine: &Engine,
     theme: &Theme,
     window_id: WindowId,
     rect: WindowRect,
     line_height: f64,
+    editor_visible_rows: usize,
 ) -> Option<RenderedMinimap> {
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return None;
@@ -10540,7 +12822,46 @@ pub fn build_minimap_data(
     if display_rows == 0 {
         return None;
     }
-    let target_lines = display_rows.saturating_mul(MINIMAP_LINES_PER_ROW).max(1);
+    // #1052: GTK's minimap rasteriser paints each sampled line at a
+    // **fixed** `ROW_PITCH_PX` (2px) row pitch, completely decoupled from
+    // the editor's own `line_height` (`quadraui::gtk::minimap`'s module
+    // doc: "Rows tile at a fixed ROW_PITCH_PX ... independent of the
+    // file's length"). `display_rows` above assumes the opposite — that
+    // one minimap display row costs one `line_height` — which is correct
+    // for TUI (whose braille row genuinely is cell-native, `lh == 1.0`)
+    // but drastically under-samples for GTK: at a typical ~20px
+    // `line_height`, GTK can actually paint ~10x more 2px rows in the same
+    // strip height than `display_rows * MINIMAP_LINES_PER_ROW` ever
+    // samples. Once those too-few samples run out, GTK's rasteriser (which
+    // paints sampled rows top-aligned, not stretched to fill the strip —
+    // see `Minimap::layout_with_sizing`'s `FixedPitch` arm) simply stops,
+    // leaving the rest of the strip flat/background — a *vertical* colour
+    // falloff by buffer line, reproduced and measured in
+    // `gtk::testing::minimap::minimap_paints_syntax_colour_near_the_bottom_of_a_long_file_via_gtk_driver`
+    // (distinct colours per decile of strip height dropped from ~9 to 1
+    // right where this under-sampling predicted, on an unfixed `develop`).
+    //
+    // This mirrors `visible_span_cols`'s column-axis fix immediately below
+    // (#1030): take the max of both backends' real row requirements rather
+    // than branching on backend identity (Platform-Neutrality Rule — this
+    // stays shared code). `rect.height` is in the caller's own native unit
+    // (pixels for GTK, cell rows for TUI), exactly like `rect.width` was
+    // for columns, so GTK's real requirement —
+    // `rect.height / ROW_PITCH_PX`, at GTK's own 1-buffer-line-per-row
+    // granularity — is only dimensionally meaningful when `rect.height` is
+    // pixels. It is still safe to fold into the max unconditionally on the
+    // TUI side too: TUI's own requirement is `rect.height *
+    // MINIMAP_LINES_PER_ROW` there (`lh` is always `1.0` for TUI), which
+    // exceeds `rect.height / ROW_PITCH_PX` for any positive `rect.height`
+    // since `MINIMAP_LINES_PER_ROW` (4) is larger than `1.0 /
+    // ROW_PITCH_PX` (0.5) — so this candidate can only ever win on GTK's
+    // own numbers, never accidentally overriding TUI's.
+    let gtk_row_capacity =
+        (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+    let target_lines = display_rows
+        .saturating_mul(MINIMAP_LINES_PER_ROW)
+        .max(gtk_row_capacity)
+        .max(1);
 
     let window = engine.windows.get(&window_id)?;
     let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
@@ -10550,125 +12871,283 @@ pub fn build_minimap_data(
         return None;
     }
 
-    // #728: pick *which* buffer lines to sample before fetching any line
-    // text — mirrors `quadraui::sample_lines`'s own stride formula (never
-    // upscales; otherwise strides every `total / target` lines) so only the
-    // ~`target_lines` candidates that will actually survive get fetched
-    // from the rope, instead of materialising a `String` for every line in
-    // the buffer on every frame (the fix this pins in
-    // `minimap_scroll_does_not_scale_with_buffer_size`). `sample_lines` is
-    // still the function that turns text into `MinimapLine`s below — this
-    // only decides which lines are worth reading in the first place.
-    let sample_indices = minimap_sample_indices(total_buffer_lines, target_lines);
-    if sample_indices.is_empty() {
+    // #1093: the strip holds a *fixed vertical scale* — one `lines` entry
+    // is always worth exactly one buffer line — instead of the whole
+    // buffer being squeezed end-to-end into the strip on every frame. The
+    // old squeeze pinned the file's last line to the strip's bottom row at
+    // *every* scroll position (so a bottom-of-strip click always jumped to
+    // EOF); VS Code's `minimap.size: proportional` this issue asks for
+    // instead shows a `target_lines`-line *window* onto the buffer that
+    // slides as the editor scrolls, so both ends of the file are reachable
+    // and a bottom click pages roughly one strip's worth of file.
+    //
+    // #1186: that fixed one-line-per-block window is #1093's *uncompressed*
+    // (`K == 1`) case. `k` below grows the window to `k * target_lines`
+    // lines — still capped, still O(target_lines) blocks — so
+    // `quadraui::primitives::minimap::block_bounds` (just below) takes its
+    // striding branch instead of its "never upscales" one and each block
+    // becomes `k` real buffer lines wide, aggregated by the exact same
+    // `quadraui::sample_blocks` path #1098 lifted from #1085's own
+    // `minimap_block_text`.
+    //
+    // #1211: `k` is a function of the strip's own geometry
+    // (`editor_visible_rows`, `target_lines`) — **never** of
+    // `total_buffer_lines`. The pre-#1211 `k` here was
+    // `total_buffer_lines.div_ceil(target_lines)`, chosen to fit the *whole
+    // buffer* into one window — which squeezed the entire file into the
+    // strip for every file shorter than `MINIMAP_MAX_COMPRESSION *
+    // target_lines` (essentially every real file), pinning `max_start` to
+    // `0` below and permanently disabling #1093's slide. See
+    // `MINIMAP_VIEWPORT_MULTIPLE`'s own doc comment for why this
+    // `desired_window_lines` formula reproduces VS Code's default
+    // (`minimap.size: "proportional"`) fixed-scale behaviour on GTK
+    // (`k == 1`) while still giving the TUI's coarser `target_lines` a small,
+    // constant compression factor (`k == 3`) instead of one that grows
+    // without bound as the file gets longer.
+    let desired_window_lines = editor_visible_rows
+        .max(1)
+        .saturating_mul(MINIMAP_VIEWPORT_MULTIPLE);
+    let k = desired_window_lines
+        .div_ceil(target_lines.max(1))
+        .clamp(1, MINIMAP_MAX_COMPRESSION);
+    // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
+    // above) stays host-side — it depends on this strip's own geometry
+    // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
+    // know — but where the window *starts* is now quadraui's own decision,
+    // via `window_start_line`. Before #1044 that primitive didn't exist, so
+    // this function pre-sliced the buffer down to a `window_len`-sized
+    // range by hand and handed quadraui only the already-sliced result;
+    // quadraui's own post-sample slide (`Minimap::layout_with_sizing`'s
+    // `FixedPitch` arm, `slide_window_start_row`) never saw more `lines`
+    // than the strip could already hold, so it always took its "already
+    // fits" branch and returned `0` — permanently defeated, as that
+    // function's own doc comment used to note. `window_start_line` is the
+    // pre-sample counterpart #1044 added specifically to close that gap:
+    // calling it here, instead of re-deriving the same fraction-of-buffer
+    // arithmetic host-side, makes the slide live rather than defeated,
+    // while still costing O(window_len) per frame, not O(file) (the
+    // #728/#1085 regression this function exists to avoid — `window_len`
+    // is still capped below `total_buffer_lines` before this call runs).
+    let window_len = target_lines.saturating_mul(k).min(total_buffer_lines);
+    // `total_at_position` is `max_scroll_top + 1`, the number of distinct
+    // scroll positions the editor itself can reach — not `total_buffer_lines`
+    // — so the slide is anchored to the editor's own scroll *ceiling*
+    // (`total_buffer_lines - editor_visible_rows`, the same arithmetic
+    // `View::ensure_cursor_visible` clamps `scroll_top` against) exactly the
+    // way #1093/#1211 always have: the window reaches its own bottom exactly
+    // when the editor viewport reaches the real bottom of the file, not some
+    // fraction short of it (which a `scroll_top / total_buffer_lines`
+    // fraction would leave — the editor's own `scroll_top` never reaches
+    // `total_buffer_lines - 1` except in a one-row viewport).
+    // `window_start_line`'s own `total_at_position <= 1` branch returns `0`
+    // here exactly when `max_scroll_top == 0`, so a one-screen file still
+    // stays top-aligned with no slide, byte-for-byte the pre-#1093
+    // behaviour.
+    let max_scroll_top = total_buffer_lines.saturating_sub(editor_visible_rows.max(1));
+    let scroll_top_for_window = window.view.scroll_top.min(max_scroll_top);
+    let window_start_line = quadraui::window_start_line(
+        total_buffer_lines,
+        window_len,
+        scroll_top_for_window,
+        max_scroll_top + 1,
+    );
+    // Downstream code (the viewport-highlight band `build_minimap_data`
+    // paints further below, and every consumer of `Minimap::visible_row_start`)
+    // relies on `scroll_top` always landing inside
+    // `[window_start_line, window_start_line + window_len)` once the window
+    // has slid. That holds here only because `target_lines` (hence
+    // `window_len`) is derived from `display_rows`/`gtk_row_capacity` —
+    // both sized off the same pane height `editor_visible_rows` comes from
+    // at the one production call site — so the window is always at least as
+    // tall as the editor's own viewport. It is **not** a general contract of
+    // this function: a future caller that decouples the strip's height from
+    // the editor's own visible-row count (passing a `rect`/`line_height`
+    // pair that yields a `target_lines` smaller than `editor_visible_rows`)
+    // could shrink the window below the viewport and violate it. Several of
+    // the unit tests below call `build_minimap_data` directly with
+    // deliberately mismatched `rect`/`editor_visible_rows` pairs to probe
+    // the windowing math in isolation — keep that mismatch out of the one
+    // real call site.
+
+    // #1085/#1098: partition the *window* into `target_lines`-many blocks
+    // *before* fetching any line text (same #728 discipline the old
+    // point-sampler followed — decide what's worth reading before reading
+    // it), then aggregate each block's lines (capped, see
+    // [`quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP`]) into one
+    // representative row instead of keeping one line and discarding the
+    // rest of the block outright. The block-partitioning and text/dither
+    // aggregation arithmetic itself now lives in quadraui
+    // (quadraui#1012); this loop only maps vimcode's own tree-sitter
+    // highlights onto the same block indices quadraui's own
+    // `sample_blocks` call (below) will read.
+    //
+    // #1096: build the syntax-span mapping in the same bounded pass over
+    // sampled lines (`block_sample_indices`, at most
+    // `BLOCK_LINE_SAMPLE_CAP` per block), instead of a second, separate
+    // pass over the *entire* `buffer_state.highlights` vec — `highlights`
+    // spans the whole buffer (`update_syntax` always parses in full; the
+    // viewport-scoped `refresh_syntax_visible` has no callers), so a full
+    // scan of it is itself O(buffer) even when every non-matching entry is
+    // skipped in O(1) (confirmed by hand: an O(1)-per-skip `sampled_at:
+    // HashMap<line, block>` early-out, checked once per entry via
+    // `rope.byte_to_line(*start)`, still left the ratio guard failing —
+    // `buffer_state.highlights.len()` itself grows with the buffer, so
+    // *touching* every entry once already costs more the bigger the file
+    // is, allocation or not).
+    //
+    // `buffer_state.highlights` is sorted by start byte
+    // (`update_syntax_with_limit` sorts it), so for each sampled line this
+    // binary-searches straight to the handful of spans that start on it —
+    // O(log highlights.len()) to find them, not O(highlights.len()) to
+    // filter them. The same sorted-highlights-plus-`partition_point` idiom
+    // already narrows highlights to the viewport a few thousand lines up in
+    // this file; this is that same trick applied per sampled line instead
+    // of to one contiguous window, since the minimap's sampled lines are
+    // scattered across the whole buffer rather than contiguous.
+    // `bounds` is *window*-relative (`0..window_len`), matching
+    // `block_sample_indices`'s own contract — remapped to real buffer line
+    // numbers below (`+ window_start_line`), both when reading from `rope`
+    // and when stamping `MinimapLine::line_idx`. At `K == 1` (`window_len
+    // <= target_lines`) this takes the "never upscales" branch and every
+    // block is exactly one line wide, same as pre-#1186; at `K > 1`
+    // (#1186's compressed mode, `window_len == target_lines * k`) it takes
+    // the striding branch instead and each block becomes `k` real buffer
+    // lines wide — the exact multi-line aggregation `sample_blocks` was
+    // already built for by #1085/#1012, now actually exercised by the one
+    // production call site instead of only by tests that pass a
+    // `total_lines` bigger than `target_lines` directly.
+    let bounds = quadraui::primitives::minimap::block_bounds(window_len, target_lines);
+    if bounds.len() < 2 {
         return None;
     }
-    let owned: Vec<String> = sample_indices
-        .iter()
-        .map(|&i| {
-            rope.line(i)
-                .as_str()
-                .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
-                .unwrap_or_else(|| {
-                    rope.line(i)
-                        .to_string()
-                        .trim_end_matches(['\n', '\r'])
-                        .to_string()
-                })
-        })
+    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
+    for r in 0..bounds.len() - 1 {
+        let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
+            bounds[r],
+            bounds[r + 1],
+            quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP,
+        )
+        .into_iter()
+        .map(|i| i + window_start_line)
         .collect();
-    let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
-    // `sample_indices.len()` candidates against a `target_rows` of exactly
-    // that count always takes `sample_lines`'s "never upscales, keep every
-    // candidate" branch, so `line_idx` below is just each candidate's
-    // position in `borrowed`/`owned` — remapped to the real buffer line
-    // number via `sample_indices` right after, since `sample_lines` only
-    // knows positions within the slice it was given, not buffer line
-    // numbers.
-    let mut lines = quadraui::sample_lines(&borrowed, borrowed.len());
-    for (line, &real_idx) in lines.iter_mut().zip(sample_indices.iter()) {
-        line.line_idx = real_idx;
+        for &i in &indices {
+            let line_start = rope.line_to_byte(i);
+            let line_end = if i + 1 < total_buffer_lines {
+                rope.line_to_byte(i + 1)
+            } else {
+                rope.len_bytes()
+            };
+            let lo = buffer_state
+                .highlights
+                .partition_point(|h| h.0 < line_start);
+            let hi = buffer_state.highlights.partition_point(|h| h.0 < line_end);
+            if lo >= hi {
+                continue;
+            }
+            let slice = rope.line(i);
+            // Clamp to this line's own content, excluding its terminator —
+            // a highlight's byte offsets are only meaningful against the
+            // line they actually came from, and a span that runs past it
+            // (or into the next line) must not paint columns as if they
+            // belonged here.
+            let content_byte_len = minimap_line_content_byte_len(slice);
+            // quadraui's rasterisers treat span columns as *character*
+            // columns (GTK converts them back to byte offsets for Pango
+            // attributes), so convert here rather than handing over raw
+            // byte deltas — locally, against this one line's own
+            // `RopeSlice`, which costs only O(log line_length) and does not
+            // grow with the buffer the way a whole-rope `byte_to_char`
+            // would (measured across #1096's fix iterations: an earlier
+            // version that binary-searched to the right lines but still
+            // converted columns via `rope.byte_to_char` on the whole rope
+            // left the large side of the ratio guard over 600ms/frame).
+            // Capped at `MINIMAP_COL_SCAN_LIMIT` chars: columns past
+            // `MINIMAP_MAX_RELEVANT_COLS` never affect `aggregate_spans`'s
+            // output (it drops any cell at/past `grid.cols`), so counting
+            // further into a long — e.g. minified — line is wasted (#728).
+            let to_col = |b: usize| -> usize {
+                let b = b.min(content_byte_len);
+                slice.byte_to_char(b).min(MINIMAP_COL_SCAN_LIMIT)
+            };
+            for (start, end, scope) in &buffer_state.highlights[lo..hi] {
+                if end <= start {
+                    continue;
+                }
+                let start_col = to_col(start.saturating_sub(line_start));
+                let end_col = to_col(end.saturating_sub(line_start));
+                if end_col <= start_col {
+                    continue;
+                }
+                let c = theme.scope_color(scope);
+                raw_spans.push(quadraui::SyntaxSpan {
+                    line_idx: r,
+                    start_col,
+                    end_col,
+                    color: quadraui::Color::rgb(c.r, c.g, c.b),
+                });
+            }
+        }
     }
+    // #1098: `sample_blocks` takes a **line accessor**, not a materialised
+    // slice — it calls `line_at` only for the (at most
+    // `BLOCK_LINE_SAMPLE_CAP`-per-block) lines its own read budget says it
+    // needs, so this never allocates a `String` for the whole window up
+    // front the way the pre-#1098 `owned: Vec<String>` /
+    // `borrowed: Vec<&str>` pair did — that whole-window materialisation
+    // was #1096's own root cause. `total_lines: window_len` against
+    // `target_rows: target_lines` recomputes the exact same `bounds` this
+    // function already derived above (pure arithmetic, no rope access), so
+    // `line_at` only ever gets called for the same window-relative indices
+    // `block_sample_indices` picked for the highlight loop, shifted by
+    // `window_start_line` here rather than there since `sample_blocks`
+    // itself is window-relative.
+    let mut lines = quadraui::sample_blocks(window_len, target_lines, |i| {
+        minimap_line_text(rope, i + window_start_line)
+    });
     if lines.is_empty() {
         return None;
     }
-
-    // Map tree-sitter highlights (whole-buffer byte offsets) onto the sampled
-    // rows. `SyntaxSpan::line_idx` is an index into `lines`, not a buffer line
-    // number, so build a buffer-line → sampled-index lookup first.
-    let mut sampled_at: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::with_capacity(lines.len());
-    for (i, l) in lines.iter().enumerate() {
-        sampled_at.entry(l.line_idx).or_insert(i);
+    // `sample_blocks` stamps each `MinimapLine::line_idx` with its own
+    // block's *window*-relative start line (`bounds[r]`, the same `bounds`
+    // this function computed above) — shift to a real buffer line number.
+    for line in lines.iter_mut() {
+        line.line_idx += window_start_line;
     }
-    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
-    for (start, end, scope) in &buffer_state.highlights {
-        if end <= start || *start >= rope.len_bytes() {
-            continue;
-        }
-        let buf_line = rope.byte_to_line(*start);
-        let Some(&idx) = sampled_at.get(&buf_line) else {
-            continue;
-        };
-        let line_start = rope.line_to_byte(buf_line);
-        // `owned`/`borrowed`/`lines` are all indexed by *sampled* position
-        // (`idx`), not by real buffer line number (`buf_line`) — `owned` no
-        // longer has one entry per buffer line since #728 stopped
-        // materialising the whole buffer, so `sampled_at`'s value (the
-        // sampled index) is what indexes it now.
-        let line_str = &owned[idx];
-        // quadraui's rasterisers treat span columns as *character* columns
-        // (GTK converts them back to byte offsets for Pango attributes), so
-        // convert here rather than handing over raw byte deltas. Capped at
-        // `MINIMAP_COL_SCAN_LIMIT` chars: columns past
-        // `MINIMAP_SPAN_COLS` * `MINIMAP_COLS_PER_CELL` never affect
-        // `aggregate_spans`'s output (it drops any cell at/past
-        // `grid.cols`), so counting further into a long — e.g. minified —
-        // line is wasted, and unbounded: a span's byte offset can land
-        // arbitrarily far into it. Without the cap this was an O(line
-        // length) rescan run up to twice per highlight span on that line
-        // (#728).
-        let to_col = |b: usize| -> usize {
-            let b = b.min(line_str.len());
-            line_str
-                .char_indices()
-                .take(MINIMAP_COL_SCAN_LIMIT)
-                .take_while(|&(byte_idx, _)| byte_idx < b)
-                .count()
-        };
-        let start_col = to_col(start.saturating_sub(line_start));
-        let end_col = to_col(end.saturating_sub(line_start));
-        if end_col <= start_col {
-            continue;
-        }
-        let c = theme.scope_color(scope);
-        raw_spans.push(quadraui::SyntaxSpan {
-            line_idx: idx,
-            start_col,
-            end_col,
-            color: quadraui::Color::rgb(c.r, c.g, c.b),
-        });
-    }
+    // #1175 (quadraui#1032): colour aggregation used to happen right here,
+    // against a `MinimapGrid` built from a hardcoded `MINIMAP_COLS_PER_CELL`.
+    // That stopped being safe the moment quadraui#1032 made TUI's default
+    // `cols_per_cell` adaptive to the buffer's own widest sampled line
+    // (GTK's stays a fixed `1`) — this function has no backend to ask, so
+    // it cannot know which scale will actually be painted. Aggregation is
+    // deferred to `draw_minimap_strip`, which *does* have a live
+    // `&dyn quadraui::Backend` and reads `cols_per_cell` back from
+    // `Backend::minimap_layout` immediately before painting (see that
+    // function's doc comment). `raw_spans` survives to that point
+    // unaggregated, in real (not cell) character columns.
+    let raw_syntax_spans = raw_spans;
 
-    let grid = quadraui::MinimapGrid {
-        rows: lines.len().div_ceil(MINIMAP_LINES_PER_ROW).max(1),
-        cols: MINIMAP_SPAN_COLS,
-        lines_per_row: MINIMAP_LINES_PER_ROW,
-        cols_per_cell: MINIMAP_COLS_PER_CELL,
-    };
-    let syntax_spans = quadraui::aggregate_spans(&raw_spans, grid);
-
-    // Where the editor's viewport lands inside `lines`.
+    // Where the editor's viewport lands inside `lines`. Uses the editor
+    // pane's own visible row count (`editor_visible_rows`), not
+    // `display_rows` (the minimap *strip's* sampling budget, above) — see
+    // this function's doc comment (#1085).
     let scroll_top = window.view.scroll_top.min(total_buffer_lines);
-    let viewport_end = scroll_top.saturating_add(display_rows.max(1));
+    let viewport_end = scroll_top.saturating_add(editor_visible_rows.max(1));
+    // #1186: each `lines` entry is a block that can now span several real
+    // buffer lines (`K > 1`), so `scroll_top`/`viewport_end` will usually
+    // fall *inside* a block's line range rather than land exactly on a
+    // `line_idx` boundary. The pre-#1186 formula
+    // (`position(|l| l.line_idx >= scroll_top)`) is only correct when every
+    // block is exactly one line wide — otherwise it skips the block that
+    // actually *contains* `scroll_top` and finds the next one instead.
+    // `partition_point` finds the last block whose start is `<= scroll_top`
+    // (i.e. the block `scroll_top` itself falls inside): at `K == 1` a block
+    // with `line_idx == scroll_top` is always present, so the two formulas
+    // agree exactly — this is a strict generalisation, not a behaviour
+    // change, for the uncompressed case.
     let visible_row_start = lines
-        .iter()
-        .position(|l| l.line_idx >= scroll_top)
-        .unwrap_or(lines.len().saturating_sub(1));
-    let visible_row_end = lines
-        .iter()
-        .position(|l| l.line_idx >= viewport_end)
-        .unwrap_or(lines.len());
+        .partition_point(|l| l.line_idx <= scroll_top)
+        .saturating_sub(1);
+    let visible_row_end = lines.partition_point(|l| l.line_idx < viewport_end);
 
     Some(RenderedMinimap {
         window_id,
@@ -10676,23 +13155,58 @@ pub fn build_minimap_data(
         minimap: quadraui::Minimap {
             id: quadraui::WidgetId::new(format!("minimap:{}", window_id.0)),
             lines,
-            syntax_spans,
+            // Filled in by `draw_minimap_strip` once it knows the real,
+            // backend-resolved `cols_per_cell` to aggregate at (#1175).
+            syntax_spans: Vec::new(),
             visible_row_start,
             visible_row_count: visible_row_end.saturating_sub(visible_row_start).max(1),
             total_buffer_lines,
         },
+        raw_syntax_spans,
+        resolved_layout: std::cell::RefCell::new(None),
     })
 }
 
 /// Paint every entry in `screen.minimap` (#722 — one per editor pane, not
-/// just the active one) through the backend's own rasteriser and return the
-/// resolved layouts for click routing, in the same order.
+/// just the active one) through the backend's own rasteriser and stash each
+/// strip's resolved layout on its own `RenderedMinimap::resolved_layout`
+/// (#1253) for [`minimap_click_line`]/[`minimap_press`] to read back at click
+/// time instead of re-deriving via `layout_with_sizing`. No return value:
+/// before #1253 this returned `Vec<quadraui::MinimapLayout>` in `screen.minimap`
+/// order for the caller to zip back up itself, but every call site (both
+/// backends' `render_content`) discarded it rather than doing that — the
+/// per-strip cache is both the fix and a simpler contract, since a caller
+/// can no longer get the pairing wrong.
 ///
 /// This is the *entire* backend-side contract for the minimap: GTK's font
 /// scaling and TUI's braille packing are quadraui's implementations of
 /// `Backend::draw_minimap`, so each backend's wiring is a single call to this
-/// function. Nothing about sampling, scaling, dot packing or colour
-/// aggregation exists on either side of it in vimcode.
+/// function. Nothing about sampling, dot packing or the *mechanics* of
+/// colour aggregation exists on either side of it in vimcode — only the
+/// *timing* of the one `quadraui::aggregate_spans` call does (#1175).
+///
+/// # Colour aggregation happens here, not in `build_minimap_data` (#1175)
+///
+/// quadraui#1032 made TUI's default `cols_per_cell` adapt to the buffer's
+/// own widest sampled line (GTK's stays a fixed `1`) instead of a constant
+/// either backend could hardcode. `build_minimap_data` runs at
+/// screen-layout time, before any backend-specific call, so it cannot know
+/// which scale is about to be painted — it hands `RenderedMinimap` an
+/// un-aggregated `raw_syntax_spans` (real character columns) alongside a
+/// `Minimap` whose `syntax_spans` starts empty. This function *does* have
+/// a live backend, so for each strip it:
+///
+/// 1. Asks `Backend::minimap_layout` for the `cols_per_cell` that backend
+///    will actually paint with — a no-paint call, since `syntax_spans` is
+///    still empty at this point and `minimap_layout` only reads `.lines`
+///    (mirrors `examples/common/minimap_app.rs`'s own read-back pattern
+///    upstream, which is what closed quadraui#1032's own colour/dot
+///    desync risk on quadraui's side of this fix).
+/// 2. Builds a [`quadraui::MinimapGrid`] from that *same* value — so the
+///    grid a cell's colour is aggregated at can never drift from the scale
+///    its dots are painted at, the exact desync #1000's review flagged and
+///    quadraui#1032 reopened by making the scale adaptive.
+/// 3. Aggregates `raw_syntax_spans` into that grid and paints.
 ///
 /// #723: the strip carries its own scroll affordance — `Minimap::layout`
 /// resolves a `viewport_highlight` band that *both* quadraui rasterisers
@@ -10707,19 +13221,74 @@ pub fn build_minimap_data(
 /// native widget is inset past the strip by `native_scrollbar_margin_start`
 /// in `src/gtk/mod.rs`, which reads the strip width from
 /// [`minimap_reserved_width`] — the same call that reserved it here.
-pub fn draw_minimap_strip(
-    backend: &mut dyn quadraui::Backend,
-    screen: &ScreenLayout,
-) -> Vec<quadraui::MinimapLayout> {
-    screen
-        .minimap
-        .iter()
-        .map(|mm| {
-            backend
-                .draw_minimap(minimap_strip_rect(mm), &mm.minimap)
-                .layout
-        })
-        .collect()
+pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
+    for mm in &screen.minimap {
+        let rect = minimap_strip_rect(mm);
+        // No-paint probe: `mm.minimap.syntax_spans` is still empty
+        // here, which is fine — `minimap_layout` (both backends' own
+        // `Backend` impls) only ever reads `.lines` to resolve its
+        // scale.
+        let cols_per_cell = backend
+            .minimap_layout(rect, &mm.minimap)
+            .cols_per_cell
+            .max(1);
+        let grid = quadraui::MinimapGrid {
+            rows: mm
+                .minimap
+                .lines
+                .len()
+                .div_ceil(MINIMAP_LINES_PER_ROW)
+                .max(1),
+            cols: minimap_grid_cols(mm.rect.width, cols_per_cell),
+            lines_per_row: MINIMAP_LINES_PER_ROW,
+            cols_per_cell,
+        };
+        let mut minimap = mm.minimap.clone();
+        minimap.syntax_spans = quadraui::aggregate_spans(&mm.raw_syntax_spans, grid);
+        let layout = backend.draw_minimap(rect, &minimap).layout;
+        *mm.resolved_layout.borrow_mut() = Some(layout);
+    }
+}
+
+/// Raw-column budget (`MinimapGrid::cols`) for a strip `cols_per_cell`
+/// columns wide per cell — see [`draw_minimap_strip`]'s doc comment for
+/// where `cols_per_cell` itself comes from (the backend's own resolved
+/// scale, never a host constant, as of #1175/quadraui#1032).
+///
+/// `rect_width` cannot alone answer "how many raw columns does this strip
+/// paint" for both backends, because it is in the *caller's own unit*
+/// (`RenderedMinimap::rect`'s doc comment: cells for TUI, pixels for GTK)
+/// and the two backends do not turn that unit into painted columns the
+/// same way:
+///
+/// - TUI's braille cell packs `cols_per_cell` raw columns per painted
+///   cell, so `rect_width` cells of TUI strip consult exactly
+///   `rect_width * cols_per_cell` raw columns — `rect_width` really is a
+///   column count here, and the formula is dimensionally exact.
+/// - GTK's rasteriser (`quadraui::gtk::minimap::draw_minimap`) does *not*
+///   scale its per-row paint walk with `rect_width`'s pixel value at all:
+///   every row is capped at a fixed
+///   `quadraui::primitives::minimap::COLUMN_CAPACITY` (120) character
+///   columns regardless of how wide the strip is in pixels (see that
+///   constant's doc comment upstream), and its own `cols_per_cell` is
+///   always `1` (`MinimapLayout`'s `Default`, and what
+///   `Minimap::layout_with_sizing` always sets), so `rect_width * 1` (a
+///   pixel count, at GTK's `MINIMAP_MIN_PX`..`MINIMAP_MAX_PX` range of
+///   48..240) is not dimensionally a column count at all.
+///
+/// Rather than branch on backend identity here (Platform-Neutrality Rule
+/// — this is shared code, not per-backend wiring), take the max of both
+/// backends' real requirements: TUI's exact `rect_width * cols_per_cell`
+/// and GTK's fixed `COLUMN_CAPACITY`. An overestimate only ever costs
+/// unreachable aggregation work; an underestimate silently drops colour
+/// data for columns a backend does paint (#990, and precisely the failure
+/// mode #1175 exists to close for TUI's now-adaptive scale — a fixed
+/// `COLUMN_CAPACITY` floor alone is not always enough once `cols_per_cell`
+/// itself can widen past what a hardcoded floor anticipated).
+fn minimap_grid_cols(rect_width: f64, cols_per_cell: usize) -> usize {
+    let visible_span_cols = ((rect_width.round().max(1.0)) as usize * cols_per_cell)
+        .max(quadraui::primitives::minimap::COLUMN_CAPACITY);
+    visible_span_cols.div_ceil(cols_per_cell).max(1)
 }
 
 /// The strip a `RenderedMinimap` occupies, in quadraui coordinates.
@@ -10730,6 +13299,51 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
         mm.rect.y as f32,
         mm.rect.width as f32,
         mm.rect.height as f32,
+    )
+}
+
+/// The `MinimapLayout` to hit-test `mm` against: [`draw_minimap_strip`]'s
+/// backend-resolved paint-time layout if this frame has already painted this
+/// strip (#1253, `mm.resolved_layout`), else re-derived via
+/// `layout_with_sizing` exactly as every call site here did before #1253.
+///
+/// The fallback exists for callers that build a `ScreenLayout` without ever
+/// calling `draw_minimap_strip` — most of this module's own unit tests,
+/// which click-test geometry directly off `build_screen_layout`'s output —
+/// so a missing paint can only ever cost the recompute this cache exists to
+/// skip, never a dropped or misrouted click.
+///
+/// `FixedPitch(1.0)` is the fallback's sizing rather than
+/// `MinimapSizing::Fill` (used to be #1093's choice) because it is safe for
+/// *both* real rasterisers' own pitches: it never overestimates the strip's
+/// real row pitch, so `rows_that_fit` can only come out larger than reality,
+/// never smaller — and since `mm.minimap.lines` is already host-windowed to
+/// fit the strip's real capacity (`build_minimap_data`), `rows_that_fit >=
+/// lines.len() / lines_per_row` holds regardless, so `layout_with_sizing`
+/// never re-slides on top of the host-side window already computed. This is
+/// also why swapping in the *real* paint-time layout above never disagrees
+/// with the fallback it replaces: TUI's own rasteriser already resolves at
+/// this exact `FixedPitch(1.0)` (`quadraui::tui::minimap::tui_minimap_layout`),
+/// and GTK's real `ROW_PITCH_PX` pitch only ever narrows `rows_shown` below
+/// `row_count`, which the host-side windowing above already keeps from
+/// happening in the first place.
+///
+/// CLAUDE.md's black-box test exemption, invoked explicitly: TUI ships no
+/// new/updated `TuiDriver` test for this change because there is no
+/// TUI-visible behaviour to cover — TUI's resolved paint-time layout and the
+/// pre-#1253 `FixedPitch(1.0)` fallback it now caches are mathematically
+/// identical (previous paragraph), and TUI's `shell_app.rs`/`render_impl.rs`
+/// call sites already discarded `draw_minimap_strip`'s old `Vec` return
+/// value, so no TUI wiring changed either (`scripts/prod_lines.py
+/// src/tui_main` delta: 0). This is an internal refactor on the TUI side.
+fn minimap_layout_for_click(mm: &RenderedMinimap) -> quadraui::MinimapLayout {
+    if let Some(layout) = mm.resolved_layout.borrow().as_ref() {
+        return layout.clone();
+    }
+    mm.minimap.layout_with_sizing(
+        minimap_strip_rect(mm),
+        MINIMAP_LINES_PER_ROW,
+        quadraui::MinimapSizing::FixedPitch(1.0),
     )
 }
 
@@ -10744,35 +13358,39 @@ pub fn minimap_strip_rect(mm: &RenderedMinimap) -> quadraui::Rect {
 /// Needs no backend instance: `MinimapLayout::hit_test` resolves purely from
 /// `bounds`, which is the same strip rect both rasterisers were handed —
 /// `lines_per_row` only shapes the *painted* rows, never the hit fraction. So
-/// "click the vertical middle → ~50% of the file" is one behaviour computed
-/// once, not two implementations that can drift.
+/// "click the vertical middle → ~50% of the *painted window*" is one
+/// behaviour computed once, not two implementations that can drift.
+///
+/// #1093: `sizing` used to be `MinimapSizing::Fill`, which (like every other
+/// sizing variant) never actually changed `hit_test`'s fraction — `hit_test`
+/// only ever reads `layout.bounds`, which is the `bounds` argument handed back
+/// verbatim, never reshaped by the sizing branch. What sizing *does* change is
+/// `layout.visible_lines`, which [`minimap_fraction_to_line`] now consults (the
+/// `start_line_idx` bridge its own doc describes) to resolve the fraction
+/// against the rows actually on screen rather than against
+/// `total_buffer_lines` — so this now has to agree with whichever pitch the
+/// real rasteriser painted with, or the two would resolve different windows.
+/// See [`minimap_layout_for_click`]'s doc comment (#1253) for why the paint-time
+/// layout it prefers and the `FixedPitch(1.0)` fallback it falls back to always
+/// agree here.
 pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(WindowId, usize)> {
     for mm in &screen.minimap {
-        // quadraui#667 deprecated the 2-arg `Minimap::layout` shim in favor
-        // of `layout_with_sizing` with an explicit `MinimapSizing` — `Fill`
-        // here is byte-for-byte the old shim's (and this function's
-        // pre-#667) behaviour, so this is a warning fix, not a behaviour
-        // change.
-        let layout = mm.minimap.layout_with_sizing(
-            minimap_strip_rect(mm),
-            MINIMAP_LINES_PER_ROW,
-            quadraui::MinimapSizing::Fill,
-        );
+        let layout = minimap_layout_for_click(mm);
         if let quadraui::MinimapHit::Seek { fraction } = layout.hit_test(x as f32, y as f32) {
             return Some((
                 mm.window_id,
-                minimap_fraction_to_line(fraction, mm.minimap.total_buffer_lines),
+                minimap_fraction_to_line(fraction, &layout, &mm.minimap),
             ));
         }
     }
     None
 }
 
-/// Apply a minimap click/drag: focus the *hit* pane, scroll it to the
-/// clicked fraction of the file, and carry the cursor with it, so the next
-/// `ensure_cursor_visible` doesn't snap the view straight back. Works
-/// against whichever pane's strip the point landed on (#722), not just the
-/// active window.
+/// Apply a minimap click/drag: focus the *hit* pane, scroll it so the
+/// clicked line sits at the *centre* of the viewport (VS Code parity), and
+/// carry the cursor with it, so the next `ensure_cursor_visible` doesn't snap
+/// the view straight back. Works against whichever pane's strip the point
+/// landed on (#722), not just the active window.
 ///
 /// The focus switch (`focus_group_for_window` + `set_cursor_for_window`,
 /// the same pair `Engine::mouse_click` uses for a plain buffer click) is a
@@ -10783,9 +13401,18 @@ pub fn minimap_click_line(screen: &ScreenLayout, x: f64, y: f64) -> Option<(Wind
 /// read as broken — a click that visibly moves a pane's view but leaves
 /// focus (and keyboard input) somewhere else.
 ///
-/// Returns the window scrolled and the buffer line scrolled to, or `None`
-/// when the point missed every strip (in which case the caller must fall
-/// through to its normal editor click handling).
+/// #1093: centres rather than top-aligns — `set_scroll_top_for_window` used
+/// to be handed `line` directly, which put the clicked line at the very top
+/// of the viewport. Combined with the strip no longer spanning the whole
+/// file, top-aligning a bottom-of-strip click made the viewport's *bottom*
+/// land a further `viewport_lines` past the clicked point, reading as an
+/// overshoot/page-down rather than "scroll to roughly here" — VS Code
+/// centres the viewport on the clicked point instead.
+///
+/// Returns the window scrolled and the buffer line scrolled to (the raw
+/// clicked line — the cursor's own target — not the centred `scroll_top`),
+/// or `None` when the point missed every strip (in which case the caller
+/// must fall through to its normal editor click handling).
 pub fn apply_minimap_click(
     engine: &mut Engine,
     screen: &ScreenLayout,
@@ -10794,22 +13421,268 @@ pub fn apply_minimap_click(
 ) -> Option<(WindowId, usize)> {
     let (window_id, line) = minimap_click_line(screen, x, y)?;
     engine.focus_group_for_window(window_id);
-    engine.set_scroll_top_for_window(window_id, line);
+    let half_viewport = engine
+        .windows
+        .get(&window_id)
+        .map(|w| w.view.viewport_lines / 2)
+        .unwrap_or(0);
+    engine.set_scroll_top_for_window(window_id, line.saturating_sub(half_viewport));
     engine.set_cursor_for_window(window_id, line, 0);
     Some((window_id, line))
 }
 
-/// Buffer line a minimap click at `fraction` of the track should scroll to.
+/// `quadraui::WidgetId` for a minimap strip's own thumb drag (#1187) —
+/// `minimap:<window_id>`, parsed back out by [`apply_scroll_offset`].
+/// Shared by both backends' press rungs so the id can never drift from what
+/// the apply-side table matches on.
+pub fn minimap_drag_widget(window_id: WindowId) -> quadraui::WidgetId {
+    quadraui::WidgetId::new(format!("minimap:{}", window_id.0))
+}
+
+/// Outcome of resolving a **press** (not a continued drag-move) against a
+/// minimap strip (#1187) — mirrors [`EditorScrollbarClick`], but for the
+/// strip's own viewport-highlight band rather than a `quadraui::Scrollbar`
+/// thumb (#723's own scrollbar is deliberately never painted over the band —
+/// see [`draw_minimap_strip`]'s doc comment).
 ///
-/// `fraction` comes from `quadraui::MinimapLayout::hit_test`; both backends
-/// funnel through here so a click at the vertical middle of the strip lands on
-/// the same line in GTK and TUI.
-pub fn minimap_fraction_to_line(fraction: f32, total_buffer_lines: usize) -> usize {
-    if total_buffer_lines == 0 {
+/// Every press that hits the strip at all begins a
+/// `quadraui::DragTarget::ScrollbarY` drag — there is no `PageTo`-style
+/// track-page outcome here, unlike [`resolve_editor_scrollbar_click`] — a
+/// press outside the band must still jump-to-position (#1093 centring),
+/// which the caller performs by calling [`apply_minimap_click`] before
+/// arming the drag whenever [`Self::jump`] is set, so a plain click's
+/// existing behaviour is unchanged: only what happens on the *next* move
+/// differs.
+///
+/// This is the fix for #1187: previously both backends re-ran
+/// `apply_minimap_click` (an absolute seek against the strip's own,
+/// scroll-following painted window) on every drag-move sample, which mostly
+/// cancelled itself out — the window re-slid the same direction the click
+/// just scrolled. Arming a real `DragTarget::ScrollbarY` against
+/// `max_scroll` (the whole file's scroll ceiling, [`Self::max_scroll`]) once
+/// on press, instead of re-seeking every move, makes a whole-strip drag
+/// traverse the whole file exactly like the real vertical scrollbar does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MinimapPress {
+    /// The pane whose strip was hit.
+    pub window_id: WindowId,
+    /// Track top, in the same native units as [`minimap_strip_rect`].
+    pub track_start: f32,
+    /// Track length (the strip's full height).
+    pub track_length: f32,
+    /// The painted viewport-highlight band's own height — the "thumb"
+    /// [`quadraui::DragTarget::ScrollbarY`] drags, whether or not the press
+    /// itself landed inside it.
+    pub thumb_length: f32,
+    /// The whole file's scroll ceiling: `total_buffer_lines -
+    /// viewport_lines`, the same arithmetic `View::ensure_cursor_visible`
+    /// clamps `scroll_top` against — never the strip's own (possibly much
+    /// smaller) painted window.
+    pub max_scroll: usize,
+    /// Offset from the band's own top edge, preserved so continued drag
+    /// moves don't jump the band out from under the cursor. `0.0` when
+    /// [`Self::jump`] is set (the press landed on the track outside the
+    /// band), matching [`resolve_editor_scrollbar_click`]'s track-click
+    /// convention — the band's new top after the jump lands under the
+    /// cursor by construction.
+    pub grab_offset: f32,
+    /// The press landed on the track *outside* the viewport-highlight band:
+    /// the caller must call [`apply_minimap_click`] first (today's #1093
+    /// jump-to-position + cursor move) before arming the drag described by
+    /// the rest of this struct.
+    pub jump: bool,
+}
+
+/// Resolve a press against every pane's minimap strip (#722), returning the
+/// geometry needed to arm a [`quadraui::DragTarget::ScrollbarY`] drag. `None`
+/// when no pane has a minimap or the point misses all of them — mirrors
+/// [`minimap_click_line`]'s "first hit wins" contract (panes never overlap).
+///
+/// Read-only (`&Engine`, not `&mut`): unlike [`apply_minimap_click`], this
+/// never mutates scroll/cursor state itself — see [`MinimapPress::jump`] for
+/// why the caller still might need to call that function too.
+///
+/// `fine` is #1271's Alt-drag fine seek: when set, the geometry armed for the
+/// subsequent `ScrollbarY` drag is remapped from the whole file (`max_scroll`
+/// stays file-wide — #1187's own guarantee, unchanged) onto the strip's
+/// *currently painted window* instead, via a **virtual track** fed to the
+/// same primitive — see [`fine_seek_geometry`] for the derivation. `false`
+/// reproduces the exact pre-#1271 (file-wide, #1187) geometry.
+pub fn minimap_press(
+    engine: &Engine,
+    screen: &ScreenLayout,
+    x: f64,
+    y: f64,
+    fine: bool,
+) -> Option<MinimapPress> {
+    for mm in &screen.minimap {
+        let bounds = minimap_strip_rect(mm);
+        // #1253: same paint-time-layout-first, `FixedPitch(1.0)`-fallback
+        // resolution `minimap_click_line` uses — see
+        // `minimap_layout_for_click`'s doc comment.
+        let layout = minimap_layout_for_click(mm);
+        if matches!(
+            layout.hit_test(x as f32, y as f32),
+            quadraui::MinimapHit::None
+        ) {
+            continue;
+        }
+        let band = layout.viewport_highlight;
+        let py = y as f32;
+        let in_band = band.height > 0.0 && py >= band.y && py < band.y + band.height;
+        let viewport_lines = engine
+            .windows
+            .get(&mm.window_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        let max_scroll = mm.minimap.total_buffer_lines.saturating_sub(viewport_lines);
+        let scroll_top = engine
+            .windows
+            .get(&mm.window_id)
+            .map(|w| w.view.scroll_top)
+            .unwrap_or(0);
+
+        let (track_start, track_length, thumb_length, grab_offset) = fine
+            .then(|| {
+                fine_seek_geometry(
+                    &bounds,
+                    &mm.minimap,
+                    max_scroll,
+                    viewport_lines,
+                    scroll_top,
+                    py,
+                    in_band,
+                )
+            })
+            .flatten()
+            .unwrap_or((
+                bounds.y,
+                bounds.height,
+                band.height,
+                if in_band { py - band.y } else { 0.0 },
+            ));
+
+        return Some(MinimapPress {
+            window_id: mm.window_id,
+            track_start,
+            track_length,
+            thumb_length,
+            max_scroll,
+            grab_offset,
+            jump: !in_band,
+        });
+    }
+    None
+}
+
+/// Derive the **virtual track** #1271's Alt-drag fine seek arms in place of
+/// the real, file-wide one — remapping the same strip pixels onto the
+/// strip's *currently painted window* (`~MINIMAP_LINES_PER_ROW` lines per
+/// cell) instead of the whole file (`~max_scroll / track_length` lines per
+/// cell), while still feeding `quadraui::dispatch_mouse_drag`'s unmodified
+/// `ScrollbarY` arithmetic — no quadraui change needed.
+///
+/// Let `S0`/`Sh` be the real strip's top/height (`bounds`), `M` the file-wide
+/// `max_scroll`, `base` the first buffer line the strip currently paints and
+/// `span` its line extent (both read off `minimap.lines`, matching the
+/// `window_len` convention `minimap_click_at_the_middle_seeks_to_the_middle_
+/// of_the_painted_window` already uses — `lines.last().line_idx + 1 -
+/// lines[0].line_idx`, robust to #1186 multi-line blocks). Then:
+///
+/// ```text
+/// effective_track = Sh * M / span      // dispatch's own track_length - thumb_length
+/// track_start     = S0 - base * Sh / span
+/// thumb_length    = Sh * viewport_lines / span
+/// track_length    = effective_track + thumb_length
+/// ```
+///
+/// Check: at `y = S0`, dispatch's `rel = base/M` → offset `base`; at
+/// `y = S0 + Sh`, `rel = (base+span)/M` → offset `base + span` — the virtual
+/// strip spans exactly the painted window, at `M/span` times the real
+/// strip's resolution.
+///
+/// `grab_offset` is derived by requiring the mapping to be an **identity at
+/// the press point** (dragging zero pixels must reproduce the current
+/// `scroll_top`) rather than by hand-rolling band arithmetic against the
+/// virtual track: `grab_offset = py - track_start - (scroll_top / M) *
+/// effective_track`. This subsumes the non-fine convention (`py - band.y`),
+/// which is the same identity solved against the *real* track/thumb instead.
+///
+/// Returns `None` (falling back to the real, file-wide geometry) when the
+/// window has no line extent (`span == 0`, an empty minimap) or the file
+/// already fits the viewport (`max_scroll == 0`, matching
+/// `dispatch_mouse_drag`'s own `*max_scroll > 0` guard — a zero-`max_scroll`
+/// drag never moves either way, so the geometry choice is moot).
+fn fine_seek_geometry(
+    bounds: &quadraui::Rect,
+    minimap: &quadraui::Minimap,
+    max_scroll: usize,
+    viewport_lines: usize,
+    scroll_top: usize,
+    py: f32,
+    in_band: bool,
+) -> Option<(f32, f32, f32, f32)> {
+    let first = minimap.lines.first()?;
+    let last = minimap.lines.last()?;
+    let base = first.line_idx as f32;
+    let span = (last.line_idx + 1).saturating_sub(first.line_idx) as f32;
+    if span <= 0.0 || max_scroll == 0 {
+        return None;
+    }
+    let m = max_scroll as f32;
+    let s0 = bounds.y;
+    let sh = bounds.height;
+
+    let effective_track = sh * m / span;
+    let track_start = s0 - base * sh / span;
+    let thumb_length = sh * viewport_lines as f32 / span;
+    let track_length = effective_track + thumb_length;
+
+    let grab_offset = if in_band {
+        py - track_start - (scroll_top as f32 / m) * effective_track
+    } else {
+        0.0
+    };
+
+    Some((track_start, track_length, thumb_length, grab_offset))
+}
+
+/// Buffer line a minimap click at `fraction` of the track should scroll to,
+/// resolved against the strip's actual **painted window** — not against
+/// [`quadraui::Minimap::total_buffer_lines`] (#1093). Once the strip holds a
+/// fixed-scale window rather than the whole file, "50% down the track" means
+/// "the row halfway through what's currently painted", which for a file
+/// taller than the strip is a real buffer line far short of 50% of the file.
+///
+/// `layout` must be the same backend/pitch-matched
+/// [`quadraui::MinimapLayout`] `fraction` itself came from (see
+/// [`minimap_click_line`]'s doc comment on why the sizing has to agree with
+/// paint). `layout.visible_lines[row].start_line_idx` bridges a resolved row
+/// back to its position in `minimap.lines`, whose own
+/// [`quadraui::MinimapLine::line_idx`] is the real buffer line
+/// `build_minimap_data` already stamped it with — so this never needs
+/// `total_buffer_lines` at all.
+pub fn minimap_fraction_to_line(
+    fraction: f32,
+    layout: &quadraui::MinimapLayout,
+    minimap: &quadraui::Minimap,
+) -> usize {
+    let last_line_idx = || minimap.lines.last().map(|l| l.line_idx).unwrap_or(0);
+    if minimap.lines.is_empty() {
         return 0;
     }
-    let f = fraction.clamp(0.0, 1.0) as f64;
-    ((f * total_buffer_lines as f64) as usize).min(total_buffer_lines - 1)
+    let row_count = layout.visible_lines.len();
+    if row_count == 0 {
+        return minimap.lines[0].line_idx;
+    }
+    let row = ((fraction.clamp(0.0, 1.0) as f64) * row_count as f64) as usize;
+    let row = row.min(row_count - 1);
+    let start_line_idx = layout.visible_lines[row].start_line_idx;
+    minimap
+        .lines
+        .get(start_line_idx)
+        .map(|l| l.line_idx)
+        .unwrap_or_else(last_line_idx)
 }
 
 /// Context menu data for TUI rendering.
@@ -12447,7 +15320,8 @@ impl Theme {
             "vscode-dark".into(),
             "vscode-light".into(),
         ];
-        // Append custom VSCode themes from ~/.config/vimcode/themes/
+        // Append custom VSCode themes from the platform config dir's themes/
+        // subdirectory (see `core::paths::vimcode_config_dir`).
         if let Some(dir) = Self::themes_dir() {
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -12465,11 +15339,13 @@ impl Theme {
 
     /// The directory where custom VSCode theme JSON files are stored.
     fn themes_dir() -> Option<std::path::PathBuf> {
-        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config/vimcode/themes"))
+        Some(crate::core::paths::vimcode_config_dir().join("themes"))
     }
 
     /// Try to load a VSCode-format `.json` theme file by name.
-    /// Looks in `~/.config/vimcode/themes/<name>.json`.
+    /// Looks in `<vimcode_config_dir>/themes/<name>.json`
+    /// (`~/.config/vimcode/themes/` on Linux/macOS, `%APPDATA%\vimcode\themes\`
+    /// on Windows).
     pub fn load_vscode_theme(name: &str) -> Option<Self> {
         let dir = Self::themes_dir()?;
         let path = dir.join(format!("{name}.json"));
@@ -12936,14 +15812,22 @@ impl Theme {
 ///     window's status into a *separated* bar above the terminal instead,
 ///     freeing that window's own bottom row) but never checking
 ///     `terminal_maximized`.
-///   - GTK's `h_scrollbar_geometry` used `window_status_line &&
-///     !terminal_maximized` (to avoid offsetting the horizontal scrollbar
-///     for a status row that isn't painted while the terminal panel covers
-///     the editor windows entirely), but never checked `separate_status`.
+///   - GTK's old hand-rolled h-scrollbar geometry helper used
+///     `window_status_line && !terminal_maximized` (to avoid offsetting the
+///     horizontal scrollbar for a status row that isn't painted while the
+///     terminal panel covers the editor windows entirely), but never
+///     checked `separate_status`.
 ///
 /// Each covered an axis the other didn't, so either one alone could
-/// disagree with what actually gets painted. Both call sites now go through
-/// this one function instead.
+/// disagree with what actually gets painted.
+///
+/// #1128: GTK's own scrollbar geometry no longer consults this function at
+/// all — `quadraui::Editor::layout` (what paint actually uses, quadraui#968)
+/// lays scrollbars out against the window's raw, unshrunk rect regardless of
+/// a per-window status line, so `app_support::editor_scrollbar_layout`
+/// applying an offset here would just reintroduce a hover/paint disagreement
+/// in the opposite direction. `build_screen_layout_with_breadcrumb_row`
+/// remains this function's one live caller.
 pub fn window_status_row_reserved(engine: &Engine) -> bool {
     // While the terminal panel is maximized, editor windows are not the
     // visible surface at all (`breadcrumb_draw_targets` suppresses every
@@ -12952,11 +15836,65 @@ pub fn window_status_row_reserved(engine: &Engine) -> bool {
     if engine.terminal_maximized {
         return false;
     }
-    let per_window_status = engine.settings.window_status_line;
+    let per_window_status = effective_window_status_line(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
     per_window_status && !separate_status
+}
+
+/// `Settings::window_status_line` narrowed by `'laststatus'` (#1206, `:h
+/// 'laststatus'`) — the value every status-line-visibility read site should
+/// use instead of the raw field.
+///
+/// `'laststatus'` is `0`/`1`/`2`/`3` in real Vim; vimcode's status line is
+/// architecturally per-window (`Settings::window_status_line`), not the
+/// single split-spanning line real Vim's `3` draws, so `3` falls back to
+/// `2`'s behavior here rather than being modeled — see the field doc
+/// comment on [`crate::core::Settings::laststatus`].
+pub fn effective_window_status_line(engine: &Engine) -> bool {
+    match engine.settings.laststatus {
+        0 => false,
+        1 => engine.settings.window_status_line && engine.windows.len() > 1,
+        _ => engine.settings.window_status_line,
+    }
+}
+
+/// Whether `'laststatus'` allows *any* status line — per-window or global —
+/// to be visible at all, independent of `Settings::window_status_line`
+/// (`:h 'laststatus'`).
+///
+/// This is the other half of `'laststatus'`'s policy that
+/// `effective_window_status_line` alone cannot express: that function
+/// answers "should each window paint its own row", so it also returns
+/// `false` for `laststatus=0` and `laststatus=1` with one window — the two
+/// cases where no status line of *any* kind should show. A naive
+/// `!effective_window_status_line(engine)` read of that `false` as "show
+/// the single global bar instead" (the correct reading for
+/// `window_status_line=false` at `laststatus=2`) reintroduces exactly the
+/// row it was supposed to hide (#1235 follow-up: `laststatus=0` painted a
+/// full-width global status bar with the per-window-row-count row freed by
+/// this same fix, because `global_status_bar`'s `if per_window_status {
+/// None } else { Some(..) }` conflated "not per-window" with "show the
+/// global fallback").
+pub fn any_status_line_visible(engine: &Engine) -> bool {
+    match engine.settings.laststatus {
+        0 => false,
+        1 => engine.windows.len() > 1,
+        _ => true,
+    }
+}
+
+/// Whether the bottom band needs a dedicated row for the **global**
+/// (non-per-window) status bar — i.e. no window paints its own status row
+/// (`!effective_window_status_line`) but `'laststatus'` still allows some
+/// status line to show (`any_status_line_visible`). When this is `false`,
+/// the bottom band's status-line footprint is a single row: either each
+/// window carries its own (`effective_window_status_line` true), or
+/// `'laststatus'` hides the status line entirely and only the always-present
+/// command line remains.
+pub fn global_status_bar_visible(engine: &Engine) -> bool {
+    !effective_window_status_line(engine) && any_status_line_visible(engine)
 }
 
 // ─── build_screen_layout ──────────────────────────────────────────────────────
@@ -13040,7 +15978,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
 
     let tab_bar = build_tab_bar(engine);
 
-    let per_window_status = engine.settings.window_status_line;
+    let per_window_status = effective_window_status_line(engine);
     let bottom_panel_open = engine.terminal_open || engine.bottom_panel_open;
     // When status_line_above_terminal is OFF and the terminal is open, extract the
     // active window's status into a separated bar rendered above the terminal.
@@ -13049,7 +15987,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let separate_status =
         per_window_status && !engine.settings.status_line_above_terminal && bottom_panel_open;
     // Single source of truth for "does this window paint its own bottom-row
-    // status line" (#728) — also consulted by GTK's `h_scrollbar_geometry`.
+    // status line" (#728). #1128: GTK's h-scrollbar geometry no longer
+    // consults this — see `window_status_row_reserved`'s doc for why.
     let own_status_row = window_status_row_reserved(engine);
 
     // Window-split dividers (#582) — independent of the `n >= 2` editor-group
@@ -13057,19 +15996,51 @@ pub fn build_screen_layout_with_breadcrumb_row(
     let window_dividers = engine.calculate_window_dividers(window_rects);
 
     // Minimap strip (#35, #722). Reserved off *every* window's right edge —
-    // not just the active one — and subtracted from that same window's rect
-    // before its text is laid out, so each pane reclaims exactly its own
+    // not just the active one — and subtracted from that same window's text
+    // width before it's laid out, so each pane reclaims exactly its own
     // strip's width when `:set nominimap` turns the strip off. Keyed per
     // window (rather than a single scalar) because `minimap_reserved_width`
     // is a function of that window's own rect width, so unevenly split
     // panes legitimately get differently-sized strips.
+    //
+    // #1094: VS Code's order is text, then the strip, then the scroll
+    // column at the pane's outermost edge — but both backends' scrollbars
+    // anchor to *their own painted rect's* right edge (quadraui's TUI
+    // `draw_editor` always reserves one inline column at `area.right - 1`
+    // when the window overflows; a future GTK native scrollbar would do the
+    // same at its own widget's right edge, per the doc comment on the
+    // `Surface::Editor` push in `app.rs`). The only way to make that edge
+    // land past the strip rather than immediately before it is for the rect
+    // this module hands to the paint path (`RenderedWindow.rect`, below) to
+    // reach the pane's *true* right edge — not a copy narrowed by the
+    // strip's width, as it used to be. The strip itself is then positioned
+    // in the gap that opens up between the (now-narrower) text and that
+    // rect's edge — see `scroll_gutter_width` and the strip's own `x` below.
+    //
+    // Narrowing the affordability check the same way the strip's own
+    // position now is: `minimap_reserved_width`'s own budget only checks
+    // against the *pane's* width, with no notion of the scroll gutter now
+    // sitting beyond the strip — a narrow pane could otherwise reserve both
+    // and leave less than `MINIMAP_MIN_TEXT_COLS` for the text between them.
+    // Suppressing the strip (falling back to the width it already returns
+    // for "off") is the same self-suppression behaviour a pane too narrow
+    // to afford the strip alone already has.
     let minimap_widths: std::collections::HashMap<WindowId, f64> = window_rects
         .iter()
         .map(|(id, r)| {
-            (
-                *id,
-                minimap_reserved_width(engine, r.width, char_width, minimap_sizing),
-            )
+            let raw = minimap_reserved_width(engine, r.width, char_width, minimap_sizing);
+            let w = if raw > 0.0 {
+                let cw = if char_width > 0.0 { char_width } else { 1.0 };
+                let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
+                if r.width - raw - gutter < MINIMAP_MIN_TEXT_COLS * cw {
+                    0.0
+                } else {
+                    raw
+                }
+            } else {
+                0.0
+            };
+            (*id, w)
         })
         .collect();
 
@@ -13081,14 +16052,28 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 visible_lines -= 1; // reserve bottom row for per-window status bar
             }
             let is_active = *window_id == active_window_id;
-            let minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
-            let narrowed = WindowRect::new(
-                rect.x,
-                rect.y,
-                (rect.width - minimap_w).max(0.0),
-                rect.height,
-            );
-            let rect = &narrowed;
+            let raw_minimap_w = minimap_widths.get(window_id).copied().unwrap_or(0.0);
+            // `rect` reaches the pane's true right edge unmodified (#1094,
+            // see the doc comment above) — `build_rendered_window` takes a
+            // `minimap_w` to keep the text-column count excluding the strip
+            // without narrowing the rect it's painted into.
+            //
+            // The strip's own `x` (below) sits a full `scroll_gutter_width`
+            // in from that edge, not just `raw_minimap_w` — so when a strip
+            // is actually present, the text has to give up that same extra
+            // sliver too, or its last column and the strip's first column
+            // would coincide (whichever paints later, the strip, would
+            // silently eat the text's own last character on a long enough
+            // line). No-op when there's no strip (`raw_minimap_w == 0.0`,
+            // off or self-suppressed) — nothing to leave room *for* then,
+            // and reserving it anyway would cost the minimap-off case a
+            // column it doesn't owe (acceptance criterion 2).
+            let minimap_w = if raw_minimap_w > 0.0 {
+                raw_minimap_w
+                    + (scroll_gutter_width(scrollbar_reserve, char_width) - scrollbar_reserve)
+            } else {
+                0.0
+            };
             let mut rw = build_rendered_window(
                 engine,
                 theme,
@@ -13100,6 +16085,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
                 multi_window,
                 color_headings,
                 scrollbar_reserve,
+                minimap_w,
             );
             if own_status_row {
                 rw.status_line = Some(build_window_status_line(
@@ -13114,11 +16100,16 @@ pub fn build_screen_layout_with_breadcrumb_row(
         })
         .collect();
 
-    // The strips themselves: the sliver just reclaimed off each window above,
-    // minus the per-window status row when one is painted inside that window.
-    // One `RenderedMinimap` per window that has a strip, in `window_rects`
-    // order — a `:vsplit` therefore carries two independent strips, each
-    // over its own pane's buffer, instead of one that migrates with focus.
+    // The strips themselves, minus the per-window status row when one is
+    // painted inside that window. One `RenderedMinimap` per window that has
+    // a strip, in `window_rects` order — a `:vsplit` therefore carries two
+    // independent strips, each over its own pane's buffer, instead of one
+    // that migrates with focus.
+    //
+    // #1094: positioned one `scroll_gutter_width` in from the pane's right
+    // edge rather than flush against it, so the scroll column painted at
+    // that edge (see the doc comment above `minimap_widths`) lands outside
+    // the strip instead of colliding with its last column.
     let minimap: Vec<RenderedMinimap> = window_rects
         .iter()
         .filter_map(|(id, r)| {
@@ -13131,17 +16122,29 @@ pub fn build_screen_layout_with_breadcrumb_row(
             } else {
                 0.0
             };
+            // The editor pane's own visible row count — the same
+            // computation the `windows` map above runs over the same
+            // `window_rects` entry — handed to `build_minimap_data`
+            // separately from the strip's own `rect`/`line_height` (#1085:
+            // see that function's doc comment for why these must not be
+            // conflated).
+            let mut editor_visible_rows = (r.height / line_height).floor() as usize;
+            if own_status_row && editor_visible_rows > 1 {
+                editor_visible_rows -= 1;
+            }
+            let gutter = scroll_gutter_width(scrollbar_reserve, char_width);
             build_minimap_data(
                 engine,
                 theme,
                 *id,
                 WindowRect::new(
-                    r.x + r.width - minimap_w,
+                    r.x + r.width - gutter - minimap_w,
                     r.y,
                     minimap_w,
                     (r.height - status_h).max(0.0),
                 ),
                 line_height,
+                editor_visible_rows,
             )
         })
         .collect();
@@ -13157,10 +16160,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
         None
     };
 
-    let global_status_bar = if per_window_status {
-        None
-    } else {
+    let global_status_bar = if global_status_bar_visible(engine) {
         Some(build_global_status_bar(engine, theme))
+    } else {
+        None
     };
     let command = build_command_line(engine);
 
@@ -13203,23 +16206,32 @@ pub fn build_screen_layout_with_breadcrumb_row(
         anchor_col: engine.view().cursor.col,
     });
 
-    let quickfix = (engine.quickfix_open && !engine.quickfix_items.is_empty()).then(|| {
-        let items = engine
-            .quickfix_items
-            .iter()
-            .map(|m| {
-                let f = m.file.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let snippet: String = m.line_text.trim().chars().take(80).collect();
-                format!("{}:{}: {}", f, m.line + 1, snippet)
-            })
-            .collect();
-        QuickfixPanel {
-            items,
-            selected_idx: engine.quickfix_selected,
-            total_items: engine.quickfix_items.len(),
-            has_focus: engine.quickfix_has_focus,
-        }
-    });
+    // The global quickfix list takes priority over the active window's
+    // location list when both happen to be open — matching how `:copen`
+    // and `:lopen` share this one bottom "list rung" (#1155;
+    // `QuickfixPanel::title` doc comment has the full rationale).
+    //
+    // #1307: this overlay is superseded for any target that already has a
+    // real `WindowLayout` leaf — that leaf paints through the ordinary
+    // per-window content path (`windows`, below) like any other window, so
+    // painting it *again* here would double it up. `qf_has_real_window` is
+    // `false` for every caller that still drives `open`/`items` directly
+    // without going through `qf_open` (most of this codebase's own
+    // rendering tests, and `qf_set_list`'s implicit `:grep` auto-open), so
+    // this stays exactly as before for them.
+    let quickfix = if engine.qf_has_real_window(None)
+        || engine.qf_has_real_window(Some(engine.active_window_id()))
+    {
+        None
+    } else if engine.quickfix.open && !engine.quickfix.items.is_empty() {
+        Some(quickfix_list_to_panel(&engine.quickfix, "QUICKFIX"))
+    } else {
+        engine
+            .location_lists
+            .get(&engine.active_window_id())
+            .filter(|l| l.open && !l.items.is_empty())
+            .map(|l| quickfix_list_to_panel(l, "LOCATION LIST"))
+    };
 
     let signature_help = engine
         .lsp_signature_help
@@ -13654,6 +16666,7 @@ pub fn build_screen_layout_with_breadcrumb_row(
     });
 
     let ext_sidebar = build_ext_sidebar_data(engine);
+    let board = build_board_data(engine);
 
     // Build breadcrumbs for each editor group
     let breadcrumbs = if engine.settings.breadcrumbs {
@@ -13788,12 +16801,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
         window_dividers,
         minimap,
         ext_sidebar,
+        board,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
         diff_peek: engine.diff_peek.as_ref().map(|dp| DiffPeekPopup {
             anchor_line: dp.anchor_line,
             hunk_lines: dp.hunk_lines.clone(),
         }),
+        change_review: engine.change_review.clone(),
         panel_hover: engine.panel_hover.as_ref().map(|ph| PanelHoverPopupData {
             markdown: ph.markdown.clone(),
             line_text: ph.line_text.clone(),
@@ -14165,6 +17180,31 @@ pub fn sc_header_status_bar(sc: &SourceControlData, theme: &Theme) -> quadraui::
     }
 }
 
+/// The SC panel's focused-hint text, shared so it can't drift between the
+/// row-reservation math in [`sc_sidebar_bands`] and the text actually
+/// painted (#1361).
+pub const SC_HINT_TEXT: &str = " Press '?' for help";
+
+/// Build the SC panel's focused-hint row as a single-segment
+/// `quadraui::StatusBar` (#1361), mirroring [`sc_header_status_bar`]. Both
+/// backends paint this through `draw_status_bar` into the row
+/// [`sc_sidebar_bands`] reserves via `ScSidebarBands::hint`, so the hint
+/// can't appear on one backend and not the other, or land on a different
+/// row than what was hit-tested.
+pub fn sc_hint_status_bar(theme: &Theme) -> quadraui::StatusBar {
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("sc:hint"),
+        left_segments: vec![quadraui::StatusBarSegment {
+            text: SC_HINT_TEXT.to_string(),
+            fg: theme.line_number_fg,
+            bg: theme.status_bg,
+            bold: false,
+            action_id: None,
+        }],
+        right_segments: Vec::new(),
+    }
+}
+
 /// Number of text rows in the SC commit message (at least 1, even when
 /// empty). Shared raw line count — both backends derive their own
 /// border/line-height-aware box height from this (#480).
@@ -14200,8 +17240,14 @@ pub struct ScSidebarBands {
     pub header: quadraui::Rect,
     /// Commit-message input box, including its border.
     pub commit_input: quadraui::Rect,
-    /// Everything below: the toolbar slab and the change sections.
+    /// The toolbar slab and the change sections — everything between the
+    /// commit box and the focused-hint row (or the panel bottom, when
+    /// unfocused).
     pub slab: quadraui::Rect,
+    /// The "Press '?' for help" row (#1361), reserved at the panel's
+    /// bottom only while the panel has keyboard focus — `None` means no
+    /// row was reserved, so `slab` already extends to the panel bottom.
+    pub hint: Option<quadraui::Rect>,
 }
 
 /// Split a git-sidebar content rect into its [`ScSidebarBands`].
@@ -14210,25 +17256,157 @@ pub struct ScSidebarBands {
 /// cells on TUI). `commit_border` is what the `TextInput` primitive's 1-unit
 /// border on top *and* bottom costs in that same unit — 2.0 px on GTK, 2.0
 /// rows on TUI (see [`sc_commit_input_box_height`], which is the row-unit
-/// spelling of the same constant).
+/// spelling of the same constant). `has_focus` reserves one `row_height`
+/// row at the bottom for the focused-hint (#1361) — both the painter and
+/// the click router pass the same `SourceControlData::has_focus` /
+/// `engine.sc_has_focus` value so the reservation can't drift between the
+/// two.
 pub fn sc_sidebar_bands(
     commit_message: &str,
     rect: quadraui::Rect,
     row_height: f32,
     commit_border: f32,
+    has_focus: bool,
 ) -> ScSidebarBands {
     let header_h = row_height;
     let commit_h = sc_commit_input_row_count(commit_message) as f32 * row_height + commit_border;
     let slab_y = rect.y + header_h + commit_h;
+    let hint_h = if has_focus { row_height } else { 0.0 };
+    let slab_h = (rect.y + rect.height - slab_y - hint_h).max(0.0);
+    let hint = if has_focus {
+        Some(quadraui::Rect::new(
+            rect.x,
+            slab_y + slab_h,
+            rect.width,
+            hint_h,
+        ))
+    } else {
+        None
+    };
     ScSidebarBands {
         header: quadraui::Rect::new(rect.x, rect.y, rect.width, header_h),
         commit_input: quadraui::Rect::new(rect.x, rect.y + header_h, rect.width, commit_h),
-        slab: quadraui::Rect::new(
-            rect.x,
-            slab_y,
-            rect.width,
-            (rect.y + rect.height - slab_y).max(0.0),
-        ),
+        slab: quadraui::Rect::new(rect.x, slab_y, rect.width, slab_h),
+        hint,
+    }
+}
+
+/// #1361: `sc_sidebar_bands` is the *only* place the focused-hint row's
+/// reservation is computed — both `App::paint_sidebar_panel_rung`'s
+/// `PANEL_GIT` arm (paint) and `App::route_sc_sidebar_event`/
+/// `tui_main::mouse`'s `SidebarOwner::Git` arm (click routing) call this
+/// exact function with the exact same `has_focus` value the frame was
+/// painted with (`cached_sc_bands`/the per-click `engine.sc_has_focus`
+/// read), so proving this function's own geometry is internally
+/// consistent is what rules out the row-reservation half of "click
+/// hit-testing for the rows below must account for the reserved row" —
+/// the shared derivation can't drift between painter and router when
+/// there is only one derivation for both to call.
+///
+/// A full click-driven sweep across a *painted row* (the more traditional
+/// black-box proof, `crate::harness::sweep_hit_band_integrity`) was tried
+/// here first and dropped: it lands on a pre-existing, focus-independent
+/// GTK hit-band inaccuracy in `quadraui::SidebarSystem`'s own section
+/// header (reproduced identically with `has_focus: false`, i.e. with no
+/// hint row reserved at all, so it predates and is unrelated to this
+/// fix) — a separate, out-of-scope defect for whoever picks it up next,
+/// not a regression this issue introduces.
+#[cfg(test)]
+mod sc_sidebar_bands_tests {
+    use super::*;
+
+    fn rect() -> quadraui::Rect {
+        quadraui::Rect::new(0.0, 0.0, 40.0, 20.0)
+    }
+
+    #[test]
+    fn hint_is_none_when_unfocused_and_slab_fills_the_rest() {
+        let unfocused = sc_sidebar_bands("", rect(), 1.0, 2.0, false);
+        assert_eq!(unfocused.hint, None, "no row should be reserved unfocused");
+        assert_eq!(
+            unfocused.slab.y + unfocused.slab.height,
+            rect().y + rect().height,
+            "with nothing reserved, the slab must reach the panel's bottom edge"
+        );
+    }
+
+    #[test]
+    fn hint_reserves_exactly_one_row_height_at_the_bottom_when_focused() {
+        let row_height = 1.0;
+        let focused = sc_sidebar_bands("", rect(), row_height, 2.0, true);
+        let hint = focused
+            .hint
+            .expect("a focused panel must reserve the hint row");
+        assert_eq!(
+            hint.height, row_height,
+            "the hint row must be exactly one text row tall"
+        );
+        assert_eq!(
+            hint.y + hint.height,
+            rect().y + rect().height,
+            "the hint row must sit flush against the panel's bottom edge"
+        );
+        assert_eq!(
+            hint.x,
+            rect().x,
+            "the hint row must span the panel's full width, starting at its left edge"
+        );
+        assert_eq!(
+            hint.width,
+            rect().width,
+            "the hint row must span the panel's full width"
+        );
+    }
+
+    #[test]
+    fn focused_slab_is_exactly_one_row_shorter_than_unfocused_and_never_overlaps_the_hint() {
+        let row_height = 1.0;
+        let unfocused = sc_sidebar_bands("", rect(), row_height, 2.0, false);
+        let focused = sc_sidebar_bands("", rect(), row_height, 2.0, true);
+
+        // Same header/commit-input geometry regardless of focus — only the
+        // slab shrinks to make room for the hint (#1361's own "only the
+        // paint mechanism differs" scoping, applied to geometry: nothing
+        // above the slab should ever move because of focus).
+        assert_eq!(unfocused.header, focused.header);
+        assert_eq!(unfocused.commit_input, focused.commit_input);
+
+        assert_eq!(
+            unfocused.slab.height - focused.slab.height,
+            row_height,
+            "the slab must shrink by exactly one row when the hint is reserved"
+        );
+        let hint = focused.hint.unwrap();
+        assert_eq!(
+            focused.slab.y + focused.slab.height,
+            hint.y,
+            "the slab must end exactly where the hint row begins — no gap, no overlap"
+        );
+    }
+
+    #[test]
+    fn a_multiline_commit_message_shifts_the_hint_reservation_but_not_its_height() {
+        // #1361 acceptance: hit-testing for rows *below* the commit box
+        // must account for the reserved row regardless of how tall the
+        // commit box itself is — the hint row's height must always stay
+        // one row, only its `y` (and the slab's) should move.
+        let row_height = 1.0;
+        let one_line = sc_sidebar_bands("single line", rect(), row_height, 2.0, true);
+        let three_lines = sc_sidebar_bands("a\nb\nc", rect(), row_height, 2.0, true);
+        let hint1 = one_line.hint.unwrap();
+        let hint3 = three_lines.hint.unwrap();
+        assert_eq!(hint1.height, hint3.height, "hint height is always one row");
+        assert_eq!(
+            hint1.y, hint3.y,
+            "both variants share the same overall rect, so the hint — \
+             anchored to the panel's bottom edge, not the commit box — \
+             must land at the same y regardless of commit message length"
+        );
+        assert!(
+            three_lines.commit_input.height > one_line.commit_input.height,
+            "sanity: the 3-line commit message must actually claim more \
+             rows than the 1-line one, or this test proves nothing"
+        );
     }
 }
 
@@ -14550,6 +17728,12 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
         let ch = kind.map(|k| k.label()).unwrap_or('?');
         let color = match ch {
             'A' => add_fg,
+            // #1051: VS Code paints Untracked the same green family as
+            // Added — distinct from Modified's orange/yellow. Falling
+            // through to `mod_fg` here (the pre-#1051 behavior, back when
+            // this arm was still '?') left the badge miscolored even after
+            // the letter itself was corrected.
+            'U' => add_fg,
             'D' => del_fg,
             '!' => del_fg,
             _ => mod_fg,
@@ -14947,7 +18131,19 @@ fn build_explorer_tree_rows(
             // and a leading-dot dotfile, so an extension-only lookup can
             // never badge either), falling back to the extension table.
             let glyph = icons::file_icon_for_name(&row.name).to_string();
-            Some(QIcon::new(glyph, ".".to_string()))
+            let file_icon = QIcon::new(glyph, ".".to_string());
+            // #1381: match the tab bar's filetype colour (`build_tab_bar_icons`
+            // / `tab_icon_color`) so the same file gets the same glyph colour
+            // in both places. Gated on Nerd Fonts the same way the tab bar
+            // gates its icons entirely (`build_tab_bar_icons` returns `&[]`
+            // when disabled): with Nerd Fonts off, leave the icon uncoloured
+            // rather than tinting the plain ASCII fallback glyph.
+            let file_icon = if icons::nerd_fonts_enabled() {
+                file_icon.with_color(tab_icon_color(&row.name))
+            } else {
+                file_icon
+            };
+            Some(file_icon)
         };
 
         out.push(TreeRow {
@@ -15264,8 +18460,8 @@ pub fn build_activity_bar(
     active_ext_panel: Option<&str>,
 ) -> quadraui::ActivityBar {
     use crate::core::engine::sidebar::{
-        ext_panel_id, HAMBURGER_PANEL_ID, PANEL_AI, PANEL_DEBUG, PANEL_EXPLORER, PANEL_EXTENSIONS,
-        PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+        ext_panel_id, HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXPLORER,
+        PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
     };
 
     // #536: the keyboard ring is matched by *panel id*, not by re-deriving each
@@ -15296,7 +18492,7 @@ pub fn build_activity_bar(
     }
 
     // (panel_id, icon, tooltip, activity_id)
-    let fixed: [(&str, &str, &str, &str); 6] = [
+    let fixed: [(&str, &str, &str, &str); 7] = [
         (
             PANEL_EXPLORER,
             icons::EXPLORER.s(),
@@ -15323,6 +18519,7 @@ pub fn build_activity_bar(
             "activity:extensions",
         ),
         (PANEL_AI, icons::AI_CHAT.s(), "AI Assistant", "activity:ai"),
+        (PANEL_BOARD, icons::BOARD.s(), "Board", "activity:board"),
     ];
 
     // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
@@ -15543,6 +18740,98 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
         scroll_offset: panel.scroll_top,
         style: TreeStyle::default(),
         has_focus: panel.has_focus,
+    }
+}
+
+// ─── Sidebar-panel-body composition (quadraui#1041/#1059, vimcode#1389) ────
+//
+// `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
+// "background fill, optional header/search chrome, body, optional
+// scrollbar gutter" — the layer order sidebar-panel renderers used to
+// hand-roll per backend (`docs/TUI_AUDIT_R2.md` §2.9). Its `render()`
+// convenience method takes the body as `&dyn BackendWidget`, which
+// requires `Self: Send + 'static` — a bound vimcode's *stateful* sidebar
+// bodies (`TreeController`/`FormController`, `Rc<RefCell<_>>`-backed on
+// the `!Send` `Engine`) can't satisfy: they're mutated in place by
+// `populate_*` and read back through a live `&Engine` borrow, never
+// rebuilt as an owned value. quadraui#1059 added `SidebarPanelBody::
+// render_with`, which takes the body as `impl FnOnce(&mut dyn Backend,
+// Rect)` instead — no `Send`/`'static` bound — so those callers now pass
+// their stateful body as a closure directly (`App::paint_sidebar_panel_rung`
+// PANEL_EXPLORER, `panels::render_explorer_sidebar_content`), instead of the
+// hand-copied `paint_sidebar_panel_chrome` background+chrome half #1242
+// needed before #1059 existed (deleted by #1389). [`ExtPanelTreeBody`] is
+// the one rung with a genuinely owned per-frame body
+// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the
+// `SidebarPanelBody::render` (`&dyn BackendWidget`) path directly.
+pub use quadraui::compose::sidebar_panel_body::{
+    SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
+};
+
+/// Build the search-only chrome (`SidebarPanelChrome::Search`, quadraui#1061)
+/// for a sidebar panel whose header the shell's own `AppShell` already owns
+/// (#1343 — the #1258 items 2/3 convergence). Shared by GTK's
+/// `App::paint_sidebar_panel_rung` (`PANEL_SETTINGS`/`PANEL_EXTENSIONS`
+/// arms) and the shipped TUI's `tui_main::panels::render_settings_panel`/
+/// `render_ext_sidebar`, so the query/placeholder/active-tint look can't
+/// drift between them the way #1256 found it had (GTK painted no search row
+/// at all; the TUI painted both a search row *and* its own duplicate header
+/// underneath the shell's).
+///
+/// Before quadraui#1061, this composed a bespoke single-row `StatusBar`
+/// directly (`paint_sidebar_search_row`, deleted by #1391) because
+/// `Backend::draw_settings_chrome` (behind [`SidebarPanelChrome::
+/// HeaderAndSearch`] above) paints its header row unconditionally — no rect
+/// made it paint a search-only strip without also painting a second header,
+/// exactly the double-header bug #1256 fixed. `SidebarPanelChrome::Search`
+/// is quadraui's own header-less variant of that composition (a single
+/// synthetic `StatusBar` segment through `Backend::
+/// draw_status_bar_interactive`), so this now just resolves the
+/// query/placeholder `fg` the same way the old bespoke row did — the
+/// `SidebarPanelBody`/`SidebarPanelChrome` composer pair above owns the
+/// actual paint.
+///
+/// `fg` is muted (`theme.line_number_fg`) while the placeholder is showing
+/// (`query` empty, not `active`), and full-strength (`theme.foreground`)
+/// otherwise — [`SidebarPanelChrome::Search`] takes one `fg` for both
+/// states (it has no theme of its own to consult), so callers resolve it
+/// per-frame the same way here. `bg` is always `theme.completion_bg`; the
+/// active-state tint (previously a discrete swap to `theme.fuzzy_selected_
+/// bg`) is now `SidebarPanelBody::render_with`'s own `bg.lighten(0.08)`
+/// while `active`.
+pub fn search_only_chrome(
+    query: &str,
+    placeholder: &str,
+    active: bool,
+    theme: &Theme,
+) -> SidebarPanelChrome {
+    let show_placeholder = query.is_empty() && !placeholder.is_empty() && !active;
+    let fg = if show_placeholder {
+        theme.line_number_fg
+    } else {
+        theme.foreground
+    };
+    SidebarPanelChrome::Search {
+        query: query.to_string(),
+        placeholder: placeholder.to_string(),
+        active,
+        fg,
+        bg: theme.completion_bg,
+    }
+}
+
+/// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
+/// unlike the stateful controllers `SidebarPanelBody::render_with` exists
+/// for (the module note above), [`ext_panel_to_tree_view`]'s output is
+/// already a fresh, owned `quadraui::TreeView`, so it satisfies
+/// `BackendWidget: Send + 'static`. Public field so a caller can read the
+/// `TreeView` back out after the borrow ends (e.g. to feed
+/// `Backend::tree_layout`).
+pub struct ExtPanelTreeBody(pub quadraui::TreeView);
+
+impl quadraui::BackendWidget for ExtPanelTreeBody {
+    fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
+        backend.draw_tree(rect, &self.0);
     }
 }
 
@@ -16014,6 +19303,30 @@ pub fn populate_settings_form_controller(engine: &Engine) {
 /// expands/collapses on a single click, and a value row selects on a single
 /// click but only *activates* (opens the inline editor / cycles an enum) on a
 /// double click.
+///
+/// # Row geometry is not offset from the paint (#983 → #1028)
+///
+/// #983 reported (v0.11.0) that a click low in a settings row selected the
+/// row *below* it, and blamed the `handle_cached` path below — the
+/// `backend: None` branch of `quadraui::FormController::click_inner`, which
+/// re-derives its row layout from `lh` alone instead of asking the backend.
+/// #1028 measured it on a real GTK frame rather than inferring it from
+/// glyph bounds, and there is no offset to fix: the `▼ LSP` category row's
+/// background is *painted* over `y ∈ [389, 421)` and this function resolves
+/// clicks to it over exactly `y ∈ [389, 421)`. Both paths agree because the
+/// row pitch is the same pure function of `lh` on both sides —
+/// `FormController`'s cached `row_height(lh)` and `GtkBackend::form_layout`'s
+/// `layout_metrics::form_row_height(lh)` are both `(lh * 1.4).round()`; the
+/// cached path only approximates the *horizontal* text measure, which row
+/// resolution does not use. The ext-panel/`SidebarSystem` rows behave the
+/// same way (`[741, 773)` painted, `[741, 773)` hit).
+///
+/// What #983's reporter actually clicked was the next row's own top padding
+/// — a row's band is ~32px tall around a ~23px glyph, so each row owns a
+/// ~4.5px strip of background above and below its label. Do **not** add a
+/// vimcode-side offset here to "fix" that; it would break the agreement
+/// above. `harness::row_click_in_its_painted_band_hits_its_own_row` locks
+/// the two bands together, on both panels and on both sides of the glyph.
 pub fn handle_settings_form_ui_event(
     engine: &mut Engine,
     event: &quadraui::UiEvent,
@@ -16098,7 +19411,7 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
     use quadraui::{ListItem, ListView, StyledText, WidgetId};
 
     let focus_mark = if qf.has_focus { " [FOCUS]" } else { "" };
-    let title_text = format!(" QUICKFIX ({} items){}", qf.total_items, focus_mark);
+    let title_text = format!(" {} ({} items){}", qf.title, qf.total_items, focus_mark);
 
     let items: Vec<ListItem> = qf
         .items
@@ -16186,6 +19499,31 @@ fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
     })
 }
 
+/// Build [`BoardData`] from engine state (#521). Always builds so backends
+/// can check `has_focus` even when there's nothing to paint yet.
+fn build_board_data(engine: &Engine) -> Option<BoardData> {
+    // A status banner is only shown in place of the board, never over it —
+    // a stale-but-present model from an earlier successful fetch keeps
+    // rendering even if the *next* refresh failed, so `board_error` only
+    // becomes a banner when there is nothing else to show.
+    let status = if engine.board_model.is_some() {
+        None
+    } else if let Some(err) = &engine.board_error {
+        Some(err.clone())
+    } else if engine.board_fetching {
+        Some("Fetching board…".to_string())
+    } else if engine.board_provider().is_none() {
+        Some("No board provider configured".to_string())
+    } else {
+        Some("Fetching board…".to_string())
+    };
+    Some(BoardData {
+        has_focus: engine.board_has_focus,
+        model: engine.board_model.clone(),
+        status,
+    })
+}
+
 fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
     let panel_name = engine.ext_panel_active.as_ref()?;
     let reg = engine.ext_panels.get(panel_name)?;
@@ -16266,14 +19604,23 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     let user_fg = theme.keyword;
     let asst_fg = theme.string_lit;
-    let turns: Vec<quadraui::ChatTurn> = engine
+    // ACP-1 (#952): agent "thought" chunks (`session/update`'s
+    // `agent_thought_chunk`, role "assistant-thought" — see
+    // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
+    // `Assistant` — `ChatController::build_transcript_rows` gives `System`
+    // both its own role-header label ("System" vs "AI") and its own colour,
+    // which is the acceptance criterion: thought chunks must be visually
+    // distinct from message chunks, not merely a different tint on the same
+    // "AI" label.
+    let thought_fg = theme.comment;
+    let mut turns: Vec<quadraui::ChatTurn> = engine
         .ai_messages
         .iter()
         .map(|m| {
-            let (role, fg) = if m.role == "user" {
-                (quadraui::ChatRole::User, user_fg)
-            } else {
-                (quadraui::ChatRole::Assistant, asst_fg)
+            let (role, fg) = match m.role.as_str() {
+                "user" => (quadraui::ChatRole::User, user_fg),
+                "assistant-thought" => (quadraui::ChatRole::System, thought_fg),
+                _ => (quadraui::ChatRole::Assistant, asst_fg),
             };
             quadraui::ChatTurn {
                 role,
@@ -16284,16 +19631,121 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
         })
         .collect();
 
+    // #955 (ACP-4): tool calls, rendered as one collapsed one-line summary
+    // turn per call, appended *after* the real conversation — same
+    // "synthetic turn, never mixed into `ai_messages`" treatment #956 gave
+    // the plan checklist below. `tool_call_summary_line` already bakes in
+    // the status glyph, so a `tool_call_update`'s `pending -> in_progress
+    // -> completed | failed` transition is visible here without any
+    // expand/collapse state to track — every call always renders its
+    // current status, every frame.
+    for call in &engine.acp_tool_calls {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::tool_call_summary_line(call),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
+
+    // #956 (ACP-5): the agent's current plan, rendered as one synthetic
+    // checklist turn appended *after* the real conversation — never mixed
+    // into `engine.ai_messages` itself. `engine.acp_plan` already holds
+    // only the latest `plan` update (a full replacement, not a delta — see
+    // that field's doc), so this turn is rebuilt fresh from it every call:
+    // two successive `plan` updates leave exactly one checklist rendered,
+    // reflecting the second, by construction (there is only ever one
+    // `acp_plan` value to read). Appending at the end rather than inline
+    // where the update actually streamed keeps "current plan state" always
+    // visible without scrolling (`ChatController` stays stuck-to-bottom),
+    // at the deliberate cost of it not being in strict chronological order
+    // with any later message chunks in the same turn.
+    if !engine.acp_plan.is_empty() {
+        turns.push(quadraui::ChatTurn {
+            role: quadraui::ChatRole::System,
+            text: quadraui::StyledText::colored(
+                crate::core::acp::plan_to_checklist_text(&engine.acp_plan),
+                thought_fg,
+            ),
+            timestamp_unix: None,
+            line_scales: Vec::new(),
+        });
+    }
+
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     chat.set_busy(engine.ai_streaming);
     let header_fg = theme.status_fg;
-    let header = if engine.ai_streaming {
-        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})"
+    let mut header = if engine.ai_streaming {
+        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
     } else {
-        " \u{f0e5} AI ASSISTANT"
+        " \u{f0e5} AI ASSISTANT".to_string()
     };
+    // #956 (ACP-5): current mode + usage telemetry both fold into this one
+    // existing status line rather than a new widget — "unobtrusive status
+    // indicator" per the issue, and by construction can't steal focus or
+    // churn layout since the header is already repainted every frame at a
+    // fixed position.
+    if let Some(mode_id) = engine.acp_current_mode_id.as_deref() {
+        let mode_label = engine
+            .acp_modes
+            .iter()
+            .find(|m| m.id == mode_id)
+            .map(|m| m.name.as_str())
+            .unwrap_or(mode_id);
+        header.push_str(&format!("  \u{b7} mode: {mode_label}"));
+    }
+    if let Some(usage) = &engine.acp_usage {
+        let summary = crate::core::acp::format_usage_summary(usage);
+        if !summary.is_empty() {
+            header.push_str(&format!("  \u{b7} {summary}"));
+        }
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
+}
+
+/// Paint the slash-command completion popup above the AI panel's input box
+/// when [`Engine::ai_command_completions`] has a match (#956, ACP-5).
+/// Reuses [`completion_menu_to_quadraui_completions`] and the
+/// `quadraui::Completions` primitive verbatim — the same machinery the
+/// editor's own word-completion popup uses — rather than a bespoke widget.
+///
+/// `chat_rect` must be the same rect the caller's last `ai_chat.render()`
+/// call used (`Engine::ai_chat_rect`), matching every other AI-panel
+/// helper's contract. Anchoring at the rect's bottom edge with the rect
+/// itself as the viewport makes `Completions::layout`'s own "prefer below,
+/// flip above on overflow" placement logic put the popup just above the
+/// panel's bottom edge — where `ChatController`'s input box always is —
+/// without this function needing to know that box's exact pixel/cell
+/// geometry (`ChatController` doesn't expose it).
+pub fn paint_ai_command_completions(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    chat_rect: quadraui::Rect,
+) {
+    if chat_rect.width <= 0.0 || chat_rect.height <= 0.0 {
+        return;
+    }
+    let Some(menu) = engine.ai_command_completions() else {
+        return;
+    };
+    let completions = completion_menu_to_quadraui_completions(&menu);
+    let unit_h = backend.line_height().max(1.0);
+    let popup_width = chat_rect.width.max(unit_h * 4.0);
+    let max_popup_height = (unit_h * (menu.candidates.len() as f32 + 1.0)).min(chat_rect.height);
+    let layout = completions.layout(
+        chat_rect.x,
+        chat_rect.y + chat_rect.height,
+        unit_h,
+        chat_rect,
+        popup_width,
+        max_popup_height,
+        |_| quadraui::CompletionItemMeasure::new(unit_h),
+    );
+    backend.draw_completions(&completions, &layout);
 }
 
 /// Build the cell grid for a single terminal session.
@@ -16581,10 +20033,25 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
     }
 }
 
-/// Compute word-aware wrap segment boundaries for a line.
-/// Returns a list of `(start_char, end_char)` pairs. Breaks prefer word boundaries
-/// (spaces, hyphens, punctuation) so words are not split mid-way.
-pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usize, usize)> {
+/// Compute wrap segment boundaries for a line, when `'wrap'` soft-wraps it.
+/// Returns a list of `(start_char, end_char)` pairs.
+///
+/// `linebreak` selects which of Vim's two wrap behaviours to use (`:h
+/// 'linebreak'`, #1207):
+/// - `false` (Vim's own default, and this fn's behaviour before #1207):
+///   hard-break exactly at `viewport_cols`, splitting a word mid-way if
+///   that's where the column falls.
+/// - `true`: break at a word boundary (space, hyphen, or `/`) at or before
+///   the column, so words are never split — falling back to a hard break
+///   only when no boundary exists in the segment.
+///
+/// Purely a display-time choice: never mutates or reflows what's actually
+/// stored in the buffer.
+pub fn compute_word_wrap_segments(
+    line: &str,
+    viewport_cols: usize,
+    linebreak: bool,
+) -> Vec<(usize, usize)> {
     let chars: Vec<char> = line.chars().collect();
     let total = chars.len();
     if viewport_cols == 0 || total <= viewport_cols {
@@ -16599,23 +20066,14 @@ pub fn compute_word_wrap_segments(line: &str, viewport_cols: usize) -> Vec<(usiz
             break;
         }
         let end = pos + viewport_cols;
-        // Scan backwards from the break point to find a word boundary (space or after punctuation).
         let mut break_at = end;
-        for i in (pos + 1..=end).rev() {
-            if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
-                break_at = i;
-                break;
-            }
-        }
-        // If no boundary found within the segment, hard-break at viewport width.
-        if break_at == end && !chars[end - 1].is_whitespace() {
-            // Check if we found a boundary at all (break_at didn't change means
-            // the for loop completed without breaking).
-            let found = (pos + 1..=end)
-                .rev()
-                .any(|i| chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/');
-            if !found {
-                break_at = end;
+        if linebreak {
+            // Scan backwards from the break point to find a word boundary (space or after punctuation).
+            for i in (pos + 1..=end).rev() {
+                if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
+                    break_at = i;
+                    break;
+                }
             }
         }
         segments.push((pos, break_at));
@@ -16655,44 +20113,204 @@ pub fn view_row_to_buf_line(
     total_lines.saturating_sub(1)
 }
 
-/// Like `view_row_to_buf_line`, but accounts for word-wrapped lines.
-/// Returns `(buffer_line, segment_col_offset)` — the segment offset is the
-/// character index within the buffer line where the clicked visual segment starts.
-/// Shared across all GUI backends for click hit-testing with `:set wrap`.
-pub fn view_row_to_buf_pos_wrap(
-    view: &crate::core::view::View,
-    buffer: &crate::core::buffer::Buffer,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-    viewport_cols: usize,
-) -> (usize, usize) {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        // Compute how many visual rows this buffer line occupies when wrapped.
-        let line_str = buffer.content.line(buf_line).to_string();
-        let line_str = line_str.trim_end_matches('\n');
-        let segments = compute_word_wrap_segments(line_str, viewport_cols);
-        let visual_rows = segments.len();
-        if view_row < visible + visual_rows {
-            // The clicked row falls within this buffer line.
-            let seg_idx = view_row - visible;
-            let seg_col_offset = segments.get(seg_idx).map(|&(start, _)| start).unwrap_or(0);
-            return (buf_line, seg_col_offset);
-        }
-        visible += visual_rows;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
+/// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
+/// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`,
+/// #1206) in a line's text. Every position-based field a `RenderedLine`
+/// carries for that line — byte-offset `StyledSpan`s *and* char-index
+/// `DiagnosticMark`/`SpellMark`s — must remap through this single table
+/// rather than recomputing the expansion delta twice, which is how #1208
+/// happened: the byte-offset remap for `spans` shipped in #1190 with no
+/// equivalent for the char-index diagnostic/spell marks.
+///
+/// Byte and char deltas are tracked *separately* (#1206): a tab expansion
+/// changes both by the same amount only when the configured tab glyph is
+/// pure ASCII, and a single-character substitution (`trail:·`, say) can
+/// change the byte length while leaving the char count at exactly 1 — the
+/// pre-#1206 shared-delta design (`:h` #1208's own doc) was only ever exact
+/// for the ASCII-only `^I` fallback it was built for.
+struct ListGlyphOffsets {
+    /// `(old_byte_offset_just_past_this_char, old_char_offset_just_past_this_char, cumulative_byte_delta, cumulative_char_delta)`.
+    breakpoints: Vec<(usize, usize, i64, i64)>,
+}
+
+impl ListGlyphOffsets {
+    fn identity() -> Self {
+        Self {
+            breakpoints: Vec::new(),
         }
     }
-    (total_lines.saturating_sub(1), 0)
+
+    fn remap_byte(&self, old_byte: usize) -> usize {
+        let shift = self
+            .breakpoints
+            .iter()
+            .rev()
+            .find(|(bp, _, _, _)| *bp <= old_byte)
+            .map(|(_, _, d, _)| *d)
+            .unwrap_or(0);
+        (old_byte as i64 + shift) as usize
+    }
+
+    fn remap_char(&self, old_char: usize) -> usize {
+        let shift = self
+            .breakpoints
+            .iter()
+            .rev()
+            .find(|(_, bp, _, _)| *bp <= old_char)
+            .map(|(_, _, _, d)| *d)
+            .unwrap_or(0);
+        (old_char as i64 + shift) as usize
+    }
+}
+
+/// Expand `'list'` glyphs in `text` per the current `'listchars'`
+/// (`settings.listchars`) and `'tabstop'` (`settings.tabstop`), returning
+/// the expanded text plus the offset table needed to remap any byte- or
+/// char-indexed position that pointed into the original `text` (see
+/// [`ListGlyphOffsets`]).
+///
+/// `tab` fills to the next `'tabstop'` stop the way Vim renders it
+/// (`:h lcs-tab`) — `col` (visual column, 0-based) is tracked from the
+/// start of `text` as if `text` began at column 0, matching how the rest of
+/// this rendering pipeline already treats each `RenderedLine` segment (a
+/// wrap-continuation segment's own tab/indent-guide math restarts at column
+/// 0 too, e.g. the `cols`/`indent` loop building indent guides) — so this
+/// isn't a new limitation, just consistent with the existing one. No
+/// `tab:` item falls back to the literal `^I` Vim shows when `'listchars'`
+/// doesn't mention tabs at all (`:h lcs-tab`, "When tab: is omitted, a tab
+/// is shown as ^I").
+fn compute_list_glyph_expansion(text: String, settings: &Settings) -> (String, ListGlyphOffsets) {
+    let listchars = &settings.listchars;
+    let tab_glyph = crate::core::settings::listchars_tab(listchars);
+    let trail_glyph = crate::core::settings::listchars_char(listchars, "trail", None);
+    let nbsp_glyph = crate::core::settings::listchars_char(listchars, "nbsp", None);
+    let space_glyph = crate::core::settings::listchars_char(listchars, "space", None);
+
+    if !text.contains('\t')
+        && trail_glyph.is_none()
+        && nbsp_glyph.is_none()
+        && space_glyph.is_none()
+    {
+        return (text, ListGlyphOffsets::identity());
+    }
+
+    let tabstop = (settings.tabstop as usize).max(1);
+
+    // Trailing-space run (char indices into `text`): where 'trail' applies
+    // instead of 'space'/nothing (`:h lcs-trail`: "Overrides the space and
+    // multispace settings for trailing spaces"). Excludes a trailing '\n'.
+    let core_len = text.chars().count() - usize::from(text.ends_with('\n'));
+    let core_chars: Vec<char> = text.chars().take(core_len).collect();
+    let mut trail_start = core_len;
+    while trail_start > 0 && core_chars[trail_start - 1] == ' ' {
+        trail_start -= 1;
+    }
+
+    let mut out = String::with_capacity(text.len());
+    let mut breakpoints: Vec<(usize, usize, i64, i64)> = Vec::new();
+    let mut byte_delta: i64 = 0;
+    let mut char_delta: i64 = 0;
+    let mut col: usize = 0;
+
+    for (old_char, (old_byte, ch)) in text.char_indices().enumerate() {
+        let rendered: String = if ch == '\t' {
+            let width = tabstop - (col % tabstop);
+            match &tab_glyph {
+                Some(g) => g.render(width),
+                None => "^I".to_string(),
+            }
+        } else if ch == ' ' && old_char >= trail_start && old_char < core_len {
+            trail_glyph.map_or_else(|| ch.to_string(), String::from)
+        } else if ch == '\u{a0}' {
+            nbsp_glyph.map_or_else(|| ch.to_string(), String::from)
+        } else if ch == ' ' {
+            space_glyph.map_or_else(|| ch.to_string(), String::from)
+        } else {
+            ch.to_string()
+        };
+
+        col += rendered.chars().count();
+        out.push_str(&rendered);
+
+        let new_byte_delta = byte_delta + rendered.len() as i64 - ch.len_utf8() as i64;
+        let new_char_delta = char_delta + rendered.chars().count() as i64 - 1;
+        if new_byte_delta != byte_delta || new_char_delta != char_delta {
+            byte_delta = new_byte_delta;
+            char_delta = new_char_delta;
+            breakpoints.push((
+                old_byte + ch.len_utf8(),
+                old_char + 1,
+                byte_delta,
+                char_delta,
+            ));
+        }
+    }
+
+    (out, ListGlyphOffsets { breakpoints })
+}
+
+/// Vim's `'list'` (#1190, `'listchars'` support #1206): apply the configured
+/// glyph set to one already-built `(raw_text, spans, diagnostics,
+/// spell_errors)` tuple. Callers must not call this for a fold-header line
+/// (`RenderedLine::is_fold_header`) — real vim's `'list'` never marks a
+/// closed fold's display text (#1208).
+///
+/// `mark_eol` is `false` for every wrap-continuation segment except the
+/// last — an `eol` glyph belongs at the true end of the buffer line, not at
+/// each mid-line wrap point — and even on the last segment, nothing is
+/// appended unless `'listchars'` actually has an `eol:` item (Neovim's real
+/// default doesn't: `:h 'listchars'`'s default is `"tab:> ,trail:-,nbsp:+"`,
+/// no `eol`, so `'list'` shows no trailing `$` out of the box — #1190's
+/// hardcoded always-`$` only matched classic Vim's *empty*-`'listchars'`
+/// fallback, not this).
+///
+/// Remaps `spans` (byte offsets), `diagnostics` and `spell_errors` (char
+/// indices) through one shared [`ListGlyphOffsets`] table computed from the
+/// expansion, rather than two parallel remap implementations that can drift
+/// out of sync (#1208).
+fn apply_list_glyphs(
+    text: String,
+    spans: Vec<StyledSpan>,
+    diagnostics: Vec<DiagnosticMark>,
+    spell_errors: Vec<SpellMark>,
+    mark_eol: bool,
+    settings: &Settings,
+) -> (String, Vec<StyledSpan>, Vec<DiagnosticMark>, Vec<SpellMark>) {
+    let (mut out, offsets) = compute_list_glyph_expansion(text, settings);
+    if mark_eol {
+        if let Some(eol) = crate::core::settings::listchars_char(&settings.listchars, "eol", None) {
+            out = match out.strip_suffix('\n') {
+                Some(stripped) => format!("{stripped}{eol}\n"),
+                None => format!("{out}{eol}"),
+            };
+        }
+    }
+
+    let spans = spans
+        .into_iter()
+        .map(|s| StyledSpan {
+            start_byte: offsets.remap_byte(s.start_byte),
+            end_byte: offsets.remap_byte(s.end_byte),
+            ..s
+        })
+        .collect();
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|d| DiagnosticMark {
+            start_col: offsets.remap_char(d.start_col),
+            end_col: offsets.remap_char(d.end_col),
+            ..d
+        })
+        .collect();
+    let spell_errors = spell_errors
+        .into_iter()
+        .map(|s| SpellMark {
+            start_col: offsets.remap_char(s.start_col),
+            end_col: offsets.remap_char(s.end_col),
+        })
+        .collect();
+
+    (out, spans, diagnostics, spell_errors)
 }
 
 /// Slice `spans` to cover only the byte range `[seg_start_byte, seg_end_byte)`,
@@ -16739,6 +20357,7 @@ fn build_rendered_window(
     multi_window: bool,
     color_headings: bool,
     scrollbar_reserve: f64,
+    minimap_w: f64,
 ) -> RenderedWindow {
     let empty = |id: WindowId| RenderedWindow {
         window_id: id,
@@ -16754,6 +20373,7 @@ fn build_rendered_window(
         total_lines: 0,
         gutter_char_width: 0,
         text_viewport_cols: 0,
+        minimap_reserved_w: 0.0,
         is_active,
         show_active_bg: false,
         has_git_diff: false,
@@ -16860,11 +20480,34 @@ fn build_rendered_window(
     // `ScrolledWindow`; TUI has none, so its backend returns `0.0`). This
     // function has no opinion on what that value is; it only subtracts
     // whatever the caller measured.
+    //
+    // `minimap_w` (#1094): `rect` is now the *pane's* rect, unmodified by
+    // the strip — see this function's caller (`build_screen_layout`'s
+    // `minimap_widths`/`windows` map, where `minimap_w` is derived) for
+    // the full rationale on why `rect` stopped being narrowed and what
+    // `minimap_w` folds in. Subtracting it here alongside
+    // `scrollbar_reserve` keeps the text column count from overestimating
+    // into the strip's own columns, even though `rect` itself runs wider
+    // than that now.
     let render_viewport_cols = if char_width > 0.0 {
-        let total_chars = ((rect.width - scrollbar_reserve) / char_width).floor() as usize;
+        let total_chars =
+            ((rect.width - scrollbar_reserve - minimap_w) / char_width).floor() as usize;
         total_chars.saturating_sub(gutter_char_width).max(1)
     } else {
         view.viewport_cols.max(1)
+    };
+
+    // #1094 review: `RenderedWindow.minimap_reserved_w` — the same
+    // strip-plus-gutter width just subtracted above, but re-expressed
+    // relative to `rect.width` (i.e. with `scrollbar_reserve` folded back
+    // in) so `window_zone_hit_test` can find the strip's boundary directly
+    // from `rect.width` without needing `scrollbar_reserve` threaded
+    // through as a parameter of its own. `minimap_w` is already `0.0` when
+    // there's no strip for this window, matching the field's own contract.
+    let minimap_reserved_w = if minimap_w > 0.0 {
+        minimap_w + scrollbar_reserve
+    } else {
+        0.0
     };
 
     // Narrow the highlights slice to only the visible window using binary search.
@@ -17223,12 +20866,19 @@ fn build_rendered_window(
         let wrap_on =
             (engine.settings.wrap || is_md_preview) && render_viewport_cols > 0 && !is_fold_header;
         let line_char_len = line_str.chars().count();
+        // 'list' (#1190): applied only to the copy handed to the renderer
+        // below (`raw_text`/`spans`) — `line_str` above (already consumed
+        // by the diagnostics/spell-check UTF-16 offset math) and the word-
+        // wrap segmentation just above stay on the untransformed text, so
+        // this cannot perturb any semantic column math, only what paints.
+        let list_mode = engine.settings.list;
 
         if wrap_on && line_char_len > render_viewport_cols {
             // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
             // Build segment boundaries using word-aware splitting.
-            let segment_boundaries = compute_word_wrap_segments(&line_str, vp);
+            let segment_boundaries =
+                compute_word_wrap_segments(&line_str, vp, engine.settings.linebreak);
             let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
                 // Find which segment contains the cursor column.
@@ -17250,6 +20900,33 @@ fn build_rendered_window(
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
                 let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
                 let is_cont = seg > 0;
+                let is_last_seg = seg + 1 == num_segments;
+                // Diagnostics/spell marks are attached only to the segment
+                // that isn't a continuation (index-0-relative, same as
+                // `seg_text`), so they share that segment's glyph-expansion
+                // offset table rather than a separately-recomputed one (#1208).
+                let seg_diagnostics = if is_cont {
+                    Vec::new()
+                } else {
+                    line_diagnostics.clone()
+                };
+                let seg_spell_errors = if is_cont {
+                    Vec::new()
+                } else {
+                    line_spell_errors.clone()
+                };
+                let (seg_text, seg_spans, seg_diagnostics, seg_spell_errors) = if list_mode {
+                    apply_list_glyphs(
+                        seg_text,
+                        seg_spans,
+                        seg_diagnostics,
+                        seg_spell_errors,
+                        is_last_seg,
+                        &engine.settings,
+                    )
+                } else {
+                    (seg_text, seg_spans, seg_diagnostics, seg_spell_errors)
+                };
                 lines.push(RenderedLine {
                     raw_text: seg_text,
                     gutter_text: if is_cont {
@@ -17263,16 +20940,8 @@ fn build_rendered_window(
                     folded_line_count: 0,
                     line_idx,
                     git_diff: if is_cont { None } else { git_status },
-                    diagnostics: if is_cont {
-                        Vec::new()
-                    } else {
-                        line_diagnostics.clone()
-                    },
-                    spell_errors: if is_cont {
-                        Vec::new()
-                    } else {
-                        line_spell_errors.clone()
-                    },
+                    diagnostics: seg_diagnostics,
+                    spell_errors: seg_spell_errors,
                     diff_status,
                     is_breakpoint: !is_cont && is_breakpoint,
                     is_conditional_bp: !is_cont && is_conditional_bp,
@@ -17329,6 +20998,23 @@ fn build_rendered_window(
                 }
             }
         } else {
+            // 'list' glyphs never apply to fold-header summary lines (#1208)
+            // — real vim's 'list' doesn't touch the folded-line-count text,
+            // and this branch is also where non-wrapped lines land, so the
+            // gate has to live here rather than on `list_mode` alone.
+            let (line_str, spans, line_diagnostics, line_spell_errors) =
+                if list_mode && !is_fold_header {
+                    apply_list_glyphs(
+                        line_str,
+                        spans,
+                        line_diagnostics,
+                        line_spell_errors,
+                        true,
+                        &engine.settings,
+                    )
+                } else {
+                    (line_str, spans, line_diagnostics, line_spell_errors)
+                };
             lines.push(RenderedLine {
                 raw_text: line_str,
                 gutter_text,
@@ -17566,7 +21252,7 @@ fn build_rendered_window(
     }
 
     // ── Bracket match positions ────────────────────────────────────────────
-    let bracket_match_positions = if engine.settings.match_brackets && is_active {
+    let mut bracket_match_positions = if engine.settings.match_brackets && is_active {
         if let Some((match_line, match_col)) = engine.bracket_match {
             let mut positions = Vec::with_capacity(2);
             // Cursor bracket position
@@ -17591,6 +21277,27 @@ fn build_rendered_window(
     } else {
         Vec::new()
     };
+
+    // `'showmatch'` (#1207): while `Engine::showmatch_flash` is armed (the one
+    // frame right after a matched closing bracket was typed in Insert mode —
+    // cleared at the top of the *next* `handle_insert_key`, see the field's
+    // doc comment on `Engine`), highlight the opening bracket it matched with
+    // the same background used for normal-mode `'matchpairs'` highlighting
+    // (`bracket_match_bg`). This reuses the existing quadraui-consumed
+    // `bracket_match_positions` channel rather than inventing a new one, so
+    // both backends pick it up for free through `to_q_editor`.
+    if is_active && engine.settings.showmatch {
+        if let Some((match_line, match_col)) = engine.showmatch_flash {
+            for (vi, l) in lines.iter().enumerate() {
+                if l.line_idx == match_line && !l.is_ghost_continuation && !l.is_wrap_continuation {
+                    let pos = (vi, match_col.saturating_sub(l.segment_col_offset));
+                    if !bracket_match_positions.contains(&pos) {
+                        bracket_match_positions.push(pos);
+                    }
+                }
+            }
+        }
+    }
 
     // Extra selections for Ctrl+D multi-cursor word selections.
     // Each extra cursor sits at the END of a word; derive selection start
@@ -17632,6 +21339,7 @@ fn build_rendered_window(
         total_lines,
         gutter_char_width,
         text_viewport_cols: render_viewport_cols,
+        minimap_reserved_w,
         is_active,
         show_active_bg: is_active && multi_window,
         has_git_diff: has_git,
@@ -18404,13 +22112,38 @@ fn build_status_line(engine: &Engine) -> (String, String, String) {
     } else {
         String::new()
     };
-    let right = format!(
-        "Ln {}, Col {}  ({} lines){} ",
-        cursor.line + 1,
-        cursor.col + 1,
-        engine.buffer().len_lines(),
-        diag_str
-    );
+    // 'ruler' (#1190): the cursor-position/line-count segment is the part
+    // Vim's `'ruler'` option gates (`:h 'ruler'`) — diagnostics are a
+    // vimcode-only addition with no Vim equivalent, so they stay visible
+    // either way.
+    let ruler_str = if engine.settings.ruler {
+        format!(
+            "Ln {}, Col {}  ({} lines){} ",
+            cursor.line + 1,
+            cursor.col + 1,
+            engine.buffer().len_lines(),
+            diag_str
+        )
+    } else if !diag_str.is_empty() {
+        format!("{} ", diag_str.trim_start())
+    } else {
+        String::new()
+    };
+
+    // 'showcmd' (#1190): the partially-typed Normal-mode command, shown
+    // immediately left of the ruler like Vim's own showcmd area (`:h
+    // 'showcmd'`).
+    let showcmd_str = if engine.settings.showcmd {
+        let sc = engine.showcmd_text();
+        if sc.is_empty() {
+            String::new()
+        } else {
+            format!("{sc} ")
+        }
+    } else {
+        String::new()
+    };
+    let right = format!("{showcmd_str}{ruler_str}");
 
     (prefix, branch, right)
 }
@@ -18465,7 +22198,10 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
                 title: t.title.clone(),
                 body: t.body.clone(),
                 severity: t.severity,
-                action: None,
+                action: t.action.as_ref().map(|a| quadraui::ToastAction {
+                    id: quadraui::WidgetId::new(format!("toast-action-{}", t.id)),
+                    label: a.button_label().to_string(),
+                }),
                 accent: None,
             })
             .collect(),
@@ -18842,13 +22578,39 @@ pub fn build_window_status_line(
             })
         };
 
-        let cursor_seg = cursor.map(|c| StatusSegment {
-            text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
-            fg: bar_fg,
-            bg: bar_bg,
-            bold: false,
-            action: Some(StatusAction::GoToLine),
-        });
+        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment.
+        let cursor_seg = if engine.settings.ruler {
+            cursor.map(|c| StatusSegment {
+                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                action: Some(StatusAction::GoToLine),
+            })
+        } else {
+            None
+        };
+
+        // 'showcmd' (#1190): the partially-typed Normal-mode command,
+        // shown immediately left of the ruler like Vim's own showcmd area
+        // (`:h 'showcmd'`). Only present in the *active* window's bar — an
+        // inactive window's pane never has pending Normal-mode input.
+        let showcmd_seg = if engine.settings.showcmd {
+            let sc = engine.showcmd_text();
+            if sc.is_empty() {
+                None
+            } else {
+                Some(StatusSegment {
+                    text: format!(" {sc} "),
+                    fg: bar_fg,
+                    bg: bar_bg,
+                    bold: false,
+                    action: None,
+                })
+            }
+        } else {
+            None
+        };
 
         // Push in priority order: least-important first.
         if let Some(s) = notification_seg {
@@ -18866,6 +22628,9 @@ pub fn build_window_status_line(
             right.push(s);
         }
         if let Some(s) = lsp_seg {
+            right.push(s);
+        }
+        if let Some(s) = showcmd_seg {
             right.push(s);
         }
         if let Some(s) = cursor_seg {
@@ -18896,14 +22661,18 @@ pub fn build_window_status_line(
             });
         }
 
-        let right = if let Some(c) = cursor {
-            vec![StatusSegment {
-                text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
-                fg: theme.status_inactive_fg,
-                bg: theme.status_inactive_bg,
-                bold: false,
-                action: None,
-            }]
+        let right = if engine.settings.ruler {
+            if let Some(c) = cursor {
+                vec![StatusSegment {
+                    text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
+                    fg: theme.status_inactive_fg,
+                    bg: theme.status_inactive_bg,
+                    bold: false,
+                    action: None,
+                }]
+            } else {
+                vec![]
+            }
         } else {
             vec![]
         };
@@ -19289,6 +23058,17 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         accent_bg: theme.tab_active_accent,
         scrollbar_track: theme.separator,
         scrollbar_thumb: theme.scrollbar_thumb,
+        // #1185: quadraui's `command_line_{bg,fg}` default to its own
+        // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
+        // this literal's `background`/`foreground` override above) unless
+        // mapped explicitly. Both backends now paint the command line
+        // through `Backend::draw_command_line_selection`, which reads
+        // these two fields — without this mapping, adopting that call
+        // would have silently swapped every colourscheme's themed command
+        // line for quadraui's defaults (a regression for TUI, which used
+        // to read `theme.command_{fg,bg}` by hand).
+        command_line_bg: theme.command_bg,
+        command_line_fg: theme.command_fg,
         ..quadraui::Theme::default()
     }
 }
@@ -19347,6 +23127,25 @@ fn to_quadraui_theme_editor(theme: &Theme, chrome: quadraui::Theme) -> quadraui:
 /// against the same per-span-attributed layout `draw_editor` painted
 /// with; TUI: `EditorLayout::col_at_x`'s uniform monospace division) —
 /// neither backend hand-rolls its own text-column inverse anymore.
+///
+/// **GTK-correct, TUI-unsafe (#1040).** For GTK, `rw.rect` *is* the exact
+/// sub-pixel float geometry Cairo paints into, so `editor.rect` genuinely
+/// matches paint here. For TUI it does not: `rw.rect` comes from
+/// continuous float split math (`quadraui::SplitTree::layout`, zero
+/// divider thickness) and is not integer-valued in general — a vertical
+/// group split at the default 50/50 ratio over an odd content width gives
+/// the *right* pane's `rect.x` a `.5`-cell fractional origin. TUI's paint
+/// path truncates that away to whole cells before drawing
+/// (`tui_main::render_impl`'s `win_rect`/`editor_area`, both `rect.x as
+/// u16`) — bypassing `editor.rect` entirely, since `Backend::draw_editor`
+/// takes its viewport as an explicit `Rect` argument, not from the
+/// `Editor` struct. Calling this function directly from TUI click code
+/// therefore resolves columns against a viewport that was never actually
+/// painted, landing one column left of the real one (clamped to 0 at the
+/// pane's first column, so it "sometimes" doesn't — exactly the #1040
+/// report). TUI click/drag/hover call sites must use
+/// [`tui_editor_text_layout`] instead, which resolves against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport.
 pub fn editor_text_layout(
     rw: &RenderedWindow,
     char_width: f64,
@@ -19354,6 +23153,45 @@ pub fn editor_text_layout(
 ) -> (quadraui::Editor, quadraui::EditorLayout) {
     let editor = to_q_editor(rw);
     let layout = editor.layout(editor.rect, char_width as f32, line_height as f32);
+    (editor, layout)
+}
+
+/// Truncate a window rect to whole terminal cells — the exact conversion
+/// TUI's paint path applies before handing a window's geometry to
+/// `ratatui`/quadraui's cell-grid rasteriser (`tui_main::render_impl`'s
+/// `win_rect` in `render_all_windows`, and the `editor_area` derived from
+/// it in `render_window`, both `rect.x as u16` etc.).
+///
+/// See [`editor_text_layout`]'s doc for why this exists: `RenderedWindow`
+/// rects are produced by continuous float split math and are not
+/// integer-valued in general, so click resolution must snap to the same
+/// grid paint already snapped to, or it silently resolves against
+/// geometry that was never painted (#1040).
+///
+/// TUI-only — GTK rects are real sub-pixel float geometry that Cairo
+/// paints exactly as given; do not call this from `gtk/click.rs`.
+pub fn tui_window_paint_rect(rect: &WindowRect) -> WindowRect {
+    WindowRect::new(
+        (rect.x as u16) as f64,
+        (rect.y as u16) as f64,
+        (rect.width as u16) as f64,
+        (rect.height as u16) as f64,
+    )
+}
+
+/// TUI-only variant of [`editor_text_layout`]: builds the same
+/// [`quadraui::Editor`], but lays it out against
+/// [`tui_window_paint_rect`]'s whole-cell-truncated viewport instead of
+/// the raw (possibly fractional) `rw.rect` — the viewport TUI's paint
+/// path actually drew into. `Editor::layout` only reads its `viewport`
+/// argument for geometry (never the `Editor.rect` field itself), so this
+/// does not disturb anything else `to_q_editor`'s `editor.rect` is used
+/// for. Every TUI click/drag/hover call site that resolves a text column
+/// must use this, not `editor_text_layout` (#1040).
+pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadraui::EditorLayout) {
+    let editor = to_q_editor(rw);
+    let viewport = quadraui::Rect::from(tui_window_paint_rect(&rw.rect));
+    let layout = editor.layout(viewport, 1.0, 1.0);
     (editor, layout)
 }
 
@@ -19722,12 +23560,21 @@ pub fn build_command_line(engine: &Engine) -> CommandLineData {
         _ => (engine.message.clone(), false, false, String::new()),
     };
 
-    // Safety: strip newlines so the command line never exceeds one row
-    let text = if let Some(first) = text.lines().next() {
-        first.to_string()
-    } else {
-        text
-    };
+    // Safety: strip newlines so the command line never exceeds one row.
+    // A message that *starts* with a blank line (Neovim's `:digraphs`, no
+    // bang, deliberately leads with one to mirror `listdigraphs` —
+    // `format_digraph_table`, #1302) would otherwise make `.lines().next()`
+    // yield `""` and paint nothing at all, even though the message holds
+    // real content on its second line — so skip past any leading empty
+    // lines first and show the first line that actually has something in
+    // it. `trim_start_matches` only strips a *leading* run, so a message
+    // that never had a blank line (every other caller) is unaffected.
+    let text = text
+        .trim_start_matches('\n')
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
 
     CommandLineData {
         text,
@@ -19855,43 +23702,25 @@ pub fn command_line_click_char_idx(
     ))
 }
 
-/// Rect spanning a mouse selection `sel` (character-count `(anchor, head)`,
-/// either order) over `text`, painted into `rect` — the paintable geometry
-/// [`quadraui::CommandLineLayout::selection_bounds`] hands back, in the same
-/// ABSOLUTE units as `rect`. `None` for an empty selection or one that maps
-/// to zero width.
-///
-/// **Not wired into either backend's paint path yet (#816 review).** TUI
-/// paints its selection by inverting fg/bg per character cell
-/// (`tui_main::panels::render_command_line`) and never needs pixel geometry.
-/// GTK has no equivalent: `quadraui::CommandLine` carries no `selection`
-/// field, and neither the GTK nor TUI `draw_command_line` in quadraui paints
-/// one — so a GTK user who drags a selection over the command line gets
-/// `cmd_sel`/Ctrl+C-copy behaviour with zero visual feedback. Hand-rolling a
-/// Cairo highlight rect here (even using this function's geometry) would be
-/// exactly the per-backend workaround CLAUDE.md's Platform-Neutrality Rule
-/// forbids; the correct fix is a `CommandLine::selection` field painted by
-/// quadraui's own `draw_command_line` (both backends). This function exists
-/// so that fix has the geometry math ready the day the primitive lands — see
-/// the quadraui issue tracking that gap (file one against
-/// `JDonaghy/quadraui` if it does not already exist; #816 stays open behind
-/// it rather than being closed as GTK-selection-complete).
-pub fn command_line_selection_rect(
-    rect: quadraui::Rect,
-    text: &str,
-    char_width: f32,
-    sel: (usize, usize),
-) -> Option<quadraui::Rect> {
-    let cmd = quadraui::CommandLine {
-        id: quadraui::WidgetId::new("cmdline:selection"),
-        text: text.to_string(),
-        cursor_offset: None,
-        right_align: false,
-    };
-    let layout = cmd.layout(rect, quadraui::CommandLineMeasure::new(char_width));
-    let lo = command_line_char_to_byte_idx(text, sel.0);
-    let hi = command_line_char_to_byte_idx(text, sel.1);
-    layout.selection_bounds((lo, hi))
+/// Convert a mouse selection `sel` (character-count `(anchor, head)`,
+/// either order — the unit `Engine::cmd_sel` uses throughout, INCLUSIVE at
+/// both ends: `route_cmdline_selection_key`'s Ctrl+C copy keeps every char
+/// with `lo <= i <= hi`, and a bare click with no drag sets `(idx, idx)`
+/// to highlight that one character) into the byte-offset `(start, end)`
+/// pair [`quadraui::Backend::draw_command_line_selection`] expects, relative
+/// to `text`. That pair is EXCLUSIVE at `end` (same contract as
+/// `CommandLineLayout::selection_bounds`, which supplies its geometry) —
+/// hence the `hi + 1` below, not a straight per-endpoint byte conversion.
+/// Both backends' paint paths call this immediately before handing `cmd_sel`
+/// to that method (issue #1185 — the consume side of quadraui#1001, which
+/// shipped the primitive this function now feeds).
+pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, usize) {
+    let lo = sel.0.min(sel.1);
+    let hi = sel.0.max(sel.1);
+    (
+        command_line_char_to_byte_idx(text, lo),
+        command_line_char_to_byte_idx(text, hi + 1),
+    )
 }
 
 // ─── Shared click target + layout geometry helpers ──────────────────────────
@@ -19983,6 +23812,21 @@ pub enum WindowZone {
         seg_col_offset: usize,
         text_rel_x: f64,
     },
+    /// The minimap strip's own column range, plus the scroll-affordance
+    /// gutter it always leaves clear alongside it (#1094 review). Neither
+    /// is text: real presses on the strip are resolved earlier by
+    /// `apply_minimap_click`, before `window_zone_hit_test` ever runs, so
+    /// every caller here treats this as a dead zone — the `_` arm in
+    /// `click.rs::pixel_to_click_target`'s match, and the `let ... else` /
+    /// `if let WindowZone::TextArea` patterns in `tui_main/mouse.rs`, both
+    /// already fall through to "not resolved" for any non-`TextArea`
+    /// variant without needing an explicit arm for this one. It exists so a
+    /// text-selection drag whose pointer sweeps over the strip's pixels
+    /// stops extending the selection there, matching the pre-#1094 outcome
+    /// (when the narrower `rect` made such a point fall outside the window
+    /// entirely) without re-narrowing `rect`, which #1094 deliberately
+    /// stopped doing.
+    Minimap,
 }
 
 /// Action to take on a gutter click.
@@ -20238,6 +24082,23 @@ pub trait DividerGeometry {
     fn axis_size(&self) -> f64;
     fn cross_start(&self) -> f64;
     fn cross_size(&self) -> f64;
+
+    /// Screen space consumed by the divider itself, along the split axis —
+    /// `axis_size() - divider_thickness()` is the *content* width/height the
+    /// split's `ratio` actually divides (see [`divider_ratio_from_pos`]).
+    /// Zero for every divider today except a `WindowDivider` in the
+    /// `Vertical` direction, which — unlike `GroupDivider`'s editor-group
+    /// splits, still `quadraui::SplitTreeMeasure::new(0.0)` — reserves one
+    /// screen column for Neovim's real vertical divider bar
+    /// (`WindowLayout::layout_snapped`, #1326). `position`/`axis_start`/
+    /// `axis_size` themselves are untouched by this (they describe what was
+    /// actually *painted*, which `divider_to_split`/`divider_hit_test` must
+    /// stay anchored to) — only the drag-to-ratio conversion needs to know
+    /// the reserved thickness, so it is its own method rather than folding
+    /// into `axis_size()`.
+    fn divider_thickness(&self) -> f64 {
+        0.0
+    }
 }
 
 impl DividerGeometry for GroupDivider {
@@ -20279,6 +24140,12 @@ impl DividerGeometry for WindowDivider {
     }
     fn cross_size(&self) -> f64 {
         self.cross_size
+    }
+    fn divider_thickness(&self) -> f64 {
+        match self.direction {
+            SplitDirection::Vertical => 1.0,
+            SplitDirection::Horizontal => 0.0,
+        }
     }
 }
 
@@ -20336,12 +24203,22 @@ pub fn divider_hit_test<D: DividerGeometry>(
 /// Given a divider being dragged and the current pointer position, compute
 /// the new split ratio (unclamped — `set_ratio_at_index` on both
 /// `GroupLayout` and `WindowLayout` already clamps to `0.1..0.9`).
+///
+/// Divides by `axis_size() - divider_thickness()`, not raw `axis_size()`
+/// (#1326): `WindowLayout::layout_snapped` interprets a `Vertical` split's
+/// `ratio` as a fraction of the *content* width (bounds width minus the
+/// reserved divider column), so a drag that instead divided by the full
+/// `axis_size()` would feed back a ratio the layout doesn't mean — a
+/// perceptible drift on a narrow split, since the denominators differ by a
+/// whole screen column. `GroupDivider`'s `divider_thickness()` is always
+/// zero, so this is a no-op there.
 pub fn divider_ratio_from_pos(div: &impl DividerGeometry, x: f64, y: f64) -> f64 {
     let mouse_pos = match div.direction() {
         SplitDirection::Vertical => x,
         SplitDirection::Horizontal => y,
     };
-    (mouse_pos - div.axis_start()) / div.axis_size()
+    let content_axis_size = (div.axis_size() - div.divider_thickness()).max(1.0);
+    (mouse_pos - div.axis_start()) / content_axis_size
 }
 
 /// Convert a [`DividerGeometry`] divider into the `(quadraui::Split,
@@ -20439,13 +24316,17 @@ pub fn window_zone_hit_test(
     let gutter_w = rw.gutter_char_width as f64 * char_width;
     let has_v_sb = rw.total_lines > viewport_lines;
     let sb_w = if has_v_sb { char_width } else { 0.0 };
-    let viewport_cols = if char_width > 0.0 {
-        ((rw.rect.width - sb_w) / char_width).floor() as usize
-    } else {
-        1
-    }
-    .saturating_sub(rw.gutter_char_width)
-    .max(1);
+    // #1094 review: reuse `rw.text_viewport_cols` — already computed by
+    // `build_rendered_window` with the minimap strip's width (and any
+    // scrollbar overlay reserve) subtracted — instead of an independent
+    // recomputation from `rw.rect.width` that had no knowledge of the strip
+    // at all. `rw.rect` now reaches the pane's *true* right edge (#1094's
+    // own fix moved the scrollbar there), so re-deriving `viewport_cols`
+    // from it directly would silently include the strip's columns,
+    // undercounting how often `has_h_sb` should be true and letting a
+    // click on a visibly-painted horizontal scrollbar fall through to
+    // `TextArea` instead.
+    let viewport_cols = rw.text_viewport_cols.max(1);
     let has_h_sb = rw.max_col > viewport_cols && viewport_lines > 1;
 
     // 2. Vertical scrollbar (rightmost column).
@@ -20453,7 +24334,20 @@ pub fn window_zone_hit_test(
         return WindowZone::VerticalScrollbar { view_row };
     }
 
-    // 3. Horizontal scrollbar (bottom content row, above status bar).
+    // 3. Minimap strip, plus the scroll-affordance gutter it always leaves
+    // clear alongside it (#1094 review) — see `WindowZone::Minimap`'s doc
+    // comment for why this has to be excluded here rather than relying on
+    // `apply_minimap_click` alone (that resolver is skipped for
+    // text-selection drag continuations). Checked after the vertical
+    // scrollbar so a shown scrollbar's own pixels still resolve to
+    // `VerticalScrollbar` above; this only ever matches the strip itself,
+    // or (when the vertical scrollbar isn't currently shown) the sliver of
+    // gutter that stays reserved for it regardless.
+    if rw.minimap_reserved_w > 0.0 && rel_x >= rw.rect.width - rw.minimap_reserved_w {
+        return WindowZone::Minimap;
+    }
+
+    // 4. Horizontal scrollbar (bottom content row, above status bar).
     let h_sb_y = content_h - line_height;
     if has_h_sb && rel_y >= h_sb_y && rel_y < content_h {
         return WindowZone::HorizontalScrollbar {
@@ -20468,7 +24362,7 @@ pub fn window_zone_hit_test(
         .map(|rl| (rl.line_idx, rl.segment_col_offset))
         .unwrap_or((rw.scroll_top + view_row, 0));
 
-    // 4. Gutter.
+    // 5. Gutter.
     if gutter_w > 0.0 && rel_x < gutter_w {
         let gutter_col = if char_width > 0.0 {
             (rel_x / char_width).floor() as usize
@@ -20482,13 +24376,138 @@ pub fn window_zone_hit_test(
         };
     }
 
-    // 5. Text area.
+    // 6. Text area.
     let text_rel_x = rel_x - gutter_w;
     WindowZone::TextArea {
         view_row,
         buf_line: line_idx,
         seg_col_offset,
         text_rel_x,
+    }
+}
+
+/// Outcome of resolving a click against an editor window's own scrollbar
+/// track (vertical or horizontal), returned by
+/// [`resolve_editor_scrollbar_click`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EditorScrollbarClick {
+    /// The click landed on the empty track, outside the thumb: page one
+    /// viewport toward the click. The new scroll offset to apply.
+    PageTo(usize),
+    /// The click landed on the thumb itself: begin a drag. `grab_offset`
+    /// (native units — pixels for GTK, whole cells for TUI) is the click's
+    /// offset from the thumb's leading edge, preserved so the thumb doesn't
+    /// jump out from under the cursor when the drag starts.
+    BeginDrag { grab_offset: f32 },
+}
+
+/// Resolve a click on an editor window's scrollbar track — thumb-drag vs.
+/// track page-jump — independent of axis (vertical/horizontal) and backend
+/// geometry units (`unit_w`/`unit_h` convention: pixels for GTK, whole
+/// cells for TUI).
+///
+/// #1061: this exact three-way decision (page toward the click on the empty
+/// track either side of the thumb; begin a drag, with a grab offset that
+/// keeps the cursor's relative position on the thumb, when the click lands
+/// on the thumb itself) was hand-rolled four times — once per axis, once
+/// per backend (`tui_main/mouse.rs`'s v/h scrollbar arms, `app.rs`'s v/h
+/// scrollbar arms) — plus a fifth, independent re-derivation of the same
+/// thumb math inside TUI's own `scrollbar_grab_offset` helper (now
+/// deleted), which the other three copies never needed because their
+/// grab-offset math already reused the same thumb bounds as their
+/// page-vs-thumb decision. This is that one decision, shared.
+///
+/// `click_pos` is the click's position along the scroll axis (row for
+/// vertical, column for horizontal — TUI; y/x — GTK), in the same native
+/// unit and coordinate origin as `thumb_start`/`thumb_end`. `thumb_start`/
+/// `thumb_end` are the thumb's absolute bounds along that axis — callers
+/// derive them however their own backend already does (both currently via
+/// `quadraui::fit_thumb`, TUI additionally quantizing to whole cells so the
+/// click decision matches what's actually painted on a terminal grid).
+/// `track_visible` is how many lines/cols fit in one page (a click-derived
+/// scroll jumps by exactly this much); `max_scroll` is the largest valid
+/// scroll offset; `current_scroll` is the scroll offset at click time.
+pub fn resolve_editor_scrollbar_click(
+    click_pos: f32,
+    thumb_start: f32,
+    thumb_end: f32,
+    track_visible: usize,
+    max_scroll: usize,
+    current_scroll: usize,
+) -> EditorScrollbarClick {
+    if click_pos < thumb_start {
+        EditorScrollbarClick::PageTo(current_scroll.saturating_sub(track_visible))
+    } else if click_pos >= thumb_end {
+        EditorScrollbarClick::PageTo((current_scroll + track_visible).min(max_scroll))
+    } else {
+        EditorScrollbarClick::BeginDrag {
+            grab_offset: click_pos - thumb_start,
+        }
+    }
+}
+
+#[cfg(test)]
+mod editor_scrollbar_click_tests {
+    //! #1061: `resolve_editor_scrollbar_click` replaces four hand-rolled
+    //! copies (TUI v/h in `tui_main/mouse.rs`, GTK v/h in `app.rs`) of this
+    //! same three-way decision. These pin the pure decision logic directly;
+    //! `harness.rs`'s `issue_987_group_scrollbar_inert_and_click_resizes`
+    //! module and its new `tui_prod`-arm sibling drive it end-to-end through
+    //! both backends' real click handlers.
+    use super::*;
+
+    #[test]
+    fn click_above_thumb_pages_backward_by_one_viewport() {
+        // Track [0, 100), thumb [40, 50), click at 10 (above the thumb).
+        let outcome = resolve_editor_scrollbar_click(10.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(20));
+    }
+
+    #[test]
+    fn click_above_thumb_saturates_at_zero() {
+        let outcome = resolve_editor_scrollbar_click(2.0, 40.0, 50.0, 20, 80, 5);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(0));
+    }
+
+    #[test]
+    fn click_below_thumb_pages_forward_by_one_viewport() {
+        // Track [0, 100), thumb [40, 50), click at 90 (below the thumb).
+        let outcome = resolve_editor_scrollbar_click(90.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(60));
+    }
+
+    #[test]
+    fn click_below_thumb_clamps_to_max_scroll() {
+        let outcome = resolve_editor_scrollbar_click(90.0, 40.0, 50.0, 20, 55, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(55));
+    }
+
+    #[test]
+    fn click_on_thumb_begins_a_drag_with_the_grab_offset_preserved() {
+        // Thumb spans [40, 50); a click at 43 is 3 units into it.
+        let outcome = resolve_editor_scrollbar_click(43.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(
+            outcome,
+            EditorScrollbarClick::BeginDrag { grab_offset: 3.0 }
+        );
+    }
+
+    #[test]
+    fn click_exactly_on_thumb_start_begins_a_drag_at_zero_offset() {
+        let outcome = resolve_editor_scrollbar_click(40.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(
+            outcome,
+            EditorScrollbarClick::BeginDrag { grab_offset: 0.0 }
+        );
+    }
+
+    #[test]
+    fn click_exactly_on_thumb_end_is_track_not_drag() {
+        // `thumb_end` is exclusive — this is the boundary #987's own
+        // negative-space case cares about: a click one unit past the
+        // thumb must not be swallowed as a drag.
+        let outcome = resolve_editor_scrollbar_click(50.0, 40.0, 50.0, 20, 80, 40);
+        assert_eq!(outcome, EditorScrollbarClick::PageTo(60));
     }
 }
 
@@ -20553,17 +24572,17 @@ pub fn apply_gutter_action(
             engine.dap_toggle_breakpoint(&file, line as u64 + 1);
         }
         Some(GutterAction::DiffPeek(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.open_diff_peek();
         }
         Some(GutterAction::DiagnosticHover(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.trigger_editor_hover_for_line(line);
         }
         Some(GutterAction::CodeAction(line)) => {
-            engine.active_tab_mut().active_window = window_id;
+            engine.active_tab_mut().focus_window(window_id);
             engine.view_mut().cursor.line = line;
             engine.show_code_actions_popup();
         }
@@ -20610,7 +24629,7 @@ pub fn compute_editor_layout(
     menu_in_viewport: bool,
 ) -> EditorLayout {
     let lh = line_height;
-    let per_window = engine.settings.window_status_line;
+    let per_window = effective_window_status_line(engine);
     let bp_open = engine.terminal_open || engine.bottom_panel_open;
 
     let menu_h = if menu_in_viewport && engine.menu_bar_visible {
@@ -20624,11 +24643,19 @@ pub fn compute_editor_layout(
         tab_bar_height_px(lh, engine.settings.breadcrumbs)
     };
     let debug_toolbar_h = debug_toolbar_height_px(lh, engine.debug_toolbar_visible);
-    let quickfix_h = if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-        6.0 * lh
-    } else {
-        0.0
-    };
+    // Shares one bottom "list rung" with the active window's location list
+    // (#1155) — see `quickfix_panel_rows`, the TUI-side equivalent of this
+    // same rule. #1307: a target with a real `WindowLayout` leaf takes its
+    // own space from the split tree, so this overlay band must not reserve
+    // rows for it too — see `quickfix_panel_rows`'s matching guard.
+    let qf_or_loc_open = !engine.qf_has_real_window(None)
+        && !engine.qf_has_real_window(Some(engine.active_window_id()))
+        && ((engine.quickfix.open && !engine.quickfix.items.is_empty())
+            || engine
+                .location_lists
+                .get(&engine.active_window_id())
+                .is_some_and(|l| l.open && !l.items.is_empty()));
+    let quickfix_h = if qf_or_loc_open { 6.0 * lh } else { 0.0 };
     let has_separated = per_window && !engine.settings.status_line_above_terminal && bp_open;
     let separated_status_h = separated_status_height_px(lh, has_separated);
     let wildmenu_h = if engine.wildmenu_items.is_empty() {
@@ -20636,7 +24663,11 @@ pub fn compute_editor_layout(
     } else {
         lh
     };
-    let status_bar_h = status_bar_height_px(lh, per_window, !engine.wildmenu_items.is_empty());
+    let status_bar_h = status_bar_height_px(
+        lh,
+        global_status_bar_visible(engine),
+        !engine.wildmenu_items.is_empty(),
+    );
     let command_line_h = lh;
 
     let (terminal_h, terminal_content_rows, terminal_max_target_rows) = if bp_open {
@@ -20648,11 +24679,7 @@ pub fn compute_editor_layout(
             } else {
                 0
             },
-            quickfix_rows: if engine.quickfix_open && !engine.quickfix_items.is_empty() {
-                6
-            } else {
-                0
-            },
+            quickfix_rows: if qf_or_loc_open { 6 } else { 0 },
             debug_toolbar_rows: if engine.debug_toolbar_visible { 1 } else { 0 },
             wildmenu_rows: if engine.wildmenu_items.is_empty() {
                 0
@@ -20741,13 +24768,15 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
 }
 
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
-pub fn status_bar_height_px(
-    line_height: f64,
-    per_window_status_line: bool,
-    has_wildmenu: bool,
-) -> f64 {
+///
+/// `show_global_status` is [`global_status_bar_visible`]'s value, **not**
+/// `effective_window_status_line`'s — the always-present command line needs
+/// only one row when no *global* bar occupies its own (either because each
+/// window paints its own status, or `'laststatus'` hides the status line
+/// entirely), and two when the global bar has its own row to sit in.
+pub fn status_bar_height_px(line_height: f64, show_global_status: bool, has_wildmenu: bool) -> f64 {
     let wildmenu_px = if has_wildmenu { line_height } else { 0.0 };
-    let global_rows = if per_window_status_line { 1.0 } else { 2.0 };
+    let global_rows = if show_global_status { 2.0 } else { 1.0 };
     line_height * global_rows + wildmenu_px
 }
 
@@ -20925,11 +24954,13 @@ pub fn split_menu_row_for_app_icon(
 /// gdk-pixbuf loader installed) should leave the slot blank rather than paint
 /// a placeholder string where a logo belongs.
 ///
-/// **Painting code wants `gtk::util::app_icon_image()`, not this.** quadraui's
-/// `Image` carries no cache, so `Backend::draw_image` re-decodes `source` every
-/// frame — and a 1024×1024 SVG through librsvg costs ~16.5 ms of that. This
-/// function owns the icon's *identity* (which asset, which fit, which id); the
-/// GTK wrapper reuses all of it and swaps in a once-rasterised small PNG.
+/// Painting code wants `crate::app`'s `app_icon_image_for_paint()`, which
+/// currently just forwards here — kept as a separate name so the paint site
+/// documents *why* it's safe to hand `Backend::draw_image` the raw SVG
+/// directly rather than pre-rasterising it itself: quadraui#1014 added a
+/// decode cache inside `Backend::draw_image` (GTK and macOS so far), so this
+/// function no longer needs a per-backend wrapper to dodge re-decoding the
+/// 1024×1024 SVG through librsvg on every frame (#1102).
 pub fn app_icon_image() -> quadraui::Image {
     quadraui::Image {
         id: quadraui::WidgetId::new("app-icon"),
@@ -20941,20 +24972,33 @@ pub fn app_icon_image() -> quadraui::Image {
 }
 
 // ─── Tab drop-zone (shared) ─────────────────────────────────────────────────
+//
+// #1370: this used to be vimcode's own hand-rolled geometry (`TabDropGroup`,
+// `build_tab_drop_groups`, `compute_tab_drop_zone`, `compute_tab_drop_overlay`)
+// layered on top of quadraui's geometry-only `compute_drop_zone` primitive.
+// quadraui#998 landed the missing piece — `resolve_tab_drop`, a
+// host-owned-model adoption path that takes the drag *source* (which pane/tab,
+// per vimcode's own `Engine::editor_groups`) and returns a position-based
+// `TabDropInstruction` instead of mutating a `TabGroupController`-owned
+// `Vec<Pane>` vimcode doesn't have. [`TabDropCtx`]/[`build_tab_drop_ctx`] is
+// now the only local adapter: it flattens a frame's group geometry into the
+// parallel index-aligned slices `resolve_tab_drop` (mutation) and
+// `drop_zone_hit_test`/`drop_zone_overlay` (overlay) both key off of the same
+// `group_idx`/`pane_idx`.
 
-pub struct TabDropGroup {
-    pub group_id: GroupId,
-    pub rect: quadraui::DropGroupRect,
-    pub tab_scroll_offset: usize,
+/// Per-frame tab-drop geometry, index-aligned so `group_ids[i]` /
+/// `rects[i]` / `tab_counts[i]` all describe the same pane — the same index
+/// quadraui's `resolve_tab_drop` calls `pane_idx` and `drop_zone_hit_test`
+/// calls `group_idx`.
+#[derive(Default, Debug)]
+pub struct TabDropCtx {
+    pub group_ids: Vec<GroupId>,
+    pub rects: Vec<quadraui::DropGroupRect>,
+    pub tab_counts: Vec<usize>,
+    pub tab_bar_height: f32,
 }
 
-pub struct TabDropOverlay {
-    pub highlight: Option<quadraui::Rect>,
-    pub insertion_bar: Option<quadraui::Rect>,
-    pub ghost_position: (f32, f32),
-}
-
-/// Lightweight group-bounds descriptor for [`build_tab_drop_groups`].
+/// Lightweight group-bounds descriptor for [`build_tab_drop_ctx`].
 pub struct DropGroupBounds {
     pub group_id: GroupId,
     pub x: f32,
@@ -20964,21 +25008,26 @@ pub struct DropGroupBounds {
     pub tab_scroll_offset: usize,
 }
 
-/// Build `TabDropGroup`s from a set of group bounds.
+/// Build a [`TabDropCtx`] from a set of group bounds.
 ///
 /// `tab_bar_height` is in the same units as the bounds (cells for TUI,
 /// pixels for GTK/Win-GUI). Each group's bounds describe the
 /// **content area** — the function prepends `tab_bar_height` above.
 ///
-/// `tab_slots_map` maps `GroupId.0` → visible tab slot positions in
-/// the same coordinate system as the bounds.
-pub fn build_tab_drop_groups(
+/// `tab_slots_map` maps `GroupId.0` → per-tab slot positions, index-aligned
+/// to the group's own `Vec<Tab>` with a `(0.0, 0.0)` sentinel for any tab
+/// scrolled off the strip — the convention `quadraui::DropGroupRect::tab_slots`
+/// and `PaneDragRect::tab_slots` both document, and the one `build_tui_tab_slots`
+/// / `TabBarHits::slot_positions` already produce.
+pub fn build_tab_drop_ctx(
     group_bounds: &[DropGroupBounds],
     engine: &crate::core::engine::Engine,
     tab_bar_height: f32,
     tab_slots_map: &std::collections::HashMap<usize, Vec<(f32, f32)>>,
-) -> (Vec<TabDropGroup>, f32) {
-    let mut groups = Vec::new();
+) -> TabDropCtx {
+    let mut group_ids = Vec::with_capacity(group_bounds.len());
+    let mut rects = Vec::with_capacity(group_bounds.len());
+    let mut tab_counts = Vec::with_capacity(group_bounds.len());
     let breadcrumbs = engine.settings.breadcrumbs;
 
     for gb in group_bounds {
@@ -21000,34 +25049,46 @@ pub fn build_tab_drop_groups(
                 .cloned()
                 .unwrap_or_default()
         };
-        groups.push(TabDropGroup {
-            group_id: gb.group_id,
-            rect: quadraui::DropGroupRect {
-                bounds: quadraui::Rect::new(
-                    gb.x,
-                    gb.y - eff_tbh,
-                    gb.width,
-                    eff_tbh + gb.content_height,
-                ),
-                tab_slots,
-            },
-            tab_scroll_offset: gb.tab_scroll_offset,
+        group_ids.push(gb.group_id);
+        rects.push(quadraui::DropGroupRect {
+            bounds: quadraui::Rect::new(
+                gb.x,
+                gb.y - eff_tbh,
+                gb.width,
+                eff_tbh + gb.content_height,
+            ),
+            tab_slots,
         });
+        tab_counts.push(
+            engine
+                .editor_groups
+                .get(&gb.group_id)
+                .map(|g| g.tabs.len())
+                .unwrap_or(0),
+        );
     }
 
-    let effective_tbh = if groups.iter().any(|g| engine.is_tab_bar_hidden(g.group_id)) {
+    let effective_tbh = if group_bounds
+        .iter()
+        .any(|gb| engine.is_tab_bar_hidden(gb.group_id))
+    {
         0.0
     } else {
         tab_bar_height
     };
-    (groups, effective_tbh)
+    TabDropCtx {
+        group_ids,
+        rects,
+        tab_counts,
+        tab_bar_height: effective_tbh,
+    }
 }
 
 /// Build [`DropGroupBounds`] from a `ScreenLayout`. Both TUI and GTK call
 /// this when the `ScreenLayout` is available (draw path, or TUI's cached
 /// layout).
 ///
-/// [`DropGroupBounds`] (and `build_tab_drop_groups`, which reconstructs the
+/// [`DropGroupBounds`] (and [`build_tab_drop_ctx`], which reconstructs the
 /// tab-bar band by subtracting `tab_bar_height` back out) expects
 /// **content-area** bounds — i.e. already past the tab bar — which is exactly
 /// what every `GroupTabBar::bounds` is ("content area of this group; tab bar
@@ -21059,114 +25120,127 @@ pub fn screen_to_drop_group_bounds(screen: &ScreenLayout) -> Vec<DropGroupBounds
         .collect()
 }
 
-/// #822 asks this adapter (and [`build_tab_drop_groups`]) to be replaced by
-/// `quadraui::compose::TabGroupController`. See the doc comment on
-/// [`TabDragState`] and `docs/PENDING_QUADRAUI_ISSUES.md` for why that isn't
-/// a like-for-like swap yet, and #822 must stay open behind the drafted
-/// quadraui gap rather than close on this investigation alone. The geometry
-/// math this function does is already shared (it calls straight through to
-/// `quadraui::compute_drop_zone`); what's local is the `Engine` ↔
-/// `TabDropGroup` adapter.
-pub fn compute_tab_drop_zone(
-    cursor_x: f32,
-    cursor_y: f32,
-    groups: &[TabDropGroup],
-    tab_bar_height: f32,
-) -> crate::core::window::DropZone {
-    use crate::core::window::DropZone;
-
-    let rects: Vec<quadraui::DropGroupRect> = groups.iter().map(|g| g.rect.clone()).collect();
-    match quadraui::compute_drop_zone(cursor_x, cursor_y, &rects, tab_bar_height) {
-        Some(qz) => {
-            let g = &groups[qz.group_idx];
-            match qz.kind {
-                quadraui::DropZoneKind::Center => DropZone::Center(g.group_id),
-                quadraui::DropZoneKind::Split(edge) => {
-                    let (dir, new_first) = match edge {
-                        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
-                        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
-                        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
-                        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
-                    };
-                    DropZone::Split(g.group_id, dir, new_first)
-                }
-                quadraui::DropZoneKind::TabReorder(idx) => {
-                    DropZone::TabReorder(g.group_id, g.tab_scroll_offset + idx)
-                }
-            }
-        }
-        None => DropZone::None,
+/// Map a [`quadraui::DropEdge`] to vimcode's own [`SplitDirection`] plus
+/// which side the new pane lands on. Mirrors [`TabDropInstruction`]'s own
+/// `edge` → `split_direction` mapping, but in vimcode's `SplitDirection`
+/// naming rather than quadraui's (the two crates name the same physical
+/// split oppositely: quadraui's `SplitDirection::Horizontal` is vimcode's
+/// `SplitDirection::Vertical` — a side-by-side pair divided by a vertical
+/// line).
+fn split_edge_to_vimcode(edge: quadraui::DropEdge) -> (SplitDirection, bool) {
+    match edge {
+        quadraui::DropEdge::Left => (SplitDirection::Vertical, true),
+        quadraui::DropEdge::Right => (SplitDirection::Vertical, false),
+        quadraui::DropEdge::Top => (SplitDirection::Horizontal, true),
+        quadraui::DropEdge::Bottom => (SplitDirection::Horizontal, false),
     }
 }
 
-pub fn compute_tab_drop_overlay(
-    drop_zone: &crate::core::window::DropZone,
-    groups: &[TabDropGroup],
-    cursor: (f32, f32),
-    tab_bar_height: f32,
+/// Resolve a live tab drag against `ctx` into vimcode's own
+/// [`crate::core::window::DropZone`] — the shape `Engine::apply_tab_drop_zone`
+/// already mutates from — via quadraui's host-owned-model adoption path
+/// (`quadraui::compose::resolve_tab_drop`, #998) instead of a hand-rolled
+/// geometry walk (#1370, replaces the old `compute_tab_drop_zone`).
+///
+/// `source` is `(group, tab index)` of the tab being dragged, captured when
+/// the drag began — [`resolve_tab_drop`][quadraui::compose::resolve_tab_drop]
+/// needs it up front to decide same-pane reorder vs. cross-pane merge, unlike
+/// the old geometry-only `compute_tab_drop_zone`, which deferred that
+/// decision to `apply_tab_drop_zone` at commit time.
+///
+/// `MoveToPane` collapses what used to be two distinct `DropZone` variants
+/// (`Center` for a content-area drop, `TabReorder` for a tab-bar drop into
+/// another group) into one instruction — its `insert_idx` already defaults to
+/// "append at the end" for the former, so mapping both to `DropZone::TabReorder`
+/// here reproduces the old mutation exactly. The lost visual distinction
+/// (highlight-the-whole-group vs. an insertion bar) is not lost overall: the
+/// overlay is resolved independently, from the same `ctx`, by
+/// [`tab_drop_overlay`] against quadraui's geometry-only `DropZoneKind`.
+pub fn resolve_tab_drop_zone(
+    ctx: &TabDropCtx,
+    source: (GroupId, usize),
+    cursor_x: f32,
+    cursor_y: f32,
+) -> crate::core::window::DropZone {
+    use crate::core::window::DropZone;
+    use quadraui::compose::{TabDragSource, TabDropInstruction};
+
+    let Some(pane_idx) = ctx.group_ids.iter().position(|&g| g == source.0) else {
+        return DropZone::None;
+    };
+    let instr = quadraui::compose::resolve_tab_drop(
+        TabDragSource {
+            pane_idx,
+            tab_idx: source.1,
+        },
+        &ctx.tab_counts,
+        cursor_x,
+        cursor_y,
+        &ctx.rects,
+        ctx.tab_bar_height,
+    );
+    match instr {
+        TabDropInstruction::NoOp => DropZone::None,
+        TabDropInstruction::Reorder {
+            pane_idx, to_idx, ..
+        } => ctx
+            .group_ids
+            .get(pane_idx)
+            .map(|&gid| DropZone::TabReorder(gid, to_idx))
+            .unwrap_or(DropZone::None),
+        TabDropInstruction::MoveToPane {
+            to_pane_idx,
+            insert_idx,
+            ..
+        } => ctx
+            .group_ids
+            .get(to_pane_idx)
+            .map(|&gid| DropZone::TabReorder(gid, insert_idx))
+            .unwrap_or(DropZone::None),
+        TabDropInstruction::SplitToNewPane {
+            target_pane_idx,
+            edge,
+            ..
+        } => {
+            let (direction, new_first) = split_edge_to_vimcode(edge);
+            ctx.group_ids
+                .get(target_pane_idx)
+                .map(|&gid| DropZone::Split(gid, direction, new_first))
+                .unwrap_or(DropZone::None)
+        }
+    }
+}
+
+/// Resolve the drop-zone overlay geometry for `ctx` at `(cursor_x, cursor_y)`
+/// — straight from quadraui's own [`quadraui::drop_zone_hit_test`] /
+/// [`quadraui::drop_zone_overlay`], no vimcode-local adapter (#1370, replaces
+/// the old `compute_tab_drop_overlay`/`TabDropOverlay`).
+///
+/// Deliberately independent of [`resolve_tab_drop_zone`]: that function
+/// answers "what mutation should this drop commit", collapsing `Center` and
+/// cross-pane `TabReorder` into one `MoveToPane`; this function answers "what
+/// should the overlay look like *right now*", which still needs that
+/// distinction (a highlight over the whole pane vs. an insertion bar) to
+/// paint correctly. Both are pure queries over the same `ctx`, so computing
+/// the hit test twice (once per question) costs nothing correctness-relevant.
+pub fn tab_drop_overlay(
+    ctx: &TabDropCtx,
+    cursor_x: f32,
+    cursor_y: f32,
     bar_thickness: f32,
     ghost_offset: f32,
-) -> Option<TabDropOverlay> {
-    use crate::core::window::DropZone;
-
-    let ghost_position = (cursor.0 + ghost_offset, cursor.1);
-
-    match drop_zone {
-        DropZone::None => None,
-        DropZone::Center(gid) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            Some(TabDropOverlay {
-                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, b.height)),
-                insertion_bar: None,
-                ghost_position,
-            })
-        }
-        DropZone::Split(gid, dir, new_first) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            let h = match (dir, new_first) {
-                (SplitDirection::Vertical, true) => {
-                    quadraui::Rect::new(b.x, b.y, b.width / 2.0, b.height)
-                }
-                (SplitDirection::Vertical, false) => {
-                    quadraui::Rect::new(b.x + b.width / 2.0, b.y, b.width / 2.0, b.height)
-                }
-                (SplitDirection::Horizontal, true) => {
-                    quadraui::Rect::new(b.x, b.y, b.width, b.height / 2.0)
-                }
-                (SplitDirection::Horizontal, false) => {
-                    quadraui::Rect::new(b.x, b.y + b.height / 2.0, b.width, b.height / 2.0)
-                }
-            };
-            Some(TabDropOverlay {
-                highlight: Some(h),
-                insertion_bar: None,
-                ghost_position,
-            })
-        }
-        DropZone::TabReorder(gid, abs_idx) => {
-            let g = groups.iter().find(|g| g.group_id == *gid)?;
-            let b = &g.rect.bounds;
-            let vis_idx = abs_idx.saturating_sub(g.tab_scroll_offset);
-            let bar_x = if vis_idx < g.rect.tab_slots.len() {
-                g.rect.tab_slots[vis_idx].0
-            } else if let Some(last) = g.rect.tab_slots.last() {
-                last.1
-            } else {
-                b.x
-            };
-            Some(TabDropOverlay {
-                highlight: Some(quadraui::Rect::new(b.x, b.y, b.width, tab_bar_height)),
-                insertion_bar: Some(quadraui::Rect::new(
-                    bar_x - bar_thickness / 2.0,
-                    b.y,
-                    bar_thickness,
-                    tab_bar_height,
-                )),
-                ghost_position,
-            })
-        }
+) -> Option<quadraui::DropOverlay> {
+    match quadraui::drop_zone_hit_test(cursor_x, cursor_y, &ctx.rects, ctx.tab_bar_height) {
+        quadraui::DropZoneHit::Zone(zone) => Some(quadraui::drop_zone_overlay(
+            &zone,
+            &ctx.rects,
+            cursor_x,
+            cursor_y,
+            ctx.tab_bar_height,
+            bar_thickness,
+            ghost_offset,
+        )),
+        quadraui::DropZoneHit::Empty => None,
     }
 }
 
@@ -21307,6 +25381,7 @@ mod tests {
                 FrameOp::UnifiedPicker,
                 FrameOp::TabSwitcher,
                 FrameOp::ContextMenu,
+                FrameOp::ChangeReview,
                 FrameOp::Dialog,
                 FrameOp::ToastStack,
             ],
@@ -21407,9 +25482,14 @@ mod tests {
             // `FolderPicker`: shared on both backends since #815, but not
             // folded into this ladder — see `route_folder_picker_click`'s
             // doc comment for why it is checked directly instead.
+            // `ChangeReview` (#955): same policy — see
+            // `route_change_review_click`'s doc comment.
             let routed_elsewhere = matches!(
                 op,
-                FrameOp::MenuDropdown | FrameOp::CommandCenter | FrameOp::FolderPicker
+                FrameOp::MenuDropdown
+                    | FrameOp::CommandCenter
+                    | FrameOp::FolderPicker
+                    | FrameOp::ChangeReview
             );
             assert_eq!(
                 arbitrated, !routed_elsewhere,
@@ -21469,6 +25549,7 @@ mod tests {
             unified_picker: true,
             tab_switcher: true,
             context_menu: true,
+            change_review: true,
             dialog: true,
             toast_stack: true,
         };
@@ -22354,6 +26435,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1127: `themes_dir()` must derive from the cross-platform
+    /// `core::paths::vimcode_config_dir()` (which handles `APPDATA` on
+    /// Windows), not read `$HOME` directly — reading `$HOME` raw would put
+    /// custom VS Code theme JSON files in the wrong directory on Windows.
+    #[test]
+    fn themes_dir_sits_under_vimcode_config_dir() {
+        let themes_dir = Theme::themes_dir().expect("themes_dir should resolve");
+        let config_dir = crate::core::paths::vimcode_config_dir();
+        assert_eq!(themes_dir, config_dir.join("themes"));
+        assert!(
+            themes_dir.starts_with(&config_dir),
+            "themes_dir {themes_dir:?} should be nested under config_dir {config_dir:?}"
+        );
+    }
+
     #[test]
     fn test_format_button_label() {
         assert_eq!(super::format_button_label("Recover", 'r'), "[R]ecover");
@@ -22702,15 +26798,18 @@ mod tests {
 
     // ─── #728: single-predicate status-row reservation ──────────────────
 
-    /// `window_status_row_reserved` is now the only place either
-    /// `build_screen_layout` or GTK's `h_scrollbar_geometry` decide whether
-    /// a window paints its own bottom-row status line. Pin every axis it
-    /// depends on: the base setting, `terminal_maximized` (GTK's old
-    /// predicate accounted for this; `build_screen_layout`'s old one
-    /// didn't), and the `status_line_above_terminal`/bottom-panel
-    /// combination that produces a *separated* status bar instead
-    /// (`build_screen_layout`'s old predicate accounted for this; GTK's old
-    /// one didn't).
+    /// `window_status_row_reserved` is now the only place `build_screen_layout`
+    /// decides whether a window paints its own bottom-row status line — GTK's
+    /// old hand-rolled h-scrollbar geometry helper used to consult it too,
+    /// before #1128 found that GTK's real scrollbar paint (quadraui#968)
+    /// never shrinks its rect for the status row in the first place, so that
+    /// consultation was itself a source of hover/paint drift and was deleted
+    /// rather than fixed. Pin every axis this function depends on: the base
+    /// setting, `terminal_maximized` (GTK's old predicate accounted for
+    /// this; `build_screen_layout`'s old one didn't), and the
+    /// `status_line_above_terminal`/bottom-panel combination that produces a
+    /// *separated* status bar instead (`build_screen_layout`'s old predicate
+    /// accounted for this; GTK's old one didn't).
     #[test]
     fn window_status_row_reserved_covers_every_axis() {
         use crate::core::engine::Engine;
@@ -23114,12 +27213,12 @@ mod tests {
     #[test]
     fn test_status_bar_height_px() {
         let lh = 16.0;
-        // per-window status → 1 global row
-        assert_eq!(status_bar_height_px(lh, true, false), lh);
-        // no per-window → 2 global rows
-        assert_eq!(status_bar_height_px(lh, false, false), 2.0 * lh);
+        // global bar not shown (per-window, or no status at all) → 1 row
+        assert_eq!(status_bar_height_px(lh, false, false), lh);
+        // global bar shown → 2 rows (bar + command line)
+        assert_eq!(status_bar_height_px(lh, true, false), 2.0 * lh);
         // with wildmenu adds one line_height
-        assert_eq!(status_bar_height_px(lh, true, true), 2.0 * lh);
+        assert_eq!(status_bar_height_px(lh, false, true), 2.0 * lh);
     }
 
     #[test]
@@ -23457,16 +27556,62 @@ mod tests {
         test_engine(&text)
     }
 
+    /// A large, syntax-free buffer used to force the strip into #1093's
+    /// genuine sliding-window regime even under #1186's compression: `n` is
+    /// picked per call site to comfortably exceed
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` for that call's own strip
+    /// geometry, so `build_minimap_data` cannot show the whole file no
+    /// matter how generous `K_max` is. Tests using this fixture are
+    /// specifically about the windowed case (file too large to ever fully
+    /// fit), as distinct from the compressed-but-whole-file case #1186
+    /// introduced — see `minimap_scale_grows_to_show_the_whole_file_when_it_fits_the_compression_ceiling`
+    /// for that one.
+    fn windowed_minimap_engine(n: usize) -> Engine {
+        let mut text = String::with_capacity(n * 14);
+        for i in 0..n {
+            text.push_str(&format!("line {i} content\n"));
+        }
+        test_engine(&text)
+    }
+
     /// A synthetic file large enough to make an O(buffer) per-frame cost
-    /// visible: 10,000 lines, none of them trivially short (so a full
+    /// visible: `n_lines` lines, none of them trivially short (so a full
     /// buffer-wide `String` materialisation actually does real allocation
-    /// work, not just touch 10,000 empty strings).
+    /// work, not just touch thousands of empty strings).
+    ///
+    /// #1096 (repairing the #728 guard's blind spot 2): installs a real
+    /// `Syntax` and forces a full reparse, so `buffer_state.highlights` is
+    /// actually populated — `test_engine` alone leaves `syntax: None` (no
+    /// filetype), which is exactly how the #1096 regression (an unbounded
+    /// per-highlighted-line `String` cache in `build_minimap_data`'s
+    /// highlight-mapping loop) went unexercised by every test using this
+    /// fixture: with `highlights` empty, that loop's body never ran at all.
+    /// The text itself (`fn line_N() { do_something(N); }`) was already
+    /// valid enough tree-sitter-Rust input to produce dense, realistic
+    /// highlight spans once a language is actually attached.
     fn large_minimap_engine(n_lines: usize) -> Engine {
         let mut text = String::with_capacity(n_lines * 24);
         for i in 0..n_lines {
             text.push_str(&format!("fn line_{i}() {{ do_something({i}); }}\n"));
         }
-        test_engine(&text)
+        let mut e = test_engine(&text);
+        let state = e.active_buffer_state_mut();
+        state.syntax = Some(crate::core::syntax::Syntax::new_for_language(
+            crate::core::syntax::SyntaxLanguage::Rust,
+        ));
+        // Explicit, generous limit rather than `update_syntax()`'s
+        // process-wide `SYNTAX_MAX_LINES` atomic — other tests write that
+        // atomic (see `test_syntax_max_lines_gate`'s own doc comment), so
+        // reading it here would make this fixture's highlight population
+        // racy under `cargo test`'s default parallelism.
+        state.update_syntax_with_limit(n_lines.saturating_add(1));
+        assert!(
+            !state.highlights.is_empty(),
+            "fixture must produce real highlights or the #1096 regression \
+             class (unbounded per-line allocation in the highlight-mapping \
+             loop) goes unexercised again"
+        );
+        e
     }
 
     /// Time `frames` simulated wheel-scroll frames of `build_minimap_data`
@@ -23484,7 +27629,7 @@ mod tests {
                 w.view.scroll_top = i % n_lines;
             }
             let t0 = std::time::Instant::now();
-            let mm = build_minimap_data(e, &theme, wid, rect, 1.0);
+            let mm = build_minimap_data(e, &theme, wid, rect, 1.0, 40);
             total += t0.elapsed();
             assert!(mm.is_some(), "minimap must build for every simulated frame");
         }
@@ -23526,6 +27671,25 @@ mod tests {
     ///
     /// So the discriminator is ~1x (fixed) vs ~10x (linear); the 4x
     /// threshold below sits between them with generous room on both sides.
+    ///
+    /// #1096 repaired this guard's own blind spot: `large_minimap_engine`
+    /// now installs real Rust highlights (see that fixture's doc comment),
+    /// so this same measurement now also covers the highlight-mapping loop
+    /// — which is exactly where #1096's regression lived, and which the
+    /// unhighlighted fixture used to skip entirely. Re-measured after that
+    /// fix, same machine/build, same 1,000- vs 10,000-line/150-frame setup:
+    ///   - #1096 regression, allocation only removed (highlight loop still
+    ///     scans every entry in `buffer_state.highlights`, itself O(buffer)):
+    ///     up to **~3,167ms/frame** at 10,000 lines, ratio up to ~9.9x —
+    ///     failed this guard outright.
+    ///   - #1096 fix (binary-search each sampled line directly into the
+    ///     sorted `highlights` vec, `partition_point`, instead of scanning
+    ///     it): **~34-44ms/frame**, ratio ~1.3x. The residual ~22ms/frame
+    ///     floor (measured with `highlights` forced empty, same fixture) is
+    ///     #1085's own block-aggregation cost — inherent to that issue's
+    ///     correctness fix, unrelated to highlighting, and out of this
+    ///     issue's scope (see #1093, which replaces this whole sampling
+    ///     strategy, and #1097, the separate non-minimap CPU cost).
     #[test]
     fn minimap_scroll_does_not_scale_with_buffer_size() {
         const SMALL_LINES: usize = 1_000;
@@ -23570,6 +27734,92 @@ mod tests {
         );
     }
 
+    /// #1096 regression guard, repairing both of the #728 guard's blind
+    /// spots at once:
+    ///
+    /// - **Blind spot 1** (`minimap_scroll_does_not_scale_with_buffer_size`
+    ///   asserts a *ratio*, not a ceiling): a same-geometry constant-factor
+    ///   regression multiplies both sides of that ratio equally and cancels
+    ///   out exactly — which is what let #1096 land invisibly (8x more line
+    ///   reads, ~20x more surviving highlight spans, at unchanged
+    ///   `target_lines`). This test instead counts real work
+    ///   (`MINIMAP_LINE_FETCH_COUNT`, incremented once per
+    ///   `minimap_line_text` call) and checks it against a formula derived
+    ///   from `target_lines`, not against a sibling run's own — possibly
+    ///   also regressed — cost.
+    /// - **Blind spot 2** (that test's fixture never set a filetype, so
+    ///   `highlights` stayed empty and the loop #1096 regressed never ran):
+    ///   `large_minimap_engine` now installs a real `Syntax` and asserts
+    ///   its own highlights are non-empty (see that fixture's doc comment).
+    ///
+    /// Both buffers use blocks large enough to saturate
+    /// `quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP` (`n_lines /
+    /// target_lines` well over the cap in both cases), so both should hit
+    /// the exact same fetch
+    /// ceiling regardless of the 10x difference in buffer size — the #728
+    /// invariant this test exists to pin, stated as a number instead of a
+    /// ratio.
+    ///
+    /// **RED against the unfixed highlight-mapping loop:** confirmed by
+    /// hand — reinstating the per-call `line_text_cache: HashMap<usize,
+    /// String>` the loop used before this fix makes `large_fetches` grow
+    /// with the highlighted line count (~buffer size) instead of staying
+    /// pinned to the block-sampling ceiling, so `large_fetches >
+    /// small_fetches` (and both blow past `ceiling`) once `n_lines` is
+    /// large enough that most highlighted lines aren't themselves block
+    /// starts. Reverted before landing this test.
+    #[test]
+    fn minimap_line_fetch_count_tracks_target_lines_not_buffer_size() {
+        const SMALL_LINES: usize = 2_000;
+        const LARGE_LINES: usize = 20_000;
+
+        let small = large_minimap_engine(SMALL_LINES);
+        let large = large_minimap_engine(LARGE_LINES);
+        let theme = Theme::onedark();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let wid_small = small.active_window_id();
+        let wid_large = large.active_window_id();
+
+        let small_fetches = count_minimap_line_fetches(|| {
+            let mm = build_minimap_data(&small, &theme, wid_small, rect, 1.0, 40);
+            assert!(mm.is_some(), "minimap must build for the small fixture");
+        });
+        let large_fetches = count_minimap_line_fetches(|| {
+            let mm = build_minimap_data(&large, &theme, wid_large, rect, 1.0, 40);
+            assert!(mm.is_some(), "minimap must build for the large fixture");
+        });
+
+        assert_eq!(
+            small_fetches, large_fetches,
+            "line fetches must depend only on strip geometry, not buffer \
+             length ({SMALL_LINES}-line buffer: {small_fetches} fetches, \
+             {LARGE_LINES}-line buffer: {large_fetches} fetches) — a \
+             mismatch means some path (most likely the highlight-mapping \
+             loop) is scanning proportionally to the buffer again"
+        );
+
+        // The ceiling itself, computed the same way `build_minimap_data`
+        // derives `target_lines` at this rect/line_height, so this stays in
+        // lockstep with that formula rather than hardcoding a number that
+        // could silently drift from it.
+        let display_rows = 40usize;
+        let gtk_row_capacity =
+            (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+        let target_lines = display_rows
+            .saturating_mul(MINIMAP_LINES_PER_ROW)
+            .max(gtk_row_capacity)
+            .max(1);
+        let cap = quadraui::primitives::minimap::BLOCK_LINE_SAMPLE_CAP;
+        let ceiling = target_lines * cap;
+        assert!(
+            small_fetches <= ceiling,
+            "expected at most {ceiling} line fetches (target_lines=\
+             {target_lines} * BLOCK_LINE_SAMPLE_CAP={cap}), got \
+             {small_fetches} — the #728 invariant (bounded by strip size, \
+             not buffer length) no longer holds"
+        );
+    }
+
     /// Acceptance: `:set nominimap` must widen the editor text area by
     /// *exactly* the reserved width, and `:set minimap` must give it back.
     /// Asserted on the rendered `text_viewport_cols`, not on the setting.
@@ -23589,7 +27839,25 @@ mod tests {
             1,
             "the minimap must be present when the setting is on"
         );
-        let expected_cols = minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING) as usize;
+        // #1094: `render_engine` is TUI-shaped (`scrollbar_reserve == 0.0`,
+        // `char_width == 1.0`), so the strip now also claims the one-column
+        // gutter that keeps its own boundary clear of the pane's outermost
+        // (scroll) column — see `scroll_gutter_width`'s doc comment. Turning
+        // the minimap off reclaims that sliver along with the strip itself.
+        //
+        // `.ceil()`, not a bare `as usize` truncation (#1326 review): a
+        // 120-wide pane's `minimap_reserved_width` happens to be exactly
+        // `18.0` here (`120 * MINIMAP_WIDTH_FRACTION`), so truncating vs.
+        // ceiling this specific fixture's width was never distinguishable —
+        // but `build_screen_layout`'s own `render_viewport_cols` computation
+        // (`floor(rect.width - minimap_w)`, `minimap_w` a continuous
+        // `f64`) reclaims `ceil(minimap_w)` columns whenever `minimap_w`
+        // isn't already a whole number, not `floor(minimap_w)`. See the
+        // split-pane test below, whose 79-column pane is the first fixture
+        // in this file to actually exercise a fractional `minimap_w`.
+        let expected_cols = (minimap_reserved_width(&e, 120.0, 1.0, TUI_MINIMAP_SIZING)
+            + scroll_gutter_width(0.0, 1.0))
+        .ceil() as usize;
 
         e.settings.minimap = false;
         let without = render_engine(&e, 120.0, 30.0);
@@ -23603,8 +27871,8 @@ mod tests {
             cols_without - cols_with,
             expected_cols,
             "turning the minimap off must hand the editor back exactly the \
-             reserved width (with={cols_with}, without={cols_without}, \
-             expected={expected_cols})"
+             reserved width, strip plus its scroll gutter (with={cols_with}, \
+             without={cols_without}, expected={expected_cols})"
         );
     }
 
@@ -23642,12 +27910,27 @@ mod tests {
                 .iter()
                 .find(|w| w.window_id == w_with.window_id)
                 .expect("window set must be identical with/without the minimap");
-            // `w_with.rect.width` is already narrowed by its own strip;
-            // `w_without.rect.width` is the same pane's un-narrowed width
-            // (minimap off ⇒ no narrowing), which is what
-            // `minimap_reserved_width` expects to be fed back in.
+            // #1094: `w_with.rect.width`/`w_without.rect.width` are now the
+            // pane's own (un-narrowed either way) width — the strip no
+            // longer narrows `rect` itself, only the text-column count — so
+            // either carries the same pane width `minimap_reserved_width`
+            // expects. The expected reclaim adds `scroll_gutter_width`'s
+            // one-column TUI gutter to the strip's own raw width, same as
+            // the single-window test above — `.ceil()`'d for the same
+            // reason (#1326 review, see that test's doc comment): a
+            // `:vsplit`'s two panes need not split evenly (#1326 reserves
+            // one column for the divider bar itself, so a fresh 160-wide
+            // `<C-w>v` here is 80/79, not 80/80), and an odd pane width
+            // like 79 gives `minimap_reserved_width` a genuinely
+            // fractional result (`79 * MINIMAP_WIDTH_FRACTION = 11.85`) —
+            // this is the fixture that first exercises that fractional
+            // case, where truncating instead of ceiling disagreed with
+            // `build_screen_layout`'s real reclaimed width by exactly one
+            // column.
             let expected_cols =
-                minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING) as usize;
+                (minimap_reserved_width(&e, w_without.rect.width, 1.0, TUI_MINIMAP_SIZING)
+                    + scroll_gutter_width(0.0, 1.0))
+                .ceil() as usize;
             assert_eq!(
                 w_without.text_viewport_cols - w_with.text_viewport_cols,
                 expected_cols,
@@ -23703,6 +27986,55 @@ mod tests {
             background_mm.window_id,
             "clicking a background pane's minimap must focus that pane, \
              not just scroll it while leaving focus on {active_before:?}"
+        );
+    }
+
+    /// #1292 review (blocking finding): `apply_gutter_action`'s `DiffPeek`,
+    /// `DiagnosticHover` and `CodeAction` arms used to assign
+    /// `engine.active_tab_mut().active_window = window_id` directly instead
+    /// of routing through `Tab::focus_window`, so clicking a gutter icon
+    /// (diagnostic squiggle, code-action lightbulb, or diff-peek marker) on
+    /// a *background* split pane moved focus there but left
+    /// `Tab::prev_window` stale — a following `CTRL-W p` would then recall
+    /// whatever was previously active before the click, not the pane the
+    /// click itself came from, diverging from Neovim's `prevwin`.
+    ///
+    /// **Verified RED against the pre-fix shape:** reverting the three
+    /// `apply_gutter_action` arms back to a direct `active_window =`
+    /// assignment makes this fail — `prev_window` stays `None` (or
+    /// whatever it held before the click) instead of recording
+    /// `active_before`.
+    #[test]
+    fn gutter_diagnostic_hover_on_a_background_pane_focuses_it_and_records_prev_window() {
+        let mut e = Engine::new_for_test();
+        e.split_window(SplitDirection::Vertical, None);
+        let active_before = e.active_window_id();
+        let background = e
+            .active_tab()
+            .window_ids()
+            .into_iter()
+            .find(|&w| w != active_before)
+            .expect("split must produce a second, non-active window");
+
+        let mut rw = fixture_window(WindowRect::new(0.0, 0.0, 40.0, 10.0), 4, 10, 0, 30, 0.0);
+        rw.window_id = background;
+        rw.diagnostic_gutter
+            .insert(2, crate::core::lsp::DiagnosticSeverity::Error);
+
+        apply_gutter_action(&mut e, &rw, background, 2, 0, "");
+
+        assert_eq!(
+            e.active_window_id(),
+            background,
+            "test setup sanity: the gutter click must focus the background pane"
+        );
+        assert_eq!(
+            e.active_tab().prev_window,
+            Some(active_before),
+            "a gutter click that moves focus to a background pane must \
+             record the previously-active window as Tab::prev_window, \
+             exactly like every other focus-changing call site, so a \
+             following CTRL-W p recalls it"
         );
     }
 
@@ -23770,6 +28102,217 @@ mod tests {
             0.0,
             "a 20-column window cannot spare the minimap's floor width plus \
              MINIMAP_MIN_TEXT_COLS of surviving text"
+        );
+    }
+
+    /// #1094 acceptance ("A narrow pane still resolves to a sane layout
+    /// rather than squeezing the text out"): `minimap_reserved_width`'s own
+    /// affordability check only knows about the *pane's* width — it has no
+    /// notion of the scroll gutter that now sits beyond the strip too (see
+    /// `scroll_gutter_width`), so a pane that can afford the strip *alone*
+    /// can still be too narrow to afford the strip *and* the gutter without
+    /// squeezing the text below `MINIMAP_MIN_TEXT_COLS`. `build_screen_
+    /// layout` has to re-check with the gutter folded in and self-suppress
+    /// the same way a pane too narrow for the strip alone already does —
+    /// this is that interaction, driven through the real entry point
+    /// rather than `minimap_reserved_width` in isolation (which cannot see
+    /// `scrollbar_reserve` at all).
+    ///
+    /// RED against a `build_screen_layout` that never re-checks
+    /// (equivalently, against reverting this fix): at `scrollbar_reserve =
+    /// 10.0`, the strip still shows and squeezes the pane's 40 columns down
+    /// to `40 - 6 (strip) - 10 (reserve) = 24` — below `MINIMAP_MIN_TEXT_
+    /// COLS` (30) — instead of self-suppressing. Confirmed by hand against
+    /// the pre-fix `render.rs`.
+    #[test]
+    fn minimap_suppresses_itself_when_the_pane_cannot_afford_both_the_strip_and_the_scroll_gutter()
+    {
+        let engine = test_engine(
+            "a line of text long enough to fill the whole pane width and then some more text",
+        );
+        let theme = Theme::onedark();
+        // Same 40-column pane `build_screen_layout_honors_an_explicit_
+        // scrollbar_reserve_even_at_char_width_one` uses: wide enough to
+        // afford the strip (`minimap_reserved_width` alone returns non-zero
+        // here) but not wide enough to *also* clear `MINIMAP_MIN_TEXT_COLS`
+        // once a real scroll gutter is reserved beyond it.
+        let bounds = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
+
+        let no_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            0.0,
+            TUI_MINIMAP_SIZING,
+        );
+        assert!(
+            !no_reserve.minimap.is_empty(),
+            "fixture precondition: this 40-column pane must afford the strip \
+             on its own (no scroll gutter competing for the same width), or \
+             this test isn't exercising the interaction at all"
+        );
+
+        let with_reserve = build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            1.0,
+            1.0,
+            false,
+            10.0,
+            TUI_MINIMAP_SIZING,
+        );
+        assert!(
+            with_reserve.minimap.is_empty(),
+            "a pane that can only afford the strip *or* the scroll gutter, \
+             not both without squeezing text below MINIMAP_MIN_TEXT_COLS, \
+             must self-suppress the strip rather than paint a squeezed \
+             layout; got minimap: {:?}",
+            with_reserve.minimap
+        );
+        // And the editor still gets a sane (non-zero, no-panic) viewport —
+        // "resolves to a sane layout" means real text columns survive, not
+        // just "doesn't crash".
+        assert!(
+            with_reserve.windows[0].text_viewport_cols > 0,
+            "self-suppressing the strip must not leave the pane with zero \
+             text columns either"
+        );
+    }
+
+    // ─── window_zone_hit_test / minimap click-drag routing (#1094 review) ──
+    //
+    // `window_zone_hit_test` is the shared classifier both `click.rs`'s
+    // `pixel_to_click_target` (GTK) and `tui_main/mouse.rs` (TUI) route
+    // through. #1094's own fix widened `RenderedWindow.rect` back out to
+    // the pane's true right edge (so the scrollbar paints there, past the
+    // strip) but initially left this function computing its own
+    // `viewport_cols` straight from that wider `rect.width`, with no idea
+    // the minimap strip eats into it. The two tests below pin the two
+    // resulting drifts: a real horizontal-scrollbar click misclassified as
+    // `TextArea`, and — worse — a text-selection drag whose pointer sweeps
+    // over the strip's own pixels extending the selection underneath
+    // painted minimap content instead of being treated as a miss.
+
+    /// Minimal `RenderedWindow` fixture with every field controllable,
+    /// mirroring `build_rendered_window`'s own `empty` closure (this
+    /// struct has no `Default` impl) — used here instead of driving a full
+    /// `Engine`/buffer through `build_screen_layout` so `max_col` and
+    /// `text_viewport_cols` can be set to the exact values needed to land
+    /// in the narrow gap the pre-fix and post-fix formulas disagree on.
+    fn fixture_window(
+        rect: WindowRect,
+        gutter_char_width: usize,
+        total_lines: usize,
+        max_col: usize,
+        text_viewport_cols: usize,
+        minimap_reserved_w: f64,
+    ) -> RenderedWindow {
+        RenderedWindow {
+            window_id: WindowId(0),
+            rect,
+            lines: vec![],
+            cursor: None,
+            extra_cursors: vec![],
+            selection: None,
+            extra_selections: vec![],
+            yank_highlight: None,
+            scroll_top: 0,
+            scroll_left: 0,
+            total_lines,
+            gutter_char_width,
+            text_viewport_cols,
+            minimap_reserved_w,
+            is_active: true,
+            show_active_bg: false,
+            has_git_diff: false,
+            has_breakpoints: false,
+            max_col,
+            diagnostic_gutter: std::collections::HashMap::new(),
+            code_action_lines: std::collections::HashSet::new(),
+            bracket_match_positions: Vec::new(),
+            active_indent_col: None,
+            tabstop: 4,
+            cursorline: false,
+            status_line: None,
+        }
+    }
+
+    /// RED against the pre-fix shape: `has_h_sb` was computed from a
+    /// `viewport_cols` re-derived straight off `rw.rect.width` (with no
+    /// minimap subtraction), so a line that overflows the real, narrower
+    /// `text_viewport_cols` but not that inflated rect-width-only figure
+    /// reported `has_h_sb == false` — a click on the horizontal scrollbar
+    /// that's actually painted on screen fell through to `TextArea`
+    /// instead of `HorizontalScrollbar`. Picks `max_col` to sit exactly in
+    /// that disagreement gap: greater than `text_viewport_cols` (so the
+    /// fixed formula, which reuses `rw.text_viewport_cols` directly, must
+    /// report overflow) but not greater than `rect.width` itself (so the
+    /// old buggy formula, which never subtracted the minimap's width at
+    /// all, would have reported none).
+    #[test]
+    fn window_zone_hit_test_h_scrollbar_click_accounts_for_the_minimap_strip() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let text_viewport_cols = 30; // rect.width(40) - minimap_reserved_w(10)
+        let max_col = text_viewport_cols + 1; // overflows the real viewport...
+        assert!(
+            max_col <= rect.width as usize,
+            "fixture invariant broken: max_col must still fall short of the \
+             old rect-width-only formula, or this test isn't exercising the \
+             regression at all"
+        );
+        let rw = fixture_window(rect, 0, 1, max_col, text_viewport_cols, 10.0);
+
+        // Row just above the (absent) status bar, inside the horizontal
+        // scrollbar's one-line band: `content_h(10) - line_height(1) = 9`.
+        let zone = window_zone_hit_test(&rw, 5.0, 9.5, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::HorizontalScrollbar { .. }),
+            "a line overflowing the real (minimap-narrowed) text viewport \
+             must resolve a click on its scrollbar row to \
+             WindowZone::HorizontalScrollbar, not fall through to \
+             TextArea; got {zone:?}"
+        );
+    }
+
+    /// A point over the minimap strip's own column range must not resolve
+    /// to `TextArea` — pre-#1094, `RenderedWindow.rect` was narrowed by the
+    /// strip's width, so such a point fell outside the window entirely
+    /// (`find_window_at` never even reached this function for it). Post-
+    /// #1094, `rect` reaches the pane's true right edge instead, so
+    /// `window_zone_hit_test` has to exclude the strip's columns
+    /// explicitly or a text-selection drag whose pointer sweeps over the
+    /// strip's pixels (`apply_tui_editor_text_drag`, and
+    /// `pixel_to_click_target`'s `mutate_focus == false` continuation path)
+    /// would extend the selection underneath the painted strip instead of
+    /// being treated as a miss.
+    #[test]
+    fn window_zone_hit_test_excludes_the_minimap_strip_from_text_area() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let rw = fixture_window(rect, 0, 1, 1, 30, 10.0);
+
+        // Comfortably inside the reserved strip+gutter band (the
+        // rightmost 10 columns of a 40-wide rect).
+        let strip_x = 35.0;
+        let zone = window_zone_hit_test(&rw, strip_x, 0.0, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::Minimap),
+            "a point over the minimap strip's own pixels must classify as \
+             WindowZone::Minimap, not TextArea/Gutter/HorizontalScrollbar; \
+             got {zone:?}"
+        );
+
+        // A point well inside the real text columns must still resolve to
+        // TextArea — the exclusion must not eat real text.
+        let zone = window_zone_hit_test(&rw, 2.0, 0.0, 1.0, 1.0);
+        assert!(
+            matches!(zone, WindowZone::TextArea { .. }),
+            "a point in the real text columns must still resolve to \
+             WindowZone::TextArea; got {zone:?}"
         );
     }
 
@@ -23957,9 +28500,17 @@ mod tests {
     /// `char_width == 1.0`.
     #[test]
     fn build_screen_layout_honors_an_explicit_scrollbar_reserve_even_at_char_width_one() {
-        let engine = test_engine(
+        let mut engine = test_engine(
             "a line of text long enough to fill the whole pane width and then some more text",
         );
+        // #1094: minimap off, to isolate `scrollbar_reserve`'s own effect on
+        // the viewport from the (new, intentional) interaction where a pane
+        // too narrow to afford both the strip and the scroll gutter beside
+        // it suppresses the strip instead — this fixture's 40-col pane is
+        // narrow enough for a 10-unit reserve to trip exactly that
+        // suppression, which would otherwise make `cols_with` reflect a
+        // *lost strip*, not the reserve alone.
+        engine.settings.minimap = false;
         let theme = Theme::onedark();
         let bounds = WindowRect::new(0.0, 0.0, 40.0, 10.0);
         let (rects, _) = engine.calculate_group_window_rects(bounds, 1.0);
@@ -23996,15 +28547,46 @@ mod tests {
         );
     }
 
-    /// Acceptance: clicking the vertical middle of the strip seeks to ~50%
-    /// of the file. Backend-independent — both backends call exactly this.
+    /// #1093 acceptance criteria 4 and 5: clicking the vertical middle of the
+    /// strip seeks to ~50% of the strip's *painted window*, not 50% of the
+    /// whole file, and the scroll it produces is centred on that line (VS
+    /// Code parity), not top-aligned. Backend-independent — both backends
+    /// call exactly this.
+    ///
+    /// **RED against the pre-#1093 shape:** the old assertion here was
+    /// `(line as f64 / total).abs() < 0.1` — i.e. "lands near 50% of the
+    /// whole file" — which is exactly the bug this issue reports (the whole
+    /// buffer squeezed into the strip on every frame, so 50% of the strip
+    /// always meant 50% of the file regardless of scroll position).
+    /// Confirmed by hand: reverting `build_minimap_data`'s windowing (handing
+    /// `quadraui::primitives::minimap::block_bounds` the whole
+    /// `total_buffer_lines` again) makes `window_len < total` (this test's
+    /// own setup-sanity check) fail
+    /// outright, since the window would once again cover the entire file.
     #[test]
-    fn minimap_click_at_the_middle_seeks_to_half_the_file() {
-        let mut e = minimap_engine();
+    fn minimap_click_at_the_middle_seeks_to_the_middle_of_the_painted_window() {
+        // #1186: `minimap_engine()`'s 201 lines now fits *entirely* inside
+        // this strip's window (compression covers whole small files, which
+        // is the point of #1186) — `windowed_minimap_engine` is large enough
+        // to stay in #1093's genuine sliding-window regime even after
+        // #1186's compression, which is what this test is actually about.
+        let mut e = windowed_minimap_engine(50_000);
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
-        let total = mm.minimap.total_buffer_lines as f64;
+        let total = mm.minimap.total_buffer_lines;
+        // The real span of buffer lines the window covers — `lines.len()`
+        // (a row/block *count*) stopped being a reliable proxy for that the
+        // moment #1186 let a block cover more than one buffer line.
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window, or this test cannot distinguish window-relative \
+             from whole-file semantics (window_len={window_len}, \
+             total={total})"
+        );
 
         let mid_x = mm.rect.x + mm.rect.width / 2.0;
         let mid_y = mm.rect.y + mm.rect.height / 2.0;
@@ -24014,39 +28596,97 @@ mod tests {
             hit_win, win_id,
             "the hit must resolve to the pane it was clicked in"
         );
-        let frac = line as f64 / total;
+
+        // The cursor starts at the top of the file, so the painted window
+        // itself starts at line 0 — a middle click must land near half of
+        // *that* window, not half of `total`.
+        let window_frac = line as f64 / window_len as f64;
         assert!(
-            (frac - 0.5).abs() < 0.1,
-            "a click at the vertical middle must land near 50% of the file, got \
-             line {line} of {total} ({frac:.3})"
+            (window_frac - 0.5).abs() < 0.15,
+            "a click at the vertical middle must land near 50% of the \
+             painted window ({window_len} lines starting at line 0), got \
+             line {line} ({window_frac:.3})"
+        );
+        let file_frac = line as f64 / total as f64;
+        assert!(
+            file_frac < 0.4,
+            "the click must NOT land near 50% of the whole file — that is \
+             the pre-#1093 whole-buffer-squeeze bug: got line {line} of \
+             {total} ({file_frac:.3})"
         );
 
-        // …and it actually scrolls the window there.
+        // …and it actually scrolls the window there, *centred* on the
+        // clicked line rather than top-aligned.
         let (scrolled_win, scrolled) =
             apply_minimap_click(&mut e, &screen, mid_x, mid_y).expect("click must be handled");
         assert_eq!(scrolled_win, win_id);
         assert_eq!(scrolled, line);
-        assert_eq!(e.scroll_top(), line, "the window must be scrolled to it");
+        let viewport_lines = e
+            .windows
+            .get(&win_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        assert_eq!(
+            e.scroll_top(),
+            line.saturating_sub(viewport_lines / 2),
+            "the click must centre the viewport on the clicked line \
+             (against the painted window's own line, not `total`), not \
+             pin it to the very top of the viewport"
+        );
     }
 
-    /// Top and bottom of the track bracket the file; a point outside the
-    /// strip must miss so the caller falls through to normal editor clicks.
+    /// #1093 acceptance criteria 1 and 4: at the top of the file, the
+    /// strip's bottom row must NOT jump to EOF — the exact repro in the
+    /// issue ("open a 647-line file at line 1, click the bottom of the
+    /// strip, the view jumps to EOF"). It must instead land near the end of
+    /// the painted window, i.e. advance by roughly one strip's worth of
+    /// file. A point outside the strip must still miss so the caller falls
+    /// through to normal editor clicks.
+    ///
+    /// **RED against the pre-#1093 shape:** confirmed by hand — the old
+    /// assertion (`bottom >= total - total / 10`, "lands in the last tenth
+    /// of the file") passed on unfixed `develop` and would fail against
+    /// this fix (`bottom` lands far short of `total`); the new assertions
+    /// below fail against unfixed `develop` instead, since there `bottom`
+    /// really is in the file's last tenth regardless of scroll position.
     #[test]
-    fn minimap_click_top_bottom_and_miss() {
-        let e = minimap_engine();
+    fn minimap_click_at_the_bottom_does_not_jump_to_eof() {
+        // #1186: see the sibling middle-click test's doc comment — a
+        // 201-line file now fits entirely inside this geometry's compressed
+        // window, so a much larger fixture is needed to keep exercising
+        // #1093's genuine sliding-window regime.
+        let e = windowed_minimap_engine(50_000);
         let screen = render_engine(&e, 120.0, 30.0);
         let win_id = screen.windows[0].window_id;
         let mm = screen.minimap.first().expect("minimap present");
         let total = mm.minimap.total_buffer_lines;
+        // Real buffer-line span the window covers — see the sibling test's
+        // comment on why `lines.len()` (a row count) is no longer a
+        // reliable proxy for this under #1186's multi-line blocks.
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window (window_len={window_len}, total={total})"
+        );
         let x = mm.rect.x + 1.0;
 
         assert_eq!(minimap_click_line(&screen, x, mm.rect.y), Some((win_id, 0)));
         let (_, bottom) = minimap_click_line(&screen, x, mm.rect.y + mm.rect.height - 0.5)
             .expect("bottom of the track must hit");
         assert!(
-            bottom >= total - total / 10,
-            "the bottom of the track must land in the last tenth of the file, \
-             got {bottom} of {total}"
+            bottom < total - total / 10,
+            "the bottom of the track must NOT land in the last tenth of \
+             the file while the cursor is still at the top — that is the \
+             issue's own repro (bottom-of-strip click jumps to EOF): got \
+             {bottom} of {total}"
+        );
+        assert!(
+            bottom as f64 >= window_len as f64 * 0.7,
+            "the bottom of the track must land near the end of the \
+             painted window ({window_len} lines), not far short of it: \
+             got {bottom}"
         );
 
         // One cell to the left of the strip is editor text, not the minimap.
@@ -24054,6 +28694,422 @@ mod tests {
             minimap_click_line(&screen, mm.rect.x - 1.0, mm.rect.y + 5.0),
             None,
             "a point outside the strip must not be treated as a minimap click"
+        );
+    }
+
+    /// #1253: `minimap_click_line`/`minimap_press` must resolve against the
+    /// **paint-time** `MinimapLayout` a prior `draw_minimap_strip` call
+    /// cached on `RenderedMinimap::resolved_layout`, not re-derive their own
+    /// via `layout_with_sizing` every click — the cache is only proven wired
+    /// up if a cached layout whose `bounds` genuinely disagrees with what a
+    /// fresh `layout_with_sizing(minimap_strip_rect(mm), ...)` call would
+    /// produce wins the hit-test.
+    ///
+    /// Stashes a `MinimapLayout` whose `bounds` is shifted 1000px away from
+    /// the strip's real `mm.rect` (impossible for any real paint to
+    /// produce — this is a synthetic probe, not a realistic backend
+    /// scale/pitch difference) directly into `resolved_layout`. A point at
+    /// the real strip's centre must then MISS (the cached, shifted bounds
+    /// don't cover it) while the same point offset into the shifted bounds
+    /// must HIT — the opposite of what a from-scratch `layout_with_sizing`
+    /// recompute against the real, unshifted `mm.rect` would ever report,
+    /// so this can only pass if the cached layout is what actually got
+    /// consulted.
+    ///
+    /// **RED without the #1253 wiring:** confirmed by hand — reverting
+    /// `minimap_layout_for_click` to unconditionally call
+    /// `mm.minimap.layout_with_sizing(minimap_strip_rect(mm), ...)` (the
+    /// pre-#1253 body of both `minimap_click_line` and `minimap_press`,
+    /// ignoring `resolved_layout` entirely) makes the real-strip-centre
+    /// assertion below fail (`Some` where the shifted cache must report
+    /// `None`) and the shifted-point assertion fail the opposite way.
+    #[test]
+    fn minimap_click_and_press_resolve_against_the_cached_paint_time_layout() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+
+        let real_bounds = minimap_strip_rect(mm);
+        let shift = 1000.0_f32;
+        let mut shifted_layout = mm.minimap.layout_with_sizing(
+            quadraui::Rect::new(
+                real_bounds.x + shift,
+                real_bounds.y,
+                real_bounds.width,
+                real_bounds.height,
+            ),
+            MINIMAP_LINES_PER_ROW,
+            quadraui::MinimapSizing::FixedPitch(1.0),
+        );
+        // Keep `visible_lines` non-empty (needed for a `Seek` hit to resolve
+        // a line at all) but leave `bounds` shifted — that's the only field
+        // `hit_test` reads.
+        assert!(
+            !shifted_layout.visible_lines.is_empty(),
+            "test setup sanity: the shifted layout must still have rows to resolve a hit against"
+        );
+        shifted_layout.bounds = quadraui::Rect::new(
+            real_bounds.x + shift,
+            real_bounds.y,
+            real_bounds.width,
+            real_bounds.height,
+        );
+        *mm.resolved_layout.borrow_mut() = Some(shifted_layout);
+
+        let real_mid_x = real_bounds.x as f64 + real_bounds.width as f64 / 2.0;
+        let real_mid_y = real_bounds.y as f64 + real_bounds.height as f64 / 2.0;
+        assert_eq!(
+            minimap_click_line(&screen, real_mid_x, real_mid_y),
+            None,
+            "a click at the real strip's own centre must MISS once the cache \
+             holds a layout whose bounds live 1000px away — proves the \
+             recompute-against-mm.rect path is NOT what answered this"
+        );
+
+        let shifted_mid_x = real_mid_x + shift as f64;
+        let (hit_win, _line) = minimap_click_line(&screen, shifted_mid_x, real_mid_y)
+            .expect("a click inside the cached layout's shifted bounds must HIT");
+        assert_eq!(hit_win, win_id);
+
+        // `minimap_press` shares the same resolution path — same proof,
+        // same shifted-bounds probe.
+        assert!(
+            minimap_press(&e, &screen, real_mid_x, real_mid_y, false).is_none(),
+            "minimap_press must also miss at the real strip's centre once \
+             the cache holds the shifted layout"
+        );
+        assert!(
+            minimap_press(&e, &screen, shifted_mid_x, real_mid_y, false).is_some(),
+            "minimap_press must hit inside the cached layout's shifted bounds"
+        );
+    }
+
+    /// #1187: a press on the viewport-highlight band itself begins a drag
+    /// that preserves the grab offset — `jump` is unset, and `grab_offset`
+    /// is the press's own offset from the band's top edge, never `0.0`
+    /// (which would jump the band's top under the cursor, the "grab
+    /// anywhere snaps to centre" bug the issue reports).
+    #[test]
+    fn minimap_press_on_the_highlight_band_preserves_the_grab_offset() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+
+        // The cursor starts at the top of the file, so the viewport
+        // highlight's own top edge coincides with the strip's top row
+        // (#1093). At this fixture's geometry the band is exactly one row
+        // tall (`FixedPitch(1.0)`'s own row pitch), so a press has to land
+        // within that single row — 0.4 units down is safely inside
+        // `[rect.y, rect.y + 1.0)` without being able to round into the row
+        // below.
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + 0.4;
+        let press = minimap_press(&e, &screen, x, y, false).expect("the strip must hit");
+        assert_eq!(press.window_id, win_id);
+        assert!(
+            !press.jump,
+            "a press 0.4 units below the strip's (and so the band's) own \
+             top edge must land inside the highlight band, not on the bare \
+             track"
+        );
+        assert!(
+            (press.grab_offset - 0.4).abs() < 0.05,
+            "grab_offset must be the press's own offset from the band's top \
+             edge (~0.4 here, matching how far below the strip's top the \
+             press landed) — got {}",
+            press.grab_offset
+        );
+    }
+
+    /// #1187: a press on the track *outside* the band must jump-to-position
+    /// (today's #1093 centring, applied by the caller — see
+    /// `MinimapPress::jump`'s doc comment) and then continue as a normal
+    /// thumb drag with `grab_offset: 0.0`, mirroring
+    /// `resolve_editor_scrollbar_click`'s track-click convention.
+    #[test]
+    fn minimap_press_outside_the_band_sets_jump_and_zero_grab_offset() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.first().expect("minimap present");
+
+        // Cursor at the top of the file puts the highlight band at the very
+        // top of the strip; the strip's bottom row is far outside it.
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + mm.rect.height - 1.0;
+        let press = minimap_press(&e, &screen, x, y, false).expect("the strip must hit");
+        assert!(
+            press.jump,
+            "a press at the strip's bottom row, with the band pinned to \
+             the top, must land outside the band"
+        );
+        assert_eq!(
+            press.grab_offset, 0.0,
+            "a track press outside the band must arm the drag with \
+             grab_offset 0.0, matching resolve_editor_scrollbar_click's \
+             track-click convention"
+        );
+    }
+
+    /// #1187's actual fix: `max_scroll` must be the whole file's scroll
+    /// ceiling (`total_buffer_lines - viewport_lines`, the same arithmetic
+    /// `View::ensure_cursor_visible` clamps against) — never the strip's own
+    /// painted window, which is only a fraction of the file once #1093's
+    /// sliding window is in play. Anchoring to the window instead is exactly
+    /// the root cause: the window re-slides under a drag in lockstep with
+    /// `scroll_top`, so the drag's motion cancels itself out and a
+    /// whole-strip drag reaches only about one window's worth of lines.
+    #[test]
+    fn minimap_press_max_scroll_is_the_whole_files_scroll_ceiling() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let win_id = screen.windows[0].window_id;
+        let mm = screen.minimap.first().expect("minimap present");
+        let total = mm.minimap.total_buffer_lines;
+        let window_len =
+            mm.minimap.lines.last().unwrap().line_idx + 1 - mm.minimap.lines[0].line_idx;
+        assert!(
+            window_len < total,
+            "test setup sanity: the file must be taller than the strip's \
+             own window (window_len={window_len}, total={total})"
+        );
+
+        let x = mm.rect.x + 1.0;
+        let y = mm.rect.y + 1.0;
+        let press = minimap_press(&e, &screen, x, y, false).expect("the strip must hit");
+        let viewport_lines = e
+            .windows
+            .get(&win_id)
+            .map(|w| w.view.viewport_lines)
+            .unwrap_or(0);
+        assert_eq!(
+            press.max_scroll,
+            total - viewport_lines,
+            "max_scroll must be the whole file's scroll ceiling, not the \
+             painted window's own (much smaller) length ({window_len})"
+        );
+    }
+
+    /// A point outside the strip must not resolve to a press at all, so the
+    /// caller falls through to normal editor click handling — mirrors
+    /// `minimap_click_line`'s own negative-space case.
+    #[test]
+    fn minimap_press_returns_none_outside_the_strip() {
+        let e = windowed_minimap_engine(50_000);
+        let screen = render_engine(&e, 120.0, 30.0);
+        let mm = screen.minimap.first().expect("minimap present");
+        assert_eq!(
+            minimap_press(&e, &screen, mm.rect.x - 1.0, mm.rect.y + 5.0, false),
+            None
+        );
+    }
+
+    /// Shared fixture for the [`fine_seek_geometry`] unit tests below:
+    /// a synthetic painted window (`base` 1000, `span` 401 — deliberately
+    /// not a round multiple of the real strip's own height, so a formula
+    /// that silently degenerated to the coarse, file-wide one would produce
+    /// a visibly different (and wrong) result rather than an accidental
+    /// match) inside a `bounds`/`max_scroll` pair distinct from either.
+    fn fine_geometry_fixture() -> (quadraui::Rect, quadraui::Minimap, usize, usize) {
+        let bounds = quadraui::Rect::new(0.0, 10.0, 5.0, 20.0); // S0 = 10, Sh = 20
+        let minimap = quadraui::Minimap {
+            id: quadraui::WidgetId::new("mm"),
+            lines: vec![
+                quadraui::MinimapLine {
+                    text: String::new(),
+                    line_idx: 1000, // base
+                },
+                quadraui::MinimapLine {
+                    text: String::new(),
+                    line_idx: 1400, // span = 1400 + 1 - 1000 = 401
+                },
+            ],
+            syntax_spans: Vec::new(),
+            visible_row_start: 0,
+            visible_row_count: 0,
+            total_buffer_lines: 50_000,
+        };
+        let max_scroll = 40_000; // M
+        let viewport_lines = 30;
+        (bounds, minimap, max_scroll, viewport_lines)
+    }
+
+    /// Drive a [`fine_seek_geometry`] result through the real,
+    /// unmodified `quadraui::dispatch_mouse_drag` — the same call both
+    /// backends' drag-move handlers make — and read back the
+    /// `ScrollOffsetChanged` offset it derives at `y`. Proves the geometry
+    /// this module hands `DragTarget::ScrollbarY` actually produces the
+    /// offsets [`fine_seek_geometry`]'s own doc comment claims, rather than
+    /// asserting on the four numbers in isolation and trusting the
+    /// arithmetic they're fed into.
+    fn dispatch_offset_at(
+        track_start: f32,
+        track_length: f32,
+        thumb_length: f32,
+        max_scroll: usize,
+        grab_offset: f32,
+        y: f32,
+    ) -> usize {
+        let mut drag = quadraui::DragState::default();
+        drag.begin(quadraui::DragTarget::ScrollbarY {
+            widget: quadraui::WidgetId::new("mm"),
+            track_start,
+            track_length,
+            thumb_length,
+            max_scroll,
+            grab_offset,
+            inverted: false,
+        });
+        let events =
+            quadraui::dispatch_mouse_drag(&drag, quadraui::Point::new(0.0, y), Default::default());
+        events
+            .into_iter()
+            .find_map(|ev| match ev {
+                quadraui::UiEvent::ScrollOffsetChanged { new_offset, .. } => Some(new_offset),
+                _ => None,
+            })
+            .expect("a ScrollbarY drag with max_scroll > 0 must emit ScrollOffsetChanged")
+    }
+
+    /// #1271: `fine_seek_geometry`'s `grab_offset` is derived by requiring
+    /// the mapping to be an **identity at the press point** — dispatching a
+    /// drag-move at the exact pixel the press happened at, with no
+    /// movement, must reproduce the current `scroll_top` exactly, not just
+    /// "close to it". Picks a non-zero, non-round `scroll_top` so a formula
+    /// that dropped the `(scroll_top / max_scroll) * effective_track` term
+    /// (leaving `grab_offset` at, say, a hand-rolled `py - band.y`) would
+    /// visibly miss.
+    #[test]
+    fn fine_seek_geometry_grab_offset_is_an_identity_at_the_press_point() {
+        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let scroll_top = 12_345;
+        let py = 15.0; // inside [S0, S0 + Sh) = [10.0, 30.0)
+
+        let (track_start, track_length, thumb_length, grab_offset) = fine_seek_geometry(
+            &bounds,
+            &minimap,
+            max_scroll,
+            viewport_lines,
+            scroll_top,
+            py,
+            true, // in_band: the identity derivation only applies here
+        )
+        .expect("span and max_scroll are both > 0 in the fixture");
+
+        let new_offset = dispatch_offset_at(
+            track_start,
+            track_length,
+            thumb_length,
+            max_scroll,
+            grab_offset,
+            py,
+        );
+        assert_eq!(
+            new_offset, scroll_top,
+            "dispatching at the exact press point (no movement) must \
+             reproduce the current scroll_top exactly — that is the \
+             identity `grab_offset` is solved for"
+        );
+    }
+
+    /// #1271: the virtual track spans exactly the painted window — at the
+    /// real strip's top (`y = S0`) the derived offset must be `base` (the
+    /// painted window's first buffer line), and at the real strip's bottom
+    /// (`y = S0 + Sh`) it must be `base + span` (one past its last line).
+    /// A formula that fell back to (or leaked) the coarse, file-wide
+    /// geometry would instead land near `0` and `max_scroll` respectively —
+    /// visibly different from `base` (1000) and `base + span` (1401) here.
+    #[test]
+    fn fine_seek_geometry_endpoints_span_exactly_the_painted_window() {
+        let (bounds, minimap, max_scroll, viewport_lines) = fine_geometry_fixture();
+        let base = minimap.lines.first().unwrap().line_idx;
+        let span = minimap.lines.last().unwrap().line_idx + 1 - base;
+
+        // `in_band: false` here only decides `grab_offset` (pinned to 0.0,
+        // the track-click convention) — `track_start`/`track_length`/
+        // `thumb_length` don't depend on it, so one call supplies the
+        // geometry both endpoint checks below drive.
+        let (track_start, track_length, thumb_length, grab_offset) = fine_seek_geometry(
+            &bounds,
+            &minimap,
+            max_scroll,
+            viewport_lines,
+            0,
+            bounds.y,
+            false,
+        )
+        .expect("span and max_scroll are both > 0 in the fixture");
+        assert_eq!(grab_offset, 0.0, "test setup: track press, not a band grab");
+
+        let top_offset = dispatch_offset_at(
+            track_start,
+            track_length,
+            thumb_length,
+            max_scroll,
+            grab_offset,
+            bounds.y,
+        );
+        assert_eq!(
+            top_offset, base,
+            "the virtual track's own top (y = S0) must resolve to the \
+             painted window's first buffer line ({base})"
+        );
+
+        let bottom_offset = dispatch_offset_at(
+            track_start,
+            track_length,
+            thumb_length,
+            max_scroll,
+            grab_offset,
+            bounds.y + bounds.height,
+        );
+        assert_eq!(
+            bottom_offset,
+            base + span,
+            "the virtual track's own bottom (y = S0 + Sh) must resolve to \
+             one past the painted window's last buffer line ({base} + {span})"
+        );
+    }
+
+    /// #1187/#722: `Engine::activate_window` — what the minimap press rung's
+    /// non-jump (in-band) branch calls instead of the jump branch's
+    /// `apply_minimap_click` — must switch which window is active without
+    /// moving that (or any) window's cursor or scroll position. This is the
+    /// engine-level contract both backends' click/mouse handlers rely on;
+    /// see the GTK driver-tier acceptance
+    /// (`gtk::testing::minimap::press_inside_a_background_panes_highlight_band_still_focuses_it_on_gtk`)
+    /// for the end-to-end proof through a real press.
+    #[test]
+    fn activate_window_switches_the_active_pane_without_moving_cursor_or_scroll() {
+        let mut e = minimap_engine();
+        e.split_window(crate::core::window::SplitDirection::Vertical, None);
+        let active_before = e.active_window_id();
+        let other = *e
+            .windows
+            .keys()
+            .find(|&&w| w != active_before)
+            .expect("a vsplit must produce a second window");
+
+        let scroll_before = e.windows.get(&other).unwrap().view.scroll_top;
+        let cursor_before = e.windows.get(&other).unwrap().view.cursor;
+
+        e.activate_window(other);
+
+        assert_eq!(
+            e.active_window_id(),
+            other,
+            "activate_window must make the named window active"
+        );
+        assert_eq!(
+            e.windows.get(&other).unwrap().view.scroll_top,
+            scroll_before,
+            "activate_window must not move the window's scroll position"
+        );
+        assert_eq!(
+            e.windows.get(&other).unwrap().view.cursor,
+            cursor_before,
+            "activate_window must not move the window's cursor"
         );
     }
 
@@ -24071,8 +29127,16 @@ mod tests {
     /// The sampled lines and aggregated spans are quadraui's output, keyed
     /// back to real buffer lines — a transposed or empty sample would show up
     /// here before it reaches a snapshot.
+    ///
+    /// #1093: renamed from `minimap_samples_the_whole_buffer_in_order` — the
+    /// strip now holds a *window*, not the whole buffer, so the claim in the
+    /// old name is no longer true (the window merely happens to start at
+    /// line 0 here, since the cursor starts at the top of the file). The
+    /// in-order/strictly-increasing assertions below are unchanged; a
+    /// `window_len < total_buffer_lines` check is added so this stays
+    /// honest about no longer covering the whole file.
     #[test]
-    fn minimap_samples_the_whole_buffer_in_order() {
+    fn minimap_window_samples_in_order_starting_at_the_top() {
         let e = minimap_engine();
         let screen = render_engine(&e, 120.0, 30.0);
         let mm = &screen.minimap.first().expect("minimap present").minimap;
@@ -24081,6 +29145,14 @@ mod tests {
             "200 lines plus the trailing one"
         );
         assert!(!mm.lines.is_empty());
+        assert!(
+            mm.lines.len() < mm.total_buffer_lines,
+            "test setup sanity: the file must be taller than the strip's \
+             own window, or this test can't distinguish a window from the \
+             pre-#1093 whole-buffer sample (window={}, total={})",
+            mm.lines.len(),
+            mm.total_buffer_lines
+        );
         assert!(
             mm.lines.windows(2).all(|w| w[0].line_idx < w[1].line_idx),
             "sampled buffer line indices must be strictly increasing"
@@ -24093,6 +29165,394 @@ mod tests {
                 && l.line_idx < 160
                 && l.text.starts_with("            ")),
             "the deeply-indented middle band must appear in the sample"
+        );
+    }
+
+    /// #1093 acceptance criterion 1: a file several times taller than the
+    /// strip, cursor at line 1 — the strip's last painted row's `line_idx`
+    /// must be well short of `total_buffer_lines`. This is the issue's own
+    /// repro (`src/app_support.rs`, 647 lines, TUI minimap, cursor at line
+    /// 1: "the strip's bottom row is line ~647").
+    ///
+    /// **RED against unfixed `develop`:** the pre-#1093 shape squeezed the
+    /// whole buffer into the strip on every frame, so the last painted row
+    /// was always `total_buffer_lines - 1` regardless of scroll position —
+    /// this exact assertion (`last_line_idx < total - total / 4`) fails
+    /// against that shape at any scroll position, including the top.
+    #[test]
+    fn minimap_window_stays_short_of_eof_when_scrolled_to_the_top() {
+        // #1211: `K` (hence the window's own length) is now a function of
+        // this call's geometry alone (`editor_visible_rows`, `target_lines`
+        // == 160 here) — never of the buffer's own length — so any file
+        // longer than that geometry-only window still cannot cover the
+        // whole file, and 20,000 lines keeps exercising #1093's genuine
+        // sliding-window regime exactly as it always has.
+        let e = large_minimap_engine(20_000);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
+            .expect("minimap must build")
+            .minimap;
+
+        assert_eq!(mm.lines[0].line_idx, 0, "cursor starts at the top");
+        let last_line_idx = mm.lines.last().unwrap().line_idx;
+        assert!(
+            last_line_idx < mm.total_buffer_lines - mm.total_buffer_lines / 4,
+            "the strip's last painted row (line {last_line_idx} of \
+             {}) must be well short of the end of the file while the \
+             cursor is at the top — a full-length map would paint the \
+             file's last line here on every frame",
+            mm.total_buffer_lines
+        );
+    }
+
+    /// #1093 acceptance criterion 2: the same file scrolled to the bottom —
+    /// the strip's last painted row **is** the last line of the file, and
+    /// its first row is not line 0 (both ends of the file are reachable by
+    /// scrolling, VS Code's `minimap.size: proportional`).
+    #[test]
+    fn minimap_window_reaches_eof_when_scrolled_to_the_bottom() {
+        // #1211: see the sibling "stays short of eof" test's comment — the
+        // window's length is geometry-only, so a 20,000-line buffer stays
+        // outside it at this rect's `target_lines` (160) and the window
+        // still has to slide.
+        let mut e = large_minimap_engine(20_000);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        const EDITOR_VISIBLE_ROWS: usize = 40;
+
+        let total_buffer_lines = {
+            let state = e.active_buffer_state_mut();
+            state.buffer.content.len_lines()
+        };
+        let max_scroll_top = total_buffer_lines - EDITOR_VISIBLE_ROWS;
+        if let Some(w) = e.windows.get_mut(&wid) {
+            w.view.scroll_top = max_scroll_top;
+        }
+
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, EDITOR_VISIBLE_ROWS)
+            .expect("minimap must build")
+            .minimap;
+
+        // #1186: the last `lines` entry is now a *block's* starting line,
+        // not necessarily the file's literal last line — a block can cover
+        // several real lines (`MINIMAP_MAX_COMPRESSION` at most here, since
+        // 20,000 lines sits well past the compression ceiling), so "reaches
+        // EOF" means the last block's own range covers `total_buffer_lines
+        // - 1`, i.e. its start is within one block-width of the end.
+        let last_line_idx = mm.lines.last().unwrap().line_idx;
+        assert!(
+            total_buffer_lines - last_line_idx <= MINIMAP_MAX_COMPRESSION,
+            "scrolled to the bottom, the strip's last painted block (starting \
+             at line {last_line_idx} of {total_buffer_lines}) must reach the \
+             file's actual last line, within one block's own width"
+        );
+        assert!(
+            mm.lines[0].line_idx > 0,
+            "scrolled to the bottom, the strip's first painted row must \
+             not still be line 0 — the window must have slid"
+        );
+    }
+
+    /// #1211 acceptance: the scale (buffer lines per painted row) is a
+    /// function of the strip's own geometry (`editor_visible_rows`,
+    /// `target_lines`) — **never** of `total_buffer_lines`. #1186 derived
+    /// `K` from `total_buffer_lines.div_ceil(target_lines)`, which squeezed
+    /// the *whole file* into the strip for every file shorter than
+    /// `MINIMAP_MAX_COMPRESSION * target_lines` (essentially every real
+    /// file), disabling #1093's slide — this test locks in the fix: two
+    /// files of wildly different lengths, same strip geometry, must land on
+    /// the *identical* scale, and neither shows through to EOF while
+    /// scrolled to the top (both must still slide to reach it).
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — restoring the
+    /// pre-#1211 `k = total_buffer_lines.div_ceil(target_lines)` makes
+    /// `step(&mm_medium)` (1,500 lines) come out to `10` and
+    /// `step(&mm_huge)` (50,000 lines) come out to `64` (the
+    /// `MINIMAP_MAX_COMPRESSION` clamp binding) — different from each other,
+    /// failing the `assert_eq!` below — and `mm_medium` reaches EOF from the
+    /// top (the whole 1,500-line file fit in one window), failing the
+    /// "must NOT reach EOF" assertion for the medium fixture.
+    #[test]
+    fn minimap_scale_is_constant_across_file_length_not_derived_from_it() {
+        let theme = Theme::onedark();
+        // `target_lines` at this rect geometry (pinned by the sibling
+        // windowing tests' own comments): 160.
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        let short = large_minimap_engine(50);
+        let medium = large_minimap_engine(1_500);
+        let huge = large_minimap_engine(50_000);
+        let wid_short = short.active_window_id();
+        let wid_medium = medium.active_window_id();
+        let wid_huge = huge.active_window_id();
+
+        let mm_short = build_minimap_data(&short, &theme, wid_short, rect, 1.0, 40)
+            .expect("minimap must build for the short fixture")
+            .minimap;
+        let mm_medium = build_minimap_data(&medium, &theme, wid_medium, rect, 1.0, 40)
+            .expect("minimap must build for the medium fixture")
+            .minimap;
+        let mm_huge = build_minimap_data(&huge, &theme, wid_huge, rect, 1.0, 40)
+            .expect("minimap must build for the huge fixture")
+            .minimap;
+
+        let step = |mm: &quadraui::Minimap| mm.lines[1].line_idx - mm.lines[0].line_idx;
+
+        // A file shorter than `target_lines` needs no compression at all —
+        // unaffected by this fix, kept as a sibling floor.
+        assert_eq!(
+            step(&mm_short),
+            1,
+            "a file shorter than target_lines must sample one buffer line \
+             per painted row"
+        );
+
+        // The core #1211 property: 1,500 lines and 50,000 lines, same
+        // geometry, must produce the exact same scale — `K` is a function
+        // of the strip, not the file.
+        assert_eq!(
+            step(&mm_medium),
+            step(&mm_huge),
+            "the painted lines-per-row must be identical for a 1,500-line \
+             and a 50,000-line file at the same strip geometry — got {} vs \
+             {}; a scale that differs by file length means K is still \
+             derived from total_buffer_lines",
+            step(&mm_medium),
+            step(&mm_huge)
+        );
+        assert!(
+            step(&mm_medium) > 1 && step(&mm_medium) <= MINIMAP_MAX_COMPRESSION,
+            "the shared scale must compress (TUI-shaped geometry: more than \
+             one buffer line per row) but stay within the safety ceiling — \
+             got {}",
+            step(&mm_medium)
+        );
+
+        // Neither file's window may reach EOF while scrolled to the top —
+        // both are longer than the (geometry-only) window, so #1093's slide
+        // must still be required to reach the end, for the small file just
+        // as much as the huge one.
+        for (label, mm) in [("medium", &mm_medium), ("huge", &mm_huge)] {
+            assert_eq!(
+                mm.lines[0].line_idx, 0,
+                "{label} fixture must start at the top"
+            );
+            assert!(
+                mm.lines.last().unwrap().line_idx < mm.total_buffer_lines - 1,
+                "{label} fixture must NOT reach EOF while scrolled to the \
+                 top — the window still has to slide (last painted line \
+                 {} of {})",
+                mm.lines.last().unwrap().line_idx,
+                mm.total_buffer_lines
+            );
+        }
+    }
+
+    /// #1093 acceptance criterion 6: a file that fits entirely within the
+    /// strip's own capacity must still paint top-to-bottom with no window —
+    /// no regression to the pre-#1093 behaviour for the common case where
+    /// the whole file already fits.
+    #[test]
+    fn minimap_window_is_the_whole_file_when_it_fits_the_strip() {
+        let e = large_minimap_engine(10);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, 40)
+            .expect("minimap must build")
+            .minimap;
+
+        assert_eq!(
+            mm.lines.len(),
+            mm.total_buffer_lines,
+            "a file shorter than the strip's own capacity must show every \
+             line, not a partial window"
+        );
+        assert_eq!(mm.lines[0].line_idx, 0);
+        assert_eq!(mm.lines.last().unwrap().line_idx, mm.total_buffer_lines - 1);
+    }
+
+    // ── #1085/#1098: point-sample → block-aggregation ───────────────────
+    //
+    // The white-box test that used to live here
+    // (`a_stride_skipped_distinctive_line_still_shows_up`) drove
+    // `minimap_block_bounds`/`minimap_block_sample_indices`/
+    // `minimap_block_text` directly — pure block-partitioning and
+    // dither-aggregation arithmetic, with no highlight/vimcode-specific
+    // logic in it at all. #1098 lifted that arithmetic into quadraui
+    // (quadraui#1012), which already carries the equivalent case
+    // (`sample_blocks_no_line_in_a_block_is_ever_fully_discarded`, same
+    // "a rare long line surrounded by short ones must not be discarded"
+    // property) in its own suite, so keeping a second copy of the same
+    // expectations here would just be a duplicate to keep in sync. The
+    // sibling test below stays: it drives the full `build_minimap_data`
+    // pipeline, which is where vimcode's own half (window/highlight
+    // mapping) still lives.
+
+    /// #1085 acceptance criterion 2: the viewport highlight band's own
+    /// *content* must differ between a blank run and a dense block of the
+    /// same file — not just which rows are highlighted (already covered
+    /// by `minimap_click_at_the_middle_seeks_to_half_the_file` and
+    /// friends), but what the aggregation actually painted into those
+    /// rows. A fix that only stops saturating (quadraui#1007's rasteriser
+    /// half) without also making vimcode's own sampling represent every
+    /// line would still show a band that doesn't track *where* on screen
+    /// the editor actually is.
+    ///
+    /// The dense region's every 5th line (`j % 5 == 2`, never `== 0`) is
+    /// the only non-blank content, deliberately never a block boundary
+    /// (`HALF` is itself a multiple of the stride, so a block boundary is
+    /// always `≡ 0 (mod 5)`, absolute or region-relative) — a fixture
+    /// where the dense region's content sat *on* the sampled point would
+    /// pass under the pre-#1085 point-sampler too and prove nothing about
+    /// this issue.
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand with the same
+    /// `block_sample_indices` → `vec![start]` revert #1085's own
+    /// (now-removed) white-box test used — the point-sampler only ever
+    /// reads each block's first line, which is blank in *both* regions by
+    /// construction here, so `dense_dots` collapses to `0` too and
+    /// `dense_dots > blank_dots * 4` (`0 > 0`) fails. Reverted before
+    /// landing this test.
+    #[test]
+    fn viewport_band_content_differs_between_a_blank_run_and_a_dense_block() {
+        const HALF: usize = 400;
+        let mut text = String::with_capacity(HALF * 22);
+        for _ in 0..HALF {
+            text.push('\n'); // blank run
+        }
+        for j in 0..HALF {
+            if j % 5 == 2 {
+                text.push_str(&"x".repeat(20));
+            }
+            text.push('\n');
+        }
+        let mut e = test_engine(&text);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        let count_band_dots = |e: &mut Engine, scroll_top: usize| -> usize {
+            if let Some(w) = e.windows.get_mut(&wid) {
+                w.view.scroll_top = scroll_top;
+            }
+            let mm = build_minimap_data(e, &theme, wid, rect, 1.0, 40)
+                .expect("minimap must build")
+                .minimap;
+            let end = (mm.visible_row_start + mm.visible_row_count).min(mm.lines.len());
+            mm.lines[mm.visible_row_start..end]
+                .iter()
+                .map(|l| l.text.chars().filter(|c| !c.is_whitespace()).count())
+                .sum()
+        };
+
+        let blank_dots = count_band_dots(&mut e, 10);
+        let dense_dots = count_band_dots(&mut e, HALF + 10);
+
+        assert_eq!(
+            blank_dots, 0,
+            "the viewport band over a blank run (scroll_top=10) must show \
+             zero set columns"
+        );
+        assert!(
+            dense_dots > 0,
+            "the viewport band over a dense block (scroll_top={}) must \
+             show at least one set column",
+            HALF + 10
+        );
+        assert!(
+            dense_dots > blank_dots * 4,
+            "the viewport band's own content must differ measurably \
+             between a blank run ({blank_dots} set columns) and a dense \
+             block ({dense_dots} set columns) of the same file"
+        );
+    }
+
+    /// #1186 acceptance: the viewport-highlight band (`Minimap::visible_row_start`/
+    /// `visible_row_count`, painted as a background band by both backends'
+    /// rasterisers — see `quadraui::tui::minimap`'s module doc) must shrink
+    /// and reposition correctly once blocks start covering more than one
+    /// real buffer line, not stay pinned to the pre-#1186 per-line shape.
+    ///
+    /// A `viewport_lines`-tall editor viewport spans `viewport_lines` real
+    /// buffer lines, which now maps to `ceil(viewport_lines / block_width)`
+    /// **blocks** (clamped to at least 1) rather than `viewport_lines`
+    /// blocks — since each block covers `block_width` real lines. This
+    /// checks that relationship directly against a compressed window
+    /// (`block_width > 1`), and that `visible_row_start` lands on the block
+    /// that actually contains `scroll_top`, not the next one after it (the
+    /// off-by-one the old `position(|l| l.line_idx >= scroll_top)` formula
+    /// would hit once a block's own range no longer starts exactly at
+    /// `scroll_top`).
+    ///
+    /// **RED against unfixed `develop`:** confirmed by hand — reverting
+    /// `visible_row_start`'s `partition_point` formula back to
+    /// `position(|l| l.line_idx >= scroll_top)` (the pre-#1186 formula) at
+    /// this test's compression skips the block that actually contains
+    /// `scroll_top`, landing one block later than expected and failing the
+    /// `visible_row_start` assertion below. Reverted before landing this
+    /// test.
+    #[test]
+    fn viewport_band_scales_down_and_repositions_under_compression() {
+        const N_LINES: usize = 20_000;
+        const EDITOR_VISIBLE_ROWS: usize = 40;
+        let mut e = large_minimap_engine(N_LINES);
+        let theme = Theme::onedark();
+        let wid = e.active_window_id();
+        let rect = WindowRect::new(0.0, 0.0, 100.0, 40.0);
+
+        // Scroll well into the file (but not to the very bottom, so the
+        // scrolled-to line lands squarely inside some block's range rather
+        // than coincidentally on a window boundary).
+        let scroll_top = N_LINES / 3;
+        if let Some(w) = e.windows.get_mut(&wid) {
+            w.view.scroll_top = scroll_top;
+            w.view.cursor.line = scroll_top;
+        }
+
+        let mm = build_minimap_data(&e, &theme, wid, rect, 1.0, EDITOR_VISIBLE_ROWS)
+            .expect("minimap must build")
+            .minimap;
+
+        let block_width = mm.lines[1].line_idx - mm.lines[0].line_idx;
+        assert!(
+            block_width > 1,
+            "test setup sanity: this fixture must be far enough past the \
+             compression ceiling to produce multi-line blocks, or this \
+             test cannot distinguish compressed from uncompressed band math \
+             (block_width={block_width})"
+        );
+
+        // Height: a `EDITOR_VISIBLE_ROWS`-line viewport must cover roughly
+        // `EDITOR_VISIBLE_ROWS / block_width` blocks (clamped to >= 1) —
+        // never the pre-#1186 `EDITOR_VISIBLE_ROWS` blocks a compressed
+        // window would wildly overshoot to.
+        let expected_rows = (EDITOR_VISIBLE_ROWS / block_width).max(1);
+        assert!(
+            mm.visible_row_count <= expected_rows + 1 && mm.visible_row_count >= 1,
+            "a {EDITOR_VISIBLE_ROWS}-line viewport at block_width \
+             {block_width} must show roughly {expected_rows} band block(s) \
+             (clamped to >= 1), got {} — the band must shrink under \
+             compression, not stay pinned to the uncompressed \
+             {EDITOR_VISIBLE_ROWS}",
+            mm.visible_row_count
+        );
+
+        // Position: `visible_row_start` must be the block that actually
+        // *contains* `scroll_top`, i.e. the last block whose own start is
+        // `<= scroll_top`.
+        let expected_start = mm
+            .lines
+            .iter()
+            .rposition(|l| l.line_idx <= scroll_top)
+            .expect("some block must start at or before scroll_top");
+        assert_eq!(
+            mm.visible_row_start, expected_start,
+            "visible_row_start must be the block containing scroll_top \
+             ({scroll_top}), not the next block after it"
         );
     }
 
@@ -24550,21 +30010,21 @@ mod tests {
     }
 
     #[test]
-    fn command_line_selection_rect_spans_the_selected_columns() {
-        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
-        // Select ":wq" from ":wq!" — char indices 0..3.
-        let r = command_line_selection_rect(rect, ":wq!", 1.0, (0, 3)).unwrap();
-        assert_eq!((r.x, r.width), (0.0, 3.0));
+    fn command_line_selection_bytes_converts_char_indices_to_byte_offsets() {
+        // ":éditer" — 'é' is 2 bytes. Inclusive char selection (1, 3) covers
+        // chars 1..=3 ("édi"); char 1 starts at byte 1, char 4 ('t', one
+        // past the inclusive end) starts at byte 5.
+        let (lo, hi) = command_line_selection_bytes(":éditer", (1, 3));
+        assert_eq!((lo, hi), (1, 5));
     }
 
     #[test]
-    fn command_line_selection_rect_order_independent_and_empty_is_none() {
-        let rect = quadraui::Rect::new(0.0, 0.0, 20.0, 1.0);
-        assert_eq!(
-            command_line_selection_rect(rect, ":wq!", 1.0, (3, 0)),
-            command_line_selection_rect(rect, ":wq!", 1.0, (0, 3))
-        );
-        assert!(command_line_selection_rect(rect, ":wq!", 1.0, (2, 2)).is_none());
+    fn command_line_selection_bytes_is_order_independent_and_end_inclusive() {
+        // No multibyte prefix: char count and byte count coincide. (1, 2)
+        // inclusive covers chars 1 and 2 ("wq" of ":wq!") -> exclusive byte
+        // range [1, 3). Either endpoint order gives the same result.
+        assert_eq!(command_line_selection_bytes(":wq!", (1, 2)), (1, 3));
+        assert_eq!(command_line_selection_bytes(":wq!", (2, 1)), (1, 3));
     }
 
     #[test]
@@ -26399,10 +31859,12 @@ mod tests {
         );
 
         // The drag ratio is likewise anchored to `axis_start`: dragging to
-        // x=450 is 25% across the group, not 75% (which is what 450/600 would
-        // give if the origin were dropped).
+        // x=450 is ~25% across the group (150 of the 599-column content
+        // width — `axis_size` minus #1326's one reserved divider column,
+        // see `divider_ratio_from_pos`'s doc), not 75% (which is what
+        // 450/600 would give if the origin were dropped).
         let r = divider_ratio_from_pos(&dividers[0], 450.0, 300.0);
-        assert!((r - 0.25).abs() < 0.0001, "ratio = {r}");
+        assert!((r - 150.0 / 599.0).abs() < 0.0001, "ratio = {r}");
     }
 
     /// Companion to the above for the paint side: `divider_to_split` must
@@ -26686,6 +32148,46 @@ mod tests {
             svg.contains("viewBox=\"0 0 1024 1024\""),
             "APP_ICON_INTRINSIC_SIZE must match the asset's own viewBox"
         );
+    }
+
+    // ── #1207: 'linebreak' wrap-point selection ─────────────────────────
+    //
+    // RED against unfixed `develop`: before #1207,
+    // `compute_word_wrap_segments` had no `linebreak` parameter at all and
+    // *always* sought a word boundary — i.e. it always did what
+    // `linebreak_off_hard_cuts_mid_word` asserts must NOT happen, so that
+    // test would have failed (the segment boundary would have fallen back
+    // to the space, not the viewport column).
+
+    #[test]
+    fn linebreak_off_hard_cuts_mid_word() {
+        // "helloworld" is 10 chars with no word boundary anywhere; a 5-col
+        // viewport with linebreak off must cut mid-word at column 5.
+        let segs = compute_word_wrap_segments("helloworld", 5, false);
+        assert_eq!(segs, vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn linebreak_on_breaks_at_word_boundary() {
+        // "hello world" (11 chars) with an 8-col viewport: a hard cut at
+        // column 8 would split "wor|ld", but 'linebreak' must back up to
+        // the space at index 5 instead.
+        let segs = compute_word_wrap_segments("hello world", 8, true);
+        assert_eq!(segs, vec![(0, 6), (6, 11)]);
+    }
+
+    #[test]
+    fn linebreak_on_falls_back_to_hard_cut_with_no_boundary() {
+        // No word boundary anywhere in "helloworld" — 'linebreak' can't do
+        // anything but the same hard cut as linebreak-off.
+        let segs = compute_word_wrap_segments("helloworld", 5, true);
+        assert_eq!(segs, vec![(0, 5), (5, 10)]);
+    }
+
+    #[test]
+    fn linebreak_is_a_no_op_when_the_line_fits() {
+        assert_eq!(compute_word_wrap_segments("short", 80, false), vec![(0, 5)]);
+        assert_eq!(compute_word_wrap_segments("short", 80, true), vec![(0, 5)]);
     }
 }
 
@@ -27025,6 +32527,7 @@ mod mouse_drag_router_tests {
             "tui:editor:0:vsb",
             "tui:editor:0:hsb",
             "editor:h_sb:0",
+            "minimap:0",
         ];
         let mut engine = drag_engine();
         for id in ids {
@@ -27063,6 +32566,29 @@ mod mouse_drag_router_tests {
             7,
             "applying an `explorer:sb` offset must move the tree, whichever \
              backend's drag emitted it"
+        );
+    }
+
+    /// #1187: `minimap:<window_id>` — armed by `minimap_press` on a strip
+    /// press — must move the *named window's* `scroll_top`, mirroring
+    /// `editor:v_sb:<window_id>`. Asserted on the window's own scroll
+    /// position, not just the table having an arm for the id.
+    #[test]
+    fn a_minimap_scrollbar_offset_moves_the_named_windows_scroll_top() {
+        let mut engine = drag_engine();
+        let win = engine.active_window_id();
+        assert_eq!(engine.windows.get(&win).unwrap().view.scroll_top, 0);
+        assert!(apply_scroll_offset(
+            &mut engine,
+            &format!("minimap:{}", win.0),
+            123,
+            ScrollApplyContext::default()
+        ));
+        assert_eq!(
+            engine.windows.get(&win).unwrap().view.scroll_top,
+            123,
+            "applying a `minimap:<window_id>` offset must move that \
+             window's scroll_top, whichever backend's drag emitted it"
         );
     }
 }
@@ -27333,14 +32859,54 @@ mod slice7_router_tests {
     #[test]
     fn ctrl_l_is_a_force_redraw_from_either_backends_spelling() {
         // TUI hands a `unicode` char; GTK hands a one-character `key_name`.
-        assert!(is_force_redraw_key("", Some('l'), true));
-        assert!(is_force_redraw_key("", Some('L'), true));
-        assert!(is_force_redraw_key("l", None, true));
-        assert!(is_force_redraw_key("L", None, true));
+        assert!(is_force_redraw_key("", Some('l'), true, false));
+        assert!(is_force_redraw_key("", Some('L'), true, false));
+        assert!(is_force_redraw_key("l", None, true, false));
+        assert!(is_force_redraw_key("L", None, true, false));
         // Without Ctrl, `l` is vim's cursor-right and must fall through —
         // the bug GTK had, where Ctrl+L moved the cursor.
-        assert!(!is_force_redraw_key("l", Some('l'), false));
-        assert!(!is_force_redraw_key("k", Some('k'), true));
+        assert!(!is_force_redraw_key("l", Some('l'), false, false));
+        assert!(!is_force_redraw_key("k", Some('k'), true, false));
+    }
+
+    /// #1160: right after `<C-x>` in Insert mode, `<C-x><C-l>` is the
+    /// whole-line completion sub-mode (`:h i_CTRL-X_CTRL-L`), not a repaint
+    /// request — `insert_ctrl_x_pending = true` must make the same Ctrl+L
+    /// chord that `ctrl_l_is_a_force_redraw_from_either_backends_spelling`
+    /// asserts *is* a force-redraw fall through instead, on both backends'
+    /// key spellings.
+    #[test]
+    fn ctrl_l_falls_through_when_ctrl_x_completion_is_pending() {
+        assert!(!is_force_redraw_key("", Some('l'), true, true));
+        assert!(!is_force_redraw_key("l", None, true, true));
+    }
+
+    /// #1243: only the popup-was-up-last-frame-and-is-gone-this-frame edge
+    /// must fire `Backend::request_full_repaint` — every other transition
+    /// (staying open, staying closed, or newly opening) repaints its own
+    /// content this frame regardless of the diff cache, so requesting a
+    /// full repaint there would just be wasted work, not a correctness bug,
+    /// but pinning all four keeps the predicate from drifting into
+    /// "request it whenever a popup isn't open" (which would fire on every
+    /// popup-free frame forever).
+    #[test]
+    fn popup_overlay_closed_this_frame_fires_only_on_the_closing_edge() {
+        assert!(
+            popup_overlay_closed_this_frame(true, false),
+            "open → closed must fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(true, true),
+            "staying open must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, false),
+            "staying closed must not fire"
+        );
+        assert!(
+            !popup_overlay_closed_this_frame(false, true),
+            "newly opening must not fire"
+        );
     }
 
     #[test]
@@ -27475,13 +33041,13 @@ mod slice7_router_tests {
         assert_eq!(scroll_top, 0, "quickfix closed: scroll resets");
 
         // Selection below the six-row window scrolls it down.
-        engine.quickfix_open = true;
-        engine.quickfix_selected = 9;
+        engine.quickfix.open = true;
+        engine.quickfix.selected = 9;
         let mut scroll_top = 0usize;
         post_key_epilogue(&mut engine, Some(&mut scroll_top));
         assert_eq!(scroll_top, 5, "9 must be the last of five visible rows");
         // Selection above it scrolls back up.
-        engine.quickfix_selected = 2;
+        engine.quickfix.selected = 2;
         post_key_epilogue(&mut engine, Some(&mut scroll_top));
         assert_eq!(scroll_top, 2);
 
@@ -27717,6 +33283,279 @@ mod slice7_router_tests {
             in_window_backend.calls.contains(&"draw_context_menu"),
             "non-native branch must still call draw_context_menu; calls were {:?}",
             in_window_backend.calls
+        );
+    }
+
+    // ─── 'list' glyph substitution (#1190, 'listchars' #1206) ──────────────
+
+    /// A `Settings` with `listchars` overridden and `tabstop` at its default
+    /// (8) — the shape every `apply_list_glyphs`/`compute_list_glyph_expansion`
+    /// test below needs, since #1206 made both option-driven.
+    fn list_glyphs_settings(listchars: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.listchars = listchars.to_string();
+        settings
+    }
+
+    #[test]
+    fn apply_list_glyphs_marks_eol_with_no_tabs() {
+        let settings = list_glyphs_settings("eol:$");
+        let (text, spans, diags, spells) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
+        assert_eq!(text, "hello$");
+        assert!(spans.is_empty());
+        assert!(diags.is_empty());
+        assert!(spells.is_empty());
+    }
+
+    #[test]
+    fn apply_list_glyphs_marks_eol_before_trailing_newline() {
+        let settings = list_glyphs_settings("eol:$");
+        let (text, ..) = apply_list_glyphs(
+            "hello\n".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
+        assert_eq!(
+            text, "hello$\n",
+            "the $ must land before the newline, not after it"
+        );
+    }
+
+    #[test]
+    fn apply_list_glyphs_skips_eol_for_non_final_wrap_segment() {
+        let settings = list_glyphs_settings("eol:$");
+        let (text, ..) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "hello", "mark_eol=false must not append $");
+    }
+
+    /// RED against unfixed `develop` (#1206): before this change,
+    /// `apply_list_glyphs` unconditionally appended `$` regardless of
+    /// `'listchars'` — this asserts the *opposite* (default `'listchars'`
+    /// has no `eol` item, so nothing is appended), which fails against the
+    /// pre-#1206 hardcoded-`$` implementation.
+    #[test]
+    fn apply_list_glyphs_default_listchars_has_no_eol_marker() {
+        let settings = Settings::default();
+        let (text, ..) = apply_list_glyphs(
+            "hello".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
+        assert_eq!(
+            text, "hello",
+            "Neovim's real default 'listchars' has no eol item"
+        );
+    }
+
+    #[test]
+    fn apply_list_glyphs_expands_tab_to_caret_i_when_no_tab_item() {
+        let settings = list_glyphs_settings("");
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a^Ib");
+    }
+
+    /// RED against unfixed `develop` (#1206): before this change, `'list'`
+    /// always rendered a tab as literal `^I`. Neovim's real default
+    /// `'listchars'` (`"tab:> ,trail:-,nbsp:+"`) instead fills to the next
+    /// `'tabstop'` stop with `>` then spaces — this fails against the
+    /// pre-#1206 hardcoded-`^I` implementation.
+    #[test]
+    fn apply_list_glyphs_default_listchars_renders_tab_as_arrow_fill() {
+        let settings = Settings::default();
+        // vimcode's default 'tabstop' is 4 (not Vim's classic 8 — see
+        // `default_tabstop`); a tab right after "a" (column 1) fills
+        // columns 1..4 — '>' then 2 more spaces (3 cells total).
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a>  b");
+    }
+
+    /// RED against unfixed `develop` (#1206): 'trail' had no implementation
+    /// at all before this change (trailing spaces just rendered as spaces).
+    #[test]
+    fn apply_list_glyphs_trailing_spaces_use_trail_glyph() {
+        let settings = list_glyphs_settings("trail:-");
+        let (text, ..) = apply_list_glyphs(
+            "ab  ".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "ab--");
+    }
+
+    /// A leading/mid-line space must NOT be treated as trailing.
+    #[test]
+    fn apply_list_glyphs_trail_glyph_does_not_touch_non_trailing_spaces() {
+        let settings = list_glyphs_settings("trail:-");
+        let (text, ..) = apply_list_glyphs(
+            "a  b  ".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a  b--");
+    }
+
+    /// RED against unfixed `develop` (#1206): 'nbsp' had no implementation
+    /// at all before this change.
+    #[test]
+    fn apply_list_glyphs_nbsp_uses_nbsp_glyph() {
+        let settings = list_glyphs_settings("nbsp:+");
+        let (text, ..) = apply_list_glyphs(
+            "a\u{a0}b".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a+b");
+    }
+
+    fn plain_style() -> Style {
+        Style {
+            fg: quadraui::Color::rgb(0, 0, 0),
+            bg: None,
+            bold: false,
+            italic: false,
+            font_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_span_offsets_past_a_tab() {
+        // "a\tbc" — a span covering "bc" (source bytes 2..4) must land on
+        // "^Ibc"'s "bc" (bytes 3..5) once the tab becomes the 2-byte `^I`.
+        let settings = list_glyphs_settings("");
+        let spans = vec![StyledSpan {
+            start_byte: 2,
+            end_byte: 4,
+            style: plain_style(),
+        }];
+        let (text, spans, ..) = apply_list_glyphs(
+            "a\tbc".to_string(),
+            spans,
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a^Ibc");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start_byte, 3);
+        assert_eq!(spans[0].end_byte, 5);
+        assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "bc");
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_spans_across_two_tabs() {
+        // "a\tb\tc" — a span on the trailing "c" (source byte 4..5) must
+        // shift by +2 (one extra byte from each of the two tabs).
+        let settings = list_glyphs_settings("");
+        let spans = vec![StyledSpan {
+            start_byte: 4,
+            end_byte: 5,
+            style: plain_style(),
+        }];
+        let (text, spans, ..) = apply_list_glyphs(
+            "a\tb\tc".to_string(),
+            spans,
+            Vec::new(),
+            Vec::new(),
+            false,
+            &settings,
+        );
+        assert_eq!(text, "a^Ib^Ic");
+        assert_eq!(&text[spans[0].start_byte..spans[0].end_byte], "c");
+    }
+
+    #[test]
+    fn apply_list_glyphs_combines_tab_and_eol() {
+        let settings = list_glyphs_settings("eol:$");
+        let (text, ..) = apply_list_glyphs(
+            "a\tb".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            &settings,
+        );
+        assert_eq!(text, "a^Ib$");
+    }
+
+    #[test]
+    fn apply_list_glyphs_remaps_diagnostic_and_spell_marks_past_a_tab() {
+        // "\tfoo" — a diagnostic/spell mark on "foo" (char cols 1..4) must
+        // land on "^Ifoo"'s "foo" (char cols 2..5) once the tab expands to
+        // the 2-char `^I` (#1208 bug 1: these are char-index based, unlike
+        // `spans`, so they need their own remap through the same table).
+        let settings = list_glyphs_settings("");
+        let diags = vec![DiagnosticMark {
+            start_col: 1,
+            end_col: 4,
+            severity: crate::core::lsp::DiagnosticSeverity::Error,
+            message: "oops".to_string(),
+        }];
+        let spells = vec![SpellMark {
+            start_col: 1,
+            end_col: 4,
+        }];
+        let (text, _, diags, spells) = apply_list_glyphs(
+            "\tfoo".to_string(),
+            Vec::new(),
+            diags,
+            spells,
+            false,
+            &settings,
+        );
+        assert_eq!(text, "^Ifoo");
+        assert_eq!(diags[0].start_col, 2);
+        assert_eq!(diags[0].end_col, 5);
+        assert_eq!(spells[0].start_col, 2);
+        assert_eq!(spells[0].end_col, 5);
+        let chars: Vec<char> = text.chars().collect();
+        let marked: String = chars[diags[0].start_col..diags[0].end_col].iter().collect();
+        assert_eq!(
+            marked, "foo",
+            "diagnostic mark must land on 'foo', not shifted left"
         );
     }
 }

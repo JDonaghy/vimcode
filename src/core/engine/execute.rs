@@ -2,8 +2,18 @@ use super::*;
 
 impl Engine {
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
-        // Save for @: repeat (before normalization, using trimmed original)
+        // Save for @: repeat (before normalization, using trimmed original).
+        // `prev_ex_command` is the value *before* this overwrite — the ":"
+        // register's true value while this command runs (`:h quote_:`):
+        // confirmed against a live oracle that `:registers`'s own listing
+        // shows the *previous* command in its ":" row, never itself, because
+        // the ":" register isn't updated until a command finishes.
+        // `self.last_ex_command` itself has to be set eagerly, right here,
+        // so `@:` and `":p`/`<C-r>:` see *this* command as soon as it
+        // completes — including for early-return paths below that never
+        // reach the bottom of this function.
         let trimmed_cmd = cmd.trim();
+        let prev_ex_command = self.last_ex_command.clone();
         if !trimmed_cmd.is_empty() {
             self.last_ex_command = Some(trimmed_cmd.to_string());
         }
@@ -522,6 +532,19 @@ impl Engine {
             return self.cmd_git_push();
         }
 
+        // Handle :GFinalize [message] — #528 Track A Phase 3: commit any
+        // working-tree edits made while reviewing a branch and push them,
+        // the "finalize review edits" action. See `Engine::
+        // finalize_review_edits` for the safety semantics (no-force push,
+        // refuses to run if the worktree has moved off the reviewed
+        // branch).
+        if cmd == "GFinalize" {
+            return self.cmd_git_finalize_review(None);
+        }
+        if let Some(msg) = cmd.strip_prefix("GFinalize ") {
+            return self.cmd_git_finalize_review(Some(msg.trim()));
+        }
+
         // Handle :Gblame / :Gb
         if cmd == "Gblame" || cmd == "Gb" {
             return self.cmd_git_blame();
@@ -716,57 +739,239 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // ── :map / :unmap — user-defined key mappings ────────────────────────────
-        if cmd == "map" {
-            // :map — list all user keymaps
-            if self.settings.keymaps.is_empty() {
-                self.message = "No user keymaps defined".to_string();
-            } else {
-                self.message = self.settings.keymaps.join("  |  ");
+        // ── :map family — vim's per-mode key mapping commands (#1151) ─────────────
+        // Before #1151, vimcode's only mapping command was its own invention,
+        // `:map <mode> <keys> :<excmd>` — mode as a positional argument, target
+        // always an ex command. Neither matches vim: vim selects the mode from
+        // the *command name* (`:nnoremap`, `:imap`, …) and `{rhs}` can be a raw
+        // key sequence, not just `:excmd`. This table drives that per-mode
+        // dispatch; `build_keymap_entries` materializes it into the same
+        // persisted-string format `settings.json` already used (so existing
+        // `keymaps` entries, and code that reads them, keep working unmigrated).
+        //
+        // "x"/"s" are vim's Visual-only / Select-only letters. vimcode has no
+        // separate Select mode, so `x` matches during `try_user_keymap`
+        // alongside `v` and `s` is accepted here (parses, lists, unmaps) but
+        // never active — see `Engine::active_keymap_modes`.
+        const MAP_DEFINE_CMDS: &[(&str, &[&str], bool)] = &[
+            ("nnoremap", &["n"], true),
+            ("nmap", &["n"], false),
+            ("vnoremap", &["v"], true),
+            ("vmap", &["v"], false),
+            ("xnoremap", &["x"], true),
+            ("xmap", &["x"], false),
+            ("onoremap", &["o"], true),
+            ("omap", &["o"], false),
+            ("inoremap", &["i"], true),
+            ("imap", &["i"], false),
+            ("cnoremap", &["c"], true),
+            ("cmap", &["c"], false),
+            ("snoremap", &["s"], true),
+            ("smap", &["s"], false),
+            // Bang forms target Insert+Command-line; bare forms target vim's
+            // combined Normal+Visual+Select+Operator-pending.
+            ("noremap!", &["i", "c"], true),
+            ("map!", &["i", "c"], false),
+            ("noremap", &["n", "v", "s", "o"], true),
+            ("map", &["n", "v", "s", "o"], false),
+        ];
+        const MAP_UNMAP_CMDS: &[(&str, &[&str])] = &[
+            ("nunmap", &["n"]),
+            ("vunmap", &["v"]),
+            ("xunmap", &["x"]),
+            ("ounmap", &["o"]),
+            ("iunmap", &["i"]),
+            ("cunmap", &["c"]),
+            ("sunmap", &["s"]),
+            ("unmap!", &["i", "c"]),
+            ("unmap", &["n", "v", "s", "o"]),
+        ];
+        const MAP_CLEAR_CMDS: &[(&str, &[&str])] = &[
+            ("nmapclear", &["n"]),
+            ("vmapclear", &["v"]),
+            ("xmapclear", &["x"]),
+            ("omapclear", &["o"]),
+            ("imapclear", &["i"]),
+            ("cmapclear", &["c"]),
+            ("smapclear", &["s"]),
+            // Bare `:mapclear` matches bare `:map`'s scope (n,v,s,o); `!`
+            // matches `:map!`'s (i,c) — it does not mean "clear everything".
+            ("mapclear!", &["i", "c"]),
+            ("mapclear", &["n", "v", "s", "o"]),
+        ];
+
+        let (map_word, map_rest) = match cmd.find(' ') {
+            Some(idx) => (&cmd[..idx], Some(cmd[idx + 1..].trim_start())),
+            None => (cmd, None),
+        };
+
+        if let Some(&(_, modes, noremap)) =
+            MAP_DEFINE_CMDS.iter().find(|(name, ..)| *name == map_word)
+        {
+            match map_rest {
+                None | Some("") => {
+                    // Bare command (any of the family) — list all user keymaps,
+                    // same as pre-#1151 bare `:map`.
+                    if self.settings.keymaps.is_empty() {
+                        self.message = "No user keymaps defined".to_string();
+                    } else {
+                        self.message = self.settings.keymaps.join("  |  ");
+                    }
+                }
+                Some(rest) => {
+                    let mut parts = rest.splitn(2, ' ');
+                    let lhs = parts.next().unwrap_or("");
+                    let rhs = parts.next().unwrap_or("").trim();
+                    match build_keymap_entries(lhs, rhs, modes, noremap) {
+                        Some(entries) => {
+                            // Redefining a mapping for the same (mode, lhs)
+                            // replaces the existing entry rather than
+                            // accumulating a stale/conflicting duplicate —
+                            // vim's `:nnoremap`/`:nmap`/etc. semantics.
+                            // Without this, `:nnoremap jk <Esc>` followed by
+                            // `:nnoremap jk <C-c>` left both entries in
+                            // `settings.keymaps` forever, with `:nmap`'s
+                            // lister showing the stale one alongside the
+                            // current one (#1151 review).
+                            let leader = self.settings.leader.to_string();
+                            let target_keys =
+                                expand_leader_tokens(parse_key_sequence(lhs), &leader);
+                            self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                                Some(km) => {
+                                    let km_keys = expand_leader_tokens(km.keys, &leader);
+                                    !(modes.contains(&km.mode.as_str()) && km_keys == target_keys)
+                                }
+                                None => true,
+                            });
+                            for entry in entries {
+                                self.settings.keymaps.push(entry);
+                            }
+                            let _ = self.settings.save();
+                            self.rebuild_user_keymaps();
+                            self.message = format!("Mapped: {lhs} -> {rhs}");
+                        }
+                        None => {
+                            self.message = format!(
+                                "Usage: :{map_word} {{lhs}} {{rhs}}  (e.g. :{map_word} jk <Esc>)"
+                            );
+                        }
+                    }
+                }
             }
             return EngineAction::None;
         }
-        if let Some(rest) = cmd.strip_prefix("map ") {
-            let rest = rest.trim();
-            // :map n <C-/> :Commentary → add keymap
-            if parse_keymap_def(rest).is_some() {
-                let entry = rest.to_string();
-                if !self.settings.keymaps.contains(&entry) {
-                    self.settings.keymaps.push(entry.clone());
-                    let _ = self.settings.save();
-                    self.rebuild_user_keymaps();
+
+        if let Some(&(_, modes)) = MAP_UNMAP_CMDS.iter().find(|(name, _)| *name == map_word) {
+            match map_rest {
+                None | Some("") => {
+                    self.message = format!("Usage: :{map_word} {{lhs}}  (e.g. :{map_word} jk)");
                 }
-                self.message = format!("Mapped: {entry}");
-            } else {
-                self.message =
-                    "Usage: :map <mode> <keys> :<command>  (e.g. :map n <C-/> :Commentary)"
-                        .to_string();
+                Some(lhs) => {
+                    let leader = self.settings.leader.to_string();
+                    let target_keys = expand_leader_tokens(parse_key_sequence(lhs), &leader);
+                    let before = self.settings.keymaps.len();
+                    self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                        Some(km) => {
+                            let km_keys = expand_leader_tokens(km.keys, &leader);
+                            !(modes.contains(&km.mode.as_str()) && km_keys == target_keys)
+                        }
+                        None => true,
+                    });
+                    if self.settings.keymaps.len() < before {
+                        let _ = self.settings.save();
+                        self.rebuild_user_keymaps();
+                        self.message = format!("Unmapped: {lhs}");
+                    } else {
+                        self.message = format!("No mapping found for: {lhs}");
+                    }
+                }
             }
             return EngineAction::None;
         }
-        if cmd == "unmap" {
-            self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
+
+        if let Some(&(_, modes)) = MAP_CLEAR_CMDS.iter().find(|(name, _)| *name == map_word) {
+            // Buffer-local (`<buffer>`) mapclear is not modeled — vimcode has
+            // no buffer-local keymaps to distinguish from global ones.
+            let before = self.settings.keymaps.len();
+            self.settings.keymaps.retain(|s| match parse_keymap_def(s) {
+                Some(km) => !modes.contains(&km.mode.as_str()),
+                None => true,
+            });
+            let removed = before - self.settings.keymaps.len();
+            if removed > 0 {
+                let _ = self.settings.save();
+                self.rebuild_user_keymaps();
+            }
+            self.message = format!("Cleared {removed} mapping(s)");
             return EngineAction::None;
         }
-        if let Some(rest) = cmd.strip_prefix("unmap ") {
-            let rest = rest.trim();
-            // Parse "n <C-/>" → find and remove matching keymap
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            if parts.len() == 2 {
-                let mode = parts[0];
-                let keys = parts[1];
-                let prefix = format!("{mode} {keys} ");
-                let before = self.settings.keymaps.len();
-                self.settings.keymaps.retain(|s| !s.starts_with(&prefix));
-                if self.settings.keymaps.len() < before {
-                    let _ = self.settings.save();
-                    self.rebuild_user_keymaps();
-                    self.message = format!("Unmapped: {mode} {keys}");
-                } else {
-                    self.message = format!("No mapping found for: {mode} {keys}");
-                }
+
+        // ── :abbreviate / :iabbrev / :cabbrev family (#1152) ──────────────────────
+        // A Vim abbreviation is a key-to-keys substitution like `:map`, but
+        // triggered by typing a non-keyword character (or leaving Insert /
+        // running the command line) right after the `lhs`, instead of typing
+        // the `lhs` itself as a command. `:noreabbrev`/`:inoreabbrev`/
+        // `:cnoreabbrev` behave identically to their `:abbreviate`/
+        // `:iabbrev`/`:cabbrev` counterparts here: the "nore" distinction
+        // only matters when the `rhs` could itself be re-expanded by another
+        // mapping as it's inserted, and this engine's abbreviation expansion
+        // inserts the replacement text directly — it is never re-fed through
+        // key-mapping lookup, recursive or otherwise.
+        if cmd == "abbreviate" || cmd == "noreabbrev" {
+            self.message = self.list_abbrevs(&["a", "i", "c"], "No abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("abbreviate ")
+            .or_else(|| cmd.strip_prefix("noreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("a", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "iabbrev" {
+            self.message = self.list_abbrevs(&["a", "i"], "No insert-mode abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("iabbrev ")
+            .or_else(|| cmd.strip_prefix("inoreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("i", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "cabbrev" {
+            self.message = self.list_abbrevs(&["a", "c"], "No command-line abbreviations");
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd
+            .strip_prefix("cabbrev ")
+            .or_else(|| cmd.strip_prefix("cnoreabbrev "))
+        {
+            self.message = self.define_abbrev_from_args("c", rest.trim());
+            return EngineAction::None;
+        }
+        if cmd == "abclear" {
+            let had_any = !self.settings.abbreviations.is_empty();
+            self.settings.abbreviations.clear();
+            if had_any {
+                let _ = self.settings.save();
+            }
+            self.rebuild_user_abbrevs();
+            self.message = "Abbreviations cleared".to_string();
+            return EngineAction::None;
+        }
+        if cmd == "unabbreviate" {
+            self.message = "Usage: :unabbreviate <lhs>  (e.g. :unabbreviate teh)".to_string();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("unabbreviate ") {
+            let lhs = rest.trim();
+            if lhs.is_empty() {
+                self.message = "Usage: :unabbreviate <lhs>  (e.g. :unabbreviate teh)".to_string();
+            } else if self.remove_abbrev(lhs) {
+                self.message = format!("Removed abbreviation: {lhs}");
             } else {
-                self.message = "Usage: :unmap <mode> <keys>  (e.g. :unmap n <C-/>)".to_string();
+                self.message = format!("No such abbreviation: {lhs}");
             }
             return EngineAction::None;
         }
@@ -902,6 +1107,35 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiMode          — show the agent's declared modes + which is current
+        // :AiMode <target> — switch mode (matched by id or name) via
+        //                    `session/set_mode` (#956, ACP-5)
+        if cmd == "AiMode" {
+            self.message = self.acp_mode_status_line();
+            return EngineAction::None;
+        }
+        if let Some(target) = cmd.strip_prefix("AiMode ").map(|s| s.trim()) {
+            if !target.is_empty() {
+                self.acp_set_mode(target);
+            }
+            return EngineAction::None;
+        }
+
+        // :AiAgent          — list configured agents (settings.acp_agents)
+        //                     and which is active (#958, ACP-7)
+        // :AiAgent <name>   — switch the active agent; takes effect on the
+        //                     next message, without restarting vimcode
+        if cmd == "AiAgent" {
+            self.message = self.acp_agent_registry_status_line();
+            return EngineAction::None;
+        }
+        if let Some(target) = cmd.strip_prefix("AiAgent ").map(|s| s.trim()) {
+            if !target.is_empty() {
+                self.acp_switch_agent(target);
+            }
+            return EngineAction::None;
+        }
+
         // Handle :e[dit]! — reload current file from disk (discard changes)
         if cmd == "edit!" {
             let buf_id = self.active_buffer_id();
@@ -931,19 +1165,35 @@ impl Engine {
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :e[dit] <filename>
+        // Handle :e[dit] <filename> — 'hidden' guard (#1190): unlike
+        // `:edit!` above, a plain `:edit` abandons the current buffer, so
+        // it must refuse when the buffer is dirty, no other window shows
+        // it, and 'hidden' isn't set (`:h 'hidden'`, `:h E37`).
         if let Some(filename) = cmd.strip_prefix("edit ") {
             let filename = filename.trim();
             if filename.is_empty() {
                 self.message = "No file name".to_string();
                 return EngineAction::Error;
             }
+            if let Err(msg) = self.check_buffer_abandon(false) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             return EngineAction::OpenFile(PathBuf::from(filename));
         }
 
-        // Handle :b[uffer] <buffer>
-        if let Some(arg) = cmd.strip_prefix("buffer ") {
-            let arg = arg.trim();
+        // Handle :b[uffer][!] <buffer> — same 'hidden' guard as `:edit`,
+        // bypassed by a trailing `!` (#1190).
+        if cmd.starts_with("buffer ") || cmd.starts_with("buffer! ") {
+            let force = cmd.starts_with("buffer! ");
+            let arg = cmd
+                .strip_prefix(if force { "buffer! " } else { "buffer " })
+                .unwrap()
+                .trim();
+            if let Err(msg) = self.check_buffer_abandon(force) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             if let Ok(num) = arg.parse::<usize>() {
                 self.goto_buffer(num);
             } else if let Some(id) = self.buffer_manager.find_by_path(arg) {
@@ -958,15 +1208,25 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bd[elete][!] [N]
+        // Handle :bd[elete][!] [N] and :bw[ipeout][!] [N] — vimcode has no
+        // separate "unloaded but still listed" buffer state (`delete_buffer`
+        // always fully removes the buffer), so `:bwipeout` shares `:bdelete`'s
+        // implementation; only the reported message differs, matching Vim's
+        // own wording for each command (#1154).
         if cmd == "bdelete"
             || cmd.starts_with("bdelete ")
             || cmd == "bdelete!"
             || cmd.starts_with("bdelete! ")
+            || cmd == "bwipeout"
+            || cmd.starts_with("bwipeout ")
+            || cmd == "bwipeout!"
+            || cmd.starts_with("bwipeout! ")
         {
+            let wipeout = cmd.starts_with("bwipeout");
             let force = cmd.contains('!');
+            let cmd_word = if wipeout { "bwipeout" } else { "bdelete" };
             let arg = cmd
-                .trim_start_matches("bdelete")
+                .trim_start_matches(cmd_word)
                 .trim_start_matches('!')
                 .trim();
 
@@ -986,7 +1246,11 @@ impl Engine {
 
             match self.delete_buffer(id, force) {
                 Ok(()) => {
-                    self.message = "Buffer deleted".to_string();
+                    self.message = if wipeout {
+                        "Buffer wiped out".to_string()
+                    } else {
+                        "Buffer deleted".to_string()
+                    };
                 }
                 Err(e) => {
                     self.message = e;
@@ -1018,6 +1282,19 @@ impl Engine {
 
         // Handle :clo[se]
         if cmd == "close" {
+            self.close_window();
+            return EngineAction::None;
+        }
+
+        // Handle :hid[e] — close the current window without touching the
+        // buffer (it stays loaded, just no longer shown here). `close_window`
+        // already never checks the dirty flag itself — that guard lives in
+        // the `:quit` handler above, which calls it after its own dirty
+        // check — so plain `close_window` already has exactly `:hide`'s
+        // "never complain about unsaved changes" semantics, including its
+        // refusal (with the same message Vim-adjacent "Cannot close last
+        // window" case) to close the very last window (#1154).
+        if cmd == "hide" {
             self.close_window();
             return EngineAction::None;
         }
@@ -1085,6 +1362,27 @@ impl Engine {
         // Handle :tabp[revious]
         if cmd == "tabprevious" {
             self.prev_tab();
+            return EngineAction::None;
+        }
+
+        // Handle :tabo[nly] — close every tab except the active one.
+        // Identical to Vim's `:tabonly`; `close_other_tabs` already implements
+        // exactly this (#1154).
+        if cmd == "tabonly" {
+            self.close_other_tabs();
+            return EngineAction::None;
+        }
+
+        // Handle :tabfir[st] — jump to the first tab.
+        if cmd == "tabfirst" {
+            self.goto_tab(0);
+            return EngineAction::None;
+        }
+
+        // Handle :tabl[ast] — jump to the last tab.
+        if cmd == "tablast" {
+            let last = self.active_group().tabs.len().saturating_sub(1);
+            self.goto_tab(last);
             return EngineAction::None;
         }
 
@@ -1158,6 +1456,23 @@ impl Engine {
                     self.ensure_spell_checker();
                 }
                 self.update_syntax();
+                // `foldmethod=indent|marker`/`foldlevel=N` (#1153, #1159) —
+                // recompute the fold hierarchy against the new level
+                // immediately, mirroring `apply_foldlevel`'s own doc
+                // ("processing deepest-first") rather than waiting for the
+                // next `z` command. Idempotent (a plain re-close/re-define
+                // pass), so it's safe to re-run whenever either option was
+                // actually touched on this `:set` line — gated on that
+                // (rather than unconditionally on every `:set`) so an
+                // unrelated option like `:set ic` doesn't pay to recompute
+                // fold state on large files (#1153 review).
+                if self.folds_are_computed()
+                    && split_set_args(trimmed)
+                        .iter()
+                        .any(|a| set_arg_touches_folding(a))
+                {
+                    self.apply_foldlevel(self.settings.foldlevel);
+                }
                 return match last_err {
                     Some(e) => {
                         self.message = e;
@@ -1203,6 +1518,11 @@ impl Engine {
             // buffer.)
             if self.settings.syntax_max_lines != prev_syntax_max_lines {
                 self.update_syntax();
+            }
+            // See the matching comment in the multi-option branch above
+            // (#1153, #1159).
+            if self.folds_are_computed() && set_arg_touches_folding(trimmed) {
+                self.apply_foldlevel(self.settings.foldlevel);
             }
             return EngineAction::None;
         }
@@ -1317,51 +1637,235 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :bn[ext]
-        if cmd == "bnext" {
+        // Handle :bn[ext][!] — 'hidden' guard (#1190): each of these
+        // switches the active buffer, so all share `check_buffer_abandon`,
+        // bypassed by a trailing `!`.
+        if cmd == "bnext" || cmd == "bnext!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.next_buffer();
             return EngineAction::None;
         }
 
-        // Handle :bp[revious]
-        if cmd == "bprevious" {
+        // Handle :bp[revious][!]
+        if cmd == "bprevious" || cmd == "bprevious!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.prev_buffer();
             return EngineAction::None;
         }
 
-        // Handle :buffer# (alternate buffer) — normalizer turns b# → buffer#
-        if cmd == "buffer#" {
+        // Handle :bf[irst][!] — jump to the lowest-numbered buffer.
+        if cmd == "bfirst" || cmd == "bfirst!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
+            self.goto_buffer(1);
+            return EngineAction::None;
+        }
+
+        // Handle :bl[ast][!] — jump to the highest-numbered buffer.
+        if cmd == "blast" || cmd == "blast!" {
+            if let Err(msg) = self.check_buffer_abandon(cmd.ends_with('!')) {
+                self.message = msg;
+                return EngineAction::Error;
+            }
+            self.goto_buffer(self.buffer_manager.len());
+            return EngineAction::None;
+        }
+
+        // Handle :buffer#[!] (alternate buffer) — normalizer turns b# →
+        // buffer# and b!# → buffer!#, so the force spelling has the bang
+        // before the `#`.
+        if cmd == "buffer#" || cmd == "buffer!#" {
+            if let Err(msg) = self.check_buffer_abandon(cmd == "buffer!#") {
+                self.message = msg;
+                return EngineAction::Error;
+            }
             self.alternate_buffer();
             return EngineAction::None;
         }
 
-        // Quickfix commands
+        // Quickfix / location-list commands (#1155). `:l*` is a thin mirror
+        // of `:c*` over the active window's location list — same `qf_*`
+        // methods (`src/core/engine/picker.rs`), just `Some(window)` instead
+        // of `None` as the target.
         if cmd == "copen" {
-            return self.open_quickfix();
+            return self.qf_open(None);
+        }
+        if cmd == "lopen" {
+            let win = self.qf_loc_target_window();
+            return self.qf_open(Some(win));
         }
         if cmd == "cclose" {
-            return self.close_quickfix();
+            return self.qf_close(None);
+        }
+        if cmd == "lclose" {
+            let win = self.qf_loc_target_window();
+            return self.qf_close(Some(win));
+        }
+        if cmd == "cwindow" {
+            return self.qf_window(None);
+        }
+        if cmd == "lwindow" {
+            let win = self.qf_loc_target_window();
+            return self.qf_window(Some(win));
         }
         if cmd == "cnext" {
-            return self.quickfix_next();
+            return self.qf_next(None);
+        }
+        if cmd == "lnext" {
+            let win = self.qf_loc_target_window();
+            return self.qf_next(Some(win));
         }
         if cmd == "cprevious" || cmd == "cN" {
-            return self.quickfix_prev();
+            return self.qf_prev(None);
+        }
+        if cmd == "lprevious" || cmd == "lN" {
+            let win = self.qf_loc_target_window();
+            return self.qf_prev(Some(win));
         }
         if let Some(n_str) = cmd.strip_prefix("cc ") {
             if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
-                return self.quickfix_go(n - 1);
+                return self.qf_go(None, n - 1);
             }
+        }
+        if let Some(n_str) = cmd.strip_prefix("ll ") {
+            if let Some(n) = n_str.trim().parse::<usize>().ok().filter(|&n| n > 0) {
+                let win = self.qf_loc_target_window();
+                return self.qf_go(Some(win), n - 1);
+            }
+        }
+        // Handle bare :cc / :ll — (re-)jump to the current entry.
+        //
+        // #1283: these used to hardcode "E42: No errors" (lowercase
+        // "errors") — real Neovim's message is "E42: No Errors" (confirmed
+        // against a live oracle). Routing through `Engine::qf_empty_msg`
+        // fixes the casing once instead of three times and keeps it from
+        // drifting again.
+        if cmd == "cc" {
+            if self.quickfix.items.is_empty() {
+                self.message = Self::qf_empty_msg(None);
+                return EngineAction::None;
+            }
+            return self.qf_jump(None);
+        }
+        if cmd == "ll" {
+            let win = self.qf_loc_target_window();
+            if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
+                self.message = Self::qf_empty_msg(Some(win));
+                return EngineAction::None;
+            }
+            return self.qf_jump(Some(win));
+        }
+        // Handle :cfirst / :lfirst — jump to the first entry.
+        if cmd == "cfirst" {
+            if self.quickfix.items.is_empty() {
+                self.message = Self::qf_empty_msg(None);
+                return EngineAction::None;
+            }
+            return self.qf_go(None, 0);
+        }
+        if cmd == "lfirst" {
+            let win = self.qf_loc_target_window();
+            if self.qf_get(Some(win)).is_none_or(|l| l.items.is_empty()) {
+                self.message = Self::qf_empty_msg(Some(win));
+                return EngineAction::None;
+            }
+            return self.qf_go(Some(win), 0);
+        }
+        // Handle :clast / :llast — jump to the last entry.
+        if cmd == "clast" {
+            if self.quickfix.items.is_empty() {
+                self.message = Self::qf_empty_msg(None);
+                return EngineAction::None;
+            }
+            return self.qf_go(None, self.quickfix.items.len() - 1);
+        }
+        if cmd == "llast" {
+            let win = self.qf_loc_target_window();
+            let Some(len) = self
+                .qf_get(Some(win))
+                .map(|l| l.items.len())
+                .filter(|&n| n > 0)
+            else {
+                self.message = Self::qf_empty_msg(Some(win));
+                return EngineAction::None;
+            };
+            return self.qf_go(Some(win), len - 1);
+        }
+        // Handle :clist / :llist — print every entry.
+        if cmd == "clist" {
+            return self.qf_list_cmd(None);
+        }
+        if cmd == "llist" {
+            let win = self.qf_loc_target_window();
+            return self.qf_list_cmd(Some(win));
+        }
+        // Handle :colder / :cnewer — walk the quickfix stack.
+        if cmd == "colder" || cmd.starts_with("colder ") {
+            let n = cmd
+                .strip_prefix("colder")
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(1);
+            return self.qf_colder(n);
+        }
+        if cmd == "cnewer" || cmd.starts_with("cnewer ") {
+            let n = cmd
+                .strip_prefix("cnewer")
+                .unwrap_or("")
+                .trim()
+                .parse::<usize>()
+                .unwrap_or(1);
+            return self.qf_newer(n);
+        }
+        // Handle :cdo / :cfdo / :ldo / :lfdo — run a command over the list.
+        if let Some(rest) = cmd.strip_prefix("cdo ") {
+            return self.qf_do(None, rest, false);
+        }
+        if let Some(rest) = cmd.strip_prefix("cfdo ") {
+            return self.qf_do(None, rest, true);
+        }
+        if let Some(rest) = cmd.strip_prefix("ldo ") {
+            let win = self.qf_loc_target_window();
+            return self.qf_do(Some(win), rest, false);
+        }
+        if let Some(rest) = cmd.strip_prefix("lfdo ") {
+            let win = self.qf_loc_target_window();
+            return self.qf_do(Some(win), rest, true);
+        }
+        if matches!(cmd, "cdo" | "cfdo" | "ldo" | "lfdo") {
+            self.message = "E471: Argument required".to_string();
+            return EngineAction::None;
         }
         if let Some(pat) = cmd
             .strip_prefix("grep ")
             .or_else(|| cmd.strip_prefix("vimgrep "))
         {
             let cwd = self.cwd.clone();
-            return self.run_quickfix_grep(pat.trim(), cwd);
+            return self.qf_run_grep(None, pat.trim(), cwd);
         }
         if cmd == "grep" || cmd == "vimgrep" {
             self.message = "Usage: :grep <pattern>".to_string();
+            return EngineAction::None;
+        }
+        if let Some(pat) = cmd
+            .strip_prefix("lgrep ")
+            .or_else(|| cmd.strip_prefix("lvimgrep "))
+        {
+            let cwd = self.cwd.clone();
+            let win = self.qf_loc_target_window();
+            return self.qf_run_grep(Some(win), pat.trim(), cwd);
+        }
+        if cmd == "lgrep" || cmd == "lvimgrep" {
+            self.message = "Usage: :lgrep <pattern>".to_string();
             return EngineAction::None;
         }
         if cmd == "Buffers" {
@@ -1402,6 +1906,17 @@ impl Engine {
 
         // `[range]:g[!]/pat/cmd` and `[range]:v/pat/cmd` — global commands.
         if let Some(action) = self.try_execute_global(cmd) {
+            return action;
+        }
+
+        // `:fold`, `:foldopen[!]`, `:foldclose[!]`, `:folddoopen`,
+        // `:folddoclosed` (#1159).
+        if let Some(action) = self.try_execute_fold_command(cmd) {
+            return action;
+        }
+
+        // `:undolist`, `:earlier`, `:later`, `:undojoin` (#1156).
+        if let Some(action) = self.try_execute_undo_command(cmd) {
             return action;
         }
 
@@ -1537,18 +2052,46 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :tabmove [N] — move current tab to position N (1-based, 0 = move to end)
+        // Handle :tabmove [N] — `:h :tabmove`: "Move the current tab page
+        // to after tab page N. Use 0 to make the current tab page the
+        // first one. Without N the current tab page is made the last one."
+        // #1281 finding: `:tabmove 0` used to be treated the same as bare
+        // `:tabmove` (both landed at the end) — Vim's own wording makes `0`
+        // and "no argument" opposite ends, not synonyms.
+        //
+        // #1281 review: the *previous* fix's formula (`dest = n.min(num_tabs
+        // - 1)`, treating `N` as a direct 0-based destination index) is
+        // wrong in general. Verified against the live oracle
+        // (`nvim v0.12.5 --headless -u NONE -i NONE`) with 5 tabs and every
+        // starting position: `N` is a 1-based reference to a tab in the
+        // *original* (pre-move) ordering — "after tab page N" — so where the
+        // current tab lands depends on whether N falls before, at, or after
+        // the current tab's own original position:
+        //   - N <= current's original 0-based index: dest = N
+        //     (the target tab N hasn't shifted yet, so N is already the
+        //     right 0-based slot to land in)
+        //   - N >  current's original 0-based index: dest = N - 1
+        //     (removing the current tab from earlier in the list shifts
+        //     every later tab back by one, so tab N's new index is N - 1)
+        //   - N == current's original 0-based index, or N == that + 1: both
+        //     resolve to the current tab's own original slot, i.e. a no-op
+        //     — confirmed against the oracle (5 tabs, current at index 2:
+        //     both `:tabmove 2` and `:tabmove 3` leave the order unchanged).
+        // Example: 5 tabs `a,b,c,d,e`, current = `a` (original index 0),
+        // `:tabmove 3` → oracle result `b,c,a,d,e` (a lands at index 2 =
+        // N - 1, since N(3) > current's original index(0)).
         if cmd == "tabmove" || cmd.starts_with("tabmove ") {
             let arg = cmd.strip_prefix("tabmove").unwrap_or("").trim();
             let num_tabs = self.active_group().tabs.len();
             let current = self.active_group().active_tab;
             let dest = if arg.is_empty() {
-                num_tabs.saturating_sub(1) // move to end
+                num_tabs.saturating_sub(1) // no arg: move to end
             } else if let Ok(n) = arg.parse::<usize>() {
-                if n == 0 {
-                    num_tabs.saturating_sub(1) // 0 also means end
+                let n = n.min(num_tabs);
+                if n <= current {
+                    n
                 } else {
-                    (n - 1).min(num_tabs.saturating_sub(1)) // 1-based to 0-based
+                    n - 1
                 }
             } else {
                 self.message = "Usage: :tabmove [N]".to_string();
@@ -1573,8 +2116,20 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // Handle :sav[eas] {file} — save buffer to a new file
-        if let Some(path_str) = cmd.strip_prefix("saveas ") {
+        // Handle :sav[eas][!] {file} — save buffer to a new file. `!` is
+        // required by Neovim whenever `{file}` already exists (confirmed
+        // against a live `nvim --headless -u NONE`: `E13: File exists (add
+        // ! to override)` without it) — vimcode doesn't refuse an existing
+        // target either way (#1282 found this while adding the on-disk
+        // probe; a bare `:saveas` clobbering silently is a separate,
+        // narrower gap than the one being fixed here, which is just that
+        // `:saveas!` used to normalize to a string this `strip_prefix`
+        // could never match — `cmd` is `"saveas!" + rest`, not
+        // `"saveas" + rest`, per `split_ex_command`).
+        if let Some(path_str) = cmd
+            .strip_prefix("saveas! ")
+            .or_else(|| cmd.strip_prefix("saveas "))
+        {
             let path_str = path_str.trim();
             if path_str.is_empty() {
                 self.message = "Usage: :saveas {file}".to_string();
@@ -1642,12 +2197,20 @@ impl Engine {
             return self.execute_command("number");
         }
 
-        // Handle :windo {cmd}
+        // Handle :windo {cmd} — #1281 finding: this used to iterate
+        // `self.windows.keys()`, which is (a) every window in the *whole
+        // engine*, not just the current tabpage (`:h :windo` is explicitly
+        // tab-scoped), and (b) `HashMap` order, so which window is left
+        // active when the loop ends was nondeterministic across runs, not
+        // just wrong. `Tab::layout.window_ids()` is deterministic
+        // left-to-right/top-to-bottom layout order, matching Neovim's own
+        // window-number order — and lands on the same "last one wins"
+        // window Neovim does.
         if let Some(subcmd) = cmd.strip_prefix("windo ") {
             let subcmd = subcmd.trim().to_string();
-            let win_ids: Vec<WindowId> = self.windows.keys().copied().collect();
+            let win_ids: Vec<WindowId> = self.active_tab().layout.window_ids();
             for wid in win_ids {
-                self.active_tab_mut().active_window = wid;
+                self.active_tab_mut().focus_window(wid);
                 self.execute_command(&subcmd);
             }
             return EngineAction::None;
@@ -1709,6 +2272,157 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // Handle :delm[arks] {marks} / :delmarks! — delete the named marks
+        // (space-separated chars and `a-c` ranges), or with `!` clear every
+        // lowercase mark in the current buffer (Vim never lets `!` touch
+        // uppercase/numbered marks — those are global, not per-buffer) (#1154).
+        if cmd == "delmarks" {
+            self.message = "E471: Argument required".to_string();
+            return EngineAction::Error;
+        }
+        if cmd == "delmarks!" {
+            let buf_id = self.active_buffer_id();
+            if let Some(marks) = self.marks.get_mut(&buf_id) {
+                marks.retain(|c, _| !c.is_ascii_lowercase());
+            }
+            return EngineAction::None;
+        }
+        if let Some(arg) = cmd.strip_prefix("delmarks ") {
+            let buf_id = self.active_buffer_id();
+            let mut chars_to_delete: Vec<char> = Vec::new();
+            for token in arg.split_whitespace() {
+                let bytes: Vec<char> = token.chars().collect();
+                if bytes.len() == 3 && bytes[1] == '-' {
+                    // Range, e.g. "a-c" — real Vim only accepts a range
+                    // between two marks of the *same* category (both
+                    // lowercase, both uppercase, or both digits) with the
+                    // low end sorting before the high end; anything else
+                    // (an inverted range like "c-a", or a mixed-case range
+                    // like "a-C") is `E475: Invalid argument` and aborts the
+                    // whole command rather than being silently reinterpreted
+                    // as three individual one-character mark names (#1154
+                    // review nit).
+                    let (lo, hi) = (bytes[0], bytes[2]);
+                    let same_category = (lo.is_ascii_lowercase() && hi.is_ascii_lowercase())
+                        || (lo.is_ascii_uppercase() && hi.is_ascii_uppercase())
+                        || (lo.is_ascii_digit() && hi.is_ascii_digit());
+                    if !same_category || lo > hi {
+                        self.message = format!("E475: Invalid argument: {}", token);
+                        return EngineAction::Error;
+                    }
+                    let mut c = lo;
+                    loop {
+                        chars_to_delete.push(c);
+                        if c == hi {
+                            break;
+                        }
+                        c = ((c as u8) + 1) as char;
+                    }
+                    continue;
+                }
+                for c in token.chars() {
+                    chars_to_delete.push(c);
+                }
+            }
+            if chars_to_delete.is_empty() {
+                self.message = "E471: Argument required".to_string();
+                return EngineAction::Error;
+            }
+            for c in chars_to_delete {
+                if c.is_ascii_lowercase() {
+                    if let Some(marks) = self.marks.get_mut(&buf_id) {
+                        marks.remove(&c);
+                    }
+                } else {
+                    self.global_marks.remove(&c);
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // Handle :star[tinsert][!] — enter Insert mode as if `i` (or, with
+        // `!`, `A`) had been pressed. Reuses the exact same field bookkeeping
+        // those normal-mode keys use rather than reimplementing entry here
+        // (#1154), including `start_undo_group`'s call order relative to the
+        // cursor adjustment: `A` starts its undo group *after* moving the
+        // cursor to end-of-line so `u` restores to the append position, not
+        // the pre-`A` cursor (#886), while plain `i` starts its undo group
+        // *before* `clamp_cursor_col` so `u` restores to the pre-clamp
+        // position exactly as pressing `i` would (#1003, keys.rs).
+        if cmd == "startinsert" || cmd == "startinsert!" {
+            if self.mode == Mode::Insert {
+                return EngineAction::None;
+            }
+            self.insert_repeat_count = 0;
+            if cmd == "startinsert!" {
+                self.insert_text_buffer.clear();
+                let line = self.view().cursor.line;
+                self.view_mut().cursor.col = self.get_line_len_for_insert(line);
+                self.start_undo_group();
+            } else {
+                self.start_undo_group();
+                self.insert_text_buffer.clear();
+                if self.view().extra_cursors.is_empty() {
+                    self.clamp_cursor_col();
+                }
+            }
+            self.set_mode(Mode::Insert);
+            return EngineAction::None;
+        }
+
+        // Handle :stopi[nsert] — leave Insert mode as if <Esc> had been
+        // pressed. Delegates to the real Escape handler so undo-group
+        // closing, dot-register recording, and cursor-left-on-exit all match
+        // pressing <Esc> exactly (#1154).
+        if cmd == "stopinsert" {
+            if self.mode == Mode::Insert {
+                let mut changed = false;
+                self.handle_insert_key("Escape", None, false, &mut changed);
+            }
+            return EngineAction::None;
+        }
+
+        // Handle `:digraphs` (`:h :digraphs`, #1160): with no arguments,
+        // lists the digraph table; with `{char1}{char2} {number} ...`
+        // arguments, defines a user digraph (`:h :dig`/`:h digraph-usage`).
+        // `:digraph` is the same command — both spellings normalize to
+        // "digraphs" via `EX_ABBREVS`.
+        if cmd == "digraphs" || cmd.starts_with("digraphs ") {
+            let args = cmd.strip_prefix("digraphs").unwrap_or("").trim();
+            return self.ex_digraphs(args);
+        }
+
+        // Handle `:registers`/`:display` (`:h :registers`, #1299): with no
+        // arguments, lists every non-empty register in Neovim's canonical
+        // order; with a `{register-name}...` argument, restricts the listing
+        // to just those registers (`:reg a`, `:reg ab`, `:reg a b` all mean
+        // "show a and b" — each non-space character of the argument is its
+        // own register name, `:h :registers`). Both spellings normalize to
+        // "registers" via `EX_ABBREVS`.
+        if cmd == "registers"
+            || cmd.starts_with("registers ")
+            || cmd == "display"
+            || cmd.starts_with("display ")
+        {
+            let args = cmd
+                .split_once(' ')
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("");
+            return self.ex_registers(args, prev_ex_command.as_deref());
+        }
+
+        // Handle `:history`/`:his` (`:h :history`, #1327): with no
+        // arguments, lists the `:` command history (Neovim's own default —
+        // confirmed against a live oracle); with a `{name}` and/or
+        // `{first}[,{last}]` index-range argument, restricts which history
+        // and which entries are listed (`:h :history-indexing`). Both are
+        // plain keyword/integer arguments, not Vim expressions, so no
+        // expression evaluator is needed to cover them.
+        if cmd == "history" || cmd.starts_with("history ") {
+            let args = cmd.strip_prefix("history").unwrap_or("").trim();
+            return self.ex_history(args);
+        }
+
         match cmd {
             "write" => {
                 let _ = self.save_with_format(false);
@@ -1721,11 +2435,7 @@ impl Engine {
                 if self.dirty() {
                     let buf_id = self.active_buffer_id();
                     let current_win = self.active_window_id();
-                    let other_views = self
-                        .windows
-                        .values()
-                        .any(|w| w.buffer_id == buf_id && w.id != current_win);
-                    if !other_views {
+                    if !self.buffer_has_other_views(buf_id, current_win) {
                         self.message = "No write since last change (add ! to override)".to_string();
                         return EngineAction::Error;
                     }
@@ -1797,59 +2507,48 @@ impl Engine {
                 self.search_index = None;
                 EngineAction::None
             }
-            // Display registers
-            "registers" | "display" => {
-                let mut lines: Vec<String> = Vec::new();
-                lines.push("--- Registers ---".to_string());
-                let special_regs: Vec<char> = vec![
-                    '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '+', '*', '.', '%',
-                    '/',
-                ];
-                for &r in &special_regs {
-                    if let Some((content, ty)) = self.registers.get(&r).cloned() {
-                        let kind = reg_type_letter(ty);
-                        let preview: String = content.chars().take(40).collect();
-                        lines.push(format!(
-                            "\"{}  {}  {}",
-                            r,
-                            kind,
-                            preview.replace('\n', "\\n")
-                        ));
-                    }
-                }
-                for c in 'a'..='z' {
-                    if let Some((content, ty)) = self.registers.get(&c).cloned() {
-                        let kind = reg_type_letter(ty);
-                        let preview: String = content.chars().take(40).collect();
-                        lines.push(format!(
-                            "\"{}  {}  {}",
-                            c,
-                            kind,
-                            preview.replace('\n', "\\n")
-                        ));
-                    }
-                }
-                self.message = lines.join("\n");
-                EngineAction::None
-            }
             // Display marks
             "marks" => {
                 let buf_id = self.active_buffer_id();
                 let mut lines: Vec<String> = Vec::new();
-                lines.push("mark line  col  file/text".to_string());
-                if let Some(marks_map) = self.marks.get(&buf_id).cloned() {
-                    let mut sorted: Vec<(char, Cursor)> = marks_map.into_iter().collect();
+                lines.push("mark line  col file/text".to_string());
+
+                // Neovim's `:marks` always lists the three automatic marks
+                // alongside any user-set ones (#1300): `'` (previous
+                // context — the pcmark set by the last jump), the user marks
+                // themselves, `"` (cursor position before last leaving this
+                // buffer), and `.` (position of the last change).
+                let mut rows: Vec<(char, usize, usize, String)> = Vec::new();
+                if let Some((line, col)) = self.last_jump_pos {
+                    rows.push(('\'', line, col, self.preview_line_text(line)));
+                }
+                if let Some(marks_map) = self.marks.get(&buf_id) {
+                    let mut sorted: Vec<(char, Cursor)> =
+                        marks_map.iter().map(|(c, cur)| (*c, *cur)).collect();
                     sorted.sort_by_key(|(c, _)| *c);
                     for (c, cur) in sorted {
-                        lines.push(format!(" {}   {:4}  {:3}", c, cur.line + 1, cur.col));
+                        rows.push((c, cur.line, cur.col, self.preview_line_text(cur.line)));
                     }
                 }
+                // vimcode does not yet track buffer-enter/leave transitions,
+                // so `"` defaults to the buffer start — matching Neovim's own
+                // default for a buffer that has never actually been left.
+                rows.push(('"', 0, 0, self.preview_line_text(0)));
+                // `.` likewise defaults to the buffer start before any real
+                // change has happened — confirmed against a live oracle,
+                // whose own fixture-loading step already counts as a change.
+                let (edit_line, edit_col) = self.last_edit_pos.unwrap_or((0, 0));
+                rows.push(('.', edit_line, edit_col, self.preview_line_text(edit_line)));
+                for (c, line, col, text) in rows {
+                    lines.push(format!(" {}{:>7}{:>5} {}", c, line + 1, col, text));
+                }
+
                 for (c, (path, line, col)) in &self.global_marks {
                     let path_str = path
                         .as_ref()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    lines.push(format!(" {}   {:4}  {:3}  {}", c, line + 1, col, path_str));
+                    lines.push(format!(" {}{:>7}{:>5} {}", c, line + 1, col, path_str));
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
@@ -1857,39 +2556,50 @@ impl Engine {
             // Display jump list
             "jumps" => {
                 let mut lines: Vec<String> = Vec::new();
-                lines.push(" jump line  col  tab  file/text".to_string());
+                // Neovim's `:jumps` header has no `tab` column — vimcode
+                // invented one — and *does* carry a `file/text` preview of
+                // the target line, which the old header omitted entirely
+                // (confirmed against a live oracle, #1301).
+                lines.push(" jump line  col file/text".to_string());
+                let current_file = self.file_path().cloned();
+                let idx = self.jump_list_pos;
                 for (i, entry) in self.jump_list.iter().enumerate() {
-                    let marker = if i == self.jump_list_pos { ">" } else { " " };
-                    let path_str = entry
-                        .file
-                        .as_ref()
-                        .map(|p| {
-                            p.file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        })
-                        .unwrap_or_default();
-                    // "tab" column: the recorded pane's TabId when it still
-                    // exists (i.e. `Ctrl-O`/`Ctrl-I` would switch to it),
-                    // or "x" when that tab/split has since been closed and
-                    // this entry would fall back to reopening `file` (#674).
-                    let tab_str = if self
-                        .locate_jump_pane(entry.group_id, entry.tab_id, entry.window_id)
-                        .is_some()
-                    {
-                        entry.tab_id.0.to_string()
+                    let marker = if i == idx { ">" } else { " " };
+                    // Jump number counts *distance from the current
+                    // position* in the list, not the raw index — entries
+                    // older than `idx` count down to 0, entries newer than
+                    // `idx` count up from 1 (matches Neovim/Vim's own
+                    // `w_jumplistidx`-relative numbering, confirmed against
+                    // a live oracle).
+                    let jump_num = i.abs_diff(idx);
+                    // `file/text`: Neovim previews the target line's text
+                    // when the jump is within the *current* buffer, and
+                    // falls back to the file path when it's a different
+                    // buffer (confirmed against a live oracle, #1301).
+                    let text = if entry.file == current_file {
+                        self.preview_line_text(entry.line)
                     } else {
-                        "x".to_string()
+                        entry
+                            .file
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default()
                     };
                     lines.push(format!(
-                        "{} {:4}  {:4}  {:3}  {:>3}  {}",
+                        "{}{:>3}{:>6}{:>5} {}",
                         marker,
-                        i,
+                        jump_num,
                         entry.line + 1,
                         entry.col,
-                        tab_str,
-                        path_str
+                        text
                     ));
+                }
+                // When the current position is past the end of the recorded
+                // list (no `Ctrl-O` has been done since the last jump),
+                // Neovim prints a bare trailing `>` line with no entry data
+                // (confirmed against a live oracle).
+                if idx == self.jump_list.len() {
+                    lines.push(">".to_string());
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
@@ -1897,24 +2607,37 @@ impl Engine {
             // Display change list
             "changes" => {
                 let mut lines: Vec<String> = Vec::new();
-                lines.push("change line  col".to_string());
+                // Neovim's `:changes` header carries a `text` column (a
+                // preview of the changed line, same idea as `:jumps`'
+                // `file/text`), which the old header omitted entirely
+                // (confirmed against a live oracle, #1303).
+                lines.push("change line  col text".to_string());
+                let idx = self.change_list_pos;
                 for (i, (line, col)) in self.change_list.iter().enumerate() {
-                    let marker = if i + 1 == self.change_list_pos {
-                        ">"
-                    } else {
-                        " "
-                    };
-                    lines.push(format!("{} {:4}  {:4}  {:3}", marker, i, line + 1, col));
+                    let marker = if i == idx { ">" } else { " " };
+                    // Change number counts *distance from the current
+                    // position* in the list, not the raw index — same
+                    // `w_changelistidx`-relative numbering `:jumps` uses for
+                    // `w_jumplistidx` (confirmed against a live oracle,
+                    // #1303; the old code printed the raw 0-based index).
+                    let change_num = i.abs_diff(idx);
+                    let text = self.preview_line_text(*line);
+                    lines.push(format!(
+                        "{}{:>4}{:>6}{:>5} {}",
+                        marker,
+                        change_num,
+                        line + 1,
+                        col,
+                        text
+                    ));
                 }
-                self.message = lines.join("\n");
-                EngineAction::None
-            }
-            // Display command history
-            "history" => {
-                let mut lines: Vec<String> = Vec::new();
-                lines.push("--- Command History ---".to_string());
-                for (i, cmd) in self.history.command_history.iter().enumerate() {
-                    lines.push(format!("{:4}  {}", i + 1, cmd));
+                // When the current position is past the end of the recorded
+                // list (no `g;` has been done since the last change),
+                // Neovim prints a bare trailing `>` line with no entry data
+                // — same shape as `:jumps` (confirmed against a live
+                // oracle, #1303).
+                if idx == self.change_list.len() {
+                    lines.push(">".to_string());
                 }
                 self.message = lines.join("\n");
                 EngineAction::None
@@ -2238,7 +2961,13 @@ impl Engine {
                 self.message = format!("\"{name}\"{modified} {total} lines --{pct}%--");
                 EngineAction::None
             }
-            "enew" => {
+            // 'hidden' guard (#1190): `:enew` abandons the current buffer
+            // for a fresh unnamed one, same rule as `:edit`/`:bnext`.
+            "enew" | "enew!" => {
+                if let Err(msg) = self.check_buffer_abandon(cmd == "enew!") {
+                    self.message = msg;
+                    return EngineAction::Error;
+                }
                 let new_id = self.buffer_manager.create();
                 self.switch_window_buffer(new_id);
                 self.message = "New buffer".to_string();
@@ -2263,9 +2992,14 @@ impl Engine {
                 EngineAction::None
             }
             "number" => {
+                // #1282: verified against a live `nvim --headless -u NONE`
+                // `msg_show` event — a single space after a **minimum**
+                // 3-wide right-justified line number (it grows past 3 for a
+                // 4+-digit line, never shrinks below it), not the 6-wide/
+                // double-space field this used to print.
                 let line = self.view().cursor.line;
                 let text = self.buffer().content.line(line).chars().collect::<String>();
-                self.message = format!("{:>6}  {}", line + 1, text.trim_end_matches('\n'));
+                self.message = format!("{:>3} {}", line + 1, text.trim_end_matches('\n'));
                 EngineAction::None
             }
             "new" => {
@@ -2324,6 +3058,21 @@ impl Engine {
         }
     }
 
+    /// Preview text for a `file/text`-column target line (`:marks`, `:jumps`):
+    /// leading whitespace trimmed, no trailing newline — matches Neovim's
+    /// listing commands (confirmed against a live oracle, #1300, #1301).
+    fn preview_line_text(&self, line_idx: usize) -> String {
+        let clamped = line_idx.min(self.buffer().content.len_lines().saturating_sub(1));
+        self.buffer()
+            .content
+            .line(clamped)
+            .chars()
+            .collect::<String>()
+            .trim_end_matches(['\n', '\r'])
+            .trim_start()
+            .to_string()
+    }
+
     /// `:[range]norm[al][!] {keys}` — the range is a full ex range, so
     /// `:2normal $`, `:%normal Ax` and `:'a,'bnormal .` all work.
     pub(crate) fn try_execute_norm(&mut self, cmd: &str) -> Option<EngineAction> {
@@ -2360,8 +3109,10 @@ impl Engine {
 
         let keys_chars: Vec<char> = keys.chars().collect();
 
-        // Save undo stack depth so we can merge all new entries into one step
-        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        // Save the undo-tree position so all the per-line commands below can
+        // be merged into one undoable step (#1156: was a saved undo-stack
+        // *length*, since replaced with a tree `seq` mark).
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
 
         for line_num in start_line..=end_line {
             if line_num >= self.buffer().len_lines() {
@@ -2426,21 +3177,11 @@ impl Engine {
         }
 
         // Finalize the last open undo group (e.g. from trailing insert mode)
-        self.active_buffer_state_mut().finish_undo_group();
+        self.finish_undo_group();
 
-        // Merge all undo entries created during :norm into a single undoable step
-        let state = self.active_buffer_state_mut();
-        if state.undo_stack.len() > saved_undo_len + 1 {
-            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
-            let cursor_before = new_entries[0].cursor_before;
-            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
-            if !merged_ops.is_empty() {
-                state.undo_stack.push(UndoEntry {
-                    ops: merged_ops,
-                    cursor_before,
-                });
-            }
-        }
+        // Merge all undo steps created during :norm into a single undoable step
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
 
         let n = end_line.saturating_sub(start_line) + 1;
         self.message = format!("{} line{} affected", n, if n == 1 { "" } else { "s" });
@@ -2571,7 +3312,7 @@ impl Engine {
         // immediately finishes this outer group (empty, so it's discarded)
         // and starts its own, so without the merge below `u` only reverts
         // the *last* matching line, and the buffer + cursor are both wrong.
-        let saved_undo_len = self.active_buffer_state_mut().undo_stack.len();
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
         while idx < pending.len() {
             let line = pending[idx];
             idx += 1;
@@ -2598,23 +3339,208 @@ impl Engine {
         }
         // Finalize the last open undo group (e.g. from a trailing insert-mode
         // sub-command).
-        self.active_buffer_state_mut().finish_undo_group();
+        self.finish_undo_group();
 
-        // Merge every undo entry created by the sub-commands above into a
+        // Merge every undo step created by the sub-commands above into a
         // single step, so `u` reverts all of `:g`'s edits at once and lands
         // on the position of the *first* one (#886).
-        let state = self.active_buffer_state_mut();
-        if state.undo_stack.len() > saved_undo_len + 1 {
-            let new_entries: Vec<UndoEntry> = state.undo_stack.drain(saved_undo_len..).collect();
-            let cursor_before = new_entries[0].cursor_before;
-            let merged_ops: Vec<_> = new_entries.into_iter().flat_map(|e| e.ops).collect();
-            if !merged_ops.is_empty() {
-                state.undo_stack.push(UndoEntry {
-                    ops: merged_ops,
-                    cursor_before,
-                });
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
+
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        if self.view().cursor.line > max_line {
+            self.view_mut().cursor.line = max_line;
+        }
+        self.clamp_cursor_col();
+
+        self.message = format!(
+            "{} line{} affected",
+            executed,
+            if executed == 1 { "" } else { "s" }
+        );
+        EngineAction::None
+    }
+
+    /// `:undolist`, `:earlier {count}`/`:earlier {N}[smhd]`, `:later
+    /// {count}`/`:later {N}[smhd]`, `:undojoin` (#1156). Returns `None` when
+    /// `cmd` doesn't name one of these, so the caller falls through to the
+    /// rest of `execute_command`'s dispatch.
+    pub(crate) fn try_execute_undo_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        let (name, args) = split_ex_name(cmd);
+        match name {
+            "undolist" => Some(self.ex_undolist()),
+            "earlier" => Some(match self.ex_earlier(args) {
+                Ok(()) => EngineAction::None,
+                Err(e) => {
+                    self.message = e;
+                    EngineAction::Error
+                }
+            }),
+            "later" => Some(match self.ex_later(args) {
+                Ok(()) => EngineAction::None,
+                Err(e) => {
+                    self.message = e;
+                    EngineAction::Error
+                }
+            }),
+            "undojoin" => Some(self.ex_undojoin()),
+            _ => None,
+        }
+    }
+
+    /// `:undolist` (#1156): list every live undo-tree node in chronological
+    /// (`seq`) order — the same order `g-`/`g+`/`:earlier`/`:later` walk —
+    /// marking the buffer's current position with `>`, like Vim's `:h
+    /// :undolist` (columns simplified: Vim's `changes` count is the number
+    /// of *lines* touched, which vimcode doesn't track per-node, so that
+    /// column is omitted here rather than fabricated — it would always be
+    /// identical to the `number` column next to it and read as meaningful
+    /// when it isn't).
+    fn ex_undolist(&mut self) -> EngineAction {
+        let bs = self.active_buffer_state();
+        let current_seq = bs.undo_tree.current_seq();
+        let nodes = bs.undo_tree.live_nodes_for_listing();
+        let now = std::time::SystemTime::now();
+        let mut lines = vec!["    number  seconds ago".to_string()];
+        for n in nodes {
+            if n.seq == 0 {
+                continue; // root: the pre-edit state, Vim's :undolist omits it too
+            }
+            let marker = if n.seq == current_seq { ">" } else { " " };
+            let secs_ago = now
+                .duration_since(n.timestamp)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            lines.push(format!("{marker}   {:4}  {:4}", n.seq, secs_ago));
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+
+    /// `:undojoin` (#1156): fold the *next* committed undo group back into
+    /// whatever undo step precedes it, so undoing after that next change
+    /// reverts both together as one `u`. Errors like Vim's `E790` if
+    /// there's no previous change to join with (a fresh buffer, or already
+    /// at the oldest undo state).
+    fn ex_undojoin(&mut self) -> EngineAction {
+        match self.active_buffer_state().undo_parent_seq() {
+            Some(mark) => {
+                self.pending_undojoin = Some(mark);
+                EngineAction::None
+            }
+            None => {
+                self.message = "E790: undojoin is not allowed after undo".to_string();
+                EngineAction::Error
             }
         }
+    }
+
+    /// `:[range]fold`, `:foldo[pen][!] [range]`, `:foldc[lose][!] [range]`,
+    /// `:[range]foldd[oopen] {cmd}`, `:[range]folddoc[losed] {cmd}` (#1159)
+    /// — the ex-command surface for folding, previously only reachable
+    /// through the `z` normal-mode commands (0 hits in `src/core/engine/`
+    /// before this). `:foldnew`, mentioned in the issue, does not exist in
+    /// Neovim (`E492: Not an editor command`, checked against `nvim
+    /// --headless -u NONE`) so isn't implemented — there is no oracle to
+    /// verify it against and no such command to be compatible with.
+    ///
+    /// Returns `None` when `cmd` doesn't name one of these, so the caller
+    /// falls through to the rest of `execute_command`'s dispatch.
+    pub(crate) fn try_execute_fold_command(&mut self, cmd: &str) -> Option<EngineAction> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let (range, consumed) = self.parse_ex_range(&chars);
+        let rest: String = chars[consumed..].iter().collect();
+        let rest = rest.trim();
+        let (name, args) = split_ex_name(rest);
+        let (name, bang) = match name.strip_suffix('!') {
+            Some(n) => (n, true),
+            None => (name, false),
+        };
+        let is = |canonical: &str, min: usize| {
+            name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
+        };
+
+        if is("fold", 4) && !bang && args.is_empty() {
+            return Some(self.ex_fold_create(range));
+        }
+        if is("foldopen", 5) && args.is_empty() {
+            return Some(self.ex_fold_open_close(range, bang, true));
+        }
+        if is("foldclose", 5) && args.is_empty() {
+            return Some(self.ex_fold_open_close(range, bang, false));
+        }
+        // Min abbreviations per `:h fold-commands`: `:foldd`/`:folddo` for
+        // `:folddoopen`, `:folddoc` for `:folddoclosed`. Neither takes `!`.
+        if is("folddoclosed", 7) && !bang && !args.is_empty() {
+            return Some(self.execute_folddo_command(range, args, true));
+        }
+        if is("folddoopen", 5) && !bang && !args.is_empty() {
+            return Some(self.execute_folddo_command(range, args, false));
+        }
+        None
+    }
+
+    /// `:[range]foldd[oopen] {cmd}` / `:[range]folddoc[losed] {cmd}` (#1159)
+    /// — run `{cmd}` on every line in `[range]` (default: the whole buffer,
+    /// unlike most other `[range]` ex commands — verified against `nvim
+    /// --headless`) that is/isn't inside a closed fold. `closed` selects
+    /// which of the two. Mirrors `execute_global_command`'s "mark first,
+    /// then run in forward order, shifting remaining marks by each
+    /// sub-command's net line delta" structure and its undo-merging (`:h
+    /// :folddoopen` explicitly compares itself to `:global`: "This works
+    /// like the \":global\" command").
+    pub(crate) fn execute_folddo_command(
+        &mut self,
+        range: Option<(isize, isize)>,
+        cmd: &str,
+        closed: bool,
+    ) -> EngineAction {
+        let num_lines = self.buffer().len_lines();
+        let (first, last) = match range {
+            Some((a, b)) => (
+                a.max(0) as usize,
+                (b.max(0) as usize).min(num_lines.saturating_sub(1)),
+            ),
+            None => (0, num_lines.saturating_sub(1)),
+        };
+
+        let mut pending: Vec<isize> = (first..=last.min(num_lines.saturating_sub(1)))
+            .filter(|&l| self.view().enclosing_closed_fold(l).is_some() == closed)
+            .map(|l| l as isize)
+            .collect();
+
+        let mut executed = 0usize;
+        let mut idx = 0usize;
+        // See `execute_global_command`'s matching comment (#886): `:folddo*`
+        // is one undoable step however many lines it touches.
+        let saved_undo_seq = self.active_buffer_state_mut().undo_seq();
+        while idx < pending.len() {
+            let line = pending[idx];
+            idx += 1;
+            if line < 0 {
+                continue;
+            }
+            let line = line as usize;
+            let before = self.buffer().len_lines();
+            if line >= before {
+                continue;
+            }
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+            self.execute_command(cmd);
+            executed += 1;
+            let delta = self.buffer().len_lines() as isize - before as isize;
+            if delta != 0 {
+                for l in pending[idx..].iter_mut() {
+                    if *l > line as isize {
+                        *l += delta;
+                    }
+                }
+            }
+        }
+        self.finish_undo_group();
+        self.active_buffer_state_mut()
+            .merge_undo_since(saved_undo_seq);
 
         let max_line = self.buffer().len_lines().saturating_sub(1);
         if self.view().cursor.line > max_line {
@@ -2786,7 +3712,22 @@ impl Engine {
         self.start_undo_group();
         let first_new_line = if line + 1 < num_lines {
             let insert_pos = self.buffer().line_to_char(line + 1);
-            self.insert_with_undo(insert_pos, content);
+            // #1282: `content` is the on-disk file verbatim, which has no
+            // trailing newline whenever the source file itself doesn't end
+            // with one (`std::fs::read_to_string` doesn't add one) — insert
+            // it as-is here and it silently merges into the following
+            // line's text instead of landing on its own line(s), confirmed
+            // against a live `nvim --headless -u NONE` `:read`. Neovim reads
+            // a file as a sequence of *lines* regardless of whether the
+            // file's own last line was newline-terminated, so this needs
+            // the same guarantee the "insert at end of buffer" branch below
+            // already has.
+            if content.ends_with('\n') {
+                self.insert_with_undo(insert_pos, content);
+            } else {
+                self.insert_with_undo(insert_pos, content);
+                self.insert_with_undo(insert_pos + content.chars().count(), "\n");
+            }
             line + 1
         } else {
             let end = self.buffer().len_chars();
@@ -3356,12 +4297,14 @@ impl Engine {
                 }
             }
         }
-        if flags.contains('c') {
-            // #801 acceptance: never *silently* discard the confirm flag.
-            self.message = "E-vimcode: the :s 'c' (confirm) flag is not implemented".to_string();
-            return EngineAction::Error;
-        }
-        let global = flags.contains('g');
+        // #1031 (#801 Phase 2): the confirm loop is entered further down,
+        // once the pattern/replacement/range are all resolved — see
+        // `confirm && !report_only` below.
+        let confirm = flags.contains('c');
+        // `:h 'gdefault'`: when set, the meaning of the `g` flag is
+        // inverted — every match on a line is replaced by default, and a
+        // `g` flag toggles that off (first match per line only).
+        let global = flags.contains('g') ^ self.settings.gdefault;
         let report_only = flags.contains('n');
         let quiet = flags.contains('e');
 
@@ -3431,6 +4374,52 @@ impl Engine {
         }
         first_line = first_line.min(n_lines.saturating_sub(1));
         last_line = last_line.min(n_lines.saturating_sub(1));
+
+        // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+        //
+        // `n` ("report only, don't substitute") wins over `c` if both are
+        // given — there is nothing to confirm if nothing is ever applied —
+        // so that combination falls through to the ordinary scan below
+        // exactly like a plain `:s///n` would.
+        if confirm && !report_only {
+            let candidates = collect_confirm_candidates(
+                body,
+                &line_starts,
+                first_line,
+                last_line,
+                &compiled,
+                global,
+                &repl,
+            );
+            if candidates.is_empty() {
+                if !quiet {
+                    self.message = format!("E486: Pattern not found: {pattern}");
+                    return EngineAction::Error;
+                }
+                self.message.clear();
+                if let Some(next) = chained {
+                    let next = next.trim().to_string();
+                    if !next.is_empty() {
+                        return self.execute_command(&next);
+                    }
+                }
+                return EngineAction::None;
+            }
+            self.confirm_sub = Some(ConfirmSubState {
+                body: body.to_string(),
+                matches: candidates,
+                idx: 0,
+                copied: 0,
+                out: String::new(),
+                n_subs: 0,
+                done_lines: Vec::new(),
+                last_end_in_out: None,
+                last_was_multiline: false,
+                cur,
+                chained,
+            });
+            return self.begin_confirm_sub_prompt();
+        }
 
         // --- single left-to-right pass over the buffer text ---
         let mut out = String::new();
@@ -3645,6 +4634,287 @@ impl Engine {
         self.splice_buffer_text_at(new_text, cursor_before);
     }
 
+    // --- `:s///c` confirm loop (#1031, #801 Phase 2) ---
+    //
+    // `run_substitute` precomputes every candidate match up front (see
+    // `collect_confirm_candidates`) using the *original*, unmodified buffer
+    // text — the same one-pass scan the non-confirm path already used,
+    // just not applied yet. The interactive loop below only ever decides,
+    // per candidate in order, whether to fold its rendered replacement into
+    // an `out` string being built incrementally; the real buffer is left
+    // untouched (`self.confirm_sub` holds all of this state) until the loop
+    // ends, at which point one `splice_buffer_text_at` applies the result —
+    // exactly mirroring what a single non-interactive `:s///g` would have
+    // spliced, just gated per-match by the user's answer. This keeps
+    // candidate positions stable across answers (no later match ever shifts
+    // because an earlier one was replaced), which is safe because, like the
+    // non-confirm path, no candidate's rendered text is re-scanned for
+    // further matches.
+    //
+    // Verified against a real `nvim --headless --listen` session (v0.12.5,
+    // driven interactively over its msgpack `--remote-send`, not the
+    // non-interactive `-es` batch mode, which short-circuits `:s///c`
+    // entirely): the pending match's *start* (not its line's first
+    // non-blank) is where the cursor sits while a prompt is up; quitting
+    // (`q`/`<Esc>`) or `l` ("last") freezes the cursor there and prints no
+    // report line even if earlier answers replaced something; only running
+    // off the end of the candidate list (individually or via `a`) both
+    // reports and re-lands the cursor the same place the non-confirm path
+    // would (last substitution's line, first non-blank unless the last
+    // substitution was multiline).
+
+    /// Show the prompt for the confirm loop's current candidate, or finish
+    /// the loop (as a "ran off the end" completion) if there isn't one.
+    ///
+    /// The candidate's line/col is *not* trusted from its frozen (original,
+    /// pre-edit) `sline`/`scol` here -- every earlier confirmed answer has
+    /// already been spliced into the real buffer (see `confirm_sub_apply_current`),
+    /// which can shift both the line count (a multiline match, or a `\r` in
+    /// the replacement, changes how many newlines precede this candidate)
+    /// and the column. Instead this asks the *live* buffer where this
+    /// candidate's match now actually sits, via `confirm_sub_live_char_pos`.
+    fn begin_confirm_sub_prompt(&mut self) -> EngineAction {
+        let Some(state) = self.confirm_sub.as_ref() else {
+            return EngineAction::None;
+        };
+        let Some(m) = state.matches.get(state.idx) else {
+            return self.finish_confirm_sub(true, true);
+        };
+        let rendered = m.rendered.clone();
+        let live_pos = confirm_sub_live_char_pos(state, m.mstart);
+        let line = self.buffer().content.char_to_line(live_pos);
+        let line_start = self.buffer().line_to_char(line);
+        let col = live_pos - line_start;
+        self.view_mut().cursor.line = line;
+        self.view_mut().cursor.col = col;
+        self.clamp_cursor_col();
+        self.message = format!(
+            "replace with {rendered}? (y)es/(n)o/(a)ll/(q)uit/(l)ast/scroll up(^E)/down(^Y)"
+        );
+        EngineAction::None
+    }
+
+    /// Route one keystroke to the confirm loop. Called from `handle_key`
+    /// while `self.confirm_sub.is_some()`, ahead of all other dispatch.
+    pub(crate) fn handle_confirm_sub_key(
+        &mut self,
+        key_name: &str,
+        unicode: Option<char>,
+        ctrl: bool,
+    ) -> EngineAction {
+        // `<C-c>`/`<C-[>` aren't in `:h :s_c`'s documented answer set, but
+        // they're the same "get me out of here" aliases for `<Esc>` that
+        // `handle_insert_key` already recognizes (#804) -- without this a
+        // user's habitual escape hatch would silently re-prompt instead of
+        // quitting the loop like every other Escape-shaped key in this
+        // codebase does.
+        if ctrl && matches!(key_name, "c" | "bracketleft" | "[") {
+            return self.finish_confirm_sub(false, false);
+        }
+        if ctrl && (unicode == Some('e') || key_name == "e") {
+            self.scroll_viewport_with_cursor(1, 1);
+            return EngineAction::None;
+        }
+        if ctrl && (unicode == Some('y') || key_name == "y") {
+            self.scroll_viewport_with_cursor(-1, 1);
+            return EngineAction::None;
+        }
+        if key_name == "Escape" {
+            return self.finish_confirm_sub(false, false);
+        }
+        match unicode {
+            Some('y') => {
+                self.confirm_sub_apply_current();
+                self.confirm_sub_advance()
+            }
+            Some('n') => self.confirm_sub_advance(),
+            Some('a') => {
+                loop {
+                    self.confirm_sub_apply_current();
+                    let Some(state) = self.confirm_sub.as_mut() else {
+                        return EngineAction::None;
+                    };
+                    state.idx += 1;
+                    if state.idx >= state.matches.len() {
+                        break;
+                    }
+                }
+                self.finish_confirm_sub(true, true)
+            }
+            // "Last" -- verified against real Neovim: unlike `q`/`<Esc>`,
+            // `l` *does* re-land the cursor the same way a natural
+            // completion would (first non-blank of the line the applied
+            // replacement landed on), it just prints no report line.
+            Some('l') => {
+                self.confirm_sub_apply_current();
+                self.finish_confirm_sub(true, false)
+            }
+            Some('q') => self.finish_confirm_sub(false, false),
+            // Any other key is simply ignored -- verified against real
+            // Neovim: the prompt stays up for the same candidate (mode
+            // stays 'r', cursor doesn't move), it is not treated as `n`.
+            _ => EngineAction::None,
+        }
+    }
+
+    /// Fold the current candidate's rendered replacement into the
+    /// in-progress `out` string (mirroring exactly what the non-confirm
+    /// scan does per match -- `run_substitute`'s own comment on the
+    /// equivalent code explains the bookkeeping) *and* splice that same
+    /// change into the real, live buffer right now.
+    ///
+    /// #1031 review: the confirm loop used to only ever touch `state.out`,
+    /// leaving the visible buffer frozen until the whole loop ended (`a`,
+    /// `q`/`<Esc>`, or running off the end) at which point `finish_confirm_sub`
+    /// applied every decided candidate in one shot. That's backwards from
+    /// the entire point of an interactive confirm prompt -- a user answering
+    /// `y` should watch that match change in place before deciding on the
+    /// next one. This now performs the live edit immediately, as part of a
+    /// single undo group spanning the whole loop (opened here, lazily, on
+    /// the first applied answer; closed once in `finish_confirm_sub`) so `u`
+    /// still undoes the entire `:s///c` invocation in one step rather than
+    /// one keystroke at a time.
+    fn confirm_sub_apply_current(&mut self) {
+        let Some(mut state) = self.confirm_sub.take() else {
+            return;
+        };
+        let Some(m) = state.matches.get(state.idx).cloned() else {
+            self.confirm_sub = Some(state);
+            return;
+        };
+
+        // Where this candidate's match currently sits in the *live* buffer
+        // -- everything up to `state.copied` has already been folded into
+        // the live buffer exactly as `state.out` records it (verbatim
+        // copies and any earlier confirmed replacements alike), so this is
+        // `state.out`'s length plus however much *unchanged* original text
+        // sits between `state.copied` and this match's start.
+        let live_start = confirm_sub_live_char_pos(&state, m.mstart);
+        let matched_chars = state.body[m.mstart..m.mend].chars().count();
+        let is_first_apply = state.n_subs == 0;
+        let first_cursor = Cursor {
+            line: m.sline,
+            col: m.scol,
+        };
+
+        state.out.push_str(&state.body[state.copied..m.mstart]);
+        state.out.push_str(&m.rendered);
+        state.copied = m.mend;
+        state.n_subs += 1;
+        state.last_end_in_out = Some(state.out.len());
+        state.last_was_multiline = m.eline > m.sline;
+        // Mirrors the non-confirm scan: a multiline match's start line is
+        // deliberately *not* added to `done_lines` there either (it shrinks
+        // `last_line` instead) -- kept identical here for the same report
+        // count.
+        if m.eline == m.sline && state.done_lines.last() != Some(&m.sline) {
+            state.done_lines.push(m.sline);
+        }
+
+        if is_first_apply {
+            self.start_undo_group_at(first_cursor);
+        }
+        if matched_chars > 0 {
+            self.delete_with_undo(live_start, live_start + matched_chars);
+        }
+        if !m.rendered.is_empty() {
+            self.insert_with_undo(live_start, &m.rendered);
+        }
+
+        self.confirm_sub = Some(state);
+    }
+
+    /// Move to the next candidate (without deciding anything about it),
+    /// showing its prompt, or finish the loop if that was the last one.
+    fn confirm_sub_advance(&mut self) -> EngineAction {
+        let Some(state) = self.confirm_sub.as_mut() else {
+            return EngineAction::None;
+        };
+        state.idx += 1;
+        if state.idx >= state.matches.len() {
+            self.finish_confirm_sub(true, true)
+        } else {
+            self.begin_confirm_sub_prompt()
+        }
+    }
+
+    /// End the confirm loop: close out the undo group spanning whatever got
+    /// decided (each answer already spliced its own change into the real
+    /// buffer live, in `confirm_sub_apply_current` -- there is nothing left
+    /// to apply here), then handle the cursor and message independently —
+    /// verified against real Neovim (see this section's own doc above),
+    /// the two don't always travel together:
+    ///
+    /// * `reposition` — land the cursor the same way the non-confirm path
+    ///   would (last substitution's line, first non-blank unless
+    ///   multiline). True for a natural "ran off the end" completion
+    ///   (individually or via `a`) *and* for `l`. False only for `q`/
+    ///   `<Esc>`, which instead freeze the cursor exactly where the last
+    ///   prompt already left it (the pending, undecided candidate).
+    /// * `report` — print "N substitutions on M lines". True only for the
+    ///   natural completion; `l`, `q` and `<Esc>` all stay silent even if
+    ///   an earlier answer replaced something.
+    fn finish_confirm_sub(&mut self, reposition: bool, report: bool) -> EngineAction {
+        let Some(state) = self.confirm_sub.take() else {
+            return EngineAction::None;
+        };
+        // `state.out` + the still-untouched tail of `state.body` from
+        // `state.copied` onward is, by construction, exactly what the live
+        // buffer already holds at this point (every earlier answer kept
+        // this invariant true via its own live splice) -- rebuilt here
+        // purely to derive the report cursor below, not to be written back.
+        let mut out = state.out;
+        out.push_str(&state.body[state.copied..]);
+
+        if state.n_subs > 0 {
+            self.finish_undo_group();
+        }
+
+        if reposition && state.n_subs > 0 {
+            let target_line = state
+                .last_end_in_out
+                .map(|b| out[..b].matches('\n').count())
+                .unwrap_or(state.cur);
+            let target_col = if state.last_was_multiline {
+                state.last_end_in_out.map(|b| {
+                    let line_start = out[..b].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    out[line_start..b].chars().count()
+                })
+            } else {
+                None
+            };
+            let max_line = self.buffer().len_lines().saturating_sub(1);
+            let target_line = target_line.min(max_line);
+            self.view_mut().cursor.line = target_line;
+            self.view_mut().cursor.col =
+                target_col.unwrap_or_else(|| self.first_non_blank_col(target_line));
+            self.clamp_cursor_col();
+        }
+        // Quitting (`q`/`<Esc>`) leaves the cursor exactly where the last
+        // prompt left it (the pending candidate) -- `reposition` is false
+        // in that case, so the block above is simply skipped.
+
+        if report && state.n_subs > 0 {
+            self.message = format!(
+                "{} substitution{} on {} line{}",
+                state.n_subs,
+                if state.n_subs == 1 { "" } else { "s" },
+                state.done_lines.len(),
+                if state.done_lines.len() == 1 { "" } else { "s" }
+            );
+        } else {
+            self.message.clear();
+        }
+
+        if let Some(next) = state.chained {
+            let next = next.trim().to_string();
+            if !next.is_empty() {
+                return self.execute_command(&next);
+            }
+        }
+        EngineAction::None
+    }
+
     // --- Search ---
 
     /// Compile a Vim pattern against the current `'ignorecase'` / `'smartcase'`
@@ -3657,13 +4927,76 @@ impl Engine {
         pattern: &str,
         smartcase_applies: bool,
     ) -> Result<vim_regex::Compiled, String> {
-        vim_regex::compile(
+        let (keyword_class, keyword_class_no_digits) = self.settings.iskeyword_regex_class_bodies();
+        vim_regex::compile_with_keyword_class(
             pattern,
             self.settings.ignorecase,
             self.settings.smartcase,
             smartcase_applies,
             &self.last_sub_replacement,
+            self.last_visual_byte_range(),
+            (&keyword_class, &keyword_class_no_digits),
+            self.settings.magic,
         )
+    }
+
+    /// The last Visual selection's byte range within `self.buffer().to_string()`
+    /// — what `\%V` (#1157) restricts a match to. `None` when there has never
+    /// been one, *or* when the last selection was Visual-Block.
+    ///
+    /// Charwise (`v`) and linewise (`V`) selections are both a single
+    /// contiguous run of text, so both translate cleanly into the `[lo, hi)`
+    /// byte span `Compiled::pos_ok` filters against. Visual-Block (`CTRL-V`)
+    /// is *not* contiguous — it's a per-line column range (e.g. columns 3..6
+    /// on every selected line) — and `pos_ok`'s single-span representation
+    /// cannot express that shape at all.
+    ///
+    /// This used to (incorrectly) run the charwise column formula for every
+    /// Visual kind, which for linewise/blockwise produced a range that looked
+    /// plausible but was arithmetically nonsense (silently wrong matches,
+    /// not a "no selection" no-op). Since there is no faithful contiguous
+    /// approximation for Visual-Block, this refuses instead: no range means
+    /// `\%V` never matches, the same safe behaviour already covered by
+    /// `percent_v_with_no_visual_range_never_matches` for "no selection yet".
+    /// Rejection, never fallback — the same doctrine `vim_regex`'s module doc
+    /// states for the untranslatable-pattern case. Proper Visual-Block
+    /// support needs a per-line-range `\%V` representation and is a
+    /// follow-up, not a fix folded into this pass.
+    fn last_visual_byte_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.last_visual_anchor?;
+        let cursor = self.last_visual_cursor?;
+        let (start, end) = if anchor.line < cursor.line
+            || (anchor.line == cursor.line && anchor.col <= cursor.col)
+        {
+            (anchor, cursor)
+        } else {
+            (cursor, anchor)
+        };
+        let rope = &self.buffer().content;
+        match self.last_visual_mode {
+            Mode::Visual => {
+                let to_char = |c: Cursor| self.buffer().line_to_char(c.line) + c.col;
+                let lo = to_char(start);
+                let hi = to_char(end);
+                let lo_byte = rope.char_to_byte(lo.min(rope.len_chars()));
+                let hi_byte = rope.char_to_byte((hi + 1).min(rope.len_chars()));
+                Some((lo_byte, hi_byte.max(lo_byte)))
+            }
+            Mode::VisualLine => {
+                let start_char = self.buffer().line_to_char(start.line);
+                let end_char = if end.line + 1 < self.buffer().len_lines() {
+                    self.buffer().line_to_char(end.line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+                Some((rope.char_to_byte(start_char), rope.char_to_byte(end_char)))
+            }
+            // Visual-Block (and any other mode `last_visual_mode` could in
+            // principle hold, though anchor/cursor being `Some` means it's
+            // realistically always one of the three Visual kinds) — refuse,
+            // see the doc comment above.
+            _ => None,
+        }
     }
 
     /// Collect every match of `re` in `text`.
@@ -3727,7 +5060,22 @@ impl Engine {
             .search_matches
             .iter()
             .position(|(start, _)| *start > cursor_char);
-        let idx = next.unwrap_or(0);
+        let idx = match next {
+            Some(i) => i,
+            None if self.settings.wrapscan => {
+                self.message = "search hit BOTTOM, continuing at TOP".to_string();
+                0
+            }
+            None => {
+                // `:h 'wrapscan'`: off, and no match after the cursor —
+                // stay put rather than wrapping (#1153).
+                self.message = format!(
+                    "E385: search hit BOTTOM without match for: {}",
+                    self.search_query
+                );
+                return;
+            }
+        };
 
         self.search_index = Some(idx);
         self.jump_to_search_match(idx);
@@ -3755,7 +5103,21 @@ impl Engine {
             .search_matches
             .iter()
             .rposition(|(start, _)| *start < cursor_char);
-        let idx = prev.unwrap_or(self.search_matches.len() - 1);
+        let idx = match prev {
+            Some(i) => i,
+            None if self.settings.wrapscan => {
+                self.message = "search hit TOP, continuing at BOTTOM".to_string();
+                self.search_matches.len() - 1
+            }
+            None => {
+                // See `search_next`'s matching `'wrapscan'` comment (#1153).
+                self.message = format!(
+                    "E384: search hit TOP without match for: {}",
+                    self.search_query
+                );
+                return;
+            }
+        };
 
         self.search_index = Some(idx);
         self.jump_to_search_match(idx);
@@ -3933,26 +5295,41 @@ impl Engine {
             let start_cursor = self.search_start_cursor.unwrap_or(self.view().cursor);
             let start_char = self.buffer().line_to_char(start_cursor.line) + start_cursor.col;
 
-            // Find the appropriate match based on search direction
+            // Find the appropriate match based on search direction. `:h
+            // 'wrapscan'`: off, and no match in the requested direction from
+            // the start position — the live preview stays put rather than
+            // previewing a wrapped-around match (#1153 review; mirrors
+            // `search_next`/`search_prev`).
             let idx = match self.search_direction {
                 SearchDirection::Forward => {
                     // Find first match at or after start position
                     self.search_matches
                         .iter()
                         .position(|(start, _)| *start >= start_char)
-                        .unwrap_or(0)
                 }
                 SearchDirection::Backward => {
                     // Find last match strictly before start position
                     self.search_matches
                         .iter()
                         .rposition(|(start, _)| *start < start_char)
-                        .unwrap_or(self.search_matches.len() - 1)
                 }
             };
 
-            self.search_index = Some(idx);
-            self.jump_to_search_match(idx);
+            let idx = match idx {
+                Some(i) => Some(i),
+                None if self.settings.wrapscan => Some(match self.search_direction {
+                    SearchDirection::Forward => 0,
+                    SearchDirection::Backward => self.search_matches.len() - 1,
+                }),
+                None => None,
+            };
+
+            if let Some(idx) = idx {
+                self.search_index = Some(idx);
+                self.jump_to_search_match(idx);
+            } else if let Some(start_cursor) = self.search_start_cursor {
+                self.view_mut().cursor = start_cursor;
+            }
         } else {
             // No matches, restore to start position
             if let Some(start_cursor) = self.search_start_cursor {
@@ -3967,7 +5344,10 @@ impl Engine {
     /// range: None = current line, Some((start_line, end_line)) = line range
     /// pattern: string to find (will use simple substring matching for now)
     /// replacement: string to replace with
-    /// flags: "g" (all), "c" (confirm), "i" (case-insensitive)
+    /// flags: "g" (all), "i" (case-insensitive) -- `c` (confirm) is handled
+    /// by `run_substitute`'s own `:s///c` loop before this function is ever
+    /// reached; this legacy per-line path's only caller (`search.rs`'s
+    /// `find_replace_replace_all`) never passes it.
     /// Returns: (num_replacements, modified_text_preview)
     pub fn replace_in_range(
         &mut self,
@@ -3981,7 +5361,6 @@ impl Engine {
         }
 
         let global = flags.contains('g');
-        let _confirm = flags.contains('c'); // For Phase 2
         let case_insensitive = flags.contains('i');
 
         // Determine line range
@@ -4620,6 +5999,568 @@ impl Engine {
         self.view_mut().cursor.col = self.first_non_blank_col(line);
         self.clamp_cursor_col();
     }
+
+    // ─── User abbreviations (#1152) ─────────────────────────────────────────
+
+    /// Parse `"{lhs} {rhs...}"` (the argument tail of `:abbreviate`/
+    /// `:iabbrev`/`:cabbrev` and their `nore` variants) and define or replace
+    /// the abbreviation. Returns the status message to show the user.
+    fn define_abbrev_from_args(&mut self, mode: &str, args: &str) -> String {
+        let mut parts = args.splitn(2, ' ');
+        match (parts.next(), parts.next()) {
+            (Some(lhs), Some(rhs)) if !lhs.is_empty() && !rhs.trim().is_empty() => {
+                let rhs = rhs.trim();
+                self.define_abbrev(mode, lhs, rhs);
+                format!("Abbreviation: {lhs} -> {rhs}")
+            }
+            _ => "Usage: :abbreviate <lhs> <rhs>  (e.g. :iabbrev teh the)".to_string(),
+        }
+    }
+
+    /// Add a user-defined abbreviation, replacing any earlier definition for
+    /// the same `(mode, lhs)` pair — matching Vim's own "redefining an
+    /// abbreviation replaces it" behaviour, and keeping
+    /// `find_abbrev_match`'s longest-match tie-break from seeing stale
+    /// duplicates.
+    fn define_abbrev(&mut self, mode: &str, lhs: &str, rhs: &str) {
+        self.settings.abbreviations.retain(|s| {
+            parse_abbrev_def(s)
+                .map(|a| a.mode != mode || a.lhs != lhs)
+                .unwrap_or(true)
+        });
+        self.settings
+            .abbreviations
+            .push(format!("{mode} {lhs} {rhs}"));
+        let _ = self.settings.save();
+        self.rebuild_user_abbrevs();
+    }
+
+    /// Remove every abbreviation (in any mode) whose `lhs` matches exactly.
+    /// Returns `true` if anything was removed. Vim distinguishes
+    /// `:unabbreviate`/`:iunabbreviate`/`:cunabbreviate` by mode; this engine
+    /// only exposes the mode-agnostic form (#1152's requested deliverable).
+    fn remove_abbrev(&mut self, lhs: &str) -> bool {
+        let before = self.settings.abbreviations.len();
+        self.settings
+            .abbreviations
+            .retain(|s| parse_abbrev_def(s).map(|a| a.lhs != lhs).unwrap_or(true));
+        let removed = self.settings.abbreviations.len() < before;
+        if removed {
+            let _ = self.settings.save();
+            self.rebuild_user_abbrevs();
+        }
+        removed
+    }
+
+    /// Format the `:abbreviate`/`:iabbrev`/`:cabbrev` no-argument lister:
+    /// every defined abbreviation whose mode is in `modes`, or `empty_msg` if
+    /// none match.
+    fn list_abbrevs(&self, modes: &[&str], empty_msg: &str) -> String {
+        let listed: Vec<String> = self
+            .settings
+            .abbreviations
+            .iter()
+            .filter_map(|s| parse_abbrev_def(s))
+            .filter(|a| modes.contains(&a.mode.as_str()))
+            .map(|a| format!("{} {} {}", a.mode, a.lhs, a.rhs))
+            .collect();
+        if listed.is_empty() {
+            empty_msg.to_string()
+        } else {
+            listed.join("  |  ")
+        }
+    }
+
+    /// `:registers`/`:display` (`:h :registers`, #1299). With `args` empty,
+    /// lists every non-empty register; otherwise each non-space character of
+    /// `args` is one requested register name and only those are listed
+    /// (still in canonical order, not argument order — confirmed against a
+    /// live oracle: `:reg b a` lists `a` before `b`).
+    ///
+    /// `prev_ex_command` is `self.last_ex_command` from *before*
+    /// [`Engine::execute_command`] overwrote it for this very invocation —
+    /// needed because the `":"` register must show the previous command
+    /// while `:registers`/`:reg` itself is running, never itself (confirmed
+    /// against a live oracle: back-to-back `:registers` calls show the
+    /// *first* one's `":"` row empty, and the *second* one's `":"` row is
+    /// `registers`, the first call — not the second call self-referencing).
+    pub(crate) fn ex_registers(
+        &mut self,
+        args: &str,
+        prev_ex_command: Option<&str>,
+    ) -> EngineAction {
+        let requested: Option<Vec<char>> = if args.is_empty() {
+            None
+        } else {
+            Some(args.chars().filter(|c| !c.is_whitespace()).collect())
+        };
+        let mut lines: Vec<String> = vec!["Type Name Content".to_string()];
+        for r in REGISTERS_DISPLAY_ORDER.iter().copied() {
+            if let Some(requested) = &requested {
+                if !requested.contains(&r) {
+                    continue;
+                }
+            }
+            let Some((content, ty)) = self.register_display_value(r, prev_ex_command) else {
+                continue;
+            };
+            if content.is_empty() {
+                continue;
+            }
+            let kind = reg_type_letter(ty);
+            let preview: String = content.chars().take(40).collect();
+            lines.push(format!(
+                "  {}  \"{}   {}",
+                kind,
+                r,
+                preview.replace('\n', "^J")
+            ));
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+
+    /// Read-only lookup used by [`Engine::ex_registers`]: mirrors
+    /// [`Engine::get_register_content`] for the read-only pseudo-registers
+    /// (`%`, `#`, `.`, `:`, `/`) but never touches `self.message` or the
+    /// system clipboard — a listing command must not have those side
+    /// effects. `+`/`*` therefore read vimcode's own stored copy rather than
+    /// querying the clipboard provider live. `:` reads `prev_ex_command`
+    /// rather than `self.last_ex_command` — see [`Engine::ex_registers`]'s
+    /// doc comment for why.
+    fn register_display_value(
+        &self,
+        r: char,
+        prev_ex_command: Option<&str>,
+    ) -> Option<(String, RegType)> {
+        match r {
+            '%' => {
+                let name = self
+                    .active_buffer_state()
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '#' => {
+                let name = self
+                    .buffer_manager
+                    .alternate_buffer
+                    .and_then(|id| self.buffer_manager.get(id))
+                    .and_then(|state| state.file_path.as_ref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Some((name, RegType::Charwise))
+            }
+            '.' => Some((self.last_inserted_text.clone(), RegType::Charwise)),
+            ':' => Some((
+                prev_ex_command.unwrap_or_default().to_string(),
+                RegType::Charwise,
+            )),
+            '/' => Some((self.search_query.clone(), RegType::Charwise)),
+            _ => self.registers.get(&r).cloned(),
+        }
+    }
+
+    /// `:history`/`:his` (`:h :history`, #1327). `args` is everything after
+    /// the command word, e.g. `""`, `"/"`, `"all"`, `"cmd 2,5"`.
+    ///
+    /// The leading token, if present, selects a [`HistoryKind`] (`:`/`cmd`,
+    /// `/`/`?`/`search`, `all`, plus `=`/`expr`, `@`/`input`, `>`/`debug` —
+    /// vimcode tracks none of the latter three, see [`HistoryKind::entries`]).
+    /// When the leading token doesn't name a kind (e.g. it's a bare number),
+    /// it is instead the index-range argument and the kind defaults to
+    /// `Cmd` — Neovim's own default (confirmed against a live oracle: typing
+    /// two prior commands then bare `:history` lists the `:` history, not
+    /// `all`).
+    ///
+    /// A trailing `{first}[,{last}]` restricts *which entries* of the
+    /// selected kind(s) are printed (`:h :history-indexing`): a bare number
+    /// means `first == last`; a negative number counts back from the newest
+    /// entry (`-1` is the newest). All confirmed against a live oracle,
+    /// including that `:history {kind} 0` / `... 99` (out of range) print
+    /// just the header with no rows rather than erroring.
+    pub(crate) fn ex_history(&mut self, args: &str) -> EngineAction {
+        let args = args.trim();
+        let mut tokens = args.split_whitespace();
+        let mut kind = HistoryKind::Cmd;
+        let mut range_tok: Option<&str> = None;
+        if let Some(first_tok) = tokens.next() {
+            if let Some(k) = HistoryKind::parse(first_tok) {
+                kind = k;
+                range_tok = tokens.next();
+            } else {
+                range_tok = Some(first_tok);
+            }
+        }
+
+        let kinds: &[HistoryKind] = if kind == HistoryKind::All {
+            &[
+                HistoryKind::Cmd,
+                HistoryKind::Search,
+                HistoryKind::Expr,
+                HistoryKind::Input,
+                HistoryKind::Debug,
+            ]
+        } else {
+            std::slice::from_ref(&kind)
+        };
+
+        // Neovim's `'history' option is zero` error is a *session-wide* gate,
+        // not a per-requested-kind one (confirmed against a live oracle):
+        // it fires only when nothing has ever been recorded in *any* history
+        // kind, and applies identically whether the request is `all` or a
+        // single named kind. E.g. after one `:` command but zero searches,
+        // `:history search` still prints an empty `search history` table
+        // (no error) because *something* has been recorded overall; only a
+        // totally fresh session errors, for `all` and for every single name.
+        // vimcode only ever populates cmd/search history, so the gate is
+        // exactly "both of those are empty".
+        if self.history.command_history.is_empty() && self.history.search_history.is_empty() {
+            self.message = "'history' option is zero".to_string();
+            return EngineAction::Error;
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        for k in kinds {
+            let entries = k.entries(self);
+            lines.push(format!("      #  {} history", k.label()));
+            let (first, last) = parse_history_range(range_tok.unwrap_or(""), entries.len());
+            let current = entries.len(); // 1-based position of the newest entry.
+            for (i, entry) in entries.iter().enumerate() {
+                let pos = (i + 1) as i64;
+                if pos < first || pos > last {
+                    continue;
+                }
+                let marker = if pos as usize == current { ">" } else { " " };
+                lines.push(format!("{marker}{pos:>6}  {entry}"));
+            }
+        }
+        self.message = lines.join("\n");
+        EngineAction::None
+    }
+}
+
+/// Canonical `:registers` iteration order — unnamed, numbered, named, then
+/// the read-only/special registers in the order a live Neovim lists them
+/// (confirmed empirically: `:h registers`' prose order doesn't match the
+/// oracle's actual `:reg` output, so this is the order the oracle printed,
+/// not the doc's).
+const REGISTERS_DISPLAY_ORDER: &[char] = &[
+    '"', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+    'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '-',
+    '*', '+', '.', ':', '%', '#', '/', '=',
+];
+
+/// Which `:history` list a `{name}` argument selects (`:h :history`). Every
+/// variant but `All` is a valid `{name}`; `All` only ever appears as the
+/// *parsed* result of the literal `all` argument and is expanded back out
+/// to the other five before use (see [`Engine::ex_history`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryKind {
+    Cmd,
+    Search,
+    Expr,
+    Input,
+    Debug,
+    All,
+}
+
+impl HistoryKind {
+    /// Parses a `:history` `{name}` token: the one-character symbol
+    /// spellings (`:`, `/`, `?`, `=`, `@`, `>`) and any non-empty lowercase
+    /// prefix of the word spelling (`c`..`cmd`, `s`..`search`, `e`..`expr`,
+    /// `i`..`input`, `d`..`debug`, `a`..`all` — `:h :history` gives each as
+    /// `x[yz]`, meaning the bracketed part is optional). Returns `None` for
+    /// anything else (a bare index-range token has no letters, or isn't
+    /// lowercase-only, and falls through to this).
+    fn parse(tok: &str) -> Option<Self> {
+        match tok {
+            ":" => Some(Self::Cmd),
+            "/" | "?" => Some(Self::Search),
+            "=" => Some(Self::Expr),
+            "@" => Some(Self::Input),
+            ">" => Some(Self::Debug),
+            _ if !tok.is_empty() && tok.bytes().all(|b| b.is_ascii_lowercase()) => {
+                if "cmd".starts_with(tok) {
+                    Some(Self::Cmd)
+                } else if "search".starts_with(tok) {
+                    Some(Self::Search)
+                } else if "expr".starts_with(tok) {
+                    Some(Self::Expr)
+                } else if "input".starts_with(tok) {
+                    Some(Self::Input)
+                } else if "debug".starts_with(tok) {
+                    Some(Self::Debug)
+                } else if "all".starts_with(tok) {
+                    Some(Self::All)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The word Neovim's header prints, e.g. `"cmd"` in `"      #  cmd
+    /// history"` (confirmed against a live oracle). Never called with `All`
+    /// — [`Engine::ex_history`] expands it to the other five first.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cmd => "cmd",
+            Self::Search => "search",
+            Self::Expr => "expr",
+            Self::Input => "input",
+            Self::Debug => "debug",
+            Self::All => "all",
+        }
+    }
+
+    /// This kind's entries, oldest first. vimcode has no expression
+    /// register, input-line or debug-command history at all, so those three
+    /// are always empty.
+    fn entries(self, engine: &Engine) -> Vec<String> {
+        match self {
+            Self::Cmd => engine.history.command_history.clone(),
+            Self::Search => engine.history.search_history.clone(),
+            Self::Expr | Self::Input | Self::Debug | Self::All => Vec::new(),
+        }
+    }
+}
+
+/// Resolves one `:history-indexing` number against a history of `len`
+/// entries: positive numbers are an absolute 1-based position, negative
+/// numbers count back from the newest entry (`-1` is the newest, `-2` the
+/// one before it, ...). Out-of-range results (e.g. `0`, or beyond `len`)
+/// are returned as-is — [`parse_history_range`]'s caller simply finds no
+/// entries at that position, which matches a live oracle's `:history 0` /
+/// `:history 99` (empty listing, no error).
+fn resolve_history_index(n: i64, len: usize) -> i64 {
+    if n < 0 {
+        len as i64 + n + 1
+    } else {
+        n
+    }
+}
+
+/// Parses a `:history` `{first}[,{last}]` range argument against a history
+/// of `len` entries (`:h :history-indexing`). An empty `spec` (no range
+/// given at all) means "everything". A single number with no comma means
+/// `first == last`. Either side of a comma may be empty, meaning "default
+/// to the start" / "default to the end" respectively (`:history 2,` lists
+/// from position 2 to the end; `:history ,2` lists from the start to
+/// position 2) — all confirmed against a live oracle.
+fn parse_history_range(spec: &str, len: usize) -> (i64, i64) {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return (1, len as i64);
+    }
+    if let Some((first, last)) = spec.split_once(',') {
+        let first = first.trim();
+        let last = last.trim();
+        let first_n = first.parse::<i64>().unwrap_or(1);
+        let last_n = last.parse::<i64>().unwrap_or(len as i64);
+        (
+            resolve_history_index(first_n, len),
+            resolve_history_index(last_n, len),
+        )
+    } else {
+        let n = spec.parse::<i64>().unwrap_or(1);
+        let resolved = resolve_history_index(n, len);
+        (resolved, resolved)
+    }
+}
+
+/// One candidate match `:s///c` offers to confirm — everything about it is
+/// derived from the *original*, unmodified buffer text once, up front (see
+/// `collect_confirm_candidates`), so answering earlier candidates never
+/// shifts a later one's position.
+#[derive(Clone)]
+pub(crate) struct ConfirmSubMatch {
+    /// Byte offset of the match's start in the frozen `body` (honours
+    /// `\zs`/`\ze` like the non-confirm scan does).
+    mstart: usize,
+    /// Byte offset just past the match's end in the frozen `body`.
+    mend: usize,
+    /// 0-indexed line the match starts on.
+    sline: usize,
+    /// 0-indexed line the match ends on (`> sline` for a match that
+    /// swallowed a line break, e.g. `:%s/\n//`).
+    eline: usize,
+    /// 0-indexed char column of `mstart` within `sline` — where the cursor
+    /// sits while this candidate's prompt is up (verified against real
+    /// Neovim: the match's start, not the line's first non-blank).
+    scol: usize,
+    /// This candidate's replacement text, already expanded against its own
+    /// captures (`\1`, `\U`, `&`, …).
+    rendered: String,
+}
+
+/// State for an in-progress `:s///c` confirm loop — lives in
+/// `Engine::confirm_sub` between keystrokes; see that field's doc and the
+/// "confirm loop" section of `impl Engine` in this file for how it's driven.
+pub(crate) struct ConfirmSubState {
+    /// The buffer's text at the moment `:s///c` was invoked, sans its
+    /// trailing `\n` (that trailing newline, if any, is never touched by
+    /// the confirm loop -- every match lives inside `body`, and each
+    /// confirmed answer is spliced live into the real buffer in place, so
+    /// there is no need to track or ever reassemble the suffix separately)
+    /// — frozen for the whole loop; matches' offsets are only ever valid
+    /// against this copy, not the live buffer.
+    body: String,
+    /// Every match `:s///c` will offer to confirm, in order, precomputed
+    /// against `body`.
+    matches: Vec<ConfirmSubMatch>,
+    /// Index into `matches` of the candidate currently being prompted for.
+    idx: usize,
+    /// Byte offset into `body` up to which `out` already accounts for
+    /// (either copied verbatim or replaced) — mirrors the non-confirm
+    /// scan's `copied`.
+    copied: usize,
+    /// The substitution result being built incrementally as candidates are
+    /// decided — mirrors the non-confirm scan's `out`.
+    out: String,
+    /// Count of candidates actually replaced (`y`/`a`/`l`) — *not* the
+    /// number of candidates offered; a `n`-answered candidate must not
+    /// count toward the post-loop report (#1031 deliverable 2).
+    n_subs: usize,
+    /// Distinct 0-indexed lines an actual replacement landed on, in the
+    /// order they were applied — feeds "N substitutions on M lines".
+    /// Mirrors the non-confirm scan's own `done_lines` quirk: a multiline
+    /// match's start line is never pushed here (see `confirm_sub_apply_current`).
+    done_lines: Vec<usize>,
+    /// Byte offset into `out` just past the most recently applied
+    /// replacement — used to compute the final cursor line/col exactly like
+    /// the non-confirm path's `last_end_in_out`.
+    last_end_in_out: Option<usize>,
+    /// Whether the most recently applied replacement swallowed a line
+    /// break, same meaning as the non-confirm path's `last_was_multiline`.
+    last_was_multiline: bool,
+    /// The cursor's line when `:s///c` was invoked — the fallback used if
+    /// nothing ever gets applied (mirrors the non-confirm path's `cur`).
+    cur: usize,
+    /// A `|`-chained follow-up ex command (`:s/a/x/|s/b/y/c`), run once the
+    /// loop ends, same as the non-confirm path.
+    chained: Option<String>,
+}
+
+/// Char position, in the *live* buffer as it currently stands, that a byte
+/// offset into the frozen `body` corresponds to.
+///
+/// Everything up to `state.copied` has already been folded into the live
+/// buffer exactly as `state.out` records it (verbatim copies of
+/// not-yet-decided text and any earlier confirmed replacements alike -- see
+/// `Engine::confirm_sub_apply_current`'s doc for why that invariant holds),
+/// so a later offset's live position is `state.out`'s length plus however
+/// much *unchanged* original text sits between `state.copied` and it.
+/// `body_byte_offset` must be `>= state.copied` (true of every candidate's
+/// `mstart`/`mend`, since candidates are processed strictly in document
+/// order and `state.copied` only ever advances to a just-applied match's
+/// `mend`).
+fn confirm_sub_live_char_pos(state: &ConfirmSubState, body_byte_offset: usize) -> usize {
+    state.out.chars().count() + state.body[state.copied..body_byte_offset].chars().count()
+}
+
+/// Scan `body` for every match `:s///c` should offer to confirm, applying
+/// the exact same global/same-line-dedup/multiline/empty-match-at-eol rules
+/// the non-confirm scan in `run_substitute` uses to decide which matches
+/// are candidates at all — the two scans *must* agree, since `:s///gc` and
+/// `:s///g` differ only in whether each candidate is applied unconditionally
+/// or interactively. Unlike that scan, this one never mutates an `out`
+/// string; it only records each candidate's span, line/col and rendered
+/// replacement text so the confirm loop (`Engine::confirm_sub_apply_current`
+/// et al.) can decide, one keystroke at a time, which candidates actually
+/// get folded into the result.
+#[allow(clippy::too_many_arguments)]
+fn collect_confirm_candidates(
+    body: &str,
+    line_starts: &[usize],
+    first_line: usize,
+    last_line: usize,
+    compiled: &vim_regex::Compiled,
+    global: bool,
+    repl: &str,
+) -> Vec<ConfirmSubMatch> {
+    let line_of = |b: usize| match line_starts.binary_search(&b) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    };
+    let mut matches = Vec::new();
+    let mut at = line_starts[first_line];
+    let mut done_lines: Vec<usize> = Vec::new();
+    let mut last_line = last_line;
+    while at <= body.len() {
+        let Some(caps) = compiled.captures_at(body, at) else {
+            break;
+        };
+        let whole = caps.get(0).expect("group 0 always matches");
+        let (mstart, mend) = compiled.span(&caps);
+        let sline = line_of(mstart);
+        if sline > last_line {
+            break;
+        }
+        let skip_to_next_line = |at: &mut usize| -> bool {
+            match line_starts.get(sline + 1) {
+                Some(&next) => {
+                    *at = next;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !global && done_lines.last() == Some(&sline) {
+            if skip_to_next_line(&mut at) {
+                continue;
+            }
+            break;
+        }
+        let at_eol = mend == body.len() || body.as_bytes()[mend] == b'\n';
+        if mstart == mend && at_eol && done_lines.last() == Some(&sline) {
+            if skip_to_next_line(&mut at) {
+                continue;
+            }
+            break;
+        }
+
+        let rendered = expand_replacement(repl, &caps, &compiled.group_map, &body[mstart..mend]);
+        let eline = line_of(mend);
+        if eline > sline {
+            last_line = last_line.saturating_sub(eline - sline);
+        } else if done_lines.last() != Some(&sline) {
+            done_lines.push(sline);
+        }
+        let line_start = line_starts[sline];
+        let scol = body[line_start..mstart].chars().count();
+        matches.push(ConfirmSubMatch {
+            mstart,
+            mend,
+            sline,
+            eline,
+            scol,
+            rendered,
+        });
+
+        at = if whole.end() > whole.start() {
+            whole.end().max(mend)
+        } else {
+            let from = whole.end().max(mend);
+            match body[from..].chars().next() {
+                Some(c) => from + c.len_utf8(),
+                None => from + 1,
+            }
+        };
+        if !global && eline == sline {
+            if let Some(&next) = line_starts.get(eline + 1) {
+                at = at.max(next);
+            } else {
+                break;
+            }
+        }
+    }
+    matches
 }
 
 /// One whitespace run `:retab` rewrote on a line, in char offsets — used to
@@ -5066,6 +7007,26 @@ pub(crate) fn split_set_args(args: &str) -> Vec<String> {
     out
 }
 
+/// Does a single `:set` argument (one entry from [`split_set_args`], or a
+/// whole single-option `:set` line) name `'foldmethod'`/`'foldlevel'`/
+/// `'foldmarker'`/`'foldnestmax'` (either full name or abbreviation)? Used
+/// to skip the `apply_foldlevel` recompute on `:set` lines that have
+/// nothing to do with folding — see the two call sites in
+/// `handle_ex_command` (#1153 review: re-running the indent-fold pass on
+/// every `:set ic` etc. was a needless cost on large files). `'foldmarker'`/
+/// `'foldnestmax'` joined the list in #1159 — changing either one also
+/// needs a recompute, for the same reason as `'foldmethod'`/`'foldlevel'`.
+fn set_arg_touches_folding(arg: &str) -> bool {
+    let arg = arg.trim();
+    let arg = arg.strip_suffix('?').unwrap_or(arg);
+    let arg = arg.strip_suffix('!').unwrap_or(arg);
+    let name = arg.split('=').next().unwrap_or(arg);
+    matches!(
+        name,
+        "foldmethod" | "fdm" | "foldlevel" | "fdl" | "foldmarker" | "fmr" | "foldnestmax" | "fdn"
+    )
+}
+
 /// One parsed `/` or `?` command line.
 pub(crate) struct SearchCmdline {
     /// The Vim pattern, empty when the user typed `//` or a bare `/`.
@@ -5164,4 +7125,31 @@ fn reg_type_letter(ty: RegType) -> &'static str {
         RegType::Linewise => "l",
         RegType::Blockwise => "b",
     }
+}
+
+/// Validate and materialize the persisted-string keymap entries for a
+/// vim-style `:{cmd} {lhs} {rhs}` definition, one per targeted mode.
+///
+/// Returns `None` if `lhs`/`rhs` don't form a valid mapping (empty, or an
+/// `{rhs}` that fails key-notation parsing). Reuses [`parse_keymap_def`] as
+/// the single source of truth for validity, so a `:nnoremap` definition and a
+/// hand-edited `settings.json` line can never disagree about what's valid
+/// (#1151).
+fn build_keymap_entries(
+    lhs: &str,
+    rhs: &str,
+    modes: &[&str],
+    noremap: bool,
+) -> Option<Vec<String>> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return None;
+    }
+    let bang = if noremap { "!" } else { "" };
+    let mut entries = Vec::with_capacity(modes.len());
+    for m in modes {
+        let entry = format!("{m}{bang} {lhs} {rhs}");
+        parse_keymap_def(&entry)?;
+        entries.push(entry);
+    }
+    Some(entries)
 }

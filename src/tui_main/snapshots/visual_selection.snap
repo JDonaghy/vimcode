@@ -1,10 +1,11 @@
 ---
 source: src/tui_main/render_impl.rs
+assertion_line: 2348
 expression: "lines.join(\"\\n\")"
 ---
      [No Name] ×                                   󰤲    ⋯
 
-     select this text                               ⠛⠛⠙⠚⠛⠃⠛⠛
+     select this text                              ⠛⠋⠛⠚⠙⠓⠉⠉
      and this too
 
 
@@ -12,4 +13,4 @@ expression: "lines.join(\"\\n\")"
 
 
 
-     VISUAL  [No Name]  LF Spaces: 4  Ln 1, Col 11
+     VISUAL  [No Name]   󰘖 utf-8 LF Spaces: 4  Ln 1, Col 11
