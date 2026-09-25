@@ -5907,7 +5907,11 @@ pub use source_control::{
     SC_SECTION_WORKTREES,
 };
 mod spell_ops;
-mod terminal_ops;
+// `pub(crate)` (rather than plain `mod`) so black-box tests outside `engine`
+// (`src/tui_main/shell_app.rs`) can reach `terminal_ops::install_exit_code_path`
+// to set up a stale leftover scratch file for the #1396 review's
+// invalidate-on-new-run regression test.
+pub(crate) mod terminal_ops;
 mod visual;
 mod vscode;
 mod windows;
