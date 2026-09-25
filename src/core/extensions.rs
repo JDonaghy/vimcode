@@ -118,18 +118,116 @@ pub struct BoardProviderConfig {
     /// Seconds between automatic background refreshes.
     #[serde(default = "default_board_poll_interval_secs")]
     pub poll_interval_secs: u64,
-    /// Maps a `quadraui::BoardAction` variant name (e.g. `"OpenIssue"`,
-    /// `"OpenReview"`) to an argv template to run when that action fires.
-    /// The literal token `{id}` in any argument is replaced with the
-    /// acted-on card id at dispatch time. Actions with no entry here are
-    /// simply not runnable — the panel host should no-op rather than
-    /// error.
+    /// Named, provider-declared actions a card can be dispatched through
+    /// (#523) — the context menu's contents, a stage keybinding table, and
+    /// (via [`Self::action_by_name`]) the target of `quadraui::BoardAction`
+    /// variants like `OpenIssue`/`OpenReview` that need somewhere to
+    /// dispatch to. Generic on purpose, same spirit as the rest of this
+    /// struct: a name like `"assign"` or `"test-pass"` is whatever the
+    /// provider calls it, never a fixed enum — vimcode's `src/core/` must
+    /// never contain a specific provider's action vocabulary, see
+    /// `crate::core::tool_client`'s module doc.
     #[serde(default)]
-    pub actions: std::collections::HashMap<String, Vec<String>>,
+    pub actions: Vec<BoardActionDef>,
+    /// Argv to run periodically as an opt-in freshness nudge (#523) — for a
+    /// daemon-less provider whose pipeline only advances when some external
+    /// "notify" command runs, so it doesn't stall just because vimcode is
+    /// the only client with the board open. Empty (the default) means the
+    /// provider doesn't need/support this; fire-and-forget either way
+    /// (stdout discarded, only "did it run" matters) and gated on
+    /// `Settings::board_tick_enabled`, which defaults **off** — a passive
+    /// viewer must not silently dispatch metered work.
+    #[serde(default)]
+    pub tick_command: Vec<String>,
+    /// Seconds between automatic `tick_command` runs, when enabled.
+    /// Independent of `poll_interval_secs` (which governs board *reads*,
+    /// always on when a provider is configured) — this is typically much
+    /// longer, since it's a background nudge to an external pipeline, not
+    /// a refresh.
+    #[serde(default = "default_board_tick_interval_secs")]
+    pub tick_interval_secs: u64,
 }
 
 fn default_board_poll_interval_secs() -> u64 {
     30
+}
+
+fn default_board_tick_interval_secs() -> u64 {
+    300
+}
+
+/// One provider-declared, named board action (#523) — e.g. "dispatch this
+/// card's work", "record a Test verdict", "merge". The provider names it,
+/// declares which stages (columns) it's valid in, an optional single-key
+/// binding, whether firing it needs confirmation, and the argv to run.
+///
+/// Generic on purpose, same spirit as [`BoardProviderConfig`] itself — a
+/// pipeline-management bundle might declare one named `"assign"` running
+/// its own dispatch command, but nothing here knows that; any provider's
+/// manifest can declare any action name.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+pub struct BoardActionDef {
+    /// Unique (within this provider) action name. Used as the context-menu
+    /// item's identity and the dialog/status-line label fallback.
+    pub name: String,
+    /// Human-readable label shown in the context menu / confirmation
+    /// dialog / result banner. Falls back to `name` when empty — see
+    /// [`Self::display_label`].
+    #[serde(default)]
+    pub label: String,
+    /// Argv template to run. The literal token `{id}` in any argument is
+    /// replaced with the acted-on card id at dispatch time (see
+    /// [`Self::resolve_argv`]). An action with an empty `command` is
+    /// declared-but-not-runnable — callers no-op rather than error, same
+    /// convention `DocumentProviderConfig`'s empty-template case uses.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Column (stage) ids this action is valid for, e.g. `["col:test"]`.
+    /// Empty means "valid in every stage" — most actions (assign, drop to
+    /// backlog) aren't stage-specific; a Test-only verdict action would set
+    /// this.
+    #[serde(default)]
+    pub stages: Vec<String>,
+    /// Optional single-key binding while the Board panel has focus and a
+    /// card matching one of `stages` is selected — single-letter
+    /// Test-verdict keys (e.g. `P`/`S`/`F`) are a common example.
+    /// `None` means menu-only (no keyboard shortcut).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Whether firing this action must be confirmed (a Yes/No dialog)
+    /// before it runs — irreversible or metered actions (dispatch work,
+    /// merge) should set this; read-only or idempotent ones don't need to.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+impl BoardActionDef {
+    /// `label` if set, otherwise `name` — every action has *something*
+    /// presentable without every provider having to repeat `name` as
+    /// `label` verbatim.
+    pub fn display_label(&self) -> &str {
+        if self.label.is_empty() {
+            &self.name
+        } else {
+            &self.label
+        }
+    }
+
+    /// Resolve the argv to run against `card_id`, substituting `{id}` in
+    /// every argument. Empty when `command` is empty — see the field's own
+    /// doc for why that's "not runnable", not an error.
+    pub fn resolve_argv(&self, card_id: &str) -> Vec<String> {
+        self.command
+            .iter()
+            .map(|arg| arg.replace("{id}", card_id))
+            .collect()
+    }
+
+    /// Whether this action is declared valid for `stage_id` — an empty
+    /// `stages` list means "every stage".
+    fn valid_for_stage(&self, stage_id: &str) -> bool {
+        self.stages.is_empty() || self.stages.iter().any(|s| s == stage_id)
+    }
 }
 
 /// Declares an extension as a document provider (#524, Phase 1): its
@@ -201,22 +299,29 @@ impl DocumentProviderConfig {
 }
 
 impl BoardProviderConfig {
-    /// Resolve the argv to run for `action_name` (a `quadraui::BoardAction`
-    /// variant name) against `card_id`, substituting `{id}` in every
-    /// argument. Returns `None` if this provider declared no command for
-    /// that action, or if it declared one as an explicit empty array
-    /// (equivalent to "not runnable").
-    pub fn action_argv(&self, action_name: &str, card_id: &str) -> Option<Vec<String>> {
-        let template = self.actions.get(action_name)?;
-        if template.is_empty() {
-            return None;
-        }
-        Some(
-            template
-                .iter()
-                .map(|arg| arg.replace("{id}", card_id))
-                .collect(),
-        )
+    /// Find a declared action by name — `None` if this provider declared
+    /// none by that name (or no `[board]` actions at all).
+    pub fn action_by_name(&self, name: &str) -> Option<&BoardActionDef> {
+        self.actions.iter().find(|a| a.name == name)
+    }
+
+    /// Every declared action valid for `stage_id` (a column id) — the
+    /// context menu's contents (#523: "listing the actions the provider
+    /// declares as valid for that card's stage").
+    pub fn actions_for_stage(&self, stage_id: &str) -> Vec<&BoardActionDef> {
+        self.actions
+            .iter()
+            .filter(|a| a.valid_for_stage(stage_id))
+            .collect()
+    }
+
+    /// The declared action bound to `key`, if any, and valid for
+    /// `stage_id` — a stage keybinding lookup (#523's single-key verdict
+    /// bindings, e.g. `P`/`S`/`F`).
+    pub fn action_for_key(&self, key: &str, stage_id: &str) -> Option<&BoardActionDef> {
+        self.actions
+            .iter()
+            .find(|a| a.key.as_deref() == Some(key) && a.valid_for_stage(stage_id))
     }
 }
 
@@ -847,8 +952,17 @@ display_name = "Example Board Provider"
 refresh_command = ["example-tool", "board", "--json"]
 poll_interval_secs = 15
 
-[board.actions]
-OpenIssue = ["example-tool", "open", "{id}"]
+[[board.actions]]
+name = "OpenIssue"
+command = ["example-tool", "open", "{id}"]
+
+[[board.actions]]
+name = "merge"
+label = "Merge"
+command = ["example-tool", "merge", "{id}"]
+stages = ["col:review"]
+key = "m"
+confirm = true
 "#;
         let m = ExtensionManifest::parse(toml).expect("should parse");
         let board = m.board.expect("board provider config should be present");
@@ -858,14 +972,35 @@ OpenIssue = ["example-tool", "open", "{id}"]
         );
         assert_eq!(board.poll_interval_secs, 15);
         assert_eq!(
-            board.action_argv("OpenIssue", "card:42"),
+            board
+                .action_by_name("OpenIssue")
+                .map(|a| a.resolve_argv("card:42")),
             Some(vec![
                 "example-tool".to_string(),
                 "open".to_string(),
                 "card:42".to_string()
             ])
         );
-        assert_eq!(board.action_argv("Merge", "card:42"), None);
+        assert_eq!(board.action_by_name("merge_typo"), None);
+
+        let merge = board.action_by_name("merge").expect("merge declared");
+        assert_eq!(merge.display_label(), "Merge");
+        assert!(merge.confirm);
+        assert_eq!(merge.key.as_deref(), Some("m"));
+        assert_eq!(
+            board.action_for_key("m", "col:review").map(|a| &a.name),
+            Some(&"merge".to_string())
+        );
+        assert_eq!(board.action_for_key("m", "col:backlog"), None);
+        assert_eq!(
+            board
+                .actions_for_stage("col:backlog")
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OpenIssue"],
+            "an action with no declared `stages` is valid everywhere"
+        );
     }
 
     #[test]

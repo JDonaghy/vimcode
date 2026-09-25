@@ -1,6 +1,101 @@
 # VimCode Project State
 
-**Last updated:** September 24, 2026 (#524, Track A Phase 1 — provider
+**Last updated:** September 24, 2026 (#523, Track A Phase 0b — wire Board
+actions to provider-declared commands, on top of #521/#522's generic Board
+host and #524's document buffers). Makes the board actionable: right-click
+(or a provider-declared stage keybinding) runs a provider-declared named
+action against a card, with confirmation for irreversible/metered actions
+and results surfaced to the status line — all through the #522 seam, with
+**no coordinator vocabulary anywhere in `src/core/`**
+(`tests/no_coord_vocabulary_in_core.rs` still passes).
+
+`src/core/extensions.rs`: `BoardProviderConfig::actions` changed from
+`HashMap<String, Vec<String>>` (unused in production — #521/#522 shipped it
+as the seam, #523 is the first consumer) to `Vec<BoardActionDef>` — each
+entry names an action, an argv `command` (`{id}` substituted), the `stages`
+(column ids) it's valid in (empty = every stage), an optional single-key
+`key` binding, and a `confirm` flag. New `BoardProviderConfig::action_by_
+name`/`actions_for_stage`/`action_for_key` lookups replace the old
+`action_argv`. Also gained opt-in freshness: `tick_command`/
+`tick_interval_secs` — a fire-and-forget nudge for a daemon-less provider's
+pipeline, run only when `Settings::board_tick_enabled` (new, **default
+off** — a passive viewer must not silently dispatch metered work) is set.
+
+`src/core/engine/board_ops.rs`: `open_board_context_menu(card_id, x, y)`
+lists the provider's declared actions valid for the card's current stage
+(its column) through the *existing* generic `Engine::context_menu`/
+`ContextMenuState` machinery already used by Explorer/Tab/Editor — a new
+`ContextMenuTarget::Board { card_id }` variant, no bespoke menu widget.
+`run_board_action_by_name(name, card_id)` resolves the argv and either
+dispatches immediately (`dispatch_board_action_command` — background
+thread via the same `ToolClient` seam `board_refresh` uses,
+`poll_board_action` surfaces exit status/stdout to `Engine::message` and
+triggers a fresh `board_refresh`) or, when the provider marked the action
+`confirm`, opens a Yes/No dialog first via the existing generic
+`show_dialog`/`process_dialog_result` machinery (new `"confirm_board_
+action"` tag, new `PendingBoardAction` engine field) — reusing established
+infra end-to-end rather than building a parallel one, per the Platform-
+Neutrality Rule. `dispatch_board_key_unified` checks a provider-declared
+stage keybinding (the coord-tui-parity `P`/`S`/`F` style) *before* falling
+to `quadraui::BoardModel::handle_key`'s generic nav, so a provider is free
+to bind letters `handle_key` doesn't already claim. `OpenIssue`/
+`OpenReview` (`quadraui::BoardAction` variants) now fall back to a
+provider-declared action of the same name when no more specific handling
+applies (a `[document]` provider still wins for `OpenIssue`, #524) —
+`apply_board_action`'s `ContextMenu` arm stays a no-op, since nothing in
+quadraui's `Board` primitive constructs that variant itself (no mouse
+handler on `BoardModel`, unlike `TreeController`); right-click resolves the
+card straight from the cached `BoardLayout` at the click site instead.
+`tick_board_provider_freshness` (new, called unconditionally from
+`poll_idle`, *not* gated on the Board panel being visible — the opposite of
+`tick_board`'s read-refresh cadence) fires `tick_command` on its own
+interval when enabled.
+
+**Backends** — GTK's `App::route_board_sidebar_event` and TUI's
+`mouse::handle_mouse` (`SidebarOwner::Board` right-click arm) both do the
+same 1-3 lines: resolve the right-clicked card via new `render::
+board_right_click_card` (mirrors `route_board_click`'s hit-test), convert
+pixel→cell (GTK only — TUI's board paints in cell units already, same
+asymmetry `handle_tab_right_click`/`handle_editor_right_click` already
+have), call `Engine::open_board_context_menu`. Confirming a menu item
+(Enter, or a click) reuses the *existing* generic `route_modal_key`/
+`ContextMenuRoute` machinery unchanged — no new backend wiring needed for
+that half, since `ContextMenuTarget::Board`'s dispatch is entirely engine-
+side (`context_menu_confirm`'s new match arm in `windows.rs`).
+
+**Settings**: new `board_tick_enabled: bool` (`Settings`, default off, no
+vim-abbreviation precedent) wired through `get_value_str`/`set_value_str`
+and a new `SettingDef` (Workspace category, "Board Auto-Tick") so it's
+toggleable from the Settings sidebar or `:set board_tick_enabled=true`.
+
+**Tests**: extensive `board_ops.rs` unit coverage (context-menu contents
+filtered by stage, dispatch + confirm + cancel + result-surfacing, stage
+keybinding dispatch falling back to nav on an unbound key, `OpenIssue`/
+`OpenReview` provider-action fallback, freshness-tick default-off/enabled/
+interval-respecting/no-tick-command cases) using the new `RecordingToolClient`-
+based assertions (argv sent, not just "something ran"). Driver-tier black-
+box coverage on both backends — TUI (`tui_main/shell_app.rs`, `TuiDriver`:
+`board_right_click_opens_context_menu_with_provider_actions_via_shell_app`,
+`board_context_menu_action_dispatches_provider_command_via_shell_app`, the
+latter using `driver.tick()`/`poll_until_screen` to reach `Engine::poll_
+board_action` exactly as the live loop does) and GTK (`gtk/testing.rs`,
+`GtkDriver`: same two scenarios, polling `Engine::poll_board_action`
+directly since the harness keeps a live `Rc<RefCell<Engine>>`) — a real
+right-click through the actual event-dispatch pipeline opens the menu
+(asserted on painted text, not `Engine::context_menu.is_some()`,
+#587/#592's lesson) and a real Enter-confirm dispatches the provider's argv
+end-to-end with a mock provider, proving no coordinator is needed to
+exercise the path (#523's acceptance bar). All four new driver tests
+RED-verified (temporarily short-circuited `open_board_context_menu`,
+confirmed both fail, restored). `cargo build`/`clippy -D warnings`/`fmt`
+clean on both feature lanes.
+
+Out of scope (per the issue): the coordinator extension bundle itself (the
+parity-matrix mapping of `assign`/`test`/`pr`/`merge`/`backlog` to real
+`coord` argv) — this ships the generic dispatch mechanism only, provable
+end-to-end with a mock provider.
+
+Prior update: September 24, 2026 (#524, Track A Phase 1 — provider
 document buffers, on top of #521/#522's generic Board host). Author/refine
 a provider's documents (e.g. a GitHub issue) as real markdown buffers,
 push edits back on `:w`, with **no coordinator vocabulary anywhere in

@@ -3736,6 +3736,7 @@ mod sidebar_panel_clicks {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
             actions: Default::default(),
+            ..Default::default()
         });
         engine
             .extension_state
@@ -3924,6 +3925,161 @@ mod sidebar_panel_clicks {
              seeded document title, not just set a status message; \
              painted: {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    /// #523 acceptance: right-clicking a card lists the provider-declared
+    /// actions valid for its stage in a real context menu, driven through
+    /// the actual right-click event path
+    /// (`App::route_board_sidebar_event`'s `MouseButton::Right` arm ->
+    /// `Engine::open_board_context_menu`), not by poking
+    /// `Engine::context_menu` directly. Asserted on the *painted* menu, not
+    /// on `Engine::context_menu.is_some()` (#587/#592's lesson).
+    #[test]
+    fn board_right_click_opens_context_menu_with_provider_actions() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        install_mock_board_provider(&mut engine);
+        if let Some(registry) = engine.ext_registry.as_mut() {
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        engine.board_model = Some(mock_board_model());
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut h = harness(engine, 1400, 900);
+        let layout = h
+            .engine
+            .borrow()
+            .board_layout
+            .borrow()
+            .clone()
+            .expect("draw_board must have cached a layout for click hit-testing");
+        let card = layout.columns[0]
+            .cards
+            .iter()
+            .find(|c| c.id.as_str() == "card:1")
+            .expect("the seeded card must have a resolved layout");
+        let cx = card.bounds.x + card.bounds.width / 2.0;
+        let cy = card.bounds.y + card.bounds.height / 2.0;
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: Point::new(cx, cy),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Assign"),
+            "right-clicking a card should open a context menu listing the \
+             provider's declared action for its stage; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #523 acceptance, continued: confirming a menu item (Enter — the
+    /// generic context-menu key route `render::route_modal_key` gives
+    /// priority over every focus-owner route) dispatches the provider's
+    /// argv (`{id}` substituted) and surfaces the result to the status
+    /// line, then a background refresh is kicked off. Proven end-to-end
+    /// with a mock provider — no coordinator (or any other specific
+    /// provider) anywhere, per #521/#522/#523's "generic host" scope.
+    #[test]
+    fn board_context_menu_action_dispatches_provider_command() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        install_mock_board_provider(&mut engine);
+        if let Some(registry) = engine.ext_registry.as_mut() {
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        engine.board_model = Some(mock_board_model());
+        let recorder = crate::core::tool_client::RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut h = harness(engine, 1400, 900);
+        let layout = h
+            .engine
+            .borrow()
+            .board_layout
+            .borrow()
+            .clone()
+            .expect("draw_board must have cached a layout for click hit-testing");
+        let card = layout.columns[0]
+            .cards
+            .iter()
+            .find(|c| c.id.as_str() == "card:1")
+            .expect("the seeded card must have a resolved layout");
+        let cx = card.bounds.x + card.bounds.width / 2.0;
+        let cy = card.bounds.y + card.bounds.height / 2.0;
+
+        h.driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: Point::new(cx, cy),
+            modifiers: quadraui::Modifiers::default(),
+        });
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Assign"),
+            "precondition: the context menu must be open"
+        );
+
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        // The mock client runs synchronously on a background thread but the
+        // channel send still has to be observed; poll until it lands —
+        // mirrors `board_ops.rs`'s own `wait_for_board_action` test helper.
+        let mut tries = 0;
+        while !h.engine.borrow_mut().poll_board_action() {
+            tries += 1;
+            assert!(tries < 1000, "board action never completed");
+            std::thread::yield_now();
+        }
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("'Assign'"),
+            "the dispatched action's result must be surfaced to the status \
+             line, not just recorded internally; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        // Two calls land on the recorder: the action dispatch itself, plus
+        // the `board_refresh()` `poll_board_action` triggers afterward
+        // (#523's "board refreshed on next poll") — both go through the
+        // same `Engine::board_client`, so this asserts the dispatch call
+        // specifically rather than assuming it's the only one.
+        let calls = recorder.calls();
+        assert!(
+            calls.iter().any(|c| c.argv
+                == vec![
+                    "mock".to_string(),
+                    "assign".to_string(),
+                    "card:1".to_string()
+                ]),
+            "'{{id}}' must be substituted with the acted-on card's id; calls: {calls:?}"
         );
     }
 
