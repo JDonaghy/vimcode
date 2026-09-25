@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use super::dap::DapServer;
 use super::extensions;
+use super::extensions::Platform;
+use super::tool_acquire::Arch;
 
 // ---------------------------------------------------------------------------
 // Built-in adapter registry
@@ -252,20 +254,34 @@ fn codelldb_install_cmd() -> String {
 
 #[cfg(not(target_os = "windows"))]
 fn codelldb_install_cmd() -> String {
-    // VS Code arch names: x86_64 → x64, aarch64 → arm64
-    let arch = if std::env::consts::ARCH == "aarch64" {
-        "arm64"
-    } else {
-        "x64"
+    codelldb_install_cmd_for(Platform::host(), Arch::host())
+}
+
+/// Build the non-Windows codelldb install command for an explicit
+/// platform/arch rather than always resolving against the host (#1395
+/// testable seam, following the `install_cmd_for(Platform)` pattern in
+/// `extensions.rs`, #919). Only `Platform::Linux` and `Platform::MacOS` are
+/// meaningful here — Windows uses the entirely separate PowerShell-based
+/// `codelldb_install_cmd()` above — but the function accepts any `Platform`
+/// and defaults to the Linux naming for anything that isn't `MacOS`.
+#[cfg(not(target_os = "windows"))]
+fn codelldb_install_cmd_for(platform: Platform, arch: Arch) -> String {
+    // VS Code arch names: amd64 → x64, arm64 → arm64
+    let arch = match arch {
+        Arch::Arm64 => "arm64",
+        Arch::Amd64 => "x64",
     };
-    // VS Code OS names: macos → darwin, linux → linux
-    let os = if std::env::consts::OS == "macos" {
-        "darwin"
-    } else {
-        "linux"
+    // VS Code OS names, and the shared-library extension the VSIX ships for
+    // that OS: macos → darwin/.dylib, linux → linux/.so. The darwin VSIX
+    // ships `liblldb.dylib` / `libpython312.dylib`, not `.so` — using the
+    // Linux names there makes `unzip` exit 11 ("filename not matched") and
+    // silently aborts the whole `&&` chain before anything is installed.
+    let (os, lib_ext) = match platform {
+        Platform::MacOS => ("darwin", "dylib"),
+        _ => ("linux", "so"),
     };
     // Extract to an absolute temp dir (no `cd` needed).
-    // codelldb requires its liblldb.so, lldb-server (for process launching on
+    // codelldb requires its liblldb, lldb-server (for process launching on
     // Linux), and the lldb Python bindings at ~/.local/lldb/ (the path baked
     // into the binary at compile time).
     format!(
@@ -275,8 +291,8 @@ fn codelldb_install_cmd() -> String {
            'extension/adapter/codelldb' \
            'extension/adapter/scripts/*' \
            'extension/lldb/bin/*' \
-           'extension/lldb/lib/liblldb.so' \
-           'extension/lldb/lib/libpython312.so' \
+           'extension/lldb/lib/liblldb.{lib_ext}' \
+           'extension/lldb/lib/libpython312.{lib_ext}' \
            'extension/lldb/lib/python3.12/*' \
            'extension/lldb/lib/lldb-python/*' \
            -d /tmp/vimcode-codelldb && \
@@ -287,8 +303,8 @@ fn codelldb_install_cmd() -> String {
          cp /tmp/vimcode-codelldb/extension/adapter/codelldb \"$HOME/.local/bin/codelldb\" && \
          cp -r /tmp/vimcode-codelldb/extension/adapter/scripts/. \"$HOME/.local/bin/scripts/\" && \
          cp -r /tmp/vimcode-codelldb/extension/lldb/bin/. \"$HOME/.local/lldb/bin/\" && \
-         cp /tmp/vimcode-codelldb/extension/lldb/lib/liblldb.so \"$HOME/.local/lldb/lib/liblldb.so\" && \
-         cp /tmp/vimcode-codelldb/extension/lldb/lib/libpython312.so \"$HOME/.local/lldb/lib/libpython312.so\" && \
+         cp /tmp/vimcode-codelldb/extension/lldb/lib/liblldb.{lib_ext} \"$HOME/.local/lldb/lib/liblldb.{lib_ext}\" && \
+         cp /tmp/vimcode-codelldb/extension/lldb/lib/libpython312.{lib_ext} \"$HOME/.local/lldb/lib/libpython312.{lib_ext}\" && \
          cp -r /tmp/vimcode-codelldb/extension/lldb/lib/python3.12 \"$HOME/.local/lldb/lib/\" && \
          cp -r /tmp/vimcode-codelldb/extension/lldb/lib/lldb-python/lldb \"$HOME/.local/lldb/lib/python3.12/\" && \
          chmod +x \"$HOME/.local/bin/codelldb\" \"$HOME/.local/lldb/bin/\"*"
@@ -963,6 +979,55 @@ mod tests {
         assert!(
             cmd.contains("vadimcn/codelldb"),
             "install cmd should reference the codelldb GitHub repo: {cmd}"
+        );
+    }
+
+    // #1395: the darwin codelldb VSIX ships `liblldb.dylib` /
+    // `libpython312.dylib`, not `.so`. Using the Linux `.so` names there made
+    // `unzip` exit 11 ("filename not matched"), aborting the `&&` chain
+    // before `~/.local/bin/codelldb` was ever written — the rust/cpp DAP leg
+    // silently never installed on macOS.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_codelldb_install_cmd_darwin_uses_dylib_names() {
+        let cmd = codelldb_install_cmd_for(Platform::MacOS, Arch::Arm64);
+        assert!(
+            cmd.contains("liblldb.dylib"),
+            "darwin install cmd should reference liblldb.dylib: {cmd}"
+        );
+        assert!(
+            cmd.contains("libpython312.dylib"),
+            "darwin install cmd should reference libpython312.dylib: {cmd}"
+        );
+        assert!(
+            !cmd.contains(".so"),
+            "darwin install cmd must not reference any .so library: {cmd}"
+        );
+        assert!(
+            cmd.contains("codelldb-darwin-arm64.vsix"),
+            "darwin/arm64 install cmd should reference the darwin-arm64 asset: {cmd}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn test_codelldb_install_cmd_linux_unchanged() {
+        let cmd = codelldb_install_cmd_for(Platform::Linux, Arch::Amd64);
+        assert!(
+            cmd.contains("liblldb.so"),
+            "linux install cmd should reference liblldb.so: {cmd}"
+        );
+        assert!(
+            cmd.contains("libpython312.so"),
+            "linux install cmd should reference libpython312.so: {cmd}"
+        );
+        assert!(
+            !cmd.contains(".dylib"),
+            "linux install cmd must not reference any .dylib library: {cmd}"
+        );
+        assert!(
+            cmd.contains("codelldb-linux-x64.vsix"),
+            "linux/amd64 install cmd should reference the linux-x64 asset: {cmd}"
         );
     }
 
