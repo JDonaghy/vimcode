@@ -56,6 +56,34 @@ use crate::core::tool_client::{self, ToolError};
 /// `type_complexity` lint).
 pub type BoardActionResult = (String, Result<Vec<u8>, ToolError>);
 
+/// Block until `ready()` observes the result of a backgrounded provider
+/// command, or fail the test after a generous wall-clock deadline.
+///
+/// Every board command (`board_refresh`, action dispatch, freshness tick)
+/// runs on a real `std::thread`, so a test that wants to see its result has
+/// to wait for the OS to schedule that thread. A bounded spin on
+/// `yield_now()` — what these tests used to do — is **not** a wait: with
+/// nothing else runnable on this core, 1000 yields retire in microseconds
+/// and the loop gives up long before the spawned thread has run at all.
+/// That made the suite pass on an idle machine and fail under the
+/// coordinator's parallel load, which is exactly how these tests were
+/// reported broken. Sleep between attempts and bound by *time*, not by
+/// iteration count, so the wait scales with how busy the box is.
+#[cfg(test)]
+pub(crate) fn wait_for_provider_command(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if ready() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never completed within 30s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 impl Engine {
     /// The first installed extension that declares a `[board]` provider, if
     /// any. "First" rather than "the only one" — nothing here assumes a
@@ -646,12 +674,7 @@ mod tests {
 
         // The mock client runs synchronously on a background thread but the
         // channel send still has to be observed; poll until it lands.
-        let mut tries = 0;
-        while !engine.poll_board() {
-            tries += 1;
-            assert!(tries < 1000, "mock refresh never completed");
-            std::thread::yield_now();
-        }
+        wait_for_provider_command("mock refresh", || engine.poll_board());
         assert!(!engine.board_fetching);
         let model = engine.board_model.as_ref().expect("model populated");
         assert_eq!(model.columns.len(), 1);
@@ -685,12 +708,7 @@ mod tests {
         ))));
 
         engine.board_refresh();
-        let mut tries = 0;
-        while !engine.poll_board() {
-            tries += 1;
-            assert!(tries < 1000, "mock refresh never completed");
-            std::thread::yield_now();
-        }
+        wait_for_provider_command("mock refresh", || engine.poll_board());
         assert!(engine.board_model.is_none());
         assert!(engine
             .board_error
@@ -1006,12 +1024,7 @@ mod tests {
     /// `board_refresh_with_mock_provider_populates_model`'s own poll loop
     /// (the background thread's send still has to be observed).
     fn wait_for_board_action(engine: &mut Engine) {
-        let mut tries = 0;
-        while !engine.poll_board_action() {
-            tries += 1;
-            assert!(tries < 1000, "board action never completed");
-            std::thread::yield_now();
-        }
+        wait_for_provider_command("board action", || engine.poll_board_action());
     }
 
     fn dispatch_action(name: &str, command: Vec<&str>) -> BoardActionDef {
@@ -1377,16 +1390,11 @@ mod tests {
         engine.ext_registry = Some(vec![manifest]);
     }
 
-    /// Poll until the recorder has observed at least one call — there is no
+    /// Wait until the recorder has observed at least one call — there is no
     /// channel/receiver for a tick (it's genuinely fire-and-forget), so this
-    /// spins on the recorder itself rather than an `Engine::poll_*` method.
+    /// waits on the recorder itself rather than an `Engine::poll_*` method.
     fn wait_for_recorded_call(recorder: &RecordingToolClient) {
-        let mut tries = 0;
-        while recorder.calls().is_empty() {
-            tries += 1;
-            assert!(tries < 1000, "tick command never ran");
-            std::thread::yield_now();
-        }
+        wait_for_provider_command("tick command", || !recorder.calls().is_empty());
     }
 
     #[test]
