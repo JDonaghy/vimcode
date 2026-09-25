@@ -23,11 +23,14 @@ pub(super) fn render_activity_bar(
 ///
 /// #766/#607: reached only via `render_sidebar_content` below.
 ///
-/// #1242: background fill + no-chrome carve go through
-/// `render::paint_sidebar_panel_chrome` (quadraui#1041's `SidebarPanelBody`).
-/// GTK's `PANEL_EXPLORER` arm uses the same call with `background: None`
-/// (unchanged behaviour there); see `paint_sidebar_panel_chrome`'s doc for
-/// why the `TreeController` body itself stays a direct call.
+/// #1389: background fill + no-chrome carve + the `TreeController` body
+/// itself all go through `SidebarPanelBody::render_with` (quadraui#1059) in
+/// a single call — `render_with` takes the body as a plain closure with no
+/// `Send + 'static` bound, so the `!Send`, `Rc<RefCell<_>>`-backed
+/// `TreeController` on `Engine` can be the body directly instead of the
+/// hand-copied `render::paint_sidebar_panel_chrome` split #1242 needed
+/// before #1059 existed. GTK's `PANEL_EXPLORER` arm uses the same call with
+/// `background: None` (unchanged behaviour there).
 pub(super) fn render_explorer_sidebar_content(
     backend: &mut dyn quadraui::Backend,
     area: Rect,
@@ -51,18 +54,13 @@ pub(super) fn render_explorer_sidebar_content(
         chrome: render::SidebarPanelChrome::None,
         scrollbar_gutter: None,
     };
-    let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_rect);
-
-    engine.explorer_tree_rect.set(layout.body_rect);
-    engine
-        .explorer_viewport_rows
-        .set(layout.body_rect.height as usize);
     render::populate_explorer_tree_controller(engine, theme);
-    backend.set_theme(super::quadraui_tui::q_theme(theme));
-    engine
-        .explorer_tree
-        .borrow()
-        .render(backend, layout.body_rect);
+    let layout = panel.render_with(backend, q_rect, |backend, body_rect| {
+        engine.explorer_tree_rect.set(body_rect);
+        engine.explorer_viewport_rows.set(body_rect.height as usize);
+        backend.set_theme(super::quadraui_tui::q_theme(theme));
+        engine.explorer_tree.borrow().render(backend, body_rect);
+    });
 
     // TreeController.render() draws the scrollbar internally.
     // Register a ScrollSurface for scroll-wheel dispatch only.
@@ -567,14 +565,14 @@ pub(super) fn render_source_control(
 /// Render an extension-provided sidebar panel.
 ///
 /// #1242: background(none), header/search chrome, tree body and scrollbar
-/// gutter compose through quadraui#1041's `SidebarPanelBody::render` — the
-/// only sidebar rung whose body is an *owned* per-frame value
+/// gutter compose through quadraui#1041's `SidebarPanelBody::render` — this
+/// rung's body is an *owned* per-frame value
 /// (`render::ext_panel_to_tree_view`'s fresh `TreeView`, not a persistent
-/// controller), so it's the one that can use the real `&dyn BackendWidget`
-/// path (`render::ExtPanelTreeBody`) rather than
-/// `paint_sidebar_panel_chrome` plus a manual body call. The help-popup
-/// overlay and the scrollbar's own thumb/track paint stay inline — neither
-/// has a `TreeView`/`SidebarPanelBody` equivalent.
+/// controller), so it uses the `&dyn BackendWidget` path
+/// (`render::ExtPanelTreeBody`) rather than `render_with`'s closure form
+/// (`render_explorer_sidebar_content` above, #1389). The help-popup overlay
+/// and the scrollbar's own thumb/track paint stay inline — neither has a
+/// `TreeView`/`SidebarPanelBody` equivalent.
 pub(super) fn render_ext_panel(
     backend: &mut dyn quadraui::Backend,
     screen: &render::ScreenLayout,

@@ -3434,18 +3434,22 @@ impl App {
 
         match active_id.as_str() {
             PANEL_EXPLORER => {
-                // #1242: composed through `render::paint_sidebar_panel_chrome`
-                // (quadraui#1041's `SidebarPanelBody`) — `None`/`None` here
+                // #1389: composed through `SidebarPanelBody::render_with`
+                // (quadraui#1059) in a single call — `None`/`None` here
                 // reproduce this arm's pre-existing "no chrome" behaviour
                 // exactly (`layout.body_rect == q_sb`); TUI's
                 // `panels::render_explorer_sidebar_content` uses the same
-                // composer with `background: Some(tab_bar_bg)`.
+                // composer with `background: Some(tab_bar_bg)`. `render_with`
+                // takes the body as a closure with no `Send + 'static` bound,
+                // so the `!Send`, `Rc<RefCell<_>>`-backed `TreeController` on
+                // `Engine` can be the body directly instead of the
+                // hand-copied `render::paint_sidebar_panel_chrome` split
+                // #1242 needed before #1059 existed.
                 let panel = render::SidebarPanelBody {
                     background: None,
                     chrome: render::SidebarPanelChrome::None,
                     scrollbar_gutter: None,
                 };
-                let layout = render::paint_sidebar_panel_chrome(backend, &panel, q_sb);
                 render::populate_explorer_tree_controller(engine, theme);
                 // Capture the exact metrics the tree is drawn with so the
                 // click hit-test (which reads the backend's mutable
@@ -3453,14 +3457,11 @@ impl App {
                 // re-apply them and resolve the correct row. (#540)
                 self.cached_explorer_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
-                engine.explorer_tree_rect.set(layout.body_rect);
-                engine
-                    .explorer_viewport_rows
-                    .set(layout.body_rect.height as usize);
-                engine
-                    .explorer_tree
-                    .borrow()
-                    .render(backend, layout.body_rect);
+                panel.render_with(backend, q_sb, |backend, body_rect| {
+                    engine.explorer_tree_rect.set(body_rect);
+                    engine.explorer_viewport_rows.set(body_rect.height as usize);
+                    engine.explorer_tree.borrow().render(backend, body_rect);
+                });
             }
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
