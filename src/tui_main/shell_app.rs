@@ -19646,6 +19646,109 @@ mod tests {
         );
     }
 
+    /// #1381: the explorer's filetype glyph must paint in the same colour
+    /// the tab bar uses for that file (`render::tab_icon_color` /
+    /// `icons::file_icon_color_for_name`), not the default foreground — and
+    /// a folder row must stay uncoloured (default fg), proving the colour
+    /// is filetype-specific, not a blanket recolor of every icon cell.
+    ///
+    /// Reads the *painted* icon cell's `fg` via `styled_row` — never engine
+    /// state — per the "rendered output, not state" rule: `Icon.color`
+    /// could be populated on the `TreeRow` while nothing paints it (the
+    /// #587/#592 shape), and a test asserting only that would pass against
+    /// that bug.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Pre-#1381, `build_explorer_tree_rows` builds every file icon with
+    /// `QIcon::new(glyph, ".")` and never calls `.with_color(..)`, so
+    /// `Icon.color` is `None` and quadraui's `draw_tree` paints the glyph
+    /// in the row's `default_fg` — identical to the folder row's fg. The
+    /// `assert_ne!` between the two, and the `assert_eq!` against the tab
+    /// bar's colour, both fail.
+    #[test]
+    fn explorer_file_icon_paints_in_the_tab_bar_s_filetype_colour() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1381_explorer_icon_color_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rust_file = dir.join("main.rs");
+        std::fs::write(&rust_file, "fn main() {}\n").unwrap();
+        let subdir = dir.join("srcdir1381");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let mut app = app_with_sidebar_open();
+        app.engine.cwd = dir.clone();
+        app.engine.explorer_reveal_path(&rust_file);
+        // Read the fixture's own resolved theme before `app` moves into the
+        // driver (see `focus_change_does_not_move_either_panes_text_via_
+        // shell_app`'s doc comment for why: it must match whatever colour
+        // this fixture actually paints with, not a hardcoded theme that
+        // could silently drift from it).
+        let theme = Theme::from_name(&app.engine.settings.colorscheme);
+
+        let driver = driver_with_shell(app, config(), 100, 24);
+        crate::icons::set_nerd_fonts(prev_nf);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let file_bounds = driver
+            .find_bounds("main.rs")
+            .expect("main.rs row should be painted in the explorer");
+        let dir_bounds = driver
+            .find_bounds("srcdir1381")
+            .expect("folder row should be painted in the explorer");
+
+        // Icon layout (`quadraui::tui::draw_tree`): a 1-codepoint glyph
+        // followed by a single space cell immediately precedes the row's
+        // text — both the Rust glyph (`FILE_RUST.nerd`) and the folder
+        // glyph (`FOLDER.nerd`) are single codepoints, so the icon column
+        // is always 2 cells left of where the name text starts.
+        let file_icon_col = file_bounds.x as usize - 2;
+        let dir_icon_col = dir_bounds.x as usize - 2;
+
+        let file_row = driver.styled_row(file_bounds.y as u16);
+        let dir_row = driver.styled_row(dir_bounds.y as u16);
+        let (file_icon_ch, file_icon_style) = file_row[file_icon_col];
+        let (dir_icon_ch, dir_icon_style) = dir_row[dir_icon_col];
+
+        assert_eq!(
+            file_icon_ch,
+            crate::icons::FILE_RUST.nerd.chars().next().unwrap(),
+            "main.rs's icon cell must be the Rust glyph"
+        );
+        assert_eq!(
+            dir_icon_ch,
+            crate::icons::FOLDER.nerd.chars().next().unwrap(),
+            "the folder row's icon cell must be the folder glyph"
+        );
+
+        let (r, g, b) = crate::icons::file_icon_color_for_name("main.rs");
+        let expected_rust_fg = quadraui::tui::ratatui_color(quadraui::Color::from_rgb(r, g, b));
+        let default_fg =
+            quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).foreground);
+
+        assert_eq!(
+            file_icon_style.fg, expected_rust_fg,
+            "main.rs's explorer icon must paint in the same colour the tab \
+             bar uses for a .rs file"
+        );
+        assert_eq!(
+            dir_icon_style.fg, default_fg,
+            "a folder row's icon must stay the default foreground, not a \
+             filetype colour"
+        );
+        assert_ne!(
+            file_icon_style.fg, dir_icon_style.fg,
+            "the coloured file icon and the uncoloured folder icon must be \
+             visibly different, proving the colour is filetype-specific"
+        );
+    }
+
     // ── #1051: explorer paints VS Code's 'U' for untracked, not git's '?' ──
 
     /// The explorer's git-status badge for an untracked file must be VS

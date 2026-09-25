@@ -17935,7 +17935,19 @@ fn build_explorer_tree_rows(
             // and a leading-dot dotfile, so an extension-only lookup can
             // never badge either), falling back to the extension table.
             let glyph = icons::file_icon_for_name(&row.name).to_string();
-            Some(QIcon::new(glyph, ".".to_string()))
+            let file_icon = QIcon::new(glyph, ".".to_string());
+            // #1381: match the tab bar's filetype colour (`build_tab_bar_icons`
+            // / `tab_icon_color`) so the same file gets the same glyph colour
+            // in both places. Gated on Nerd Fonts the same way the tab bar
+            // gates its icons entirely (`build_tab_bar_icons` returns `&[]`
+            // when disabled): with Nerd Fonts off, leave the icon uncoloured
+            // rather than tinting the plain ASCII fallback glyph.
+            let file_icon = if icons::nerd_fonts_enabled() {
+                file_icon.with_color(tab_icon_color(&row.name))
+            } else {
+                file_icon
+            };
+            Some(file_icon)
         };
 
         out.push(TreeRow {
