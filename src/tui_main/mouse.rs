@@ -2000,18 +2000,30 @@ pub(super) fn handle_mouse(
             sidebar.has_focus = true;
             engine.dap_sidebar_has_focus = true;
 
-            if sidebar_row < 2 {
-                // Chrome rows (title + action button). TUI's action-hit
-                // layout is already populated in absolute-column space (`y`
-                // is always `0.0` — a single-row band), unlike GTK's, which
-                // is bar-local and needs its cached rect subtracted first;
-                // `dap_sidebar_action_click_at` takes the already-local
-                // point either way (#754).
-                render::dap_sidebar_action_click_at(engine, col as f32, 0.0);
+            // #1392: which band (chrome vs. body) a press landed in is
+            // resolved against `dap_sidebar_body_rect` — the rect
+            // `render_debug_sidebar` actually painted the body into this
+            // frame — instead of the `sidebar_row < 2` heuristic this used
+            // to be (which assumed the sidebar's chrome always starts at
+            // `menu_rows` and is always exactly 2 rows tall; it silently
+            // disagreed with the real paint whenever something else, e.g. a
+            // tab bar, reserves rows above the sidebar too). GTK's
+            // `route_debug_sidebar_event` gates on the identical `pos.y <
+            // body_rect.y` comparison. `dap_sidebar_action_hits` is
+            // populated straight from `SidebarPanelBodyLayout::
+            // status_bar_hit_regions` in the same absolute column/row space
+            // `col`/`row` are already in, so no per-backend translation is
+            // needed either — unlike GTK, whose `pos` is in pixels rather
+            // than cells but is likewise passed through unmodified.
+            let rect = engine.dap_sidebar_body_rect.get();
+            if (row as f32) < rect.y {
+                render::dap_sidebar_action_click_at(
+                    engine,
+                    quadraui::Point::new(col as f32, row as f32),
+                );
             } else {
                 // Route body click through the shared `SidebarSystem`
                 // dispatch (#754) — same function GTK calls.
-                let rect = engine.dap_sidebar_body_rect.get();
                 let click_event = quadraui::UiEvent::MouseDown {
                     widget: None,
                     button: quadraui::MouseButton::Left,

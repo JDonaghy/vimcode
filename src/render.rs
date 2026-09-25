@@ -7964,21 +7964,22 @@ pub fn dispatch_dap_sidebar_body_event(
 }
 
 /// Resolve a press against the debug sidebar's title + action-button chrome
-/// row, at a point already translated into that row's own local space (`(0,
-/// 0)` at the row's own top-left — `StatusBar::layout`'s own convention).
-/// GTK translates by subtracting its cached `action_rect`'s origin; TUI's
-/// action row already paints at `y == 0` of its own local frame, so its
-/// local point is the raw column. Returns whether a segment was actually
-/// hit — the caller claims the whole chrome row regardless, matching both
-/// backends' pre-#754 behaviour.
-pub fn dap_sidebar_action_click_at(engine: &mut Engine, local_x: f32, local_y: f32) -> bool {
+/// row, given `pos` in the same absolute space `SidebarPanelBody::
+/// render_with` painted the chrome into — i.e. whatever space the `rect`
+/// passed to that call was in (TUI cell coordinates, GTK pixels). Both
+/// backends now store that same space on `Engine::dap_sidebar_action_hits`
+/// (populated straight from `SidebarPanelBodyLayout::status_bar_hit_regions`
+/// — see that field's doc), so there is no per-backend translation step left
+/// here (issue #1392; GTK used to subtract its own separately-cached
+/// `action_rect`'s origin, which is exactly the "paint and click can
+/// disagree" risk the issue called out). Returns whether a segment was
+/// actually hit — the caller claims the whole chrome row regardless,
+/// matching both backends' pre-#754 behaviour.
+pub fn dap_sidebar_action_click_at(engine: &mut Engine, pos: quadraui::Point) -> bool {
     let matched = {
         let hits = engine.dap_sidebar_action_hits.borrow();
-        hits.as_ref().is_some_and(|l| {
-            matches!(
-                l.hit_test(local_x, local_y),
-                quadraui::StatusBarHit::Segment(_)
-            )
+        hits.iter().any(|(rect, hit)| {
+            rect.contains(pos) && matches!(hit, quadraui::StatusBarHit::Segment(_))
         })
     };
     if matched {
@@ -11236,9 +11237,31 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
-/// Build two `StatusBar` rows for the debug sidebar chrome:
-/// row 0 = title ("DEBUG | config_name"), row 1 = action button (Continue/Stop/Start).
-pub fn debug_sidebar_chrome_to_status_bars(
+/// Build the debug sidebar's `SidebarPanelChrome::StatusBars` (quadraui#1061,
+/// issue #1392) — row 0 = title ("DEBUG | config_name"), row 1 = the
+/// Run/Stop/Continue action button. Both backends now paint this chrome
+/// through `SidebarPanelBody::render_with` (`tui_main::panels::
+/// render_debug_sidebar`, `App::paint_sidebar_panel_rung`'s `PANEL_DEBUG`
+/// arm) instead of slicing two rows off `area` by hand and calling
+/// `Backend::draw_status_bar` on each directly — `StatusBars` reserves one
+/// row per bar and paints each through the same rasteriser the old code
+/// called separately for each row, and surfaces its hit regions on
+/// `SidebarPanelBodyLayout::
+/// status_bar_hit_regions` in the same absolute space the caller's `rect`
+/// was in — the caller stores that directly on `Engine::
+/// dap_sidebar_action_hits` (see its doc) rather than re-deriving the
+/// action row's rect as a second, independently-computed value the way
+/// `cached_dap_action_rect` used to (paint and click could disagree).
+pub fn debug_sidebar_chrome(sidebar: &DebugSidebarData, theme: &Theme) -> SidebarPanelChrome {
+    let (title, action) = debug_sidebar_status_bars(sidebar, theme);
+    SidebarPanelChrome::StatusBars(vec![title, action])
+}
+
+/// Build the debug sidebar's title/action-button `StatusBar` pair. Split out
+/// of [`debug_sidebar_chrome`] only because constructing the two bars is
+/// easier to read un-nested from the `Vec` wrapper; not called directly by
+/// either backend any more (see that function's doc).
+fn debug_sidebar_status_bars(
     sidebar: &DebugSidebarData,
     theme: &Theme,
 ) -> (quadraui::StatusBar, quadraui::StatusBar) {

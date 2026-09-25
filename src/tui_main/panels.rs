@@ -1060,11 +1060,19 @@ pub(super) fn render_board_panel(
 
 // ─── Debug sidebar panel ──────────────────────────────────────────────────────
 
-/// Render the debug sidebar: header + run button + 4 sections (Variables, Watch, Call Stack, Breakpoints).
-/// Migrated to four `quadraui::TreeView` instances (#281), one per
-/// section. Panel header (row 0) + Run/Stop button (row 1) + per-section
-/// title rows + per-section scrollbar overlays remain panel-specific
-/// chrome; item rendering goes through `Backend::draw_tree`.
+/// Render the debug sidebar: title + Run/Stop button chrome, then the four
+/// `quadraui::TreeView` sections (Variables, Watch, Call Stack, Breakpoints)
+/// via `SidebarSystem`.
+///
+/// #1392: chrome composed through `SidebarPanelBody::render_with`
+/// (quadraui#1059) with `SidebarPanelChrome::StatusBars` (quadraui#1061,
+/// `render::debug_sidebar_chrome`) instead of slicing `area` into two rows
+/// by hand and calling `Backend::draw_status_bar` on each directly. The
+/// returned layout's `status_bar_hit_regions` — already in `area`'s own
+/// absolute space — is stored straight onto `Engine::dap_sidebar_action_hits`
+/// for `mouse::handle_mouse`'s `dap_sidebar_action_click_at` to read, so
+/// paint and click share one geometry. GTK's `App::paint_sidebar_panel_rung`
+/// `PANEL_DEBUG` arm builds the identical chrome through the same helper.
 /// #607: `backend` widened to `&mut dyn quadraui::Backend` — this renderer
 /// was already trait-pure, same rationale as `render_search_panel` above.
 pub(super) fn render_debug_sidebar(
@@ -1082,39 +1090,32 @@ pub(super) fn render_debug_sidebar(
     // doc comment — instead of rebuilding a second `ScreenLayout` just to
     // read `debug_sidebar`.
     let sidebar = &screen.debug_sidebar;
-
-    // ── Chrome rows (panel-specific): header + Run/Stop button via StatusBar. ──
-    let (title_bar, action_bar) = render::debug_sidebar_chrome_to_status_bars(sidebar, theme);
     let q_theme = super::quadraui_tui::q_theme(theme);
-
-    let title_rect = quadraui::Rect::new(area.x as f32, area.y as f32, area.width as f32, 1.0);
     backend.set_theme(q_theme);
-    let _ = backend.draw_status_bar(title_rect, &title_bar, None, None);
 
-    if area.height < 2 {
-        return;
-    }
-
-    let action_rect =
-        quadraui::Rect::new(area.x as f32, (area.y + 1) as f32, area.width as f32, 1.0);
-    backend.set_theme(q_theme);
-    let hits = backend.draw_status_bar(action_rect, &action_bar, None, None);
-    engine.dap_sidebar_action_hits.replace(Some(hits));
-
-    // ── SidebarSystem body (the four sections). ──
-    if area.height < 3 {
-        return;
-    }
-    let msv_rect = quadraui::Rect::new(
+    let q_rect = quadraui::Rect::new(
         area.x as f32,
-        (area.y + 2) as f32,
+        area.y as f32,
         area.width as f32,
-        (area.height - 2) as f32,
+        area.height as f32,
     );
-    engine.dap_sidebar_body_rect.set(msv_rect);
-    render::populate_dap_sidebar_system(engine);
-    backend.set_theme(q_theme);
-    engine.dap_sidebar_system.borrow().render(backend, msv_rect);
+    let panel = render::SidebarPanelBody {
+        background: None,
+        chrome: render::debug_sidebar_chrome(sidebar, theme),
+        scrollbar_gutter: None,
+    };
+    let layout = panel.render_with(backend, q_rect, |backend, body_rect| {
+        engine.dap_sidebar_body_rect.set(body_rect);
+        render::populate_dap_sidebar_system(engine);
+        backend.set_theme(q_theme);
+        engine
+            .dap_sidebar_system
+            .borrow()
+            .render(backend, body_rect);
+    });
+    engine
+        .dap_sidebar_action_hits
+        .replace(layout.status_bar_hit_regions);
 }
 
 // The bottom-band rungs that used to live here — `render_bottom_panel_tabs`,

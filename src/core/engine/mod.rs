@@ -3707,9 +3707,18 @@ pub struct Engine {
     /// Per-section allocated heights in content rows (excluding header).
     /// Computed by backends and stored for ensure_visible calculations.
     pub dap_sidebar_section_heights: [u16; 4],
-    /// Cached layout for the debug sidebar action-button row.
-    /// Paint fills; click reads via `hit_test()` (paint↔click pattern).
-    pub dap_sidebar_action_hits: std::cell::RefCell<Option<quadraui::StatusBarLayout>>,
+    /// Hit regions for the debug sidebar's title + action-button chrome
+    /// (`SidebarPanelChrome::StatusBars`, quadraui#1061), in whatever
+    /// absolute space the frame's `SidebarPanelBody::render_with` call
+    /// painted them into (TUI cells, GTK pixels) — straight from
+    /// `SidebarPanelBodyLayout::status_bar_hit_regions`, not re-derived.
+    /// Paint fills (`render::debug_sidebar_chrome`'s two callers); click
+    /// reads via `render::dap_sidebar_action_click_at` (paint↔click
+    /// pattern, issue #1392: previously GTK also cached a separate
+    /// bar-local `StatusBarLayout` plus its own `action_rect` to translate
+    /// into it — two independently-derived values for the same geometry,
+    /// which is exactly what let paint and click disagree).
+    pub dap_sidebar_action_hits: std::cell::RefCell<Vec<(quadraui::Rect, quadraui::StatusBarHit)>>,
     /// Forward-indexed scroll offset for the debug output panel (0 = top/oldest).
     pub debug_output_scroll: usize,
     /// When true, debug output auto-scrolls to show newest lines.
@@ -4821,7 +4830,7 @@ impl Engine {
             dap_sidebar_selected: 0,
             dap_sidebar_scroll: [0; 4],
             dap_sidebar_section_heights: [0; 4],
-            dap_sidebar_action_hits: std::cell::RefCell::new(None),
+            dap_sidebar_action_hits: std::cell::RefCell::new(Vec::new()),
             debug_output_scroll: 0,
             debug_output_auto_scroll: true,
             scroll_surfaces: std::cell::RefCell::new(Vec::new()),
