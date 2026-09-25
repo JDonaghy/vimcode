@@ -10023,7 +10023,11 @@ pub fn paint_change_review_rung(
         viewport.width,
         (viewport.height - footer_h).max(0.0),
     );
-    let _ = b.draw_diff_view(diff_rect, &entry.view);
+    // #527: splice any pinned line comments into the rows that get painted
+    // — see `crate::core::review::view_with_inline_comments`'s doc for why
+    // this lives in core rather than as backend-specific text munging.
+    let painted_view = crate::core::review::view_with_inline_comments(&review.comments, entry);
+    let _ = b.draw_diff_view(diff_rect, &painted_view);
     engine.change_review_diff_rect.set(diff_rect);
 
     let decision = match entry.decision {
@@ -10032,7 +10036,8 @@ pub fn paint_change_review_rung(
         crate::core::review::ChangeDecision::Rejected => "rejected",
     };
     let msg = format!(
-        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject ]/[=hunk n/p=file Esc=close ",
+        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
+         ]/[=hunk n/p=file Esc=close ",
         review.current + 1,
         review.entries.len(),
         entry.change.path,

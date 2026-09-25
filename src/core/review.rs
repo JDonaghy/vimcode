@@ -41,6 +41,23 @@ pub enum ChangeDecision {
     Rejected,
 }
 
+/// A single pinned review comment (#527, Track A Phase 3): a short note
+/// anchored to one file/line within an open [`ChangeReviewState`],
+/// collected into [`ChangeReviewState::comments`] and folded into the
+/// verdict body #526 composes (via [`markdown_findings_serializer`], or
+/// whichever [`FindingsSerializer`] the host has installed). `file` is
+/// whatever path the reviewed [`ProposedChange`] itself carries (the same
+/// string [`ChangeReviewEntry::change`]'s `path` uses — not necessarily
+/// absolute), `line` is 1-based, matching every other line number this
+/// module already hands out (`row_to_location`, `DiffHunk::left_start`/
+/// `right_start`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub file: String,
+    pub line: u32,
+    pub text: String,
+}
+
 /// A verdict on the review as a whole, reported through a provider-declared
 /// command (#526) — distinct from [`ChangeDecision`], which is per-file
 /// accept/reject within the diff surface itself. Generic vocabulary: these
@@ -69,6 +86,46 @@ impl ReviewVerdict {
             ReviewVerdict::Comment => "comment",
         }
     }
+}
+
+/// A findings-list serializer (#527): turns the pinned [`ReviewComment`]s
+/// collected on a [`ChangeReviewState`] into the text a verdict composer
+/// buffer is prefilled with. Deliberately just a plain function pointer,
+/// not a hardcoded call — the issue's own acceptance bar is "the findings
+/// serializer is pluggable, not hardcoded to one provider's format", so
+/// `crate::core::engine::Engine::review_findings_serializer` holds one of
+/// these (defaulting to [`markdown_findings_serializer`]) and calls
+/// through it rather than formatting a string inline; a host that wants a
+/// provider-specific findings layout swaps the field (`Engine::
+/// set_review_findings_serializer` in tests today; a real per-provider
+/// hook is future work, but nothing here would need to change shape to
+/// add one — see this module's own tests for two different serializers
+/// producing two different bodies from the same `Vec<ReviewComment>`).
+pub type FindingsSerializer = fn(&[ReviewComment]) -> String;
+
+/// The generic default [`FindingsSerializer`]: a Markdown bullet list,
+/// `- **file:line** — text` per finding, under a `## Findings` heading —
+/// the same universal, no-specific-tool's-wire-format bar
+/// [`ReviewVerdict::token`] already holds itself to (every mainstream
+/// review UI renders a Markdown bullet list the same way). Comments are
+/// listed in collection order (the order they were pinned in), not
+/// sorted by file/line — [`ChangeReviewState::comments`] is already a
+/// plain append/edit/delete list, so preserving that order is "no
+/// surprise reordering" for the human proof-reading the composed body
+/// before `:w`.
+///
+/// Empty `comments` produces an empty string, so a review with no pinned
+/// findings composes exactly the blank body it did before #527.
+pub fn markdown_findings_serializer(comments: &[ReviewComment]) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("## Findings\n\n");
+    for c in comments {
+        out.push_str(&format!("- **{}:{}** — {}\n", c.file, c.line, c.text));
+    }
+    out.push('\n');
+    out
 }
 
 /// Build a single hunk where every line of `text` is a pure `Added` row
@@ -175,6 +232,12 @@ impl ChangeReviewEntry {
 pub struct ChangeReviewState {
     pub entries: Vec<ChangeReviewEntry>,
     pub current: usize,
+    /// Pinned line comments collected while this review is open (#527,
+    /// Track A Phase 3) — provider-agnostic, in pin order. Never sorted or
+    /// deduplicated automatically; [`Self::comment_index_at`] is how a
+    /// caller finds "the comment already on this line" to edit/delete
+    /// rather than accumulating duplicates.
+    pub comments: Vec<ReviewComment>,
 }
 
 impl ChangeReviewState {
@@ -191,6 +254,7 @@ impl ChangeReviewState {
         Self {
             entries,
             current: 0,
+            comments: Vec::new(),
         }
     }
 
@@ -296,6 +360,153 @@ impl ChangeReviewState {
                 .iter()
                 .all(|e| e.decision != ChangeDecision::Pending)
     }
+
+    /// `(path, 1-based line)` the current entry's `DiffView` is scrolled
+    /// to — the same row `Return`'s jump-to-hit resolves, reused here so
+    /// "comment on the current line" always agrees with "jump to the
+    /// current line" about which line that is. `None` on an empty review
+    /// or a scroll offset that has drifted past every hunk (shouldn't
+    /// happen in practice, but `row_to_location` is a plain lookup that
+    /// can fail, so this stays fallible rather than panicking).
+    pub fn current_location(&self) -> Option<(String, u32)> {
+        let entry = self.current_entry()?;
+        row_to_location(entry, entry.view.scroll_offset)
+    }
+
+    /// Index into [`Self::comments`] of the comment already pinned to
+    /// `file`/`line`, if any — how a caller distinguishes "add a new
+    /// comment here" from "edit the one that's already here".
+    pub fn comment_index_at(&self, file: &str, line: u32) -> Option<usize> {
+        self.comments
+            .iter()
+            .position(|c| c.file == file && c.line == line)
+    }
+
+    /// Overwrite `comments[index]`'s text in place. No-op (returns
+    /// `false`) if `index` is out of range — a stale index from a dialog
+    /// that outlived a comment someone else deleted in the meantime,
+    /// say.
+    pub fn edit_comment(&mut self, index: usize, text: String) -> bool {
+        match self.comments.get_mut(index) {
+            Some(c) => {
+                c.text = text;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Remove and return `comments[index]`, if it exists.
+    pub fn delete_comment(&mut self, index: usize) -> Option<ReviewComment> {
+        if index < self.comments.len() {
+            Some(self.comments.remove(index))
+        } else {
+            None
+        }
+    }
+}
+
+/// Derive a 1-based `(path, line)` for `row_idx` (an index into
+/// `entry.view.flat_rows()`) from the hunk that contains it — the same
+/// per-row arithmetic `quadraui::unified_hunk_header` uses per-hunk, just
+/// walked row by row. Prefers the right-side (new) line number, falling
+/// back to the left-side one for a pure-removal row that has no right
+/// side at all.
+///
+/// `pub(crate)` rather than private: both `Engine::change_review_jump_to_hit`
+/// (`crate::core::engine::review_ops`) and [`ChangeReviewState::
+/// current_location`] above need the exact same row → location mapping —
+/// keeping it here as the single definition is what makes "comment on the
+/// current line" and "jump to the current line" structurally unable to
+/// disagree about which line that is.
+pub(crate) fn row_to_location(entry: &ChangeReviewEntry, row_idx: usize) -> Option<(String, u32)> {
+    let mut acc = 0usize;
+    for hunk in &entry.view.hunks {
+        if row_idx < acc + hunk.rows.len() {
+            let offset = row_idx - acc;
+            let mut left_line = hunk.left_start as u32;
+            let mut right_line = hunk.right_start as u32;
+            for row in &hunk.rows[..offset] {
+                if row.left.is_some() {
+                    left_line += 1;
+                }
+                if row.right.is_some() {
+                    right_line += 1;
+                }
+            }
+            let row = &hunk.rows[offset];
+            let line = if row.right.is_some() {
+                right_line
+            } else {
+                left_line
+            };
+            return Some((entry.change.path.clone(), line));
+        }
+        acc += hunk.rows.len();
+    }
+    None
+}
+
+/// Build a copy of `entry.view` with any [`ReviewComment`]s pinned to
+/// `entry.change.path` appended inline to their row's rendered text — the
+/// "existing line-annotation / virtual-text channel" #527 names
+/// (`src/core/engine/plugins.rs`'s `ctx.annotate_lines` -> `RenderedLine::
+/// annotation`) reused for the diff surface: extra text spliced into what
+/// gets *painted*, never touching the underlying [`ProposedChange`]/diff
+/// data itself, same "virtual, not real" contract that channel already
+/// holds for the plain editor buffer. `quadraui::DiffRow` has no
+/// dedicated annotation slot (unlike `RenderedLine`), so the text is
+/// appended directly onto the row's `right` (or `left`, for a pure-removal
+/// row with no right side) string — since `draw_diff_view` takes ordinary
+/// row text, this is the whole mechanism, no backend-specific code on
+/// either side needed.
+///
+/// Returns a borrowed `Cow` when there is nothing to add (no comments at
+/// all, or none on this file) — the common case, so a review with no
+/// pinned findings costs no per-frame clone.
+pub fn view_with_inline_comments<'a>(
+    comments: &[ReviewComment],
+    entry: &'a ChangeReviewEntry,
+) -> std::borrow::Cow<'a, DiffView> {
+    let relevant: Vec<&ReviewComment> = comments
+        .iter()
+        .filter(|c| c.file == entry.change.path)
+        .collect();
+    if relevant.is_empty() {
+        return std::borrow::Cow::Borrowed(&entry.view);
+    }
+    let mut view = entry.view.clone();
+    for hunk in &mut view.hunks {
+        let mut left_line = hunk.left_start as u32;
+        let mut right_line = hunk.right_start as u32;
+        for row in &mut hunk.rows {
+            let line = if row.right.is_some() {
+                right_line
+            } else {
+                left_line
+            };
+            let on_this_row: Vec<&str> = relevant
+                .iter()
+                .filter(|c| c.line == line)
+                .map(|c| c.text.as_str())
+                .collect();
+            if !on_this_row.is_empty() {
+                let suffix = format!("   [comment] {}", on_this_row.join(" | "));
+                if let Some(right) = &mut row.right {
+                    right.push_str(&suffix);
+                } else if let Some(left) = &mut row.left {
+                    left.push_str(&suffix);
+                }
+            }
+            if row.left.is_some() {
+                left_line += 1;
+            }
+            if row.right.is_some() {
+                right_line += 1;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(view)
 }
 
 #[cfg(test)]
@@ -444,5 +655,191 @@ mod tests {
         state.extend(vec![change("a", Some("x"), "z")]);
         assert_eq!(state.entries.len(), 2);
         assert_eq!(state.entries[1].change.new_text, "z");
+    }
+
+    // ── #527 Track A Phase 3: pinned line comments ────────────────────
+
+    #[test]
+    fn new_review_starts_with_no_comments() {
+        let state = ChangeReviewState::new(vec![change("f", Some("a"), "b")]);
+        assert!(state.comments.is_empty());
+    }
+
+    /// `current_location` must resolve to the same `(path, line)` that
+    /// `row_to_location(entry, scroll_offset)` would — this is the
+    /// contract "comment on the current line" depends on for agreeing
+    /// with "jump to the current line" about which line that is.
+    #[test]
+    fn current_location_resolves_the_scrolled_to_row() {
+        let state = ChangeReviewState::new(vec![change("f.rs", Some("old\n"), "new\n")]);
+        let (path, line) = state.current_location().expect("a fresh review has a row");
+        assert_eq!(path, "f.rs");
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn current_location_is_none_on_an_empty_review() {
+        let state = ChangeReviewState {
+            entries: vec![],
+            current: 0,
+            comments: vec![],
+        };
+        assert!(state.current_location().is_none());
+    }
+
+    #[test]
+    fn comment_index_at_finds_an_existing_pin_and_nothing_else() {
+        let mut state = ChangeReviewState::new(vec![change("f", Some("a"), "b")]);
+        state.comments.push(ReviewComment {
+            file: "f".to_string(),
+            line: 3,
+            text: "nit".to_string(),
+        });
+        assert_eq!(state.comment_index_at("f", 3), Some(0));
+        assert_eq!(state.comment_index_at("f", 4), None);
+        assert_eq!(state.comment_index_at("other", 3), None);
+    }
+
+    #[test]
+    fn edit_comment_overwrites_text_in_place() {
+        let mut state = ChangeReviewState::new(vec![change("f", Some("a"), "b")]);
+        state.comments.push(ReviewComment {
+            file: "f".to_string(),
+            line: 1,
+            text: "before".to_string(),
+        });
+        assert!(state.edit_comment(0, "after".to_string()));
+        assert_eq!(state.comments[0].text, "after");
+        assert!(
+            !state.edit_comment(5, "nope".to_string()),
+            "an out-of-range index must not panic or silently succeed"
+        );
+    }
+
+    #[test]
+    fn delete_comment_removes_and_returns_it() {
+        let mut state = ChangeReviewState::new(vec![change("f", Some("a"), "b")]);
+        state.comments.push(ReviewComment {
+            file: "f".to_string(),
+            line: 1,
+            text: "gone soon".to_string(),
+        });
+        let removed = state.delete_comment(0).expect("index 0 exists");
+        assert_eq!(removed.text, "gone soon");
+        assert!(state.comments.is_empty());
+        assert!(state.delete_comment(0).is_none(), "already empty");
+    }
+
+    /// #527 acceptance: "render pinned comments inline". Asserted on the
+    /// rendered `DiffView` text a backend would actually paint, not on
+    /// `comments` being populated — a comment pinned to a row must show
+    /// up spliced into that exact row's content, not some other row's.
+    #[test]
+    fn view_with_inline_comments_splices_text_into_the_right_row() {
+        let state = ChangeReviewState::new(vec![change("f.rs", Some("a\nb\nc\n"), "a\nB\nc\n")]);
+        let entry = &state.entries[0];
+        let comments = vec![ReviewComment {
+            file: "f.rs".to_string(),
+            line: 2,
+            text: "why change this?".to_string(),
+        }];
+        let view = view_with_inline_comments(&comments, entry);
+        let row = view
+            .flat_rows()
+            .into_iter()
+            .find(|r| r.right.as_deref() == Some("B") || r.left.as_deref() == Some("b"))
+            .expect("the changed line 2 must still be present");
+        let painted = row.right.as_deref().or(row.left.as_deref()).unwrap();
+        assert!(
+            painted.contains("why change this?"),
+            "the comment text must be spliced into line 2's own row, got: {painted:?}"
+        );
+        // A different, uncommented row must be untouched.
+        let untouched = view
+            .flat_rows()
+            .into_iter()
+            .find(|r| r.right.as_deref() == Some("a") || r.left.as_deref() == Some("a"))
+            .expect("line 1 must still be present");
+        let untouched_text = untouched
+            .right
+            .as_deref()
+            .or(untouched.left.as_deref())
+            .unwrap();
+        assert!(!untouched_text.contains("why change this?"));
+    }
+
+    #[test]
+    fn view_with_inline_comments_is_borrowed_when_there_is_nothing_to_add() {
+        let state = ChangeReviewState::new(vec![change("f.rs", Some("a\n"), "b\n")]);
+        let entry = &state.entries[0];
+        let view = view_with_inline_comments(&[], entry);
+        assert!(matches!(view, std::borrow::Cow::Borrowed(_)));
+
+        // A comment on a *different* file must not force a clone either.
+        let other_file_comment = vec![ReviewComment {
+            file: "other.rs".to_string(),
+            line: 1,
+            text: "irrelevant here".to_string(),
+        }];
+        let view = view_with_inline_comments(&other_file_comment, entry);
+        assert!(matches!(view, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn markdown_findings_serializer_is_empty_for_no_comments() {
+        assert_eq!(markdown_findings_serializer(&[]), "");
+    }
+
+    #[test]
+    fn markdown_findings_serializer_lists_file_line_and_text_in_order() {
+        let comments = vec![
+            ReviewComment {
+                file: "a.rs".to_string(),
+                line: 3,
+                text: "first".to_string(),
+            },
+            ReviewComment {
+                file: "b.rs".to_string(),
+                line: 10,
+                text: "second".to_string(),
+            },
+        ];
+        let body = markdown_findings_serializer(&comments);
+        let first_pos = body.find("a.rs:3").expect("first finding must appear");
+        let second_pos = body.find("b.rs:10").expect("second finding must appear");
+        assert!(
+            first_pos < second_pos,
+            "findings must serialize in pin order, not sorted"
+        );
+        assert!(body.contains("first"));
+        assert!(body.contains("second"));
+    }
+
+    /// #527's own acceptance bar: "the findings serializer is pluggable,
+    /// not hardcoded to one provider's format" — proven here by two
+    /// different [`FindingsSerializer`]s producing two different bodies
+    /// from the identical `Vec<ReviewComment>`, both reachable through the
+    /// same `FindingsSerializer` function-pointer type.
+    #[test]
+    fn findings_serializer_is_pluggable_not_a_single_hardcoded_format() {
+        fn plain_csv(comments: &[ReviewComment]) -> String {
+            comments
+                .iter()
+                .map(|c| format!("{},{},{}", c.file, c.line, c.text))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let comments = vec![ReviewComment {
+            file: "x.rs".to_string(),
+            line: 1,
+            text: "note".to_string(),
+        }];
+        let via_default: FindingsSerializer = markdown_findings_serializer;
+        let via_custom: FindingsSerializer = plain_csv;
+        let default_out = via_default(&comments);
+        let custom_out = via_custom(&comments);
+        assert_ne!(default_out, custom_out);
+        assert!(default_out.contains("**x.rs:1**"));
+        assert_eq!(custom_out, "x.rs,1,note");
     }
 }

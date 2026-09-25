@@ -16461,6 +16461,111 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #527 acceptance: "Comments anchor to lines, render inline, survive
+    /// scrolling, and appear in the submitted body." Drives the real key
+    /// path end to end: `c` opens the one-line comment dialog (`Engine::
+    /// change_review_start_comment`), typing + Enter saves it (`Dialog`'s
+    /// existing text-input handling -> `process_dialog_result`'s
+    /// `"review_comment"` arm), and the comment text must then be visible
+    /// *painted into the diff row itself* — not merely present in
+    /// `Engine::change_review.comments` (#587/#592's lesson: state
+    /// populated is not evidence of paint). Navigating away to a second
+    /// file and back (the same `Tab`/`p` keys `tab_and_n_advance_to_the_
+    /// next_file` already covers) proves the comment is re-derived from
+    /// `(file, line)` on every paint rather than pinned to a row index
+    /// that would drift or vanish once the surface's `current` entry
+    /// changes — the "survive scrolling"/navigation half of the
+    /// acceptance bar. `d` then deletes it, and the surface goes back to
+    /// painting exactly what it did before `c` was ever pressed.
+    ///
+    /// RED verified: with `paint_change_review_rung`'s
+    /// `view_with_inline_comments` call reverted to painting `&entry.view`
+    /// directly (the pre-#527 line), this test fails at the first
+    /// "comment must be painted inline" assertion — the pinned comment
+    /// exists in `Engine::change_review.comments` but nothing on screen
+    /// ever shows it.
+    #[test]
+    fn change_review_c_key_pins_and_paints_an_inline_comment_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.change_review = Some(crate::core::review::ChangeReviewState::new(vec![
+            crate::core::review::ProposedChange {
+                path: "first.rs".to_string(),
+                old_text: Some("old line\n".to_string()),
+                new_text: "new line\n".to_string(),
+            },
+            crate::core::review::ProposedChange {
+                path: "second.rs".to_string(),
+                old_text: Some("second old\n".to_string()),
+                new_text: "second new\n".to_string(),
+            },
+        ]));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line") && !screen.contains("a design nit here"),
+            "precondition: the first file's diff is painted with no \
+             comment yet; screen:\n{screen}"
+        );
+
+        // `c`: open the comment dialog on the current (first) row.
+        driver.type_char('c');
+        driver.render();
+        assert!(
+            driver.screen_contains("Add comment"),
+            "'c' must open a comment dialog; screen:\n{}",
+            driver.screen()
+        );
+
+        for ch in "a design nit here".chars() {
+            driver.type_char(ch);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Add comment"),
+            "Enter must dismiss the dialog; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("a design nit here"),
+            "the pinned comment must be painted inline into the diff row, \
+             not just recorded in state; screen:\n{screen}"
+        );
+
+        // Navigate away to the second file and back — the comment must
+        // still paint on the first file's row, not follow the row index
+        // or disappear.
+        driver.type_char('n');
+        driver.render();
+        assert!(
+            driver.screen_contains("second new") && !driver.screen_contains("a design nit here"),
+            "switching files must show the second file's diff, with no \
+             leftover comment text from the first file; screen:\n{}",
+            driver.screen()
+        );
+        driver.type_char('p');
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("new line") && screen.contains("a design nit here"),
+            "returning to the first file must still show its pinned \
+             comment, re-derived by (file, line) rather than a stale row \
+             index; screen:\n{screen}"
+        );
+
+        // `d`: delete the comment on the current line.
+        driver.type_char('d');
+        driver.render();
+        assert!(
+            !driver.screen_contains("a design nit here"),
+            "'d' must remove the pinned comment from the painted diff; \
+             screen:\n{}",
+            driver.screen()
+        );
+    }
+
     /// #526 acceptance: pressing `A` on an open change-review surface that
     /// was opened for a board card closes the diff (same as Esc) and opens
     /// a verdict-composer buffer bound to that card — asserted on the
