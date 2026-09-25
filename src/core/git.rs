@@ -1544,6 +1544,92 @@ mod tests {
         assert_eq!(current_branch(&dir).as_deref(), Some("feature-x"));
     }
 
+    // ── changed_files_between ────────────────────────────────────────────
+
+    #[test]
+    fn test_changed_files_between_lists_files_changed_on_head_since_base() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["config", "user.name", "T"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("unchanged.txt"), "same\n").unwrap();
+        std::fs::write(dir.join("modified.txt"), "before\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "base"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        create_branch(&dir, "feature").unwrap();
+        std::fs::write(dir.join("modified.txt"), "after\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "feature work"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        // A commit on `main`/`master` after the branch diverged must not
+        // show up as a "changed" file on `feature` — three-dot semantics.
+        checkout_branch(&dir, "main")
+            .or_else(|_| checkout_branch(&dir, "master"))
+            .unwrap();
+        std::fs::write(dir.join("unchanged.txt"), "changed on base only\n").unwrap();
+        git_command()
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        git_command()
+            .args(["commit", "-m", "base-only change"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base = current_branch(&dir).unwrap();
+
+        let mut files = changed_files_between(&dir, &base, "feature");
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["modified.txt".to_string(), "new.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_changed_files_between_unknown_ref_is_empty_not_error() {
+        let dir = std::env::temp_dir().join("vimcode_changed_files_between_bad_ref");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_command()
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(changed_files_between(&dir, "nope-base", "nope-head").is_empty());
+    }
+
     // ── normalize_remote_url ────────────────────────────────────────────────
 
     #[test]
@@ -2331,6 +2417,30 @@ pub fn log_line_range(
 /// Run `git diff <ref>` and return the full diff output.
 pub fn diff_against_ref(dir: &Path, ref_spec: &str) -> Option<String> {
     run_git(dir, &["diff", ref_spec])
+}
+
+/// Paths (relative to the repository root) that differ between `base` and
+/// `head`, using git's three-dot ("what changed on `head` since it
+/// diverged from `base`") comparison rather than a plain two-dot diff —
+/// the right semantics for reviewing a feature branch against the branch
+/// it was cut from, since it ignores commits `base` has picked up in the
+/// meantime that `head` never saw. Both `base`/`head` must already be
+/// resolvable in the local repository (already pulled/checked out) — this
+/// is worktree-local, no fetch (#525's stated scope; the remote/ssh case
+/// is #530). Empty on any git failure (no repo, unknown ref, …) rather
+/// than erroring, matching this module's other "no git = no data"
+/// primitives.
+pub fn changed_files_between(dir: &Path, base: &str, head: &str) -> Vec<String> {
+    let spec = format!("{base}...{head}");
+    match run_git(dir, &["diff", "--name-only", &spec]) {
+        Some(output) => output
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Return detailed log entries for a specific file.

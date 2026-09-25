@@ -336,6 +336,41 @@ pub fn fetch_board_model(
     serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
 }
 
+// ─── The branch-review contract (#525) ─────────────────────────────────────
+
+/// The result of resolving a board card to a reviewable change: which git
+/// revision holds the change (`branch`) and which revision to diff it
+/// against (`base`). Generic, same spirit as [`ToolDocument`]/
+/// [`quadraui::BoardModel`] — any provider whose `"OpenReview"` board
+/// action (see `crate::core::extensions::BoardProviderConfig::actions`)
+/// emits this JSON shape on stdout gets a multi-file diff review; nothing
+/// here names a specific provider or lifecycle vocabulary. Both revisions
+/// must already be resolvable in the *local* repository (already pulled/
+/// checked out) — turning this into a real diff is pure local git
+/// (`crate::core::git::changed_files_between`), not another external-tool
+/// round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct BranchReviewTarget {
+    /// The branch (or any git revision) containing the change to review.
+    pub branch: String,
+    /// The revision to diff `branch` against — typically the branch it was
+    /// cut from. Compared with three-dot semantics, see
+    /// `crate::core::git::changed_files_between`.
+    pub base: String,
+}
+
+/// Run `argv` via `client` and parse the result as a [`BranchReviewTarget`]
+/// — the "resolve a card to a branch" half of #525's review seam. The
+/// "branch to changed files" half is pure local git; this is the only part
+/// that needs an external tool at all.
+pub fn fetch_branch_review_target(
+    client: &dyn ToolClient,
+    argv: &[String],
+) -> Result<BranchReviewTarget, ToolError> {
+    let value = client.run_json(argv)?;
+    serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -586,5 +621,26 @@ mod tests {
             vec!["follow-up".to_string(), "42".to_string()]
         );
         assert_eq!(calls[0].stdin, Some(Vec::new()));
+    }
+
+    // ── fetch_branch_review_target (#525) ───────────────────────────────
+
+    #[test]
+    fn mock_client_fetch_branch_review_target_parses_fixture() {
+        let client = MockToolClient(Ok(serde_json::json!({
+            "branch": "issue-525-review",
+            "base": "develop",
+        })));
+        let target = fetch_branch_review_target(&client, &["whatever".to_string()])
+            .expect("fixture should parse into BranchReviewTarget");
+        assert_eq!(target.branch, "issue-525-review");
+        assert_eq!(target.base, "develop");
+    }
+
+    #[test]
+    fn fetch_branch_review_target_propagates_configured_error() {
+        let client = MockToolClient(Err(ToolError::BinaryNotFound("some-provider".into())));
+        let err = fetch_branch_review_target(&client, &["some-provider".to_string()]).unwrap_err();
+        assert!(matches!(err, ToolError::BinaryNotFound(ref b) if b == "some-provider"));
     }
 }

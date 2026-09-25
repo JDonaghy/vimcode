@@ -112,16 +112,21 @@ impl Engine {
 
     /// Apply a semantic [`quadraui::BoardAction`] to the cached model.
     /// Phase 0 only handles the read-only actions (`SelectCard`,
-    /// `MoveSelection`, `JumpToTop`/`JumpToBottom`, `OpenIssue`); every
-    /// other variant is a provider-dispatch action out of scope until #523
-    /// and is a deliberate no-op here.
+    /// `MoveSelection`, `JumpToTop`/`JumpToBottom`, `OpenIssue`,
+    /// `OpenReview` — #525); every other variant is a provider-dispatch
+    /// action out of scope until #523 and is a deliberate no-op here.
     pub fn apply_board_action(&mut self, action: quadraui::BoardAction) {
         use quadraui::BoardAction;
-        // `OpenIssue` needs `&mut self` (to open a document buffer, #524),
-        // which can't happen while `model` still holds `self.board_model`
-        // borrowed — resolve it to an owned id first and handle it after
-        // the match, once that borrow has ended.
-        let open_issue_id = {
+        // `OpenIssue`/`OpenReview` both need `&mut self` (to open a
+        // document buffer or the change-review surface), which can't
+        // happen while `model` still holds `self.board_model` borrowed —
+        // resolve to an owned pending action first and handle it after the
+        // match, once that borrow has ended.
+        enum Pending {
+            OpenIssue(quadraui::WidgetId),
+            OpenReview(quadraui::WidgetId),
+        }
+        let pending = {
             let Some(model) = self.board_model.as_mut() else {
                 return;
             };
@@ -142,16 +147,18 @@ impl Engine {
                     model.jump_to_bottom();
                     None
                 }
-                BoardAction::OpenIssue(id) => Some(id),
+                BoardAction::OpenIssue(id) => Some(Pending::OpenIssue(id)),
+                BoardAction::OpenReview(id) => Some(Pending::OpenReview(id)),
                 // Provider-dispatch actions (#523) and context menu —
                 // no-op in this read-only phase.
-                BoardAction::ContextMenu(..) | BoardAction::OpenReview(_) => None,
+                BoardAction::ContextMenu(..) => None,
             }
         };
-        let Some(id) = open_issue_id else {
-            return;
-        };
-        self.open_issue_card(id);
+        match pending {
+            Some(Pending::OpenIssue(id)) => self.open_issue_card(id),
+            Some(Pending::OpenReview(id)) => self.open_review_card(id),
+            None => {}
+        }
     }
 
     /// `OpenIssue`'s handling: if a document provider is configured
@@ -180,6 +187,40 @@ impl Engine {
         }
     }
 
+    /// `OpenReview`'s handling (#525): run the configured board provider's
+    /// `"OpenReview"` action (`BoardProviderConfig::action_argv`) to
+    /// resolve this card to a
+    /// [`crate::core::tool_client::BranchReviewTarget`], then hand that
+    /// off to `Engine::open_branch_review`, which turns it into a local
+    /// git diff and opens the shared change-review surface (#955). This
+    /// function is the only place that knows the review comes from a board
+    /// card — `open_branch_review` itself has no idea.
+    ///
+    /// **Blocking**, the same one-shot tradeoff `open_issue_card`'s
+    /// document-provider path already made: opening a review is a
+    /// deliberate user action with no cached state to show while waiting.
+    fn open_review_card(&mut self, id: quadraui::WidgetId) {
+        let Some(provider) = self.board_provider() else {
+            self.message = "Board: no provider configured".to_string();
+            return;
+        };
+        let Some(argv) = provider.action_argv("OpenReview", id.as_str()) else {
+            self.message = "Board: no review command configured".to_string();
+            return;
+        };
+        let target =
+            match tool_client::fetch_branch_review_target(self.board_client.as_ref(), &argv) {
+                Ok(target) => target,
+                Err(e) => {
+                    self.message = format!("Board: {}", e.user_message());
+                    return;
+                }
+            };
+        if let Err(e) = self.open_branch_review(target) {
+            self.message = format!("Board: {e}");
+        }
+    }
+
     /// Keyboard dispatch for the Board panel — the
     /// `dispatch_*_sidebar_key_unified` pattern every other panel uses.
     ///
@@ -187,13 +228,27 @@ impl Engine {
     /// `h`/`Left` and `l`/`Right` are left to `quadraui::BoardModel::
     /// handle_key`'s own generic keymap for column navigation instead,
     /// since (unlike the other panels) they are meaningful board
-    /// navigation here, not an "exit to the activity bar" gesture.
+    /// navigation here, not an "exit to the activity bar" gesture. `R`
+    /// (#525) opens the review for the selected card — `handle_key`'s own
+    /// doc explicitly calls "review" out as a workflow-specific verb hosts
+    /// should handle themselves, so it's dispatched here rather than added
+    /// to quadraui's generic keymap.
     ///
     /// Returns whether the panel is still focused afterward.
     pub fn dispatch_board_key_unified(&mut self, key: &str) -> bool {
         if key == "Escape" {
             self.board_has_focus = false;
             return false;
+        }
+        if key == "R" {
+            if let Some(id) = self
+                .board_model
+                .as_ref()
+                .and_then(|m| m.selected_card_id.clone())
+            {
+                self.apply_board_action(quadraui::BoardAction::OpenReview(id));
+            }
+            return true;
         }
         // Both backends' `engine_key_from_ui`/`map_gtk_key_name` translate
         // an Enter keypress to the engine's own `"Return"`/`"KP_Enter"`
@@ -437,5 +492,176 @@ mod tests {
         install_mock_provider(&mut engine, fixture_model());
         engine.focus_sidebar_panel(sidebar::PANEL_BOARD);
         assert!(engine.board_fetching, "first focus should kick off a fetch");
+    }
+
+    // ── OpenReview (#525) ────────────────────────────────────────────────
+
+    fn install_mock_provider_with_review_action(
+        engine: &mut Engine,
+        model: BoardModel,
+        review_client_response: Result<serde_json::Value, crate::core::tool_client::ToolError>,
+    ) {
+        let mut manifest = ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        let mut actions = std::collections::HashMap::new();
+        actions.insert(
+            "OpenReview".to_string(),
+            vec!["mock-review".to_string(), "{id}".to_string()],
+        );
+        manifest.board = Some(BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions,
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+        engine.board_model = Some(model);
+        engine.set_board_client_for_test(MockToolClient(review_client_response));
+    }
+
+    /// Real temp repo with a `base` commit and a `feature` branch adding
+    /// one file — enough for `open_branch_review` to actually build a
+    /// non-empty change list. Returns `(repo dir, base branch name)`.
+    fn init_review_repo(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "board-ops-review-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new.txt"), "from the reviewed branch\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+        (dir, base)
+    }
+
+    #[test]
+    fn apply_open_review_resolves_target_via_provider_and_opens_the_surface() {
+        let (dir, base) = init_review_repo("happy-path");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        install_mock_provider_with_review_action(
+            &mut engine,
+            fixture_model(),
+            Ok(serde_json::json!({"branch": "feature", "base": base})),
+        );
+
+        engine.apply_board_action(BoardAction::OpenReview(WidgetId::new("card:1")));
+
+        let review = engine
+            .change_review
+            .as_ref()
+            .expect("OpenReview should open the change-review surface");
+        assert_eq!(review.entries.len(), 1);
+        assert_eq!(review.entries[0].change.path, "new.txt");
+        assert_eq!(
+            review.entries[0].change.new_text,
+            "from the reviewed branch\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_open_review_with_no_provider_sets_a_message_not_a_panic() {
+        let mut engine = Engine::new_for_test();
+        engine.board_model = Some(fixture_model());
+        engine.apply_board_action(BoardAction::OpenReview(WidgetId::new("card:1")));
+        assert!(engine.change_review.is_none());
+        assert!(engine.message.contains("no provider configured"));
+    }
+
+    #[test]
+    fn apply_open_review_with_no_review_command_configured_sets_a_message() {
+        let mut engine = Engine::new_for_test();
+        engine.board_model = Some(fixture_model());
+        install_mock_provider(&mut engine, fixture_model()); // no `actions` entry at all
+        engine.apply_board_action(BoardAction::OpenReview(WidgetId::new("card:1")));
+        assert!(engine.change_review.is_none());
+        assert!(engine.message.contains("no review command configured"));
+    }
+
+    #[test]
+    fn apply_open_review_surfaces_a_failing_provider_as_a_message() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_review_action(
+            &mut engine,
+            fixture_model(),
+            Err(crate::core::tool_client::ToolError::BinaryNotFound(
+                "mock-review".to_string(),
+            )),
+        );
+        engine.apply_board_action(BoardAction::OpenReview(WidgetId::new("card:1")));
+        assert!(engine.change_review.is_none());
+        assert!(engine.message.contains("not found on PATH"));
+    }
+
+    #[test]
+    fn dispatch_key_shift_r_opens_review_for_the_selected_card() {
+        let (dir, base) = init_review_repo("shift-r-key");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        install_mock_provider_with_review_action(
+            &mut engine,
+            fixture_model(),
+            Ok(serde_json::json!({"branch": "feature", "base": base})),
+        );
+
+        let still_focused = engine.dispatch_board_key_unified("R");
+
+        assert!(still_focused);
+        assert!(
+            engine.change_review.is_some(),
+            "R should open the review for the selected card"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dispatch_key_shift_r_with_no_selection_is_a_noop() {
+        let mut engine = Engine::new_for_test();
+        engine.board_model = Some(BoardModel {
+            id: WidgetId::new("board"),
+            columns: vec![],
+            selected_card_id: None,
+            col_scroll_offset: 0,
+        });
+        let still_focused = engine.dispatch_board_key_unified("R");
+        assert!(still_focused);
+        assert!(engine.change_review.is_none());
     }
 }
