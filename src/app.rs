@@ -2575,6 +2575,28 @@ impl App {
             None => {}
         }
 
+        // ── Shared Ctrl-W sidebar chord rung (#1419, closes #406) ──────
+        // GTK kept no per-keypress chord latch of its own, so `Ctrl-W`
+        // followed by `h`/`l` in a sidebar panel silently did nothing here
+        // while TUI's TUI-only `TuiSidebar::pending_ctrl_w` handled it.
+        // `Engine::sidebar_ctrl_w_pending` is the shared latch both backends
+        // now read/write through `route_sidebar_chord_key`; GTK has no
+        // "sidebar band holds focus" shadow flag to clear on
+        // `SidebarChordAction::FocusOut` (unlike TUI's `sidebar.has_focus`),
+        // so there is nothing else to do here besides redraw.
+        if focus_route != render::FocusKeyRoute::None
+            && render::route_sidebar_chord_key(
+                &mut self.engine.borrow_mut(),
+                &key_name,
+                unicode,
+                ctrl,
+            )
+            .is_some()
+        {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared focus-owner *dispatch* rung (#762 / #734 slice 7) ───
         // Slice 2 shared only the *routing*; `render::dispatch_sidebar_panel_key`
         // now states the six pure-`Engine` arms too, and TUI's

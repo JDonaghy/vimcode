@@ -4095,32 +4095,18 @@ fn handle_focus_owner_key(
         );
     }
 
-    // Ctrl-W prefix: set pending state for window navigation. A Vim chord,
-    // so it stays inline rather than becoming an accelerator. Still
-    // TUI-only — GTK has no per-keypress chord latch to hang
-    // `pending_ctrl_w` on, which is #406; converging it needs the latch
-    // promoted into the engine and is out of scope for this slice.
-    if ctrl && matches!(key_val, Key::Char('w') | Key::Char('W')) {
-        sidebar.pending_ctrl_w = true;
-        return Reaction::Redraw;
-    }
-    // Ctrl-W {h,l,Left,Right}: navigate between toolbar / panel / editor.
-    if sidebar.pending_ctrl_w {
-        sidebar.pending_ctrl_w = false;
-        match key_val {
-            Key::Char('h') | Key::Named(NamedKey::Left) => {
-                // Panel → activity bar toolbar
-                let idx = engine.activity_bar_toolbar_idx_for_active_panel();
-                sidebar.has_focus = false;
-                engine.clear_sidebar_focus();
-                engine.activity_bar_focus_in_at(idx);
-            }
-            Key::Char('l') | Key::Named(NamedKey::Right) => {
-                // Panel → editor
-                sidebar.has_focus = false;
-                engine.clear_sidebar_focus();
-            }
-            _ => {} // Unknown Ctrl-W combo in the sidebar: ignore
+    // Ctrl-W {arm, then h/l/Left/Right}: navigate between toolbar / panel /
+    // editor. `render::route_sidebar_chord_key` (#1419, closes #406) is the
+    // shared rung GTK's `App::handle_key_press` now calls too — the latch
+    // itself (`Engine::sidebar_ctrl_w_pending`) moved off this TUI-only
+    // struct into `Engine` so both backends read/write the same state.
+    let (chord_key_name, chord_unicode, _) =
+        render::engine_key_from_ui(key, modifiers, keyboard_enhanced).unwrap_or_default();
+    if let Some(action) =
+        render::route_sidebar_chord_key(engine, &chord_key_name, chord_unicode, ctrl)
+    {
+        if action == render::SidebarChordAction::FocusOut {
+            sidebar.has_focus = false;
         }
         return Reaction::Redraw;
     }
@@ -19662,7 +19648,8 @@ mod tests {
 
     /// Ctrl-W then `l` moves focus from the sidebar back to the editor
     /// (mirrors `mod.rs:1938`-`:1972`). Two keypresses, because the chord is
-    /// stateful — the first only arms `pending_ctrl_w`.
+    /// stateful — the first only arms `Engine::sidebar_ctrl_w_pending`
+    /// (#1419, promoted off `TuiSidebar` so GTK can share the same latch).
     #[test]
     fn sidebar_focused_ctrl_w_l_returns_focus_to_the_editor() {
         let mut engine = Engine::new();
@@ -19689,7 +19676,7 @@ mod tests {
             &mut backend,
             &mut scratch.state(),
         );
-        assert!(sidebar.pending_ctrl_w, "Ctrl-W must arm the chord");
+        assert!(engine.sidebar_ctrl_w_pending, "Ctrl-W must arm the chord");
         assert!(sidebar.has_focus, "Ctrl-W alone must not move focus");
 
         handle_key_pressed(
@@ -19705,7 +19692,7 @@ mod tests {
             &mut backend,
             &mut scratch.state(),
         );
-        assert!(!sidebar.pending_ctrl_w, "the chord must be consumed");
+        assert!(!engine.sidebar_ctrl_w_pending, "the chord must be consumed");
         assert!(
             !sidebar.has_focus,
             "Ctrl-W l must return focus to the editor"

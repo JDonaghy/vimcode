@@ -377,8 +377,6 @@ use crate::core::engine::sidebar::*;
 
 struct TuiSidebar {
     has_focus: bool,
-    /// True after Ctrl-W is pressed in a sidebar panel, waiting for h/j/k/l.
-    pending_ctrl_w: bool,
     /// When set, sidebar renders an extension panel instead of the fixed panels.
     ext_panel_name: Option<String>,
 }
@@ -387,7 +385,6 @@ impl TuiSidebar {
     fn new() -> Self {
         TuiSidebar {
             has_focus: false,
-            pending_ctrl_w: false,
             ext_panel_name: None,
         }
     }
