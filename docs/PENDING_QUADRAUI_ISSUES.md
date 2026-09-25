@@ -357,44 +357,12 @@ this same PR, see that file's new §2c).
 
 ---
 
-## `quadraui::tui::testing::TuiDriver` has no way to resize its `TestBackend` mid-test — a TOCTOU/resize regression (e.g. quadraui#1040's class of bug) can't be driver-tested from a downstream crate
+## ~~`quadraui::tui::testing::TuiDriver` has no way to resize its `TestBackend` mid-test — a TOCTOU/resize regression (e.g. quadraui#1040's class of bug) can't be driver-tested from a downstream crate~~ — **FILED as quadraui#1063, do not file (struck 2026-09-24)**
 
-**Title:** `TuiDriver` (`quadraui/src/tui/testing.rs`) constructs a
-fixed-size `ratatui::backend::TestBackend` in `Self::new` and exposes no
-`resize`/`terminal()` accessor, so a downstream crate (vimcode) cannot write
-a black-box regression test that actually shrinks the terminal mid-session
-and re-renders — the only way to drive-test a TOCTOU gap between
-layout-time size and paint-time buffer size (quadraui#1040's bug class)
-from outside the crate.
-
-**Body:**
-
-vimcode#1246 (consume side of quadraui#1040) wanted to add a driver-tier
-regression test reproducing vimcode#203's "resize while the Extensions
-panel/an overflowing sidebar is visible" crash, to confirm it stays fixed.
-`TuiDriver::new` (`quadraui/src/tui/testing.rs`) builds its own
-`Terminal<TestBackend>` internally and keeps it in a private
-`Rc<RefCell<Terminal<TestBackend>>>` field with no public accessor; `TestBackend`
-itself only grows/shrinks via `ratatui::Terminal::resize`, which nothing in
-`TuiDriver`'s public API reaches. A downstream test can call
-`TuiDriver::dispatch(UiEvent::WindowResized { .. })`, but that only updates
-`TuiBackend`'s own `Viewport` bookkeeping (what a host layout pass reads) —
-it does not touch the `TestBackend`'s actual cell grid, so the specific race
-quadraui#1040 fixed (layout computed for one size, `Buffer` already
-reallocated to a smaller one) cannot be constructed at all from a `TuiDriver`
-test today.
-
-**Ask:** add a `TuiDriver::resize(&mut self, width: u16, height: u16)` (or
-equivalent) that calls `Terminal::resize` on the internal `TestBackend`
-*without* also updating `TuiBackend`'s cached `Viewport`/size state, so a
-test can reproduce the exact stale-layout-vs-shrunk-buffer condition:
-resize the backend buffer first, then separately drive a repaint through the
-old (larger) layout to assert the paint path degrades gracefully (truncates,
-does not panic) rather than indexing out of bounds. This is testing
-infrastructure only — no behavior change to `TuiDriver`'s existing
-constructors or `dispatch`/`render` methods.
-
-**Blocks:** nothing currently open — quadraui#1040 is already fixed and
-consumed (see the struck entry above); this is filed so a *future*
-resize/TOCTOU regression in `draw_editor` or its siblings has a driver-tier
-repro path instead of requiring another investigate-only issue like #203.
+> **This draft is retired: it is now a real issue.** Filed 2026-09-24 as
+> quadraui#1063 (milestone #9), after re-checking the gap at vimcode's pin
+> `3020d9e` and quadraui `develop`: `TuiDriver` still keeps its
+> `Terminal<TestBackend>` private, sizes it once in `new`, and has no
+> `resize`/`terminal()` accessor. The full draft text lives in that issue
+> now. It blocks no open vimcode issue; it exists so a future resize/TOCTOU
+> regression has a driver-tier repro path.
