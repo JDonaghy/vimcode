@@ -50,7 +50,13 @@ impl Engine {
     ///
     /// Worktree-local (#525's stated scope): both `target.branch` and
     /// `target.base` must already be resolvable in the local repository —
-    /// no fetch, no remote/ssh handling (that's #530).
+    /// still no fetch, no `ssh` handling, even after #530 (Track A Phase
+    /// 5). That issue's "review-where-the-code-is" mode is *vimcode itself
+    /// running on the worker box*, at which point `target.branch`/`.base`
+    /// are trivially local again — the only new data this method threads
+    /// through unexamined is `target.host`, purely for the provenance
+    /// footer (`render::paint_change_review_rung`) to show which machine
+    /// that local checkout happens to be on.
     pub fn open_branch_review(&mut self, target: BranchReviewTarget) -> Result<(), String> {
         let root = self
             .workspace_root
@@ -536,6 +542,7 @@ mod tests {
             .open_branch_review(BranchReviewTarget {
                 branch: "feature".to_string(),
                 base: base.clone(),
+                host: None,
             })
             .expect("branch review should build a change list");
 
@@ -547,6 +554,7 @@ mod tests {
             Some(BranchReviewTarget {
                 branch: "feature".to_string(),
                 base,
+                host: None,
             }),
             "opening a branch review must record it as the review target"
         );
@@ -596,6 +604,7 @@ mod tests {
             .open_branch_review(BranchReviewTarget {
                 branch: base.clone(),
                 base,
+                host: None,
             })
             .unwrap_err();
         assert!(err.contains("no changes"));
@@ -612,6 +621,7 @@ mod tests {
             .open_branch_review(BranchReviewTarget {
                 branch: "feature".to_string(),
                 base: "main".to_string(),
+                host: None,
             })
             .unwrap_err();
         assert!(err.contains("no workspace"));
@@ -678,6 +688,7 @@ mod tests {
         engine.review_target = Some(BranchReviewTarget {
             branch: branch.clone(),
             base: branch.clone(),
+            host: None,
         });
 
         let summary = engine
@@ -716,6 +727,7 @@ mod tests {
         engine.review_target = Some(BranchReviewTarget {
             branch: branch.clone(),
             base: branch.clone(),
+            host: None,
         });
 
         let action = engine.execute_command("GFinalize typed commit message");
@@ -762,6 +774,7 @@ mod tests {
         engine.review_target = Some(BranchReviewTarget {
             branch,
             base: "irrelevant".to_string(),
+            host: None,
         });
 
         let err = engine
@@ -818,6 +831,7 @@ mod tests {
         engine.review_target = Some(BranchReviewTarget {
             branch: branch.clone(),
             base: branch,
+            host: None,
         });
 
         let err = engine

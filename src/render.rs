@@ -10074,6 +10074,15 @@ pub fn paint_change_review_rung(
 /// review (no git branch at all) and the plain "no review has been opened
 /// this session" case, in which case the footer shows only the left
 /// segment, same as before this field existed.
+///
+/// #530 (Track A Phase 5, the fleet review seat) adds `target.host` to
+/// this line when the provider supplied one: "which worktree" (already
+/// covered by `root`) stops being unambiguous the moment vimcode itself
+/// can be *running on the worker box* rather than a local pull, so a
+/// reviewer needs "which machine" too — this is the whole of that issue's
+/// "provenance is unmistakable" acceptance bar. `host: None` (a provider
+/// with only one checkout, or an external "pull the branch locally
+/// first" flow) paints exactly the pre-#530 line, unchanged.
 fn branch_review_provenance_segment(
     engine: &Engine,
     theme: &Theme,
@@ -10084,8 +10093,15 @@ fn branch_review_provenance_segment(
         .as_deref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "?".to_string());
+    let text = match &target.host {
+        Some(host) => format!(
+            " reviewing branch '{}' on '{}' in {} ",
+            target.branch, host, root
+        ),
+        None => format!(" reviewing branch '{}' in {} ", target.branch, root),
+    };
     Some(quadraui::StatusBarSegment {
-        text: format!(" reviewing branch '{}' in {} ", target.branch, root),
+        text,
         fg: theme.status_fg,
         bg: theme.status_bg,
         bold: true,

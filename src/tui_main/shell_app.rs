@@ -15061,6 +15061,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #530 (Track A Phase 5, the fleet review seat): when the provider's
+    /// `"OpenReview"` response names a `host` (a fleet roster spans more
+    /// than one worker machine), the footer must paint *which machine*
+    /// alongside the branch/worktree — "which worktree" alone stops being
+    /// enough provenance once vimcode itself can be the process running
+    /// on that worker box (vimcode-over-ssh), not just a local pull.
+    ///
+    /// RED verified: with `host` dropped from
+    /// `branch_review_provenance_segment`'s formatted text (reverting to
+    /// the pre-#530 single-format line), this test fails — the screen
+    /// still shows the branch but never the machine name.
+    #[test]
+    fn board_review_footer_paints_host_provenance_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-host-provenance-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            let mut actions = std::collections::HashMap::new();
+            actions.insert(
+                "OpenReview".to_string(),
+                vec!["mock-review".to_string(), "{id}".to_string()],
+            );
+            registry[0].board.as_mut().unwrap().actions = actions;
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({
+                    "branch": "feature",
+                    "base": base,
+                    "host": "worker-3.fleet.local",
+                }),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 240, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("reviewing branch 'feature'")
+                && screen.contains("worker-3.fleet.local"),
+            "the diff surface footer must name which fleet machine this \
+             worktree lives on, not just the branch/path; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// AI: typing after focusing the panel must land in the `ChatController`
     /// (#819) input box and grow across multiple visual lines on `Enter` —
     /// the "multi-line growing input box" this panel's own doc comment

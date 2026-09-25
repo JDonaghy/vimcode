@@ -1,5 +1,45 @@
 # VimCode Project State
 
+**Last updated:** September 24, 2026 (#530, Track A Phase 5 — the fleet
+review seat). "vimcode-over-ssh" needs **no vimcode-side ssh/transport
+code at all** — the moat is that vimcode already works correctly when it
+is the process running (via a plain `ssh <host>`) on a worker's box, in
+that worktree's own checkout, so #525's `Engine::open_branch_review`
+already handles the "review-where-the-code-is" mode unmodified: both it
+and "pull-local" (#525's original default) resolve `target.branch`/
+`.base` as local git revisions either way. The only real gap was
+**provenance** — "which worktree" (already shown by the #528 footer) stops
+uniquely identifying "which checkout" once vimcode itself can *be* the
+process on a different machine. `src/core/tool_client.rs::
+BranchReviewTarget` gained `host: Option<String>` (`#[serde(default)]` —
+every #525-era provider response still parses unchanged), a purely
+descriptive label a fleet provider's roster fills in per card/assignment
+(picking which machine+assignment to review is just picking a board card,
+same as #525 — no new selection UI needed, since the provider already
+decides what `host` a given card resolves to). `render::
+branch_review_provenance_segment` now paints `"reviewing branch 'X' on
+'<host>' in <root>"` when `target.host` is `Some`, falling back to the
+pre-#530 `"reviewing branch 'X' in <root>"` line when it's `None` (a
+single-checkout provider, or a locally-pulled branch). New
+`board_review_footer_paints_host_provenance_via_shell_app` in
+`src/tui_main/shell_app.rs` (`TuiDriver`, real temp git repo, mock
+provider returning `{"branch", "base", "host"}`), RED-verified by
+temporarily reverting the segment to its single pre-#530 format string and
+confirming the assertion fails, then restoring it. New
+`mock_client_fetch_branch_review_target_parses_host_when_present` in
+`tool_client.rs` covers the parse side, plus a same-module assertion that
+a host-less fixture still parses `host: None` (the `#[serde(default)]`
+compatibility guarantee). `finalize_review_edits` (#528) needed **no
+change** — a plain `git push` from wherever the worktree physically is
+already *is* "the provider's existing remote path" the acceptance bar
+asks for, regardless of mode. No ACP/Node dependency anywhere in this
+diff (Track B stays untouched, per the issue's explicit warning). `cargo
+build`/`clippy -D warnings`/`fmt` clean on both feature lanes;
+`no_coord_vocabulary_in_core` still passes (an early doc-comment draft
+that named `coord pull` was caught by it and reworded to "an external
+'pull the branch locally first' flow" — the mechanism this issue's core
+code has no business knowing the name of).
+
 **Last updated:** September 24, 2026 (#528, Track A Phase 3 — push human
 review edits back to the branch). A review worktree opened via `Engine::
 open_branch_review` (#525) is a real checkout: nothing in this scope was
