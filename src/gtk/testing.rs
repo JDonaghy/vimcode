@@ -5162,6 +5162,46 @@ second line here
         );
     }
 
+    /// #529 (Track A Phase 4 — observability, "plan preview"): the plan
+    /// checklist painted in the AI panel must come from a source-agnostic
+    /// model, not one hard-wired to the ACP transport. This builds the
+    /// `AcpPlanEntry` list directly — no `parse_plan_update`, no
+    /// `"sessionUpdate"` envelope, no ACP session in play at all — the
+    /// same shape a future Board/remote-worker plan-preview command would
+    /// hand the engine through an entirely different feeder
+    /// (`ToolClient`, not ACP's NDJSON stdio). If the checklist render
+    /// path secretly depended on having come through ACP's parser, this
+    /// would paint nothing.
+    #[test]
+    fn ai_panel_renders_plan_built_without_any_acp_transport() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.acp_plan = vec![
+                crate::core::acp::AcpPlanEntry {
+                    content: "PLAN_STEP_DONE".to_string(),
+                    status: crate::core::acp::AcpPlanEntryStatus::Completed,
+                },
+                crate::core::acp::AcpPlanEntry {
+                    content: "PLAN_STEP_ACTIVE".to_string(),
+                    status: crate::core::acp::AcpPlanEntryStatus::InProgress,
+                },
+            ];
+        }
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        // A neutral event to force a repaint against the freshly-seeded plan.
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+
+        assert!(
+            h.driver.screen_contains("PLAN_STEP_DONE"),
+            "a plan built with no ACP envelope must still paint (#529)"
+        );
+        assert!(
+            h.driver.screen_contains("PLAN_STEP_ACTIVE"),
+            "every entry in a non-ACP-sourced plan must paint, not just the first"
+        );
+    }
+
     /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
     /// the AI panel transcript incrementally through the real
     /// `App`/`GtkDriver` stack — GTK's twin of
