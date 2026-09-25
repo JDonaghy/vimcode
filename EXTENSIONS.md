@@ -149,7 +149,7 @@ confirm = true                              # Confirm before running (irreversib
 [[board.actions]]
 name = "OpenReview"                         # Matches a `quadraui::BoardAction::OpenReview`
 label = "Start Review"
-command = ["my-tool", "review", "{id}"]
+command = ["my-tool", "review", "{id}"]     # Must print a review target as JSON — see below
 
 [board.verdict_commands]                    # Review verdicts (#526), keyed by the
 approve = ["my-tool", "verdict", "{id}",    # generic "approve"/"request-changes"/
@@ -158,6 +158,24 @@ request-changes = ["my-tool", "verdict",    # temp file holding the composed rev
   "{id}", "--changes", "--body-file",       # body (never inline)
   "{body_file}"]
 ```
+
+**`OpenReview` is the one special-cased action name (#525).** Every other
+action is fire-and-forget: vimcode runs the argv, surfaces its exit status
+and trimmed stdout on the status line, and refreshes the board.
+`OpenReview` instead expects its command to print a **review target** as
+JSON on stdout, which vimcode resolves into a local git diff and opens as
+an in-editor multi-file review (the same surface `:Review` uses):
+
+```json
+{ "branch": "issue-42-my-work", "base": "develop", "host": "worker-3" }
+```
+
+`branch` and `base` are required — both are resolved as **local** git
+revisions (three-dot diff), so the branch must already exist in the
+workspace vimcode has open. `host` is optional provenance: when the
+provider's roster spans more than one machine, it is painted in the review
+footer alongside the branch and worktree path, so a human editing files
+there can tell it isn't their own checkout.
 
 ### Field Reference
 
@@ -225,9 +243,9 @@ Each `[[board.actions]]` entry:
 |-------|------|-------------|
 | `name` | String | Action id. Also matched against `OpenIssue`/`OpenReview` to wire those `BoardAction` variants to a provider command. |
 | `label` | String | Optional human-readable label for the context menu / confirmation dialog (falls back to `name`). |
-| `command` | String[] | Argv to run. The literal token `{id}` in any argument is substituted with the acted-on card's id. An entry with an empty `command` is declared-but-not-runnable. |
+| `command` | String[] | Argv to run. The literal token `{id}` in any argument is substituted with the acted-on card's id. An entry with an empty `command` is declared-but-not-runnable. Stdout is surfaced on the status line, **except** for `name = "OpenReview"`, whose stdout must be a review-target JSON document (see above). |
 | `stages` | String[] | Optional column ids this action is valid in. Empty/omitted means valid in every stage. |
-| `key` | String | Optional single-key binding while the Board panel has focus and a card matching one of `stages` is selected (e.g. `"P"`/`"S"`/`"F"` for Test verdicts). |
+| `key` | String | Optional single-key binding while the Board panel has focus and a card matching one of `stages` is selected (e.g. `"P"`/`"S"`/`"F"` for Test verdicts). `R` is reserved by the host for "open the review for the selected card" and cannot be rebound. |
 | `confirm` | Bool | Whether firing this action needs a Yes/No confirmation first (default `false`) — set this for irreversible or metered actions (dispatch work, merge). |
 
 If no provider extension is installed/configured, the Board panel reports
