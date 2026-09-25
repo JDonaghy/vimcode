@@ -195,6 +195,18 @@ impl Engine {
             self.board_has_focus = false;
             return false;
         }
+        // Both backends' `engine_key_from_ui`/`map_gtk_key_name` translate
+        // an Enter keypress to the engine's own `"Return"`/`"KP_Enter"`
+        // convention (see `keys.rs`), but `quadraui::BoardModel::handle_key`
+        // matches the literal `"Enter"` — translate here (a real key never
+        // reaches this function spelled `"Enter"`), so pressing Enter on a
+        // selected card actually opens it instead of `handle_key` silently
+        // returning `None` for a key it doesn't recognise.
+        let key = if key == "Return" || key == "KP_Enter" {
+            "Enter"
+        } else {
+            key
+        };
         if let Some(action) = self
             .board_model
             .as_ref()

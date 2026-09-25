@@ -104,19 +104,22 @@ pub trait ToolClient: Send + Sync {
     fn run_json(&self, argv: &[String]) -> Result<serde_json::Value, ToolError>;
 
     /// Run `argv[0]` with `argv[1..]` as arguments, writing `stdin` to the
-    /// process's stdin and discarding its stdout. `Ok(())` on a zero exit,
-    /// a typed error otherwise. **Blocking**, same contract as
-    /// [`Self::run_json`]. Used for provider commands that *consume* a
-    /// payload rather than emit one — [`push_tool_document`] (#524) is the
-    /// first caller.
-    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError>;
+    /// process's stdin, and return its raw stdout on a zero exit (a typed
+    /// error otherwise). **Blocking**, same contract as [`Self::run_json`].
+    /// Used for provider commands that *consume* a payload — the stdout is
+    /// captured (not parsed as JSON here) so a caller like
+    /// [`push_tool_document`] (#524) can opportunistically read back
+    /// whatever the provider chose to echo (e.g. a newly-assigned document
+    /// id on create), without every such command being required to emit
+    /// anything at all.
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<Vec<u8>, ToolError>;
 
     /// Run `argv` with no stdin and discard stdout — a fire-and-forget
     /// command where only success/failure matters (e.g. a provider's
     /// declared follow-up command after a write). Default impl in terms of
     /// [`Self::run_with_stdin`]; implementors don't need to override it.
     fn run(&self, argv: &[String]) -> Result<(), ToolError> {
-        self.run_with_stdin(argv, &[])
+        self.run_with_stdin(argv, &[]).map(|_| ())
     }
 }
 
@@ -147,7 +150,7 @@ impl ToolClient for SubprocessToolClient {
         serde_json::from_slice(&output.stdout).map_err(|e| ToolError::InvalidJson(e.to_string()))
     }
 
-    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError> {
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<Vec<u8>, ToolError> {
         let (program, args) = argv.split_first().ok_or(ToolError::EmptyCommand)?;
 
         let mut cmd = hidden_command(program);
@@ -187,7 +190,7 @@ impl ToolClient for SubprocessToolClient {
             });
         }
 
-        Ok(())
+        Ok(output.stdout)
     }
 }
 
@@ -202,8 +205,14 @@ impl ToolClient for MockToolClient {
         self.0.clone()
     }
 
-    fn run_with_stdin(&self, _argv: &[String], _stdin: &[u8]) -> Result<(), ToolError> {
-        self.0.clone().map(|_| ())
+    fn run_with_stdin(&self, _argv: &[String], _stdin: &[u8]) -> Result<Vec<u8>, ToolError> {
+        // The canned value doubles as "stdout" here, JSON-encoded — lets a
+        // test exercise the create-path id-capture round trip (#524) with
+        // e.g. `MockToolClient(Ok(json!({"id": "99"})))` without a second,
+        // stdout-specific mock type.
+        self.0
+            .clone()
+            .map(|v| serde_json::to_vec(&v).unwrap_or_default())
     }
 }
 
@@ -246,7 +255,7 @@ impl ToolClient for RecordingToolClient {
         Ok(serde_json::Value::Null)
     }
 
-    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError> {
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<Vec<u8>, ToolError> {
         self.calls
             .lock()
             .expect("recording client mutex")
@@ -254,7 +263,7 @@ impl ToolClient for RecordingToolClient {
                 argv: argv.to_vec(),
                 stdin: Some(stdin.to_vec()),
             });
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -291,16 +300,26 @@ pub fn fetch_tool_document(
 
 /// Run `argv` via `client`, feeding it `{"title": title, "body": body}` on
 /// stdin — the write half of #524's buffer-authoring seam. Success is a
-/// zero exit; the provider's own stdout (if any) is not parsed here.
+/// zero exit; returns the provider-assigned id if the provider chose to
+/// echo one as `{"id": "..."}` on stdout — the create path (`{id}` was
+/// substituted empty) needs this to bind the now-existing document to its
+/// buffer, so a second `:w` updates it instead of re-running "create" with
+/// an empty id again. A provider that emits nothing, or emits something
+/// that isn't `{"id": "..."}`, is not an error — `None` either way, since
+/// nothing here requires a provider to echo anything at all.
 pub fn push_tool_document(
     client: &dyn ToolClient,
     argv: &[String],
     title: &str,
     body: &str,
-) -> Result<(), ToolError> {
+) -> Result<Option<String>, ToolError> {
     let payload = serde_json::json!({ "title": title, "body": body });
     let stdin = serde_json::to_vec(&payload).map_err(|e| ToolError::InvalidJson(e.to_string()))?;
-    client.run_with_stdin(argv, &stdin)
+    let stdout = client.run_with_stdin(argv, &stdin)?;
+    let id = serde_json::from_slice::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|v| v.get("id").and_then(|id| id.as_str()).map(str::to_string));
+    Ok(id)
 }
 
 // ─── The board contract ─────────────────────────────────────────────────────
@@ -498,6 +517,27 @@ mod tests {
             serde_json::from_slice(calls[0].stdin.as_deref().expect("stdin was sent")).unwrap();
         assert_eq!(sent["title"], "My title");
         assert_eq!(sent["body"], "My body");
+    }
+
+    /// #524 review follow-up: a provider that echoes `{"id": "..."}` on
+    /// stdout from the write command lets the create path learn the
+    /// newly-assigned id (`document_ops.rs`'s `save_tool_document_buffer`
+    /// is the actual consumer — this covers the plumbing it depends on).
+    #[test]
+    fn push_tool_document_returns_provider_assigned_id_from_stdout() {
+        let client = MockToolClient(Ok(serde_json::json!({ "id": "99" })));
+        let id = push_tool_document(&client, &["provider".to_string()], "t", "b").unwrap();
+        assert_eq!(id, Some("99".to_string()));
+    }
+
+    /// A provider that echoes nothing useful (or nothing at all) is not an
+    /// error — the create path just stays unbound, exactly like before this
+    /// echoing convention existed.
+    #[test]
+    fn push_tool_document_with_no_id_in_stdout_returns_none() {
+        let client = RecordingToolClient::default();
+        let id = push_tool_document(&client, &["provider".to_string()], "t", "b").unwrap();
+        assert_eq!(id, None);
     }
 
     #[test]

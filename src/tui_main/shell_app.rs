@@ -4380,6 +4380,31 @@ fn handle_focus_owner_key(
         return Reaction::Redraw;
     }
 
+    // ── Board panel (#521 / #524) ───────────────────────────────────────
+    // Missing until now: every other panel route above has its own
+    // `if route == FocusKeyRoute::X` arm here, but `Board` had none, so a
+    // real keypress (j/k/h/l/g/G/Enter) fell all the way through to the
+    // Explorer fallback below instead of ever reaching
+    // `Engine::dispatch_board_key_unified` — GTK's generic
+    // `dispatch_sidebar_panel_key` call (`app.rs`) already covered every
+    // route including this one, so the gap was TUI-only. Same
+    // char/named-key shape as the `ExtSidebar` arm above; Board needs
+    // nothing more (no shift resolution, no ctrl chord).
+    if route == render::FocusKeyRoute::Board {
+        let (key_name, unicode) = match key_val {
+            Key::Char(c) => (c.to_string(), Some(c)),
+            Key::Named(_) => (engine_name(), None),
+        };
+        let still_focused = render::dispatch_sidebar_panel_key(
+            engine, route, &key_name, unicode, None, ctrl, false,
+        )
+        .unwrap_or(true);
+        if !still_focused {
+            sidebar.has_focus = false;
+        }
+        return Reaction::Redraw;
+    }
+
     // ── Explorer (`FocusKeyRoute::Explorer`, the resolver's fallback) ───
     {
         use crate::core::engine::ExplorerKeyResult;
@@ -14774,6 +14799,66 @@ mod tests {
             after.map(|s| s.bg),
             "clicking 'Second card' must repaint it as selected \
              (a background change), before: {before:?}, after: {after:?}"
+        );
+    }
+
+    /// #524 Track A Phase 1 (review-requested driver coverage): `OpenIssue`
+    /// with a `[document]` provider configured opens an editable markdown
+    /// buffer in a new tab — asserted on the *rendered* screen, not on
+    /// `Engine::tool_document`/buffer state being populated (#587/#592's
+    /// lesson: state populated is not evidence of paint). Drives the real
+    /// key path (`Enter` on the selected board card ->
+    /// `quadraui::BoardModel::handle_key` -> `Engine::apply_board_action` ->
+    /// `Engine::open_tool_document` -> a new buffer/tab) through
+    /// `TuiDriver`, exactly the way a user would trigger it — mirroring
+    /// `board_panel_click_selects_the_clicked_card_via_shell_app`'s
+    /// no-coordinator-anywhere pattern, with a `[document]` provider layered
+    /// onto the same mock extension manifest a `[board]` provider already
+    /// installed (#522: one manifest can declare both).
+    #[test]
+    fn board_open_issue_paints_document_buffer_tab_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].document = Some(crate::core::extensions::DocumentProviderConfig {
+                read_command: vec!["mock".to_string(), "show".to_string(), "{id}".to_string()],
+                write_command: vec!["mock".to_string(), "write".to_string(), "{id}".to_string()],
+                write_follow_up: vec![],
+            });
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .set_document_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({
+                    "title": "Improve board host, in full",
+                    "body": "Full body seeded from the mock provider.\n",
+                }),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert_eq!(
+            render::route_focus_key(&app.engine, app.sidebar.has_focus),
+            render::FocusKeyRoute::Board,
+            "precondition: the Board panel must own the keyboard"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Improve board host, in full"),
+            "Enter on the selected card should paint a new tab with the \
+             seeded document title, not just set a status message; \
+             screen:\n{screen}"
         );
     }
 
