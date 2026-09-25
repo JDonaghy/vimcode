@@ -9,7 +9,9 @@
 //! dedicated repo-root test enforces mechanically.
 //!
 //! Phase 0 is read-only: only `SelectCard` and `OpenIssue` are handled below
-//! (selection + a status-line acknowledgement). Actions that would mutate a
+//! (selection + a status-line acknowledgement, or — when a `[document]`
+//! provider is configured, #524 — opening the card as an editable markdown
+//! buffer via `Engine::open_tool_document`). Actions that would mutate a
 //! provider's state (`Dispatch`, `RecordTest`, `Merge`, …) are #523's scope.
 
 use super::*;
@@ -115,28 +117,66 @@ impl Engine {
     /// and is a deliberate no-op here.
     pub fn apply_board_action(&mut self, action: quadraui::BoardAction) {
         use quadraui::BoardAction;
-        let Some(model) = self.board_model.as_mut() else {
+        // `OpenIssue` needs `&mut self` (to open a document buffer, #524),
+        // which can't happen while `model` still holds `self.board_model`
+        // borrowed — resolve it to an owned id first and handle it after
+        // the match, once that borrow has ended.
+        let open_issue_id = {
+            let Some(model) = self.board_model.as_mut() else {
+                return;
+            };
+            match action {
+                BoardAction::SelectCard(id) => {
+                    model.selected_card_id = Some(id);
+                    None
+                }
+                BoardAction::MoveSelection(dir) => {
+                    model.move_selection(dir);
+                    None
+                }
+                BoardAction::JumpToTop => {
+                    model.jump_to_top();
+                    None
+                }
+                BoardAction::JumpToBottom => {
+                    model.jump_to_bottom();
+                    None
+                }
+                BoardAction::OpenIssue(id) => Some(id),
+                // Provider-dispatch actions (#523) and context menu —
+                // no-op in this read-only phase.
+                BoardAction::ContextMenu(..) | BoardAction::OpenReview(_) => None,
+            }
+        };
+        let Some(id) = open_issue_id else {
             return;
         };
-        match action {
-            BoardAction::SelectCard(id) => model.selected_card_id = Some(id),
-            BoardAction::MoveSelection(dir) => model.move_selection(dir),
-            BoardAction::JumpToTop => model.jump_to_top(),
-            BoardAction::JumpToBottom => model.jump_to_bottom(),
-            BoardAction::OpenIssue(id) => {
-                let title = model
-                    .columns
-                    .iter()
-                    .flat_map(|c| c.cards.iter())
-                    .find(|c| c.id == id)
-                    .map(|c| c.title.clone());
-                if let Some(title) = title {
-                    self.message = format!("Board: {title}");
-                }
+        self.open_issue_card(id);
+    }
+
+    /// `OpenIssue`'s handling: if a document provider is configured
+    /// (#524), open the card as an editable markdown buffer seeded by the
+    /// provider's read command. Otherwise fall back to Phase 0's
+    /// acknowledgement — echo the cached card's title to the status line —
+    /// so a board with no document provider still gives feedback on open.
+    fn open_issue_card(&mut self, id: quadraui::WidgetId) {
+        if self.document_provider().is_some() {
+            match self.open_tool_document(id.as_str()) {
+                Ok(()) => {}
+                Err(e) => self.message = format!("Board: {e}"),
             }
-            // Provider-dispatch actions (#523) and context menu — no-op in
-            // this read-only phase.
-            BoardAction::ContextMenu(..) | BoardAction::OpenReview(_) => {}
+            return;
+        }
+        let title = self.board_model.as_ref().and_then(|model| {
+            model
+                .columns
+                .iter()
+                .flat_map(|c| c.cards.iter())
+                .find(|c| c.id == id)
+                .map(|c| c.title.clone())
+        });
+        if let Some(title) = title {
+            self.message = format!("Board: {title}");
         }
     }
 
@@ -310,6 +350,52 @@ mod tests {
         engine.board_model = Some(fixture_model());
         engine.apply_board_action(BoardAction::OpenIssue(WidgetId::new("card:2")));
         assert!(engine.message.contains("Another"));
+    }
+
+    /// #524: when a document provider is configured, `OpenIssue` opens the
+    /// card as an editable markdown buffer instead of just echoing its
+    /// title — "from a board card" in the issue's scope.
+    #[test]
+    fn apply_open_issue_opens_document_buffer_when_provider_configured() {
+        use crate::core::extensions::DocumentProviderConfig;
+        use crate::core::tool_client::MockToolClient;
+
+        let mut engine = Engine::new_for_test();
+        engine.board_model = Some(fixture_model());
+
+        let mut manifest = ExtensionManifest {
+            name: "mock-doc-provider".to_string(),
+            ..Default::default()
+        };
+        manifest.document = Some(DocumentProviderConfig {
+            read_command: vec!["mock".into(), "show".into(), "{id}".into()],
+            write_command: vec!["mock".into(), "write".into(), "{id}".into()],
+            write_follow_up: vec![],
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+        engine.set_document_client_for_test(MockToolClient(Ok(serde_json::json!({
+            "title": "Another, in full",
+            "body": "Full body from the provider.\n",
+        }))));
+
+        engine.apply_board_action(BoardAction::OpenIssue(WidgetId::new("card:2")));
+
+        assert!(
+            engine.active_buffer_state().tool_document.is_some(),
+            "OpenIssue should open a document buffer, not just set a message"
+        );
+        assert!(engine.buffer().to_string().contains("Another, in full"));
+        assert!(engine
+            .buffer()
+            .to_string()
+            .contains("Full body from the provider."));
     }
 
     #[test]

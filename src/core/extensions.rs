@@ -81,6 +81,11 @@ pub struct ExtensionManifest {
     /// `None` means this extension doesn't provide a board.
     #[serde(default)]
     pub board: Option<BoardProviderConfig>,
+    /// Declares this extension as a document provider for buffer-based
+    /// authoring (#524). `None` means this extension can't open its
+    /// documents as editable buffers.
+    #[serde(default)]
+    pub document: Option<DocumentProviderConfig>,
 }
 
 /// Comment style override specified in an extension manifest `[comment]` section.
@@ -125,6 +130,74 @@ pub struct BoardProviderConfig {
 
 fn default_board_poll_interval_secs() -> u64 {
     30
+}
+
+/// Declares an extension as a document provider (#524, Phase 1): its
+/// documents (e.g. issues) can be opened as real markdown scratch buffers
+/// for editing, with edits pushed back through a write command on `:w`.
+///
+/// Generic on purpose, same spirit as [`BoardProviderConfig`] — names no
+/// particular provider or lifecycle vocabulary. Any extension can point
+/// `read_command`/`write_command` at external tools that speak vimcode's
+/// document contract (`crate::core::tool_client::ToolDocument`) and get
+/// working buffer-based authoring.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct DocumentProviderConfig {
+    /// Argv to run to fetch a document's body for editing. The literal
+    /// token `{id}` in any argument is replaced with the document id at
+    /// dispatch time. Must emit a `ToolDocument` JSON document on stdout
+    /// and exit zero.
+    #[serde(default)]
+    pub read_command: Vec<String>,
+    /// Argv to run to push an edited document's title/body back. `{id}` is
+    /// replaced with the document id, or the empty string for a
+    /// not-yet-created document (the new-document flow: this same command
+    /// doubles as "create", the provider script tells the two apart by
+    /// whether `{id}` came through empty). The edited `{"title", "body"}`
+    /// payload is delivered on stdin as JSON, never substituted into argv
+    /// (titles/bodies are free text — unsafe to splice into a command
+    /// line).
+    #[serde(default)]
+    pub write_command: Vec<String>,
+    /// Argv to run after a successful write on an *already-existing*
+    /// document (never on the create path — see `write_command`'s doc).
+    /// `{id}` is replaced with the document id. This is where a bundle's
+    /// own lifecycle transition lives (e.g. a pipeline-management bundle
+    /// flipping a "refining" document to "ready") — this struct only
+    /// knows "run this argv after that one succeeds," no lifecycle
+    /// vocabulary itself.
+    #[serde(default)]
+    pub write_follow_up: Vec<String>,
+}
+
+impl DocumentProviderConfig {
+    /// Resolve the argv to run to fetch `id`'s body, substituting `{id}`
+    /// in every argument. `None` if this provider declared no read
+    /// command.
+    pub fn read_argv(&self, id: &str) -> Option<Vec<String>> {
+        Self::substitute(&self.read_command, id)
+    }
+
+    /// Resolve the argv to run to push an edit back. `id` is `None` for
+    /// the new-document flow (substitutes the empty string). `None` if
+    /// this provider declared no write command.
+    pub fn write_argv(&self, id: Option<&str>) -> Option<Vec<String>> {
+        Self::substitute(&self.write_command, id.unwrap_or(""))
+    }
+
+    /// Resolve the argv to run after a successful write on an existing
+    /// document. `None` if this provider declared no follow-up command
+    /// (a provider is not required to have one).
+    pub fn write_follow_up_argv(&self, id: &str) -> Option<Vec<String>> {
+        Self::substitute(&self.write_follow_up, id)
+    }
+
+    fn substitute(template: &[String], id: &str) -> Option<Vec<String>> {
+        if template.is_empty() {
+            return None;
+        }
+        Some(template.iter().map(|arg| arg.replace("{id}", id)).collect())
+    }
 }
 
 impl BoardProviderConfig {
@@ -793,6 +866,74 @@ OpenIssue = ["example-tool", "open", "{id}"]
             ])
         );
         assert_eq!(board.action_argv("Merge", "card:42"), None);
+    }
+
+    #[test]
+    fn document_provider_config_defaults_when_absent_from_toml() {
+        let toml = r#"
+name = "rust"
+display_name = "Rust Language Support"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        assert!(m.document.is_none());
+    }
+
+    #[test]
+    fn document_provider_config_parses_from_toml() {
+        let toml = r#"
+name = "example-provider"
+display_name = "Example Document Provider"
+
+[document]
+read_command = ["example-tool", "show", "{id}"]
+write_command = ["example-tool", "write", "{id}"]
+write_follow_up = ["example-tool", "ready", "{id}"]
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let doc = m
+            .document
+            .expect("document provider config should be present");
+        assert_eq!(
+            doc.read_argv("42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "show".to_string(),
+                "42".to_string()
+            ])
+        );
+        assert_eq!(
+            doc.write_argv(Some("42")),
+            Some(vec![
+                "example-tool".to_string(),
+                "write".to_string(),
+                "42".to_string()
+            ])
+        );
+        // New-document flow: no id yet, `{id}` substitutes to empty.
+        assert_eq!(
+            doc.write_argv(None),
+            Some(vec![
+                "example-tool".to_string(),
+                "write".to_string(),
+                "".to_string()
+            ])
+        );
+        assert_eq!(
+            doc.write_follow_up_argv("42"),
+            Some(vec![
+                "example-tool".to_string(),
+                "ready".to_string(),
+                "42".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn document_provider_config_no_declared_command_is_none() {
+        let doc = DocumentProviderConfig::default();
+        assert_eq!(doc.read_argv("42"), None);
+        assert_eq!(doc.write_argv(Some("42")), None);
+        assert_eq!(doc.write_follow_up_argv("42"), None);
     }
 
     #[test]

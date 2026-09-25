@@ -510,6 +510,11 @@ impl Engine {
         if self.active_buffer_state().is_registries_buf {
             return self.save_registries_buffer();
         }
+        // Provider document buffer (#524): push title/body back through
+        // the bound provider's write command instead of disk.
+        if self.active_buffer_state().tool_document.is_some() {
+            return self.save_tool_document_buffer();
+        }
 
         // Promote preview on save
         let active_id = self.active_buffer_id();

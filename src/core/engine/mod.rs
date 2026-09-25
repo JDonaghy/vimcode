@@ -4086,6 +4086,18 @@ pub struct Engine {
     /// consumer is testable with no provider binary installed anywhere.
     pub(crate) board_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
 
+    // --- Provider document buffers (#524, Phase 1) ---
+    //
+    // Author/refine a provider's documents as real markdown buffers —
+    // sourced from whatever provider an extension declares via the #522
+    // seam (`ExtensionManifest::document`). No coordinator vocabulary
+    // lives here; see `crate::core::tool_client`'s module doc.
+    /// The [`crate::core::tool_client::ToolClient`] used to run the
+    /// document provider's read/write/follow-up commands. Real subprocess
+    /// by default; test-swappable via
+    /// [`Self::set_document_client_for_test`].
+    pub(crate) document_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
+
     // --- Settings sidebar panel state ---
     /// Whether the Settings sidebar panel has keyboard focus.
     pub settings_has_focus: bool,
@@ -4892,6 +4904,7 @@ impl Engine {
             board_last_refresh: None,
             board_layout: std::cell::RefCell::new(None),
             board_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
+            document_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
             settings_has_focus: false,
             settings_selected: 0,
             settings_scroll_top: 0,
@@ -5840,6 +5853,7 @@ mod buffers;
 mod dap_ops;
 pub use dap_ops::DEBUG_BUTTON_IDS;
 mod digraph_ops;
+mod document_ops;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
 mod execute;

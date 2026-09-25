@@ -8,6 +8,18 @@ use super::buffer::{Buffer, BufferId};
 use super::cursor::Cursor;
 use super::syntax::Syntax;
 
+/// Binds a scratch buffer to a provider document (#524): the id (if the
+/// document already exists on the provider — `None` for the new-document
+/// flow) plus the write/follow-up argv templates captured at open time, so
+/// `:w` can push edits back without re-resolving the provider (which may
+/// have been reconfigured or uninstalled since the buffer was opened).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolDocumentBinding {
+    pub id: Option<String>,
+    pub write_command: Vec<String>,
+    pub write_follow_up: Vec<String>,
+}
+
 /// Upper bound on line count for tree-sitter highlighting.
 ///
 /// Buffers with more lines than this skip the expensive `Syntax::parse()` call
@@ -611,6 +623,11 @@ pub struct BufferState {
     pub cmdline_is_search: bool,
     /// Display name for plugin-created scratch buffers (shown in tab bar).
     pub scratch_name: Option<String>,
+    /// Set when this buffer is a provider document opened for editing
+    /// (#524) — `:w` pushes the title/body back through the bound
+    /// provider's write command instead of writing to disk. `None` for
+    /// every ordinary buffer.
+    pub tool_document: Option<ToolDocumentBinding>,
     /// Override display name without brackets (e.g. for diff tabs).
     pub diff_label: Option<String>,
     /// Last-known modification time of the file on disk.
@@ -670,6 +687,7 @@ impl BufferState {
             is_cmdline_buf: false,
             cmdline_is_search: false,
             scratch_name: None,
+            tool_document: None,
             diff_label: None,
             file_mtime: None,
             file_change_warned: false,
@@ -716,6 +734,7 @@ impl BufferState {
             is_cmdline_buf: false,
             cmdline_is_search: false,
             scratch_name: None,
+            tool_document: None,
             diff_label: None,
             file_mtime,
             file_change_warned: false,
