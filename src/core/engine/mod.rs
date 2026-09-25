@@ -74,6 +74,12 @@ pub struct TerminalSlot {
     /// exiting/closed pane was a login flow (never a regular shell or an
     /// extension install) and route to `Engine::acp_finish_terminal_login`.
     pub acp_auth_pending: bool,
+    /// #1396: set once `poll_terminal` has finalized this pane's install
+    /// (registered the LSP/DAP server or reported a failure) from the exit-code
+    /// scratch file, so the pane can keep running its "Press Enter to close…"
+    /// prompt without a second `finalize_install_from_terminal` firing when the
+    /// shell itself exits afterwards. Meaningless when `install_ctx` is `None`.
+    pub install_finalized: bool,
 }
 
 /// How a register's contents were captured, and therefore how `p`/`P` put them
