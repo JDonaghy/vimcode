@@ -532,6 +532,19 @@ impl Engine {
             return self.cmd_git_push();
         }
 
+        // Handle :GFinalize [message] — #528 Track A Phase 3: commit any
+        // working-tree edits made while reviewing a branch and push them,
+        // the "finalize review edits" action. See `Engine::
+        // finalize_review_edits` for the safety semantics (no-force push,
+        // refuses to run if the worktree has moved off the reviewed
+        // branch).
+        if cmd == "GFinalize" {
+            return self.cmd_git_finalize_review(None);
+        }
+        if let Some(msg) = cmd.strip_prefix("GFinalize ") {
+            return self.cmd_git_finalize_review(Some(msg.trim()));
+        }
+
         // Handle :Gblame / :Gb
         if cmd == "Gblame" || cmd == "Gb" {
             return self.cmd_git_blame();

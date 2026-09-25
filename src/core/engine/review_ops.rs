@@ -56,6 +56,12 @@ impl Engine {
             .workspace_root
             .clone()
             .ok_or_else(|| "no workspace open".to_string())?;
+        // Recorded *before* the diff build can fail below, and left set
+        // even on that failure: a provider that resolved a real
+        // branch/base the local repo can't currently diff (wrong worktree,
+        // stale fetch) is exactly the provenance a human is about to need
+        // while they go figure out why, not something to silently drop.
+        self.review_target = Some(target.clone());
         // `changed_files_between` now distinguishes "git failure" (`None`
         // — unknown ref, bad revision, no repo) from "a real, empty diff"
         // (`Some(vec![])`), so a misconfigured provider's bogus branch/base
@@ -94,6 +100,77 @@ impl Engine {
             .collect();
         self.open_change_review(changes);
         Ok(())
+    }
+
+    /// Commit any working-tree edits made while reviewing a branch, and
+    /// push them — the "human edits, pushed back" leg of #528 (Track A
+    /// Phase 3), modelled on coordinator's remote-fix `finalize`: a
+    /// commit, then a plain (non-force) [`crate::core::git::push`], so a
+    /// rejected push never loses anything — the commit, and the worktree
+    /// it lives in, are left exactly where they are for a human to
+    /// resolve and retry. Reachable as `:GFinalize [message]` (`execute.
+    /// rs`); `message` defaults to `"Review edits"` when omitted.
+    ///
+    /// Safety check: if a branch review was opened this session
+    /// (`self.review_target`, set by [`Self::open_branch_review`] and left
+    /// in place after the diff surface itself is closed — see that
+    /// field's own doc), refuses to push unless the worktree is *still*
+    /// on that exact branch. Nothing stops a human from `git checkout`ing
+    /// elsewhere in the same worktree mid-review and then hitting
+    /// finalize, which would otherwise push edits meant for the reviewed
+    /// branch onto whatever branch happens to be checked out — precisely
+    /// the "must know which branch they're editing" footgun the issue
+    /// calls out. No review opened this session (`review_target: None`)
+    /// — finalize is then a generic "commit and push whatever's here",
+    /// same as `:Gcommit` + `:Gpush` already are, so there is nothing to
+    /// check against.
+    pub fn finalize_review_edits(&mut self, message: &str) -> Result<String, String> {
+        let dir = self
+            .workspace_root
+            .clone()
+            .unwrap_or_else(|| self.git_dir());
+        if let Some(target) = &self.review_target {
+            let current = crate::core::git::current_branch(&dir);
+            if current.as_deref() != Some(target.branch.as_str()) {
+                return Err(format!(
+                    "refusing to finalize: worktree is on '{}', not the reviewed branch '{}' \
+                     — checkout '{}' first",
+                    current.as_deref().unwrap_or("(detached/unknown)"),
+                    target.branch,
+                    target.branch,
+                ));
+            }
+        }
+        let has_changes = !crate::core::git::status_detailed(&dir).is_empty();
+        if has_changes {
+            crate::core::git::stage_all(&dir)?;
+            crate::core::git::commit(&dir, message)?;
+            let ids: Vec<_> = self.buffer_manager.list();
+            for id in ids {
+                self.refresh_git_diff(id);
+            }
+            self.git_branch = crate::core::git::current_branch(&dir);
+        }
+        match crate::core::git::push(&dir) {
+            Ok(summary) => Ok(if has_changes {
+                format!(
+                    "Finalized review edits and pushed: {}",
+                    if summary.is_empty() {
+                        "ok".to_string()
+                    } else {
+                        summary
+                    }
+                )
+            } else if summary.is_empty() {
+                "Nothing to commit; branch already up to date with origin.".to_string()
+            } else {
+                summary
+            }),
+            Err(e) => Err(format!(
+                "push failed — commit and worktree preserved, retry with :GFinalize once \
+                 resolved: {e}"
+            )),
+        }
     }
 
     /// Close the change-review surface without deciding anything left
@@ -458,9 +535,21 @@ mod tests {
         engine
             .open_branch_review(BranchReviewTarget {
                 branch: "feature".to_string(),
-                base,
+                base: base.clone(),
             })
             .expect("branch review should build a change list");
+
+        // Provenance (#528): opening a branch review must record which
+        // branch/base it resolved, so the UI (and `finalize_review_edits`'s
+        // safety check) can tell the human which branch they're on.
+        assert_eq!(
+            engine.review_target,
+            Some(BranchReviewTarget {
+                branch: "feature".to_string(),
+                base,
+            }),
+            "opening a branch review must record it as the review target"
+        );
 
         let review = engine.change_review.as_ref().expect("surface should open");
         let mut paths: Vec<_> = review
@@ -526,6 +615,234 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.contains("no workspace"));
+    }
+
+    // ── finalize_review_edits / :GFinalize (#528, Track A Phase 3) ─────────
+
+    /// Small `git -C dir <args>` runner shared by the finalize tests below
+    /// — same shape as `init_branch_review_repo`'s local closure, just
+    /// hoisted out since two tests need it against two different dirs.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} (in {}) failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A working checkout with a real bare "origin" remote and an
+    /// established upstream-tracking branch — what plain `git push` (no
+    /// `-u`, no explicit refspec) needs to succeed at all, since a review
+    /// worktree is expected to already have this set up by whatever
+    /// created it (`GWorktreeAdd`/coordinator), not by `finalize_review_
+    /// edits` itself. Returns `(work_dir, remote_dir, branch_name)`.
+    fn init_repo_with_remote_tracking_branch(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String) {
+        let remote_dir = unique_temp_dir(&format!("{tag}-remote"));
+        let work_dir = unique_temp_dir(&format!("{tag}-work"));
+        git_in(&remote_dir, &["init", "--bare", "-q"]);
+        git_in(&work_dir, &["init", "-q"]);
+        git_in(&work_dir, &["config", "user.email", "t@t.com"]);
+        git_in(&work_dir, &["config", "user.name", "T"]);
+        std::fs::write(work_dir.join("f.txt"), "base\n").unwrap();
+        git_in(&work_dir, &["add", "."]);
+        git_in(&work_dir, &["commit", "-q", "-m", "base"]);
+        git_in(
+            &work_dir,
+            &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+        );
+        let branch = crate::core::git::current_branch(&work_dir).expect("branch after init");
+        git_in(&work_dir, &["push", "-q", "-u", "origin", &branch]);
+        (work_dir, remote_dir, branch)
+    }
+
+    /// Happy path: an edit made in the workspace while `review_target` is
+    /// set gets committed and pushed to the real remote — asserted against
+    /// the *pushed content at the remote*, not just "finalize returned
+    /// Ok", so this would fail if finalize silently no-opped the push.
+    #[test]
+    fn finalize_review_edits_commits_and_pushes_to_origin() {
+        let (work_dir, remote_dir, branch) =
+            init_repo_with_remote_tracking_branch("finalize-happy");
+        std::fs::write(work_dir.join("f.txt"), "base\nedited by reviewer\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(work_dir.clone());
+        engine.review_target = Some(BranchReviewTarget {
+            branch: branch.clone(),
+            base: branch.clone(),
+        });
+
+        let summary = engine
+            .finalize_review_edits("fix a typo during review")
+            .expect("finalize should succeed against a real, reachable remote");
+        assert!(
+            summary.contains("Finalized"),
+            "unexpected summary: {summary}"
+        );
+
+        let remote_content = crate::core::git::show_file_at_ref(&remote_dir, &branch, "f.txt")
+            .expect("edited file must exist at the pushed remote ref");
+        assert_eq!(
+            remote_content, "base\nedited by reviewer\n",
+            "the remote branch must carry the reviewer's edit, not just some push"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// The user-facing surface for all of the above: `:GFinalize <message>`
+    /// must actually reach [`Engine::finalize_review_edits`] with the
+    /// typed message as the commit message (checked at the pushed remote,
+    /// not just "some command ran") and report the result on `self.
+    /// message`, the same status-line contract every other `:G*` command
+    /// uses.
+    #[test]
+    fn gfinalize_command_commits_the_typed_message_and_pushes() {
+        let (work_dir, remote_dir, branch) =
+            init_repo_with_remote_tracking_branch("finalize-command");
+        std::fs::write(work_dir.join("f.txt"), "base\nedited via command\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(work_dir.clone());
+        engine.review_target = Some(BranchReviewTarget {
+            branch: branch.clone(),
+            base: branch.clone(),
+        });
+
+        let action = engine.execute_command("GFinalize typed commit message");
+        assert_ne!(
+            action,
+            EngineAction::Error,
+            "GFinalize must be a recognised command: {}",
+            engine.message
+        );
+        assert!(
+            engine.message.contains("Finalized"),
+            "unexpected status message: {}",
+            engine.message
+        );
+
+        let remote_head = crate::core::git::git_log(&remote_dir, 1);
+        assert_eq!(
+            remote_head.first().map(|e| e.message.as_str()),
+            Some("typed commit message"),
+            "the pushed remote commit must carry the message typed after :GFinalize"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// Safety check: a review worktree that has since been checked out to
+    /// a different branch than the one under review must refuse to
+    /// finalize rather than silently pushing the human's edit onto
+    /// whichever branch happens to be checked out — the provenance
+    /// footgun #528 calls out. No commit/push may happen at all.
+    #[test]
+    fn finalize_review_edits_refuses_when_worktree_left_the_reviewed_branch() {
+        let (work_dir, remote_dir, branch) =
+            init_repo_with_remote_tracking_branch("finalize-wrong-branch");
+        git_in(
+            &work_dir,
+            &["checkout", "-q", "-b", "not-the-reviewed-branch"],
+        );
+        std::fs::write(work_dir.join("f.txt"), "an edit made on the wrong branch\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(work_dir.clone());
+        engine.review_target = Some(BranchReviewTarget {
+            branch,
+            base: "irrelevant".to_string(),
+        });
+
+        let err = engine
+            .finalize_review_edits("should never land")
+            .unwrap_err();
+        assert!(
+            err.contains("refusing to finalize"),
+            "unexpected error: {err}"
+        );
+        // Nothing was committed: the edit is still an unstaged, uncommitted
+        // change on disk.
+        assert_eq!(
+            crate::core::git::status_detailed(&work_dir).len(),
+            1,
+            "the edit must remain an uncommitted working-tree change"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// A rejected (non-fast-forward) push must not lose the commit: the
+    /// worktree keeps the real local commit for the human to resolve and
+    /// retry, exactly the acceptance bar's "a failed push preserves the
+    /// worktree and its commits."
+    #[test]
+    fn finalize_review_edits_failed_push_preserves_the_local_commit() {
+        let (work_dir, remote_dir, branch) =
+            init_repo_with_remote_tracking_branch("finalize-reject");
+
+        // A second clone pushes first, moving `origin/<branch>` ahead of
+        // what `work_dir` knows about — the next `work_dir` push is a
+        // real, rejected non-fast-forward.
+        let other_dir = unique_temp_dir("finalize-reject-other");
+        let _ = std::fs::remove_dir_all(&other_dir);
+        git_in(
+            remote_dir.parent().unwrap(),
+            &[
+                "clone",
+                "-q",
+                remote_dir.to_str().unwrap(),
+                other_dir.to_str().unwrap(),
+            ],
+        );
+        git_in(&other_dir, &["config", "user.email", "t@t.com"]);
+        git_in(&other_dir, &["config", "user.name", "T"]);
+        std::fs::write(other_dir.join("f.txt"), "raced ahead\n").unwrap();
+        git_in(&other_dir, &["commit", "-q", "-am", "raced ahead"]);
+        git_in(&other_dir, &["push", "-q"]);
+
+        std::fs::write(work_dir.join("f.txt"), "base\nlocal edit\n").unwrap();
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(work_dir.clone());
+        engine.review_target = Some(BranchReviewTarget {
+            branch: branch.clone(),
+            base: branch,
+        });
+
+        let err = engine
+            .finalize_review_edits("local edit during review")
+            .expect_err("push must be rejected as non-fast-forward");
+        assert!(
+            err.contains("push failed") && err.contains("preserved"),
+            "unexpected error: {err}"
+        );
+        // The commit itself must still exist locally — finalize does not
+        // roll it back just because the push failed.
+        let log = crate::core::git::git_log(&work_dir, 5);
+        assert!(
+            log.iter()
+                .any(|e| e.message.contains("local edit during review")),
+            "the local commit must survive a rejected push, got log: {log:?}"
+        );
+        assert!(
+            crate::core::git::status_detailed(&work_dir).is_empty(),
+            "the edit was committed locally even though the push failed"
+        );
+
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     #[test]
