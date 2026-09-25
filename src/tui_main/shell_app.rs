@@ -19728,7 +19728,7 @@ mod tests {
         );
 
         let (r, g, b) = crate::icons::file_icon_color_for_name("main.rs");
-        let expected_rust_fg = quadraui::tui::ratatui_color(quadraui::Color::from_rgb(r, g, b));
+        let expected_rust_fg = quadraui::tui::ratatui_color(Color::from_rgb(r, g, b));
         let default_fg =
             quadraui::tui::ratatui_color(super::quadraui_tui::q_theme(&theme).foreground);
 
