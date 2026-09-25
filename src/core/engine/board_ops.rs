@@ -1027,6 +1027,27 @@ mod tests {
         wait_for_provider_command("board action", || engine.poll_board_action());
     }
 
+    /// The argv of every recorded call that is **not** the mock provider's
+    /// `refresh_command`.
+    ///
+    /// [`Engine::poll_board_action`] deliberately kicks off a follow-up
+    /// [`Engine::board_refresh`] once an action's result lands (#523's
+    /// "board refreshed on next poll"), and that refresh runs on its own
+    /// background thread through this same client. Whether it has reached
+    /// the recorder by the time the test reads the log is a race against
+    /// the OS scheduler — `recorder.calls().len()` is legitimately 1 *or*
+    /// 2 — so an assertion about *the action* must not count it.
+    /// `poll_board_action_triggers_a_follow_up_provider_refresh` covers the
+    /// refresh itself, deterministically, by waiting for it.
+    fn action_argvs(recorder: &RecordingToolClient) -> Vec<Vec<String>> {
+        recorder
+            .calls()
+            .into_iter()
+            .map(|c| c.argv)
+            .filter(|argv| argv.first().map(String::as_str) != Some("mock-provider"))
+            .collect()
+    }
+
     fn dispatch_action(name: &str, command: Vec<&str>) -> BoardActionDef {
         BoardActionDef {
             name: name.to_string(),
@@ -1122,10 +1143,10 @@ mod tests {
         assert!(started);
         wait_for_board_action(&mut engine);
 
-        let calls = recorder.calls();
+        let calls = action_argvs(&recorder);
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].argv,
+            calls[0],
             vec![
                 "mock".to_string(),
                 "assign".to_string(),
@@ -1138,6 +1159,34 @@ mod tests {
             "exit status/stdout must be surfaced to the user; message: {}",
             engine.message
         );
+    }
+
+    /// The other half of [`Engine::poll_board_action`] (#523's "board
+    /// refreshed on next poll"): once the action's result lands, the
+    /// provider's `refresh_command` must be dispatched too, so the panel
+    /// reflects whatever the action changed. Waited on explicitly rather
+    /// than asserted as a call count — the refresh runs on its own thread,
+    /// which is exactly why `action_argvs` filters it out elsewhere.
+    #[test]
+    fn poll_board_action_triggers_a_follow_up_provider_refresh() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![dispatch_action("assign", vec!["mock", "assign", "{id}"])],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        assert!(engine.run_board_action_by_name("assign", WidgetId::new("card:2")));
+        wait_for_board_action(&mut engine);
+
+        wait_for_provider_command("follow-up board refresh", || {
+            recorder
+                .calls()
+                .iter()
+                .any(|c| c.argv == vec!["mock-provider".to_string()])
+        });
     }
 
     #[test]
@@ -1182,10 +1231,10 @@ mod tests {
         engine.process_dialog_result(&dlg.tag, "yes", None);
         wait_for_board_action(&mut engine);
 
-        let calls = recorder.calls();
+        let calls = action_argvs(&recorder);
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].argv,
+            calls[0],
             vec![
                 "mock".to_string(),
                 "merge".to_string(),
@@ -1241,10 +1290,10 @@ mod tests {
         assert!(still_focused);
         wait_for_board_action(&mut engine);
 
-        let calls = recorder.calls();
+        let calls = action_argvs(&recorder);
         assert_eq!(calls.len(), 1);
         assert_eq!(
-            calls[0].argv,
+            calls[0],
             vec!["mock".to_string(), "pass".to_string(), "card:1".to_string()]
         );
     }
