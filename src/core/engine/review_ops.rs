@@ -56,13 +56,29 @@ impl Engine {
             .workspace_root
             .clone()
             .ok_or_else(|| "no workspace open".to_string())?;
-        let paths = crate::core::git::changed_files_between(&root, &target.base, &target.branch);
-        if paths.is_empty() {
-            return Err(format!(
-                "no changes between '{}' and '{}'",
-                target.base, target.branch
-            ));
-        }
+        // `changed_files_between` now distinguishes "git failure" (`None`
+        // — unknown ref, bad revision, no repo) from "a real, empty diff"
+        // (`Some(vec![])`), so a misconfigured provider's bogus branch/base
+        // name surfaces as its own message rather than silently reading
+        // the same as "nothing changed" (review non-blocking finding,
+        // #525).
+        let paths =
+            match crate::core::git::changed_files_between(&root, &target.base, &target.branch) {
+                Some(paths) if !paths.is_empty() => paths,
+                Some(_) => {
+                    return Err(format!(
+                        "no changes between '{}' and '{}'",
+                        target.base, target.branch
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "could not diff '{}'...'{}' — check the branch/base names \
+                         the provider returned",
+                        target.base, target.branch
+                    ))
+                }
+            };
         let changes = paths
             .into_iter()
             .map(|path| {
