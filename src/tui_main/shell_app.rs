@@ -9421,6 +9421,18 @@ mod tests {
             "this test covers the unsplit single-group tab bar arm"
         );
         let mut driver = driver_with_shell(app, config(), 100, 24);
+        // Settle the sidebar width before measuring anything — see hazard (2)
+        // in `tui_editor_text_drag_paints_a_selection_through_the_shared_drag_router`'s
+        // doc comment. `driver_with_shell` paints frame 1 from the [`config`]
+        // helper, which leaves quadraui's generic 20-column
+        // `default_sidebar_width` in place, and `handle()`'s end-of-dispatch
+        // `set_sidebar_width(self.sidebar_width)` sync re-widens it to
+        // `SIDEBAR_WIDTH` (30) on the first event of *any* kind. Without this
+        // no-op key first, every tab column measured off frame 1 is 10 cells
+        // stale from frame 2 onwards, so `mouse_down` lands on a tab slot the
+        // press itself has already moved — a machine-dependent failure that
+        // only shows up when the ambient session leaves the sidebar visible.
+        driver.press_named(quadraui::NamedKey::Escape);
 
         // `find_bounds` scans rows top-down and the tab bar always paints on
         // row 0 (see `render_content_paints_single_group_tab_bar_via_shell_app`
@@ -9508,6 +9520,10 @@ mod tests {
     fn tui_tab_drag_into_another_group_merges_and_collapses_the_source() {
         let (app, dir) = app_with_two_file_groups("1370merge");
         let mut driver = driver_with_shell(app, config(), 120, 24);
+        // Settle the sidebar width before measuring — same frame-1
+        // `default_sidebar_width` staleness the sibling reorder test above
+        // guards against; see its comment for the full mechanism.
+        driver.press_named(quadraui::NamedKey::Escape);
 
         let left_before = driver
             .find_bounds("left1039.txt")
@@ -9630,6 +9646,13 @@ mod tests {
         // rejects drops left of) at once, without hand-deriving the exact
         // painted sidebar width.
         let mut driver = driver_with_shell(app, config(), 300, 24);
+        // Settle the sidebar width before measuring — same frame-1
+        // `default_sidebar_width` staleness the sibling reorder test above
+        // guards against; see its comment for the full mechanism. It matters
+        // doubly here: the drop point is derived from `a_before.x`, and a
+        // 10-cell-stale origin can push it left of `editor_left`, which
+        // `resolve_tui_tab_drop_zone` rejects outright.
+        driver.press_named(quadraui::NamedKey::Escape);
 
         let a_before = driver
             .find_bounds("only1370a.txt")
