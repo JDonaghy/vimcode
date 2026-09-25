@@ -1873,36 +1873,208 @@ mod tests {
         },
     }
 
-    // ── #1361: hit-testing must account for the reserved hint row ───────
+    // ── #1361 review: hit-testing must account for the reserved hint row ──
     //
     // The acceptance bar for this half names `sweep_hit_band_integrity`
-    // — tried against the SC panel's "STAGED CHANGES" section header
-    // (focused, hint row reserved), fingerprinting on whether
+    // — tried first against the SC panel's "STAGED CHANGES" section
+    // header (focused, hint row reserved), fingerprinting on whether
     // "sc1361file.txt" stayed visible across the section's collapse
-    // toggle. It was dropped, and so was its `_resetting` twin (built for
-    // exactly the "same-spot restore click" confound this widget has,
-    // per `src/gtk/testing.rs`'s existing `hit_band_sweep_971` module):
-    // both report the identical alternating true/false/true/false/true
-    // outcome pattern, at the identical y-offsets, on `gtk` — and it
-    // reproduces byte-for-byte with `has_focus: false` (no hint row
-    // reserved at all). That rules out both the click-restore mechanism
-    // and this issue's own fix as the cause: it is a pre-existing,
+    // toggle. That attempt (and its `_resetting` twin, built for exactly
+    // the "same-spot restore click" confound this widget has, per
+    // `src/gtk/testing.rs`'s existing `hit_band_sweep_971` module) reports
+    // the identical alternating true/false/true/false/true outcome
+    // pattern, at the identical y-offsets, on `gtk` — and reproduces
+    // byte-for-byte with `has_focus: false` (no hint row reserved at
+    // all). That rules out both the click-restore mechanism and this
+    // issue's own fix as the cause: it is a pre-existing,
     // focus-independent hit-band inaccuracy in `quadraui::SidebarSystem`'s
-    // own section-header row, out of scope here and not a regression
-    // this issue introduces. Left as a call-out for whoever picks it up
-    // next rather than routed around in this issue's own diff.
+    // own section-header row — unrelated to #1361, but flagged here
+    // rather than silently dropped: whoever next touches the SC/ext-panel
+    // section-header hit band should file a quadraui issue for it (the
+    // repro is `sweep_hit_band_integrity(driver, "STAGED CHANGES", 5,
+    // |d| d.screen_has("sc1361file.txt"))` against `engine_with_sc_panel`
+    // below, on `gtk`) before relying on `sweep_hit_band_integrity`
+    // against any `SidebarSystem` header again.
     //
-    // The actual invariant this bullet needs — "the row reservation the
-    // painter applies is the exact same one the click router applies" —
-    // is proved instead where it is actually enforced: both consumers
-    // call the one shared `render::sc_sidebar_bands` with the same
-    // `has_focus` value, so its geometry is the single source of truth
-    // for both. `render::sc_sidebar_bands_tests` (next to the function,
-    // in `src/render.rs`) is that proof: it asserts the slab shrinks by
-    // exactly one row when focused, the hint sits flush with zero gap or
-    // overlap against the slab, and header/commit-input geometry never
-    // moves regardless of focus — the exact three properties a drifted
-    // reservation would violate.
+    // The review's own minimal bar — "even a single click-and-assert on
+    // a content row with focus/hint reserved would close the gap" — is
+    // what the two `#[test]` scenarios below deliver, sidestepping the
+    // header bug entirely by clicking a plain content row (a file entry)
+    // and the hint row itself, neither of which is a `SidebarSystem`
+    // header:
+    //
+    //   1. `sc_content_row_click_still_opens_it_when_hint_reserved_gtk`:
+    //      with the panel already focused (hint painted, slab one row
+    //      shorter), a double-click on a real file's own row must still
+    //      open *that* file — proving the click router resolves against
+    //      the exact shrunk geometry the painter used.
+    //   2. `sc_hint_row_click_does_not_open_a_content_row_gtk`: a
+    //      double-click landing inside the hint row's own painted band
+    //      must have no effect on any content row beneath it — the other
+    //      half of "the hint row is reserved": reservation must apply to
+    //      the click router, not just the painter.
+    //
+    // Both are real regressions to catch, not just re-statements of the
+    // geometry unit tests: `render::sc_sidebar_bands_tests` (next to
+    // `sc_sidebar_bands`, in `src/render.rs`) proves the *pure* band
+    // math is internally consistent (slab shrinks by exactly one row,
+    // hint sits flush with no gap/overlap, header/commit-input never
+    // move) — it says nothing about whether the real `SidebarSystem`
+    // widget (`sc_panel_layout`/`sc_sidebar_body_rect`) actually hit-tests
+    // against that same shrunk rect once wired through `Engine`/`App`.
+    // The two scenarios below are what closes that integration gap.
+    //
+    // RED-verification: reverting `App::paint_sidebar_panel_rung`'s
+    // `PANEL_GIT` arm to drop its `bands.hint` paint call (this issue's
+    // own fix, as `sc_hint_row_shows_only_while_focused` above already
+    // documents) fails both scenarios' own precondition assert
+    // (`screen_has("Press '?' for help")`) on `gtk` before either ever
+    // reaches its double-click — the same shared precondition
+    // `sc_hint_row_shows_only_while_focused` uses, RED-verified there.
+    //
+    // `gtk`-only, **not** registered on `tui_prod`: driving either
+    // scenario through `tui_prod` (`TuiShellApp` + `super::mouse::
+    // handle_mouse`) hits a second, entirely different pre-existing bug
+    // from the header one above — a genuine `MouseDown` dispatched at
+    // *any* point inside the SC panel (reproduced with a bare click on
+    // the "SOURCE CONTROL" header text itself, no hint/focus/content-row
+    // involvement at all) blanks the **whole** sidebar (header, commit
+    // box, toolbar, section list all vanish; only the activity-bar
+    // column and chrome borders remain) on the very first click, for
+    // both `sc_has_focus: true` and `sc_has_focus: false`. Reproduced
+    // against `engine_with_sc_panel`, the same fixture
+    // `sc_hint_row_shows_only_while_focused` already uses (which never
+    // clicks — only `press_named`/`screen_has` — so it never hit this),
+    // at both this issue's own (800, 480) viewport and a plain (100, 30)
+    // one, so it is not a viewport-size artifact either. `tui_prod`'s
+    // sibling explorer coverage (`sweep_hit_band_integrity_proof` above)
+    // clicks through the identical `TuiShellApp`/`handle_mouse` pipeline
+    // successfully, so this is specific to the SC panel's own click arm
+    // in `tui_main::mouse::handle_mouse`, not a `conformance_harness_prod`
+    // limitation in general. This diff's own `tui_main/mouse.rs` change is
+    // a one-line, backward-compatible parameter addition (`engine.
+    // sc_has_focus` passed to the already-existing `sc_sidebar_bands`
+    // call) — reproducing with a header click and `sc_has_focus: false`
+    // rules this diff out as the cause the same way the SidebarSystem
+    // header bug above was ruled out for #1361. Left here rather than
+    // silently dropped, same as the header bug: whoever next touches
+    // `tui_main::mouse`'s SC panel arm or adds `tui_prod` click coverage
+    // to this panel should file a vimcode issue for it first.
+
+    /// Like [`engine_with_sc_panel`], but with one real (untracked) file
+    /// on disk so a double-click on its row has a genuine, painted side
+    /// effect (`sc_activate_row`'s open path) to assert on — the same
+    /// technique `src/tui_main/shell_app.rs`'s
+    /// `tui_sc_sidebar_double_click_on_a_changed_file_opens_it` (#817)
+    /// uses for this exact click path, run here with `sc_has_focus: true`
+    /// from the first frame so the hint row is already reserved (slab one
+    /// row shorter) when the click below lands.
+    fn engine_with_sc_panel_and_file(
+        tag: &str,
+        file_name: &str,
+        marker: &str,
+    ) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1361_sc_row_{tag}_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output();
+        std::fs::write(dir.join(file_name), format!("{marker}\n")).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir;
+        engine.git_branch = Some("main".to_string());
+        engine.sc_has_focus = true;
+        // Untracked, like #817's fixture: `sc_activate_row` takes the
+        // plain-open path rather than the diff-split path, so no real
+        // `git show`/`diff` subprocess is needed.
+        engine.sc_file_statuses = vec![crate::core::git::FileStatus {
+            path: file_name.to_string(),
+            staged: None,
+            unstaged: Some(crate::core::git::StatusKind::Untracked),
+            unmerged: None,
+        }];
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_GIT,
+        ));
+        engine
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn sc_content_row_click_still_opens_it_when_hint_reserved_gtk() {
+        use quadraui::testing::{Anchor, ConformanceDriver};
+
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_with_sc_panel_and_file("content_row", "zqxw1361c.txt", "SC1361CONTENTMARKER"),
+            800,
+            480,
+        );
+        assert!(
+            h.driver.screen_has("Press '?' for help"),
+            "precondition: the panel starts focused, so the hint row must \
+             already be reserved/painted before the click below — this is \
+             the exact geometry (slab one row shorter) the click router \
+             must account for"
+        );
+        assert!(
+            !h.driver.screen_has("SC1361CONTENTMARKER"),
+            "precondition: the file must not be open yet"
+        );
+
+        // Two clicks on the same spot fold into one `UiEvent::DoubleClick`
+        // (`quadraui::dispatch::DoubleClickDetector`, the same folding
+        // `src/gtk/testing.rs`'s `hit_band_sweep_971` module's own doc
+        // explains) — `sc_activate_row`'s open path, same mechanism as
+        // #817's `tui_sc_sidebar_double_click_on_a_changed_file_opens_it`.
+        h.driver.click_text_at("zqxw1361c.txt", Anchor::Center);
+        h.driver.click_text_at("zqxw1361c.txt", Anchor::Center);
+
+        assert!(
+            h.driver.screen_has("SC1361CONTENTMARKER"),
+            "a double-click on the file's own row, painted while the SC \
+             panel has focus (hint row reserved, slab one row shorter), \
+             must still open exactly that file — the click router must \
+             resolve against the same shrunk geometry the painter used"
+        );
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn sc_hint_row_click_does_not_open_a_content_row_gtk() {
+        use quadraui::testing::{Anchor, ConformanceDriver};
+
+        let mut h = crate::gtk::testing::conformance_harness(
+            engine_with_sc_panel_and_file("hint_row", "zqxw1361h.txt", "SC1361HINTMARKER"),
+            800,
+            480,
+        );
+        assert!(
+            h.driver.screen_has("Press '?' for help"),
+            "precondition: the hint row must be painted (panel focused)"
+        );
+
+        // A click landing inside the hint row's own band must not leak
+        // through to `handle_sc_sidebar_ui_event` and activate whatever
+        // content row the un-reserved geometry would have put there — the
+        // other half of "the hint row is reserved" (#1361's own acceptance
+        // bar).
+        h.driver.click_text_at("Press '?' for help", Anchor::Center);
+        h.driver.click_text_at("Press '?' for help", Anchor::Center);
+
+        assert!(
+            !h.driver.screen_has("SC1361HINTMARKER"),
+            "a double-click on the reserved hint row must not open any \
+             content row beneath it — the reservation the painter applied \
+             must also be excluded from the click router's own geometry"
+        );
+    }
 
     // ── Deliverable 4, item 2: both gate directions (#982) ──────────────
     //
