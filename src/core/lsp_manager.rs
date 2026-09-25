@@ -1776,6 +1776,52 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+
+        // #523 smoke follow-up — burn the `ETXTBSY` window before any
+        // counting starts.
+        //
+        // A *freshly written* executable can transiently fail to `exec` on
+        // Linux with `ETXTBSY`: `fs::write` above holds a writable fd on this
+        // file for a microsecond or two, and any of the ~3900 other `--lib`
+        // tests sharing this process can `fork` inside that window. The
+        // forked child inherits the writable fd and keeps the kernel's
+        // "open for writing" count above zero until it `exec`s, and while
+        // that lasts, exec'ing this script fails.
+        //
+        // That matters here because `cargo_bin_probe_ok` treats a failed
+        // *spawn* exactly like a failed *probe*: it logs and returns `false`
+        // without the script ever running, so the invocation counter the
+        // tests below assert on silently reads one short. The result is a
+        // load-dependent flake that only shows up when the machine is busy
+        // (i.e. on the coordinator's Test stage, never in an isolated run).
+        //
+        // So: run the proxy here until it genuinely execs, then truncate the
+        // counter file. Once this loop succeeds no writable fd to the file
+        // exists anywhere and none can reappear (nothing reopens it), so
+        // every later probe is guaranteed to reach the script. Assertions
+        // downstream are unchanged — they still start counting from zero.
+        let mut execd = false;
+        for _ in 0..200 {
+            if std::process::Command::new(&binary_path)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+            {
+                execd = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            execd,
+            "fake broken proxy at {} never became executable",
+            binary_path.display()
+        );
+        std::fs::write(counter_file, "").unwrap();
+
         home
     }
 
