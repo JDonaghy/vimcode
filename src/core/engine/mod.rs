@@ -1064,6 +1064,38 @@ pub struct EngineToast {
     pub body: String,
     pub severity: quadraui::ToastSeverity,
     pub created_at: std::time::Instant,
+    /// Optional action button. `None` = plain toast — only the dismiss
+    /// "×" (`quadraui::ToastHit::Dismiss`) is clickable. `Some` wires the
+    /// button's `ToastHit::Action` to a semantic follow-up, dispatched by
+    /// `Engine::handle_toast_hit`.
+    pub action: Option<ToastActionKind>,
+    /// If true, `prune_toasts` never auto-expires this toast via
+    /// `TOAST_LIFETIME` — it stays until the user acts (the action
+    /// button) or explicitly dismisses it (×). Used for offers that need
+    /// a decision: disappearing after 5s would silently revert to
+    /// "never asked", with no record the user ever saw it (#1397).
+    pub sticky: bool,
+}
+
+/// Semantic action wired to a toast's action button
+/// (`quadraui::ToastAction`). `Engine::handle_toast_hit` matches on this
+/// to decide what `ToastHit::Action` actually does — previously the
+/// engine had no consumer for action-button taps at all (#1397 is the
+/// first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToastActionKind {
+    /// Install the named extension via `ext_install_from_registry`. Shown
+    /// from `lsp_did_open`'s "recommended extension" offer.
+    InstallExtension(String),
+}
+
+impl ToastActionKind {
+    /// Label painted on the toast's action button.
+    pub(crate) fn button_label(&self) -> &'static str {
+        match self {
+            ToastActionKind::InstallExtension(_) => "Install",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -5343,6 +5375,31 @@ impl Engine {
         body: &str,
         severity: quadraui::ToastSeverity,
     ) -> u64 {
+        self.push_toast_inner(title, body, severity, None, false)
+    }
+
+    /// Push a toast with an action button and no auto-expiry (#1397): the
+    /// offer stays until the user picks the action or dismisses it (×) —
+    /// see `EngineToast::sticky`'s doc for why a 5s auto-expiry is wrong
+    /// for a decision the user might not have looked up from yet.
+    pub fn push_sticky_action_toast(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+        action: ToastActionKind,
+    ) -> u64 {
+        self.push_toast_inner(title, body, severity, Some(action), true)
+    }
+
+    fn push_toast_inner(
+        &mut self,
+        title: &str,
+        body: &str,
+        severity: quadraui::ToastSeverity,
+        action: Option<ToastActionKind>,
+        sticky: bool,
+    ) -> u64 {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
         self.toasts.push(EngineToast {
@@ -5351,16 +5408,20 @@ impl Engine {
             body: body.to_string(),
             severity,
             created_at: std::time::Instant::now(),
+            action,
+            sticky,
         });
         id
     }
 
-    /// Drop toasts older than `TOAST_LIFETIME`. Returns true if any were
-    /// removed (so the caller can request a redraw).
+    /// Drop toasts older than `TOAST_LIFETIME`. Sticky toasts (#1397) are
+    /// never auto-dropped here — only an explicit dismiss or action can
+    /// remove them. Returns true if any were removed (so the caller can
+    /// request a redraw).
     pub fn prune_toasts(&mut self) -> bool {
         let before = self.toasts.len();
         self.toasts
-            .retain(|t| t.created_at.elapsed() < TOAST_LIFETIME);
+            .retain(|t| t.sticky || t.created_at.elapsed() < TOAST_LIFETIME);
         self.toasts.len() != before
     }
 
@@ -5375,10 +5436,14 @@ impl Engine {
                 self.dismiss_toast_by_widget(&widget_id);
                 true
             }
-            quadraui::ToastHit::Action(_) | quadraui::ToastHit::Body(_) => {
-                // Currently no consumers use action buttons or body
-                // clicks; treat as consumed so the click doesn't leak
-                // through to the editor under the toast.
+            quadraui::ToastHit::Action(widget_id) => {
+                self.run_toast_action(&widget_id);
+                true
+            }
+            quadraui::ToastHit::Body(_) => {
+                // No consumer reacts to a body click; treat as consumed so
+                // the click doesn't leak through to the editor under the
+                // toast.
                 true
             }
             quadraui::ToastHit::Empty => false,
@@ -5392,6 +5457,33 @@ impl Engine {
         let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
         if let Some(id) = target_id {
             self.toasts.retain(|t| t.id != id);
+        }
+    }
+
+    /// Run the semantic action behind an action-button tap. Action button
+    /// widget ids are formatted as `toast-action-{id}` by
+    /// `build_toast_stack`, matching the toast's own `toast-{id}` scheme.
+    /// The toast is removed once its action has run — the offer has been
+    /// answered (#1397).
+    fn run_toast_action(&mut self, widget_id: &quadraui::WidgetId) {
+        let key = widget_id.as_str();
+        let Some(target_id) = key
+            .strip_prefix("toast-action-")
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let Some(toast) = self.toasts.iter().find(|t| t.id == target_id) else {
+            return;
+        };
+        let Some(action) = toast.action.clone() else {
+            return;
+        };
+        self.toasts.retain(|t| t.id != target_id);
+        match action {
+            ToastActionKind::InstallExtension(name) => {
+                self.ext_install_from_registry(&name);
+            }
         }
     }
 

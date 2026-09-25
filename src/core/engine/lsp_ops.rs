@@ -141,9 +141,26 @@ impl Engine {
             {
                 self.prompted_extensions.insert(name.to_string());
                 self.ext_hint_pending_name = Some(name.to_string());
-                self.message = format!(
-                    "No {} extension — :ExtInstall {}  (N to dismiss)",
-                    manifest.display_name, name
+                // #1397: the offer is a non-modal, actionable toast (never
+                // auto-expires — see `EngineToast::sticky`'s doc) rather
+                // than the old status-line-only hint, which any later
+                // status message silently overwrote before the user ever
+                // saw it. `:ExtInstall <name>` and `N` (handled in
+                // `keys.rs`, gated on `ext_hint_pending_name`) remain the
+                // keyboard-only equivalents of the toast's action button
+                // and dismiss "×", so a mouse-less user loses nothing.
+                self.push_sticky_action_toast(
+                    &format!("Install {}?", manifest.display_name),
+                    // "N: don't ask again" leads (not `:ExtInstall {name}`,
+                    // which can run long for a verbose extension name) —
+                    // the toast box is narrow enough on a typical terminal
+                    // width that the tail of a long body line clips before
+                    // "?", and this half is the one with no other on-screen
+                    // affordance (the action button already shows
+                    // "Install").
+                    &format!("N: don't ask again  ·  :ExtInstall {name}"),
+                    quadraui::ToastSeverity::Info,
+                    ToastActionKind::InstallExtension(name.clone()),
                 );
             } else if let Some(err) = no_server {
                 // #436: extension is installed but the LSP didn't start

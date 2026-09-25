@@ -16803,6 +16803,288 @@ mod tests {
         );
     }
 
+    // ── #1397: recommended-extension install offer — actionable toast, not
+    // a missable status-line hint — black-box coverage ─────────────────────
+    //
+    // Before #1397 the only surface was `Engine::message` (the status
+    // line), overwritten by any later status message before a user ever
+    // saw it. These tests drive the real `lsp_did_open` → toast → click/
+    // key pipeline through `TuiShellApp` + `driver_with_shell`, asserting
+    // on painted screen content — never on `engine.toasts`/
+    // `ext_hint_pending_name` directly (CLAUDE.md's "assert on rendered
+    // output" rule) — except for the one precondition check in the shared
+    // fixture below, which mirrors the #1344 install tests' own "state
+    // before `driver_with_shell`, screen after" split (`driver.app_mut()
+    // .engine` is unreachable once wrapped — see the #1088 test's comment
+    // above).
+    //
+    // **Verified RED against unfixed `develop`:** before #1397,
+    // `lsp_did_open` never pushed a toast at all — only `self.message` —
+    // so `render::build_toast_stack` returned `None` and nothing painted;
+    // `extension_install_offer_toast_renders_and_keeps_editor_focus_via_shell_app`'s
+    // first assertion failed immediately. Reverting `lsp_did_open`'s
+    // `push_sticky_action_toast` call back to a plain `self.message =
+    // format!(...)` reproduces that failure.
+
+    /// Build a `TuiShellApp` whose first frame already shows the #1397
+    /// install-offer toast for a synthetic extension: a fake `lsp.binary`
+    /// (never actually resolvable) mapped to a fake language via
+    /// `settings.language_map`, opened via `open_file_in_tab` (which runs
+    /// `lsp_did_open` for real) *before* the app is handed to
+    /// `driver_with_shell`.
+    ///
+    /// `unique` tags every synthetic name (extension, language, file
+    /// extension, temp path) so parallel test threads never collide, and
+    /// is deliberately kept free of the substring "install" — the title
+    /// this builds says "Install {display_name}?" (the issue's own
+    /// wording), and a `unique` containing "install" would make that
+    /// substring appear a second time on the title's own row, breaking
+    /// the "only the action button matches after the title" assumption
+    /// the click test below relies on.
+    fn app_with_ext_install_offer(unique: &str) -> (TuiShellApp, String, String, PathBuf) {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use std::io::Write;
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = format!("vimcode-test-ext-1397-{unique}");
+        // Short: the toast box is only ~27 cells wide once the dismiss ×
+        // and action-button regions are reserved (`quadraui::tui::toast`'s
+        // `TUI_TOAST_WIDTH`/`TUI_DISMISS_WIDTH`/action-padding constants) —
+        // a longer title truncates before "?", breaking the exact-title
+        // match the tests below do.
+        let display_name = format!("X1397{unique}");
+        let lang_id = format!("vimcode-test-lang-1397-{unique}");
+        let file_ext = format!("zqx1397{unique}");
+
+        app.engine
+            .settings
+            .language_map
+            .insert(file_ext.clone(), lang_id.clone());
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: display_name.clone(),
+            language_ids: vec![lang_id],
+            lsp: LspConfig {
+                binary: "vc-bin-1397".to_string(),
+                install: "true".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        let path = std::env::temp_dir().join(format!(
+            "vimcode_test_1397_{unique}_{}.{file_ext}",
+            std::process::id()
+        ));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"hello\n").unwrap();
+        }
+
+        app.engine.open_file_in_tab(&path);
+        assert!(
+            app.engine.ext_hint_pending_name.is_some(),
+            "precondition: opening the file must queue the install offer toast"
+        );
+
+        (app, ext_name, display_name, path)
+    }
+
+    /// Locate `needle` in row `y`, starting the search at column `after_x`
+    /// (exclusive) — used to find the toast's action-button label, which
+    /// repeats the same word ("Install") the toast's title also contains,
+    /// on the same painted row. `TuiDriver::find`/`find_bounds` only ever
+    /// return the *first* match on the whole screen, which would be the
+    /// title's own occurrence; this scans the specific row with
+    /// `styled_row` (public) to find the next one instead.
+    fn find_in_row_after(
+        driver: &quadraui::tui::testing::TuiDriver<impl quadraui::runner::AppLogic>,
+        y: u16,
+        after_x: u16,
+        needle: &str,
+    ) -> Option<(f32, f32)> {
+        let needle: Vec<char> = needle.chars().collect();
+        let row: Vec<char> = driver.styled_row(y).into_iter().map(|(c, _)| c).collect();
+        if row.len() < needle.len() {
+            return None;
+        }
+        for start in (after_x as usize)..=(row.len() - needle.len()) {
+            if row[start..start + needle.len()] == needle[..] {
+                return Some((start as f32 + 0.5, y as f32 + 0.5));
+            }
+        }
+        None
+    }
+
+    /// #1397 core acceptance: opening a file whose recommended extension
+    /// isn't installed must paint a toast offer — not just a status-line
+    /// hint any later message silently overwrites — and that toast must
+    /// not steal keyboard focus (#416): typing must still reach the
+    /// editor while it's up.
+    #[test]
+    fn extension_install_offer_toast_renders_and_keeps_editor_focus_via_shell_app() {
+        let (app, _ext_name, display_name, _path) = app_with_ext_install_offer("render");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let screen = driver.screen();
+        let want_title = format!("Install {display_name}?");
+        assert!(
+            screen.contains(&want_title),
+            "install offer toast title must paint; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("N: don't ask again"),
+            "toast must document the N keyboard shortcut (keyboard parity \
+             with the action button, for TUI/mouse-less users); screen:\n{screen}"
+        );
+
+        // Type directly (no click first) — the toast must not have grabbed
+        // keyboard focus away from the editor, which still has it from
+        // `open_file_in_tab` leaving the cursor at (0, 0).
+        driver.type_char('i');
+        driver.type_char('Z');
+        driver.press_named(quadraui::NamedKey::Escape);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Zhello"),
+            "typing must still reach the editor while the install-offer \
+             toast is up — it must not steal keyboard focus (#416); \
+             screen:\n{screen}"
+        );
+    }
+
+    /// #1397: clicking the toast's "Install" action button must run the
+    /// same install path `:ExtInstall <name>` does
+    /// (`Engine::ext_install_from_registry`), proven by the command line's
+    /// "Extension '…' installed — …" outcome message that call always
+    /// leaves behind — real rendered output, not
+    /// `engine.pending_terminal_command` (unreachable through `driver`
+    /// once wrapped, and exactly the state-vs-paint distinction #587/#592
+    /// exist to enforce).
+    #[test]
+    fn extension_install_offer_toast_install_action_triggers_install_via_shell_app() {
+        let (app, ext_name, display_name, _path) = app_with_ext_install_offer("act");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        let title_bounds = driver
+            .find_bounds(&want_title)
+            .unwrap_or_else(|| panic!("toast title must paint; screen:\n{}", driver.screen()));
+        let button_x = title_bounds.x as u16 + title_bounds.width as u16;
+        let (ax, ay) = find_in_row_after(&driver, title_bounds.y as u16, button_x, "Install")
+            .unwrap_or_else(|| {
+                panic!(
+                    "action button 'Install' must paint after the title on \
+                     its own row; screen:\n{}",
+                    driver.screen()
+                )
+            });
+
+        driver.click(ax, ay);
+
+        let screen = driver.screen();
+        let want_outcome = format!("Extension '{ext_name}' installed");
+        assert!(
+            screen.contains(&want_outcome),
+            "clicking the toast's Install button must run \
+             ext_install_from_registry for the right extension; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains(&want_title),
+            "the toast must be gone once its action has run; screen:\n{screen}"
+        );
+    }
+
+    /// #1397 "Don't ask again": `N` (the pre-#1397 keyboard shortcut,
+    /// preserved for parity) must dismiss the toast *and* persist the
+    /// dismissal for the rest of the session — re-opening the same file
+    /// must not show the offer again. Mirrors the pre-#1397 `N`-to-dismiss
+    /// behaviour (`extension_state.mark_dismissed`), just re-targeted at
+    /// the toast instead of `self.message`.
+    #[test]
+    fn extension_install_offer_toast_n_key_dismisses_and_persists_for_session_via_shell_app() {
+        let (app, _ext_name, display_name, path) = app_with_ext_install_offer("keyn");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        assert!(
+            driver.screen().contains(&want_title),
+            "precondition: offer must be showing; screen:\n{}",
+            driver.screen()
+        );
+
+        driver.type_char('N');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'N' must dismiss the toast; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("dismissed"),
+            "'N' must confirm the dismissal on the command line; screen:\n{screen}"
+        );
+
+        // Re-open the same file (`:e <path>` on an already-open buffer
+        // still re-runs `lsp_did_open` — see `open_file_in_tab`'s
+        // "already shows this buffer" branch) through the real
+        // command-line pipeline, and confirm the offer does not come back
+        // this session.
+        run_ex_command(&mut driver, &format!(":e {}", path.display()));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'N' ('Don't ask again') must persist for the rest of the \
+             session, not just the first showing; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1397 "Not now": dismissing the toast via its × (the dismiss
+    /// affordance every toast has, `ToastHit::Dismiss`) must hide it
+    /// without asking again this session (today's `prompted_extensions`
+    /// behaviour, which is recorded when the toast is *pushed*, not when
+    /// it's dismissed — see `lsp_did_open`).
+    #[test]
+    fn extension_install_offer_toast_dismiss_x_hides_for_session_via_shell_app() {
+        let (app, _ext_name, display_name, path) = app_with_ext_install_offer("keyx");
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        let want_title = format!("Install {display_name}?");
+        let title_bounds = driver
+            .find_bounds(&want_title)
+            .unwrap_or_else(|| panic!("toast title must paint; screen:\n{}", driver.screen()));
+
+        // Locate the toast's own dismiss × by row, not `driver.find("×")`
+        // (which would match the *tab bar's* close × first — same glyph,
+        // a different, higher-up row — since `find`/`find_bounds` always
+        // return the first match on the whole screen).
+        let dismiss_x = title_bounds.x as u16 + title_bounds.width as u16;
+        let (dx, dy) = find_in_row_after(&driver, title_bounds.y as u16, dismiss_x, "×")
+            .unwrap_or_else(|| {
+                panic!(
+                    "dismiss × must paint on the toast's own row; screen:\n{}",
+                    driver.screen()
+                )
+            });
+        driver.click(dx, dy);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "clicking × must dismiss the toast; screen:\n{screen}"
+        );
+
+        run_ex_command(&mut driver, &format!(":e {}", path.display()));
+        let screen = driver.screen();
+        assert!(
+            !screen.contains(&want_title),
+            "'Not now' must not re-prompt again this session \
+             (prompted_extensions); screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `TuiAccelHost::terminal_toggle_max` must derive `terminal_max_rows`
     /// from `screen_h` (the terminal's row count), not `screen_w` — the bug
     /// review iteration 1 of vimcode#595 caught: the wrapper silently fed

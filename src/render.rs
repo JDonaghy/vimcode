@@ -22074,7 +22074,10 @@ pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
                 title: t.title.clone(),
                 body: t.body.clone(),
                 severity: t.severity,
-                action: None,
+                action: t.action.as_ref().map(|a| quadraui::ToastAction {
+                    id: quadraui::WidgetId::new(format!("toast-action-{}", t.id)),
+                    label: a.button_label().to_string(),
+                }),
                 accent: None,
             })
             .collect(),

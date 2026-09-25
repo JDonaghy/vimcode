@@ -444,13 +444,22 @@ impl Engine {
             }
         }
 
-        // N-to-dismiss extension hint: intercept 'N' in Normal mode when a hint is visible.
-        // Only active while the hint is still the current status message (cleared on any edit).
+        // N-to-dismiss extension hint (#1397 keyboard parity with the toast's
+        // action button / dismiss "×" — see `lsp_did_open`): intercept 'N' in
+        // Normal mode while the install-offer toast for `name` is still up.
+        // Gated on the toast itself (not `self.message`, which the toast no
+        // longer writes to) so it stays live for as long as the toast does —
+        // i.e. until acted on or dismissed, not just until the next status
+        // message.
         if let Some(ref name) = self.ext_hint_pending_name.clone() {
-            if !self.message.contains(name.as_str()) {
-                // Message was overwritten — forget the pending name silently.
+            let toast_still_shown = self.toasts.iter().any(
+                |t| matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == name),
+            );
+            if !toast_still_shown {
+                // Toast was dismissed/acted on some other way — forget the
+                // pending name silently.
                 self.ext_hint_pending_name = None;
-            } else if key_name == "N"
+            } else if (key_name == "N" || unicode == Some('N'))
                 && !ctrl
                 && matches!(self.mode, Mode::Normal)
                 && self.pending_key.is_none()
@@ -459,6 +468,9 @@ impl Engine {
                 let name = self.ext_hint_pending_name.take().unwrap();
                 self.extension_state.mark_dismissed(&name);
                 let _ = self.extension_state.save();
+                self.toasts.retain(|t| {
+                    !matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == &name)
+                });
                 self.message =
                     format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
                 return EngineAction::None;
