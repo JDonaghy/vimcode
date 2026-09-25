@@ -217,7 +217,9 @@ impl GtkEngineActionHost<'_> {
 impl render::EngineActionHost for GtkEngineActionHost<'_> {
     /// Was `App::new_terminal_tab`; see this struct's own doc.
     fn open_terminal(&mut self, engine: &mut Engine) {
-        let cols = self.app.terminal_cols();
+        let cols = self
+            .app
+            .terminal_panel_cols(self.app.painted_editor_content_width());
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_new_tab(cols, rows);
         self.app.draw_needed.set(true);
@@ -225,8 +227,10 @@ impl render::EngineActionHost for GtkEngineActionHost<'_> {
     /// Inlines `App::toggle_terminal_maximize`.
     fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
         let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: self.app.terminal_cols(),
-            terminal_max_rows: self.app.terminal_target_maximize_rows(),
+            terminal_cols: self
+                .app
+                .terminal_panel_cols(self.app.painted_editor_content_width()),
+            terminal_max_rows: self.app.terminal_maximize_target_rows(&*engine),
         };
         engine.handle_ui_event(
             crate::core::engine::UiEvent::Accelerator(
@@ -239,7 +243,9 @@ impl render::EngineActionHost for GtkEngineActionHost<'_> {
     }
     /// Inlines `App::run_command_in_terminal`.
     fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self.app.terminal_cols();
+        let cols = self
+            .app
+            .terminal_panel_cols(self.app.painted_editor_content_width());
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_run_command(&cmd, cols, rows);
         self.app.draw_needed.set(true);
@@ -334,7 +340,9 @@ impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
     /// borrowed mutably as the `engine` parameter below; a second borrow
     /// would panic (`RefCell` already mutably borrowed).
     fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf) {
-        let cols = self.app.terminal_cols();
+        let cols = self
+            .app
+            .terminal_panel_cols(self.app.painted_editor_content_width());
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_new_tab_at(cols, rows, Some(&dir));
         self.app.draw_needed.set(true);
@@ -400,7 +408,9 @@ impl render::TickHost for GtkTickHost<'_> {
     /// directly — see this struct's own doc for why it can't call that
     /// method.
     fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self.app.terminal_cols();
+        let cols = self
+            .app
+            .terminal_panel_cols(self.app.painted_editor_content_width());
         let rows = engine.session.terminal_panel_rows;
         engine.terminal_run_command(&cmd, cols, rows);
     }
@@ -996,6 +1006,20 @@ pub(crate) struct App {
     /// makes hit-test-agrees-with-paint true *by construction* instead of by
     /// two formulas being kept in sync by hand.
     pub(crate) cached_editor_bounds: Cell<Option<(core::WindowRect, f64)>>,
+    /// Main-content pixel height last painted by `render_content` — the `h`
+    /// argument it hands `render::compute_editor_layout` (before that call
+    /// subtracts the status bar / debug toolbar / quickfix / terminal bands
+    /// out of it). Distinct from `cached_editor_bounds`'s rect height, which
+    /// is `compute_editor_layout`'s *output* (`editor_bottom`, i.e. already
+    /// net of those bands) — reusing that would feed the already-reduced
+    /// figure back in as the total and double-subtract.
+    ///
+    /// [`App::terminal_maximize_target_rows`] replays the same
+    /// `compute_editor_layout` call against this cached value for callers
+    /// (accelerators, menu/tick paths) with no live viewport height of their
+    /// own in scope. Defaults to `600.0`, matching `cached_window_height`'s
+    /// own pre-first-paint default. (#1421)
+    pub(crate) cached_main_content_height: Cell<f64>,
     /// Menu bar row rect (full content width, `lh` tall) computed in
     /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
     /// click/key routing tests against the exact rect the bar was drawn
@@ -1888,6 +1912,7 @@ impl App {
             cached_window_width: Cell::new(800),
             cached_window_height: Cell::new(600),
             cached_editor_bounds: Cell::new(None),
+            cached_main_content_height: Cell::new(600.0),
             menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             menu_items_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
@@ -5095,7 +5120,7 @@ impl App {
                     // it. This is what feeds `ToggleSplit`'s initial
                     // full_cols when opening a split.
                     terminal_cols: self.terminal_panel_cols(width),
-                    terminal_max_rows: self.terminal_target_maximize_rows(),
+                    terminal_max_rows: self.terminal_maximize_target_rows(&self.engine.borrow()),
                 };
                 let effect =
                     render::apply_bottom_panel_route(&mut self.engine.borrow_mut(), route, x, ctx);
@@ -5352,7 +5377,9 @@ impl App {
                             // Create the terminal tab immediately (not via
                             // the deferred `DeferredAction::ToggleTerminal`)
                             // so the panel appears on this same draw cycle.
-                            let cols = self.terminal_cols();
+                            // #1421: `width` is this handler's own live panel
+                            // width — prefer it over the cached one.
+                            let cols = self.terminal_panel_cols(width);
                             let rows = engine.session.terminal_panel_rows;
                             engine.terminal_new_tab(cols, rows);
                             drop(engine);
@@ -5512,7 +5539,7 @@ impl App {
                     .handle_breadcrumb_click(group_id, idx);
             }
             render::ChromeRoute::StatusAction(action) => {
-                let cols = self.terminal_cols();
+                let cols = self.terminal_panel_cols(self.painted_editor_content_width());
                 let follow_up =
                     render::apply_status_action(&mut self.engine.borrow_mut(), &action, cols);
                 if matches!(
@@ -5972,9 +5999,8 @@ impl App {
         if self.terminal_resize_dragging {
             self.terminal_resize_dragging = false;
             let rows = self.engine.borrow().session.terminal_panel_rows;
-            // #731: was `if let Some(da) = self.drawing_area…`, permanently
-            // `None` under the ShellApp runner — see `terminal_cols`.
-            let cols = self.terminal_cols();
+            // #1421: `width` is this handler's own live panel width.
+            let cols = self.terminal_panel_cols(width);
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
         }
@@ -6000,8 +6026,8 @@ impl App {
                 && engine.terminal_panes.is_empty()
         };
         if needs_new_tab {
-            // Use the actual drawing area width so the PTY matches the visible panel.
-            let cols = self.terminal_cols();
+            // Use the actual editor content width so the PTY matches the visible panel.
+            let cols = self.terminal_panel_cols(self.painted_editor_content_width());
             let rows = self.engine.borrow().session.terminal_panel_rows;
             self.engine.borrow_mut().terminal_new_tab(cols, rows);
         } else {
@@ -6016,8 +6042,8 @@ impl App {
         // path as the keybinding above + the EngineAction handler
         // + the toolbar click handler.
         let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: self.terminal_cols(),
-            terminal_max_rows: self.terminal_target_maximize_rows(),
+            terminal_cols: self.terminal_panel_cols(self.painted_editor_content_width()),
+            terminal_max_rows: self.terminal_maximize_target_rows(&self.engine.borrow()),
         };
         self.engine.borrow_mut().handle_ui_event(
             crate::core::engine::UiEvent::Accelerator(
@@ -7153,26 +7179,25 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// #731: was `if let Some(da) = self.drawing_area…` — that field is
-    /// permanently `None` under the ShellApp runner (see its removal in
-    /// #731), so this always took the `else` branch. The real fix is a way
-    /// to read the live DA's pixel width without a widget handle (e.g. from
-    /// `backend: &mut dyn quadraui::Backend`, which none of this method's
-    /// callers currently have in scope) — until then this is pinned at the
-    /// fallback, same as it was silently pinned at runtime before the dead
-    /// field was deleted.
+    /// Editor content pixel width last painted by `render_content`
+    /// (`cached_editor_bounds`) — the same width the bottom (terminal) panel
+    /// spans, since `editor_bounds` is derived from `main_content_bounds`
+    /// with the sidebar/activity bar already excluded (#582). Used by
+    /// [`Self::terminal_panel_cols`] callers with no live pixel width of
+    /// their own in scope (accelerator/menu/tick paths) — callers that DO
+    /// have one (a click/drag handler's own `width` parameter) should pass
+    /// that same-frame value to `terminal_panel_cols` directly instead, for
+    /// the #1058 reason recorded on `terminal_panel_cols` itself.
     ///
-    /// Callers that DO have a live pixel width in scope (a click/drag's own
-    /// `width` parameter, or `ctx.layout.main_content_bounds` off the
-    /// `ShellContext` `handle_dispatch` already receives) must call
-    /// [`Self::terminal_panel_cols`] instead — see #1058, where the
-    /// terminal-split finalize path used this method's `80` fallback (and a
-    /// separate `da_w = 800.0` guess) rather than converting the real width,
-    /// so any window that wasn't exactly 800px wide split the terminal into
-    /// the wrong column counts.
-    #[allow(dead_code)]
-    fn terminal_cols(&self) -> u16 {
-        80
+    /// Falls back to the cached window width before the first frame has
+    /// painted (`cached_editor_bounds` is still `None`).
+    ///
+    /// #1421: replaces the old hardcoded `terminal_cols() -> 80`.
+    fn painted_editor_content_width(&self) -> f64 {
+        self.cached_editor_bounds
+            .get()
+            .map(|(r, _)| r.width)
+            .unwrap_or_else(|| self.cached_window_width.get() as f64)
     }
 
     /// Terminal panel pixel width reserved for the panel's own vertical
@@ -7182,24 +7207,36 @@ impl App {
     const TERMINAL_PANEL_SB_W: f64 = 6.0;
 
     /// Convert a *live* terminal-panel pixel width to a column count using
-    /// the last-painted char advance (`cached_char_width`) — the real
-    /// pixel→cell conversion `terminal_cols()` cannot do because it has no
-    /// width in scope. Falls back to `terminal_cols()`'s pinned `80` only
-    /// when no char width has been measured yet (`cached_char_width <= 0.0`,
-    /// i.e. before the first paint).
+    /// the last-painted char advance (`cached_char_width`). #1058: this used
+    /// to be a fallback of a hardcoded `terminal_cols() -> 80` (and, for the
+    /// terminal-split finalize path specifically, a separate `da_w = 800.0`
+    /// guess) rather than a real conversion of the live width, so any window
+    /// that wasn't exactly 800px wide split the terminal into the wrong
+    /// column counts. `cached_char_width` is seeded to a positive default in
+    /// `App::new` and only ever grows from a real paint, so clamping it to a
+    /// `1.0` floor (rather than branching on a `<= 0.0` fallback) is enough
+    /// to avoid a divide-by-zero without a second hardcoded column count.
     fn terminal_panel_cols(&self, width: f64) -> u16 {
-        if self.cached_char_width > 0.0 {
-            ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / self.cached_char_width) as u16
-        } else {
-            self.terminal_cols()
-        }
+        let cw = self.cached_char_width.max(1.0);
+        ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / cw) as u16
     }
 
-    /// #731: see `terminal_cols` — was `if let Some(da) =
-    /// self.drawing_area…`, permanently `None`, so this always took the
-    /// `else` branch.
-    fn terminal_target_maximize_rows(&self) -> u16 {
-        10
+    /// Terminal-maximize target row count for the next
+    /// `terminal.toggle_maximize` dispatch — the exact
+    /// `render::compute_editor_layout` call `render_content` makes every
+    /// frame, replayed here against the content height/line height last
+    /// painted (`cached_main_content_height`, `cached_line_height`) so
+    /// accelerator/menu paths — which have no live pixel height of their own
+    /// in scope — agree with what was actually painted. Same reasoning as
+    /// [`Self::painted_editor_content_width`]'s fallback.
+    ///
+    /// #1421: replaces the old hardcoded `terminal_target_maximize_rows() ->
+    /// 10`. Mirrors the TUI equivalent,
+    /// `tui_main::terminal_target_maximize_rows_tui`.
+    fn terminal_maximize_target_rows(&self, engine: &Engine) -> u16 {
+        let h = self.cached_main_content_height.get();
+        let lh = self.cached_line_height.max(1.0);
+        render::compute_editor_layout(engine, h, lh, false).terminal_max_target_rows
     }
 }
 
@@ -8224,6 +8261,10 @@ impl quadraui::ShellApp for App {
         // instead of on a second, differently-originated guess (#582).
         self.cached_editor_bounds
             .set(Some((editor_bounds, tab_bar_h)));
+        // #1421: the raw `h` this frame's `compute_editor_layout` call above
+        // was given — see `cached_main_content_height`'s own doc for why
+        // this is `h`, not `editor_area_h`/`editor_bounds`'s height.
+        self.cached_main_content_height.set(h);
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_h);
 

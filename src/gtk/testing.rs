@@ -16447,6 +16447,80 @@ mod issue_1063_menu_action_engine_action_applier_gtk {
     }
 }
 
+/// #1421: `GtkEngineActionHost::open_terminal` used to size every new PTY to
+/// a hardcoded `App::terminal_cols() -> 80`, no matter how wide the actual
+/// window was. This is the GTK black-box proof that a terminal opened in a
+/// wide headless window gets a column count derived from the geometry
+/// `render_content` actually painted (`App::painted_editor_content_width` /
+/// `App::terminal_panel_cols`), not the old constant.
+///
+/// **RED-verified:** with `App::painted_editor_content_width` changed to
+/// always return `0.0` (forcing `terminal_panel_cols`'s pixel→cell division
+/// down near zero, the same "editor content width unavailable" shape the
+/// pre-#1421 `terminal_cols() -> 80` constant had) the `cols != 80` assertion
+/// below still incidentally passes (`0 != 80`), so the test was instead
+/// RED-verified directly against the pre-fix hardcoded body — reverting
+/// `open_terminal` to `let cols = 80;` makes this test fail. Restored before
+/// committing.
+#[cfg(test)]
+mod issue_1421_terminal_size_derived_from_layout {
+    use super::*;
+
+    #[test]
+    fn opening_a_terminal_in_a_wide_window_sizes_the_pty_from_the_painted_layout_on_gtk() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        // Wide enough that dividing by any plausible char-cell width lands
+        // well clear of 80 columns, so this cannot pass by coincidence.
+        let mut h = harness(engine, 2400, 900);
+        h.driver.render();
+
+        let header = h
+            .driver
+            .find_bounds("Terminal")
+            .expect("the Terminal menu-bar header must paint");
+        h.driver.click(
+            header.x + header.width / 2.0,
+            header.y + header.height / 2.0,
+        );
+        h.driver.render();
+
+        let new_terminal = h.driver.find_bounds("New Terminal").expect(
+            "clicking the Terminal menu-bar header must open its dropdown, \
+             showing \"New Terminal\"",
+        );
+        h.driver.click(
+            new_terminal.x + new_terminal.width / 2.0,
+            new_terminal.y + new_terminal.height / 2.0,
+        );
+        h.driver.render();
+
+        let cols = h
+            .engine
+            .borrow()
+            .terminal_panes
+            .first()
+            .map(|slot| slot.session.cols());
+        assert_ne!(
+            cols,
+            Some(80),
+            "a terminal opened in a 2400px-wide window must not be pinned \
+             at the old hardcoded 80-column constant — the PTY column count \
+             ({cols:?}) must come from the editor content width \
+             `render_content` actually painted"
+        );
+        let cols = cols.expect("opening a terminal via the menu must create a terminal pane");
+        assert!(
+            cols > 150,
+            "a 2400px-wide window's editor content area, divided by any \
+             plausible char-cell width, must yield well over 150 PTY \
+             columns; got {cols} — looks like the width→columns conversion \
+             is still reading a narrow/hardcoded value rather than the \
+             painted layout"
+        );
+    }
+}
+
 #[cfg(test)]
 mod issue_1235_laststatus_frame_sizing {
     //! #1235: `app.rs`'s `TerminalPanelResize` drag row math and the
