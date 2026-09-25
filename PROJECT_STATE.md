@@ -1,5 +1,52 @@
 # VimCode Project State
 
+**Last updated:** September 24, 2026 (#525, Track A Phase 2 — in-editor
+diff review of a work branch, consuming the change-review surface #955
+built rather than building a second one). `BoardAction::OpenReview` on a
+board card now resolves "card -> branch -> changed files" and opens a real
+multi-file diff, entirely through generic seams — no coordinator
+vocabulary anywhere, `tests/no_coord_vocabulary_in_core.rs` still passes.
+New `src/core/tool_client.rs::BranchReviewTarget{branch, base}` +
+`fetch_branch_review_target` — same "generic contract, provider supplies
+the JSON" pattern as `ToolDocument`/`BoardModel`: any provider whose
+`"OpenReview"` board action (`BoardProviderConfig::actions`, already
+generic since #522) emits `{"branch", "base"}` on stdout gets a review.
+New `src/core/git.rs::changed_files_between(dir, base, head)` — `git diff
+--name-only base...head` (three-dot, so a commit landing on `base` after
+`head` diverged never shows up as a spurious change). New
+`Engine::open_branch_review` (`review_ops.rs`) is the git feeder for
+#955's `core::review::ChangeReviewState`: turns `changed_files_between`'s
+paths into `ProposedChange{path, old_text, new_text}` via
+`git::show_file_at_ref` at both revisions (`old_text: None` when the path
+doesn't exist at `base` — a new file, matching `ProposedChange`'s existing
+"pure addition" convention) and calls the same `open_change_review` #955's
+ACP feeder calls — proof the surface really is source-agnostic, one layer
+up from `core::review`'s own non-ACP unit test. `board_ops.rs`'s
+`apply_board_action` now resolves `OpenReview(id)` the same way `OpenIssue`
+already resolves to a pending action outside the `board_model` borrow,
+dispatching to new `Engine::open_review_card` (blocking, one-shot, same
+tradeoff `open_tool_document` already made) which runs the provider's
+`"OpenReview"` action via the existing `board_client` `ToolClient`,
+degrading to a status-line message (no provider / no review command
+configured / provider failed) rather than a panic on every failure path.
+New host-level `R` keybinding in `dispatch_board_key_unified` opens the
+review for the selected card — dispatched here rather than added to
+quadraui's generic `BoardModel::handle_key` keymap, since that method's
+own doc explicitly calls "review" out as a workflow-specific verb hosts
+should handle themselves. Everything downstream (hunk nav `]`/`[`, file
+nav `n`/`p`/Tab, click/Return-to-jump opening a real buffer with real LSP
+diagnostics and git blame, accept/reject) is reused verbatim from #955 —
+no new per-backend diff drawing, no touches to `src/gtk/` or
+`src/tui_main/` at all. Tests: two real-git-repo tests for
+`changed_files_between` (including the three-dot-semantics case), two for
+`fetch_branch_review_target`, three `open_branch_review` tests against a
+real temp repo (happy path, no-changes error, no-workspace error), and six
+`board_ops.rs` tests covering the full `OpenReview` wiring (happy path
+through a mock provider + real repo, no provider, no review command
+configured, failing provider, and the `R` keybinding with/without a
+selection). `cargo build`/`clippy -D warnings`/`fmt` clean on both feature
+lanes.
+
 **Last updated:** September 24, 2026 (#524, Track A Phase 1 — provider
 document buffers, on top of #521/#522's generic Board host). Author/refine
 a provider's documents (e.g. a GitHub issue) as real markdown buffers,

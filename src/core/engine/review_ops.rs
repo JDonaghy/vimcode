@@ -24,6 +24,7 @@
 
 use super::*;
 use crate::core::review::ProposedChange;
+use crate::core::tool_client::BranchReviewTarget;
 
 impl Engine {
     /// Open the change-review surface for `changes`, replacing whatever
@@ -35,6 +36,48 @@ impl Engine {
             return;
         }
         self.change_review = Some(crate::core::review::ChangeReviewState::new(changes));
+    }
+
+    /// Build a source-agnostic change list from a local git branch diff
+    /// (#525) and open it via [`Self::open_change_review`] — the git
+    /// feeder for the surface #955 built, proving it really is source-
+    /// agnostic (see `crate::core::review`'s own non-ACP unit test for the
+    /// same point at the data-model level). `target` is typically resolved
+    /// from a board card through a provider's `"OpenReview"` action
+    /// (`Engine::open_review_card` in `board_ops.rs`) — this method itself
+    /// has no idea where `target` came from, it just turns two git
+    /// revisions into a diff.
+    ///
+    /// Worktree-local (#525's stated scope): both `target.branch` and
+    /// `target.base` must already be resolvable in the local repository —
+    /// no fetch, no remote/ssh handling (that's #530).
+    pub fn open_branch_review(&mut self, target: BranchReviewTarget) -> Result<(), String> {
+        let root = self
+            .workspace_root
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?;
+        let paths = crate::core::git::changed_files_between(&root, &target.base, &target.branch);
+        if paths.is_empty() {
+            return Err(format!(
+                "no changes between '{}' and '{}'",
+                target.base, target.branch
+            ));
+        }
+        let changes = paths
+            .into_iter()
+            .map(|path| {
+                let old_text = crate::core::git::show_file_at_ref(&root, &target.base, &path);
+                let new_text = crate::core::git::show_file_at_ref(&root, &target.branch, &path)
+                    .unwrap_or_default();
+                ProposedChange {
+                    path,
+                    old_text,
+                    new_text,
+                }
+            })
+            .collect();
+        self.open_change_review(changes);
+        Ok(())
     }
 
     /// Close the change-review surface without deciding anything left
@@ -332,6 +375,141 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── open_branch_review (#525) ───────────────────────────────────────
+
+    /// Set up a repo with a base commit, a `feature` branch carrying a
+    /// modified file and a brand-new file, *and* a commit made on the base
+    /// branch after `feature` diverged — proving `open_branch_review` uses
+    /// three-dot semantics end to end (not just at the `git.rs` unit
+    /// level): that base-only commit must never show up in the review.
+    /// Returns `(repo dir, base branch name)`.
+    fn init_branch_review_repo(tag: &str) -> (std::path::PathBuf, String) {
+        let dir = unique_temp_dir(tag);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("modified.rs"), "before\n").unwrap();
+        std::fs::write(dir.join("untouched.rs"), "same\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        git(&["branch", "feature"]);
+        git(&["checkout", "feature"]);
+        std::fs::write(dir.join("modified.rs"), "after\n").unwrap();
+        std::fs::write(dir.join("added.rs"), "new file\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        let base = crate::core::git::current_branch(&dir).unwrap(); // still "feature" here
+        let _ = base;
+        let base_branch = if std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "main"])
+            .current_dir(&dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            "main"
+        } else {
+            "master"
+        };
+        git(&["checkout", base_branch]);
+        std::fs::write(dir.join("untouched.rs"), "changed on base only\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base-only change"]);
+        (dir, base_branch.to_string())
+    }
+
+    #[test]
+    fn open_branch_review_builds_a_change_list_from_a_local_git_branch() {
+        let (dir, base) = init_branch_review_repo("branch-review");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        engine
+            .open_branch_review(BranchReviewTarget {
+                branch: "feature".to_string(),
+                base,
+            })
+            .expect("branch review should build a change list");
+
+        let review = engine.change_review.as_ref().expect("surface should open");
+        let mut paths: Vec<_> = review
+            .entries
+            .iter()
+            .map(|e| e.change.path.clone())
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["added.rs".to_string(), "modified.rs".to_string()],
+            "base-only 'untouched.rs' change must not appear (three-dot semantics)"
+        );
+
+        let added = review
+            .entries
+            .iter()
+            .find(|e| e.change.path == "added.rs")
+            .unwrap();
+        assert!(
+            added.change.old_text.is_none(),
+            "a brand-new file has no left side"
+        );
+        assert_eq!(added.change.new_text, "new file\n");
+
+        let modified = review
+            .entries
+            .iter()
+            .find(|e| e.change.path == "modified.rs")
+            .unwrap();
+        assert_eq!(modified.change.old_text.as_deref(), Some("before\n"));
+        assert_eq!(modified.change.new_text, "after\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_branch_review_errors_with_no_changes_between_revisions() {
+        let (dir, base) = init_branch_review_repo("branch-review-noop");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+
+        let err = engine
+            .open_branch_review(BranchReviewTarget {
+                branch: base.clone(),
+                base,
+            })
+            .unwrap_err();
+        assert!(err.contains("no changes"));
+        assert!(engine.change_review.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_branch_review_errors_with_no_workspace_open() {
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = None;
+        let err = engine
+            .open_branch_review(BranchReviewTarget {
+                branch: "feature".to_string(),
+                base: "main".to_string(),
+            })
+            .unwrap_err();
+        assert!(err.contains("no workspace"));
     }
 
     #[test]
