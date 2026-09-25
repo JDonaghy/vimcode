@@ -10038,6 +10038,16 @@ pub fn paint_change_review_rung(
         review.entries.len(),
         entry.change.path,
     );
+    // Provenance (#528): a git-branch-fed review (`Engine::
+    // open_branch_review`) is showing the human a diff *of a real branch
+    // checked out right here* — the footgun the issue calls out is a human
+    // who edits/finalizes believing this is their own checkout. Right-
+    // aligned so it never competes with the left segment's file/decision
+    // info for the narrow-terminal case. `None` (an ACP tool-call-fed
+    // review has no branch) means no segment at all, not a blank one.
+    let right_segments = branch_review_provenance_segment(engine, theme)
+        .into_iter()
+        .collect();
     let status = quadraui::StatusBar {
         id: quadraui::WidgetId::new("change-review-status"),
         left_segments: vec![quadraui::StatusBarSegment {
@@ -10047,7 +10057,7 @@ pub fn paint_change_review_rung(
             bold: false,
             action_id: None,
         }],
-        right_segments: vec![],
+        right_segments,
     };
     let footer_rect = quadraui::Rect::new(
         viewport.x,
@@ -10056,6 +10066,31 @@ pub fn paint_change_review_rung(
         footer_h,
     );
     let _ = b.draw_status_bar_interactive(footer_rect, &status, &quadraui::InteractionState::new());
+}
+
+/// Build the "you are editing a real branch checkout, not your own" status
+/// segment for a branch-fed change review (#528, Track A Phase 3) — `None`
+/// when `engine.review_target` is unset, which covers both the ACP-fed
+/// review (no git branch at all) and the plain "no review has been opened
+/// this session" case, in which case the footer shows only the left
+/// segment, same as before this field existed.
+fn branch_review_provenance_segment(
+    engine: &Engine,
+    theme: &Theme,
+) -> Option<quadraui::StatusBarSegment> {
+    let target = engine.review_target.as_ref()?;
+    let root = engine
+        .workspace_root
+        .as_deref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    Some(quadraui::StatusBarSegment {
+        text: format!(" reviewing branch '{}' in {} ", target.branch, root),
+        fg: theme.status_fg,
+        bg: theme.status_bg,
+        bold: true,
+        action_id: None,
+    })
 }
 
 /// Where the menu bar's labels end, in absolute coordinates.

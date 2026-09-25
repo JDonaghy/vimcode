@@ -2139,6 +2139,25 @@ impl Engine {
         }
     }
 
+    /// Finalize review edits: commit + push (`:GFinalize [message]`, #528).
+    /// See `Engine::finalize_review_edits` for the actual git work and its
+    /// safety semantics; this wrapper just supplies the default commit
+    /// message and turns the result into a status message + `EngineAction`,
+    /// the same shape every other `cmd_git_*` wrapper in this file uses.
+    pub(crate) fn cmd_git_finalize_review(&mut self, message: Option<&str>) -> EngineAction {
+        let message = message.filter(|m| !m.is_empty()).unwrap_or("Review edits");
+        match self.finalize_review_edits(message) {
+            Ok(summary) => {
+                self.message = summary;
+                EngineAction::None
+            }
+            Err(e) => {
+                self.message = e;
+                EngineAction::Error
+            }
+        }
+    }
+
     /// Open `git blame` for the current file in a vertical split.
     pub(crate) fn cmd_git_blame(&mut self) -> EngineAction {
         let path = match self.file_path().map(|p| p.to_path_buf()) {

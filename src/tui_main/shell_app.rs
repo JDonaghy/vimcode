@@ -14966,6 +14966,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #528 Track A Phase 3 ("push human review edits back to the
+    /// branch"): once `R` opens a branch review, the diff surface's footer
+    /// must name which branch is under review — the "must know they are
+    /// editing the agent's branch, not their own checkout" footgun the
+    /// issue calls out as the main risk. Asserted on the *rendered*
+    /// screen, not on `Engine::review_target` being `Some` (#587/#592's
+    /// lesson: state populated is not evidence of paint). A wide terminal
+    /// avoids the status-bar-truncation ambiguity a real temp-dir-path
+    /// segment would otherwise hit at 80 columns.
+    ///
+    /// RED verified: with `render::paint_change_review_rung`'s provenance
+    /// segment removed (reverting to the pre-#528 `right_segments: vec![]`
+    /// literal), this test fails — the screen shows the diff but never the
+    /// reviewed branch name.
+    #[test]
+    fn board_review_footer_paints_branch_provenance_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "board-review-provenance-tui-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "t@t.com"]);
+        git(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let base = crate::core::git::current_branch(&dir).unwrap();
+        git(&["checkout", "-b", "feature"]);
+        std::fs::write(dir.join("new_from_branch.rs"), "fn reviewed() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "feature work"]);
+        git(&["checkout", &base]);
+
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            let mut actions = std::collections::HashMap::new();
+            actions.insert(
+                "OpenReview".to_string(),
+                vec!["mock-review".to_string(), "{id}".to_string()],
+            );
+            registry[0].board.as_mut().unwrap().actions = actions;
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine.workspace_root = Some(dir.clone());
+        app.engine
+            .set_board_client_for_test(crate::core::tool_client::MockToolClient(Ok(
+                serde_json::json!({"branch": "feature", "base": base}),
+            )));
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+        app.engine.board_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        // Wide terminal: the footer's provenance segment carries a real
+        // temp-dir path, and this test cares whether the branch name
+        // painted at all, not how a narrow terminal would truncate it.
+        let mut driver = driver_with_shell(app, config(), 240, 24);
+        driver.type_char('R');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("reviewing branch 'feature'"),
+            "the diff surface footer must show which branch is under \
+             review, so a human editing files here can tell this isn't \
+             their own checkout; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// AI: typing after focusing the panel must land in the `ChatController`
     /// (#819) input box and grow across multiple visual lines on `Enter` —
     /// the "multi-line growing input box" this panel's own doc comment

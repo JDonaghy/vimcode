@@ -3632,6 +3632,20 @@ pub struct Engine {
     /// before calling `Engine::change_review_jump_to_hit`, so paint and
     /// hit-test can never disagree about geometry.
     pub change_review_diff_rect: std::cell::Cell<quadraui::Rect>,
+    /// Which branch/base a still-open-or-since-closed [`Self::
+    /// open_branch_review`] resolved (#528, Track A Phase 3) — set when
+    /// the review opens and left in place after the human closes the diff
+    /// surface (`Esc`/`q`) to keep editing files, since that's exactly
+    /// when the provenance this field exists for matters most: nothing
+    /// else on screen says "this workspace is the agent's branch
+    /// checkout, not your own" once the diff view is gone. Read by
+    /// `render::branch_review_provenance_line` (both backends' status
+    /// chrome) and by [`Self::finalize_review_edits`], which refuses to
+    /// push if the worktree has since moved off `branch` — the "must know
+    /// which branch/worktree they're editing" footgun the issue calls out
+    /// as the main risk. Cleared only by opening a *different* branch
+    /// review; a plain `Esc` out of the diff surface must not clear it.
+    pub review_target: Option<crate::core::tool_client::BranchReviewTarget>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -4784,6 +4798,7 @@ impl Engine {
             acp_tool_calls: Vec::new(),
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
+            review_target: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),

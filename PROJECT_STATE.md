@@ -1,5 +1,41 @@
 # VimCode Project State
 
+**Last updated:** September 24, 2026 (#528, Track A Phase 3 — push human
+review edits back to the branch). A review worktree opened via `Engine::
+open_branch_review` (#525) is a real checkout: nothing in this scope was
+needed to make editing its files work (the editor already edits any file
+on disk), so this issue's actual gap was making that safe and legible.
+New `Engine::review_target: Option<BranchReviewTarget>` (`mod.rs`) records
+which branch/base a branch review resolved, set by `open_branch_review`
+and left in place after the diff surface itself closes — the human keeps
+editing files after `Esc`, and that's exactly when "which branch is this"
+matters most. New `Engine::finalize_review_edits(message)`
+(`review_ops.rs`), reachable as `:GFinalize [message]` (`execute.rs` ->
+`cmd_git_finalize_review`, `buffers.rs`, following the existing `:Gcommit`/
+`:Gpush` pattern): stages+commits any working-tree changes, then a plain
+(non-force) `git push` — modelled on coordinator's remote-fix `finalize`,
+so a rejected push (real non-fast-forward tested against a bare remote)
+never loses the commit or the worktree, just returns an `Err` the human
+can retry after resolving. Safety check: refuses to finalize if the
+worktree has since been `git checkout`ed off `review_target.branch` (the
+"must know which branch you're editing" footgun the issue names as the
+main risk) — verified with real `git worktree`-adjacent temp repos, not
+mocked git calls. Provenance in the UI: `render::paint_change_review_rung`
+now paints a right-aligned "reviewing branch '<branch>' in <root>" footer
+segment (shared `render.rs`, both backends, `None` for an ACP-fed review
+with no `review_target`) — new `board_review_footer_paints_branch_
+provenance_via_shell_app` in `src/tui_main/shell_app.rs`, RED-verified by
+reverting the segment to `right_segments: vec![]` and confirming the
+assertion fails before restoring it. Three new real-git tests in
+`review_ops.rs` (happy path against a bare remote, wrong-branch refusal,
+rejected-push commit preservation) plus a `:GFinalize` wiring test
+asserting the typed commit message lands at the pushed remote ref, not
+just "some push happened". `cargo build`/`clippy -D warnings`/`fmt` clean
+on both feature lanes; `no_coord_vocabulary_in_core` still passes (the
+git plumbing this issue adds — commit/push/branch-refusal — is exactly as
+generic as the `:G*` commands it's modelled on, no coordinator vocabulary
+anywhere in `src/core/` or `src/render.rs`).
+
 **Last updated:** September 24, 2026 (#525 review fixes, iteration 1).
 Addressed the review's blocking + non-blocking findings on top of the
 Track A Phase 2 work below:
