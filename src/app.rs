@@ -1257,94 +1257,6 @@ fn activity_id_to_panel_id(id: &str) -> Option<String> {
     }
 }
 
-/// Map GDK key names to the engine's expected key names.
-///
-/// This is the canonical superset mapping — callers that only care about a
-/// subset simply ignore the extra translations (they're harmless).
-fn map_gtk_key_name(gdk_name: &str) -> &str {
-    match gdk_name {
-        "Return" | "KP_Enter" => "Return",
-        "Escape" => "Escape",
-        "BackSpace" => "BackSpace",
-        "Delete" => "Delete",
-        "Tab" => "Tab",
-        "ISO_Left_Tab" => "BackTab",
-        "Up" => "Up",
-        "Down" => "Down",
-        "Left" => "Left",
-        "Right" => "Right",
-        "Home" => "Home",
-        "End" => "End",
-        "Page_Down" | "KP_Page_Down" => "PageDown",
-        "Page_Up" | "KP_Page_Up" => "PageUp",
-        "space" => " ",
-        "slash" => "/",
-        "question" => "?",
-        other => other,
-    }
-}
-
-fn gtk_key_name_to_quadraui(mapped: &str, ctrl: bool) -> Option<quadraui::UiEvent> {
-    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
-    let key = match mapped {
-        "Down" => Key::Named(NamedKey::Down),
-        "Up" => Key::Named(NamedKey::Up),
-        "Home" => Key::Named(NamedKey::Home),
-        "End" => Key::Named(NamedKey::End),
-        "PageDown" => Key::Named(NamedKey::PageDown),
-        "PageUp" => Key::Named(NamedKey::PageUp),
-        "Tab" => Key::Named(NamedKey::Tab),
-        "Return" => Key::Named(NamedKey::Enter),
-        " " => Key::Char(' '),
-        "j" => Key::Char('j'),
-        "k" => Key::Char('k'),
-        "g" => Key::Char('g'),
-        "G" => Key::Char('G'),
-        _ => return None,
-    };
-    Some(UiEvent::KeyPressed {
-        key,
-        modifiers: Modifiers {
-            ctrl,
-            ..Modifiers::default()
-        },
-        repeat: false,
-    })
-}
-
-/// Map a GDK key name and extract the unicode character for input-mode handlers.
-///
-/// Returns `(mapped_key_name, unicode)`.  Special keys return `None` for unicode;
-/// single-character key names return the character as `Some(ch)`.
-fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
-    match gdk_name {
-        "Return" | "KP_Enter" => ("Return", None),
-        "Escape" => ("Escape", None),
-        "BackSpace" => ("BackSpace", None),
-        "Delete" => ("Delete", None),
-        "Up" => ("Up", None),
-        "Down" => ("Down", None),
-        "Left" => ("Left", None),
-        "Right" => ("Right", None),
-        "Home" => ("Home", None),
-        "End" => ("End", None),
-        "Tab" => ("Tab", None),
-        "ISO_Left_Tab" => ("BackTab", None),
-        "Page_Up" => ("Page_Up", None),
-        "Page_Down" => ("Page_Down", None),
-        "question" => ("?", Some('?')),
-        "slash" => ("/", Some('/')),
-        other => {
-            let mut chars = other.chars();
-            if let (Some(ch), None) = (chars.next(), chars.next()) {
-                (other, Some(ch))
-            } else {
-                (other, None)
-            }
-        }
-    }
-}
-
 /// Set up system clipboard callbacks on the engine via
 /// `backend.services().clipboard()` (issue #1100 — quadraui#991's
 /// `PlatformServices` seam, replacing the bespoke `copypasta_ext` stack).
@@ -2671,18 +2583,30 @@ impl App {
         // hands back `None` for the two it cannot own — Debug needs a live
         // `Backend`, Explorer is a backend widget — which the fallback match
         // below still spells out.
-        let (sc_mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
-        let mapped = map_gtk_key_name(key_name.as_str());
-        let panel_key = match focus_route {
-            render::FocusKeyRoute::SourceControl => sc_mapped,
-            _ => mapped,
-        };
+        //
+        // #1422: `key_name` is already the shared `render::engine_key_from_ui`
+        // spelling (`"Page_Up"`/`"Page_Down"`, `"ISO_Left_Tab"`, …) — the same
+        // one TUI's `engine_name()` produces — so there is no second,
+        // GTK-local mapping to apply here. The old `map_gtk_key_name` /
+        // `map_gtk_key_with_unicode` pair round-tripped `key_name` through a
+        // GDK-spelled table (`"Page_Up"` -> `"PageUp"`, `"ISO_Left_Tab"` ->
+        // `"BackTab"`) whose output every downstream consumer already accepts
+        // in its *un*-mapped, `key_name` form too (`panels.rs`/`search.rs`/
+        // `ext_panel.rs`/`source_control.rs` all dual-accept `"ISO_Left_Tab"`
+        // since #1060; nothing reads plain `"PageUp"`/`"PageDown"` at all —
+        // see issue #1422). `sc_unicode` collapses into `unicode` the same
+        // way: for a `Key::Char` press `unicode` is already `Some(c)`
+        // independent of `ctrl` (decoded once, above, when `key_name`/
+        // `unicode` were built from the raw `UiEvent`), matching what
+        // TUI's Source-Control arm (`shell_app.rs`) re-derives with `ctrl`
+        // forced off; for a `Key::Named` press both were always `None`.
+        let panel_key = key_name.as_str();
         let shared = render::dispatch_sidebar_panel_key(
             &mut self.engine.borrow_mut(),
             focus_route,
             panel_key,
             unicode,
-            sc_unicode,
+            unicode,
             ctrl,
             alt,
         );
@@ -2816,25 +2740,31 @@ impl App {
         ctrl: bool,
         ui_event: &quadraui::UiEvent,
     ) -> Option<Option<bool>> {
-        let mapped = map_gtk_key_name(key_name);
         match route {
             render::FocusKeyRoute::Debug => {
+                // #1422: pass the real `ui_event` straight to `SidebarSystem::
+                // handle` instead of reconstructing a `UiEvent` from `key_name`
+                // through the old `gtk_key_name_to_quadraui` table (which only
+                // covered a dozen named/nav keys and silently skipped `.handle`
+                // for everything else). Mirrors TUI's identical, unconditional
+                // `.handle(ui_event, backend, rect)` call for this route
+                // (`shell_app.rs`'s `handle_focus_owner_key`) — see
+                // `dispatch_dap_sidebar_event`'s own doc: it already reports
+                // `Ignored` as `false` so an unrecognised key still falls
+                // through to `dispatch_dap_sidebar_action_key` below exactly
+                // as before.
                 let mut engine = self.engine.borrow_mut();
                 let rect = engine.dap_sidebar_body_rect.get();
                 render::populate_dap_sidebar_system(&engine);
-                let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
-                    let backend_rc = self.backend.clone();
-                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                        &ui_event,
-                        &mut **backend_rc.borrow_mut(),
-                        rect,
-                    );
-                    engine.dispatch_dap_sidebar_event(sidebar_event)
-                } else {
-                    false
-                };
+                let backend_rc = self.backend.clone();
+                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                    ui_event,
+                    &mut **backend_rc.borrow_mut(),
+                    rect,
+                );
+                let consumed = engine.dispatch_dap_sidebar_event(sidebar_event);
                 if !consumed {
-                    engine.dispatch_dap_sidebar_action_key(mapped);
+                    engine.dispatch_dap_sidebar_action_key(key_name);
                 }
                 Some(Some(engine.dap_sidebar_has_focus))
             }
@@ -2842,8 +2772,7 @@ impl App {
                 // Unlike Debug (nav-only), the AI panel's `ChatController`
                 // needs the real, un-round-tripped `UiEvent` — `KeyPressed`
                 // *or* `CharTyped` — so free-form typed text reaches its
-                // input buffer; `gtk_key_name_to_quadraui`'s reconstruction
-                // only covers a handful of named/nav keys (#819).
+                // input buffer.
                 let mut engine = self.engine.borrow_mut();
                 let rect = engine.ai_chat_rect.get();
                 let theme = render::Theme::from_name(&engine.settings.colorscheme);
@@ -2870,7 +2799,7 @@ impl App {
                 // Explorer keys used to be routed through a per-DrawingArea
                 // key controller when the DA had focus (#732 retired the
                 // `Msg` variant it sent; nothing has produced it since #540).
-                self.handle_explorer_da_key(mapped.to_string(), unicode, ctrl);
+                self.handle_explorer_da_key(key_name.to_string(), unicode, ctrl);
                 self.draw_needed.set(true);
                 Some(None)
             }
@@ -6854,7 +6783,7 @@ impl App {
     /// GTK sink for the actions it names.
     fn handle_activity_bar_key(&mut self, key_name: &str, ctrl: bool) {
         use render::ActivityBarKeyAction;
-        match render::activity_bar_key_action(map_gtk_key_name(key_name), ctrl) {
+        match render::activity_bar_key_action(key_name, ctrl) {
             ActivityBarKeyAction::MoveDown => self.engine.borrow_mut().activity_bar_move_down(),
             ActivityBarKeyAction::MoveUp => self.engine.borrow_mut().activity_bar_move_up(),
             ActivityBarKeyAction::Activate => {
@@ -7703,24 +7632,18 @@ impl App {
                         //    arm so both backends get the same, still-working
                         //    `"Insert"` spelling.
                         //
-                        // `key_name` doesn't reach engine consumers raw: it
-                        // passes through a second, GTK-local decode layer —
-                        // `map_gtk_key_name` / `map_gtk_key_with_unicode`
-                        // below in this file — before `handle_key_press`
-                        // dispatches it. Both tables already had an
-                        // `"ISO_Left_Tab"` arm from before this PR, but it
-                        // was dead code on the GTK path (GTK never produced
-                        // that spelling as `key_name` pre-#1060). Making
-                        // `"ISO_Left_Tab"` live here is what surfaced their
-                        // disagreement: `map_gtk_key_name` round-trips it to
-                        // `"BackTab"` correctly, but `map_gtk_key_with_unicode`
-                        // used to collapse both `"Tab"` and `"ISO_Left_Tab"`
-                        // to plain `"Tab"`, silently turning Shift+Tab into
-                        // Tab for the one route that consumes its output
-                        // (`FocusKeyRoute::SourceControl`'s `sc_mapped`).
-                        // Fixed alongside this comment so `map_gtk_key_with_unicode`
-                        // now matches `map_gtk_key_name`'s `"ISO_Left_Tab" =>
-                        // "BackTab"` round-trip.
+                        // #1422: `key_name` now reaches every engine consumer
+                        // exactly as produced here — `handle_key_press` and
+                        // its callees (`dispatch_sidebar_panel_key`,
+                        // `dispatch_focus_owner_residual`,
+                        // `activity_bar_key_action`, …) used to round-trip it
+                        // through a second, GTK-local decode layer
+                        // (`map_gtk_key_name` / `map_gtk_key_with_unicode` /
+                        // `gtk_key_name_to_quadraui`) that this shared
+                        // decoder's own spelling already made redundant — see
+                        // issue #1422 for the full audit of why every
+                        // consumer already accepted this decoder's spelling
+                        // directly.
                         let n = render::engine_key_from_ui(&key, modifiers, true)
                             .map(|(name, _, _)| name)
                             .unwrap_or_default();

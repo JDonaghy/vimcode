@@ -265,8 +265,9 @@ impl Engine {
                 None
             }
             // "Shift_Tab" is sent by the TUI backend explicitly.
-            // "ISO_Left_Tab" is GDK's key name for Shift+Tab; "BackTab" is the
-            // value produced by map_gtk_key_name("ISO_Left_Tab").  Accept all
+            // "ISO_Left_Tab" is `render::engine_key_from_ui`'s spelling for
+            // `NamedKey::BackTab` (both backends, since #1060); "BackTab" is
+            // kept for any caller still on the pre-#1060 name. Accept all
             // three so backward button cycling works on both backends.
             "Tab" | "Shift_Tab" | "ISO_Left_Tab" | "BackTab" => {
                 let len = dialog.buttons.len();

@@ -4028,9 +4028,9 @@ fn handle_activity_bar_focused_key(
 /// [`render::route_focus_key`] resolves (#757 / #734 slice 2), which is where
 /// the ladder — and the four cross-backend divergences it used to hide — is
 /// stated. Named keys are decoded via the shared [`render::engine_key_from_ui`]
-/// (#826); each panel's `Key::Char` whitelist stays backend-local (TUI's char
-/// spellings differ from GTK's `map_gtk_key_name`), and only TUI needs the
-/// Ctrl+V clipboard pre-read, since quadraui's runner delivers Ctrl+V to GTK
+/// (#826); each panel's `Key::Char` whitelist stays backend-local, and only
+/// TUI needs the Ctrl+V clipboard pre-read, since quadraui's runner delivers
+/// Ctrl+V to GTK
 /// as `UiEvent::ClipboardPaste` before any key event reaches this rung, per
 /// `render::dispatch_sidebar_panel_key`'s `Search` arm doc comment).
 ///
@@ -4184,11 +4184,12 @@ fn handle_focus_owner_key(
             }
             // #1249: `c.to_string()`, not a hand-written char->`String`
             // identity table (`'q' => "q".to_string()`, …) — like GTK's own
-            // pass-through (`map_gtk_key_name`'s `other => other`),
-            // `dispatch_dap_sidebar_action_key` already ignores any letter
-            // it doesn't whitelist. Also fixes 'h' silently doing nothing on
-            // TUI: the old table never listed it, though the dispatch
-            // function (and GTK) both treat it the same as "Left".
+            // pass-through (`handle_key_press` hands `key_name` straight
+            // through, #1422), `dispatch_dap_sidebar_action_key` already
+            // ignores any letter it doesn't whitelist. Also fixes 'h'
+            // silently doing nothing on TUI: the old table never listed it,
+            // though the dispatch function (and GTK) both treat it the same
+            // as "Left".
             let key_name = match key_val {
                 Key::Char(c) => c.to_string(),
                 Key::Named(NamedKey::F(n)) if (5..=11).contains(&n) => match n {
@@ -4214,7 +4215,7 @@ fn handle_focus_owner_key(
         // One spelling for both sub-modes: `render::dispatch_sidebar_panel_key`
         // (and, under it, `Engine::handle_ext_panel_key`/`handle_ext_panel_input_key`)
         // branches on `ext_panel_input_active` itself, the same way GTK's
-        // caller (`map_gtk_key_name`) never special-cases it either — neither
+        // caller never special-cases it either — neither
         // engine method reads `ctrl`, and both accept a raw named key or a
         // literal character.
         let (key_name, unicode) = match key_val {
@@ -4335,9 +4336,9 @@ fn handle_focus_owner_key(
         // Char('S')) instead of a second, SC-local copy of it plus a
         // 20-entry char->`&str` identity table gating which resolved letters
         // pass through. `ctrl` is forced off: the one SC ctrl chord (Ctrl+b)
-        // is handled above, and `dispatch_sc_sidebar_key_unified` (like
-        // GTK's `map_gtk_key_with_unicode`) already ignores any letter it
-        // doesn't recognise.
+        // is handled above, and `dispatch_sc_sidebar_key_unified` already
+        // ignores any letter it doesn't recognise (GTK's `handle_key_press`
+        // passes the same unfiltered spelling, #1422).
         //
         // Deliberate incidental fix, called out per review (non-blocking,
         // #1249 iteration 1): the old SC-local shift resolver only
@@ -4416,9 +4417,9 @@ fn handle_focus_owner_key(
             // table: it also supplies "BackSpace"/"Delete", which the old
             // explorer-local table dropped even though
             // `dispatch_explorer_edit_key` handles them — so rename/new-entry
-            // editing lost those two keys on TUI while GTK
-            // (`map_gtk_key_name`) had them. `Page_Up`/`Page_Down` and
-            // `PageUp`/`PageDown` are both accepted by the engine.
+            // editing lost those two keys on TUI while GTK had them.
+            // `Page_Up`/`Page_Down` and `PageUp`/`PageDown` are both
+            // accepted by the engine.
             //
             // #1249: `c.to_string()`, not a hand-written char->`String`
             // identity table (`'j' => "j".to_string()`, …, `_ =>
@@ -4426,8 +4427,8 @@ fn handle_focus_owner_key(
             // ignores any name it doesn't recognise and falls through to its
             // `chr`-driven custom-keybinding lookup, which never read
             // `key_name` anyway, so restricting which chars got a real name
-            // bought nothing (GTK's `map_gtk_key_with_unicode` is the same
-            // unrestricted pass-through).
+            // bought nothing (GTK's `handle_key_press` is the same
+            // unrestricted pass-through, #1422).
             let key_name = match key_val {
                 Key::Char(c) => c.to_string(),
                 Key::Named(_) => engine_name(),
@@ -13987,8 +13988,8 @@ mod tests {
     /// Debug (DAP) sidebar was unreachable from the TUI keyboard before this
     /// fix — the old hand-written char whitelist only listed `'q'`/`'x'`/`'d'`,
     /// never `'h'`, even though `Engine::dispatch_dap_sidebar_action_key`
-    /// (`src/core/engine/dap_ops.rs`) and GTK's `map_gtk_key_name`
-    /// pass-through both treat `"h"` the same as `"Left"`: focus leaves the
+    /// (`src/core/engine/dap_ops.rs`) and GTK's own pass-through both treat
+    /// `"h"` the same as `"Left"`: focus leaves the
     /// sidebar and parks the activity-bar cursor on the Debug slot
     /// (`Engine::activity_bar_focus_in_at(3)`). The new
     /// `Key::Char(c) => c.to_string()` pass-through restores it.
@@ -24991,9 +24992,8 @@ mod tests {
     /// Backspace or Delete, so those two arrived at
     /// `dispatch_explorer_key` as the empty string and were dropped —
     /// even though `dispatch_explorer_edit_key` handles both, and GTK
-    /// (which routes through the single `map_gtk_key_name` table) had
-    /// them. Renaming a file from the TUI explorer could not delete a
-    /// character.
+    /// (which passed the decoded key name straight through) had them.
+    /// Renaming a file from the TUI explorer could not delete a character.
     ///
     /// #757 replaced that copy with the module's `tui_key_to_engine_name`,
     /// which is where the two names come from; #826 folded that helper into

@@ -3810,9 +3810,9 @@ pub enum ActivityBarKeyAction {
     Ignore,
 }
 
-/// Map an engine-space key name (GTK's `map_gtk_key_name` output, TUI's
-/// `tui_key_to_engine_name` output or a bare character) to its activity-bar
-/// action. `ctrl` suppresses activation and focus-out, matching GTK.
+/// Map an engine-space key name (both backends' `engine_key_from_ui` output,
+/// or a bare character) to its activity-bar action. `ctrl` suppresses
+/// activation and focus-out, matching GTK.
 pub fn activity_bar_key_action(key: &str, ctrl: bool) -> ActivityBarKeyAction {
     match key {
         "j" | "Down" => ActivityBarKeyAction::MoveDown,
@@ -4367,9 +4367,10 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 ///
 /// `sc_unicode` exists because the source-control panel's key table reads
 /// printables that its siblings read as named keys (`?`, `/`), so a backend
-/// whose translation layer distinguishes the two — GTK's
-/// `map_gtk_key_with_unicode` vs `map_gtk_key_name` — has a second spelling to
-/// hand over. Backends with one spelling pass `unicode` twice.
+/// whose translation layer distinguishes the two has a second spelling to
+/// hand over. #1422 deleted GTK's own such layer (`map_gtk_key_with_unicode`
+/// vs `map_gtk_key_name`) once its spelling turned out identical to
+/// `unicode`'s — both backends now pass `unicode` twice.
 pub fn dispatch_sidebar_panel_key(
     engine: &mut Engine,
     route: FocusKeyRoute,

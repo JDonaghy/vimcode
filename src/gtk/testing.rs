@@ -15789,15 +15789,19 @@ mod engine_key_from_ui_gtk_tests {
     /// #1060 review: plain BackTab (Shift+Tab, no ctrl) against the Source
     /// Control sidebar — the GTK mirror of TUI's `back_tab_cycles_the_sc_
     /// sidebar_section_backward_via_shell_app`. `FocusKeyRoute::SourceControl`
-    /// is the one route whose `key_name` travels through `map_gtk_key_with_
-    /// unicode` (not `map_gtk_key_name`), and that function's `"Tab" |
-    /// "ISO_Left_Tab" => ("Tab", None)` arm used to silently collapse the
-    /// shared decoder's `"ISO_Left_Tab"` spelling (which `NamedKey::BackTab`
-    /// now produces, since this PR routed it through `engine_key_from_ui`)
-    /// right back down to plain `"Tab"` before `sc_sidebar_navigate` ever
-    /// saw it — so Shift+Tab silently cycled the active section *forward*
-    /// instead of backward, a regression this PR introduced and this test
-    /// closes.
+    /// used to be the one route whose `key_name` travelled through a
+    /// second, GTK-local `map_gtk_key_with_unicode` table (not
+    /// `map_gtk_key_name`) before reaching `dispatch_sc_sidebar_key_unified`
+    /// — that table's `"Tab" | "ISO_Left_Tab" => ("Tab", None)` arm used to
+    /// silently collapse the shared decoder's `"ISO_Left_Tab"` spelling
+    /// (which `NamedKey::BackTab` produces via `engine_key_from_ui`) right
+    /// back down to plain `"Tab"`, so Shift+Tab silently cycled the active
+    /// section *forward* instead of backward. #1422 deleted that whole
+    /// second decode layer — `handle_key_press` now hands
+    /// `dispatch_sidebar_panel_key` the decoder's own `"ISO_Left_Tab"`
+    /// spelling directly for every route, SourceControl included — so this
+    /// test keeps guarding the same behaviour with one fewer translation
+    /// layer to regress.
     ///
     /// **Verified RED against unfixed `develop`:** with `map_gtk_key_with_
     /// unicode`'s `"ISO_Left_Tab"` arm restored to fold into `("Tab", None)`

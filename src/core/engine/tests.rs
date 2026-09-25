@@ -18672,8 +18672,9 @@ fn test_dialog_modifier_only_key_does_not_fire_hotkey() {
     assert!(e.dialog.is_none(), "'s' must still fire the Save hotkey");
 }
 
-/// Shift+Tab (sent as "ISO_Left_Tab" by GDK or "BackTab" after map_gtk_key_name)
-/// must cycle the dialog selection backward (#207 side-effect).
+/// Shift+Tab (sent as "ISO_Left_Tab", both backends' `engine_key_from_ui`
+/// spelling since #1060, or the pre-#1060 "BackTab") must cycle the dialog
+/// selection backward (#207 side-effect).
 #[test]
 fn test_dialog_shift_tab_backward_navigation() {
     let mut e = Engine::new();
@@ -18709,7 +18710,7 @@ fn test_dialog_shift_tab_backward_navigation() {
     // Backward at start wraps to last (0 → 2)
     e.handle_key("ISO_Left_Tab", None, false);
     assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
-    // BackTab (from map_gtk_key_name("ISO_Left_Tab")) → backward (2 → 1)
+    // BackTab (the pre-#1060 spelling, still accepted) → backward (2 → 1)
     e.handle_key("BackTab", None, false);
     assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
     // Shift_Tab (TUI explicit) → backward (1 → 0)
