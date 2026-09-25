@@ -26324,6 +26324,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1386 black-box acceptance (the driver-tier proof the
+    /// `lsp_manager.rs`/`lsp_ops.rs` unit tests above don't give on their
+    /// own — CLAUDE.md's Testing section requires rendered-output coverage
+    /// for a user-visible fix, not just engine-state assertions): opening a
+    /// file whose language's LSP server resolves to a broken rustup-style
+    /// proxy (present on disk, fails its `--version` probe — the exact
+    /// shape from the issue) must not block the harness-rendered buffer
+    /// from appearing, and a *second* open of the same language — driven
+    /// through the real `:e` command-line pipeline, the same path a user
+    /// typing in the running TUI takes — must not pay the probe cost
+    /// again.
+    ///
+    /// The first open happens directly on `app.engine` before the driver
+    /// is constructed (matching `no_install_command_error_paints_on_
+    /// command_line_via_shell_app` just above); the second happens through
+    /// `run_ex_command`'s real key-injection path once the driver is live,
+    /// so the regression guard covers both "opens before a driver exists"
+    /// and "opens driven live through the shell".
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting the
+    /// `failed_language_resolutions` negative cache in
+    /// `LspManager::ensure_server_for_language` makes
+    /// `probes_after_second_open` read higher than `probes_after_first_open`
+    /// (the broken proxy gets re-invoked by the second `:e`'s did-open +
+    /// semantic-tokens resolution calls) instead of equal. Both opens still
+    /// succeed and paint their content either way — the bug was the
+    /// repeated probe *cost*, not a hard open failure — so only the
+    /// probe-count assertion, not the `screen_contains` ones, distinguishes
+    /// fixed from broken here.
+    #[test]
+    #[cfg(unix)]
+    fn opening_a_file_with_unresolvable_lsp_server_probes_once_across_two_opens_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+
+        let binary_name = "vimcode-test-1386-shell-proxy";
+        let unique = format!(
+            "vimcode_test_1386_shell_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(&unique);
+        let home = base.join("home");
+        let cargo_bin = home.join(".cargo").join("bin");
+        let files_dir = base.join("files");
+        std::fs::create_dir_all(&cargo_bin).unwrap();
+        std::fs::create_dir_all(&files_dir).unwrap();
+        let counter_file = base.join("probes.log");
+
+        let binary_path = cargo_bin.join(binary_name);
+        std::fs::write(
+            &binary_path,
+            format!(
+                "#!/bin/sh\necho probe >> {}\nexit 1\n",
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Thread-local, not `set_var("HOME", …)` — see
+        // `core::paths::TEST_HOME_OVERRIDE` for why the process-global
+        // version corrupts concurrently-running tests (#957 smoke).
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let ext_name = "vc-test-1386-shell-ext";
+        let file1 = files_dir.join("File1386A.java");
+        let file2 = files_dir.join("File1386B.java");
+        std::fs::write(&file1, "class File1386A { }\n").unwrap();
+        std::fs::write(&file2, "class File1386B { }\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: ext_name.to_string(),
+            language_ids: vec!["java".to_string()],
+            file_extensions: vec![".java".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        app.engine.extension_state.mark_installed(ext_name);
+
+        // First open — direct `Engine` call, before the driver exists, the
+        // same production call path `render.rs`'s `EngineAction::OpenFile`
+        // handler uses.
+        app.engine
+            .open_file_with_mode(&file1, crate::core::engine::OpenMode::Permanent)
+            .unwrap_or_else(|e| panic!("open must succeed despite unresolvable LSP: {e}"));
+
+        let mut driver = driver_with_shell(app, config(), 100, 24);
+        driver.render();
+
+        assert!(
+            driver.screen_contains("File1386A"),
+            "the harness-rendered buffer must show the opened file's \
+             content even though its language's LSP server is \
+             unresolvable; screen:\n{}",
+            driver.screen()
+        );
+
+        let count_probes = |file: &std::path::Path| {
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .count()
+        };
+        let probes_after_first_open = count_probes(&counter_file);
+        assert!(
+            probes_after_first_open >= 1,
+            "test setup sanity: opening the first file must have driven \
+             at least one probe of the broken proxy"
+        );
+
+        // Second open, through the real `:e` command-line pipeline this
+        // time (`run_ex_command` → `Engine::execute_command` →
+        // `EngineAction::OpenFile` → `render.rs`'s shared handler →
+        // `open_file_with_mode`) — the same path a user driving the
+        // running TUI takes, not a direct `Engine` call.
+        run_ex_command(&mut driver, &format!(":e {}", file2.display()));
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("File1386B"),
+            "the second file must also open and paint despite the \
+             still-unresolvable server; screen:\n{screen}"
+        );
+
+        let probes_after_second_open = count_probes(&counter_file);
+        assert_eq!(
+            probes_after_second_open, probes_after_first_open,
+            "opening a second file of the same unresolvable-server \
+             language must not pay the probe cost again; probes after \
+             open 1: {probes_after_first_open}, after open 2: \
+             {probes_after_second_open}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // ── #1344: extension install exit status / combined LSP+DAP outcome —
     // black-box coverage ──────────────────────────────────────────────────
     //

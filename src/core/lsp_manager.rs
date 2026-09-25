@@ -482,7 +482,24 @@ pub fn resolve_command(cmd: &str) -> Option<PathBuf> {
         let first_line = path_str.lines().next()?.trim();
         if !first_line.is_empty() {
             let resolved = PathBuf::from(first_line);
-            if already_probed.contains(&resolved) {
+            // #1386 review follow-up: compare canonicalized paths, not just
+            // the raw strings — `which`/`where` can resolve to a
+            // differently-formatted-but-equivalent path to a candidate the
+            // tool-dirs loop above already rejected (a symlink, a relative
+            // vs. absolute form, etc.), which a plain string comparison
+            // would miss, reintroducing the double-probe for that shape.
+            // `canonicalize()` is a cheap stat-based syscall, not a spawn —
+            // nowhere near the cost this fix targets — so falling back to
+            // the raw path on failure (e.g. it vanished between `which`
+            // returning and this call) only ever loses the dedupe, never
+            // adds a spurious one.
+            let already_seen = already_probed.contains(&resolved)
+                || resolved.canonicalize().is_ok_and(|c| {
+                    already_probed
+                        .iter()
+                        .any(|p| p.canonicalize().is_ok_and(|pc| pc == c))
+                });
+            if already_seen {
                 return None;
             }
             // `which` happily resolves the rustup proxy in ~/.cargo/bin/
@@ -592,6 +609,17 @@ pub struct LspManager {
     /// the (possibly slow — broken rustup proxy, uninstalled binary) probe
     /// on every buffer open (#1386). Maps language_id → the error message
     /// that was produced the first time, so later opens still surface it.
+    ///
+    /// Populated on *any* `resolve_and_start_server` failure, not only
+    /// "binary could not be resolved" — a transient `LspServer::start`
+    /// spawn failure on an already-resolved binary (resource exhaustion,
+    /// permissions) is cached too, so it no longer gets a silent retry on
+    /// the next open the way it did before #1386. That's a deliberate
+    /// trade-off in favor of a bounded probe cost: an explicit
+    /// `:LspRestart` (`restart_server_for_language`), reinstalling the
+    /// extension (`add_registry_entry`), or the extension set changing
+    /// (`set_ext_manifests`) all clear the affected entry/entries and let
+    /// the next open re-probe.
     failed_language_resolutions: HashMap<String, Option<String>>,
 }
 
