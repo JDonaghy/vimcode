@@ -26996,6 +26996,16 @@ mod tests {
     #[cfg(unix)]
     const SELF_CLOSING_INSTALL_PREFIX: &str = "read() { :; } ; ";
 
+    /// The status bar's in-progress spinner glyphs (`render.rs`'s
+    /// `notification_seg` — `frames = ['⠋', '⠙', ...]`), used by the #1396
+    /// tests below to confirm a `NotificationKind::LspInstall` notification
+    /// has actually flipped from "spinning" to "done" (bell), not just that
+    /// its message text is still on screen (the message is left unchanged by
+    /// `notify_done_by_kind(&NotificationKind::LspInstall, None)`, so text
+    /// alone can't distinguish the two states).
+    #[cfg(unix)]
+    const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
     /// #1344 core acceptance case: a non-zero exit code from the install
     /// command must paint "failed (exit N)" on the command line, and must
     /// NOT claim "not found on PATH" — the exact confusion #1344 reports
@@ -27169,6 +27179,296 @@ mod tests {
             screen.contains("installed and started"),
             "the LSP success message must survive alongside the DAP \
              not-found message, not be overwritten by it; screen:\n{screen}"
+        );
+    }
+
+    // ── #1396: finalize on command exit, not pane exit ──────────────────
+    //
+    // The first two tests below deliberately do NOT use
+    // `SELF_CLOSING_INSTALL_PREFIX` — the wrapper's `read __dummy` really
+    // blocks, so the pane's shell never exits on its own. Before #1396,
+    // `poll_terminal` only called `finalize_install_from_terminal` once
+    // `TerminalSession::is_exited()` fired, so with a real blocking `read`
+    // the install looked permanently hung: the spinner never resolved and
+    // the status message never painted until a human noticed the pane and
+    // pressed Enter. These tests poll for the resolved state and never send
+    // a keystroke at all — a real Enter keypress is deliberately not used to
+    // *close* the pane afterwards either (unlike some #1344 tests' framing
+    // might suggest): `poll_until_screen`'s own doc comment above documents
+    // in detail why synthesising that keystroke against a real interactive
+    // shell is a genuine race, not just unnecessary here — confirmed
+    // in practice while writing these tests, where a `press_named(Enter)`
+    // step here flaked in exactly the way that doc predicts. The third test
+    // below instead exercises the "closing must not double-finalize"
+    // half of the issue via `SELF_CLOSING_INSTALL_PREFIX`, which reaches
+    // the same `poll_terminal` code path deterministically (the shell exits
+    // on its own, no synthetic keystroke needed).
+
+    /// #1396 success case: the "Installing…" spinner and the status message
+    /// must both resolve while the pane is still sitting open at its "Press
+    /// Enter to close…" prompt — i.e. before the shell exits.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `poll_terminal`
+    /// to only finalize on `is_exited()` makes the first `poll_until_screen`
+    /// below time out — the command has already exited 0 and the shell is
+    /// permanently parked on `read`, so nothing ever calls
+    /// `finalize_install_from_terminal` and neither the spinner nor the
+    /// status message ever resolve.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_finalizes_before_enter_pressed_success_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        // See `extension_install_failure_exit_code_paints_via_shell_app`
+        // above for why `check_settings_reload` is pointed away from the
+        // real settings file.
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_success_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        // A binary name that doesn't exist anywhere yet, so `ext_install_
+        // from_registry` actually queues the terminal install (unlike the
+        // #1344 combined test above, which deliberately used `sh` so the
+        // LSP leg would already be resolved). A fake `~/.local/bin` (see
+        // `fake_home_with_local_bin_binary` in `terminal_ops.rs`'s own
+        // tests) is set up empty first, then populated with the binary
+        // *after* the install is queued but *before* the driver ticks — the
+        // exact "install script created a new binary" shape, without
+        // depending on this fake shell command to actually create anything.
+        let binary_name = "vimcode-test-fake-lsp-1396-success";
+        let home = std::env::temp_dir().join(format!(
+            "vimcode_test_home_1396_success_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let local_bin = home.join(".local").join("bin");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let _home_guard = crate::core::paths::set_test_home(&home);
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-success".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 success test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-success".to_string()],
+            lsp: LspConfig {
+                binary: binary_name.to_string(),
+                install: "sh -c 'exit 0'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued \
+             ({binary_name} must not resolve yet)"
+        );
+
+        let binary_path = local_bin.join(binary_name);
+        std::fs::write(&binary_path, "#!/bin/sh\necho fake\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        // Precondition: the spinner notification is already up (`notify`
+        // ran synchronously inside `ext_install_from_registry`, before the
+        // terminal pane was even spawned).
+        assert!(
+            driver.screen().contains("Installing"),
+            "spinner notification never painted before the install ran; screen:\n{}",
+            driver.screen()
+        );
+
+        // No keystroke is sent anywhere in this block: the install command
+        // exits almost immediately, but the wrapper's real (unoverridden)
+        // `read __dummy` keeps the pane's shell alive at its prompt.
+        let resolved_before_exit =
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("installed and started") && screen.contains("Press Enter to close")
+            });
+        assert!(
+            resolved_before_exit,
+            "install must finalize (status message painted) while the pane \
+             is still open at its Enter prompt, without waiting for the \
+             shell to exit; screen:\n{}",
+            driver.screen()
+        );
+
+        // The notification itself must have resolved too (bell, not a spin
+        // frame) — not just the command-line text, which `notify_done_by_
+        // kind(.., None)` deliberately leaves unchanged.
+        let screen = driver.screen();
+        assert!(
+            !SPINNER_FRAMES.iter().any(|f| screen.contains(*f)),
+            "notification must no longer show an active spinner frame once \
+             the install has finalized; screen:\n{screen}"
+        );
+
+        // The pane is still sitting open at its Enter prompt at this point
+        // (asserted above via `resolved_before_exit`'s second half) — no
+        // keystroke is sent to close it. See the module comment above for
+        // why: `driver.press_named(NamedKey::Enter)` against this real,
+        // still-blocked interactive shell is a race (confirmed while
+        // writing this test), not a deterministic "close the pane" signal.
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1396 failure case: a non-zero exit code must resolve (status message
+    /// painted) while the pane is still sitting open at its "Press Enter to
+    /// close…" prompt — i.e. before the shell exits — exactly like the
+    /// success case above.
+    ///
+    /// **Verified RED against unfixed `develop`:** reverting `poll_terminal`
+    /// to only finalize on `is_exited()` makes `poll_until_screen` below
+    /// time out, identically to the success-case test above.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_finalizes_before_enter_pressed_failure_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_failure_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-failure".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 failure test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-failure".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-failure".to_string(),
+                install: "sh -c 'exit 9'".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        let resolved_before_exit =
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 9)") && screen.contains("Press Enter to close")
+            });
+        assert!(
+            resolved_before_exit,
+            "failed install must finalize (status message painted) while \
+             the pane is still open at its Enter prompt, without waiting \
+             for the shell to exit; screen:\n{}",
+            driver.screen()
+        );
+        assert!(
+            !driver.screen().to_lowercase().contains("not found"),
+            "a failed install must not also claim the binary was 'not \
+             found on PATH'; screen:\n{}",
+            driver.screen()
+        );
+    }
+
+    /// #1396 idempotency half: closing the install pane must not run
+    /// `finalize_install_from_terminal` a second time.
+    ///
+    /// Uses `SELF_CLOSING_INSTALL_PREFIX` (like the #1344 tests above)
+    /// rather than a synthetic Enter keypress, so the pane's shell reaches
+    /// `poll_terminal`'s `is_exited()` branch deterministically — no race
+    /// against a real blocked `read`. With the command exiting almost
+    /// immediately, the very same `poll_terminal` tick typically observes
+    /// both the exit-code file *and* `is_exited()` at once, exercising the
+    /// `TerminalSlot::install_finalized` guard between the two branches
+    /// added by #1396.
+    ///
+    /// The regression is made observable because `read_install_exit_code`
+    /// *consumes* (deletes) the scratch file: an unguarded second finalize
+    /// call would find no file, skip the early "failed (exit N)" return,
+    /// and fall through to the binary-resolution checks — which fail for
+    /// this manifest's nonexistent LSP binary and paint "was not found"
+    /// over the original failure message.
+    ///
+    /// **Verified RED against unfixed `develop`** (checked by hand while
+    /// iterating on the fix): dropping `TerminalSlot::install_finalized`
+    /// while keeping the exit-code-file poll makes the final assertion
+    /// below observe "was not found" once the pane has closed.
+    #[test]
+    #[cfg(unix)]
+    fn extension_install_pane_close_does_not_duplicate_finalize_via_shell_app() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::settings::TestSettingsPathGuard;
+
+        let _settings_guard = TestSettingsPathGuard::install(std::env::temp_dir().join(format!(
+            "vimcode_test_shell_app_1396_dup_settings_{}_{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+
+        let mut app = TuiShellApp::new_for_test();
+        let ext_name = "vimcode-test-ext-1396-dup".to_string();
+        app.engine.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.clone(),
+            display_name: "Fake Extension (1396 duplicate-finalize test)".to_string(),
+            language_ids: vec!["vimcode-test-lang-1396-dup".to_string()],
+            lsp: LspConfig {
+                binary: "vimcode-test-nonexistent-binary-1396-dup".to_string(),
+                install: format!("{SELF_CLOSING_INSTALL_PREFIX}sh -c 'exit 9'"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        app.engine.ext_install_from_registry(&ext_name);
+        assert!(
+            app.engine.pending_terminal_command.is_some(),
+            "precondition: the manifest's install command must be queued"
+        );
+
+        let mut driver = driver_with_shell(app, config(), 300, 24);
+
+        assert!(
+            poll_until_screen(&mut driver, Duration::from_secs(20), |screen| {
+                screen.contains("failed (exit 9)")
+            }),
+            "command line never painted the failed-install message; screen:\n{}",
+            driver.screen()
+        );
+
+        // Give the pane's shell time to actually exit (it self-closes, no
+        // keystroke needed) and `poll_terminal` a few more ticks to run its
+        // `is_exited()` branch on that now-finalized slot.
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..10 {
+            driver.tick();
+            driver.render();
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("failed (exit 9)"),
+            "the original failure message must still be the last thing \
+             painted once the pane has closed; screen:\n{screen}"
+        );
+        assert!(
+            !screen.to_lowercase().contains("not found"),
+            "the pane closing must not trigger a second finalize — 'not \
+             found' would only appear if finalize ran again after the \
+             exit-code scratch file was already consumed; screen:\n{screen}"
         );
     }
 

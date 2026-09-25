@@ -107,6 +107,7 @@ impl Engine {
                     session: sess,
                     install_ctx: None,
                     acp_auth_pending: false,
+                    install_finalized: false,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -118,15 +119,19 @@ impl Engine {
 
     /// Run a command in a new terminal pane (visible to the user).
     /// Used for extension installs so the user can see progress, errors, and enter
-    /// sudo passwords. The pane waits for Enter after the command finishes, then
-    /// the shell **exits** so `poll_terminal` detects `is_exited()` and calls
-    /// `finalize_install_from_terminal` to register the LSP/DAP server.
+    /// sudo passwords. `poll_terminal` finalizes the install (#1396) as soon as
+    /// the wrapper records the command's exit code — it does not wait for the
+    /// pane's shell to exit, so the "Installing…" spinner resolves even if the
+    /// user never notices the pane or presses Enter at its "Press Enter to
+    /// close…" prompt. The prompt itself stays, so the output remains readable;
+    /// pressing Enter afterwards just closes the pane and is a no-op for the
+    /// install (`TerminalSlot::install_finalized` guards against a second
+    /// finalize on that later shell-exit path).
     ///
     /// Spawns an interactive shell via the quadraui `TerminalSession` primitive, then
     /// immediately injects the wrapped command into the PTY so the shell executes it.
-    /// The wrapper ends with `exit` / `Exit` so the shell process exits after Enter —
-    /// without that suffix the interactive shell would return to its PS1 prompt and
-    /// `is_exited()` would never fire, leaving the install context unregistered.
+    /// The wrapper still ends with `exit` / `Exit` so the shell process eventually
+    /// exits after Enter, closing the pane and removing its `TerminalSlot`.
     pub fn terminal_run_command(&mut self, command: &str, cols: u16, rows: u16) {
         let cwd = self.cwd.clone();
         let history_cap = self.settings.terminal_scrollback_lines;
@@ -156,6 +161,7 @@ impl Engine {
                     session: sess,
                     install_ctx: ctx,
                     acp_auth_pending: false,
+                    install_finalized: false,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -215,6 +221,7 @@ impl Engine {
                     session: sess,
                     install_ctx: None,
                     acp_auth_pending: true,
+                    install_finalized: false,
                 });
                 self.terminal_active = self.terminal_panes.len() - 1;
                 self.terminal_open = true;
@@ -274,6 +281,7 @@ impl Engine {
                             session: sess,
                             install_ctx: None,
                             acp_auth_pending: false,
+                            install_finalized: false,
                         });
                     }
                     Err(e) => {
@@ -295,6 +303,7 @@ impl Engine {
                         session: sess,
                         install_ctx: None,
                         acp_auth_pending: false,
+                        install_finalized: false,
                     });
                 }
                 Err(e) => {
@@ -788,22 +797,56 @@ impl Engine {
     /// Drain PTY output from all sessions and update VT100 screens.
     /// Returns true if a redraw is needed.
     /// Exited sessions are automatically removed; closes the panel when the last one exits.
+    ///
+    /// #1396: install panes finalize as soon as the command's exit-code scratch
+    /// file appears (below), not only when the shell itself exits — the wrapper
+    /// (`build_terminal_install_wrapper`) blocks on "Press Enter to close…"
+    /// *after* the command finishes and *after* it has written that file, so
+    /// waiting for `is_exited()` alone left the "Installing…" spinner stuck
+    /// until the user noticed the pane and pressed Enter. The pane itself still
+    /// stays open with its prompt so the user can read the output; `install_ctx`
+    /// is only taken (and the slot removed) once the shell actually exits.
     pub fn poll_terminal(&mut self) -> bool {
         let mut got_data = false;
         for slot in &mut self.terminal_panes {
             got_data |= slot.session.poll();
         }
+        // Finalize any install pane whose command has already recorded its exit
+        // status, ahead of the shell-exit loop below. Collected into a separate
+        // Vec first because `finalize_install_from_terminal` takes `&mut self`
+        // and can't run while `terminal_panes` is borrowed by the scan.
+        let mut newly_finalized: Vec<(usize, InstallContext)> = Vec::new();
+        for (i, slot) in self.terminal_panes.iter().enumerate() {
+            if slot.install_finalized {
+                continue;
+            }
+            if let Some(ctx) = &slot.install_ctx {
+                if install_exit_code_ready(&ctx.install_key) {
+                    newly_finalized.push((i, ctx.clone()));
+                }
+            }
+        }
+        for (i, ctx) in newly_finalized {
+            if let Some(slot) = self.terminal_panes.get_mut(i) {
+                slot.install_finalized = true;
+            }
+            self.finalize_install_from_terminal(&ctx);
+        }
         // Remove exited sessions in reverse order (preserves earlier indices during removal).
-        // For install panes, finalize the install (check binary, register LSP) before removing.
+        // For install panes that weren't already finalized above (e.g. the pane was
+        // closed before the command wrote its exit code), finalize before removing.
         let mut i = self.terminal_panes.len();
         while i > 0 {
             i -= 1;
             if self.terminal_panes[i].session.is_exited() {
                 let ctx = self.terminal_panes[i].install_ctx.take();
+                let already_finalized = self.terminal_panes[i].install_finalized;
                 let was_acp_auth = self.terminal_panes[i].acp_auth_pending;
                 let exit_code = self.terminal_panes[i].session.exit_code();
                 if let Some(ctx) = ctx {
-                    self.finalize_install_from_terminal(&ctx);
+                    if !already_finalized {
+                        self.finalize_install_from_terminal(&ctx);
+                    }
                 }
                 self.terminal_panes.remove(i);
                 // #957 (ACP-6): call after `remove` so `acp_finish_terminal_login`
@@ -837,10 +880,13 @@ impl Engine {
         got_data
     }
 
-    /// Called when an install terminal pane exits. Checks the install command's
-    /// recorded exit status (#1344) and, if it succeeded, whether the binary is
-    /// now resolvable via the shared `binary_on_path` lookup, registering the
-    /// LSP/DAP server if so.
+    /// Called by `poll_terminal`, either as soon as the install command's exit
+    /// code is available (#1396 — the common case, well before the pane's
+    /// shell itself exits) or, as a fallback, when an unfinalized install pane's
+    /// shell exits (e.g. the pane was closed before the command finished).
+    /// Checks the install command's recorded exit status (#1344) and, if it
+    /// succeeded, whether the binary is now resolvable via the shared
+    /// `binary_on_path` lookup, registering the LSP/DAP server if so.
     fn finalize_install_from_terminal(&mut self, ctx: &InstallContext) {
         self.lsp_installing.remove(&ctx.install_key);
         // Clear the "Installing …" spinner notification.
@@ -1386,6 +1432,18 @@ fn read_install_exit_code(install_key: &str) -> Option<i32> {
     let contents = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     contents.trim().parse::<i32>().ok()
+}
+
+/// Non-consuming check for whether the wrapper has written the exit-code
+/// scratch file for `install_key` yet (#1396). `poll_terminal` uses this on
+/// every idle tick to finalize an install as soon as the *command* finishes,
+/// rather than waiting for the shell to exit (which requires the user to
+/// notice the pane and press Enter at its "Press Enter to close…" prompt).
+/// Deliberately just an existence check, not a read — the actual value is
+/// consumed exactly once, by `read_install_exit_code` inside
+/// `finalize_install_from_terminal`, so a peek here can't race the real read.
+fn install_exit_code_ready(install_key: &str) -> bool {
+    install_exit_code_path(install_key).exists()
 }
 
 /// Build the PTY-injected wrapper script for `terminal_run_command`.
