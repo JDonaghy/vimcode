@@ -3674,6 +3674,129 @@ mod tests {
         );
     }
 
+    /// #1418: GTK half of the explorer context-menu "Delete" scenario —
+    /// `harness::issue_1418_explorer_context_menu::
+    /// context_menu_delete_opens_confirm_dialog` (`src/harness.rs`) covers
+    /// the identical fixture/action on `tui_prod` by asserting
+    /// `screen_has("Confirm Delete")`, but `Engine::confirm_delete_file`'s
+    /// dialog (no table, no text input) is natively-expressible on GTK
+    /// (quadraui#666) — same as the quit-confirm/close-tab-confirm dialogs
+    /// above, it never paints in-canvas, so `native_dialog_shown` /
+    /// `pending_native_dialog` are the proof here instead of
+    /// `screen_contains`, not a weaker substitute for it.
+    ///
+    /// Confirms via the keyboard (`Enter`, `render::ModalKeyRoute::
+    /// ContextMenu` -> `App::dispatch_context_menu_key` ->
+    /// `render::apply_explorer_context_action`'s `"delete"` arm), the same
+    /// route the `tui_prod` scenario drives, so both backends are proven to
+    /// reach the same `Engine::confirm_delete_file` call from the same
+    /// confirmed context-menu action — just observed through each
+    /// backend's own correct rendering of that state (in-canvas dialog on
+    /// TUI, queued native alert on GTK).
+    ///
+    /// RED-verified: with `apply_explorer_context_action`'s `"delete"` arm
+    /// changed to a bare `_ => {}`, neither `native_dialog_shown` nor
+    /// `pending_native_dialog` ever flips/queues.
+    #[test]
+    fn explorer_context_menu_delete_opens_native_confirm_dialog() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1418_gtk_delete_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "hello").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.open_explorer_context_menu(dir, true, 5, 5);
+        // "Delete" is the 9th (idx 8) item of a folder's context menu —
+        // see `Engine::open_explorer_context_menu`'s `is_dir` branch.
+        engine.context_menu.as_mut().unwrap().selected = 8;
+
+        let mut h = harness(engine, 800, 480);
+        h.driver.press_named(quadraui::NamedKey::Enter);
+
+        assert!(
+            h.native_dialog_shown.get(),
+            "confirming 'Delete' must open the delete-confirmation dialog \
+             (the edge-trigger flag must flip)"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_some(),
+            "confirming 'Delete' must queue the native delete-confirm present"
+        );
+    }
+
+    /// #1418: GTK half of the explorer context-menu "Open in Integrated
+    /// Terminal" scenario — `harness::issue_1418_explorer_context_menu::
+    /// context_menu_open_terminal_opens_terminal_tab` (`src/harness.rs`)
+    /// covers the identical fixture/action on `tui_prod` with a plain
+    /// `screen_has("Terminal")`, which that scenario's own doc explains
+    /// cannot be shared with `gtk`: GTK's menu bar has its own permanent
+    /// "Terminal" top-level item, so `screen_has`/`count` taken *after* the
+    /// context menu has already opened (contributing its own "Open in
+    /// Integrated Terminal" occurrence) can't tell "a tab opened" from "the
+    /// menu closed" — both change the count by the same amount. Taking the
+    /// baseline *before* the context menu ever opens (this test's `before`)
+    /// sidesteps that: opening a real terminal tab is the only thing that
+    /// can raise the count above the menu-bar-only baseline.
+    ///
+    /// RED-verified: with `apply_explorer_context_action`'s
+    /// `"open_terminal"` arm changed to a bare `_ => {}`, `after` reads the
+    /// same as `before` (menu bar only) — no tab strip label was ever
+    /// added.
+    #[test]
+    fn explorer_context_menu_open_terminal_opens_terminal_tab() {
+        use quadraui::testing::ConformanceDriver;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1418_gtk_terminal_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "hello").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+
+        let mut h = harness(engine, 1400, 900);
+        let before = h.driver.inventory().count("Terminal");
+
+        h.engine
+            .borrow_mut()
+            .open_explorer_context_menu(dir, true, 5, 5);
+        // "Open in Integrated Terminal" is the 4th (idx 3) item of a
+        // folder's context menu — see
+        // `Engine::open_explorer_context_menu`'s `is_dir` branch.
+        h.engine
+            .borrow_mut()
+            .context_menu
+            .as_mut()
+            .unwrap()
+            .selected = 3;
+        h.driver.render();
+
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        let after = h.driver.inventory().count("Terminal");
+
+        assert!(
+            after > before,
+            "confirming 'Open in Integrated Terminal' must open a terminal \
+             tab, raising the painted \"Terminal\" occurrence count above \
+             the menu-bar-only baseline ({before}); got {after}"
+        );
+    }
+
     /// #1038 (GTK half of the shared-engine fix): `handle_mouse_click`
     /// routes a tab-bar × click through the very same
     /// `Engine::handle_tab_bar_click` `CloseTab` arm the TUI does

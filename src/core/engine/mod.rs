@@ -3313,6 +3313,14 @@ pub struct Engine {
     pub picker_history_index: Option<usize>,
     /// Saves the user's in-progress query when they start browsing history.
     pub picker_history_typing_buffer: String,
+    /// When `Some`, [`PickerSource::Grep`] searches under this directory
+    /// instead of [`Engine::cwd`] — set by the explorer context menu's
+    /// "Find in Folder..." action (`open_grep_picker_scoped`) so the
+    /// picker's search is actually scoped to the folder the menu label
+    /// names, not the whole workspace (#1418). Reset to `None` by
+    /// [`Engine::open_picker`] like every other picker-session field, so a
+    /// plain `<leader>fg`/Command-Center grep never inherits a stale scope.
+    pub picker_grep_scope: Option<std::path::PathBuf>,
 
     // --- Find/Replace overlay (Ctrl+F) ---
     /// Whether the find/replace overlay is open.
@@ -4829,6 +4837,7 @@ impl Engine {
             picker_history: std::collections::HashMap::new(),
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),
+            picker_grep_scope: None,
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),

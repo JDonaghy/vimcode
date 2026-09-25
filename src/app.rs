@@ -314,6 +314,33 @@ impl render::EngineActionHost for GtkEngineActionHost<'_> {
     }
 }
 
+/// [`render::ExplorerContextHost`] impl for GTK (#1418) — see the rung's
+/// header comment above [`render::apply_explorer_context_action`]. Same
+/// `app: &'a mut App` / `self.engine.clone()`-before-borrowing shape as
+/// [`GtkEngineActionHost`] above, for the same reason: the caller
+/// (`App::dispatch_context_menu_key`) already holds the confirmed action
+/// string, which was read out from a now-dropped `engine.borrow_mut()`, so
+/// building this host doesn't double-borrow the engine `RefCell`.
+struct GtkExplorerCtxHost<'a> {
+    app: &'a mut App,
+}
+
+impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
+    /// Was the `"open_terminal"` arm of the deleted
+    /// `App::dispatch_explorer_ctx_action`, which called `App::open_terminal_at`
+    /// — inlined here (rather than calling it) because that method reaches
+    /// for its own `self.engine.borrow_mut()`, and the caller
+    /// (`App::dispatch_context_menu_key`) already holds this same `Engine`
+    /// borrowed mutably as the `engine` parameter below; a second borrow
+    /// would panic (`RefCell` already mutably borrowed).
+    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf) {
+        let cols = self.app.terminal_cols();
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab_at(cols, rows, Some(&dir));
+        self.app.draw_needed.set(true);
+    }
+}
+
 /// [`render::TickHost`] impl for GTK — the tick-time background chores
 /// `App::handle_poll_tick` shares with TUI's `TuiShellApp::tick` (#1248).
 /// Holds `app: &mut App` and `backend` as plain borrows, same shape as
@@ -6002,16 +6029,6 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// Open a new terminal tab rooted at `dir`.
-    fn open_terminal_at(&mut self, dir: PathBuf) {
-        let cols = self.terminal_cols();
-        let rows = self.engine.borrow().session.terminal_panel_rows;
-        self.engine
-            .borrow_mut()
-            .terminal_new_tab_at(cols, rows, Some(&dir));
-        self.draw_needed.set(true);
-    }
-
     /// #731: was `if let Some(ref da) = *self.menu_dropdown_da.borrow()`
     /// — that field is permanently `None` under the ShellApp runner
     /// (nothing assigns it), so this has been a no-op since #540. The menu
@@ -6127,19 +6144,6 @@ impl App {
             self.sync_sidebar_widgets();
         } else {
             self.sync_sidebar_from_engine();
-        }
-    }
-
-    /// Explorer CRUD action triggered by a keyboard shortcut or context
-    /// menu. The string table moved to
-    /// [`crate::core::settings::ExplorerAction::from_action_str`] in #823
-    /// item 6 — see its doc comment for why only this 5-string resolver
-    /// (not the surrounding dispatch) is shared with TUI.
-    fn explorer_action(&mut self, action_str: String) {
-        if let Some(action) = crate::core::settings::ExplorerAction::from_action_str(&action_str) {
-            self.engine.borrow_mut().dispatch_explorer_crud(action);
-            self.queue_explorer_draw();
-            self.draw_needed.set(true);
         }
     }
 
@@ -6876,8 +6880,16 @@ impl App {
             let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
             action
         };
-        if let (Some(ref act), Some((ref path, _is_dir))) = (action, target) {
-            self.dispatch_explorer_ctx_action(act, path);
+        if let (Some(ref act), Some((ref path, is_dir))) = (action, target) {
+            let engine_rc = self.engine.clone();
+            let mut host = GtkExplorerCtxHost { app: self };
+            render::apply_explorer_context_action(
+                &mut engine_rc.borrow_mut(),
+                act,
+                path,
+                is_dir,
+                &mut host,
+            );
         }
         let needs_refresh = {
             let mut engine = self.engine.borrow_mut();
@@ -6890,34 +6902,6 @@ impl App {
         }
         self.queue_explorer_draw();
         self.draw_needed.set(true);
-    }
-
-    /// #426: Map the action string returned by `context_menu_confirm` for
-    /// an explorer ctx menu to the appropriate backend Msg. Engine-side
-    /// actions (copy_path, reveal, select_for_diff, etc.) were already
-    /// handled inside `context_menu_confirm`; this only covers actions
-    /// that require GTK plumbing.
-    fn dispatch_explorer_ctx_action(&mut self, action: &str, target: &std::path::Path) {
-        match action {
-            "new_file" | "new_folder" | "rename" | "delete" | "move_file" => {
-                self.explorer_action(action.to_string());
-            }
-            "open_terminal" => {
-                let dir = if target.is_dir() {
-                    target.to_path_buf()
-                } else {
-                    target
-                        .parent()
-                        .unwrap_or(std::path::Path::new("."))
-                        .to_path_buf()
-                };
-                self.open_terminal_at(dir);
-            }
-            "find_in_folder" => {
-                self.toggle_focus_search();
-            }
-            _ => {} // engine-handled actions (copy_path, reveal, etc.)
-        }
     }
 
     /// Minimize the application window (inline window-control button).
