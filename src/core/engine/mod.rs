@@ -503,6 +503,16 @@ pub struct DialogInput {
     pub is_password: bool,
 }
 
+/// A resolved provider-declared board action (#523) awaiting the user's
+/// "yes" on the `"confirm_board_action"` dialog `Engine::run_board_action_
+/// by_name` opens for any action the provider marked `confirm`. `argv` is
+/// already `{id}`-substituted — nothing left to resolve once this fires.
+#[derive(Debug, Clone)]
+pub struct PendingBoardAction {
+    pub argv: Vec<String>,
+    pub label: String,
+}
+
 /// A single entry in the command palette.
 pub struct PaletteCommand {
     pub label: &'static str,
@@ -1536,12 +1546,32 @@ pub enum TerminalKeyAction {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum ContextMenuTarget {
-    Tab { group_id: GroupId, tab_idx: usize },
-    ExplorerFile { path: PathBuf },
-    ExplorerDir { path: PathBuf },
+    Tab {
+        group_id: GroupId,
+        tab_idx: usize,
+    },
+    ExplorerFile {
+        path: PathBuf,
+    },
+    ExplorerDir {
+        path: PathBuf,
+    },
     Editor,
-    EditorActionMenu { group_id: GroupId },
-    ExtPanel { panel_name: String, item_id: String },
+    EditorActionMenu {
+        group_id: GroupId,
+    },
+    ExtPanel {
+        panel_name: String,
+        item_id: String,
+    },
+    /// A Board-panel card (#523) — right-clicked, or opened via a future
+    /// keyboard binding. `context_menu_confirm`'s items are the provider's
+    /// own declared actions for this card's stage
+    /// (`Engine::open_board_context_menu`); confirming one runs
+    /// `Engine::run_board_action_by_name`.
+    Board {
+        card_id: quadraui::WidgetId,
+    },
 }
 
 /// A single item in a context menu popup.
@@ -4147,6 +4177,12 @@ pub struct Engine {
     /// [`Self::tick_board`]. `None` means "never fetched", which always
     /// counts as due.
     pub board_last_refresh: Option<std::time::Instant>,
+    /// When the provider's opt-in `tick_command` (#523's "freshness" nudge)
+    /// last ran — drives `BoardProviderConfig::tick_interval_secs`'s
+    /// cadence in `Engine::tick_board_provider_freshness`. Independent of
+    /// `board_last_refresh`: this fires whether or not the Board panel is
+    /// currently visible, gated only on `Settings::board_tick_enabled`.
+    pub board_last_tick: Option<std::time::Instant>,
     /// Cached layout from the last paint, used for click hit-testing
     /// (`quadraui::BoardLayout::hit_test`) — the same "paint caches, click
     /// reads" pattern as `explorer_tree_rect` / `ext_panel_tree_layout`.
@@ -4156,6 +4192,21 @@ pub struct Engine {
     /// test-swappable via [`Self::set_board_client_for_test`] so every
     /// consumer is testable with no provider binary installed anywhere.
     pub(crate) board_client: std::sync::Arc<dyn crate::core::tool_client::ToolClient>,
+    /// A provider-declared board action awaiting confirmation (#523) — set
+    /// by `Engine::run_board_action_by_name` when the action's `confirm`
+    /// flag is set, consumed by `process_dialog_result`'s
+    /// `"confirm_board_action"` arm.
+    pub pending_board_action: Option<PendingBoardAction>,
+    /// True while a dispatched board action's background subprocess is
+    /// running — `Engine::dispatch_board_action_command` refuses to start a
+    /// second one concurrently (#523: metered actions shouldn't stack).
+    pub board_action_running: bool,
+    /// Channel for receiving a dispatched board action's result: the
+    /// action's display label (captured at dispatch time, so the result
+    /// message reads correctly even if the board refreshes out from under
+    /// it) paired with its raw stdout on success. Polled by
+    /// `Engine::poll_board_action`.
+    pub board_action_rx: Option<std::sync::mpsc::Receiver<board_ops::BoardActionResult>>,
 
     // --- Provider document buffers (#524, Phase 1) ---
     //
@@ -4975,8 +5026,12 @@ impl Engine {
             board_fetching: false,
             board_rx: None,
             board_last_refresh: None,
+            board_last_tick: None,
             board_layout: std::cell::RefCell::new(None),
             board_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
+            pending_board_action: None,
+            board_action_running: false,
+            board_action_rx: None,
             document_client: std::sync::Arc::new(crate::core::tool_client::SubprocessToolClient),
             settings_has_focus: false,
             settings_selected: 0,
@@ -5230,7 +5285,9 @@ impl Engine {
         redraw |= self.poll_tool_acquire();
         redraw |= self.poll_sc_diff();
         self.tick_board();
+        self.tick_board_provider_freshness();
         redraw |= self.poll_board();
+        redraw |= self.poll_board_action();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
         redraw |= self.poll_panel_hover();

@@ -1993,6 +1993,16 @@ impl Engine {
                 let arg = format!("{}||{}|{}|", panel_name, item_id, action);
                 self.plugin_event("panel_context_menu", &arg);
             }
+            ContextMenuTarget::Board { card_id } => {
+                // #523: `action` is one of the provider-declared action
+                // names `open_board_context_menu` populated the menu from
+                // for this exact card/stage, so it's already known-valid —
+                // `run_board_action_by_name` re-resolving it (rather than
+                // this call site caching the argv) keeps the menu-vs-run
+                // lookup as the single source of truth.
+                let card_id = card_id.clone();
+                self.run_board_action_by_name(&action, card_id);
+            }
         }
 
         Some(action)

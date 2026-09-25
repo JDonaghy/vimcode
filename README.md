@@ -741,6 +741,26 @@ Browse extensions in the sidebar (click the extensions icon in the activity bar)
 
 ---
 
+### Board Panel
+
+A generic kanban/pipeline host — click the board icon in the activity bar. On
+its own it shows "no board provider configured"; any extension whose
+manifest declares a `[board]` section (see `EXTENSIONS.md`) supplies a real
+board over an external-tool JSON seam, no specific provider hardcoded.
+
+- **Read** — the provider's `refresh_command` populates columns of cards
+  with inline status badges, polled on its declared interval.
+- **Act** — right-click (or a provider-declared single-key stage binding, in
+  the coord-tui `P`/`S`/`F` style) runs a provider-declared named action
+  against the selected card; irreversible/metered actions the provider
+  marks `confirm` ask first. The result (exit status/stdout) shows on the
+  status line and the board refreshes afterward.
+- **Freshness** — an opt-in "Board Auto-Tick" setting (off by default) runs
+  a provider's `tick_command` on a timer, so a daemon-less pipeline doesn't
+  stall just because vimcode is the only client with the board open.
+
+---
+
 ### AI Assistant
 
 Built-in AI chat panel. Click the chat icon in the activity bar to open.

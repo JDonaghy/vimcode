@@ -180,8 +180,8 @@ mod tests {
         manifest.board = Some(BoardProviderConfig {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
-            actions: Default::default(),
             verdict_commands,
+            ..Default::default()
         });
         engine
             .extension_state

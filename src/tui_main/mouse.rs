@@ -1384,6 +1384,18 @@ pub(super) fn handle_mouse(
                     &theme,
                     &mut tui_backend,
                 );
+            } else if render::sidebar_owner(engine) == render::SidebarOwner::Board {
+                // #523: mirrors `App::route_board_sidebar_event`'s GTK
+                // right-click arm — `render::board_right_click_card`
+                // resolves the card from the same `Engine::board_layout`
+                // cache the left-click arm below reads, then
+                // `open_board_context_menu` takes cell coordinates
+                // directly (no pixel→cell conversion needed on TUI, unlike
+                // GTK).
+                let pos = quadraui::Point::new(col as f32, row as f32);
+                if let Some(card_id) = render::board_right_click_card(engine, pos) {
+                    engine.open_board_context_menu(card_id, col, row);
+                }
             }
             return sidebar_width;
         }

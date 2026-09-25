@@ -1,4 +1,5 @@
-//! Board panel engine plumbing (#521 — Phase 0, read-only).
+//! Board panel engine plumbing (#521 Phase 0 read-only + #523
+//! provider-dispatch actions).
 //!
 //! This module is the generic host's `core` half: it knows how to find a
 //! configured provider (an installed extension whose manifest declares
@@ -8,15 +9,52 @@
 //! `tool_client`'s module doc for the placement rule this satisfies, which a
 //! dedicated repo-root test enforces mechanically.
 //!
-//! Phase 0 is read-only: only `SelectCard` and `OpenIssue` are handled below
-//! (selection + a status-line acknowledgement, or — when a `[document]`
-//! provider is configured, #524 — opening the card as an editable markdown
-//! buffer via `Engine::open_tool_document`). Actions that would mutate a
-//! provider's state (`Dispatch`, `RecordTest`, `Merge`, …) are #523's scope.
+//! ## #523: provider-declared named actions
+//!
+//! Beyond the read-only navigation `quadraui::BoardAction` already covers
+//! (`SelectCard`, `MoveSelection`, `JumpToTop`/`JumpToBottom`, `OpenIssue`),
+//! a provider can declare arbitrary named actions
+//! (`extensions::BoardActionDef` — e.g. "dispatch this card's work",
+//! "record a Test verdict") scoped to specific stages (columns), with an
+//! optional keybinding and a confirmation requirement. Three entry points
+//! run them:
+//!
+//! - [`Engine::open_board_context_menu`] — right-click a card, lists every
+//!   action valid for its current stage; confirming an item runs
+//!   [`Engine::run_board_action_by_name`] (`windows.rs`'s
+//!   `context_menu_confirm`, `ContextMenuTarget::Board` arm).
+//! - [`Engine::dispatch_board_key_unified`] — a single key matching a
+//!   provider-declared stage keybinding for the selected card (e.g. a
+//!   `P`/`S`/`F` style single-key verdict) runs it directly.
+//! - `Engine::open_issue_card` — `OpenIssue` falls back to a provider
+//!   action of the same name when no more specific handling applies (a
+//!   `[document]` provider, #524). `OpenReview` is the one exception: its
+//!   provider action resolves a review *target* rather than being
+//!   fire-and-forget, so `Engine::open_review_card` reads the declared argv
+//!   itself and feeds the result to `Engine::open_branch_review` (#525)
+//!   instead of going through the generic dispatch below.
+//!
+//! [`Engine::run_board_action_by_name`] resolves the action's argv
+//! (`{id}` substituted) and either dispatches it immediately or — when the
+//! provider marked it `confirm` — opens a Yes/No dialog first
+//! (`panels.rs`'s `"confirm_board_action"` `process_dialog_result` arm).
+//! Dispatch itself is a background subprocess via the same `ToolClient`
+//! seam `board_refresh` uses ([`Engine::dispatch_board_action_command`] /
+//! [`Engine::poll_board_action`]); its exit status/stdout land in
+//! `Engine::message`, and a successful run triggers a fresh
+//! [`Engine::board_refresh`] so the panel reflects the provider's new state
+//! on the next poll.
 
 use super::*;
 use crate::core::extensions::BoardProviderConfig;
 use crate::core::tool_client::{self, ToolError};
+
+/// A dispatched board action's result, as sent over `Engine::board_action_rx`
+/// — the action's display label paired with its raw stdout on success (or
+/// the typed error on failure). A named alias purely to keep
+/// `Engine::board_action_rx`'s field type readable (clippy's
+/// `type_complexity` lint).
+pub type BoardActionResult = (String, Result<Vec<u8>, ToolError>);
 
 impl Engine {
     /// The first installed extension that declares a `[board]` provider, if
@@ -110,23 +148,63 @@ impl Engine {
         }
     }
 
+    /// Opt-in freshness (#523): periodically run the provider's declared
+    /// `tick_command`, independent of whether the Board panel is currently
+    /// visible — unlike [`Self::tick_board`], which only refreshes reads
+    /// while the panel is active, the whole point of a tick is nudging a
+    /// daemon-less provider's pipeline forward even when nobody is looking
+    /// at the board. Call once per `poll_idle` tick.
+    ///
+    /// A no-op unless `Settings::board_tick_enabled` is set (**default
+    /// off** — a passive viewer must not silently dispatch metered work)
+    /// and the provider declared a non-empty `tick_command`. Fire-and-forget
+    /// — the command's stdout/exit status are discarded (`ToolClient::run`),
+    /// since a tick is a nudge, not a request the user is waiting on;
+    /// `board_refresh`/the board panel's own poll picks up whatever changed
+    /// as a result on its own cadence.
+    pub(crate) fn tick_board_provider_freshness(&mut self) {
+        if !self.settings.board_tick_enabled {
+            return;
+        }
+        let Some(provider) = self.board_provider() else {
+            return;
+        };
+        if provider.tick_command.is_empty() {
+            return;
+        }
+        let interval = std::time::Duration::from_secs(provider.tick_interval_secs.max(1));
+        let due = self.board_last_tick.is_none_or(|t| t.elapsed() >= interval);
+        if !due {
+            return;
+        }
+        self.board_last_tick = Some(std::time::Instant::now());
+        let client = std::sync::Arc::clone(&self.board_client);
+        let argv = provider.tick_command;
+        std::thread::spawn(move || {
+            let _ = client.run(&argv);
+        });
+    }
+
     /// Apply a semantic [`quadraui::BoardAction`] to the cached model.
-    /// Phase 0 only handles the read-only actions (`SelectCard`,
-    /// `MoveSelection`, `JumpToTop`/`JumpToBottom`, `OpenIssue`,
-    /// `OpenReview` — #525); every other variant is a provider-dispatch
-    /// action out of scope until #523 and is a deliberate no-op here.
+    /// The read-only navigation actions (`SelectCard`, `MoveSelection`,
+    /// `JumpToTop`/`JumpToBottom`) mutate the model directly; `OpenIssue`/
+    /// `OpenReview` need `&mut self` beyond the model borrow (opening a
+    /// document buffer, running a provider action) so they're resolved to
+    /// an owned follow-up and handled after the match, once that borrow
+    /// has ended. `ContextMenu` is never constructed by this host — a
+    /// right-click opens the menu directly via
+    /// [`Self::open_board_context_menu`] (pixel→cell conversion is a
+    /// backend concern, done at the click site, not here) rather than
+    /// round-tripping through this action enum.
     pub fn apply_board_action(&mut self, action: quadraui::BoardAction) {
         use quadraui::BoardAction;
-        // `OpenIssue`/`OpenReview` both need `&mut self` (to open a
-        // document buffer or the change-review surface), which can't
-        // happen while `model` still holds `self.board_model` borrowed —
-        // resolve to an owned pending action first and handle it after the
-        // match, once that borrow has ended.
-        enum Pending {
+
+        enum Followup {
             OpenIssue(quadraui::WidgetId),
             OpenReview(quadraui::WidgetId),
         }
-        let pending = {
+
+        let followup = {
             let Some(model) = self.board_model.as_mut() else {
                 return;
             };
@@ -147,31 +225,33 @@ impl Engine {
                     model.jump_to_bottom();
                     None
                 }
-                BoardAction::OpenIssue(id) => Some(Pending::OpenIssue(id)),
-                BoardAction::OpenReview(id) => Some(Pending::OpenReview(id)),
-                // Provider-dispatch actions (#523) and context menu —
-                // no-op in this read-only phase.
+                BoardAction::OpenIssue(id) => Some(Followup::OpenIssue(id)),
+                BoardAction::OpenReview(id) => Some(Followup::OpenReview(id)),
                 BoardAction::ContextMenu(..) => None,
             }
         };
-        match pending {
-            Some(Pending::OpenIssue(id)) => self.open_issue_card(id),
-            Some(Pending::OpenReview(id)) => self.open_review_card(id),
+        match followup {
+            Some(Followup::OpenIssue(id)) => self.open_issue_card(id),
+            Some(Followup::OpenReview(id)) => self.open_review_card(id),
             None => {}
         }
     }
 
-    /// `OpenIssue`'s handling: if a document provider is configured
-    /// (#524), open the card as an editable markdown buffer seeded by the
-    /// provider's read command. Otherwise fall back to Phase 0's
-    /// acknowledgement — echo the cached card's title to the status line —
-    /// so a board with no document provider still gives feedback on open.
+    /// `OpenIssue`'s handling, in priority order: a `[document]` provider
+    /// (#524) opens the card as an editable markdown buffer; otherwise a
+    /// provider-declared `"OpenIssue"` named action (#523) dispatches it;
+    /// otherwise fall back to Phase 0's acknowledgement — echo the cached
+    /// card's title to the status line — so a board with neither still
+    /// gives feedback on open.
     fn open_issue_card(&mut self, id: quadraui::WidgetId) {
         if self.document_provider().is_some() {
             match self.open_tool_document(id.as_str()) {
                 Ok(()) => {}
                 Err(e) => self.message = format!("Board: {e}"),
             }
+            return;
+        }
+        if self.run_board_action_by_name("OpenIssue", id.clone()) {
             return;
         }
         let title = self.board_model.as_ref().and_then(|model| {
@@ -188,13 +268,18 @@ impl Engine {
     }
 
     /// `OpenReview`'s handling (#525): run the configured board provider's
-    /// `"OpenReview"` action (`BoardProviderConfig::action_argv`) to
-    /// resolve this card to a
+    /// `"OpenReview"` action ([`crate::core::extensions::BoardProviderConfig::
+    /// action_by_name`]) to resolve this card to a
     /// [`crate::core::tool_client::BranchReviewTarget`], then hand that
     /// off to `Engine::open_branch_review`, which turns it into a local
     /// git diff and opens the shared change-review surface (#955). This
     /// function is the only place that knows the review comes from a board
     /// card — `open_branch_review` itself has no idea.
+    ///
+    /// Note this is the one named action that is **not** dispatched through
+    /// [`Self::run_board_action_by_name`] (#523's generic path): its
+    /// command's stdout is a review *target* to resolve into a diff, not a
+    /// fire-and-forget side effect whose stdout belongs on the status line.
     ///
     /// **Blocking**, the same one-shot tradeoff `open_issue_card`'s
     /// document-provider path already made: opening a review is a
@@ -204,7 +289,11 @@ impl Engine {
             self.message = "Board: no provider configured".to_string();
             return;
         };
-        let Some(argv) = provider.action_argv("OpenReview", id.as_str()) else {
+        let argv = provider
+            .action_by_name("OpenReview")
+            .map(|a| a.resolve_argv(id.as_str()))
+            .filter(|argv| !argv.is_empty());
+        let Some(argv) = argv else {
             self.message = "Board: no review command configured".to_string();
             return;
         };
@@ -228,6 +317,188 @@ impl Engine {
         self.review_card_id = Some(id.as_str().to_string());
     }
 
+    /// The column (stage) id containing `card_id`, if it's present on the
+    /// current board model. `None` for a stale id (card moved/removed
+    /// since a menu/keybinding referencing it was set up) as well as "no
+    /// model at all" — callers treat both the same (no-op).
+    pub fn board_card_stage_id(&self, card_id: &quadraui::WidgetId) -> Option<String> {
+        self.board_model
+            .as_ref()?
+            .columns
+            .iter()
+            .find(|c| c.cards.iter().any(|card| &card.id == card_id))
+            .map(|c| c.id.as_str().to_string())
+    }
+
+    /// Open a context menu listing the provider-declared actions valid for
+    /// `card_id`'s current stage (#523: "listing the actions the provider
+    /// declares as valid for that card's stage"). `x`/`y` are cell
+    /// coordinates — the same convention `Engine::open_editor_context_menu`
+    /// uses; callers convert a pixel click themselves (GTK) or pass the
+    /// cell position straight through (TUI).
+    ///
+    /// A no-op — no menu opened — when there's no provider configured, the
+    /// card isn't on the current model, or the provider declared no
+    /// actions valid for that card's stage; the panel stays perfectly
+    /// usable read-only in that case.
+    pub fn open_board_context_menu(&mut self, card_id: quadraui::WidgetId, x: u16, y: u16) {
+        let Some(provider) = self.board_provider() else {
+            return;
+        };
+        let Some(stage_id) = self.board_card_stage_id(&card_id) else {
+            return;
+        };
+        let actions = provider.actions_for_stage(&stage_id);
+        if actions.is_empty() {
+            return;
+        }
+        let items = actions
+            .iter()
+            .map(|a| ContextMenuItem {
+                label: a.display_label().to_string(),
+                action: a.name.clone(),
+                shortcut: a.key.clone().unwrap_or_default(),
+                separator_after: false,
+                enabled: true,
+            })
+            .collect();
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::Board { card_id },
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+            trigger_height: 0.0,
+        });
+    }
+
+    /// Run a provider-declared named action (#523) against `card_id` — from
+    /// the context menu, a stage keybinding, or an `OpenIssue`/`OpenReview`
+    /// fallback. Returns whether an action was actually found and started
+    /// (dispatched immediately, or a confirmation dialog opened) — `false`
+    /// means "no provider", "no action by that name", or "declared with an
+    /// empty command" (not runnable), so callers can fall back to their own
+    /// default behaviour.
+    ///
+    /// An action marked `confirm` opens a Yes/No dialog first (#523's
+    /// "irreversible or metered actions" requirement) instead of
+    /// dispatching right away — the actual dispatch happens from
+    /// `process_dialog_result`'s `"confirm_board_action"` arm on "yes".
+    pub fn run_board_action_by_name(
+        &mut self,
+        action_name: &str,
+        card_id: quadraui::WidgetId,
+    ) -> bool {
+        let Some(provider) = self.board_provider() else {
+            return false;
+        };
+        let Some(action) = provider.action_by_name(action_name) else {
+            return false;
+        };
+        let argv = action.resolve_argv(card_id.as_str());
+        if argv.is_empty() {
+            return false;
+        }
+        let label = action.display_label().to_string();
+        if action.confirm {
+            self.pending_board_action = Some(PendingBoardAction {
+                argv,
+                label: label.clone(),
+            });
+            self.show_dialog(
+                "confirm_board_action",
+                "Confirm Action",
+                vec![format!("Run '{label}'?")],
+                vec![
+                    DialogButton {
+                        label: "Yes".into(),
+                        hotkey: 'y',
+                        action: "yes".into(),
+                    },
+                    DialogButton {
+                        label: "Cancel".into(),
+                        hotkey: '\0',
+                        action: "cancel".into(),
+                    },
+                ],
+            );
+        } else {
+            self.dispatch_board_action_command(argv, label);
+        }
+        true
+    }
+
+    /// Run `argv` on a background thread via the configured
+    /// [`crate::core::tool_client::ToolClient`] — the same "spawn +
+    /// mpsc, poll from `poll_idle`" pattern [`Self::board_refresh`] uses.
+    /// Refuses to start a second action while one is already running
+    /// (#523: metered actions shouldn't stack); the result lands via
+    /// [`Self::poll_board_action`].
+    pub fn dispatch_board_action_command(&mut self, argv: Vec<String>, label: String) {
+        if self.board_action_running {
+            self.message = "A board action is already running".to_string();
+            return;
+        }
+        let client = std::sync::Arc::clone(&self.board_client);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label_for_thread = label.clone();
+        std::thread::spawn(move || {
+            let result = client.run_with_stdin(&argv, &[]);
+            let _ = tx.send((label_for_thread, result));
+        });
+        self.board_action_rx = Some(rx);
+        self.board_action_running = true;
+        self.message = format!("Running '{label}'…");
+    }
+
+    /// Non-blocking check for a completed board action. Call from
+    /// `poll_idle`. Surfaces the exit outcome (trimmed stdout on success,
+    /// the typed error's message on failure) in `Engine::message` (#523's
+    /// "exit status and stdout surfaced to the user"), then triggers a
+    /// fresh [`Self::board_refresh`] so the panel reflects the provider's
+    /// new state on the next poll (#523's "board refreshed on next poll").
+    pub fn poll_board_action(&mut self) -> bool {
+        let result: Option<(String, Result<Vec<u8>, ToolError>)> = self
+            .board_action_rx
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        let Some((label, result)) = result else {
+            return false;
+        };
+        self.board_action_running = false;
+        self.board_action_rx = None;
+        match result {
+            Ok(stdout) => {
+                let text = String::from_utf8_lossy(&stdout);
+                let text = text.trim();
+                self.message = if text.is_empty() {
+                    format!("'{label}' completed")
+                } else {
+                    format!("'{label}': {text}")
+                };
+            }
+            Err(err) => {
+                self.message = format!("'{label}' failed: {}", err.user_message());
+            }
+        }
+        self.board_refresh();
+        true
+    }
+
+    /// The provider-declared action bound to `key` for the currently
+    /// selected card's stage, if any — `Engine::dispatch_board_key_
+    /// unified`'s lookup for #523's single-key verdict-style keybindings
+    /// (e.g. `P`/`S`/`F`). `None` when there's no provider, no selected
+    /// card, or no action bound to that key for the card's current stage.
+    fn board_key_action(&self, key: &str) -> Option<(String, quadraui::WidgetId)> {
+        let provider = self.board_provider()?;
+        let card_id = self.board_model.as_ref()?.selected_card_id.clone()?;
+        let stage_id = self.board_card_stage_id(&card_id)?;
+        provider
+            .action_for_key(key, &stage_id)
+            .map(|a| (a.name.clone(), card_id))
+    }
+
     /// Keyboard dispatch for the Board panel — the
     /// `dispatch_*_sidebar_key_unified` pattern every other panel uses.
     ///
@@ -235,11 +506,26 @@ impl Engine {
     /// `h`/`Left` and `l`/`Right` are left to `quadraui::BoardModel::
     /// handle_key`'s own generic keymap for column navigation instead,
     /// since (unlike the other panels) they are meaningful board
-    /// navigation here, not an "exit to the activity bar" gesture. `R`
-    /// (#525) opens the review for the selected card — `handle_key`'s own
-    /// doc explicitly calls "review" out as a workflow-specific verb hosts
-    /// should handle themselves, so it's dispatched here rather than added
-    /// to quadraui's generic keymap.
+    /// navigation here, not an "exit to the activity bar" gesture.
+    ///
+    /// Two host-level keymaps sit in front of that generic one, in this
+    /// precedence order:
+    ///
+    /// 1. `R` (#525) opens the review for the selected card —
+    ///    `handle_key`'s own doc explicitly calls "review" out as a
+    ///    workflow-specific verb hosts should handle themselves, so it's
+    ///    dispatched here rather than added to quadraui's generic keymap.
+    ///    It deliberately wins over a provider that also declares `R` as a
+    ///    stage keybinding: a provider's `"OpenReview"` command returns a
+    ///    review *target* to resolve (see [`Self::open_review_card`]), not
+    ///    a fire-and-forget command, so letting the generic dispatch path
+    ///    claim `R` would silently downgrade opening a review to printing
+    ///    that JSON to the status line.
+    /// 2. A key matching a provider-declared stage keybinding for the
+    ///    selected card (#523) is checked *before* falling to
+    ///    `BoardModel::handle_key`'s generic navigation, so a provider is
+    ///    free to bind e.g. `P`/`S`/`F` without them ever reaching the
+    ///    primitive's own keymap.
     ///
     /// Returns whether the panel is still focused afterward.
     pub fn dispatch_board_key_unified(&mut self, key: &str) -> bool {
@@ -269,6 +555,10 @@ impl Engine {
         } else {
             key
         };
+        if let Some((action_name, card_id)) = self.board_key_action(key) {
+            self.run_board_action_by_name(&action_name, card_id);
+            return true;
+        }
         if let Some(action) = self
             .board_model
             .as_ref()
@@ -508,7 +798,7 @@ mod tests {
     /// Builds on [`install_mock_provider`] (manifest/`extension_state`/
     /// `ext_registry` wiring) rather than duplicating it (review nit,
     /// #525), layering on the one thing `OpenReview` needs that a plain
-    /// board provider doesn't: an `actions["OpenReview"]` entry, plus
+    /// board provider doesn't: an `"OpenReview"` [`BoardActionDef`], plus
     /// swapping the mock client's response from "board refresh" JSON to
     /// "review-action" JSON for the `OpenReview` tests that follow.
     fn install_mock_provider_with_review_action(
@@ -521,16 +811,15 @@ mod tests {
             .ext_registry
             .as_mut()
             .expect("install_mock_provider populates the registry");
-        let mut actions = std::collections::HashMap::new();
-        actions.insert(
-            "OpenReview".to_string(),
-            vec!["mock-review".to_string(), "{id}".to_string()],
-        );
         registry[0]
             .board
             .as_mut()
             .expect("install_mock_provider populates a [board] provider")
-            .actions = actions;
+            .actions = vec![BoardActionDef {
+            name: "OpenReview".to_string(),
+            command: vec!["mock-review".to_string(), "{id}".to_string()],
+            ..Default::default()
+        }];
         engine.board_model = Some(model);
         engine.set_board_client_for_test(MockToolClient(review_client_response));
     }
@@ -671,5 +960,505 @@ mod tests {
         let still_focused = engine.dispatch_board_key_unified("R");
         assert!(still_focused);
         assert!(engine.change_review.is_none());
+    }
+
+    // ─── #523: provider-declared named actions ─────────────────────────────
+
+    use crate::core::extensions::BoardActionDef;
+    use crate::core::tool_client::RecordingToolClient;
+
+    /// Install a mock `[board]` provider (like `install_mock_provider`) that
+    /// additionally declares `actions`. No coordinator (or any other
+    /// specific provider) vocabulary anywhere in this test, per #522/#523's
+    /// "generic host" scope. Also sets `engine.board_model` directly
+    /// (synchronously) — #523's tests exercise action dispatch against an
+    /// already-loaded model, not the async refresh flow
+    /// `board_refresh_with_mock_provider_populates_model` covers.
+    fn install_mock_provider_with_actions(
+        engine: &mut Engine,
+        model: BoardModel,
+        actions: Vec<BoardActionDef>,
+    ) {
+        let mut manifest = ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        manifest.board = Some(BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions,
+            ..Default::default()
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+        let json = serde_json::to_value(&model).unwrap();
+        engine.set_board_client_for_test(MockToolClient(Ok(json)));
+        engine.board_model = Some(model);
+    }
+
+    /// Poll until a dispatched board action's result has landed, mirroring
+    /// `board_refresh_with_mock_provider_populates_model`'s own poll loop
+    /// (the background thread's send still has to be observed).
+    fn wait_for_board_action(engine: &mut Engine) {
+        let mut tries = 0;
+        while !engine.poll_board_action() {
+            tries += 1;
+            assert!(tries < 1000, "board action never completed");
+            std::thread::yield_now();
+        }
+    }
+
+    fn dispatch_action(name: &str, command: Vec<&str>) -> BoardActionDef {
+        BoardActionDef {
+            name: name.to_string(),
+            label: String::new(),
+            command: command.into_iter().map(str::to_string).collect(),
+            stages: vec![],
+            key: None,
+            confirm: false,
+        }
+    }
+
+    #[test]
+    fn open_board_context_menu_lists_only_actions_valid_for_the_cards_stage() {
+        let mut engine = Engine::new_for_test();
+        let mut model = fixture_model();
+        model.columns.push(BoardColumn {
+            id: WidgetId::new("col:test"),
+            title: "Test".into(),
+            cards: vec![card("card:3", "Third")],
+            scroll_offset: 0,
+        });
+        install_mock_provider_with_actions(
+            &mut engine,
+            model,
+            vec![
+                dispatch_action("assign", vec!["mock", "assign", "{id}"]),
+                BoardActionDef {
+                    name: "test-pass".into(),
+                    label: "Mark Passed".into(),
+                    command: vec!["mock".into(), "test".into(), "{id}".into()],
+                    stages: vec!["col:test".into()],
+                    key: Some("P".into()),
+                    confirm: false,
+                },
+            ],
+        );
+
+        // A card in "col:backlog": only the stage-agnostic "assign" applies.
+        engine.open_board_context_menu(WidgetId::new("card:1"), 3, 4);
+        let menu = engine.context_menu.take().expect("menu opened");
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].action, "assign");
+        assert_eq!(menu.screen_x, 3);
+        assert_eq!(menu.screen_y, 4);
+
+        // A card in "col:test": both apply.
+        engine.open_board_context_menu(WidgetId::new("card:3"), 0, 0);
+        let menu = engine.context_menu.take().expect("menu opened");
+        let names: Vec<&str> = menu.items.iter().map(|i| i.action.as_str()).collect();
+        assert!(names.contains(&"assign"));
+        assert!(names.contains(&"test-pass"));
+        assert_eq!(
+            menu.items
+                .iter()
+                .find(|i| i.action == "test-pass")
+                .unwrap()
+                .shortcut,
+            "P"
+        );
+    }
+
+    #[test]
+    fn open_board_context_menu_is_a_no_op_with_no_actions_for_the_stage() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![BoardActionDef {
+                name: "test-pass".into(),
+                stages: vec!["col:test".into()],
+                ..dispatch_action("test-pass", vec!["mock"])
+            }],
+        );
+        engine.open_board_context_menu(WidgetId::new("card:1"), 0, 0);
+        assert!(
+            engine.context_menu.is_none(),
+            "'card:1' is in 'col:backlog', which the only declared action doesn't cover"
+        );
+    }
+
+    #[test]
+    fn run_board_action_by_name_dispatches_and_surfaces_result() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![dispatch_action("assign", vec!["mock", "assign", "{id}"])],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        let started = engine.run_board_action_by_name("assign", WidgetId::new("card:2"));
+        assert!(started);
+        wait_for_board_action(&mut engine);
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv,
+            vec![
+                "mock".to_string(),
+                "assign".to_string(),
+                "card:2".to_string()
+            ],
+            "'{{id}}' must be substituted with the acted-on card's id"
+        );
+        assert!(
+            engine.message.contains("assign"),
+            "exit status/stdout must be surfaced to the user; message: {}",
+            engine.message
+        );
+    }
+
+    #[test]
+    fn run_board_action_by_name_with_no_provider_action_is_a_no_op() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(&mut engine, fixture_model(), vec![]);
+        assert!(!engine.run_board_action_by_name("assign", WidgetId::new("card:1")));
+        assert!(!engine.board_action_running);
+    }
+
+    #[test]
+    fn run_board_action_by_name_with_confirm_opens_dialog_and_waits() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![BoardActionDef {
+                name: "merge".into(),
+                label: "Merge".into(),
+                command: vec!["mock".into(), "merge".into(), "{id}".into()],
+                stages: vec![],
+                key: None,
+                confirm: true,
+            }],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        let started = engine.run_board_action_by_name("merge", WidgetId::new("card:1"));
+        assert!(started);
+        assert!(
+            engine.dialog.is_some(),
+            "a `confirm: true` action must open a dialog, not dispatch immediately"
+        );
+        assert!(
+            recorder.calls().is_empty(),
+            "nothing should run before the dialog is confirmed"
+        );
+
+        // Confirm via the real dialog-result path.
+        let dlg = engine.dialog.take().unwrap();
+        engine.process_dialog_result(&dlg.tag, "yes", None);
+        wait_for_board_action(&mut engine);
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv,
+            vec![
+                "mock".to_string(),
+                "merge".to_string(),
+                "card:1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn run_board_action_by_name_confirm_cancel_never_dispatches() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![BoardActionDef {
+                name: "merge".into(),
+                confirm: true,
+                ..dispatch_action("merge", vec!["mock", "merge", "{id}"])
+            }],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.run_board_action_by_name("merge", WidgetId::new("card:1"));
+        let dlg = engine.dialog.take().unwrap();
+        engine.process_dialog_result(&dlg.tag, "cancel", None);
+
+        assert!(recorder.calls().is_empty());
+        assert!(engine.pending_board_action.is_none());
+        assert!(!engine.board_action_running);
+    }
+
+    #[test]
+    fn dispatch_board_key_unified_runs_provider_stage_keybinding() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![BoardActionDef {
+                name: "test-pass".into(),
+                label: "Mark Passed".into(),
+                command: vec!["mock".into(), "pass".into(), "{id}".into()],
+                stages: vec!["col:backlog".into()],
+                key: Some("P".into()),
+                confirm: false,
+            }],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+        // `fixture_model` selects "card:1", which is in "col:backlog".
+
+        let still_focused = engine.dispatch_board_key_unified("P");
+        assert!(still_focused);
+        wait_for_board_action(&mut engine);
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv,
+            vec!["mock".to_string(), "pass".to_string(), "card:1".to_string()]
+        );
+    }
+
+    #[test]
+    fn dispatch_board_key_unified_falls_back_to_navigation_when_key_not_bound() {
+        // A provider-declared keybinding takes priority, but a key nothing
+        // binds still reaches `quadraui::BoardModel::handle_key`'s own
+        // generic navigation — provider actions augment, they don't break,
+        // Phase 0's read-only navigation.
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![BoardActionDef {
+                name: "test-pass".into(),
+                key: Some("P".into()),
+                ..dispatch_action("test-pass", vec!["mock"])
+            }],
+        );
+        engine.dispatch_board_key_unified("j");
+        assert_eq!(
+            engine.board_model.as_ref().unwrap().selected_card_id,
+            Some(WidgetId::new("card:2"))
+        );
+    }
+
+    #[test]
+    fn context_menu_confirm_on_board_target_runs_the_selected_action() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![dispatch_action("assign", vec!["mock", "assign", "{id}"])],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.open_board_context_menu(WidgetId::new("card:2"), 1, 1);
+        assert!(engine.context_menu.is_some());
+
+        let confirmed = engine.context_menu_confirm();
+        assert_eq!(confirmed.as_deref(), Some("assign"));
+        assert!(engine.context_menu.is_none(), "confirming closes the menu");
+        wait_for_board_action(&mut engine);
+
+        assert_eq!(
+            recorder.calls()[0].argv,
+            vec![
+                "mock".to_string(),
+                "assign".to_string(),
+                "card:2".to_string()
+            ]
+        );
+    }
+
+    /// `"OpenReview"` is the one provider-declared action name that must
+    /// **not** flow through #523's generic fire-and-forget dispatch: #525
+    /// resolves its stdout into a
+    /// [`crate::core::tool_client::BranchReviewTarget`] and opens the
+    /// change-review surface instead (see `Engine::open_review_card`).
+    /// Pinning the precedence here because the two features were developed
+    /// in parallel and both claim the same action name — a regression would
+    /// silently turn "open the review" back into "print the review JSON to
+    /// the status line".
+    #[test]
+    fn apply_open_review_resolves_a_target_instead_of_dispatching_the_action() {
+        let (dir, base) = init_review_repo("precedence-over-dispatch");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        install_mock_provider_with_review_action(
+            &mut engine,
+            fixture_model(),
+            Ok(serde_json::json!({"branch": "feature", "base": base})),
+        );
+
+        engine.apply_board_action(BoardAction::OpenReview(WidgetId::new("card:1")));
+
+        assert!(
+            engine.change_review.is_some(),
+            "OpenReview must open the change-review surface (#525)"
+        );
+        assert!(
+            !engine.board_action_running,
+            "OpenReview must not be routed through the generic board-action \
+             dispatcher (#523) — message was {:?}",
+            engine.message
+        );
+        assert!(
+            !engine.message.starts_with("Running '"),
+            "OpenReview must not surface as a fire-and-forget dispatch; \
+             message: {:?}",
+            engine.message
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_open_issue_falls_back_to_provider_action_when_no_document_provider() {
+        // No `[document]` provider configured, but the board provider does
+        // declare an "OpenIssue" action — #523's dispatch should be tried
+        // before falling all the way back to the plain title-echo message.
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_actions(
+            &mut engine,
+            fixture_model(),
+            vec![dispatch_action("OpenIssue", vec!["mock", "open", "{id}"])],
+        );
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.apply_board_action(BoardAction::OpenIssue(WidgetId::new("card:2")));
+        wait_for_board_action(&mut engine);
+
+        assert_eq!(
+            recorder.calls()[0].argv,
+            vec!["mock".to_string(), "open".to_string(), "card:2".to_string()]
+        );
+    }
+
+    // ─── #523: opt-in freshness (`tick_command`) ───────────────────────────
+
+    fn install_mock_provider_with_tick(engine: &mut Engine, tick_interval_secs: u64) {
+        let mut manifest = ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        manifest.board = Some(BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            tick_command: vec!["mock".to_string(), "notify".to_string()],
+            tick_interval_secs,
+            ..Default::default()
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+    }
+
+    /// Poll until the recorder has observed at least one call — there is no
+    /// channel/receiver for a tick (it's genuinely fire-and-forget), so this
+    /// spins on the recorder itself rather than an `Engine::poll_*` method.
+    fn wait_for_recorded_call(recorder: &RecordingToolClient) {
+        let mut tries = 0;
+        while recorder.calls().is_empty() {
+            tries += 1;
+            assert!(tries < 1000, "tick command never ran");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn tick_board_provider_freshness_is_off_by_default() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_tick(&mut engine, 1);
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+        assert!(!engine.settings.board_tick_enabled);
+
+        engine.tick_board_provider_freshness();
+
+        // Give a background thread every chance to have fired anyway before
+        // asserting nothing did — flakiness here would hide a real bug
+        // (dispatching metered work with no opt-in), not save time.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            recorder.calls().is_empty(),
+            "a passive viewer must not silently dispatch metered work"
+        );
+    }
+
+    #[test]
+    fn tick_board_provider_freshness_runs_when_enabled_and_due() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.board_tick_enabled = true;
+        install_mock_provider_with_tick(&mut engine, 1);
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.tick_board_provider_freshness();
+        wait_for_recorded_call(&recorder);
+
+        assert_eq!(
+            recorder.calls()[0].argv,
+            vec!["mock".to_string(), "notify".to_string()]
+        );
+    }
+
+    #[test]
+    fn tick_board_provider_freshness_respects_the_interval() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.board_tick_enabled = true;
+        // A long interval so the second call below is unambiguously "not
+        // due yet" rather than a race against real time.
+        install_mock_provider_with_tick(&mut engine, 3600);
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.tick_board_provider_freshness();
+        wait_for_recorded_call(&recorder);
+        engine.tick_board_provider_freshness();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            recorder.calls().len(),
+            1,
+            "a second tick within the declared interval must not re-fire"
+        );
+    }
+
+    #[test]
+    fn tick_board_provider_freshness_with_no_tick_command_is_a_no_op() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.board_tick_enabled = true;
+        install_mock_provider(&mut engine, fixture_model());
+        let recorder = RecordingToolClient::default();
+        engine.set_board_client_for_test(recorder.clone());
+
+        engine.tick_board_provider_freshness();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(recorder.calls().is_empty());
     }
 }

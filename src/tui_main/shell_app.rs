@@ -15133,12 +15133,12 @@ mod tests {
                 .ext_registry
                 .as_mut()
                 .expect("install_mock_board_provider populates the registry");
-            let mut actions = std::collections::HashMap::new();
-            actions.insert(
-                "OpenReview".to_string(),
-                vec!["mock-review".to_string(), "{id}".to_string()],
-            );
-            registry[0].board.as_mut().unwrap().actions = actions;
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
         }
         app.engine.board_model = Some(mock_board_model());
         app.engine.workspace_root = Some(dir.clone());
@@ -15231,12 +15231,12 @@ mod tests {
                 .ext_registry
                 .as_mut()
                 .expect("install_mock_board_provider populates the registry");
-            let mut actions = std::collections::HashMap::new();
-            actions.insert(
-                "OpenReview".to_string(),
-                vec!["mock-review".to_string(), "{id}".to_string()],
-            );
-            registry[0].board.as_mut().unwrap().actions = actions;
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
         }
         app.engine.board_model = Some(mock_board_model());
         app.engine.workspace_root = Some(dir.clone());
@@ -15323,12 +15323,12 @@ mod tests {
                 .ext_registry
                 .as_mut()
                 .expect("install_mock_board_provider populates the registry");
-            let mut actions = std::collections::HashMap::new();
-            actions.insert(
-                "OpenReview".to_string(),
-                vec!["mock-review".to_string(), "{id}".to_string()],
-            );
-            registry[0].board.as_mut().unwrap().actions = actions;
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "OpenReview".to_string(),
+                    command: vec!["mock-review".to_string(), "{id}".to_string()],
+                    ..Default::default()
+                }];
         }
         app.engine.board_model = Some(mock_board_model());
         app.engine.workspace_root = Some(dir.clone());
@@ -15358,6 +15358,129 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #523 acceptance: right-clicking a card lists the provider-declared
+    /// actions valid for its stage in a real context menu, driven through
+    /// the actual right-click event path (`mouse::handle_mouse`'s
+    /// `SidebarOwner::Board` right-click arm ->
+    /// `Engine::open_board_context_menu`), not by poking
+    /// `Engine::context_menu` directly. Asserted on the *painted* menu
+    /// (`ContextMenuPanel`'s rung), not on `Engine::context_menu.is_some()`
+    /// (#587/#592's lesson).
+    #[test]
+    fn board_right_click_opens_context_menu_with_provider_actions_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let (x, y) = driver
+            .find("Improve board host")
+            .expect("the mock card must be painted before it can be right-clicked");
+        driver.right_click(x, y);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Assign"),
+            "right-clicking a card should open a context menu listing the \
+             provider's declared action for its stage; screen:\n{screen}"
+        );
+    }
+
+    /// #523 acceptance, continued: confirming a menu item (Enter — the
+    /// generic context-menu key route `render::route_modal_key` gives
+    /// priority over every focus-owner route, so this works with no board
+    /// focus set) dispatches the provider's argv (`{id}` substituted) and
+    /// surfaces the result to the status line, then a background refresh is
+    /// kicked off. Proven end-to-end with a mock provider — no coordinator
+    /// (or any other specific provider) anywhere, per #521/#522/#523's
+    /// "generic host" scope. `driver.tick()` (via `poll_until_screen`) is
+    /// what actually reaches `Engine::poll_idle` -> `poll_board_action`,
+    /// exactly as the live event loop does.
+    #[test]
+    fn board_context_menu_action_dispatches_provider_command_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        install_mock_board_provider(&mut app.engine);
+        {
+            let registry = app
+                .engine
+                .ext_registry
+                .as_mut()
+                .expect("install_mock_board_provider populates the registry");
+            registry[0].board.as_mut().unwrap().actions =
+                vec![crate::core::extensions::BoardActionDef {
+                    name: "assign".to_string(),
+                    label: "Assign".to_string(),
+                    command: vec!["mock".to_string(), "assign".to_string(), "{id}".to_string()],
+                    stages: vec![],
+                    key: None,
+                    confirm: false,
+                }];
+        }
+        app.engine.board_model = Some(mock_board_model());
+        let recorder = crate::core::tool_client::RecordingToolClient::default();
+        app.engine.set_board_client_for_test(recorder.clone());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_BOARD));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let (x, y) = driver
+            .find("Improve board host")
+            .expect("the mock card must be painted before it can be right-clicked");
+        driver.right_click(x, y);
+        assert!(
+            driver.screen().contains("Assign"),
+            "precondition: the context menu must be open"
+        );
+
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let surfaced = poll_until_screen(&mut driver, Duration::from_secs(2), |s| {
+            s.contains("'Assign'")
+        });
+        assert!(
+            surfaced,
+            "the dispatched action's result must be surfaced to the status \
+             line, not just recorded internally; screen:\n{}",
+            driver.screen()
+        );
+
+        // Two calls land on the recorder: the action dispatch itself, plus
+        // the `board_refresh()` `poll_board_action` triggers afterward
+        // (#523's "board refreshed on next poll") — both go through the
+        // same `Engine::board_client`, so this asserts the dispatch call
+        // specifically rather than assuming it's the only one.
+        let calls = recorder.calls();
+        assert!(
+            calls.iter().any(|c| c.argv
+                == vec![
+                    "mock".to_string(),
+                    "assign".to_string(),
+                    "card:1".to_string()
+                ]),
+            "'{{id}}' must be substituted with the acted-on card's id; calls: {calls:?}"
+        );
     }
 
     /// AI: typing after focusing the panel must land in the `ChatController`
