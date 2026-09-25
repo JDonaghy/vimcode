@@ -196,14 +196,6 @@ fn fill_row(
     fill_row_q(backend, x, y, width, text, fg, bg);
 }
 
-/// Clear `area` to `bg` — the trait-only equivalent of the nested
-/// `for y { for x { set_cell(..) } }` background wipe the panels open with.
-fn fill_rect(backend: &mut dyn quadraui::Backend, area: Rect, fg: Color, bg: Color) {
-    for y in area.y..area.y + area.height {
-        fill_row(backend, area.x, y, area.width, "", fg, bg);
-    }
-}
-
 /// Render the settings panel — shows current key settings and the file path.
 ///
 /// B5c.4: routes the form rendering through `Backend::draw_form` so
@@ -363,6 +355,17 @@ pub(super) fn render_command_line(
 /// [`fill_rect`]/[`fill_row`] calls, so `TuiShellApp::render_content` can
 /// paint this panel. Everything else here was already a `Backend::draw_*`
 /// trait call.
+///
+/// #1390: the background wipe goes through `SidebarPanelBody::render_with`
+/// (quadraui#1059, the composer `render_explorer_sidebar_content` uses,
+/// #1389) instead of a standalone [`fill_rect`] call. `chrome` stays
+/// [`render::SidebarPanelChrome::None`] — the shell's own sidebar header
+/// already titles this panel "SOURCE CONTROL", so the header row painted
+/// below (`render::sc_header_status_bar`, live branch/ahead-behind) is body
+/// content, not a second title (#1256's double-header bug). `None` chrome
+/// reserves no rows, so `render_with`'s `body_rect` is pixel-identical to
+/// `area`; the closure keeps using the outer `area` rather than threading a
+/// second rect through every call below.
 pub(super) fn render_source_control(
     backend: &mut dyn quadraui::Backend,
     screen: &render::ScreenLayout,
@@ -373,191 +376,198 @@ pub(super) fn render_source_control(
     if area.height == 0 {
         return;
     }
-    let hdr_fg = theme.status_fg;
-    let hdr_bg = theme.status_bg;
-    // Clear the entire area first to prevent stale content from previous renders.
-    fill_rect(backend, area, theme.foreground, theme.tab_bar_bg);
-
-    // #1252: SC data comes from the frame's own `screen` (built once by
-    // `build_screen_for_shell_content`) instead of a second, independently
-    // built `ScreenLayout` — see `render_sidebar_content`'s doc comment.
-    let Some(ref sc) = screen.source_control else {
-        return;
-    };
-
-    // #1361: whether the bottom row is reserved for the focused-hint comes
-    // from `render::sc_sidebar_bands` — the exact same derivation
-    // `mouse.rs`'s click router uses (row_height 1.0, commit_border 2.0,
-    // `sc.has_focus`) — so the reservation this paints can never disagree
-    // with what a click is hit-tested against. Painted as a shared
-    // `StatusBar` (`render::sc_hint_status_bar`), same mechanism as GTK's
-    // `PANEL_GIT` arm, not a raw `fill_row`.
-    let bands = render::sc_sidebar_bands(
-        &sc.commit_message,
-        super::shell_app::to_q_rect(area),
-        1.0,
-        2.0,
-        sc.has_focus,
-    );
-    if let Some(hint_rect) = bands.hint {
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        let hint_bar = render::sc_hint_status_bar(theme);
-        let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
-    }
-    // #1361 review: the pre-#1361 code additionally gated the whole hint
-    // reservation on `area.height > 2`, guarding against a degenerate
-    // 1-2 row panel. That guard is gone: `bands.hint.is_some()` alone
-    // (i.e. `sc.has_focus`) now decides the reservation, matching GTK
-    // (which never had a height guard here) and the single shared
-    // `render::sc_sidebar_bands` derivation both painters and both click
-    // routers call — see this function's own top-of-block comment.
-    // `area.height - 1` cannot underflow: the `area.height == 0` guard at
-    // the top of this function already returned, so `area.height >= 1`
-    // here, and `1 - 1 == 0` is a valid (if degenerate) zero-row `Rect`,
-    // not a panic. A real sidebar is never 1-2 rows tall in practice, so
-    // the worst case is the hint/header rows painting over each other in
-    // a pathologically tiny panel — a pre-existing cosmetic-only risk
-    // `sc_sidebar_bands`'s own `.max(0.0)` on `slab_h` already bounds,
-    // not a new crash surface this diff introduces.
-    let area = if bands.hint.is_some() {
-        Rect {
-            x: area.x,
-            y: area.y,
-            width: area.width,
-            height: area.height - 1,
-        }
-    } else {
-        area
-    };
-
-    // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
-    let branch_info = render::sc_header_text(sc);
-    fill_row(
-        backend,
-        area.x,
-        area.y,
-        area.width,
-        &branch_info,
-        hdr_fg,
-        hdr_bg,
-    );
-
-    if area.height < 2 {
-        return;
-    }
-
-    // ── Row 1+: commit input box (quadraui::TextInput, #480) ─────────────────
-    // Migrated from a hand-rolled `set_cell` multi-line editor to the shared
-    // `TextInput` primitive (quadraui#222). `commit_box_h` includes the
-    // primitive's 1-row border on top and bottom — see
-    // `render::sc_commit_input_box_height` doc for why this height is the
-    // single source of truth shared with `mouse.rs`'s click hit-test.
-    let ti = render::sc_commit_message_to_text_input(sc);
-    let commit_box_h = render::sc_commit_input_box_height(&sc.commit_message);
-    {
-        let paint_h = commit_box_h.min(area.height.saturating_sub(1));
-        let ti_rect = quadraui::Rect::new(
-            area.x as f32,
-            (area.y + 1) as f32,
-            area.width as f32,
-            paint_h as f32,
-        );
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        backend.draw_text_input(ti_rect, &ti);
-    }
-
-    if area.height < 1 + commit_box_h {
-        return;
-    }
-
-    // ── Bottom slab: toolbar slot + sections via SidebarPanel (#509) ──────────
-    // Passes the entire remaining area (just below commit input) to
-    // draw_sc_sidebar_panel, which reserves one toolbar-height row for the
-    // button row and returns content_bounds for the sections below. No
-    // per-side padding rows — option (a) from the issue: tighter layout,
-    // zero manual arithmetic.
-    {
-        let slab_y = area.y + 1 + commit_box_h;
-        let slab_h = (area.y + area.height).saturating_sub(slab_y);
-        let slab_rect = quadraui::Rect::new(
-            area.x as f32,
-            slab_y as f32,
-            area.width as f32,
-            slab_h as f32,
-        );
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
-    }
-
-    // Read section-area origin from the cached layout.
-    let section_start_y = {
-        let l = engine.sc_panel_layout.borrow();
-        l.as_ref()
-            .map(|l| l.content_bounds.y as u16)
-            .unwrap_or(area.y + 1 + commit_box_h + 1) // fallback: btn row + 1
-    };
-    if section_start_y >= area.y + area.height {
-        return;
-    }
-
-    // Section rendering — migrated to `SidebarSystem` (#321).
-    let section_area = Rect {
-        x: area.x,
-        y: section_start_y,
-        width: area.width,
-        height: (area.y + area.height).saturating_sub(section_start_y),
-    };
-    let q_rect = quadraui::Rect::new(
-        section_area.x as f32,
-        section_area.y as f32,
-        section_area.width as f32,
-        section_area.height as f32,
-    );
-    engine.sc_sidebar_body_rect.set(q_rect);
-    render::populate_sc_sidebar_system(engine, theme);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    engine.sc_sidebar_system.borrow().render(backend, q_rect);
-    // ── Branch picker / create popup (quadraui::Palette dual-mode, #480) ─────
-    // Migrated from a hand-rolled popup to the dual-mode `Palette` primitive
-    // shipped in quadraui#224 (list mode = switch branch, input mode =
-    // create branch). Scroll is authoritative in the TUI rasteriser (keeps
-    // `selected_idx` in view), so no manual scroll-offset math is needed
-    // here the way the hand-rolled version required.
-    if let Some(ref bp) = sc.branch_picker {
-        let palette = render::sc_branch_picker_to_palette(bp);
-        let popup_w = area.width.saturating_sub(2).min(40);
-        let popup_h = if bp.create_mode {
-            4u16
-        } else {
-            area.height.saturating_sub(4).min(15)
-        };
-        let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
-        let popup_y = area.y + 2;
-        let q_rect = quadraui::Rect::new(
-            popup_x as f32,
-            popup_y as f32,
-            popup_w as f32,
-            popup_h as f32,
-        );
-        backend.set_theme(super::quadraui_tui::q_theme(theme));
-        backend.draw_palette(q_rect, &palette);
-    }
+    let panel = render::SidebarPanelBody {
+        background: Some(theme.tab_bar_bg),
+        chrome: render::SidebarPanelChrome::None,
+        scrollbar_gutter: None,
+    };
+    let q_rect = super::shell_app::to_q_rect(area);
+    panel.render_with(backend, q_rect, |backend, _body_rect| {
+        let hdr_fg = theme.status_fg;
+        let hdr_bg = theme.status_bg;
 
-    // ── Help dialog (quadraui::Dialog + DialogTable, #480) ───────────────────
-    // Migrated from a hand-rolled 2-column popup to `Dialog`'s table slot,
-    // shipped in quadraui#225. Bindings list lives once in
-    // `render::sc_help_dialog` instead of being duplicated per backend.
-    if sc.help_open {
-        let viewport = quadraui::Rect::new(
-            area.x as f32,
-            area.y as f32,
-            area.width as f32,
-            area.height as f32,
+        // #1252: SC data comes from the frame's own `screen` (built once by
+        // `build_screen_for_shell_content`) instead of a second, independently
+        // built `ScreenLayout` — see `render_sidebar_content`'s doc comment.
+        let Some(ref sc) = screen.source_control else {
+            return;
+        };
+
+        // #1361: whether the bottom row is reserved for the focused-hint comes
+        // from `render::sc_sidebar_bands` — the exact same derivation
+        // `mouse.rs`'s click router uses (row_height 1.0, commit_border 2.0,
+        // `sc.has_focus`) — so the reservation this paints can never disagree
+        // with what a click is hit-tested against. Painted as a shared
+        // `StatusBar` (`render::sc_hint_status_bar`), same mechanism as GTK's
+        // `PANEL_GIT` arm, not a raw `fill_row`.
+        let bands = render::sc_sidebar_bands(
+            &sc.commit_message,
+            super::shell_app::to_q_rect(area),
+            1.0,
+            2.0,
+            sc.has_focus,
         );
-        let (dialog, layout) = render::sc_help_dialog_layout(viewport, 1.0, 1.0);
+        if let Some(hint_rect) = bands.hint {
+            backend.set_theme(super::quadraui_tui::q_theme(theme));
+            let hint_bar = render::sc_hint_status_bar(theme);
+            let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+        }
+        // #1361 review: the pre-#1361 code additionally gated the whole hint
+        // reservation on `area.height > 2`, guarding against a degenerate
+        // 1-2 row panel. That guard is gone: `bands.hint.is_some()` alone
+        // (i.e. `sc.has_focus`) now decides the reservation, matching GTK
+        // (which never had a height guard here) and the single shared
+        // `render::sc_sidebar_bands` derivation both painters and both click
+        // routers call — see this function's own top-of-block comment.
+        // `area.height - 1` cannot underflow: the `area.height == 0` guard at
+        // the top of this function already returned, so `area.height >= 1`
+        // here, and `1 - 1 == 0` is a valid (if degenerate) zero-row `Rect`,
+        // not a panic. A real sidebar is never 1-2 rows tall in practice, so
+        // the worst case is the hint/header rows painting over each other in
+        // a pathologically tiny panel — a pre-existing cosmetic-only risk
+        // `sc_sidebar_bands`'s own `.max(0.0)` on `slab_h` already bounds,
+        // not a new crash surface this diff introduces.
+        let area = if bands.hint.is_some() {
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: area.height - 1,
+            }
+        } else {
+            area
+        };
+
+        // ── Row 0: header "SOURCE CONTROL" ──────────────────────────────────────
+        let branch_info = render::sc_header_text(sc);
+        fill_row(
+            backend,
+            area.x,
+            area.y,
+            area.width,
+            &branch_info,
+            hdr_fg,
+            hdr_bg,
+        );
+
+        if area.height < 2 {
+            return;
+        }
+
+        // ── Row 1+: commit input box (quadraui::TextInput, #480) ─────────────────
+        // Migrated from a hand-rolled `set_cell` multi-line editor to the shared
+        // `TextInput` primitive (quadraui#222). `commit_box_h` includes the
+        // primitive's 1-row border on top and bottom — see
+        // `render::sc_commit_input_box_height` doc for why this height is the
+        // single source of truth shared with `mouse.rs`'s click hit-test.
+        let ti = render::sc_commit_message_to_text_input(sc);
+        let commit_box_h = render::sc_commit_input_box_height(&sc.commit_message);
+        {
+            let paint_h = commit_box_h.min(area.height.saturating_sub(1));
+            let ti_rect = quadraui::Rect::new(
+                area.x as f32,
+                (area.y + 1) as f32,
+                area.width as f32,
+                paint_h as f32,
+            );
+            backend.set_theme(super::quadraui_tui::q_theme(theme));
+            backend.draw_text_input(ti_rect, &ti);
+        }
+
+        if area.height < 1 + commit_box_h {
+            return;
+        }
+
+        // ── Bottom slab: toolbar slot + sections via SidebarPanel (#509) ──────────
+        // Passes the entire remaining area (just below commit input) to
+        // draw_sc_sidebar_panel, which reserves one toolbar-height row for the
+        // button row and returns content_bounds for the sections below. No
+        // per-side padding rows — option (a) from the issue: tighter layout,
+        // zero manual arithmetic.
+        {
+            let slab_y = area.y + 1 + commit_box_h;
+            let slab_h = (area.y + area.height).saturating_sub(slab_y);
+            let slab_rect = quadraui::Rect::new(
+                area.x as f32,
+                slab_y as f32,
+                area.width as f32,
+                slab_h as f32,
+            );
+            backend.set_theme(super::quadraui_tui::q_theme(theme));
+            render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
+        }
+
+        // Read section-area origin from the cached layout.
+        let section_start_y = {
+            let l = engine.sc_panel_layout.borrow();
+            l.as_ref()
+                .map(|l| l.content_bounds.y as u16)
+                .unwrap_or(area.y + 1 + commit_box_h + 1) // fallback: btn row + 1
+        };
+        if section_start_y >= area.y + area.height {
+            return;
+        }
+
+        // Section rendering — migrated to `SidebarSystem` (#321).
+        let section_area = Rect {
+            x: area.x,
+            y: section_start_y,
+            width: area.width,
+            height: (area.y + area.height).saturating_sub(section_start_y),
+        };
+        let q_rect = quadraui::Rect::new(
+            section_area.x as f32,
+            section_area.y as f32,
+            section_area.width as f32,
+            section_area.height as f32,
+        );
+        engine.sc_sidebar_body_rect.set(q_rect);
+        render::populate_sc_sidebar_system(engine, theme);
         backend.set_theme(super::quadraui_tui::q_theme(theme));
-        let _ = backend.draw_dialog(&dialog, &layout);
-    }
+        engine.sc_sidebar_system.borrow().render(backend, q_rect);
+        // ── Branch picker / create popup (quadraui::Palette dual-mode, #480) ─────
+        // Migrated from a hand-rolled popup to the dual-mode `Palette` primitive
+        // shipped in quadraui#224 (list mode = switch branch, input mode =
+        // create branch). Scroll is authoritative in the TUI rasteriser (keeps
+        // `selected_idx` in view), so no manual scroll-offset math is needed
+        // here the way the hand-rolled version required.
+        if let Some(ref bp) = sc.branch_picker {
+            let palette = render::sc_branch_picker_to_palette(bp);
+            let popup_w = area.width.saturating_sub(2).min(40);
+            let popup_h = if bp.create_mode {
+                4u16
+            } else {
+                area.height.saturating_sub(4).min(15)
+            };
+            let popup_x = area.x + (area.width.saturating_sub(popup_w)) / 2;
+            let popup_y = area.y + 2;
+            let q_rect = quadraui::Rect::new(
+                popup_x as f32,
+                popup_y as f32,
+                popup_w as f32,
+                popup_h as f32,
+            );
+            backend.set_theme(super::quadraui_tui::q_theme(theme));
+            backend.draw_palette(q_rect, &palette);
+        }
+
+        // ── Help dialog (quadraui::Dialog + DialogTable, #480) ───────────────────
+        // Migrated from a hand-rolled 2-column popup to `Dialog`'s table slot,
+        // shipped in quadraui#225. Bindings list lives once in
+        // `render::sc_help_dialog` instead of being duplicated per backend.
+        if sc.help_open {
+            let viewport = quadraui::Rect::new(
+                area.x as f32,
+                area.y as f32,
+                area.width as f32,
+                area.height as f32,
+            );
+            let (dialog, layout) = render::sc_help_dialog_layout(viewport, 1.0, 1.0);
+            backend.set_theme(super::quadraui_tui::q_theme(theme));
+            let _ = backend.draw_dialog(&dialog, &layout);
+        }
+    });
 }
 
 // ─── Extension panel (plugin-provided) ───────────────────────────────────────
