@@ -4436,17 +4436,19 @@ pub fn dispatch_sidebar_panel_key(
 /// popup-disappearance clear this comment used to point at —
 /// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
 ///
-/// **No driver test covers the Ctrl+L call site, by measurement not by
-/// omission.** One was written and RED-verified by disabling this rung —
-/// and stayed green: a fall-through Ctrl+L is inert in every reachable
-/// mode (Normal, unbound; Insert, where `Engine::handle_key` drops
-/// `Ctrl`-modified printables; picker/dialog, whose rungs intercept
-/// first), so the chord's *only* effect is the repaint — which is
-/// unobservable under the only driver vimcode can reach. See
-/// [`popup_overlay_closed_this_frame`]'s doc for the proof and for the
-/// ready-to-file upstream gap in `docs/PENDING_QUADRAUI_ISSUES.md`. The
-/// decision logic here is unit-tested in `slice7_router_tests` below; the
-/// wiring at the call site is a one-line delegation.
+/// **#1393 (quadraui#1060 consume side): the Ctrl+L call site now has a
+/// driver test that proves the repaint itself**, not just the decision
+/// logic — `tui_main::shell_app`'s
+/// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`,
+/// RED-verified by disabling this rung's `backend.request_full_repaint()`
+/// call. A `TestBackend`-based driver (`quadraui::tui::testing::TuiDriver`)
+/// genuinely cannot observe this — see [`popup_overlay_closed_this_frame`]'s
+/// doc for the full proof — so that test uses the vt100-backed
+/// `quadraui::tui::vt_testing::TuiVtDriver` instead (quadraui#1060,
+/// `driver_with_shell` + `inject_raw`, landed at this repo's pinned rev).
+/// The decision logic here is additionally unit-tested in
+/// `slice7_router_tests` below; the wiring at the call site is a one-line
+/// delegation.
 ///
 /// `insert_ctrl_x_pending` is `engine.insert_ctrl_x_pending` (only ever true
 /// in the one-keystroke window right after `<C-x>` in Insert mode): right
@@ -4483,10 +4485,9 @@ pub fn is_force_redraw_key(
 /// just above) because it is the one piece of this wiring that *is*
 /// directly unit-testable from here.
 ///
-/// **Why no driver test can assert on the *repaint* itself yet, only on
-/// this edge-detection predicate plus `tui_main::shell_app`'s
-/// paint-integrity black-box test
-/// (`picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app`) —
+/// **Why `tui_main::shell_app`'s `TestBackend`-driven
+/// `picker_dismiss_leaves_no_popup_glyphs_on_the_grid_via_shell_app` cannot
+/// assert on the *repaint* itself, only on this edge-detection predicate —
 /// verified directly against quadraui checkout rev `215e9e4`
 /// (`Cargo.toml`'s pin), not assumed:**
 /// `quadraui::tui::testing::TuiDriver` (`TestBackend`-backed) already
@@ -4508,25 +4509,22 @@ pub fn is_force_redraw_key(
 /// is unchanged" condition the hook exists to fix, and only
 /// [`TuiVtDriver`] (vt100-backed, real ANSI byte stream) can model that —
 /// see its own `render_actually_clears_stale_content_outside_the_diff_cache`
-/// test, which proves the *mechanism* works upstream. Two seams block
-/// reusing it from vimcode for a `ShellApp` impl: `TuiVtDriver::new`
-/// takes `AppLogic`, not `ShellApp` (no `driver_with_shell`-equivalent
-/// exists for it, and the only adapter between the two,
-/// `shell_adapter::build_shell_adapter`, is `pub(crate)`), and
-/// `TuiVtDriver`'s `parser: Rc<RefCell<vt100::Parser>>` field — the only
-/// way to inject the out-of-band bytes that test's technique relies on —
-/// is private with no public equivalent. `quadraui::Backend` is also
-/// `sealed::Sealed`, so a vimcode-side spy `Backend` that merely counts
-/// `request_full_repaint` calls cannot be written either.
+/// test, which proves the *mechanism* works upstream.
 ///
-/// That upstream test-infrastructure gap is **drafted in full, ready to
-/// file, in `docs/PENDING_QUADRAUI_ISSUES.md`** ("TUI test drivers can't
-/// observe `Backend::request_full_repaint`…") — the repo's standing
-/// convention for exactly this, since worker sessions are `git`-only and
-/// cannot file GitHub issues themselves. Filing it is the coordinator
-/// action that unblocks the real black-box test; this doc comment is the
-/// grep-able pointer that keeps the finding from being lost in the
-/// meantime.
+/// **#1393 (quadraui#1060 consume side) closed the two seams that used to
+/// block reusing `TuiVtDriver` from a vimcode `ShellApp` impl**:
+/// `quadraui::tui::vt_testing::driver_with_shell` (mirroring
+/// `quadraui::tui::testing::driver_with_shell`) now wraps a `ShellApp` in
+/// the same `ShellAdapter` stack the live runner uses, and the public
+/// `TuiVtDriver::inject_raw` hook exposes the out-of-band byte injection
+/// that test's technique relies on — both landed at this repo's pinned
+/// rev. `tui_main::shell_app`'s
+/// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+/// and
+/// `popup_dismiss_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+/// use them to assert on the actual repaint this function's transition
+/// exists to trigger, RED-verified against unfixed `develop`-shaped wiring
+/// by disabling each call site in turn.
 ///
 /// [`TuiVtDriver`]: https://github.com/JDonaghy/quadraui/blob/215e9e4/quadraui/src/tui/vt_testing.rs
 pub fn popup_overlay_closed_this_frame(was_open: bool, is_open_now: bool) -> bool {
