@@ -697,57 +697,20 @@ fn with_frame_scope<R>(
 
 // ─── Explorer context menu action handler ────────────────────────────────────
 
-/// Process explorer-specific context menu actions that need sidebar prompts.
-/// Tab context menu actions (close, split, etc.) are handled directly by
-/// `context_menu_confirm()` in the engine.
-///
-/// `ctx_path` / `ctx_is_dir` come from the context menu target — callers
-/// extract them *before* `context_menu_confirm()` consumes the menu.
-fn handle_explorer_context_action(
-    action: &str,
-    engine: &mut Engine,
-    _sidebar: &TuiSidebar,
+/// TUI's [`render::ExplorerContextHost`] — the one action
+/// [`render::apply_explorer_context_action`] needs backend plumbing for
+/// (#1418). `terminal_size` is captured by the caller (the live viewport at
+/// the moment the context menu was confirmed) since `Engine` doesn't carry
+/// it.
+struct TuiExplorerCtxHost {
     terminal_size: Option<Size>,
-    ctx_path: PathBuf,
-    ctx_is_dir: bool,
-) {
-    let path = ctx_path;
-    let is_dir = ctx_is_dir;
+}
 
-    match action {
-        // #823 item 6: the string -> `ExplorerAction` resolution for these
-        // two arms moved to `ExplorerAction::from_action_str` (shared with
-        // GTK's `App::explorer_action`) — see its doc comment for why
-        // `"delete"` (below) and `"move_file"` (no arm here at all) stay
-        // backend-specific rather than also routing through it.
-        "new_file" | "new_folder" | "rename" => {
-            if let Some(crud_action) =
-                crate::core::settings::ExplorerAction::from_action_str(action)
-            {
-                engine.dispatch_explorer_crud(crud_action);
-            }
-        }
-        "delete" => {
-            engine.confirm_delete_file(&path);
-        }
-        // copy_path, copy_relative_path, reveal, open_side, open_side_vsplit handled by engine
-        "copy_path" | "copy_relative_path" | "reveal" | "open_side" | "open_side_vsplit" => {}
-        "open_terminal" => {
-            let dir = if is_dir {
-                path.clone()
-            } else {
-                path.parent().unwrap_or(&engine.cwd).to_path_buf()
-            };
-            let cols = terminal_size.map(|s| s.width).unwrap_or(80);
-            let rows = engine.session.terminal_panel_rows;
-            engine.terminal_new_tab_at(cols, rows, Some(&dir));
-        }
-        // select_for_diff and diff_with_selected are handled by the engine
-        "select_for_diff" | "diff_with_selected" => {}
-        "find_in_folder" => {
-            engine.open_picker(crate::core::engine::PickerSource::Grep);
-        }
-        _ => {}
+impl render::ExplorerContextHost for TuiExplorerCtxHost {
+    fn open_terminal_at(&mut self, engine: &mut Engine, dir: PathBuf) {
+        let cols = self.terminal_size.map(|s| s.width).unwrap_or(80);
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_new_tab_at(cols, rows, Some(&dir));
     }
 }
 

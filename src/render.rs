@@ -5293,6 +5293,108 @@ pub fn apply_engine_action(
     }
 }
 
+// ─── Explorer context-menu applier (#1418) ─────────────────────────────────
+//
+// The explorer context menu's *decision* — which item is highlighted, which
+// key/click confirms it — was already shared (`Engine::handle_context_menu_key`
+// / `Engine::context_menu_target_path`), but what happened with the
+// confirmed action *string* was written once per backend: TUI's
+// `handle_explorer_context_action` (`tui_main/mod.rs`) and GTK's
+// `App::dispatch_explorer_ctx_action` (`app.rs`). They had already drifted —
+// TUI's `"delete"` used the context menu's own explicit target path
+// (`Engine::confirm_delete_file`); GTK's routed through
+// `dispatch_explorer_crud(Delete)`, which acts on the explorer tree's
+// *selected* row instead, picking the wrong file whenever a right-click
+// target and the tree's selection disagree. `"find_in_folder"` was worse:
+// TUI opened the (workspace-wide, not folder-scoped) Grep picker, GTK just
+// focused the Search sidebar panel — a different feature entirely, despite
+// both being wired to a menu item labelled "Find in Folder...".
+//
+// [`apply_explorer_context_action`] is the one function both backends now
+// call. It picks TUI's explicit-target behavior for `"delete"`/`"move_file"`
+// (`Engine::confirm_delete_file`/`Engine::start_move_file_dialog` take the
+// path directly — no tree-selection ambiguity possible), and gives
+// `"find_in_folder"` one real behavior on both backends:
+// `Engine::open_grep_picker_scoped`, a live-grep search restricted to the
+// clicked folder (#1418), matching the menu label for the first time on
+// either backend.
+//
+// `new_file`/`new_folder`/`rename` keep routing through
+// `dispatch_explorer_crud` (selected-row-based) — both backends already
+// agreed on that subset before this issue, so it is not a divergence this
+// rung needs to resolve, only preserve.
+//
+// `host: &mut impl ExplorerContextHost` covers the one action that
+// genuinely needs backend-specific plumbing: `"open_terminal"` needs the
+// live terminal pane's column count, which only each backend's own runner
+// has in scope. Every other action is a plain `Engine` call with no
+// backend seam — including the caller's own post-action redraw/refresh
+// bookkeeping (`explorer_needs_refresh`, `draw_needed`), which stays at
+// each call site exactly as before since it is generic "something changed"
+// plumbing already shared across far more than context-menu actions, not
+// specific to this rung.
+pub trait ExplorerContextHost {
+    /// Open a new terminal tab rooted at `dir` (needs the live pane's
+    /// column count, which only the backend's own runner has in scope).
+    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf);
+}
+
+/// Resolve the "open_terminal"/"find_in_folder" target directory: `target`
+/// itself when it is already a directory, its parent otherwise (falling
+/// back to `engine.cwd` for a target with no parent).
+fn explorer_ctx_action_dir(
+    engine: &Engine,
+    target: &std::path::Path,
+    is_dir: bool,
+) -> std::path::PathBuf {
+    if is_dir {
+        target.to_path_buf()
+    } else {
+        target.parent().unwrap_or(&engine.cwd).to_path_buf()
+    }
+}
+
+/// Apply the action string [`Engine::context_menu_confirm`] returned for an
+/// explorer context menu (`target`/`is_dir` are that same confirm's
+/// `Engine::context_menu_target_path`, captured by the caller *before*
+/// confirming — see e.g. `crate::app::App::dispatch_context_menu_key`).
+///
+/// `copy_path`/`copy_relative_path`/`reveal`/`open_side`/`open_side_vsplit`/
+/// `select_for_diff`/`diff_with_selected` are engine-owned — already fully
+/// handled inside `context_menu_confirm` itself — so they (and any other
+/// unrecognised action) are a deliberate no-op here.
+pub fn apply_explorer_context_action(
+    engine: &mut Engine,
+    action: &str,
+    target: &std::path::Path,
+    is_dir: bool,
+    host: &mut impl ExplorerContextHost,
+) {
+    match action {
+        "new_file" | "new_folder" | "rename" => {
+            if let Some(crud_action) =
+                crate::core::settings::ExplorerAction::from_action_str(action)
+            {
+                engine.dispatch_explorer_crud(crud_action);
+            }
+        }
+        "delete" => engine.confirm_delete_file(target),
+        "move_file" => {
+            let root = engine.cwd.clone();
+            engine.start_move_file_dialog(target, &root);
+        }
+        "open_terminal" => {
+            let dir = explorer_ctx_action_dir(engine, target, is_dir);
+            host.open_terminal_at(engine, dir);
+        }
+        "find_in_folder" => {
+            let dir = explorer_ctx_action_dir(engine, target, is_dir);
+            engine.open_grep_picker_scoped(&dir);
+        }
+        _ => {}
+    }
+}
+
 // ─── Native file-dialog rung (#1125) ────────────────────────────────────────
 //
 // TUI's `save_workspace_as_dialog` used to hardcode `engine.cwd.join(

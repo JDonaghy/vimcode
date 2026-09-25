@@ -20,6 +20,7 @@ impl Engine {
         self.breadcrumb_scoped_parent_line = None;
         self.picker_history_index = None;
         self.picker_history_typing_buffer.clear();
+        self.picker_grep_scope = None;
 
         match source {
             PickerSource::Files => {
@@ -76,6 +77,17 @@ impl Engine {
         self.picker_filter();
         self.picker_load_preview();
         self.picker_open = true;
+    }
+
+    /// Open the Grep picker scoped to `dir` — the explorer context menu's
+    /// "Find in Folder..." action (#1418). Search results are restricted to
+    /// `dir` (via [`Self::picker_grep_scope`]) instead of the whole
+    /// workspace, matching the menu label. `open_picker` already reset
+    /// `picker_grep_scope` to `None`, so this only needs to set it
+    /// afterwards.
+    pub fn open_grep_picker_scoped(&mut self, dir: &Path) {
+        self.open_picker(PickerSource::Grep);
+        self.picker_grep_scope = Some(dir.to_path_buf());
     }
 
     /// Open the Command Center picker (called from menu bar search box click).
@@ -1435,9 +1447,15 @@ impl Engine {
 
     /// Run a project grep search with a given query string and populate picker_items.
     /// Shared between the standalone Grep picker source and Command Center `%` prefix.
+    ///
+    /// Searches under [`Self::picker_grep_scope`] when set (the "Find in
+    /// Folder..." context-menu action, #1418) — [`Self::cwd`] otherwise.
     fn picker_cc_grep_search(&mut self, query: &str) {
         let options = project_search::SearchOptions::default();
-        let cwd = self.cwd.clone();
+        let cwd = self
+            .picker_grep_scope
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone());
         match project_search::search_in_project(&cwd, query, &options) {
             Ok(mut results) => {
                 results.truncate(200);

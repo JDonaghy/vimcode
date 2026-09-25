@@ -4835,7 +4835,7 @@ fn apply_modal_key_route(
     modifiers: quadraui::Modifiers,
     keyboard_enhanced: bool,
     engine: &mut Engine,
-    sidebar: &mut TuiSidebar,
+    _sidebar: &mut TuiSidebar,
     screen_w: u16,
     screen_h: u16,
 ) -> Reaction {
@@ -4866,13 +4866,11 @@ fn apply_modal_key_route(
                 let ctx = engine.context_menu_target_path();
                 let (_consumed, action) = engine.handle_context_menu_key(&effective_key);
                 if let (Some(act), Some((ctx_path, ctx_is_dir))) = (action, ctx) {
-                    handle_explorer_context_action(
-                        &act,
-                        engine,
-                        sidebar,
-                        Some(Size::new(screen_w, screen_h)),
-                        ctx_path,
-                        ctx_is_dir,
+                    let mut host = TuiExplorerCtxHost {
+                        terminal_size: Some(Size::new(screen_w, screen_h)),
+                    };
+                    render::apply_explorer_context_action(
+                        engine, &act, &ctx_path, ctx_is_dir, &mut host,
                     );
                 }
             }
@@ -19356,12 +19354,14 @@ mod tests {
     }
 
     /// `handle_key_pressed`'s context-menu branch must dispatch the
-    /// confirmed item's action to [`handle_explorer_context_action`]
-    /// (mirrors `mod.rs:2703`-`:2706`) — unlike `Engine::handle_key`'s own
-    /// context-menu branch (`keys.rs:66`-`:71`), which consumes the key but
-    /// silently discards the resulting action. Confirms the first item
-    /// ("New File...", action `"new_file"`) of a folder context menu and
-    /// asserts on `explorer_new_entry_pending`, the observable side effect
+    /// confirmed item's action to [`render::apply_explorer_context_action`]
+    /// (#1418, the shared applier `handle_explorer_context_action` used to
+    /// be before both backends' hand-rolled copies converged onto it) —
+    /// unlike `Engine::handle_key`'s own context-menu branch
+    /// (`keys.rs:66`-`:71`), which consumes the key but silently discards
+    /// the resulting action. Confirms the first item ("New File...", action
+    /// `"new_file"`) of a folder context menu and asserts on
+    /// `explorer_new_entry_pending`, the observable side effect
     /// `dispatch_explorer_crud(ExplorerAction::NewFile)` produces.
     #[test]
     fn handle_key_pressed_context_menu_dispatches_explorer_action() {
@@ -19395,8 +19395,9 @@ mod tests {
         );
         assert!(
             engine.explorer_new_entry_pending.is_some(),
-            "the 'New File...' action should reach `handle_explorer_context_action` \
-             and dispatch `ExplorerAction::NewFile`"
+            "the 'New File...' action should reach \
+             `render::apply_explorer_context_action` and dispatch \
+             `ExplorerAction::NewFile`"
         );
     }
 

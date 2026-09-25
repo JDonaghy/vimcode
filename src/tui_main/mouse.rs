@@ -456,13 +456,11 @@ pub(super) fn handle_mouse(
                     let ctx = engine.context_menu_target_path();
                     if let Some(act) = engine.context_menu_confirm() {
                         if let Some((ctx_path, ctx_is_dir)) = ctx {
-                            handle_explorer_context_action(
-                                &act,
-                                engine,
-                                sidebar,
-                                *terminal_size,
-                                ctx_path,
-                                ctx_is_dir,
+                            let mut host = TuiExplorerCtxHost {
+                                terminal_size: *terminal_size,
+                            };
+                            render::apply_explorer_context_action(
+                                engine, &act, &ctx_path, ctx_is_dir, &mut host,
                             );
                         }
                     }

@@ -4620,3 +4620,262 @@ mod issue_1360_activity_bar_click_focuses_panel {
         },
     }
 }
+
+/// #1418: `render::apply_explorer_context_action` converges what used to be
+/// two hand-rolled, drifted appliers — TUI's `handle_explorer_context_action`
+/// and GTK's `App::dispatch_explorer_ctx_action` — into one function both
+/// backends now call from `render::ModalKeyRoute::ContextMenu`'s key rung.
+/// One conformance scenario per action below, each pre-building the explorer
+/// context menu with the target item already highlighted (mirroring
+/// `Engine::open_explorer_context_menu`'s fixed folder-menu order) so the
+/// scenario body only has to press `Enter` — `Engine::handle_context_menu_key`'s
+/// own `"Return"` confirm binding — and read the painted result.
+///
+/// `backends: [gtk, tui_prod]` only (no `tui`): `App::dispatch_context_menu_key`
+/// is shared code between the `gtk` arm and the `tui` "control" arm (`App` on
+/// `quadraui::tui::TuiBackend`), so `tui` would just be a second copy of the
+/// same result — `tui_prod` (`TuiShellApp`, the shell `tui_main::run` actually
+/// ships) is the one genuinely independent implementation, same reasoning
+/// `sc_hint_row_shows_only_while_focused` gives above.
+#[cfg(test)]
+mod issue_1418_explorer_context_menu {
+    use super::*;
+
+    /// Build an engine with one folder (`root`, containing `marker.txt`)
+    /// already shown in an open, populated explorer sidebar, with its
+    /// context menu already open and `selected_idx` already highlighted —
+    /// one of the 9 items `Engine::open_explorer_context_menu`'s `is_dir`
+    /// branch builds, in that fixed order (0 new_file, 1 new_folder,
+    /// 2 reveal, 3 open_terminal, 4 find_in_folder, 5 copy_path,
+    /// 6 copy_relative_path, 7 rename, 8 delete).
+    fn engine_with_folder_ctx_menu(tag: &str, selected_idx: usize) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1418_ctxmenu_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker.txt"), "hello").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.open_explorer_context_menu(dir, true, 5, 5);
+        engine.context_menu.as_mut().unwrap().selected = selected_idx;
+        engine
+    }
+
+    // "New File..." (idx 0): confirming must start the tree's inline-edit
+    // placeholder (`Engine::dispatch_explorer_crud`'s `NewFile` arm),
+    // painted on both backends (`quadraui::tui::tree`'s `set_cell` loop /
+    // `quadraui::gtk::tree`'s `show_layout` call, both gated on
+    // `edit.placeholder`).
+    //
+    // RED-verified: with `apply_explorer_context_action`'s
+    // `"new_file"`/`"new_folder"`/`"rename"` arm changed to a bare
+    // `_ => {}` (never calling `dispatch_explorer_crud`), "New file
+    // name..." goes unpainted on both arms below.
+    crate::backend_conformance! {
+        label: context_menu_new_file_starts_inline_edit,
+        backends: [gtk, tui_prod],
+        engine: engine_with_folder_ctx_menu("new_file", 0),
+        size: (800, 480),
+        body: |driver| {
+            // "file name..." rather than the full "New file name..." —
+            // TUI's `paint_edit_input` (quadraui `tui/tree.rs`) always
+            // overwrites the placeholder's first painted cell with an
+            // inverted-space cursor block, so the leading "N" never
+            // survives into a painted text run there (GTK draws the caret
+            // as a separate overlay rectangle instead, leaving its own
+            // text run intact) — a backend rasterization difference, not
+            // part of what this scenario is proving.
+            assert!(
+                !driver.screen_has("file name..."),
+                "precondition: nothing is being edited yet"
+            );
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("file name..."),
+                "confirming 'New File...' must start the tree's inline-edit \
+                 placeholder"
+            );
+        },
+    }
+
+    // "Delete" (idx 8): confirming must open the delete-confirmation
+    // dialog (`Engine::confirm_delete_file`, titled "Confirm Delete") —
+    // using the context menu's own explicit target, not whichever row the
+    // explorer tree happens to have selected (`ExplorerAction::from_action_str`'s
+    // own doc comment on why those two can disagree).
+    //
+    // `tui_prod` only (no `gtk`): `confirm_delete_file`'s dialog (no
+    // table, no text input) is natively-expressible on GTK (quadraui#666)
+    // — it never paints in-canvas there, so `screen_has("Confirm Delete")`
+    // cannot be this scenario's GTK proof. GTK's own coverage
+    // (`native_dialog_shown`/`pending_native_dialog` bookkeeping, the
+    // established idiom this file's `native_dialog_presented_exactly_once_
+    // across_repeated_frames` etc. already use) lives in
+    // `src/gtk/testing.rs`'s `explorer_context_menu_delete_opens_native_
+    // confirm_dialog` instead — see that test's own doc for why it's a
+    // separate assertion vocabulary, not weaker coverage.
+    //
+    // RED-verified: with the `"delete"` arm changed to a bare `_ => {}`,
+    // "Confirm Delete" goes unpainted below.
+    crate::backend_conformance! {
+        label: context_menu_delete_opens_confirm_dialog,
+        backends: [tui_prod],
+        engine: engine_with_folder_ctx_menu("delete", 8),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "precondition: no dialog is open yet"
+            );
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("Confirm Delete"),
+                "confirming 'Delete' must open the delete-confirmation dialog"
+            );
+        },
+    }
+
+    // "Open in Integrated Terminal" (idx 3): confirming must open a real
+    // terminal tab in the bottom panel (`Engine::terminal_new_tab_at`),
+    // same painted "Terminal" tab-strip label
+    // `bottom_panel_tab_strip_click_switches_the_painted_panel` (GTK-only,
+    // above) already asserts on.
+    //
+    // `tui_prod` only (no `gtk`): GTK's menu bar has its own permanent
+    // "Terminal" top-level menu item (`File Edit View Go Run Terminal
+    // Help`), so a bare `screen_has("Terminal")` is true on GTK whether or
+    // not a terminal tab ever opens — confirmed empirically (`count
+    // ("Terminal")` reads 2 both with and without this scenario's fix
+    // applied: the still-open context menu's own "Open in Integrated
+    // Terminal" item contributes one occurrence pre-confirm, the new tab
+    // strip's "Terminal" label contributes one post-confirm, so the *count*
+    // doesn't move even though what produced it did). GTK's own coverage —
+    // `src/gtk/testing.rs`'s `explorer_context_menu_open_terminal_opens_
+    // terminal_tab`, which measures the count *before the context menu
+    // ever opens* to get a real baseline — is what closes that gap; see
+    // its own doc for why a plain `screen_has`/`count` inside this shared
+    // body can't.
+    //
+    // RED-verified: with the `"open_terminal"` arm changed to a bare
+    // `_ => {}`, no "Terminal" tab is ever painted below.
+    crate::backend_conformance! {
+        label: context_menu_open_terminal_opens_terminal_tab,
+        backends: [tui_prod],
+        engine: engine_with_folder_ctx_menu("open_terminal", 3),
+        size: (1400, 900),
+        body: |driver| {
+            // No "no terminal tab is open yet" precondition here — the
+            // still-open context menu's own "Open in Integrated Terminal"
+            // label already contains the substring "Terminal", so a
+            // `!screen_has("Terminal")` check would be asserting against
+            // the menu, not the (yet-to-open) terminal panel.
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("Terminal"),
+                "confirming 'Open in Integrated Terminal' must open a \
+                 terminal tab"
+            );
+        },
+    }
+
+    /// Marker text shared by both fixture files
+    /// [`engine_with_scoped_grep_ctx_menu`] writes — present in both, so a
+    /// query matching it alone cannot tell scoped from unscoped; the
+    /// per-directory suffix below is what a scoped search must filter on.
+    const SCOPED_GREP_COMMON: &str = "zqxw1418ctxmenugrep";
+
+    /// Build an engine with two sibling folders under one cwd —
+    /// `scoped_dir` (containing a file matching `SCOPED_GREP_COMMON` +
+    /// `"scoped"`) and `other_dir` (containing a file matching
+    /// `SCOPED_GREP_COMMON` + `"other"`) — with `scoped_dir`'s own context
+    /// menu open and "Find in Folder..." (idx 4) already highlighted.
+    fn engine_with_scoped_grep_ctx_menu(tag: &str) -> crate::core::Engine {
+        let root = std::env::temp_dir().join(format!(
+            "vimcode_test_1418_grep_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scoped_dir = root.join("scoped_dir");
+        let other_dir = root.join("other_dir");
+        std::fs::create_dir_all(&scoped_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(
+            scoped_dir.join("in_scope.txt"),
+            format!("{SCOPED_GREP_COMMON}scoped"),
+        )
+        .unwrap();
+        std::fs::write(
+            other_dir.join("out_of_scope.txt"),
+            format!("{SCOPED_GREP_COMMON}other"),
+        )
+        .unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = root.clone();
+        engine.explorer_expanded.insert(root.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.open_explorer_context_menu(scoped_dir, true, 5, 5);
+        engine.context_menu.as_mut().unwrap().selected = 4;
+        engine
+    }
+
+    // "Find in Folder..." (idx 4) is the one action that used to have two
+    // genuinely *different* behaviors, not just two copies of the same
+    // one: TUI opened the (workspace-wide) Grep picker,
+    // GTK just focused the Search sidebar panel — neither actually
+    // scoped to the clicked folder the menu label names. Confirming must
+    // now open the Grep picker (`"Live Grep"` title) scoped to
+    // `scoped_dir` (`Engine::open_grep_picker_scoped`): typing the marker
+    // query both fixture files share must surface only `scoped_dir`'s own
+    // match.
+    //
+    // RED-verified: with `apply_explorer_context_action`'s
+    // `"find_in_folder"` arm changed to a bare `_ => {}`, no picker ever
+    // opens on either arm below — the same failure both actual pre-fix
+    // behaviors would also hit, since neither GTK's old
+    // `self.toggle_focus_search()` (opens the Search panel, no
+    // `"Live Grep"` title at all) nor TUI's old unscoped
+    // `engine.open_picker(PickerSource::Grep)` (would fail this scenario's
+    // *last* assertion instead, surfacing `other_dir`'s match too) leaves
+    // this scenario green.
+    crate::backend_conformance! {
+        label: context_menu_find_in_folder_scopes_grep_to_the_folder,
+        backends: [gtk, tui_prod],
+        engine: engine_with_scoped_grep_ctx_menu("find_in_folder"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                !driver.screen_has("Live Grep"),
+                "precondition: the Grep picker is not open yet"
+            );
+            driver.press_named(NamedKey::Enter);
+            assert!(
+                driver.screen_has("Live Grep"),
+                "confirming 'Find in Folder...' must open the Grep picker \
+                 (GTK used to just focus the Search panel instead — a \
+                 different feature, not a scoped version of this one)"
+            );
+            driver.type_text(SCOPED_GREP_COMMON);
+            assert!(
+                driver.screen_has("in_scope.txt"),
+                "the scoped folder's own match must appear"
+            );
+            assert!(
+                !driver.screen_has("out_of_scope.txt"),
+                "a sibling folder's match must be filtered out by the \
+                 folder scope — TUI used to search the whole workspace \
+                 unscoped"
+            );
+        },
+    }
+}
