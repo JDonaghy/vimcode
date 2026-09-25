@@ -28,7 +28,8 @@
   "required_contexts": [
     "Test (Linux, headless)",
     "Test (Linux, headless, GUI feature on)",
-    "Test (macOS native, AppKit)"
+    "Test (macOS native, AppKit)",
+    "Build (Windows TUI, vcd.exe)"
   ],
 
   "branches": {
