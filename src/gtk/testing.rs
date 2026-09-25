@@ -2323,12 +2323,13 @@ mod tests {
     /// needle and `FILE_GENERIC`'s glyph is also painted elsewhere in this
     /// fixture's chrome (verified by hand: it resolves to an unrelated
     /// widget, not the row under test), so a shared-screen comparison could
-    /// silently pass by matching the wrong occurrence. There is no per-icon
-    /// *colour* to probe here unlike the tab bar: `build_explorer_tree_rows`
-    /// constructs `QIcon::new(glyph, fallback)` with no colour parameter at
-    /// all (unlike `quadraui::TabIcon`), so the glyph identity itself is the
-    /// only thing to assert on — via `find_bounds` locating the raw glyph
-    /// string, the same way `find_bounds("Paste")` locates ordinary text.
+    /// silently pass by matching the wrong occurrence. This test only
+    /// probes glyph *identity* via `find_bounds` locating the raw glyph
+    /// string, the same way `find_bounds("Paste")` locates ordinary text —
+    /// see `explorer_file_icon_paints_in_the_tab_bar_s_filetype_colour`
+    /// below for the per-icon *colour* coverage (#1381 gave
+    /// `build_explorer_tree_rows`'s `QIcon` a colour parameter, matching
+    /// `quadraui::TabIcon`).
     ///
     /// # Why this fails against unfixed `develop`
     ///
@@ -2376,6 +2377,105 @@ mod tests {
             "an unrecognised-extension file's row must still paint the \
              generic badge (proving the difference above is real, not just \
              'nothing painted')"
+        );
+    }
+
+    // ── #1381: explorer file-row filetype glyphs match the tab bar's ───────
+
+    /// #1381 (GTK): the explorer's filetype glyph must paint in the same
+    /// colour the tab bar uses for that file (`render::tab_icon_color` /
+    /// `icons::file_icon_color_for_name`) — the GTK twin of the TUI-side
+    /// `explorer_file_icon_paints_in_the_tab_bar_s_filetype_colour` test in
+    /// `tui_main::shell_app` — while a folder row's icon stays the default
+    /// row foreground. Samples the *painted* pixel colour via
+    /// `GtkDriver::pixel`, never engine state, per the "rendered output,
+    /// not state" rule (#587/#592): `Icon.color` could be populated on the
+    /// `TreeRow` while `quadraui::gtk::tree::draw_tree` never painted it,
+    /// and a test asserting only the former would pass against that bug —
+    /// the same shape as `tab_paints_a_distinct_icon_for_cs_files` above,
+    /// which this mirrors for the explorer.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Pre-#1381, `build_explorer_tree_rows` builds every file icon with
+    /// `QIcon::new(glyph, ".")` and never calls `.with_color(..)`, so
+    /// `Icon.color` is `None` and `draw_tree` paints the glyph in the
+    /// row's `def_fg` — the same colour the folder row's glyph paints in.
+    /// The Rust-orange assertion below fails.
+    #[test]
+    fn explorer_file_icon_paints_in_the_tab_bar_s_filetype_colour() {
+        let prev_nf = crate::icons::nerd_fonts_enabled();
+        crate::icons::set_nerd_fonts(true);
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1381_gtk_explorer_icon_color_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rust_file = dir.join("main.rs");
+        std::fs::write(&rust_file, "fn main() {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("srcdir1381")).unwrap();
+
+        let mut engine = Engine::new();
+        engine.cwd = dir.clone();
+        engine.settings.use_nerd_fonts = Some(true);
+        engine.explorer_reveal_path(&rust_file);
+
+        let mut h = harness(engine, 1400, 900);
+        crate::icons::set_nerd_fonts(prev_nf);
+
+        let file_glyph_bounds = h
+            .driver
+            .find_bounds(crate::icons::FILE_RUST.nerd)
+            .expect("main.rs's explorer row must paint the Rust glyph");
+        let dir_glyph_bounds = h
+            .driver
+            .find_bounds(crate::icons::FOLDER.nerd)
+            .expect("the srcdir1381 explorer row must paint the folder glyph");
+
+        // Scan every pixel inside each glyph's painted bounds rather than
+        // just the center point: antialiasing means a Pango glyph's own
+        // center pixel can land on a fringe rather than the glyph's solid
+        // fill (verified by hand — the Rust-glyph center sampled far from
+        // `ICON_ORANGE`), the same reason `tab_zero_left_half` above scans
+        // a region instead of one coordinate.
+        let mut scan = |b: quadraui::Rect| -> Vec<(u8, u8, u8)> {
+            let mut px = Vec::new();
+            for x in (b.x as i32)..((b.x + b.width) as i32) {
+                for y in (b.y as i32)..((b.y + b.height) as i32) {
+                    px.push(h.driver.pixel(x, y));
+                }
+            }
+            px
+        };
+        let file_px = scan(file_glyph_bounds);
+        let dir_px = scan(dir_glyph_bounds);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            file_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_ORANGE)),
+            "main.rs's explorer icon must paint in the same Rust-orange \
+             colour the tab bar uses for a .rs file; sampled: {:?}",
+            file_px
+        );
+        assert!(
+            !dir_px
+                .iter()
+                .copied()
+                .any(|p| pixel_near(p, crate::icons::ICON_ORANGE)),
+            "a folder row's icon must not paint Rust-orange, proving the \
+             colour is filetype-specific, not a blanket recolor of every \
+             icon cell; matches: {:?}",
+            dir_px
+                .iter()
+                .copied()
+                .filter(|p| pixel_near(*p, crate::icons::ICON_ORANGE))
+                .collect::<Vec<_>>()
         );
     }
 
