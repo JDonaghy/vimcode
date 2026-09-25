@@ -405,6 +405,21 @@ pub(super) fn render_source_control(
         let hint_bar = render::sc_hint_status_bar(theme);
         let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
     }
+    // #1361 review: the pre-#1361 code additionally gated the whole hint
+    // reservation on `area.height > 2`, guarding against a degenerate
+    // 1-2 row panel. That guard is gone: `bands.hint.is_some()` alone
+    // (i.e. `sc.has_focus`) now decides the reservation, matching GTK
+    // (which never had a height guard here) and the single shared
+    // `render::sc_sidebar_bands` derivation both painters and both click
+    // routers call — see this function's own top-of-block comment.
+    // `area.height - 1` cannot underflow: the `area.height == 0` guard at
+    // the top of this function already returned, so `area.height >= 1`
+    // here, and `1 - 1 == 0` is a valid (if degenerate) zero-row `Rect`,
+    // not a panic. A real sidebar is never 1-2 rows tall in practice, so
+    // the worst case is the hint/header rows painting over each other in
+    // a pathologically tiny panel — a pre-existing cosmetic-only risk
+    // `sc_sidebar_bands`'s own `.max(0.0)` on `slab_h` already bounds,
+    // not a new crash surface this diff introduces.
     let area = if bands.hint.is_some() {
         Rect {
             x: area.x,
