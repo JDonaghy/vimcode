@@ -3508,118 +3508,137 @@ impl App {
                     .render(backend, body_rect);
             }
             PANEL_GIT => {
-                if let Some(ref sc) = screen.source_control {
-                    // Header row + commit-input box (#480). Previously
-                    // entirely unpainted under ShellApp — the only place
-                    // that ever drew them was the dead
-                    // `draw.rs::draw_source_control_panel` Cairo painter,
-                    // which has zero live callers (superseded by this
-                    // `render_content` path back when the 14 legacy DAs
-                    // were collapsed into one, #493). Paint them for
-                    // real now that quadraui#222 (TextInput) has landed,
-                    // through the same `render::sc_*` adapters TUI uses
-                    // so the two renderers can't drift.
-                    // Band geometry (header / commit box / slab) comes from
-                    // the shared `render::sc_sidebar_bands` so the click
-                    // router in `try_route_sidebar_mouse_event` resolves a
-                    // press against the *same* derivation that painted it
-                    // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
-                    // border top+bottom — GTK's native unit is pixels,
-                    // unlike TUI's whole-cell border (see
-                    // `render::sc_commit_input_box_height` doc).
-                    let bands = render::sc_sidebar_bands(
-                        &sc.commit_message,
-                        q_sb,
-                        lh as f32,
-                        SC_COMMIT_BORDER_PX,
-                        sc.has_focus,
-                    );
-                    self.cached_sc_bands.set(Some(bands));
-                    let header_bar = render::sc_header_status_bar(sc, theme);
-                    let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
-
-                    let ti = render::sc_commit_message_to_text_input(sc);
-                    backend.draw_text_input(bands.commit_input, &ti);
-
-                    // Render the toolbar-slab + section list below the
-                    // header + commit input.
-                    let slab_rect = bands.slab;
-                    render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
-                    // Focused-hint row (#1361): shared with TUI through
-                    // `render::sc_hint_status_bar`, painted only when
-                    // `ScSidebarBands::hint` was reserved (i.e. the panel
-                    // has focus) so it can't show unreserved space.
-                    if let Some(hint_rect) = bands.hint {
-                        let hint_bar = render::sc_hint_status_bar(theme);
-                        let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
-                    }
-                    let body_rect = engine
-                        .sc_panel_layout
-                        .borrow()
-                        .as_ref()
-                        .map(|l| l.content_bounds)
-                        .unwrap_or(slab_rect);
-                    engine.sc_sidebar_body_rect.set(body_rect);
-                    // #971: without this, `sc_sidebar_system.handle_cached`
-                    // returns `Ignored` unconditionally and every
-                    // content-row press (header collapse, row select) is a
-                    // silent no-op — see `render::gui_sidebar_system_metrics`'s
-                    // own doc for the full story. Reads `backend.line_height()`
-                    // directly — not the `lh` parameter above, whose
-                    // `self.cached_line_height.max(backend.line_height())`
-                    // derivation (`render_content`'s own top) can lag behind
-                    // what `backend` reports by the time `render()` a few
-                    // lines down actually reads it — so the metrics
-                    // `handle_cached` hit-tests against can never disagree
-                    // with what this exact `render()` call paints.
-                    let sc_lh = backend.line_height();
-                    engine
-                        .sc_sidebar_system
-                        .borrow_mut()
-                        .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
-                    render::populate_sc_sidebar_system(engine, theme);
-                    engine.sc_sidebar_system.borrow().render(backend, body_rect);
-
-                    // Branch picker / create popup (dual-mode Palette,
-                    // quadraui#224) and help dialog (Dialog + DialogTable,
-                    // quadraui#225) — both keyboard-reachable via
-                    // `dispatch_sc_sidebar_key_unified` even though the
-                    // git sidebar has no live mouse-click routing yet
-                    // (#449 tracks that separately). Render over the
-                    // whole sidebar content area, same popup-over-panel
-                    // z-order TUI uses.
-                    if let Some(ref bp) = sc.branch_picker {
-                        let palette = render::sc_branch_picker_to_palette(bp);
-                        let popup_w = q_sb.width.min(40.0 * cw as f32);
-                        let popup_h = if bp.create_mode {
-                            4.0 * lh as f32
-                        } else {
-                            (q_sb.height * 0.6).min(15.0 * lh as f32)
-                        };
-                        let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
-                        let popup_y = q_sb.y + 2.0 * lh as f32;
-                        backend.draw_palette(
-                            quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
-                            &palette,
+                // #1390: composed through `SidebarPanelBody::render_with`
+                // (quadraui#1059, the composer the `PANEL_EXPLORER` arm
+                // uses, #1389) instead of operating on `q_sb` directly with
+                // no wrapper. `chrome: SidebarPanelChrome::None` — the
+                // shell's own sidebar header already titles this panel
+                // "SOURCE CONTROL", so `sc_header_status_bar`'s row below
+                // (live branch/ahead-behind) is body content, not a second
+                // title (#1256's double-header bug). `None` chrome reserves
+                // no rows, so `body_rect` is pixel-identical to `q_sb` —
+                // shadow `q_sb` with it below rather than threading a second
+                // name through every band/popup rect in this arm.
+                let panel = render::SidebarPanelBody {
+                    background: None,
+                    chrome: render::SidebarPanelChrome::None,
+                    scrollbar_gutter: None,
+                };
+                panel.render_with(backend, q_sb, |backend, body_rect| {
+                    let q_sb = body_rect;
+                    if let Some(ref sc) = screen.source_control {
+                        // Header row + commit-input box (#480). Previously
+                        // entirely unpainted under ShellApp — the only place
+                        // that ever drew them was the dead
+                        // `draw.rs::draw_source_control_panel` Cairo painter,
+                        // which has zero live callers (superseded by this
+                        // `render_content` path back when the 14 legacy DAs
+                        // were collapsed into one, #493). Paint them for
+                        // real now that quadraui#222 (TextInput) has landed,
+                        // through the same `render::sc_*` adapters TUI uses
+                        // so the two renderers can't drift.
+                        // Band geometry (header / commit box / slab) comes from
+                        // the shared `render::sc_sidebar_bands` so the click
+                        // router in `try_route_sidebar_mouse_event` resolves a
+                        // press against the *same* derivation that painted it
+                        // (#544). `SC_COMMIT_BORDER_PX` is the primitive's 1px
+                        // border top+bottom — GTK's native unit is pixels,
+                        // unlike TUI's whole-cell border (see
+                        // `render::sc_commit_input_box_height` doc).
+                        let bands = render::sc_sidebar_bands(
+                            &sc.commit_message,
+                            q_sb,
+                            lh as f32,
+                            SC_COMMIT_BORDER_PX,
+                            sc.has_focus,
                         );
-                    }
+                        self.cached_sc_bands.set(Some(bands));
+                        let header_bar = render::sc_header_status_bar(sc, theme);
+                        let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
 
-                    if sc.help_open {
-                        let viewport = q_sb;
-                        let (dialog, dlayout) =
-                            render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
-                        backend.draw_dialog(&dialog, &dlayout);
+                        let ti = render::sc_commit_message_to_text_input(sc);
+                        backend.draw_text_input(bands.commit_input, &ti);
+
+                        // Render the toolbar-slab + section list below the
+                        // header + commit input.
+                        let slab_rect = bands.slab;
+                        render::draw_sc_sidebar_panel(backend, engine, sc, slab_rect);
+                        // Focused-hint row (#1361): shared with TUI through
+                        // `render::sc_hint_status_bar`, painted only when
+                        // `ScSidebarBands::hint` was reserved (i.e. the panel
+                        // has focus) so it can't show unreserved space.
+                        if let Some(hint_rect) = bands.hint {
+                            let hint_bar = render::sc_hint_status_bar(theme);
+                            let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+                        }
+                        let body_rect = engine
+                            .sc_panel_layout
+                            .borrow()
+                            .as_ref()
+                            .map(|l| l.content_bounds)
+                            .unwrap_or(slab_rect);
+                        engine.sc_sidebar_body_rect.set(body_rect);
+                        // #971: without this, `sc_sidebar_system.handle_cached`
+                        // returns `Ignored` unconditionally and every
+                        // content-row press (header collapse, row select) is a
+                        // silent no-op — see `render::gui_sidebar_system_metrics`'s
+                        // own doc for the full story. Reads `backend.line_height()`
+                        // directly — not the `lh` parameter above, whose
+                        // `self.cached_line_height.max(backend.line_height())`
+                        // derivation (`render_content`'s own top) can lag behind
+                        // what `backend` reports by the time `render()` a few
+                        // lines down actually reads it — so the metrics
+                        // `handle_cached` hit-tests against can never disagree
+                        // with what this exact `render()` call paints.
+                        let sc_lh = backend.line_height();
+                        engine
+                            .sc_sidebar_system
+                            .borrow_mut()
+                            .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
+                        render::populate_sc_sidebar_system(engine, theme);
+                        engine.sc_sidebar_system.borrow().render(backend, body_rect);
+
+                        // Branch picker / create popup (dual-mode Palette,
+                        // quadraui#224) and help dialog (Dialog + DialogTable,
+                        // quadraui#225) — both keyboard-reachable via
+                        // `dispatch_sc_sidebar_key_unified` even though the
+                        // git sidebar has no live mouse-click routing yet
+                        // (#449 tracks that separately). Render over the
+                        // whole sidebar content area, same popup-over-panel
+                        // z-order TUI uses.
+                        if let Some(ref bp) = sc.branch_picker {
+                            let palette = render::sc_branch_picker_to_palette(bp);
+                            let popup_w = q_sb.width.min(40.0 * cw as f32);
+                            let popup_h = if bp.create_mode {
+                                4.0 * lh as f32
+                            } else {
+                                (q_sb.height * 0.6).min(15.0 * lh as f32)
+                            };
+                            let popup_x = q_sb.x + (q_sb.width - popup_w) / 2.0;
+                            let popup_y = q_sb.y + 2.0 * lh as f32;
+                            backend.draw_palette(
+                                quadraui::Rect::new(popup_x, popup_y, popup_w, popup_h),
+                                &palette,
+                            );
+                        }
+
+                        if sc.help_open {
+                            let viewport = q_sb;
+                            let (dialog, dlayout) =
+                                render::sc_help_dialog_layout(viewport, cw as f32, lh as f32);
+                            backend.draw_dialog(&dialog, &dlayout);
+                        }
+                    } else {
+                        // Git panel is the active tab but there's no repo open
+                        // (e.g. the user closed it, or switched to a non-git
+                        // folder, without also switching sidebar tabs) — nothing
+                        // paints this frame. Clear the cached band geometry so a
+                        // stray click doesn't get resolved against stale
+                        // coordinates from the last time a repo *was* open
+                        // (`route_sc_sidebar_event` reads this cache directly).
+                        self.cached_sc_bands.set(None);
                     }
-                } else {
-                    // Git panel is the active tab but there's no repo open
-                    // (e.g. the user closed it, or switched to a non-git
-                    // folder, without also switching sidebar tabs) — nothing
-                    // paints this frame. Clear the cached band geometry so a
-                    // stray click doesn't get resolved against stale
-                    // coordinates from the last time a repo *was* open
-                    // (`route_sc_sidebar_event` reads this cache directly).
-                    self.cached_sc_bands.set(None);
-                }
+                });
             }
             PANEL_EXTENSIONS => {
                 // #1343: the shell's own `AppShell` sidebar header already
