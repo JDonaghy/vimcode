@@ -20,6 +20,18 @@ pub struct ToolDocumentBinding {
     pub write_follow_up: Vec<String>,
 }
 
+/// Binds a scratch buffer to a review-verdict-in-progress (#526): the
+/// reviewed card's id plus the provider's declared verdict-command argv
+/// template (still carrying its `{id}`/`{body_file}` tokens, substituted
+/// at save time) — same "capture at open time so `:w` doesn't need to
+/// re-resolve a provider that may have been reconfigured since" precedent
+/// as [`ToolDocumentBinding`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewVerdictBinding {
+    pub card_id: String,
+    pub verdict_command: Vec<String>,
+}
+
 /// Upper bound on line count for tree-sitter highlighting.
 ///
 /// Buffers with more lines than this skip the expensive `Syntax::parse()` call
@@ -628,6 +640,12 @@ pub struct BufferState {
     /// provider's write command instead of writing to disk. `None` for
     /// every ordinary buffer.
     pub tool_document: Option<ToolDocumentBinding>,
+    /// Set when this buffer is composing a review verdict body (#526) —
+    /// `:w` reports the verdict through the bound provider's verdict
+    /// command instead of writing to disk. `None` for every ordinary
+    /// buffer (including a `tool_document` one; the two are mutually
+    /// exclusive).
+    pub review_verdict: Option<ReviewVerdictBinding>,
     /// Override display name without brackets (e.g. for diff tabs).
     pub diff_label: Option<String>,
     /// Last-known modification time of the file on disk.
@@ -688,6 +706,7 @@ impl BufferState {
             cmdline_is_search: false,
             scratch_name: None,
             tool_document: None,
+            review_verdict: None,
             diff_label: None,
             file_mtime: None,
             file_change_warned: false,
@@ -735,6 +754,7 @@ impl BufferState {
             cmdline_is_search: false,
             scratch_name: None,
             tool_document: None,
+            review_verdict: None,
             diff_label: None,
             file_mtime,
             file_change_warned: false,

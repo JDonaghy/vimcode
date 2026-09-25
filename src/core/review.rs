@@ -41,6 +41,36 @@ pub enum ChangeDecision {
     Rejected,
 }
 
+/// A verdict on the review as a whole, reported through a provider-declared
+/// command (#526) — distinct from [`ChangeDecision`], which is per-file
+/// accept/reject within the diff surface itself. Generic vocabulary: these
+/// are universal code-review terms (GitHub, GitLab, Gerrit all use them),
+/// not any specific pipeline tool's — `src/core/` and `src/render.rs` must
+/// name no coordinator-specific verdict wording (checked by a dedicated
+/// repo-root test).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewVerdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl ReviewVerdict {
+    /// The stable string this verdict is keyed by — both the key a
+    /// provider's manifest uses in
+    /// `crate::core::extensions::BoardProviderConfig::verdict_commands`,
+    /// and the token substituted for the literal `{verdict}` in a resolved
+    /// argv (`BoardProviderConfig::verdict_argv`), matching the `{id}`/
+    /// `{body_file}` substitution convention the same method uses.
+    pub fn token(self) -> &'static str {
+        match self {
+            ReviewVerdict::Approve => "approve",
+            ReviewVerdict::RequestChanges => "request-changes",
+            ReviewVerdict::Comment => "comment",
+        }
+    }
+}
+
 /// Build a single hunk where every line of `text` is a pure `Added` row
 /// (`left: None`) — the "new file" branch of [`ChangeReviewEntry::new`].
 /// A single trailing empty element from `text.split('\n')` (the normal
@@ -271,6 +301,13 @@ impl ChangeReviewState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_verdict_tokens_are_stable_and_distinct() {
+        assert_eq!(ReviewVerdict::Approve.token(), "approve");
+        assert_eq!(ReviewVerdict::RequestChanges.token(), "request-changes");
+        assert_eq!(ReviewVerdict::Comment.token(), "comment");
+    }
 
     fn change(path: &str, old: Option<&str>, new: &str) -> ProposedChange {
         ProposedChange {

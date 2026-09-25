@@ -218,7 +218,14 @@ impl Engine {
             };
         if let Err(e) = self.open_branch_review(target) {
             self.message = format!("Board: {e}");
+            return;
         }
+        // `open_branch_review` -> `open_change_review` already reset
+        // `review_card_id` to `None`; set it back now that the surface it
+        // opened really is for this card, so a later verdict
+        // (`Engine::start_review_verdict`, #526) knows which one to report
+        // against.
+        self.review_card_id = Some(id.as_str().to_string());
     }
 
     /// Keyboard dispatch for the Board panel — the
@@ -316,6 +323,7 @@ mod tests {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
             actions: Default::default(),
+            ..Default::default()
         });
         engine
             .extension_state
@@ -372,6 +380,7 @@ mod tests {
             refresh_command: vec!["mock-provider".to_string()],
             poll_interval_secs: 30,
             actions: Default::default(),
+            ..Default::default()
         });
         engine
             .extension_state

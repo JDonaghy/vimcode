@@ -76,6 +76,60 @@ git plumbing this issue adds — commit/push/branch-refusal — is exactly as
 generic as the `:G*` commands it's modelled on, no coordinator vocabulary
 anywhere in `src/core/` or `src/render.rs`).
 
+**Last updated:** September 24, 2026 (#526, Track A Phase 2 — review verdict
+round-trip through a provider command). Closes the loop #525 opened: from an
+open change-review surface, `A`/`C`/`M` report Approve/Request-changes/
+Comment-only verdicts through a provider-declared command, with **no
+coordinator vocabulary anywhere in `src/core/`** —
+`tests/no_coord_vocabulary_in_core.rs` still passes.
+`src/core/extensions.rs`'s `BoardProviderConfig` gained
+`verdict_commands: HashMap<String, Vec<String>>` (keyed by the new
+`crate::core::review::ReviewVerdict::token()` — `"approve"`/
+`"request-changes"`/`"comment"`, generic code-review vocabulary, not any
+specific pipeline tool's) plus `verdict_argv`, substituting `{id}` *and*
+`{body_file}` — the body is **never** inline, matching `DocumentProviderConfig
+::write_command`'s existing stdin-not-argv precedent for the same "review
+bodies contain newlines/code fences/quotes" reason. New
+`crate::core::tool_client::write_review_body_temp_file` writes the composed
+body to a fresh temp file before the provider command runs, so a failing
+command still leaves the body on disk *and* untouched in the still-open
+buffer — `save_review_verdict_buffer`'s own tests exercise exactly that
+"a failed verdict command preserves the composed body" acceptance bar.
+Composing a verdict reuses #524's own "open a real markdown scratch buffer,
+`:w` pushes it through a provider command" shape verbatim (new
+`crate::core::buffer_manager::ReviewVerdictBinding`, new
+`src/core/engine/review_verdict_ops.rs` mirroring `document_ops.rs`
+structurally) rather than a bespoke text-input widget — the same vim editing
+(undo, search, paste) authoring an issue already gets is now available for
+composing a review. New `Engine::review_card_id` tracks which board card
+(if any) the currently-open `change_review` surface was opened for — always
+reset to `None` inside `open_change_review` and set back by
+`Engine::open_review_card` (`board_ops.rs`) right after a successful
+`open_branch_review`, so an ACP tool-call diff never inherits a stale id
+from an earlier board review and has nothing to report a verdict against.
+New keys on the change-review surface (`handle_change_review_key`,
+`review_ops.rs`): `A` (Approve), `C` (Request changes), `M` (Comment-only) —
+each hands off to `Engine::start_review_verdict`, which closes the diff
+surface and opens the composer buffer; a verdict with no reviewed card
+behind the surface, no board provider configured, or no command declared
+for that verdict degrades to a status message rather than a panic, the same
+precedent `board_ops.rs`'s `open_review_card` already set for #525. Driver
+coverage: `change_review_shift_a_paints_a_verdict_composer_tab_via_shell_app`
+in `src/tui_main/shell_app.rs` (`#[cfg(test)]`, `TuiDriver` via
+`driver_with_shell`) drives the real `A` keypress against a mock `[board]`
+provider's `verdict_commands`, asserting on the *rendered* screen (the diff
+content disappearing, the new tab's name painting) — RED-verified by
+temporarily disabling the `'A'` match arm and confirming the test failed,
+then restored. No GTK-specific driver test: the whole feature is core key
+handling + the same generic scratch-buffer/tab rendering `document_ops.rs`'s
+buffers already exercise on GTK, zero backend-specific code added or
+changed (mirrors #525's own review-accepted precedent of a TUI-only driver
+test for its analogous `OpenReview`-key coverage). `cargo build`/
+`clippy -D warnings`/`fmt` clean on both feature lanes; `review_ops::`/
+`review_verdict_ops::`/`board_ops::`/`document_ops::`/`extensions::`/
+`tool_client::`/`buffer_manager::`/the new shell_app driver test/
+`no_coord_vocabulary_in_core` all pass.
+
 **Last updated:** September 24, 2026 (#525 review fixes, iteration 1).
 Addressed the review's blocking + non-blocking findings on top of the
 Track A Phase 2 work below:

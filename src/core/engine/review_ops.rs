@@ -36,6 +36,12 @@ impl Engine {
             return;
         }
         self.change_review = Some(crate::core::review::ChangeReviewState::new(changes));
+        // Always reset first — only `Engine::open_review_card` (board_ops.rs,
+        // #526) knows the reviewed card's id and sets it back afterward. An
+        // ACP tool-call diff (or a direct `open_branch_review` call with no
+        // board card behind it) must never inherit a stale id left over
+        // from an earlier board review.
+        self.review_card_id = None;
     }
 
     /// Build a source-agnostic change list from a local git branch diff
@@ -203,6 +209,17 @@ impl Engine {
     /// | `p`         | Previous file                              |
     /// | `a`         | Accept the current file's change           |
     /// | `r`         | Reject the current file's change           |
+    /// | `A`         | Approve — report a verdict (#526)          |
+    /// | `C`         | Request changes — report a verdict (#526)  |
+    /// | `M`         | Comment-only — report a verdict (#526)     |
+    ///
+    /// The three verdict keys hand off to
+    /// [`Self::start_review_verdict`], which closes this surface and opens
+    /// a body-composer buffer — see `review_verdict_ops.rs`'s module doc.
+    /// A key with no provider-configured command for that verdict (or no
+    /// reviewed card behind this surface at all — an ACP tool-call diff,
+    /// say) degrades to a status message rather than doing nothing
+    /// silently.
     pub(crate) fn handle_change_review_key(
         &mut self,
         key_name: &str,
@@ -277,6 +294,11 @@ impl Engine {
             }
             Some('a') => self.change_review_accept_current(),
             Some('r') => self.change_review_reject_current(),
+            Some('A') => self.start_review_verdict(crate::core::review::ReviewVerdict::Approve),
+            Some('C') => {
+                self.start_review_verdict(crate::core::review::ReviewVerdict::RequestChanges)
+            }
+            Some('M') => self.start_review_verdict(crate::core::review::ReviewVerdict::Comment),
             _ => {}
         }
         true
@@ -955,5 +977,82 @@ mod tests {
         let (path, line) = row_to_location(entry, 1).expect("row 1 is a real row");
         assert_eq!(path, "f.rs");
         assert_eq!(line, 2);
+    }
+
+    // ── verdict keys (#526) ──────────────────────────────────────────────
+
+    fn install_mock_provider_with_approve_verdict(engine: &mut Engine) {
+        use crate::core::extensions::{BoardProviderConfig, ExtensionManifest};
+        let mut manifest = ExtensionManifest {
+            name: "mock-board".to_string(),
+            ..Default::default()
+        };
+        let mut verdict_commands = std::collections::HashMap::new();
+        verdict_commands.insert(
+            "approve".to_string(),
+            vec![
+                "mock".to_string(),
+                "verdict".to_string(),
+                "{id}".to_string(),
+            ],
+        );
+        manifest.board = Some(BoardProviderConfig {
+            refresh_command: vec!["mock-provider".to_string()],
+            poll_interval_secs: 30,
+            actions: Default::default(),
+            verdict_commands,
+        });
+        engine
+            .extension_state
+            .installed
+            .push(crate::core::session::InstalledExtension {
+                name: manifest.name.clone(),
+                version: String::new(),
+            });
+        engine.ext_registry = Some(vec![manifest]);
+    }
+
+    /// `A` while the surface is open closes it (same as Esc) and opens a
+    /// verdict-composer buffer bound to the reviewed card — the
+    /// keyboard-reachable path into #526's verdict flow.
+    #[test]
+    fn shift_a_closes_the_surface_and_opens_a_verdict_composer() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_approve_verdict(&mut engine);
+        engine.open_change_review(vec![change("f.rs", Some("a"), "b")]);
+        engine.review_card_id = Some("card:9".to_string());
+
+        assert!(engine.handle_change_review_key("", Some('A')));
+
+        assert!(
+            engine.change_review.is_none(),
+            "A must close the diff surface, same as Esc"
+        );
+        let binding = engine
+            .active_buffer_state()
+            .review_verdict
+            .as_ref()
+            .expect("A must open a verdict composer buffer");
+        assert_eq!(binding.card_id, "card:9");
+    }
+
+    /// With no reviewed card behind the surface (an ACP tool-call diff,
+    /// which `open_change_review` never binds a `review_card_id` for), `A`
+    /// degrades to a status message rather than opening a composer for a
+    /// card that doesn't exist.
+    #[test]
+    fn shift_a_with_no_reviewed_card_leaves_the_surface_open_with_a_message() {
+        let mut engine = Engine::new_for_test();
+        install_mock_provider_with_approve_verdict(&mut engine);
+        engine.open_change_review(vec![change("f.rs", Some("a"), "b")]);
+        assert!(engine.review_card_id.is_none());
+
+        assert!(engine.handle_change_review_key("", Some('A')));
+
+        assert!(
+            engine.change_review.is_some(),
+            "no card to report against — the diff surface must stay open"
+        );
+        assert!(engine.message.contains("no card to report"));
     }
 }
