@@ -34,6 +34,7 @@
 //! pattern wraps, kept separate so it stays trivially mockable.
 
 use crate::core::git::hidden_command;
+use serde::{Deserialize, Serialize};
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
 
@@ -101,6 +102,22 @@ pub trait ToolClient: Send + Sync {
     /// parse it as JSON. **Blocking** — see the module doc for the
     /// threading contract callers are expected to follow.
     fn run_json(&self, argv: &[String]) -> Result<serde_json::Value, ToolError>;
+
+    /// Run `argv[0]` with `argv[1..]` as arguments, writing `stdin` to the
+    /// process's stdin and discarding its stdout. `Ok(())` on a zero exit,
+    /// a typed error otherwise. **Blocking**, same contract as
+    /// [`Self::run_json`]. Used for provider commands that *consume* a
+    /// payload rather than emit one — [`push_tool_document`] (#524) is the
+    /// first caller.
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError>;
+
+    /// Run `argv` with no stdin and discard stdout — a fire-and-forget
+    /// command where only success/failure matters (e.g. a provider's
+    /// declared follow-up command after a write). Default impl in terms of
+    /// [`Self::run_with_stdin`]; implementors don't need to override it.
+    fn run(&self, argv: &[String]) -> Result<(), ToolError> {
+        self.run_with_stdin(argv, &[])
+    }
 }
 
 /// Real [`ToolClient`] impl: spawns an actual OS subprocess.
@@ -129,6 +146,49 @@ impl ToolClient for SubprocessToolClient {
 
         serde_json::from_slice(&output.stdout).map_err(|e| ToolError::InvalidJson(e.to_string()))
     }
+
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError> {
+        let (program, args) = argv.split_first().ok_or(ToolError::EmptyCommand)?;
+
+        let mut cmd = hidden_command(program);
+        let mut child = cmd
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ToolError::BinaryNotFound(program.clone())
+                } else {
+                    ToolError::Spawn(e.to_string())
+                }
+            })?;
+
+        if let Some(mut child_stdin) = child.stdin.take() {
+            use std::io::Write;
+            // A provider that exits without reading stdin (or a pipe that
+            // fills before the process drains it) makes this write fail —
+            // treat that the same as any other spawn-time failure rather
+            // than panicking.
+            if let Err(e) = child_stdin.write_all(stdin) {
+                return Err(ToolError::Spawn(e.to_string()));
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| ToolError::Spawn(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(ToolError::NonZeroExit {
+                code: output.status.code(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 /// Test/mock [`ToolClient`]: returns a canned result without spawning
@@ -141,6 +201,106 @@ impl ToolClient for MockToolClient {
     fn run_json(&self, _argv: &[String]) -> Result<serde_json::Value, ToolError> {
         self.0.clone()
     }
+
+    fn run_with_stdin(&self, _argv: &[String], _stdin: &[u8]) -> Result<(), ToolError> {
+        self.0.clone().map(|_| ())
+    }
+}
+
+/// Test [`ToolClient`] that records the argv (and stdin, if any) of every
+/// call it receives, in order, so a test can assert *what* was sent to a
+/// provider — not just that something succeeded. Every call succeeds
+/// (`run_json` returns `null`). Used by #524's push/follow-up tests to
+/// verify the write command gets the right title/body payload and the
+/// follow-up command gets the right id.
+#[derive(Debug, Clone, Default)]
+pub struct RecordingToolClient {
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<RecordedCall>>>,
+}
+
+/// One recorded [`RecordingToolClient`] invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedCall {
+    pub argv: Vec<String>,
+    /// `Some` for a [`ToolClient::run_with_stdin`]/[`ToolClient::run`]
+    /// call, `None` for a [`ToolClient::run_json`] call.
+    pub stdin: Option<Vec<u8>>,
+}
+
+impl RecordingToolClient {
+    /// Snapshot of every call recorded so far, in order.
+    pub fn calls(&self) -> Vec<RecordedCall> {
+        self.calls.lock().expect("recording client mutex").clone()
+    }
+}
+
+impl ToolClient for RecordingToolClient {
+    fn run_json(&self, argv: &[String]) -> Result<serde_json::Value, ToolError> {
+        self.calls
+            .lock()
+            .expect("recording client mutex")
+            .push(RecordedCall {
+                argv: argv.to_vec(),
+                stdin: None,
+            });
+        Ok(serde_json::Value::Null)
+    }
+
+    fn run_with_stdin(&self, argv: &[String], stdin: &[u8]) -> Result<(), ToolError> {
+        self.calls
+            .lock()
+            .expect("recording client mutex")
+            .push(RecordedCall {
+                argv: argv.to_vec(),
+                stdin: Some(stdin.to_vec()),
+            });
+        Ok(())
+    }
+}
+
+// ─── The document contract (#524) ──────────────────────────────────────────
+
+/// vimcode's generic document contract: a provider's read command emits
+/// this shape on stdout to seed an editable markdown buffer; the write
+/// command receives the (title, body) pair back on stdin as this same
+/// shape's `title`/`body` fields. `labels`/`status` are read-only context
+/// shown in the buffer's metadata header — never sent back on `:w`, since
+/// editing them is lifecycle-specific and belongs to whatever bundle
+/// declared the provider, not this generic seam (see the module doc).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolDocument {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Run `argv` via `client` and parse the result as a [`ToolDocument`] —
+/// the read half of #524's buffer-authoring seam.
+pub fn fetch_tool_document(
+    client: &dyn ToolClient,
+    argv: &[String],
+) -> Result<ToolDocument, ToolError> {
+    let value = client.run_json(argv)?;
+    serde_json::from_value(value).map_err(|e| ToolError::InvalidJson(e.to_string()))
+}
+
+/// Run `argv` via `client`, feeding it `{"title": title, "body": body}` on
+/// stdin — the write half of #524's buffer-authoring seam. Success is a
+/// zero exit; the provider's own stdout (if any) is not parsed here.
+pub fn push_tool_document(
+    client: &dyn ToolClient,
+    argv: &[String],
+    title: &str,
+    body: &str,
+) -> Result<(), ToolError> {
+    let payload = serde_json::json!({ "title": title, "body": body });
+    let stdin = serde_json::to_vec(&payload).map_err(|e| ToolError::InvalidJson(e.to_string()))?;
+    client.run_with_stdin(argv, &stdin)
 }
 
 // ─── The board contract ─────────────────────────────────────────────────────
@@ -280,5 +440,111 @@ mod tests {
             stderr: "boom".to_string(),
         };
         assert!(err.user_message().contains("boom"));
+    }
+
+    // ─── #524: the document contract ───────────────────────────────────────
+
+    #[test]
+    fn mock_client_fetch_tool_document_parses_fixture() {
+        let client = MockToolClient(Ok(serde_json::json!({
+            "title": "Briefing readability",
+            "body": "Some prose.\n\n```rust\nfn f() {}\n```\n",
+            "labels": ["docs"],
+            "status": "refining",
+        })));
+        let doc = fetch_tool_document(&client, &["whatever".to_string()])
+            .expect("fixture should parse into ToolDocument");
+        assert_eq!(doc.title, "Briefing readability");
+        assert!(doc.body.contains("```rust"));
+        assert_eq!(doc.labels, vec!["docs".to_string()]);
+        assert_eq!(doc.status.as_deref(), Some("refining"));
+    }
+
+    #[test]
+    fn tool_document_missing_fields_default_rather_than_error() {
+        // A provider that only emits `body` (or nothing at all) shouldn't
+        // fail to parse — every field defaults.
+        let client = MockToolClient(Ok(serde_json::json!({})));
+        let doc = fetch_tool_document(&client, &["whatever".to_string()]).unwrap();
+        assert_eq!(doc, ToolDocument::default());
+    }
+
+    #[test]
+    fn push_tool_document_sends_title_and_body_on_stdin() {
+        let client = RecordingToolClient::default();
+        push_tool_document(
+            &client,
+            &[
+                "provider".to_string(),
+                "write".to_string(),
+                "42".to_string(),
+            ],
+            "My title",
+            "My body",
+        )
+        .expect("recording client always succeeds");
+
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv,
+            vec![
+                "provider".to_string(),
+                "write".to_string(),
+                "42".to_string()
+            ]
+        );
+        let sent: serde_json::Value =
+            serde_json::from_slice(calls[0].stdin.as_deref().expect("stdin was sent")).unwrap();
+        assert_eq!(sent["title"], "My title");
+        assert_eq!(sent["body"], "My body");
+    }
+
+    #[test]
+    fn push_tool_document_propagates_client_error() {
+        let client = MockToolClient(Err(ToolError::NonZeroExit {
+            code: Some(1),
+            stderr: "rejected".to_string(),
+        }));
+        let err = push_tool_document(&client, &["provider".to_string()], "t", "b").unwrap_err();
+        assert!(matches!(err, ToolError::NonZeroExit { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_client_run_with_stdin_round_trips_through_cat() {
+        // `cat` echoes stdin to stdout; a real subprocess proves the pipe
+        // actually carries the payload, not just that the argv was built.
+        let client = SubprocessToolClient;
+        client
+            .run_with_stdin(&["cat".to_string()], b"hello")
+            .expect("cat should exit zero");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_client_run_with_stdin_nonzero_exit_is_typed_error() {
+        let client = SubprocessToolClient;
+        let (shell, flag) = crate::core::terminal::shell_command();
+        let argv = vec![shell, flag, "cat >/dev/null; exit 7".to_string()];
+        match client.run_with_stdin(&argv, b"ignored").unwrap_err() {
+            ToolError::NonZeroExit { code, .. } => assert_eq!(code, Some(7)),
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recording_client_run_records_no_stdin_call() {
+        let client = RecordingToolClient::default();
+        client
+            .run(&["follow-up".to_string(), "42".to_string()])
+            .unwrap();
+        let calls = client.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].argv,
+            vec!["follow-up".to_string(), "42".to_string()]
+        );
+        assert_eq!(calls[0].stdin, Some(Vec::new()));
     }
 }

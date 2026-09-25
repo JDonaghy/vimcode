@@ -1,5 +1,64 @@
 # VimCode Project State
 
+**Last updated:** September 24, 2026 (#524, Track A Phase 1 — provider
+document buffers, on top of #521/#522's generic Board host). Author/refine
+a provider's documents (e.g. a GitHub issue) as real markdown buffers,
+push edits back on `:w`, with **no coordinator vocabulary anywhere in
+`src/core/`** — `tests/no_coord_vocabulary_in_core.rs` still passes.
+`src/core/extensions.rs` gained `ExtensionManifest::document:
+Option<DocumentProviderConfig>` — `read_command`/`write_command`/
+`write_follow_up` argv templates (same `{id}` substitution convention as
+`BoardProviderConfig::actions`), with `write_command` doing double duty as
+"create" when `{id}` substitutes to the empty string (the new-document
+flow — no separate create command). `src/core/tool_client.rs` (#522's
+seam) grew a second half: `ToolClient::run_with_stdin`/`run` (a payload
+*into* the process, discarding stdout — `push_tool_document` feeds
+`{"title", "body"}` JSON on stdin; `run` is the fire-and-forget follow-up
+call), `ToolDocument{title, body, labels, status}` (the read contract,
+mirroring `BoardModel`'s role for the Board panel), and
+`RecordingToolClient` (a test client that logs every argv+stdin it was
+asked to run, so a test can assert *what* was pushed, not just that
+something succeeded — `MockToolClient` alone can't do that since it only
+returns a canned result). New `src/core/engine/document_ops.rs`:
+`Engine::document_provider()` (mirrors `board_provider()`),
+`open_tool_document(id)` (blocking — a deliberate one-shot action, unlike
+the Board panel's background poll) opens a scratch buffer whose text is
+`# <title>\n\n<body>`, preceded by a read-only `<!-- status: ... labels:
+... -->` comment when the provider supplied either (labels/status are
+shown, never parsed back — editing them is lifecycle-specific, the
+bundle's job, not this generic seam's), `new_tool_document()` for the
+blank-buffer flow, and `save_tool_document_buffer()` (wired into
+`Engine::save()` ahead of the on-disk path, same slot as the keymaps/
+registries scratch buffers) which pushes title/body then the
+`write_follow_up` command — but only when the document already had an id;
+the create path has nothing to transition from. `BufferState` gained
+`tool_document: Option<ToolDocumentBinding>` (id + the write/follow-up
+argv captured at open time, so `:w` doesn't need to re-resolve a provider
+that may have changed) — `file_path` stays `None` throughout, so a
+document buffer is never written to disk. `board_ops.rs`'s
+`BoardAction::OpenIssue` now opens the card as a document buffer when a
+`[document]` provider is configured (falls back to Phase 0's status-line
+echo otherwise) — the "from a board card" half of the issue's scope; the
+"provider-declared command" half (`:CoordRefine 42` naming a specific
+command) is explicitly the coordinator bundle's job, not built here.
+Tests: unit coverage in all four touched modules, including an explicit
+"round-trips through a mock provider" test asserting the exact argv+JSON
+payload sent to `write_command` and `write_follow_up` via
+`RecordingToolClient`, a new-document-flow test asserting the empty-`{id}`
+substitution and no follow-up call, and a `board_ops.rs` test proving
+`OpenIssue` actually opens a buffer (not just a state flag) when a
+document provider is installed. No driver-tier (`TuiDriver`/`GtkDriver`)
+test — this reuses the existing generic buffer/tab/`:w` rendering path
+with no new paint or click surface (same precedent as the keymaps/
+registries scratch buffers, neither of which has one either); the
+scenario this issue's acceptance bar cares about (open → edit → `:w`
+round-trips through a mock provider) is exercised end-to-end at the
+engine level instead. `cargo build`/`clippy -D warnings`/`fmt` clean on
+both feature lanes. Out of scope (per the issue): the coordinator
+extension bundle itself (`:CoordRefine`/`:CoordReview` command names,
+`coord` argv, the `status:refining -> ready` semantics) and #523's
+provider-dispatch board actions.
+
 **Last updated:** September 24, 2026 (#955, ACP-4 — tool-call rendering
 plus a source-agnostic change-review surface, on top of ACP-1's #952
 transport; shares its review surface with the future #525 git-branch-diff
