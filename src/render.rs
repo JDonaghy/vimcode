@@ -18598,7 +18598,7 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
     }
 }
 
-// ─── Sidebar-panel-body composition (quadraui#1041, vimcode#1242) ─────────
+// ─── Sidebar-panel-body composition (quadraui#1041/#1059, vimcode#1389) ────
 //
 // `quadraui::compose::sidebar_panel_body::SidebarPanelBody` composes
 // "background fill, optional header/search chrome, body, optional
@@ -18609,52 +18609,19 @@ pub fn ext_panel_to_tree_view(panel: &ExtPanelData, theme: &Theme) -> quadraui::
 // bodies (`TreeController`/`FormController`, `Rc<RefCell<_>>`-backed on
 // the `!Send` `Engine`) can't satisfy: they're mutated in place by
 // `populate_*` and read back through a live `&Engine` borrow, never
-// rebuilt as an owned value. [`paint_sidebar_panel_chrome`] is `render()`'s
-// background+chrome half, factored out so those callers still share the
-// primitive's layer order and row-slicing, painting their own body into
-// the returned [`SidebarPanelBodyLayout::body_rect`]. [`ExtPanelTreeBody`]
-// is the one rung with a genuinely owned per-frame body
-// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the real
-// `SidebarPanelBody::render` path directly.
+// rebuilt as an owned value. quadraui#1059 added `SidebarPanelBody::
+// render_with`, which takes the body as `impl FnOnce(&mut dyn Backend,
+// Rect)` instead — no `Send`/`'static` bound — so those callers now pass
+// their stateful body as a closure directly (`App::paint_sidebar_panel_rung`
+// PANEL_EXPLORER, `panels::render_explorer_sidebar_content`), instead of the
+// hand-copied `paint_sidebar_panel_chrome` background+chrome half #1242
+// needed before #1059 existed (deleted by #1389). [`ExtPanelTreeBody`] is
+// the one rung with a genuinely owned per-frame body
+// (`ext_panel_to_tree_view`'s fresh `TreeView`), so it uses the
+// `SidebarPanelBody::render` (`&dyn BackendWidget`) path directly.
 pub use quadraui::compose::sidebar_panel_body::{
     SidebarPanelBody, SidebarPanelBodyLayout, SidebarPanelChrome,
 };
-
-/// [`SidebarPanelBody::render`]'s background+chrome half, for hosts whose
-/// body can't be a `&dyn BackendWidget` — see the module note above.
-/// Returns the layout so the caller paints its own body into `body_rect`.
-pub fn paint_sidebar_panel_chrome(
-    backend: &mut dyn quadraui::Backend,
-    panel: &SidebarPanelBody,
-    rect: quadraui::Rect,
-) -> SidebarPanelBodyLayout {
-    let layout = panel.layout(rect, backend.line_height());
-    if let Some(bg) = panel.background {
-        backend.draw_solid_fill(rect, bg);
-    }
-    if let Some(chrome_rect) = layout.chrome_rect {
-        match &panel.chrome {
-            SidebarPanelChrome::None => {}
-            SidebarPanelChrome::Header(text) => {
-                backend.draw_settings_chrome(chrome_rect, text, "", "", false);
-            }
-            SidebarPanelChrome::HeaderAndSearch {
-                header,
-                query,
-                placeholder,
-                active,
-            } => {
-                backend.draw_settings_chrome(chrome_rect, header, query, placeholder, *active);
-            }
-            // quadraui#1061 (bump #1388) added `Search`/`StatusBars` to this
-            // `#[non_exhaustive]` enum. Neither is constructed by vimcode yet
-            // — adopting them is #1242/#1243's job, not this pin bump's — so
-            // this arm exists only to keep the match exhaustive.
-            _ => {}
-        }
-    }
-    layout
-}
 
 /// Paint a borderless, single-row search/filter strip for a sidebar panel
 /// whose header the shell's own `AppShell` already owns (#1343 — the #1258
@@ -18682,8 +18649,8 @@ pub fn paint_sidebar_panel_chrome(
 /// appended while `active`. Returns `rect` shrunk by one row
 /// (`Backend::line_height()`, clamped to `rect`'s own height) so the
 /// caller paints its body into the remainder — mirrors
-/// [`paint_sidebar_panel_chrome`]'s `SidebarPanelBodyLayout::body_rect`
-/// split, minus the header-reservation half this panel no longer needs.
+/// [`SidebarPanelBody`]'s `SidebarPanelBodyLayout::body_rect` split, minus
+/// the header-reservation half this panel no longer needs.
 pub fn paint_sidebar_search_row(
     backend: &mut dyn quadraui::Backend,
     rect: quadraui::Rect,
@@ -18730,11 +18697,12 @@ pub fn paint_sidebar_search_row(
 }
 
 /// Owned per-frame body for the plugin extension panel (`ext:<name>`) —
-/// unlike the stateful controllers [`paint_sidebar_panel_chrome`] exists
-/// for, [`ext_panel_to_tree_view`]'s output is already a fresh, owned
-/// `quadraui::TreeView`, so it satisfies `BackendWidget: Send + 'static`.
-/// Public field so a caller can read the `TreeView` back out after the
-/// borrow ends (e.g. to feed `Backend::tree_layout`).
+/// unlike the stateful controllers `SidebarPanelBody::render_with` exists
+/// for (the module note above), [`ext_panel_to_tree_view`]'s output is
+/// already a fresh, owned `quadraui::TreeView`, so it satisfies
+/// `BackendWidget: Send + 'static`. Public field so a caller can read the
+/// `TreeView` back out after the borrow ends (e.g. to feed
+/// `Backend::tree_layout`).
 pub struct ExtPanelTreeBody(pub quadraui::TreeView);
 
 impl quadraui::BackendWidget for ExtPanelTreeBody {
