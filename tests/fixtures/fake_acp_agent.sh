@@ -197,6 +197,12 @@
 # (an embedded `resource` block with the exact buffer text vs. a
 # `resource_link` + fenced-text fallback) against the same fixture.
 #
+# #1464: `initialize`'s `agentCapabilities.promptCapabilities.image` is
+# `false`/absent unless $ACP_FAKE_IMAGE_CAPABILITY is set, in which case
+# it's `true` — lets a test drive both branches of
+# `Engine::acp_attach_file`/`Engine::acp_attach_clipboard_image`'s refusal
+# gate against the same fixture.
+#
 # #1459: `initialize`'s `agentCapabilities.loadSession` is `false`/absent
 # unless $ACP_FAKE_LOAD_SESSION is set, in which case it's `true` and
 # `session/load` becomes reachable (see that method's entry above) — lets a
@@ -310,15 +316,33 @@ while IFS= read -r line; do
       # `Engine::acp_prompt_content_blocks`. Unset (every pre-#1450 test)
       # keeps the empty `{}` every prior slice relies on, which parses as
       # all-`false` per `parse_prompt_capabilities`'s doc.
+      # #1464: $ACP_FAKE_IMAGE_CAPABILITY set -> promptCapabilities also
+      # carries image:true (nested in the same object as embeddedContext,
+      # not a sibling of it — both are fields of `promptCapabilities` per
+      # the ACP schema), so a test can drive both branches of
+      # `Engine::acp_attach_file`/`acp_attach_clipboard_image`'s
+      # `promptCapabilities.image` gate against the same fixture. Built
+      # independently of $ACP_FAKE_EMBEDDED_CONTEXT so either, both, or
+      # neither can be set without a case per combination.
       # #1459: $ACP_FAKE_LOAD_SESSION set -> agentCapabilities also carries
       # (or, absent embeddedContext, carries alone) loadSession:true, so a
       # test can drive `parse_load_session_capability` and the actual
       # `session/load` path. Built independently of embeddedContext above so
       # either, both, or neither can be set without the fixture needing a
       # case for every combination.
-      caps_fields=""
+      prompt_caps_fields=""
       if [ -n "$ACP_FAKE_EMBEDDED_CONTEXT" ]; then
-        caps_fields='"promptCapabilities":{"embeddedContext":true}'
+        prompt_caps_fields='"embeddedContext":true'
+      fi
+      if [ -n "$ACP_FAKE_IMAGE_CAPABILITY" ]; then
+        if [ -n "$prompt_caps_fields" ]; then
+          prompt_caps_fields="${prompt_caps_fields},"
+        fi
+        prompt_caps_fields="${prompt_caps_fields}\"image\":true"
+      fi
+      caps_fields=""
+      if [ -n "$prompt_caps_fields" ]; then
+        caps_fields="\"promptCapabilities\":{${prompt_caps_fields}}"
       fi
       if [ -n "$ACP_FAKE_LOAD_SESSION" ]; then
         if [ -n "$caps_fields" ]; then

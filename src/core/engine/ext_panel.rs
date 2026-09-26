@@ -3051,6 +3051,13 @@ impl Engine {
         if let Some(attachment) = self.acp_pending_attachment.as_ref() {
             chip_lines.push(attachment.chip(&self.acp_workspace_cwd()));
         }
+        // #1464: one chip line per manually attached file/image, same
+        // "named on the displayed transcript, regardless of whether the
+        // chip is also shown live in the header" contract as the two
+        // attachments above.
+        for attachment in &self.acp_manual_attachments {
+            chip_lines.push(attachment.chip());
+        }
         let displayed_text = if chip_lines.is_empty() {
             text.clone()
         } else {
@@ -3254,6 +3261,9 @@ impl Engine {
         // own state, untouched here, matching this function's existing
         // scope).
         self.acp_pending_attachment = None;
+        // #1464: manually attached files/images are composed content too,
+        // same reasoning as `acp_pending_attachment` immediately above.
+        self.acp_manual_attachments.clear();
         // #955 (ACP-4): tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
@@ -3499,16 +3509,22 @@ impl Engine {
                 }
                 true
             }
-            // #1450 point 4: Ctrl+R drops a staged Visual-selection/
-            // `:{range}AI` attachment (the `⧉`-chip in the panel header)
-            // without sending it — "let the user remove it before sending".
-            // Same escape-hatch shape as Ctrl+C above: `ChatController`
-            // doesn't bind Ctrl+R internally, so it reaches here as a plain
+            // #1450 point 4 / #1464: Ctrl+R drops the most-recently-staged
+            // attachment without sending it — "let the user remove it
+            // before sending". Checks the Visual-selection/`:{range}AI`
+            // range attachment first (unchanged #1450 behaviour), then
+            // falls through to popping the last manually attached
+            // file/image (#1464) once that's empty — one key, most-recent-
+            // first, across both kinds of pending attachment. Same escape-
+            // hatch shape as Ctrl+C above: `ChatController` doesn't bind
+            // Ctrl+R internally, so it reaches here as a plain
             // `KeyPressed`. A no-op (still consumes the key) when nothing is
-            // staged.
+            // staged at all.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('r')" => {
                 if self.acp_pending_attachment.take().is_some() {
                     self.message = "Attachment removed.".to_string();
+                } else if let Some(removed) = self.acp_manual_attachments.pop() {
+                    self.message = format!("Removed {}", removed.chip());
                 }
                 true
             }

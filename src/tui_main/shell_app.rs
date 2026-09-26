@@ -17617,6 +17617,49 @@ mod tests {
         );
     }
 
+    /// #1464 acceptance: `:AiAttach <path>` stages a file as the next
+    /// prompt's attachment and shows a `📎`-prefixed chip naming it in the
+    /// AI panel header — the "chip in the panel" half of the issue;
+    /// `core::engine::acp_ops::tests::
+    /// ai_attach_file_stages_a_plain_file_as_a_resource_link` covers the
+    /// wire-content half this harness can't inspect from the outside.
+    ///
+    /// RED verified: with `AcpManualAttachment::chip`'s `File` arm stubbed
+    /// to return an empty string, the screen never shows the attached
+    /// file's name at all.
+    #[test]
+    fn ai_panel_shows_manually_attached_file_chip_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_acp1464_tui_attach_ws_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        std::fs::write(workspace.join("notes.txt"), "hello").expect("write attach target");
+        app.engine.cwd = workspace.clone();
+        app.engine.workspace_root = Some(workspace.clone());
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char(':');
+        for c in "AiAttach notes.txt".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains('\u{1f4ce}') && screen.contains("notes.txt"),
+            "the manually attached file's chip must be visible in the AI \
+             panel header; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// #1449 acceptance: typing `@` with a matching prefix opens a
     /// completion popup listing open buffers before workspace-only files,
     /// and Tab/Enter accepts one into the input as `@path ` — the same

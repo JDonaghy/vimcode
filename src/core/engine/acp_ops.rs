@@ -873,7 +873,158 @@ impl Engine {
         if let Some(attachment) = self.acp_pending_attachment.take() {
             blocks.extend(attachment.content_blocks(self.acp_prompt_capabilities));
         }
+        // #1464: every manually attached file/image, in the order they were
+        // attached — `drain(..)` so a removed-before-send attachment (Ctrl+R)
+        // never reaches this point in the first place, and a sent one is
+        // gone for the *next* prompt, same one-shot-per-send contract
+        // `acp_pending_attachment.take()` above already has.
+        for attachment in self.acp_manual_attachments.drain(..) {
+            blocks.push(attachment.content_block());
+        }
         blocks
+    }
+
+    // ── prompt context: manual file/image attachments (#1464) ───────────────
+
+    /// `:AiAttach <path>` — stage `path` as the next prompt's attachment.
+    /// `path` is resolved the same way `Self::acp_current_buffer_attachment`
+    /// resolves the active buffer's path: joined onto the first workspace
+    /// root when relative, then must land inside a workspace root (see
+    /// [`crate::core::acp::resolve_path_within_roots`]) — a path outside the
+    /// workspace is refused with a clear message, not silently dropped.
+    ///
+    /// An image extension ([`crate::core::acp::image_mime_type_for_path`])
+    /// stages an `image` content block instead of a `resource_link` — gated
+    /// on `self.acp_prompt_capabilities.image` (refused with a clear message
+    /// when the agent hasn't declared support — there is no baseline-ACP
+    /// fallback for binary image data) and on
+    /// [`crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES`] (refused the
+    /// same way). Anything else attaches as a baseline `resource_link` —
+    /// no capability check, no size limit, since nothing is read off disk
+    /// for that variant.
+    pub(crate) fn acp_attach_file(&mut self, arg: &str) {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            self.message = "Usage: :AiAttach <path>".to_string();
+            return;
+        }
+        let roots = self.acp_workspace_roots();
+        let root = roots.first().cloned().unwrap_or_else(|| self.cwd.clone());
+        let candidate = root.join(arg);
+        let resolved = match crate::core::acp::resolve_path_within_roots(&candidate, &roots) {
+            Ok(p) => p,
+            Err(_) => {
+                self.message = format!("Cannot attach '{arg}': outside the workspace");
+                return;
+            }
+        };
+        if !resolved.is_file() {
+            self.message = format!("Cannot attach '{arg}': no such file");
+            return;
+        }
+
+        if let Some(mime_type) = crate::core::acp::image_mime_type_for_path(&resolved) {
+            if !self.acp_prompt_capabilities.image {
+                self.message = "This agent doesn't support image attachments \
+                    (promptCapabilities.image is false)"
+                    .to_string();
+                return;
+            }
+            let size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+            if size > crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES {
+                self.message = format!(
+                    "Cannot attach '{arg}': {} is larger than the {} limit",
+                    crate::core::acp::format_byte_size(size),
+                    crate::core::acp::format_byte_size(
+                        crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES
+                    ),
+                );
+                return;
+            }
+            let data = match std::fs::read(&resolved) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.message = format!("Cannot attach '{arg}': {e}");
+                    return;
+                }
+            };
+            let name = resolved
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| arg.to_string());
+            self.acp_manual_attachments
+                .push(crate::core::acp::AcpManualAttachment::Image {
+                    name,
+                    mime_type: mime_type.to_string(),
+                    data,
+                });
+            self.message = format!("Attached image '{arg}'");
+        } else {
+            self.acp_manual_attachments
+                .push(crate::core::acp::AcpManualAttachment::File { path: resolved });
+            self.message = format!("Attached '{arg}'");
+        }
+    }
+
+    /// Paste an image straight off the system clipboard as the next
+    /// prompt's attachment (#1464) — the "paste an image" half of the
+    /// issue, alongside `:AiAttach`'s "attach by path" half.
+    /// `self.clipboard_read_image` is the callback the GTK backend wires at
+    /// startup (`App::setup_gtk_clipboard`'s image twin), straight through
+    /// to `quadraui::Clipboard::read_image`; TUI never wires one (no
+    /// terminal clipboard-image channel — see that callback's own doc), so
+    /// this is a clear "can't paste an image here" message there, never a
+    /// panic or a silent no-op. Same `promptCapabilities.image` gate and
+    /// [`crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES`] size limit as
+    /// `Self::acp_attach_file`'s image branch — checked against the
+    /// *encoded* PNG size, since that's what actually goes over the wire.
+    pub(crate) fn acp_attach_clipboard_image(&mut self) {
+        let Some(read_image) = self.clipboard_read_image.as_ref() else {
+            self.message = "This platform can't paste an image from the clipboard".to_string();
+            return;
+        };
+        if !self.acp_prompt_capabilities.image {
+            self.message = "This agent doesn't support image attachments \
+                (promptCapabilities.image is false)"
+                .to_string();
+            return;
+        }
+        let image = match read_image() {
+            Ok(img) => img,
+            Err(quadraui::BackendError::Unsupported) => {
+                self.message = "This platform can't paste an image from the clipboard".to_string();
+                return;
+            }
+            Err(e) => {
+                self.message = format!("Clipboard paste failed: {e:?}");
+                return;
+            }
+        };
+        let png_bytes =
+            match crate::core::acp::encode_png_rgba8(image.width, image.height, &image.pixels) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    self.message = format!("Could not encode clipboard image: {e}");
+                    return;
+                }
+            };
+        if png_bytes.len() as u64 > crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES {
+            self.message = format!(
+                "Clipboard image is {} \u{2014} larger than the {} limit",
+                crate::core::acp::format_byte_size(png_bytes.len() as u64),
+                crate::core::acp::format_byte_size(
+                    crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES
+                ),
+            );
+            return;
+        }
+        self.acp_manual_attachments
+            .push(crate::core::acp::AcpManualAttachment::Image {
+                name: "(pasted image)".to_string(),
+                mime_type: "image/png".to_string(),
+                data: png_bytes,
+            });
+        self.message = "Attached clipboard image".to_string();
     }
 
     // ── prompt context: Visual selection / `:{range}AI` (#1450) ─────────────
@@ -2532,6 +2683,228 @@ mod tests {
             "the panel must accept a new message after the failed handshake \
              cleared the busy state"
         );
+    }
+
+    // ── #1464: manual file/image attachments ──────────────────────────────
+
+    /// Write `contents` (bytes, not necessarily valid UTF-8/a real image —
+    /// the fixture agent and `Engine::acp_attach_file` never decode it,
+    /// only size-check and base64-encode it) to a fresh temp file under a
+    /// fresh temp workspace, pointing `engine.cwd`/`workspace_root` at that
+    /// workspace. Returns the file's bare name (what a test passes to
+    /// `:AiAttach`) and its full path (for cleanup).
+    #[cfg(unix)]
+    fn setup_attach_workspace(
+        engine: &mut Engine,
+        tag: &str,
+        name: &str,
+        contents: &[u8],
+    ) -> (String, PathBuf) {
+        let workspace =
+            std::env::temp_dir().join(format!("vimcode_test_acp1464_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        let file_path = workspace.join(name);
+        std::fs::write(&file_path, contents).expect("write attach target");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace);
+        (name.to_string(), file_path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_attach_file_stages_a_plain_file_as_a_resource_link() {
+        let mut engine = Engine::new_for_test();
+        let (name, file_path) = setup_attach_workspace(&mut engine, "plain", "notes.txt", b"hi");
+
+        engine.acp_attach_file(&name);
+
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            1,
+            "{:?}",
+            engine.message
+        );
+        let block = engine.acp_manual_attachments[0].content_block();
+        assert_eq!(block["type"], "resource_link");
+        assert_eq!(block["name"], "notes.txt");
+        assert!(
+            engine.message.contains("Attached"),
+            "message: {}",
+            engine.message
+        );
+
+        let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
+    }
+
+    /// RED verified: with `Engine::acp_attach_file`'s image-capability check
+    /// removed, this fails — an image attaches (and would later be sent)
+    /// even though the agent never declared `promptCapabilities.image`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_attach_file_refuses_an_image_when_the_agent_lacks_the_capability() {
+        let mut engine = Engine::new_for_test();
+        assert!(!engine.acp_prompt_capabilities.image);
+        let (name, file_path) =
+            setup_attach_workspace(&mut engine, "noimg", "shot.png", b"not-really-a-png");
+
+        engine.acp_attach_file(&name);
+
+        assert!(
+            engine.acp_manual_attachments.is_empty(),
+            "refused image must not be staged: {:?}",
+            engine.acp_manual_attachments
+        );
+        assert!(
+            engine.message.contains("doesn't support image attachments"),
+            "message: {}",
+            engine.message
+        );
+
+        let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
+    }
+
+    /// RED verified: with `content_block`'s `Image` arm stubbed to the
+    /// `File` arm's `resource_link` shape, the `block["type"] == "image"`
+    /// assertion below fails.
+    #[cfg(unix)]
+    #[test]
+    fn ai_attach_file_attaches_an_image_with_base64_data_when_the_capability_is_present() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a];
+        let (name, file_path) = setup_attach_workspace(&mut engine, "img", "shot.png", &bytes);
+
+        engine.acp_attach_file(&name);
+
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            1,
+            "{:?}",
+            engine.message
+        );
+        let block = engine.acp_manual_attachments[0].content_block();
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            block["data"],
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+
+        let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
+    }
+
+    /// RED verified: with `Engine::acp_attach_file`'s size check removed,
+    /// this fails — a 5&nbsp;MiB+1 image attaches instead of being refused.
+    #[cfg(unix)]
+    #[test]
+    fn ai_attach_file_rejects_an_oversize_image() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        let oversize = vec![0u8; (crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES + 1) as usize];
+        let (name, file_path) = setup_attach_workspace(&mut engine, "big", "huge.png", &oversize);
+
+        engine.acp_attach_file(&name);
+
+        assert!(
+            engine.acp_manual_attachments.is_empty(),
+            "oversize image must not be staged: {:?}",
+            engine.acp_manual_attachments
+        );
+        assert!(
+            engine.message.contains("larger than the 5.0 MB limit"),
+            "message: {}",
+            engine.message
+        );
+
+        let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ai_attach_file_refuses_a_path_outside_the_workspace() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_acp1464_outside_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+
+        engine.acp_attach_file("../../etc/passwd");
+
+        assert!(engine.acp_manual_attachments.is_empty());
+        assert!(
+            engine.message.contains("outside the workspace"),
+            "message: {}",
+            engine.message
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// The issue's own acceptance line: "Assert an image block is sent with
+    /// the right mime and base64 when the capability is present" — a real
+    /// round trip through the fixture agent (`$ACP_FAKE_IMAGE_CAPABILITY`),
+    /// not just `Engine::acp_attach_file`'s local staging the tests above
+    /// cover, so this also proves `Engine::acp_prompt_content_blocks`
+    /// actually drains `acp_manual_attachments` onto the wire.
+    ///
+    /// RED verified: with `Engine::acp_prompt_content_blocks`'s manual-
+    /// attachment drain loop removed, the captured prompt never contains an
+    /// `image`-typed block at all.
+    #[cfg(unix)]
+    #[test]
+    fn ranged_ai_attach_sends_an_image_block_with_base64_data_over_the_wire() {
+        let capture = capture_file_path("attach_image");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_IMAGE_CAPABILITY", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.ai_attach_current_buffer = false;
+        poll_acp_until(&mut engine, |e| e.acp_prompt_capabilities.image);
+        assert!(
+            engine.acp_prompt_capabilities.image,
+            "fixture should have advertised promptCapabilities.image: true"
+        );
+
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a];
+        let (name, file_path) = setup_attach_workspace(&mut engine, "wire", "shot.png", &bytes);
+        engine.acp_attach_file(&name);
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            1,
+            "{:?}",
+            engine.message
+        );
+
+        engine.ai_send_message("look at this".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        let image_block = blocks
+            .iter()
+            .find(|b| b["type"] == "image")
+            .unwrap_or_else(|| panic!("expected an image block: {blocks:?}"));
+        assert_eq!(image_block["mimeType"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            image_block["data"],
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+        assert!(
+            engine.acp_manual_attachments.is_empty(),
+            "the attachment must be consumed (drained), not left staged \
+             after it was sent"
+        );
+
+        let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
+        let _ = std::fs::remove_file(&capture);
     }
 
     // ── ACP-2 (#953): session/request_permission human-in-the-loop dialog ──
