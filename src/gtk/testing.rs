@@ -17484,3 +17484,167 @@ mod issue_1397_ext_install_offer_toast {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// #1460: per-turn ACP change review + checkpoints (GTK twin of
+/// `tui_main::shell_app::tests`' same-named scenarios).
+#[cfg(test)]
+mod issue_1460_acp_turn_review_and_checkpoints {
+    use super::*;
+
+    /// GTK twin of `tui_main::shell_app::tests::
+    /// acp_turn_review_lists_all_three_files_and_revert_restores_one_via_shell_app`
+    /// — see that test's doc comment for the full rationale. Drives the
+    /// same three real `Engine::acp_write_text_file` calls + `Engine::
+    /// acp_end_turn` (the exact call `PromptStopped` makes), then asserts
+    /// the *painted* turn-review surface via the real `GtkDriver` (Cairo
+    /// `ImageSurface`, headless) rather than `Engine::change_review` state.
+    ///
+    /// RED verified (same repro as the TUI twin): with `Engine::
+    /// change_review_reject_current`'s turn-review branch short-circuited
+    /// to the proposal-review "no buffer effect" behavior, `c.txt` stays at
+    /// `"ccc2\n"` after `r` instead of reverting to `"ccc1\n"`.
+    #[test]
+    fn acp_turn_review_lists_all_three_files_and_revert_restores_one_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1460_gtk_turn_review_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        std::fs::write(&a, "aaa1\n").unwrap();
+        std::fs::write(&b, "bbb1\n").unwrap();
+        std::fs::write(&c, "ccc1\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "aaa2\n").unwrap();
+        engine.acp_write_text_file(&b, "bbb2\n").unwrap();
+        engine.acp_write_text_file(&c, "ccc2\n").unwrap();
+        engine.acp_end_turn();
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Change 1/3"),
+            "the turn review must show all 3 files in its counter; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("aaa1") && h.driver.screen_contains("aaa2"),
+            "entry 1 must paint a.txt's pre-turn and current content"
+        );
+
+        h.driver.type_char('n');
+        h.driver.render();
+        assert!(h.driver.screen_contains("Change 2/3"));
+        assert!(
+            h.driver.screen_contains("bbb1") && h.driver.screen_contains("bbb2"),
+            "entry 2 must paint b.txt's pre-turn and current content"
+        );
+
+        h.driver.type_char('n');
+        h.driver.render();
+        assert!(h.driver.screen_contains("Change 3/3"));
+        assert!(
+            h.driver.screen_contains("ccc1") && h.driver.screen_contains("ccc2"),
+            "entry 3 must paint c.txt's pre-turn and current content"
+        );
+
+        // Revert the currently-shown entry (c.txt).
+        h.driver.type_char('r');
+        h.driver.render();
+
+        assert_eq!(
+            std::fs::read_to_string(&c).unwrap(),
+            "ccc1\n",
+            "reverting c.txt must restore exactly its pre-turn contents"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "aaa2\n",
+            "a.txt must be untouched by reverting c.txt alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "bbb2\n",
+            "b.txt must be untouched by reverting c.txt alone"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GTK twin of `tui_main::shell_app::tests::
+    /// acp_restore_checkpoint_keeps_a_user_edit_via_shell_app` — see that
+    /// test's doc comment for the full rationale. `:AiRestore`, typed
+    /// through the real command line, must revert `b.txt` while refusing
+    /// to clobber a hand-edit to `a.txt` made after the agent's turn.
+    ///
+    /// RED verified (same repro as the TUI twin): with `Engine::
+    /// acp_restore_checkpoint`'s "current content differs from the agent's
+    /// last write" guard removed (always reverting), `a.txt` is overwritten
+    /// back to `"agent-a\n"`, losing the human's edit.
+    #[test]
+    fn acp_restore_checkpoint_keeps_a_user_edit_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1460_gtk_restore_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "orig-a\n").unwrap();
+        std::fs::write(&b, "orig-b\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "agent-a\n").unwrap();
+        engine.acp_write_text_file(&b, "agent-b\n").unwrap();
+        engine.acp_end_turn();
+        engine.close_change_review();
+
+        // The human hand-edits a.txt directly — NOT through the agent —
+        // after the turn ended, and the edit is already saved (both disk
+        // and the open buffer agree, exactly what a real `:w` leaves).
+        std::fs::write(&a, "human-edit-a\n").unwrap();
+        let buf_id = engine.buffer_manager.open_file(&a).unwrap();
+        {
+            let state = engine.buffer_manager.get_mut(buf_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "human-edit-a\n");
+        }
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        for c in ":AiRestore".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("b.txt") || h.driver.screen_contains("Restored checkpoint"),
+            "the command-line message must report the restore; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "human-edit-a\n",
+            "the human's edit to a.txt must survive :AiRestore untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).unwrap(),
+            "orig-b\n",
+            "b.txt, which nothing touched after the agent wrote it, must revert"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

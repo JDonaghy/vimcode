@@ -91,6 +91,16 @@ impl Engine {
                     // — see `Engine::ai_clear`'s matching reset.
                     self.acp_tool_calls.clear();
                     self.change_review = None;
+                    // #1460: deliberately NOT cleared here, unlike
+                    // `acp_tool_calls`/`change_review` above — a dead agent
+                    // may still have completed turns worth reviewing/
+                    // restoring (`acp_turn_checkpoints`), and an in-flight
+                    // turn that died before `PromptStopped` never became a
+                    // checkpoint at all (`acp_current_turn_entries` simply
+                    // sits unused until `Engine::ai_clear` explicitly ends
+                    // the conversation). Losing that history just because
+                    // the agent process happened to exit would defeat the
+                    // whole point of a checkpoint being a restore point.
                     self.ai_streaming = false;
                     redraw = true;
                 }
@@ -275,6 +285,10 @@ impl Engine {
                             content: format!("[turn stopped: {stop_reason}]"),
                         });
                     }
+                    // #1460: the turn just ended — checkpoint whatever it
+                    // wrote and open the combined turn-review surface, same
+                    // moment `:AiReview` would open it manually.
+                    self.acp_end_turn();
                     redraw = true;
                 }
                 AcpEvent::RequestFailed {
@@ -1253,6 +1267,43 @@ impl Engine {
             .buffer_manager
             .open_file(&resolved)
             .map_err(|e| format!("failed to open {}: {e}", resolved.display()))?;
+        // #1460: capture this file's content *before* it's overwritten below
+        // — the "pre-turn contents captured the first time each file is
+        // touched" acceptance bar — before anything below mutates the
+        // buffer. `acp_record_turn_write` is a no-op (besides advancing the
+        // "last written" value) on every write after the first this turn.
+        let pre_content = self
+            .buffer_manager
+            .get(buffer_id)
+            .map(|s| s.buffer.content.to_string())
+            .unwrap_or_default();
+        self.acp_record_turn_write(
+            &resolved.to_string_lossy(),
+            pre_content,
+            content.to_string(),
+        );
+        self.acp_replace_buffer_content(buffer_id, content);
+        self.save_buffer_by_id(buffer_id)
+    }
+
+    /// Write `content` into the real buffer/disk for `path` exactly like
+    /// [`Self::acp_write_text_file`] (open-or-reuse, single undo group,
+    /// persisted to disk) but **without** recording it into the in-flight
+    /// turn's snapshot (#1460) — used to apply a turn-review *revert*
+    /// (writing a file's own already-captured pre-turn content back), which
+    /// must not be mistaken for a fresh agent write a later checkpoint would
+    /// otherwise capture *this* write as the "before" state for.
+    pub(crate) fn acp_write_file_untracked(
+        &mut self,
+        path: &Path,
+        content: &str,
+    ) -> Result<(), String> {
+        let roots = self.acp_workspace_roots();
+        let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
+        let buffer_id = self
+            .buffer_manager
+            .open_file(&resolved)
+            .map_err(|e| format!("failed to open {}: {e}", resolved.display()))?;
         self.acp_replace_buffer_content(buffer_id, content);
         self.save_buffer_by_id(buffer_id)
     }
@@ -1513,7 +1564,7 @@ impl Engine {
     /// eventually write) — the "current contents"
     /// [`crate::core::review::resolve_fragment`] needs in order to safely
     /// locate a `diff` block's fragment (#1454).
-    fn acp_current_file_content(&self, path: &Path) -> Result<String, String> {
+    pub(crate) fn acp_current_file_content(&self, path: &Path) -> Result<String, String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
         self.acp_read_text_file(&resolved, None, None)

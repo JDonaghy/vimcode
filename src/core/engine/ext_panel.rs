@@ -3270,6 +3270,13 @@ impl Engine {
         // ends it" reasoning as everything else in this block).
         self.acp_tool_calls.clear();
         self.change_review = None;
+        // #1460: the per-turn tracking + checkpoint history are session-
+        // scoped too, same reasoning as `acp_tool_calls`/`change_review`
+        // just above — clearing the conversation ends any restore point a
+        // later `:AiRestore` could have picked from it.
+        self.acp_current_turn_entries.clear();
+        self.acp_turn_checkpoints.clear();
+        self.turn_review_checkpoint_id = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
         self.message = "AI conversation cleared.".to_string();
     }

@@ -135,6 +135,19 @@
 #                           "write:ok" or "write:error:<message>" depending
 #                           on whether the reply was a JSON-RPC error —
 #                           same "drive it for real, read the transcript"
+#                           shape as the read case. (#1460) Additionally,
+#                           when $ACP_FAKE_FS_WRITE_PATH2/3 are also set
+#                           (each with an optional matching
+#                           $ACP_FAKE_FS_WRITE_CONTENT2/3, default "written
+#                           by acp 2"/"3"), the same request/block/reply
+#                           round trip repeats for each of them (ids 9012,
+#                           9013) — all still ONE turn/`session/prompt`
+#                           reply — so a test can drive a single agent turn
+#                           that writes several files, the shape #1460's
+#                           per-turn change-review surface needs to prove
+#                           itself against a turn that touches more than
+#                           one file, not just a repeated single-file
+#                           scenario.
 #                           shape as the read case. With $ACP_FAKE_PLAN set
 #                           (#956, ACP-5): emits an available_commands_update
 #                           (two commands, "commit" and "compact", sharing
@@ -478,19 +491,33 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"read:%s"}}}}\n' "$content"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_FS_WRITE_PATH" ]; then
-        write_content="${ACP_FAKE_FS_WRITE_CONTENT:-written by acp}"
-        printf '{"jsonrpc":"2.0","id":9011,"method":"fs/write_text_file","params":{"sessionId":"sess-1","path":"%s","content":"%s"}}\n' "$ACP_FAKE_FS_WRITE_PATH" "$write_content"
-        # Park: block until the client answers request 9011 out of band.
-        read -r fsreply
-        case "$fsreply" in
-          *'"error"'*)
-            message=$(printf '%s' "$fsreply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
-            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:error:%s"}}}}\n' "$message"
-            ;;
-          *)
-            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:ok"}}}}\n'
-            ;;
-        esac
+        # #1460: one write request/block/reply round trip, factored out so
+        # a turn that writes several files (ACP_FAKE_FS_WRITE_PATH2/3) can
+        # repeat it without duplicating the request/error/ok plumbing.
+        fake_write() {
+          write_path="$1"
+          write_content="$2"
+          write_id="$3"
+          printf '{"jsonrpc":"2.0","id":%s,"method":"fs/write_text_file","params":{"sessionId":"sess-1","path":"%s","content":"%s"}}\n' "$write_id" "$write_path" "$write_content"
+          # Park: block until the client answers this write request out of band.
+          read -r fsreply
+          case "$fsreply" in
+            *'"error"'*)
+              message=$(printf '%s' "$fsreply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+              printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:error:%s"}}}}\n' "$message"
+              ;;
+            *)
+              printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:ok"}}}}\n'
+              ;;
+          esac
+        }
+        fake_write "$ACP_FAKE_FS_WRITE_PATH" "${ACP_FAKE_FS_WRITE_CONTENT:-written by acp}" 9011
+        if [ -n "$ACP_FAKE_FS_WRITE_PATH2" ]; then
+          fake_write "$ACP_FAKE_FS_WRITE_PATH2" "${ACP_FAKE_FS_WRITE_CONTENT2:-written by acp 2}" 9012
+        fi
+        if [ -n "$ACP_FAKE_FS_WRITE_PATH3" ]; then
+          fake_write "$ACP_FAKE_FS_WRITE_PATH3" "${ACP_FAKE_FS_WRITE_CONTENT3:-written by acp 3}" 9013
+        fi
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'

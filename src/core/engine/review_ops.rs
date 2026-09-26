@@ -42,6 +42,12 @@ impl Engine {
         // board card behind it) must never inherit a stale id left over
         // from an earlier board review.
         self.review_card_id = None;
+        // #1460: this method only ever opens a *proposal* review — a
+        // *turn* review is opened directly by `Engine::acp_open_turn_
+        // review`, which sets this field itself right after building its
+        // own `ChangeReviewState` — so never inherit a stale turn marker
+        // left over from an earlier turn review.
+        self.turn_review_checkpoint_id = None;
     }
 
     /// Build a source-agnostic change list from a local git branch diff
@@ -190,6 +196,13 @@ impl Engine {
     /// — closing only discards the *surface*, not decisions already made.
     pub fn close_change_review(&mut self) {
         self.change_review = None;
+        // #1460: a closed turn review can still be reopened by checkpoint
+        // id (`:AiReview`, `Engine::acp_open_turn_review`) — that's the
+        // *first* thing `restore_checkpoint_keeps_a_user_edit_made_in_
+        // between` test below exercises — so this only clears the "is a
+        // turn review currently showing" marker, never the checkpoint
+        // itself (`acp_turn_checkpoints`).
+        self.turn_review_checkpoint_id = None;
     }
 
     /// Handle a keypress while the change-review surface is open. Returns
@@ -207,8 +220,8 @@ impl Engine {
     /// | `[`         | Jump to the previous hunk                  |
     /// | `n` / Tab   | Next file                                  |
     /// | `p`         | Previous file                              |
-    /// | `a`         | Accept the current file's change           |
-    /// | `r`         | Reject the current file's change           |
+    /// | `a`         | Accept (proposal review) / keep (turn review, #1460) |
+    /// | `r`         | Reject (proposal review) / revert to pre-turn content (turn review, #1460) |
     /// | `A`         | Approve — report a verdict (#526)          |
     /// | `C`         | Request changes — report a verdict (#526)  |
     /// | `M`         | Comment-only — report a verdict (#526)     |
@@ -340,6 +353,23 @@ impl Engine {
     /// no fragment resolution; that would be the bug this issue reports
     /// (writing an edited-region fragment over the whole file).
     pub(crate) fn change_review_accept_current(&mut self) {
+        // #1460: a turn review's files are already written to disk — "keep"
+        // is a pure decision, never a write (see `acp_turn_ops.rs`'s module
+        // doc for the full a/r truth table).
+        if self.turn_review_checkpoint_id.is_some() {
+            let Some(review) = &mut self.change_review else {
+                return;
+            };
+            let Some(path) = review.current_entry().map(|e| e.change.path.clone()) else {
+                return;
+            };
+            if let Some(entry) = review.current_entry_mut() {
+                entry.decision = crate::core::review::ChangeDecision::Accepted;
+            }
+            self.message = format!("Kept change to {path}");
+            self.close_turn_review_if_all_decided();
+            return;
+        }
         let Some(review) = &mut self.change_review else {
             return;
         };
@@ -358,9 +388,33 @@ impl Engine {
         }
     }
 
-    /// Reject the currently-shown entry: no buffer effect. Auto-closes
-    /// the surface once every entry has a decision.
+    /// Reject the currently-shown entry. In a *proposal* review (#955):
+    /// no buffer effect — the change was never applied. In a **turn**
+    /// review (#1460): actually reverts the file to its pre-turn content
+    /// (`entry.change.old_text`) through the single-undo-group buffer path
+    /// — the file already holds the agent's write, so "reject" here means
+    /// "revert it". Auto-closes the surface once every entry has a
+    /// decision, same as accept.
     pub(crate) fn change_review_reject_current(&mut self) {
+        if self.turn_review_checkpoint_id.is_some() {
+            let Some(review) = &mut self.change_review else {
+                return;
+            };
+            let Some(entry) = review.current_entry_mut() else {
+                return;
+            };
+            entry.decision = crate::core::review::ChangeDecision::Rejected;
+            let path = entry.change.path.clone();
+            let old_text = entry.change.old_text.clone().unwrap_or_default();
+            if let Err(msg) = self.acp_write_file_untracked(std::path::Path::new(&path), &old_text)
+            {
+                self.message = format!("Failed to revert {path}: {msg}");
+            } else {
+                self.message = format!("Reverted change to {path}");
+            }
+            self.close_turn_review_if_all_decided();
+            return;
+        }
         let Some(review) = &mut self.change_review else {
             return;
         };
@@ -368,6 +422,18 @@ impl Engine {
         self.message = "Rejected change".to_string();
         if review.all_decided() {
             self.change_review = None;
+        }
+    }
+
+    /// Close the turn review (and clear its checkpoint marker) once every
+    /// entry has a decision — the shared auto-close tail
+    /// [`Self::change_review_accept_current`]/[`Self::
+    /// change_review_reject_current`]'s turn-review branches both need, so
+    /// `turn_review_checkpoint_id` never outlives the surface it names.
+    fn close_turn_review_if_all_decided(&mut self) {
+        if self.change_review.as_ref().is_some_and(|r| r.all_decided()) {
+            self.change_review = None;
+            self.turn_review_checkpoint_id = None;
         }
     }
 

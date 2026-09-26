@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod acp_sessions;
+pub mod acp_turn;
 pub mod ai;
 pub mod buffer;
 pub mod buffer_manager;
