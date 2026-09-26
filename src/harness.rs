@@ -5400,6 +5400,38 @@ mod issue_1418_explorer_context_menu {
 /// `TuiShellApp` proves the shared implementation, not a second TUI-only
 /// reimplementation of it — see this module's own header doc, "Why `App`,
 /// not a fresh mock".
+///
+/// **RED-before-fix, verified by hand**: with this module's test bodies kept
+/// as-is but `src/app.rs`, `src/render.rs`, `src/tui_main/shell_app.rs` and
+/// `src/tui_main/app_on_tui_tests.rs` reverted to their pre-#1427 state
+/// (commit `50d6af2`, the parent of the #1427 fix commit — i.e. before
+/// `App::setup` grew the three-way `BackendCaps` branch and before
+/// `App::shell_config` prepended the hamburger `PanelDefinition`), three of
+/// these four tests failed:
+///
+/// - `alt_letter_reveals_menu_bar_via_app_on_tui`: `assertion left == right
+///   failed` — `left: 3, right: 4`. Alt+F redrew (the `MenuSystem` intercept
+///   already existed) but did *not* reveal a title-bar row, because pre-fix
+///   `App` never sets `menu_bar_toggleable`/hides the bar on a
+///   no-window-chrome backend in the first place — the marker stayed on the
+///   same row instead of shifting down by one.
+/// - `hamburger_relocated_click_after_reveal_hides_menu_bar_via_app_on_tui`
+///   and `hamburger_stale_click_position_after_reveal_still_hides_menu_bar_
+///   via_app_on_tui`: both panicked at their own `"precondition: menu bar
+///   starts hidden"` assert — pre-fix `App::setup`'s `else` branch pinned
+///   `engine.menu_bar_visible = true` unconditionally on a no-native-menu/
+///   no-window-chrome backend (today's now-three-way branch's `window_chrome`
+///   arm), so the bar painted "File Edit View …" from the very first frame
+///   and there was no hamburger `PanelDefinition` to click at all.
+///
+/// The fourth, `driver_click_on_settings_toggle_with_menu_bar_visible_flips_
+/// its_own_row_via_app_on_tui`, stayed green on both revisions: it forces
+/// `engine.menu_bar_visible = true` directly in its own fixture rather than
+/// exercising the reveal/hide toggle, and pre-#1427 `App` already pinned the
+/// bar visible unconditionally in that state, so the row-resolution behaviour
+/// it checks was already correct before this issue — it is a non-regression
+/// port, not new RED-to-green coverage, and is included for parity with its
+/// `tui_prod` twin rather than because it caught a bug.
 #[cfg(test)]
 mod issue_1427_menu_bar_reveal_shared {
     use super::*;

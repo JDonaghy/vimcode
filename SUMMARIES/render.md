@@ -1,4 +1,4 @@
-# src/render.rs — 29,923 lines (~21,405 production, uncorrected since #1155's edit)
+# src/render.rs — 34,149 lines (~21,405 production as of #1155; +375 lines / 9 public fns added by #1427, not yet re-measured by `prod_lines.py`)
 
 Platform-agnostic rendering abstraction, and since #751–#766 **the place every
 cross-backend decision is made**. Transforms engine state into `ScreenLayout`
@@ -88,6 +88,32 @@ verdicts live here.
 - `Theme::from_vscode_json(path)` — import VSCode JSON theme
 - `Theme::scope_color(scope)` — tree-sitter scope to color mapping
 - `Theme::semantic_token_style(type, modifiers)` — semantic token styling
+
+## Shared Menu-Bar Reveal/Hide Routing (#1427)
+Lifted out of `TuiShellApp` so `App` (any backend with `BackendCaps::window_chrome ==
+false`, gated on `Engine::menu_bar_toggleable`) shares the same reveal/hide mechanics;
+all are documented no-ops on a permanently-visible-menu-bar backend (GTK/macOS/Win).
+- `consume_hamburger_stale_click_guard(engine, event)` — one-shot spend of the #988/#1029
+  stale-click guard on the direct-dispatch path; call first, before any early exit
+- `disarm_hamburger_stale_click_guard(engine)` — spend the guard on the shell-consumed
+  path (a real `AppShellEvent` that never reaches `ShellApp::handle`)
+- `route_menu_bar_reveal(engine, event, stale_hamburger_corner_click, backend, ctx)` —
+  the #318 Alt+<letter> reveal shim + the stale-hamburger-corner hide
+- `menu_bar_intercept_rect(toggleable, cached, viewport_width)` — resolves the rect
+  `MenuSystem::handle`/`::render` hit-test against, with a one-row fallback for the
+  just-revealed-but-not-yet-painted frame
+- `sync_menu_bar_title_row(ctx, engine)` — keeps the runner `AppShell`'s title-bar row
+  reservation in sync with `engine.menu_bar_visible`
+- `route_hamburger_panel_changed(engine, panel_id)` — the hamburger's own
+  `AppShellEvent::PanelChanged`: reveals the bar, arms the stale-click guard on a genuine
+  reveal
+- `route_hamburger_sidebar_hidden(engine, ctx)` — the hamburger's own second click
+  (`AppShellEvent::SidebarHidden`): hides the bar again
+- `reclaim_hamburger_sidebar_reservation(engine, layout)` — corrects a frame's
+  `AppShellLayout` for the hamburger's phantom sidebar column
+- `sync_runner_sidebar_visibility(engine, ctx)` — keeps the runner `AppShell`'s sidebar
+  *visibility* in sync with the shadow, special-casing the hamburger reveal out of the
+  sync while it's in effect
 
 ## Shared Geometry Helpers (multi-backend)
 - `tab_row_height_px(line_height)` — tab row height as ceil(line_height * 1.6)
