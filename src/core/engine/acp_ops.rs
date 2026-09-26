@@ -460,6 +460,21 @@ impl Engine {
     /// ACP_CONTRACT_TESTS.md`'s "deliberately out of scope" section), so
     /// this is the only site MCP servers need wiring through.
     pub(crate) fn acp_begin_session(&mut self) {
+        // Review round 1 (#1462): compute and apply the wire/dropped/
+        // active-servers bookkeping only once there's an actual client to
+        // send `session/new` to. `acp_client` can already be `None` here —
+        // the agent process can die between `Initialized`/`Authenticated`
+        // and this call, a pre-existing race the surrounding code already
+        // guards for — and reporting servers as "active"/warning about
+        // drops for a `session/new` that was never sent would contradict
+        // `acp_active_mcp_servers`'s own doc comment ("what was actually
+        // sent"). Reset to empty on that branch instead, so a stale value
+        // from a previous session never survives a session that failed to
+        // start.
+        if self.acp_client.is_none() {
+            self.acp_active_mcp_servers.clear();
+            return;
+        }
         let cwd = self.acp_workspace_cwd();
         let configs = self.acp_resolve_mcp_servers();
         let (wire, dropped) =

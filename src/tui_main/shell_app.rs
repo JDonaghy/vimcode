@@ -16203,6 +16203,174 @@ mod tests {
         );
     }
 
+    /// #1462 (review round 1) acceptance: the `:AiAgent` status line's
+    /// `" | MCP: <names>"` suffix must actually paint on screen, not just
+    /// be true of `Engine::acp_agent_registry_status_line`'s return value
+    /// in isolation. Drives a real session start through `:AI hi` (the
+    /// fixture agent advertises `mcpCapabilities.http` via
+    /// `$ACP_FAKE_MCP_HTTP`, so the configured `http` server is sent, not
+    /// dropped), then types `:AiAgent` itself and reads the painted
+    /// command line — the same "engine.message renders verbatim" surface
+    /// `render_content_paints_command_line_via_shell_app` establishes.
+    ///
+    /// RED verified: reverting `Engine::acp_begin_session` to its
+    /// pre-#1462 `client.new_session(&cwd, vec![])` (so
+    /// `acp_active_mcp_servers` stays empty) makes this fail — the
+    /// `:AiAgent` screen shows no `MCP:` suffix at all.
+    #[cfg(unix)]
+    #[test]
+    fn ai_agent_status_line_shows_active_mcp_server_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // `Engine::new_for_test` seeds `settings_mtime: None`, which
+        // `check_settings_reload` treats as "reload unconditionally" the
+        // first time it runs (see `ctrl_b_clamped_scroll_lands_cursor_on_
+        // new_window_bottom_via_shell_app`'s doc comment for the full
+        // explanation) — it would otherwise stomp the `acp_agents`/
+        // `acp_mcp_servers` set below with whatever this *machine's real*
+        // `~/.config/vimcode/settings.json` happens to contain the first
+        // time `driver.tick()` runs. Consume that one-shot reload here,
+        // before configuring the fixture agent.
+        app.engine.check_settings_reload();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec![
+                "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                "ACP_FAKE_MCP_HTTP=1".to_string(),
+                "ACP_FAKE_AGENT_LABEL=Mcp1462".to_string(),
+            ],
+            mcp_servers: Vec::new(),
+        }];
+        app.engine.settings.acp_active_agent = "alpha".to_string();
+        app.engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+            name: "remoteMcp1462".to_string(),
+            transport: "http".to_string(),
+            url: "https://mcp.example.com".to_string(),
+            ..Default::default()
+        }];
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "AI hi".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello_Mcp1462") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello_Mcp1462"),
+            "session must start and reply within 5s; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AiAgent".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MCP: remoteMcp1462"),
+            "`:AiAgent`'s painted status line must name the MCP server the \
+             live session actually started with; screen:\n{screen}"
+        );
+    }
+
+    /// #1462 (review round 1) acceptance, the drop-warning half: when the
+    /// agent does NOT advertise `mcpCapabilities.http`, a configured
+    /// `http` MCP server is dropped and the warning must reach the
+    /// painted command line, not merely `engine.message` in isolation.
+    /// Session start is driven through the real `:AI hi` ex command, same
+    /// as the sibling test above, minus `$ACP_FAKE_MCP_HTTP`.
+    ///
+    /// RED verified: reverting `Engine::acp_begin_session` to its
+    /// pre-#1462 `client.new_session(&cwd, vec![])` (so the drop warning
+    /// is never assigned to `self.message`) makes this fail — the screen
+    /// right after `:AI hi` shows no `ACP:`/`dropped` text at all.
+    #[cfg(unix)]
+    #[test]
+    fn ai_agent_warns_about_dropped_mcp_server_via_shell_app() {
+        let mut app = TuiShellApp::new_for_test();
+        // See the sibling test above for why this must run before the
+        // fixture agent/MCP servers are configured: `check_settings_reload`
+        // would otherwise stomp them with this machine's real settings.json
+        // the first time `driver.tick()` runs.
+        app.engine.check_settings_reload();
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec!["ACP_FAKE_NO_TOOL_REQUEST=1".to_string()],
+            mcp_servers: Vec::new(),
+        }];
+        app.engine.settings.acp_active_agent = "alpha".to_string();
+        app.engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+            name: "droppedMcp1462".to_string(),
+            transport: "http".to_string(),
+            url: "https://mcp.example.com".to_string(),
+            ..Default::default()
+        }];
+
+        // 140 columns, not the usual 80: the command line shares its row
+        // with the AI sidebar's right border, leaving well under 80 columns
+        // of free width — not enough to fit
+        // "ACP: agent doesn't support dropped MCP server(s): droppedMcp1462"
+        // without truncating the server name off-screen.
+        let mut driver = driver_with_shell(app, config(), 140, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "AI hi".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        driver.render();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("droppedMcp1462") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("droppedMcp1462"),
+            "the painted command line must name the dropped MCP server \
+             within 5s of session start; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("ACP:") && screen.contains("dropped"),
+            "the painted command line must warn that the server was \
+             dropped, not merely mention its name; screen:\n{screen}"
+        );
+    }
+
     /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
     /// **dirty** buffer's unsaved in-memory content, not stale on-disk
     /// text — the single most important correctness property in the

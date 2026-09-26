@@ -6225,6 +6225,80 @@ second line here
         );
     }
 
+    /// #1462 (review round 1) acceptance, GTK's twin of `tui_main::
+    /// shell_app::tests::ai_agent_status_line_shows_active_mcp_server_via_
+    /// shell_app`: a `settings.acp_mcp_servers` entry the fixture agent
+    /// advertises `mcpCapabilities.http` for is sent on `session/new`, and
+    /// `:AiAgent` (the real ex-command path, via `execute_command`) paints
+    /// the server's name in its `" | MCP: <names>"` suffix — asserted on
+    /// the painted command line, not on `Engine::acp_agent_registry_status_
+    /// line`'s return value in isolation.
+    ///
+    /// RED verified: reverting `Engine::acp_begin_session` to its
+    /// pre-#1462 `client.new_session(&cwd, vec![])` (so `acp_active_mcp_
+    /// servers` stays empty) makes this fail — the `:AiAgent` screen shows
+    /// no `MCP:` suffix at all.
+    #[cfg(unix)]
+    #[test]
+    fn ai_agent_status_line_shows_active_mcp_server_on_gtk() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_MCP_HTTP=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=Mcp1462Gtk".to_string(),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+                name: "remoteMcp1462Gtk".to_string(),
+                transport: "http".to_string(),
+                url: "https://mcp.example.com".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_Mcp1462Gtk") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_Mcp1462Gtk"),
+            "session must start and reply within 5s"
+        );
+
+        h.engine.borrow_mut().execute_command("AiAgent");
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("MCP: remoteMcp1462Gtk"),
+            "`:AiAgent`'s painted status line must name the MCP server the \
+             live session actually started with; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// #1449 acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_shows_attached_current_buffer_chip_via_shell_app`: with
     /// `ai_attach_current_buffer` on (the default) and the active buffer
