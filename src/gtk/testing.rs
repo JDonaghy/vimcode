@@ -5584,6 +5584,49 @@ second line here
         );
     }
 
+    /// #1453: `:AI <message>` must *reveal* the AI panel, not just send the
+    /// message into it. Starts with the sidebar showing Explorer, never
+    /// touches `app_shell.show_panel(PANEL_AI)`/`ai_has_focus` directly the
+    /// way every other AI panel test in this file does, and drives the real
+    /// `execute_command` ex-command path.
+    ///
+    /// RED verified: with `execute.rs`'s `:AI` arm reverted to a bare
+    /// `self.ai_has_focus = true` (no `focus_sidebar_panel` call), this
+    /// fails — the screen keeps showing the Explorer tree, never "AI
+    /// ASSISTANT" or the sent message, because `app_shell`'s active panel
+    /// (what GTK's sidebar paint dispatch actually reads) never moved off
+    /// Explorer.
+    #[test]
+    fn ai_command_reveals_panel_from_collapsed_sidebar() {
+        use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+        let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let mut h = panel_harness(PANEL_EXPLORER);
+        assert!(
+            !h.driver.screen_contains("AI ASSISTANT"),
+            "precondition: the AI panel is not yet visible"
+        );
+
+        h.engine.borrow_mut().execute_command("AI hello");
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("AI ASSISTANT"),
+            ":AI must reveal the AI panel even though it started hidden \
+             behind Explorer (#1453)"
+        );
+        assert!(
+            h.driver.screen_contains("hello") && h.driver.screen_contains("You"),
+            "the sent message must be visible in the now-revealed panel's \
+             transcript"
+        );
+    }
+
     /// AI: the transcript must scroll — messages painted while stuck to the
     /// tail must no longer include the earliest message once scrolled up,
     /// and scrolling must reveal it. `ChatController` follows the tail by
