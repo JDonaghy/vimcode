@@ -183,6 +183,14 @@ pub struct Harness<A: AppLogic> {
     /// (nav arrows + search box) must never paint past this rect's left
     /// edge — see `command_center_does_not_overlap_window_controls`.
     pub title_bar_rect: Rc<Cell<quadraui::Rect>>,
+    /// The last inline window-control action dispatched (`render::
+    /// WINDOW_MINIMIZE_ACTION` / `_MAXIMIZE_ACTION` / `_CLOSE_ACTION`), or
+    /// `None` before any click (#1530). See `App::last_window_control_
+    /// action`'s own doc for why minimize/maximize need this seam at all:
+    /// this harness's `Backend::window()` is always `None` (module doc, "No
+    /// window"), so `WindowControl::minimize`/`toggle_window_maximize`
+    /// leave no other headlessly-observable trace.
+    pub last_window_control_action: Rc<Cell<Option<&'static str>>>,
     /// The full menu-bar row band the last frame laid out (`layout
     /// .title_bar_bounds`), or a default (zero) rect before the first frame
     /// (#720). Aim app-icon pixel probes at
@@ -489,6 +497,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
     let status_segment_map = Rc::clone(&app.status_segment_map);
     let separated_status_bar_rect = Rc::clone(&app.separated_status_bar_rect);
     let title_bar_rect = Rc::clone(&app.title_bar_rect);
+    let last_window_control_action = Rc::clone(&app.last_window_control_action);
     let menu_row_rect = Rc::clone(&app.menu_row_rect);
     let dialog_layout = Rc::clone(&app.dialog_layout);
     let context_menu_layout = Rc::clone(&app.context_menu_layout);
@@ -515,6 +524,7 @@ pub fn harness(engine: Engine, width: i32, height: i32) -> Harness<impl AppLogic
         status_segment_map,
         separated_status_bar_rect,
         title_bar_rect,
+        last_window_control_action,
         menu_row_rect,
         dialog_layout,
         context_menu_layout,
@@ -16016,6 +16026,160 @@ mod issue_857_titlebar_close_button {
             h.driver.exited(),
             "GtkDriver::exited() must latch — the black-box stand-in \
              for the process actually exiting cleanly"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_1530_titlebar_minimize_button {
+    //! #1530: the custom titlebar painted only **maximize** and **close** —
+    //! **minimize** was missing. Root cause was geometric, not the #715
+    //! glyph-contrast bug: `measure_title_bar_bands` (#676) narrows the
+    //! `controls` rect to *exactly* the three buttons' painted width
+    //! (measured against the wide `full` band, where `StatusBar::layout`'s
+    //! `min_gap` subtraction never goes negative), but `paint_title_bar_band`
+    //! then repaints at that narrower rect — and with no left segments to
+    //! spend the `min_gap` against, `bar_width == total_right` makes the
+    //! identical subtraction go negative and silently drops the front
+    //! (lowest-priority) segment: minimize.
+    //!
+    //! `window_minimize`/`window_toggle_maximize` both route through
+    //! `Backend::window()`, which this harness reports `None` from (module
+    //! doc, "No window") — a live `gtk4::Window` never exists here, so a
+    //! click has no other headlessly-observable effect. `App::
+    //! last_window_control_action` (#1530) is the same kind of test-only
+    //! seam `native_dialog_shown`/`pending_native_dialog` already are for
+    //! `window_close`'s quit-confirm path.
+    use super::*;
+
+    /// Presses then releases the left mouse button over the centre of the
+    /// window-control glyph whose padded label contains `needle`, located
+    /// exactly the way [`click_titlebar_close_button`] (sibling module)
+    /// locates the × button — never a hardcoded coordinate.
+    fn click_titlebar_glyph<A: AppLogic>(h: &mut Harness<A>, needle: &str) -> quadraui::Reaction {
+        let controls = h.title_bar_rect.get();
+        assert!(
+            controls.width > 0.0,
+            "window controls must have painted a non-degenerate rect \
+             before a click can be aimed at them"
+        );
+        let bounds = h.driver.find_bounds(needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar control {needle:?} must have painted \
+                 before a click can be aimed at it; painted runs this \
+                 frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        assert!(
+            bounds.x >= controls.x && bounds.x + bounds.width <= controls.x + controls.width + 0.5,
+            "sanity: the painted {needle:?} label must sit inside the \
+             window-control band this frame; bounds={bounds:?} \
+             controls={controls:?}"
+        );
+        let x = bounds.x + bounds.width / 2.0;
+        let y = bounds.y + bounds.height / 2.0;
+        h.driver.mouse_down(x, y);
+        h.driver.mouse_up(x, y)
+    }
+
+    /// **Verified RED against unfixed `develop`:** before the #1530 fix,
+    /// `measure_title_bar_bands` narrows `controls` to exactly the three
+    /// buttons' width and `paint_title_bar_band`'s repaint at that width
+    /// re-triggers `StatusBar::layout`'s min-gap priority-drop, which drops
+    /// `right_segments[0]` — minimize, the first segment in
+    /// `window_controls_status_bar`'s list. `find_bounds` for the minimize
+    /// needle returns `None` and this test panics before a single assertion
+    /// runs.
+    #[test]
+    fn titlebar_paints_three_distinct_window_control_glyphs() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        let minimize_needle = format!("  {}  ", crate::icons::WINDOW_MINIMIZE.s());
+        let maximize_needle = format!("  {}  ", crate::icons::WINDOW_MAXIMIZE.s());
+        let close_needle = format!("  {}  ", crate::icons::WINDOW_CLOSE.s());
+
+        let minimize = h.driver.find_bounds(&minimize_needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar minimize button never painted; \
+                 painted runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        let maximize = h.driver.find_bounds(&maximize_needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar maximize button never painted; \
+                 painted runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        let close = h.driver.find_bounds(&close_needle).unwrap_or_else(|| {
+            panic!(
+                "the inline titlebar close button never painted; painted \
+                 runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        assert!(
+            minimize.x + minimize.width <= maximize.x + 0.5,
+            "minimize must paint strictly left of maximize (VS Code/\
+             Electron ordering); minimize={minimize:?} maximize={maximize:?}"
+        );
+        assert!(
+            maximize.x + maximize.width <= close.x + 0.5,
+            "maximize must paint strictly left of close; \
+             maximize={maximize:?} close={close:?}"
+        );
+
+        let controls = h.title_bar_rect.get();
+        for (name, bounds) in [
+            ("minimize", minimize),
+            ("maximize", maximize),
+            ("close", close),
+        ] {
+            assert!(
+                bounds.x >= controls.x
+                    && bounds.x + bounds.width <= controls.x + controls.width + 0.5,
+                "{name} must paint inside the measured window-control \
+                 band; bounds={bounds:?} controls={controls:?}"
+            );
+        }
+    }
+
+    /// **Verified RED against unfixed `develop`:** [`click_titlebar_glyph`]
+    /// panics before this test's own assertions run, for the identical
+    /// reason `titlebar_paints_three_distinct_window_control_glyphs` is RED
+    /// — the minimize glyph never paints, so there is no rect to aim the
+    /// click at.
+    #[test]
+    fn titlebar_minimize_click_dispatches_minimize() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 800, 600);
+        h.driver.render();
+
+        assert_eq!(
+            h.last_window_control_action.get(),
+            None,
+            "sanity: no window-control action should be recorded before \
+             the click"
+        );
+
+        let needle = format!("  {}  ", crate::icons::WINDOW_MINIMIZE.s());
+        let reaction = click_titlebar_glyph(&mut h, &needle);
+
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Redraw,
+            "clicking the inline titlebar minimize button must redraw"
+        );
+        assert_eq!(
+            h.last_window_control_action.get(),
+            Some(crate::render::WINDOW_MINIMIZE_ACTION),
+            "clicking the painted minimize glyph must dispatch \
+             App::window_minimize, not maximize/close or nothing at all"
         );
     }
 }
