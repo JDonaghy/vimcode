@@ -1607,6 +1607,13 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // its own `// #1426 gate:` comment in `app_on_tui_tests.rs` with the
     // corrected root cause.
     //
+    // #1427 fixed the "feature" pair below (`App::setup`'s `BackendCaps::
+    // window_chrome`/`native_menu` three-way branch — the "menu-bar caps"
+    // target these two entries named) — `known_bug_gate`'s `FixLanded`
+    // panic on each confirmed it, so they're gone from this list; the
+    // remaining two (quadraui, product×2) are unrelated to menu-bar
+    // visibility and still open.
+    //
     // category: quadraui (`quadraui::native_dialog_options` reports a
     // `Dialog` as "natively expressible" whenever it has no table/input,
     // with no backend-capability gate — so `App::render_content` queues a
@@ -1626,13 +1633,6 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // doesn't open a terminal pane through `App` — a dispatch gap unrelated
     // to geometry units) — target: TBD, needs its own filed issue.
     "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
-    // category: feature (`App` unconditionally reserves and paints its own
-    // GTK-style menu-bar row on every backend; the shipped TUI shell only
-    // shows that row in vscode-mode or when Alt-revealed, so the tab bar
-    // sits on a different row than the shipped TUI's own fixture expects)
-    // — target: menu-bar caps (conditional menu-bar reveal on `App`).
-    "app_on_tui::render_content_paints_single_group_tab_bar_via_shell_app",
-    "app_on_tui::two_groups_paint_two_tab_bars",
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
@@ -2731,6 +2731,24 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         engine.explorer_expanded.insert(dir.clone());
         engine.explorer_rebuild_rows();
         engine.session.explorer_visible = true;
+        // #1427: `session.explorer_visible` alone only reaches the shadow
+        // `engine.app_shell`'s `sidebar_visible()` through
+        // `Engine::sync_app_shell_sidebar_visibility`, which already ran
+        // (inside `Engine::new_for_test()`, above) *before* this line set
+        // the field — the same "mutate an already-built Engine" gap that
+        // method's own doc describes. `TuiShellApp::from_engine` (the
+        // `tui_prod` arm's constructor) re-runs that sync itself, picking
+        // this up; the `tui` arm's `App::new_headless_with_backend` does
+        // not, so the shadow's `sidebar_visible()` would otherwise stay
+        // stale-`false` — which `render::sync_runner_sidebar_visibility`
+        // (called unconditionally on every dispatch, #1427) then mirrors
+        // onto the *runner's* own `AppShell`, collapsing the sidebar
+        // column entirely after the very first click and erasing the
+        // chevron-expand this scenario asserts on. `show_panel` sets the
+        // shadow's `sidebar_visible` directly, sidestepping the staleness.
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
         engine
     }
 
@@ -2965,6 +2983,16 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
         let mut engine = Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
         engine.settings.minimap = false;
+        // #1427: pin the shadow `engine.app_shell`'s sidebar open (on
+        // whichever panel — this scenario never looks at sidebar content,
+        // only column geometry) so `render::sync_runner_sidebar_visibility`
+        // (called unconditionally on every dispatch) doesn't collapse the
+        // runner's sidebar column mid-drag, shifting every column this
+        // scenario measures. See `engine_with_collapsed_explorer_dir`'s
+        // identical fix, above, for the full mechanics.
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
 
         let buf_left = engine.active_buffer_id();
         let left_content: String = (0..2000).map(|i| format!("leftline{i}_{tag}\n")).collect();
@@ -4538,7 +4566,29 @@ mod issue_1064_take_requested_panel {
 
     #[test]
     fn tui() {
-        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 800, 480);
+        // #1427: `App::shell_config`'s `cell`-profile hamburger
+        // `PanelDefinition` now occupies index 0 in the *runner's* fresh
+        // `AppShell` (`quadraui::AppShell::new` always activates index 0),
+        // so a bare `engine_fixture()` — whose shadow `engine.app_shell`
+        // starts hidden, matching `Engine::new_for_test()`'s deterministic
+        // default — paints "Menu" (the hamburger's own header) at frame
+        // zero instead of "EXPLORER". Pin the shadow's sidebar open on
+        // Explorer up front (matching this scenario's own doc, "both start
+        // with the sidebar open on Explorer") and land one reconciling
+        // dispatch — the same `WindowFocused` "poke" pattern
+        // `render::sync_runner_sidebar_visibility`'s own doc and every
+        // hamburger scenario in `issue_1427_menu_bar_reveal_shared` uses —
+        // so `ShellApp::take_requested_panel` steers the runner's chrome
+        // onto Explorer before this scenario's own precondition reads it.
+        // `gtk` needs neither: GTK never registers the hamburger panel, so
+        // its runner already defaults to Explorer at index 0.
+        let mut engine = engine_fixture();
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.session.explorer_visible = true;
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 800, 480);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
         app_initiated_switch_reconciles_runner_chrome(&mut h.driver, &h.engine);
     }
 
@@ -5325,5 +5375,303 @@ mod issue_1418_explorer_context_menu {
                  unscoped"
             );
         },
+    }
+}
+
+/// #1427: the TUI menu-bar reveal/hide rung (the #318 Alt+<letter> shim,
+/// the #988/#1029 hamburger-corner-click guard, and the hamburger panel's
+/// own reveal/hide) lifted out of `TuiShellApp` into shared `render.rs`
+/// functions (`route_menu_bar_reveal`, `route_hamburger_panel_changed`,
+/// `route_hamburger_sidebar_hidden`, `sync_menu_bar_title_row`,
+/// `reclaim_hamburger_sidebar_reservation`) so `App` — the cross-backend-
+/// shared shell every `gtk`/`tui`/`macos`/`win` conformance arm already
+/// drives — shares them too, gated on `BackendCaps::window_chrome` in
+/// `App::setup` rather than reimplemented per backend.
+///
+/// These are `tui`-arm ports of scenarios that, before #1427, only existed
+/// as `TuiShellApp`-only unit tests in `src/tui_main/shell_app.rs` (still
+/// present there, unchanged, as the `tui_prod` proof the shipped TUI binary
+/// keeps agreeing with the shared implementation): `alt_letter_reveals_
+/// menu_bar_via_shell_app`, `driver_click_on_settings_toggle_with_menu_bar_
+/// visible_flips_its_own_row_via_shell_app`, `hamburger_relocated_click_
+/// after_reveal_hides_menu_bar`, and `hamburger_stale_click_position_after_
+/// reveal_still_hides_menu_bar`. Driving `App` on `quadraui::tui::TuiBackend`
+/// (via `crate::tui_main::testing::conformance_harness`) rather than
+/// `TuiShellApp` proves the shared implementation, not a second TUI-only
+/// reimplementation of it — see this module's own header doc, "Why `App`,
+/// not a fresh mock".
+#[cfg(test)]
+mod issue_1427_menu_bar_reveal_shared {
+    use super::*;
+    use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+    fn engine_fixture() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine
+    }
+
+    /// [`engine_fixture`], plus the sidebar pinned open on Explorer — the
+    /// `App`-on-`TuiBackend` twin of `shell_app.rs`'s own
+    /// `app_with_sidebar_open` fixture, needed for the same two reasons
+    /// that helper documents: (1) `Engine::new_for_test()`'s sidebar is
+    /// hidden by default (`default_explorer_visible()` — a deterministic
+    /// fixture must not depend on ambient `~/.config/vimcode` state, unlike
+    /// a bare `App::new`/`TuiShellApp::new`), which would leave the File
+    /// dropdown painting flush against the left edge and erasing an
+    /// editor-offset-0 marker; and (2), specific to the hamburger tests
+    /// below: `App::shell_config`'s `cell`-profile hamburger
+    /// `PanelDefinition` occupies index 0 in the *runner's* fresh
+    /// `AppShell` (`quadraui::AppShell::new` always activates index 0),
+    /// so the very first hamburger click only produces the reveal
+    /// (`AppShellEvent::PanelChanged`) this scenario needs — rather than a
+    /// toggle-hide (`SidebarHidden`, `AppShell::handle_activity_click`'s
+    /// "already active and visible" branch) — once construction's initial
+    /// `take_requested_panel` poll has somewhere real (Explorer) to
+    /// reconcile the runner onto first. Explicit `show_panel` (which also
+    /// sets `sidebar_visible: true`) rather than relying solely on
+    /// `session.explorer_visible` is what actually flips the shadow
+    /// `engine.app_shell` here — the session field alone only take effect
+    /// through `Engine::sync_app_shell_sidebar_visibility`, which runs once
+    /// at construction, before this fixture gets a chance to set it.
+    fn engine_with_sidebar_open() -> Engine {
+        let mut engine = engine_fixture();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.session.explorer_visible = true;
+        engine
+    }
+
+    /// Port of `alt_letter_reveals_menu_bar_via_shell_app` (`shell_app.rs`):
+    /// Alt+F must reveal the (hidden by default) menu bar *and* hand the
+    /// same keystroke to the `MenuSystem` intercept, which activates the
+    /// File menu — both of which redraw, and the reveal reserves one more
+    /// row above the editor content, shifting a marker at buffer offset 0
+    /// down by exactly one line.
+    #[test]
+    fn alt_letter_reveals_menu_bar_via_app_on_tui() {
+        let mut engine = engine_with_sidebar_open();
+        engine.buffer_mut().insert(0, "ZQXW_ALT_MARKER");
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+
+        let before = h.driver.screen();
+        let before_row = before
+            .lines()
+            .position(|l| l.contains("ZQXW_ALT_MARKER"))
+            .expect("marker should paint before the Alt-reveal keypress");
+
+        let reaction = h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+            key: quadraui::Key::Char('f'),
+            modifiers: quadraui::Modifiers {
+                alt: true,
+                ..quadraui::Modifiers::default()
+            },
+            repeat: false,
+        });
+        assert_eq!(
+            reaction,
+            quadraui::Reaction::Redraw,
+            "Alt+F should reveal + activate the File menu, both of which redraw"
+        );
+
+        let after = h.driver.screen();
+        let after_row = after
+            .lines()
+            .position(|l| l.contains("ZQXW_ALT_MARKER"))
+            .unwrap_or_else(|| {
+                panic!("marker should still paint after the Alt-reveal keypress; after:\n{after}")
+            });
+        assert_eq!(
+            after_row,
+            before_row + 1,
+            "revealing the menu bar should reserve one more row above the \
+             editor content, shifting the marker down by exactly one line; \
+             before:\n{before}\nafter:\n{after}"
+        );
+    }
+
+    /// Port of `driver_click_on_settings_toggle_with_menu_bar_visible_
+    /// flips_its_own_row_via_shell_app`: with the menu bar already visible
+    /// (occupying its own reserved row above the sidebar/activity bar,
+    /// `render::sync_menu_bar_title_row`'s seeded-at-construction half —
+    /// `App::shell_config`'s `cell`-profile `has_title_bar` branch), a click
+    /// on a settings toggle row still resolves to the *painted* row, not a
+    /// stale one-row-too-high guess.
+    #[test]
+    fn driver_click_on_settings_toggle_with_menu_bar_visible_flips_its_own_row_via_app_on_tui() {
+        use crate::core::engine::sidebar::PANEL_SETTINGS;
+
+        let mut engine = engine_fixture();
+        engine.menu_bar_visible = true;
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        assert!(
+            engine.settings.cursorline,
+            "fixture assumes cursorline defaults to true"
+        );
+
+        let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+        let before = h
+            .driver
+            .find_bounds("Cursor Line")
+            .expect("the \"Cursor Line\" toggle row must paint");
+
+        // Click mid-row (not on the label's own first cell) — the whole
+        // row is the control's hit target, so this still proves the click
+        // resolved to *this* row's control, not a fluke hit on the label
+        // glyph itself.
+        h.driver.click(before.x + 2.0, before.y);
+
+        let screen = h.driver.screen();
+        let clicked_row = screen.lines().nth(before.y as usize).unwrap_or_default();
+        assert!(
+            clicked_row.contains("[ ]"),
+            "clicking the \"Cursor Line\" row should flip its own toggle off (was \"[x]\"); \
+             row:\n{clicked_row}\nfull screen:\n{screen}"
+        );
+    }
+
+    /// Port of `hamburger_relocated_click_after_reveal_hides_menu_bar`: a
+    /// full reveal → correctly-relocated-hide → reveal cycle through the
+    /// hamburger `PanelDefinition`'s own click path
+    /// (`render::route_hamburger_panel_changed` /
+    /// `render::route_hamburger_sidebar_hidden`), each click re-located from
+    /// the frame the *previous* click actually painted — never a stored
+    /// coordinate, so a real row-shift bug can't hide behind a stale
+    /// assertion.
+    #[test]
+    fn hamburger_relocated_click_after_reveal_hides_menu_bar_via_app_on_tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 80, 24);
+        h.driver.set_double_click_folding(false);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            h.driver.screen()
+        );
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx1, hy1) = h
+            .driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        h.driver.click(hx1, hy1);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("File"),
+            "first hamburger click must reveal the menu row; screen:\n{}",
+            h.driver.screen()
+        );
+
+        let (hx2, hy2) = h
+            .driver
+            .find(hamburger)
+            .expect("hamburger icon must still paint with the menu bar open");
+        assert_ne!(
+            (hx1, hy1),
+            (hx2, hy2),
+            "sanity: revealing the menu bar must shift the hamburger's own \
+             row, or this test isn't exercising the row-shift this issue is \
+             about"
+        );
+        h.driver.click(hx2, hy2);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("File"),
+            "second hamburger click, correctly re-located, must hide the \
+             menu row again; screen:\n{}",
+            h.driver.screen()
+        );
+
+        let (hx3, hy3) = h
+            .driver
+            .find(hamburger)
+            .expect("hamburger icon must still paint with the menu bar hidden again");
+        assert_eq!(
+            (hx1, hy1),
+            (hx3, hy3),
+            "sanity: hiding the menu bar must shift the hamburger back to \
+             its original row"
+        );
+        h.driver.click(hx3, hy3);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("File"),
+            "a third hamburger click must reveal the menu row again — the \
+             toggle must survive a second on/off cycle, not just the \
+             first; screen:\n{}",
+            h.driver.screen()
+        );
+    }
+
+    /// Port of `hamburger_stale_click_position_after_reveal_still_hides_
+    /// menu_bar` (#988/#1029): a second click at the *same physical
+    /// position* the first (reveal) click used — the stale-position muscle
+    /// memory a hamburger reveal leaves behind — must still hide the menu
+    /// bar via `render::route_menu_bar_reveal`'s stale-corner-click guard,
+    /// rather than falling into the `MenuSystem` intercept and opening
+    /// whichever menu now paints at that column.
+    #[test]
+    fn hamburger_stale_click_position_after_reveal_still_hides_menu_bar_via_app_on_tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 80, 24);
+        h.driver.set_double_click_folding(false);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "precondition: menu bar starts hidden; screen:\n{}",
+            h.driver.screen()
+        );
+
+        let hamburger = crate::icons::HAMBURGER.s();
+        let (hx1, hy1) = h
+            .driver
+            .find(hamburger)
+            .expect("hamburger icon must paint on the activity bar");
+        h.driver.click(hx1, hy1);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("File"),
+            "first hamburger click must reveal the menu row; screen:\n{}",
+            h.driver.screen()
+        );
+
+        let (hx2, hy2) = h
+            .driver
+            .find(hamburger)
+            .expect("hamburger icon must still paint with the menu bar open");
+        assert_ne!(
+            (hx1, hy1),
+            (hx2, hy2),
+            "sanity: revealing the menu bar must shift the hamburger's own \
+             row, or this test isn't exercising the row-shift this issue is \
+             about"
+        );
+
+        // Deliberately the SAME `(hx1, hy1)` as the first click.
+        h.driver.click(hx1, hy1);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("File"),
+            "second click at the SAME physical position the first click \
+             used must hide the menu row again (#988); screen:\n{}",
+            h.driver.screen()
+        );
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "the stale second click must not open the File dropdown \
+             (the #988 symptom); screen:\n{}",
+            h.driver.screen()
+        );
     }
 }
