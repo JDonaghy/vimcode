@@ -267,6 +267,19 @@ mod tests {
 
     /// Unique scratch dir per test — same manual pattern `review_ops.rs`'s
     /// own `unique_temp_dir` uses.
+    ///
+    /// #1504: canonicalized before returning. Production records paths via
+    /// `resolve_path_within_roots` (see `acp_ops.rs`), which canonicalizes
+    /// the resolved path's existing ancestor — so every path this module's
+    /// engine records (review entries, checkpoint entries) is canonical.
+    /// On Linux `$TMPDIR` is already canonical, so this was a no-op there
+    /// and the mismatch never showed up; on macOS `$TMPDIR` lives under
+    /// `/var`, a symlink to `/private/var`, so an un-canonicalized expected
+    /// path (built by joining onto this dir) compared `/var/...` against
+    /// the engine's recorded `/private/var/...` and failed. Canonicalizing
+    /// once here, at the one place every test derives both its on-disk
+    /// paths and its expected strings from, keeps the two in agreement on
+    /// every OS.
     fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "acp-turn-ops-{tag}-{}-{}",
@@ -277,7 +290,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        dir.canonicalize().unwrap_or(dir)
     }
 
     /// #1460's own words: "the turn review lists all 3" — a fake agent
