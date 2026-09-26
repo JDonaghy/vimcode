@@ -3707,4 +3707,153 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Mouse wheel scroll polarity (#1433)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod mouse_scroll {
+        use super::*;
+        use quadraui::{Point, ScrollDelta, UiEvent};
+
+        /// Buffer long enough that a viewport scroll cannot be clamped away
+        /// — the TUI-on-`App` twin of `crate::gtk::testing`'s identically
+        /// purposed `engine_with_long_buffer`.
+        fn engine_with_long_buffer() -> crate::core::Engine {
+            let mut engine = plain_engine();
+            let text: String = (0..500).map(|i| format!("line {i}\n")).collect();
+            engine.buffer_mut().insert(0, &text);
+            engine
+        }
+
+        /// #554, re-verified now that `UiEvent::Scroll` reaches `App` from
+        /// the *TUI* runner (`tui_main::run`'s flip onto `App`, #1433)
+        /// instead of only ever from GTK — the direct model here is
+        /// `crate::gtk::testing`'s
+        /// `gdk_wheel_down_scrolls_the_viewport_down_not_up`, whose "Half 2"
+        /// (what a real `UiEvent::Scroll` does to the engine through
+        /// production dispatch) is exactly what this ports, since
+        /// `App::handle_dispatch`'s `UiEvent::Scroll` arm — the negate-back-
+        /// to-GTK-raw-polarity code #554 fixed — is backend-neutral and
+        /// runs unmodified for both backends' drivers.
+        ///
+        /// Also exercises the #1433 item-4 refactor of
+        /// `App::handle_mouse_scroll_msg`'s hovered-window lookup onto
+        /// `render::find_window_at` (previously a hand-rolled
+        /// `calculate_group_window_rects` scan): if that lookup ever
+        /// resolved the wrong window, or no window at all, the scroll
+        /// would silently no-op instead of moving `scroll_top`.
+        ///
+        /// RED-verified: temporarily dropping the `-` in
+        /// `App::handle_dispatch`'s `self.handle_mouse_scroll_msg(&*backend,
+        /// delta.x as f64, -(delta.y as f64))` (passing `delta.y` straight
+        /// through) makes the "wheel down" assertion below fail —
+        /// `scroll_top` stays `0` instead of rising, since a quadraui-
+        /// convention `delta.y` of `-1.0` (scroll down) would then reach
+        /// `handle_mouse_scroll_msg` un-negated and `scroll_up_visible` at
+        /// `scroll_top == 0` clamps to `0`.
+        #[test]
+        fn wheel_down_scrolls_the_viewport_down_not_up() {
+            let mut h = harness(engine_with_long_buffer());
+            let win = h.engine.borrow().active_window_id();
+            let rect = h
+                .screen_layout
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.windows.first().map(|w| w.rect))
+                .expect("the editor window must have painted a rect");
+            let x = (rect.x + rect.width / 2.0) as f32;
+            let y = (rect.y + rect.height / 2.0) as f32;
+
+            // quadraui convention: negative delta.y = scroll down.
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                position: Point::new(x, y),
+                delta: ScrollDelta::new(0.0, -1.0),
+            });
+            let after_down = h.engine.borrow().windows[&win].view.scroll_top;
+            assert!(
+                after_down > 0,
+                "wheel down must move the viewport DOWN (scroll_top 0 -> >0), \
+                 got {after_down} — direction is inverted (#554)"
+            );
+
+            // ...and the opposite notch walks it back, so this cannot pass
+            // by a consumer that ignores the sign entirely.
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                position: Point::new(x, y),
+                delta: ScrollDelta::new(0.0, 1.0),
+            });
+            let after_up = h.engine.borrow().windows[&win].view.scroll_top;
+            assert!(
+                after_up < after_down,
+                "wheel up must move the viewport back UP ({after_down} -> {after_up})"
+            );
+        }
+
+        /// #1433 item 4: `App::handle_mouse_scroll_msg`'s hovered-window
+        /// lookup — freshly refactored onto `render::find_window_at`
+        /// against `self.cached_screen_layout`, replacing a hand-rolled
+        /// `calculate_group_window_rects` scan — must resolve the
+        /// *unfocused* pane the pointer is actually over, not just fall
+        /// back to the active window. Direct TUI-on-`App` port of
+        /// `crate::gtk::testing`'s
+        /// `wheel_scrolls_the_pane_under_the_pointer_not_the_focused_one`.
+        ///
+        /// RED-verified: forcing `hovered_window_id` to always resolve to
+        /// `None` (e.g. by making the `render::find_window_at` call always
+        /// return `None`) makes the first assertion below fail — the
+        /// scroll would then land on the *focused* window (the `unwrap_or
+        /// (active_id)` fallback) instead of the unfocused one under the
+        /// pointer, leaving `unfocused`'s `scroll_top` at `0`.
+        #[test]
+        fn wheel_scrolls_the_pane_under_the_pointer_not_the_focused_one() {
+            let mut h = harness(engine_with_long_buffer());
+            h.engine
+                .borrow_mut()
+                .split_window(SplitDirection::Horizontal, None);
+            // Repaint so `cached_screen_layout` carries both panes' rects.
+            h.driver.render();
+
+            let focused = h.engine.borrow().active_window_id();
+            let unfocused = *h
+                .engine
+                .borrow()
+                .windows
+                .keys()
+                .find(|id| **id != focused)
+                .expect("`:split` must produce a second window");
+
+            let unfocused_rect = h
+                .screen_layout
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.windows.iter().find(|w| w.window_id == unfocused))
+                .map(|w| w.rect)
+                .expect("the unfocused pane must have painted a rect");
+            let ux = (unfocused_rect.x + unfocused_rect.width / 2.0) as f32;
+            let uy = (unfocused_rect.y + unfocused_rect.height / 2.0) as f32;
+
+            h.driver.dispatch(UiEvent::Scroll {
+                widget: None,
+                position: Point::new(ux, uy),
+                delta: ScrollDelta::new(0.0, -1.0),
+            });
+
+            assert!(
+                h.engine.borrow().windows[&unfocused].view.scroll_top > 0,
+                "wheel over the unfocused pane must scroll it (scroll_top stayed 0)"
+            );
+            assert_eq!(
+                h.engine.borrow().windows[&focused].view.scroll_top,
+                0,
+                "wheel over the unfocused pane must NOT scroll the focused pane"
+            );
+            assert_eq!(
+                h.engine.borrow().active_window_id(),
+                focused,
+                "hovering to scroll must not move focus"
+            );
+        }
+    }
 }

@@ -865,8 +865,20 @@ impl TuiShellApp {
     }
 
     /// Construct the app, running the engine-only startup work that
-    /// `tui_main::run()` currently does before entering raw mode
-    /// (`mod.rs:641`-`:678`) — none of it needs a terminal or backend.
+    /// `tui_main::run()` used to do before entering raw mode.
+    ///
+    /// #1433: `tui_main::run()` no longer calls this — it builds
+    /// `crate::app::App` instead (see that function's own doc). This
+    /// constructor, and every other inherent method below gated the same
+    /// way, stay reachable for two callers that are not the shipped binary:
+    /// the in-crate `#[cfg(test)] mod tests` suite in this file (the
+    /// `tui_prod` conformance arm's regression bar, per that suite's own
+    /// module doc) and, until the coordinator re-points it (see #1433's own
+    /// issue body), the sealed `tests/acceptance/ms-example/seam_657.rs`
+    /// slice — an external crate, built with `feature = "test-support"` but
+    /// *not* `cfg(test)`, which is why the gate below is `any(test,
+    /// feature = "test-support")` rather than plain `#[cfg(test)]`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(file_path: Option<PathBuf>) -> Self {
         Self::from_engine(Engine::new(), file_path, true)
     }
@@ -946,6 +958,12 @@ impl TuiShellApp {
     /// own arguments, and `startup_without_session_restore(None)` is a
     /// no-op when `file_path` is `None` (see `Engine::startup_inner`), so
     /// this never overwrites whatever state the fixture already set up.
+    ///
+    /// #1433: gated the same as [`TuiShellApp::new`] above — its only
+    /// remaining callers are that constructor, [`TuiShellApp::new_for_test`]
+    /// (both `#[cfg(test)]`) and `testing::conformance_harness_prod`
+    /// (`#[cfg(test)]`), none of which run in the shipped binary anymore.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_engine(
         mut engine: Engine,
         file_path: Option<PathBuf>,
@@ -1103,6 +1121,16 @@ impl TuiShellApp {
     /// live in `setup()` rather than here or in the wrapper that calls
     /// this. This method only records the caller's intent; it doesn't do
     /// either operation itself.
+    ///
+    /// #1433: `tui_main::run()` no longer calls this (it builds
+    /// `crate::app::App`, whose own `live` field `App::new_portable` already
+    /// sets — see that constructor's doc) — the in-crate `#[cfg(test)]`
+    /// suite below is the only remaining caller. `pub(super)` visibility
+    /// means this was never reachable from the `test-support`-only
+    /// acceptance crate anyway, so `#[cfg(test)]` alone (not `any(test,
+    /// feature = "test-support")`) is the right gate here, unlike its
+    /// siblings above.
+    #[cfg(test)]
     pub(super) fn prepare_for_live_run(&mut self) {
         self.live = true;
     }
@@ -1165,6 +1193,17 @@ impl TuiShellApp {
     /// (`quadraui::tui::shell_runner`) reads to decide whether to call
     /// `AppShell::with_title_bar` at construction — setting them directly
     /// here is simpler than routing through that builder twice.
+    ///
+    /// #1433: `tui_main::run()` builds `crate::app::App` now and derives its
+    /// `ShellConfig` from `App::shell_config()` instead — see that method's
+    /// doc for why the panel/icon-table logic here has a shared,
+    /// `App`-side twin rather than being deleted outright. Gated like
+    /// [`TuiShellApp::new`] (see that method's doc for why `any(test,
+    /// feature = "test-support")` rather than plain `#[cfg(test)]`) — the
+    /// in-crate test suite below and the not-yet-repointed
+    /// `tests/acceptance/ms-example/seam_657.rs` both still call this
+    /// directly.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn build_shell_config(menu_bar_visible: bool) -> quadraui::ShellConfig {
         fn panel(id: &str, icon: &str, title: &str, tooltip: &str) -> quadraui::PanelDefinition {
             quadraui::PanelDefinition {
@@ -1263,6 +1302,14 @@ impl TuiShellApp {
     /// `ctx.panel_registrations` drain runs after every Lua callback), so this
     /// only seeds frame zero — [`Self::sync_ext_activity_panels`] keeps the
     /// live `AppShell` converged from there.
+    ///
+    /// #1433: `tui_main::run()` no longer calls this — `App::shell_config()`
+    /// reads `engine.ext_activity_panels()` itself (see that method's doc),
+    /// so it is already "live" without needing a separate variant. `pub(super)`
+    /// visibility means this was never reachable from the `test-support`-only
+    /// acceptance crate anyway, so `#[cfg(test)]` alone is the right gate,
+    /// matching [`TuiShellApp::prepare_for_live_run`].
+    #[cfg(test)]
     pub(super) fn live_shell_config(engine: &Engine) -> quadraui::ShellConfig {
         let mut cfg = Self::build_shell_config(engine.menu_bar_visible);
         cfg.panels.extend(engine.ext_activity_panels());

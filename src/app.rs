@@ -2493,17 +2493,22 @@ impl App {
         // was unconditionally `None`; and even had it run, a `(0, 0)`
         // origin is the exact coordinate-frame mismatch #582 fixed for
         // divider hit-testing.
-        let hovered_window_id = self
-            .last_editor_pointer
-            .get()
-            .zip(self.cached_editor_bounds.get())
-            .and_then(|((x, y), (editor_bounds, tab_bar_height))| {
-                let (rects, _) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-                rects
-                    .iter()
-                    .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-                    .map(|(id, _)| *id)
-            });
+        //
+        // #1433: resolved via `render::find_window_at` against
+        // `self.cached_screen_layout` — the same painted-window lookup the
+        // double-click branch above already uses — instead of a second,
+        // hand-rolled `calculate_group_window_rects` scan. `find_window_at`
+        // is the *shared* hit-test both backends' mouse code already routes
+        // through everywhere else (`tui_main::mouse`'s `render::
+        // find_window_at` call sites), so this was the one remaining
+        // GTK-only reimplementation of it — inlined here since #240, before
+        // `find_window_at` existed as a shared helper.
+        let hovered_window_id = self.last_editor_pointer.get().and_then(|(x, y)| {
+            let layout = self.cached_screen_layout.borrow();
+            let layout = layout.as_ref()?;
+            let idx = render::find_window_at(layout, x, y)?;
+            Some(layout.windows[idx].window_id)
+        });
         if delta_y.abs() > 0.01 {
             let scroll_count = (delta_y * 3.0).round().abs() as usize;
             let active_id = engine.active_window_id();
@@ -7147,17 +7152,29 @@ impl App {
         // Suppress the default engine key handler — key is consumed.
     }
 
-    /// #734 slice 1: the single GTK-side sink for the shared context-menu
-    /// key rung (`render::ModalKeyRoute::ContextMenu`).
+    /// #734 slice 1: the single sink for the shared context-menu key rung
+    /// (`render::ModalKeyRoute::ContextMenu`) — on every backend `App` hosts
+    /// now (#1433 flips TUI onto this same method; it was written when
+    /// `App` was still GTK-only, hence the "GTK-side" framing this doc used
+    /// to carry).
     ///
     /// Replaces two hand-rolled copies — the block that opened
     /// `handle_key_press` and `handle_explorer_ctx_menu_key` (#426) on the
     /// explorer DA path — both of which reimplemented selection movement
     /// inline instead of calling `Engine::handle_context_menu_key`, and so
     /// disagreed with TUI on `l` (confirm), `q`/`h` (close) and disabled-item
-    /// skipping. The engine owns all of that now; the only GTK-specific part
+    /// skipping. The engine owns all of that now; the only per-action part
     /// left is dispatching the confirmed action, since `new_file` /
-    /// `open_terminal` / `find_in_folder` need backend plumbing.
+    /// `open_terminal` / `find_in_folder` need backend plumbing —
+    /// `find_in_folder` itself has no remaining backend fork to record:
+    /// #1418 already converged TUI's explicit-target `"delete"`/
+    /// `"move_file"` handling and GTK's mismatched `"find_in_folder"`
+    /// (Search-panel-focus vs Grep-picker) onto the one shared
+    /// `render::apply_explorer_context_action`, which is what this method
+    /// calls below — #1433 re-checked this while auditing what became
+    /// backend-shared vs stayed backend-specific once `App` started running
+    /// on TUI in production, and confirmed there is nothing left to
+    /// reconcile here.
     fn dispatch_context_menu_key(&mut self, key_name: &str, unicode: Option<char>) {
         let effective_key = if key_name.is_empty() {
             unicode.map(|c| c.to_string()).unwrap_or_default()
@@ -9642,19 +9659,22 @@ impl quadraui::ShellApp for App {
                 render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // The runner treats bottom activity-bar items as action
                 // buttons (not sidebar panels), so it never toggles or
-                // hides on its own — it only ever reports the click
-                // (TUI's `on_shell_event`, same arm, carries the matching
-                // comment). #1057: this used to unconditionally
-                // `show_panel`, so a second click on an already-open
-                // bottom item (e.g. "bottom:settings") re-showed it
-                // instead of collapsing the sidebar like VS Code does for
-                // an active-tab click — while TUI, one click handler
-                // over, already ran the toggle. Route through
-                // `switch_panel`, the same shared
-                // `render::apply_activity_panel_switch` call site
-                // `PanelChanged`'s ext-panel arm above already uses, so
-                // both backends make the identical toggle decision from
-                // one place instead of drifting again.
+                // hides on its own — it only ever reports the click.
+                // #1057: this used to unconditionally `show_panel`, so a
+                // second click on an already-open bottom item (e.g.
+                // "bottom:settings") re-showed it instead of collapsing the
+                // sidebar like VS Code does for an active-tab click — while
+                // the old, hand-rolled `TuiShellApp::on_shell_event` (same
+                // arm) already ran the toggle. Route through `switch_panel`,
+                // the same shared `render::apply_activity_panel_switch`
+                // call site `PanelChanged`'s ext-panel arm above already
+                // uses, so both backends make the identical toggle decision
+                // from one place instead of drifting again. #1433: this is
+                // no longer "two arms that happen to agree" — `App` is what
+                // TUI dispatches through in production now too, so this one
+                // arm *is* both backends' Settings-bottom-item-toggle
+                // behaviour; there was no remaining fork to reconcile when
+                // auditing this for the flip.
                 self.switch_panel(id.as_str().to_string());
             }
             // #1427: every remaining `AppShellEvent` variant is likewise a

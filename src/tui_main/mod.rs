@@ -36,6 +36,30 @@ mod render_impl;
 mod services;
 mod shell_app;
 
+/// [`crate::app::TextMetricsBackend`] for quadraui's `TuiBackend` (#982) —
+/// the TUI sibling of `impl TextMetricsBackend for GtkBackend`/`WinBackend`
+/// (`src/app.rs`) and `MacBackend` (`src/macos/mod.rs`).
+///
+/// Both setters are genuine no-ops, not stubs of the #967/#969 kind:
+/// `TuiBackend::line_height`/`char_width` (`quadraui::Backend` impl) are
+/// hardcoded to `1.0` — one ratatui cell is one row/column by construction,
+/// so there is no pixel metric here for the #540/#819 drift guard to ever
+/// disagree with. That is also why TUI is exempt from
+/// `crate::harness::assert_text_metrics_backend_applies_metrics` (only
+/// GTK/macOS/Win call it): that assertion round-trips a probe value through
+/// the setter and back through the getter, which would necessarily fail
+/// here even though nothing is broken — TUI's getters never vary.
+///
+/// #1433: moved out of the `#[cfg(any(test, feature = "test-support"))]`
+/// `testing` module below (where it lived from #982 through #1432, the only
+/// callers being `testing::conformance_harness*`) — [`run`] now builds an
+/// `App` on a real `TuiBackend` too, so this impl has to be reachable from
+/// an ordinary release build, not only from a test/acceptance one.
+impl crate::app::TextMetricsBackend for backend::TuiBackend {
+    fn set_current_line_height(&mut self, _line_height: f64) {}
+    fn set_current_char_width(&mut self, _char_width: f64) {}
+}
+
 /// #657 test-support seam — the TUI half of what the sealed acceptance suite
 /// (`tests/acceptance.rs`, a *separate* crate) needs.
 ///
@@ -116,25 +140,6 @@ pub mod testing {
     use crate::app::TextMetricsBackend;
     use crate::core::Engine;
     use crate::harness::ConformanceHarness;
-
-    /// [`TextMetricsBackend`] for quadraui's `TuiBackend` (#982) — the TUI
-    /// sibling of `impl TextMetricsBackend for GtkBackend`/`WinBackend`
-    /// (`src/app.rs`) and `MacBackend` (`src/macos/mod.rs`).
-    ///
-    /// Both setters are genuine no-ops, not stubs of the #967/#969 kind:
-    /// `TuiBackend::line_height`/`char_width` (`quadraui::Backend` impl)
-    /// are hardcoded to `1.0` — one ratatui cell is one row/column by
-    /// construction, so there is no pixel metric here for the #540/#819
-    /// drift guard to ever disagree with. That is also why TUI is exempt
-    /// from `crate::harness::assert_text_metrics_backend_applies_metrics`
-    /// (only GTK/macOS/Win call it): that assertion round-trips a probe
-    /// value through the setter and back through the getter, which would
-    /// necessarily fail here even though nothing is broken — TUI's getters
-    /// never vary.
-    impl TextMetricsBackend for TuiBackend {
-        fn set_current_line_height(&mut self, _line_height: f64) {}
-        fn set_current_char_width(&mut self, _char_width: f64) {}
-    }
 
     /// The `TuiDriver` instantiation of `crate::harness::ConformanceHarness`
     /// (#982) — mirrors `crate::gtk::testing::conformance_harness`
@@ -352,6 +357,14 @@ use ratatui::Terminal;
 use crate::core::engine::{EngineAction, PendingPlatformAction};
 use crate::core::window::{GroupDivider, GroupId, SplitDirection};
 use crate::core::{Engine, Mode, OpenMode, WindowRect};
+// #1433: nothing in this file's own (unconditionally-compiled) code uses
+// `icons::` anymore — every direct call moved to `crate::app`/`App::
+// shell_config`'s copy of the icon table when `tui_main::run()` stopped
+// building `TuiShellApp`. This import survives for `shell_app.rs`'s `use
+// super::*;` (its own `icons::set_gui_backend`/`set_nerd_fonts`/`HAMBURGER`
+// calls, in code gated `any(test, feature = "test-support")`) — see this
+// module's own top for why that gate, not plain `cfg(test)`, is right here.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports))]
 use crate::icons;
 use crate::render::{self, build_screen_layout, Color, ColorExt, RenderedWindow, Theme};
 
@@ -397,6 +410,17 @@ pub(super) fn terminal_panel_cols(engine: &Engine, screen_w: u16, sidebar_width:
 
 // ─── Sidebar constants ────────────────────────────────────────────────────────
 
+/// #1433: unlike [`ACTIVITY_BAR_WIDTH`] below (still read unconditionally by
+/// [`terminal_panel_cols`]), every non-test production reader of this
+/// constant was `TuiShellApp::build_shell_config`/`live_shell_config` — both
+/// gated `#[cfg(any(test, feature = "test-support"))]` now that
+/// `tui_main::run()` builds `crate::app::App` instead (`App::shell_config`
+/// has its own copy, `SIDEBAR_WIDTH as f32`, for the same clamp). The
+/// `#[allow]` only fires outside that gate — a plain `cargo build`/`cargo
+/// clippy` never has a live reader left; `cargo test` and the `test-support`
+/// feature both still do (`mouse.rs`'s own `#[cfg(test)] mod tests`, and
+/// `shell_app.rs`'s).
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 const SIDEBAR_WIDTH: u16 = 30;
 const ACTIVITY_BAR_WIDTH: u16 = 3;
 
@@ -459,7 +483,22 @@ impl TuiSidebar {
 ///
 /// Compiled only for real builds — see the `cfg(test)` twin below for why the
 /// in-crate suite gets a hermetic stand-in instead.
+///
+/// #1433: `tui_main::run()` no longer calls this (`App::new_portable`
+/// installs the clipboard itself, via `setup_gtk_clipboard` — a
+/// misleadingly-named, backend-neutral helper in `src/app.rs` despite the
+/// name — reading `backend.services().clipboard()`, which resolves to this
+/// exact `TuiPlatformServices` on a real `TuiBackend`). The remaining
+/// caller is `TuiShellApp::from_engine`, itself gated `#[cfg(any(test,
+/// feature = "test-support"))]` now — under plain `cfg(not(test))` *without*
+/// that feature (an ordinary release build), nothing calls this anymore,
+/// hence the `#[allow]`. It stays real (not deleted) rather than delegating
+/// to the `#[cfg(test)]` hermetic twin below, because the not-yet-repointed
+/// `tests/acceptance/ms-example/seam_657.rs` (`feature = "test-support"`,
+/// `cfg(test)` false for the *library*) still builds a live `TuiShellApp`
+/// and expects it to behave like production, arboard clipboard included.
 #[cfg(not(test))]
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 fn setup_tui_clipboard(engine: &mut Engine) {
     use quadraui::PlatformServices;
 
@@ -553,79 +592,91 @@ fn sync_tui_clipboard(engine: &mut Engine, last: &mut Option<String>) {
     crate::render::sync_register_to_clipboard(engine, last);
 }
 
-/// The TUI entry point: initialise the engine and drive it through
-/// `quadraui::tui::shell_runner::run_with_shell`.
+/// The TUI entry point: initialise the shared [`crate::app::App`] and drive
+/// it through `quadraui::tui::shell_runner::run_with_shell` — the TUI twin
+/// of `crate::macos::run` (`src/macos/mod.rs`), not the hand-rolled
+/// `TuiShellApp`-based `run()` this replaces.
 ///
-/// #634 (Stage 6, vimcode#595): this *is* the live path now. It started life
-/// in #635 (Stage 6b item F) as `run_via_shell`, a dormant sibling of the
-/// hand-rolled `run()`/`event_loop()` pair, precisely so that flipping
-/// `main.rs`/`tui_bin.rs` over would be a rename plus a deletion rather than
-/// a re-architecture. The old `run()`, `event_loop()` (~2,130 lines) and
-/// `restore_terminal()` are gone; `git show 509b8fe:src/tui_main/mod.rs`
-/// reads them at their final revision, which is what the `mod.rs:NNNN` line
-/// references scattered through `shell_app.rs` point at.
+/// #1433: `App` — the same cross-backend-shared shell GTK/macOS/Win-GUI
+/// run — is what ships here now, not [`shell_app::TuiShellApp`].
+/// #1425–#1432 spent four sessions proving `App` paints and dispatches
+/// identically to `TuiShellApp` on a real `quadraui::tui::TuiBackend` (41
+/// driver tests, `crate::harness::KNOWN_BUGS` driven to empty) before this
+/// function was allowed to flip — see that gap-inventory suite
+/// (`app_on_tui_tests.rs`) for the regression bar this flip has to clear.
+/// `TuiShellApp` itself is **not** deleted: it stays alive, at
+/// [`testing::TuiShellApp`], as the `tui_prod` conformance arm and the
+/// ported `shell_app.rs` test corpus's own subject — a *second*,
+/// independently-implemented TUI shell that a future regression in this
+/// function's `App`-based path can be checked against. `grep -n
+/// 'TuiShellApp' src/tui_main/mod.rs src/main.rs src/tui_bin.rs` should
+/// show only that one re-export.
 ///
-/// Keeps the non-loop responsibilities the old `run()` owned — the panic
-/// hook, emergency-engine registration, the emergency swap flush, and the
-/// custom crash message — around `run_with_shell`.
+/// #634 (Stage 6, vimcode#595) established the shape this mirrors: initialise
+/// state, then hand it to `run_with_shell` rather than driving a hand-rolled
+/// event loop. That `TuiShellApp`-based version is what `git show
+/// 509b8fe:src/tui_main/mod.rs`'s even-older `event_loop()` predates and what
+/// this function's own history (`git log -p` on this file) shows evolving
+/// from — the `mod.rs:NNNN` line references scattered through `shell_app.rs`
+/// point at that lineage, not at this function's current body.
 ///
-/// Unlike the old `run()`, this does **not** do its own raw-mode / alternate-screen
-/// / mouse-capture / keyboard-enhancement terminal setup or teardown:
-/// `run_with_shell` → `quadraui::tui::run::run` (`quadraui/src/tui/run.rs`)
-/// already does all of that internally (`enable_raw_mode`,
-/// `EnterAlternateScreen`, `EnableMouseCapture`, `EnableBracketedPaste`, the
-/// kitty keyboard-enhancement push/pop), and always restores the terminal
-/// — even on panic, via its own inner `catch_unwind` — before propagating
-/// via `resume_unwind`. That's exactly what makes wrapping it in a second,
-/// outer `catch_unwind` here safe and sufficient: this closure's
-/// `catch_unwind` still observes the same panic payload, with the terminal
-/// already back to normal, the same guarantee the old `run()`'s own outer
-/// `catch_unwind` relied on around `event_loop`.
+/// Keeps the non-loop responsibilities the old `TuiShellApp`-based `run()`
+/// owned — the panic hook, emergency-engine registration, the emergency swap
+/// flush, and the custom crash message — around `run_with_shell`, exactly
+/// like `crate::macos::run` does around its own `run_with_shell` call.
+/// `App::new_portable` installs the emergency-engine pointer itself (see its
+/// own doc), so there is nothing left for this function to do there — the
+/// panic hook below only has to *use* that pointer via
+/// `crate::core::swap::run_emergency_flush()`, not register it.
+///
+/// This does **not** do its own raw-mode / alternate-screen / mouse-capture /
+/// keyboard-enhancement terminal setup or teardown: `run_with_shell` →
+/// `quadraui::tui::run::run` (`quadraui/src/tui/run.rs`) already does all of
+/// that internally (`enable_raw_mode`, `EnterAlternateScreen`,
+/// `EnableMouseCapture`, `EnableBracketedPaste`, the kitty
+/// keyboard-enhancement push/pop), and always restores the terminal — even on
+/// panic, via its own inner `catch_unwind` — before propagating via
+/// `resume_unwind`. That's exactly what makes wrapping it in a second, outer
+/// `catch_unwind` here safe and sufficient: this closure's `catch_unwind`
+/// still observes the same panic payload, with the terminal already back to
+/// normal.
 ///
 /// `keyboard_enhanced` (threaded into `render::engine_key_from_ui` for
-/// Ctrl-combo disambiguation, #826) and the emergency-engine pointer
-/// registration both move
-/// into `TuiShellApp::setup` instead of living here — see
-/// [`shell_app::TuiShellApp::prepare_for_live_run`] and that `setup`
-/// override's doc comments for why: `run_with_shell` takes `app` *by
-/// value* and moves it through several stack frames
-/// (`build_shell_adapter` → `ShellAdapter`'s own field →
-/// `tui::run::run`'s `mut app: A` local) before it settles, so a raw
-/// pointer captured here, before that call, would already be stale by the
-/// time anything could read it — `setup()` runs only after all of those
-/// moves are done.
+/// Ctrl-combo disambiguation, #826) is read once, from the live
+/// `Backend::backend_caps().kitty_keyboard` answer, inside `App::setup` —
+/// unconditionally, on every backend `App` hosts (see that override's own
+/// doc in `src/app.rs` for why it's a no-op on GTK/macOS/Win) — so there is
+/// nothing TUI-specific left for this function to seed before handing `app`
+/// to `run_with_shell`.
 pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     if let Some(ref path) = debug_log_path {
         init_debug_log(path);
         debug_log!("=== VimCode TUI debug log started ===");
     }
 
-    let mut app = shell_app::TuiShellApp::new(file_path);
-    app.prepare_for_live_run();
+    // #1433: the TUI twin of `crate::macos::run`'s
+    // `crate::core::swap::install_gui_crash_hook()` call — except it sinks
+    // the same three message lines into the `--debug` log too, since a raw-
+    // mode/alternate-screen terminal makes `eprintln!` alone invisible (or
+    // corrupts the screen the user is looking at) the way it never is for a
+    // GUI backend. See `install_gui_crash_hook_with_sink`'s own doc.
+    crate::core::swap::install_gui_crash_hook_with_sink(|line| {
+        debug_log!("{}", line);
+    });
 
-    // Always install a panic hook that writes crash info to
-    // /tmp/vimcode-crash.log AND to the debug log (if --debug is active) —
-    // verbatim copy of the deleted `run()`'s own hook.
-    {
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            // Emergency: flush swap files for all dirty buffers before
-            // anything else, via the pointer `TuiShellApp::setup` registers
-            // once `app` reaches its stable live-run address.
-            crate::core::swap::run_emergency_flush();
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(
+            Box::new(backend::TuiBackend::new()),
+        ));
 
-            if let Some(path) = crate::core::swap::write_crash_log(info) {
-                debug_log!("Crash log written to {}", path.display());
-            }
-            prev_hook(info);
-        }));
-    }
-
-    // #557: `live_shell_config`, not the static `shell_config` — plugins have
-    // already registered their sidebar panels by the time `App::new` returns,
-    // so frame zero can paint their activity-bar icons rather than waiting for
+    let app = crate::app::App::new_portable(file_path, backend, crate::render::UnitProfile::cell());
+    // #557: read after `App::new_portable` returns and before `app` moves
+    // into `run_with_shell` below — plugins have already registered their
+    // sidebar panels by then (`App::shell_config` appends
+    // `engine.ext_activity_panels()` live, see that method's own doc), so
+    // frame zero can paint their activity-bar icons rather than waiting for
     // the first dispatch's `sync_ext_activity_panels` to add them.
-    let config = shell_app::TuiShellApp::live_shell_config(&app.engine);
+    let config = app.shell_config();
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         quadraui::tui::shell_runner::run_with_shell(app, config);
