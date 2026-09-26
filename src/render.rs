@@ -4881,7 +4881,9 @@ pub fn route_cmdline_selection_key(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PostKeyEpilogue {
     /// Ctrl-W h/l overflowed left with a sidebar panel visible — give the
-    /// sidebar band the keyboard.
+    /// sidebar band the keyboard. Also set when a panel reveal from inside
+    /// `Engine::handle_key` asked for the keyboard via
+    /// `Engine::sidebar_focus_requested` (#1450).
     pub focus_sidebar: bool,
     /// Ctrl-W h/l overflowed left with **no** sidebar panel visible — put the
     /// cursor on the activity bar toolbar instead. GTK never did this: its
@@ -4928,6 +4930,15 @@ pub fn post_key_epilogue(
     quickfix_scroll_top: Option<&mut usize>,
 ) -> PostKeyEpilogue {
     let mut out = PostKeyEpilogue::default();
+
+    // #1450: a programmatic panel reveal from inside `Engine::handle_key`
+    // (Visual `<leader>ai`, `:{range}AI` with no message) asked for the
+    // keyboard. One-shot — taken here so the *next* keypress routes normally
+    // again. Shared, so TUI's cached `sidebar.has_focus` and GTK's
+    // re-sync both go through the one field they already honour.
+    if std::mem::take(&mut engine.sidebar_focus_requested) {
+        out.focus_sidebar = true;
+    }
 
     // Ctrl-W h/l overflow: move focus to the sidebar, or — when no panel is
     // visible to receive it — to the activity bar.

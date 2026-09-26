@@ -4282,22 +4282,16 @@ fn handle_key_pressed(
     }
 
     let epilogue = render::post_key_epilogue(engine, Some(state.quickfix_scroll_top));
+    // `focus_sidebar` covers Ctrl-W h/l overflow *and* (#1450) a
+    // programmatic panel reveal from inside the `Engine::handle_key` above
+    // that asked for the keyboard — `Engine::acp_focus_ai_panel_for_keyboard`
+    // (Visual-mode `<leader>ai`, `:{range}AI` with no message), which has no
+    // shell/mouse event of its own to hang a `sidebar.has_focus = true` off,
+    // unlike every other `focus_sidebar_panel` call site in this file. GTK
+    // needs no equivalent: its `route_focus_key` call reads
+    // `Engine::sidebar_has_focus()` fresh every keystroke instead of a cached
+    // local bool.
     if epilogue.focus_sidebar {
-        sidebar.has_focus = true;
-    }
-    // #1450: `Engine::acp_focus_ai_panel_for_keyboard` (the Visual-mode
-    // `<leader>ai` mapping, `:{range}AI`) can set `ai_has_focus` from deep
-    // inside this same `Engine::handle_key` call above, with no shell/mouse
-    // event of its own to hang a `sidebar.has_focus = true` off — unlike
-    // every existing `focus_sidebar_panel` call site in this file, which is
-    // itself inside a click/shell-event handler. GTK needs no equivalent:
-    // its `route_focus_key` call reads `Engine::sidebar_has_focus()` fresh
-    // every keystroke instead of a cached local bool, so `ai_has_focus`
-    // flipping true is already enough there. Scoped to `ai_has_focus`
-    // specifically (not the general `sidebar_has_focus()`, which also covers
-    // panels with other, already-correct focus paths) to keep this a
-    // zero-risk addition for #1450 rather than a general re-plumbing.
-    if engine.ai_has_focus {
         sidebar.has_focus = true;
     }
     // Sync the unnamed register → system clipboard (`clipboard=unnamedplus`).
@@ -16848,10 +16842,11 @@ mod tests {
     /// a character afterward and seeing it painted, not swallowed by the
     /// editor (which would happen if focus silently stayed on the buffer).
     ///
-    /// RED verified: with the TUI-only `sidebar.has_focus` sync this test
-    /// depends on removed from `handle_key_pressed` (the `if engine.
-    /// ai_has_focus { sidebar.has_focus = true; }` line this issue adds),
-    /// the panel and chip still paint (`Engine::focus_sidebar_panel` alone
+    /// RED verified: with the keyboard-focus request this test depends on
+    /// removed (`Engine::acp_focus_ai_panel_for_keyboard`'s
+    /// `sidebar_focus_requested = true`, drained by
+    /// `render::post_key_epilogue` into `epilogue.focus_sidebar` above), the
+    /// panel and chip still paint (`Engine::focus_sidebar_panel` alone
     /// handles that half, shared with GTK), but the typed `x` below lands in
     /// the editor buffer instead of the chat input, and the final assertion
     /// fails.
@@ -16919,6 +16914,66 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// #1450 regression guard: `:{range}AI <message>` sends and reveals the
+    /// AI panel, but must **not** pull the keyboard into its chat input —
+    /// otherwise the very next `:` the user types is swallowed as chat text
+    /// and every ex command after an `:AI` send is lost. That is exactly
+    /// what broke the #958 driver test above
+    /// (`ai_panel_switches_between_registered_agents_via_ai_agent_command_
+    /// via_shell_app`) in this issue's first draft: `:AiAgent beta` was
+    /// being *typed into the panel* instead of switching agents.
+    ///
+    /// The agent command points at a binary that doesn't exist, so the send
+    /// fails fast right in the transcript — that failure message is the
+    /// rendered proof the range command really did send. The following
+    /// `:Xyzzy1450` then proves the command line is still reachable: its
+    /// unknown-command error can only come from `execute_command`, and the
+    /// text must *not* appear in the panel's input line.
+    ///
+    /// RED verified: restoring the blanket `if engine.ai_has_focus {
+    /// sidebar.has_focus = true; }` sync in `handle_key_pressed` (in place
+    /// of draining the one-shot `epilogue.focus_sidebar`) makes this fail —
+    /// "Not an editor command" never appears, because `:Xyzzy1450` is typed
+    /// into the chat input instead.
+    #[test]
+    fn ex_command_after_ranged_ai_send_still_reaches_the_command_line_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.settings.acp_agent_command = "nosuchagentbinary1450".to_string();
+        app.engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+        let mut driver = driver_with_shell(app, config(), 120, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        driver.type_char(':');
+        for c in "1,2AI hello".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("nosuchagentbinary1450"),
+            "`:{{range}}AI <message>` must actually send (here: fail to start \
+             the agent, in the transcript); screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "Xyzzy1450".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Not an editor command"),
+            "the `:` after an `:AI` send must open the command line, not be \
+             typed into the chat input; screen:\n{screen}"
+        );
     }
 
     /// How long the two #957 (ACP-6) driver tests below wait on a real

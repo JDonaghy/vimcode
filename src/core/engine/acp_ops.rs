@@ -656,14 +656,26 @@ impl Engine {
     /// `message` is empty (`:'<,'>AI` alone), just focus the panel so the
     /// user can type one — the attachment stays staged either way, so it's
     /// not lost by typing the message separately.
+    ///
+    /// The two cases differ in *keyboard* focus, deliberately (#958
+    /// regression): with a message the user handed over a complete ex
+    /// command and stays where they were, so this only reveals the panel
+    /// (`ai_has_focus`, exactly what plain `:AI <message>` has always done)
+    /// and must **not** pull the keyboard into the chat input — otherwise
+    /// the next `:` typed after `:AI hi` becomes chat text instead of
+    /// opening the command line, and consecutive ex commands (`:AI hi` then
+    /// `:AiAgent beta`) stop working. With no message there is nothing to
+    /// send until the user types one, so the input does need the keyboard.
     pub(crate) fn ai_attach_range(&mut self, start_line: usize, end_line: usize, message: &str) {
         if let Some(attachment) = self.acp_build_range_attachment(start_line, end_line, None) {
             self.acp_pending_attachment = Some(attachment);
         }
-        if !message.is_empty() {
+        if message.is_empty() {
+            self.acp_focus_ai_panel_for_keyboard();
+        } else {
             self.ai_send_message(message.to_string());
+            self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
         }
-        self.acp_focus_ai_panel_for_keyboard();
     }
 
     /// `<leader>ai` in Visual mode (#1450 point 2): stage the current
@@ -705,15 +717,21 @@ impl Engine {
     /// have run for it to show up at all, per [`Self::focus_sidebar_panel`]'s
     /// own doc ("used for programmatic reveals like DAP session start").
     ///
-    /// This still doesn't put keyboard input in the panel's input on TUI by
-    /// itself: `sidebar.has_focus` there is a cached copy of "is the sidebar
-    /// band focused", updated ad hoc by mouse/shell-event handlers, not
-    /// re-derived every keystroke the way GTK's `Engine::sidebar_has_focus`
-    /// call is (see that method's doc) — so `TuiShellApp::handle_key_pressed`
-    /// has a matching one-line sync right after the "general fallback"
-    /// dispatch, reading this same `ai_has_focus` flag this call sets.
+    /// `focus_sidebar_panel` alone doesn't put keyboard input in the panel's
+    /// input on TUI: `sidebar.has_focus` there is a cached copy of "is the
+    /// sidebar band focused", updated ad hoc by mouse/shell-event handlers,
+    /// not re-derived every keystroke the way GTK's
+    /// `Engine::sidebar_has_focus` call is (see that method's doc) — so this
+    /// also raises the one-shot [`Engine::sidebar_focus_requested`] flag,
+    /// which `render::post_key_epilogue` drains into
+    /// `PostKeyEpilogue::focus_sidebar` for whichever backend is running. A
+    /// one-shot request, not a "whenever `ai_has_focus` is set" rule: the
+    /// latter also fires on the keypresses *after* the reveal, which is what
+    /// broke `:AI hi` followed by `:AiAgent beta` (#958) — see
+    /// [`Self::ai_attach_range`].
     fn acp_focus_ai_panel_for_keyboard(&mut self) {
         self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
+        self.sidebar_focus_requested = true;
     }
 
     /// Answer a parked `fs/read_text_file` request. A malformed request
