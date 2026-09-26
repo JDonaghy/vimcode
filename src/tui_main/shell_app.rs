@@ -16503,6 +16503,184 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1454: the fake fixture's `ACP_FAKE_TOOL_CALL` always reports the
+    /// same `oldText`/`newText` fragment ("old line\n" -> "new line\n"), but
+    /// a *real* ACP adapter's `diff` block is the edited region only, not
+    /// the whole file — `@agentclientprotocol/claude-agent-acp`'s `Edit`
+    /// tool emits exactly this shape. This test pre-populates the target
+    /// file with surrounding context around that fragment and drives the
+    /// same accept keypress the whole-file test above does, asserting the
+    /// surrounding lines survive on disk — the exact data-loss repro this
+    /// issue reports (a 2959-line file collapsing to 16).
+    ///
+    /// RED verified: reverting `Engine::acp_open_review_for_diffs` to write
+    /// the raw `diff` block's fragment straight through as a whole-file
+    /// `ProposedChange` (pre-#1454) makes this accept write bare
+    /// `"new line\n"` to disk, discarding `"line1"`/`"line3"` — this test
+    /// failed exactly that way against that reverted code.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_fragment_preserves_surrounding_file_content_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!("acp1454-tui-fragment-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "line1\nold line\nline3\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("old line") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("old line") && screen.contains("new line"),
+            "the change-review surface must still paint the fragment; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char('a');
+        driver.tick();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "line1\nnew line\nline3\n"
+            && Instant::now() < deadline
+        {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "line1\nnew line\nline3\n",
+            "accepting a fragment diff must preserve the surrounding file \
+             content, not truncate the file to just the edited region"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1454: an `oldText` fragment that occurs twice in the current file
+    /// must be refused rather than applied to an arbitrary occurrence (or,
+    /// worse, written whole-file over both). The change-review surface
+    /// never opens for this diff — the fake agent's message stream still
+    /// reaches `end_turn`, so the fixture's transcript proceeds normally —
+    /// and the refusal is surfaced on the painted command line via
+    /// `engine.message`.
+    ///
+    /// RED verified against the pre-#1454 pass-through: that version wrote
+    /// `"new line\n"` as the entire file, which would have made this test's
+    /// "file unchanged" assertion fail.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_ambiguous_fragment_is_refused_via_shell_app() {
+        let dir =
+            std::env::temp_dir().join(format!("acp1454-tui-ambiguous-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\nold line\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        app.engine.workspace_root = Some(dir.clone());
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_TOOL_CALL", "1"),
+                ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "please edit".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !(screen.contains("ambiguous") || screen.contains("refus"))
+            && Instant::now() < deadline
+        {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("ambiguous") || screen.contains("refus"),
+            "the refusal message must reach the painted command line; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("new line"),
+            "an ambiguous fragment must never open the change-review \
+             surface; screen:\n{screen}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "old line\nold line\n",
+            "a refused edit must never touch the file on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #955 (ACP-4) review follow-up: "clicking a `location` jumps to that
     /// file and line" driven through a *real mouse click* against the
     /// painted diff geometry — `driver.click(x, y)` on the row `driver.find`

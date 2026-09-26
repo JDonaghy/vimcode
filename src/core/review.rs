@@ -24,11 +24,91 @@ use quadraui::{DiffEditability, DiffMode, DiffPane, DiffView};
 /// schema's `oldText: string | null`) — distinct from `Some(String::new())`
 /// (an existing, empty file), though [`ChangeReviewEntry::new`] diffs both
 /// the same way (`compute_hunks` against `""`).
+///
+/// **Both `old_text` and `new_text` must be whole-file content by the time
+/// they land here** (#1454). A real ACP adapter's `diff` content block is
+/// *not* guaranteed to be whole-file — `@agentclientprotocol/claude-agent-acp`
+/// emits the edited snippet only (`oldText`/`newText` covering just the
+/// changed region) — so a caller feeding this from a wire `diff` block must
+/// resolve that snippet against the file's actual current contents first
+/// ([`resolve_fragment`] does exactly that) rather than passing the raw
+/// fragment straight through. This module has no filesystem/buffer access to
+/// do that resolution itself, hence it living in the caller
+/// (`crate::core::engine::acp_ops::Engine::acp_open_review_for_diffs`) —
+/// but the *contract* that `old_text`/`new_text` are whole-file lives here,
+/// next to the type it protects: this is what makes both the accept-write
+/// (`Engine::change_review_accept_current`, which writes `new_text` as the
+/// entire file) and the `DiffView` this module builds correct at once,
+/// rather than each needing its own fragment-awareness.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProposedChange {
     pub path: String,
     pub old_text: Option<String>,
     pub new_text: String,
+}
+
+/// Outcome of resolving a `diff` content block's `old_text` fragment against
+/// a file's actual current whole-file content (#1454) — the safety check
+/// that stands between an agent-reported snippet and ever writing it as if
+/// it were the entire file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentResolution {
+    /// `fragment` occurs in `current` exactly once: unambiguous. `old_whole`
+    /// is `current` itself (the diff's whole-file "before"); `new_whole` is
+    /// `current` with that one occurrence replaced by `replacement` (the
+    /// whole-file "after") — both ready to feed [`ProposedChange`] as-is.
+    Applied {
+        old_whole: String,
+        new_whole: String,
+    },
+    /// `fragment` occurs zero times, but `replacement` already occurs
+    /// exactly once — the edit already landed by some other path (e.g. the
+    /// agent's own `fs/write_text_file` beat this `diff` report to the
+    /// buffer/disk, the double-apply race #1454 flags for ACP adapters that
+    /// apply edits themselves and merely *report* them via `diff`). Nothing
+    /// left to do; a caller should treat this as informational, not as a
+    /// pending change to review.
+    AlreadyApplied,
+    /// `fragment` occurs zero times (and `replacement` doesn't uniquely
+    /// identify an already-applied edit either), or two or more times —
+    /// there is no single unambiguous place to apply this edit. Carries a
+    /// human-readable reason. A caller must refuse rather than guess: never
+    /// silently write `replacement` over the whole file (the data-loss bug
+    /// #1454 reported) and never pick an arbitrary occurrence among several.
+    Refused(String),
+}
+
+/// Resolve a `diff` content block's fragment (`fragment` = the wire's
+/// `oldText`, `replacement` = its `newText`) against `current` — a file's
+/// actual whole-file content, read fresh (buffer-first) by the caller right
+/// before opening the review, per [`ProposedChange`]'s doc. Exact
+/// single-occurrence match is the only case that's safe to treat as
+/// unambiguous; see [`FragmentResolution`] for the other two outcomes.
+///
+/// Callers: only for a `diff` block whose `oldText` is non-null (an edit to
+/// an existing file) — a null `oldText` (a new file) has no "current
+/// contents" to resolve against and is handled entirely by the caller
+/// without involving this function at all.
+pub fn resolve_fragment(current: &str, fragment: &str, replacement: &str) -> FragmentResolution {
+    let occurrences = current.matches(fragment).count();
+    if occurrences == 1 {
+        return FragmentResolution::Applied {
+            old_whole: current.to_string(),
+            new_whole: current.replacen(fragment, replacement, 1),
+        };
+    }
+    if occurrences == 0 {
+        if current.matches(replacement).count() == 1 {
+            return FragmentResolution::AlreadyApplied;
+        }
+        return FragmentResolution::Refused(
+            "change text was not found in the current file contents".to_string(),
+        );
+    }
+    FragmentResolution::Refused(format!(
+        "change text appears {occurrences} times in the current file contents; \
+         refusing an ambiguous edit"
+    ))
 }
 
 /// Human decision on one [`ChangeReviewEntry`]. `Pending` is the only
@@ -841,5 +921,93 @@ mod tests {
         assert_ne!(default_out, custom_out);
         assert!(default_out.contains("**x.rs:1**"));
         assert_eq!(custom_out, "x.rs,1,note");
+    }
+
+    // ── resolve_fragment (#1454) ────────────────────────────────────────────
+
+    /// The core data-loss fix: a fragment `oldText` that occurs exactly once
+    /// inside a much larger file resolves to a whole-file `new_whole` that
+    /// still carries every surrounding line — not just the replacement
+    /// snippet. RED against the bug this issue reports: writing `new_text`
+    /// (the bare fragment) straight to disk would have truncated the file to
+    /// just "new line".
+    #[test]
+    fn resolve_fragment_replaces_only_the_matched_region_within_a_larger_file() {
+        let current = "line1\nold line\nline3\n";
+        match resolve_fragment(current, "old line\n", "new line\n") {
+            FragmentResolution::Applied {
+                old_whole,
+                new_whole,
+            } => {
+                assert_eq!(old_whole, current);
+                assert_eq!(new_whole, "line1\nnew line\nline3\n");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// A fragment that is itself the *entire* current file (the fake-agent
+    /// fixture's shape, and #955's original whole-file assumption) still
+    /// resolves cleanly — the fix is backward-compatible with a whole-file
+    /// `diff` block, not just additive for fragments.
+    #[test]
+    fn resolve_fragment_handles_a_fragment_that_is_the_whole_file() {
+        match resolve_fragment("old line\n", "old line\n", "new line\n") {
+            FragmentResolution::Applied {
+                old_whole,
+                new_whole,
+            } => {
+                assert_eq!(old_whole, "old line\n");
+                assert_eq!(new_whole, "new line\n");
+            }
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// A fragment occurring twice is refused, not applied to an arbitrary
+    /// occurrence — the exact ambiguous-`oldText` case #1454 asks be
+    /// refused rather than silently guessing.
+    #[test]
+    fn resolve_fragment_refuses_an_ambiguous_fragment_that_occurs_twice() {
+        let current = "old line\nold line\n";
+        match resolve_fragment(current, "old line\n", "new line\n") {
+            FragmentResolution::Refused(reason) => {
+                assert!(
+                    reason.contains("ambiguous") || reason.contains("2 times"),
+                    "reason should explain the ambiguity: {reason}"
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    /// A fragment that matches nowhere, and whose replacement doesn't
+    /// already uniquely identify an applied edit, is refused with a clear
+    /// reason — never silently written as if the fragment were the whole
+    /// file.
+    #[test]
+    fn resolve_fragment_refuses_a_fragment_not_found_anywhere() {
+        let current = "completely different contents\n";
+        match resolve_fragment(current, "old line\n", "new line\n") {
+            FragmentResolution::Refused(reason) => {
+                assert!(reason.contains("not found"), "reason: {reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+    }
+
+    /// Double-apply guard: if `oldText` is no longer present but `newText`
+    /// already appears exactly once, the edit already landed (e.g. the
+    /// agent's own `fs/write_text_file` beat the `diff` report) — treated
+    /// as `AlreadyApplied`, not `Refused`, so a caller can skip it silently
+    /// rather than surfacing a scary "not found" error for an edit that in
+    /// fact already succeeded.
+    #[test]
+    fn resolve_fragment_recognises_an_edit_that_already_landed() {
+        let current = "line1\nnew line\nline3\n";
+        assert_eq!(
+            resolve_fragment(current, "old line\n", "new line\n"),
+            FragmentResolution::AlreadyApplied
+        );
     }
 }
