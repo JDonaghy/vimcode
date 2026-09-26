@@ -5305,10 +5305,26 @@ impl Engine {
 
         // All known built-in leader sequences
         const SEQUENCES: &[&str] = &[
-            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw",
+            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw", "ai",
         ];
 
         match partial.as_str() {
+            "ai" => {
+                // #1450 point 2: in Visual mode, stage the selection as the
+                // next AI-panel attachment and focus the panel (see
+                // `Engine::acp_attach_visual_selection_and_focus`'s doc).
+                // Outside Visual mode there's no selection to attach, so
+                // this just focuses the panel — the same fallback the
+                // palette's plain `chat_open` action already has.
+                if matches!(
+                    self.mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.acp_attach_visual_selection_and_focus();
+                } else {
+                    self.ai_has_focus = true;
+                }
+            }
             "b" => {
                 // Enter breadcrumb focus mode
                 self.rebuild_breadcrumb_segments();

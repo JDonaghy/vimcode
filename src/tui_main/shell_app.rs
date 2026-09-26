@@ -4285,6 +4285,21 @@ fn handle_key_pressed(
     if epilogue.focus_sidebar {
         sidebar.has_focus = true;
     }
+    // #1450: `Engine::acp_focus_ai_panel_for_keyboard` (the Visual-mode
+    // `<leader>ai` mapping, `:{range}AI`) can set `ai_has_focus` from deep
+    // inside this same `Engine::handle_key` call above, with no shell/mouse
+    // event of its own to hang a `sidebar.has_focus = true` off — unlike
+    // every existing `focus_sidebar_panel` call site in this file, which is
+    // itself inside a click/shell-event handler. GTK needs no equivalent:
+    // its `route_focus_key` call reads `Engine::sidebar_has_focus()` fresh
+    // every keystroke instead of a cached local bool, so `ai_has_focus`
+    // flipping true is already enough there. Scoped to `ai_has_focus`
+    // specifically (not the general `sidebar_has_focus()`, which also covers
+    // panels with other, already-correct focus paths) to keep this a
+    // zero-risk addition for #1450 rather than a general re-plumbing.
+    if engine.ai_has_focus {
+        sidebar.has_focus = true;
+    }
     // Sync the unnamed register → system clipboard (`clipboard=unnamedplus`).
     sync_tui_clipboard(engine, state.last_clipboard_content);
     if epilogue.arm_yank_highlight {
@@ -16818,6 +16833,89 @@ mod tests {
             screen.contains("@mentionable_other.rs "),
             "cycling once (Tab) then accepting (Enter) must fill the input \
              with the SECOND candidate plus a trailing space; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// #1450 point 2 acceptance, end to end through the real key-dispatch
+    /// stack (not a direct `Engine::acp_attach_visual_selection_and_focus`
+    /// call, unlike the engine-level tests in `core::engine::acp_ops::tests`
+    /// and `core::engine::tests`): selecting two lines in `V` (linewise
+    /// Visual) and pressing `<leader>ai` (Space, then `a`, `i`) must open
+    /// the AI panel, show the `⧉`-chip naming the file and line range in the
+    /// panel header, AND put keyboard focus in its input — proven by typing
+    /// a character afterward and seeing it painted, not swallowed by the
+    /// editor (which would happen if focus silently stayed on the buffer).
+    ///
+    /// RED verified: with the TUI-only `sidebar.has_focus` sync this test
+    /// depends on removed from `handle_key_pressed` (the `if engine.
+    /// ai_has_focus { sidebar.has_focus = true; }` line this issue adds),
+    /// the panel and chip still paint (`Engine::focus_sidebar_panel` alone
+    /// handles that half, shared with GTK), but the typed `x` below lands in
+    /// the editor buffer instead of the chat input, and the final assertion
+    /// fails.
+    #[test]
+    fn ai_panel_leader_ai_visual_mapping_shows_chip_and_focuses_input_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1450_tui_leader_ws_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        let file_path = workspace.join("t.rs");
+        std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+        app.engine.cwd = workspace.clone();
+        app.engine.workspace_root = Some(workspace.clone());
+        let buf = app.engine.active_buffer_id();
+        if let Some(state) = app.engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(file_path.clone());
+        }
+        app.engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+        let mut driver = driver_with_shell(app, config(), 160, 30);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // `V` + `j` selects lines 1-2 (0-based 0-1), linewise.
+        driver.type_char('V');
+        driver.type_char('j');
+        driver.type_char(' ');
+        driver.type_char('a');
+        driver.type_char('i');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AI ASSISTANT"),
+            "the AI panel must be visible after <leader>ai; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains('\u{29c9}') && screen.contains("t.rs"),
+            "the attachment chip naming the file must be visible in the \
+             panel header; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("1-2"),
+            "the chip must show the 1-based line range; screen:\n{screen}"
+        );
+
+        // Prove the input, not the editor buffer, has keyboard focus: a
+        // stray `x` reaching the editor in Normal mode would *delete* a
+        // character (Vim's `x`) rather than insert one — e.g. turning "two"
+        // into "wo" — so this checks both the positive (the typed char
+        // shows up) and negative (the buffer text survives intact) signal.
+        driver.type_char('x');
+        let screen = driver.screen();
+        assert!(
+            screen.contains("two"),
+            "the editor buffer must be untouched — a stray `x` reaching \
+             Normal mode would have deleted a character from \"two\"; \
+             screen:\n{screen}"
+        );
+        assert!(
+            screen.contains('x'),
+            "typing after <leader>ai must land in the AI panel's input \
+             (proving it has keyboard focus), not be swallowed as an editor \
+             command; screen:\n{screen}"
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
