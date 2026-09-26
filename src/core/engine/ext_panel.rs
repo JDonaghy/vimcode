@@ -3259,6 +3259,11 @@ impl Engine {
         // #1449: `promptCapabilities` came off the same `initialize`
         // response as `authMethods` — reset alongside it.
         self.acp_mut().prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
+        // #1487: same reasoning — `mcpCapabilities` came off that same
+        // response, and the MCP servers the (now-ending) session started
+        // with no longer apply to whatever session starts next.
+        self.acp_mut().mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
+        self.acp_mut().active_mcp_servers.clear();
         // #1450: a staged Visual-selection/`:{range}AI` attachment is
         // composed content the user hasn't sent yet — clearing the
         // conversation drops it too, same as clearing the typed-but-

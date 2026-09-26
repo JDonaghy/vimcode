@@ -639,6 +639,33 @@ pub struct Settings {
     #[serde(default)]
     pub acp_reopen_last_session: bool,
 
+    /// User-configured MCP servers (#1487, redo of #1462) sent on every
+    /// `session/new`/`session/load` — the global list, shared across all
+    /// `acp_agents` entries (and the single-agent `acp_agent_command`
+    /// path) unless an entry's own `AcpAgentProfile::mcp_servers`
+    /// overrides it (see that field's doc, and `Engine::
+    /// acp_resolve_mcp_servers`). Shape mirrors ACP's `McpServer` wire
+    /// type — `transport` picks `"stdio"` (default), `"http"`, or `"sse"`;
+    /// `command`/`args`/`env` apply to `stdio`, `url`/`headers` to
+    /// `http`/`sse`. An `http`/`sse` entry is dropped at session-start time
+    /// (with a status-line warning) if the live agent's `initialize`
+    /// response doesn't advertise `agentCapabilities.mcpCapabilities.
+    /// http`/`.sse` — `stdio` is never dropped, it's baseline ACP v1.
+    ///
+    /// Empty (the default, every pre-#1462 config) sends no MCP servers at
+    /// all — unchanged from before this setting existed.
+    ///
+    /// Example `settings.json` fragment:
+    /// ```json
+    /// "acp_mcp_servers": [
+    ///   { "name": "fs", "command": "mcp-server-filesystem", "args": ["/repo"] },
+    ///   { "name": "search", "transport": "http", "url": "https://mcp.example.com",
+    ///     "headers": ["Authorization=Bearer tok"] }
+    /// ]
+    /// ```
+    #[serde(default)]
+    pub acp_mcp_servers: Vec<crate::core::acp::AcpMcpServerConfig>,
+
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer (default: false).
     #[serde(default)]
@@ -1584,6 +1611,7 @@ impl Default for Settings {
             acp_agents: Vec::new(),
             acp_active_agent: String::new(),
             acp_reopen_last_session: false,
+            acp_mcp_servers: Vec::new(),
             show_hidden_files: false,
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),

@@ -41,8 +41,9 @@
 use std::collections::HashMap;
 
 use super::acp::{
-    AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpPermissionRequest,
-    AcpPlanEntry, AcpPromptCapabilities, AcpSessionMode, AcpToolCall, AcpUsage,
+    AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpMcpCapabilities,
+    AcpPermissionRequest, AcpPlanEntry, AcpPromptCapabilities, AcpSessionMode, AcpToolCall,
+    AcpUsage,
 };
 use super::ai::AiMessage;
 
@@ -80,6 +81,21 @@ pub struct AcpSession {
     pub authenticated: bool,
     pub prompt_capabilities: AcpPromptCapabilities,
     pub tool_calls: Vec<AcpToolCall>,
+    /// `agentCapabilities.mcpCapabilities` from this session's `initialize`
+    /// response (#1487, redo of #1462 on the multi-session engine) — which
+    /// optional MCP server transports (`http`/`sse`) the agent accepts,
+    /// beyond the always-eligible `stdio`. Read by `Engine::
+    /// acp_begin_session` to decide which of `settings.acp_mcp_servers`/
+    /// `AcpAgentProfile::mcp_servers` to actually send on `session/new`/
+    /// `session/load`.
+    pub mcp_capabilities: AcpMcpCapabilities,
+    /// Names of the MCP servers *this* session actually started with —
+    /// i.e. what `session/new`/`session/load`'s `mcpServers` carried after
+    /// `build_mcp_servers_wire` dropped anything the agent doesn't support
+    /// (#1487). Empty before the session's handshake completes, or if none
+    /// were configured/all were dropped. Drives the `:AiAgent` status
+    /// line's `" | MCP: ..."` suffix (`acp_agent_registry_status_line`).
+    pub active_mcp_servers: Vec<String>,
 
     /// This session's own transcript — `Engine::ai_messages` pre-#1463.
     pub ai_messages: Vec<AiMessage>,

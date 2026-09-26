@@ -788,6 +788,25 @@ below) is configured:
     Switching agents ends any session currently in progress — a new agent process
     shares no context with the old one. Once `acp_agents` is non-empty,
     `acp_agent_command` is ignored.
+  - **MCP servers** — `acp_mcp_servers` lists MCP servers to hand the agent on every
+    `session/new`/`session/load` (including a resumed session), in ACP's own
+    `McpServer` shape:
+    ```json
+    "acp_mcp_servers": [
+      { "name": "fs", "command": "mcp-server-filesystem", "args": ["/repo"] },
+      { "name": "search", "transport": "http", "url": "https://mcp.example.com",
+        "headers": ["Authorization=Bearer <token>"] }
+    ]
+    ```
+    `transport` is `"stdio"` (the default — `command`/`args`/`env` apply), `"http"`, or
+    `"sse"` (`url`/`headers` apply instead). An `http`/`sse` entry is only sent if the
+    live agent's `initialize` response actually advertises support for that transport;
+    otherwise it's dropped with a status-line warning naming it — `stdio` is always
+    sent. An `acp_agents` entry can override the global list for just that agent with
+    its own `mcp_servers` field (same shape); an override entry with the same `name` as
+    a global one replaces it, any other name is added alongside it. `:AiAgent` (with or
+    without an argument) also shows which MCP servers the current session actually
+    started with.
   - **Sign-in** — if the agent advertises auth methods on startup (e.g. Claude
     subscription login), the panel opens a dialog to pick one, or "Continue without
     auth". A `type: "terminal"` method (like `claude-ai-login`) opens an interactive
