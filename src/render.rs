@@ -19797,6 +19797,17 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
             header.push_str(&format!("  \u{b7} {summary}"));
         }
     }
+    // #1450 point 4: a staged Visual-selection/`:{range}AI` attachment's
+    // `⧉`-chip rides on this same always-repainted, focus-safe status line
+    // — visible until it's sent (or removed with Ctrl+R,
+    // `Engine::dispatch_ai_chat_event`) — rather than a new widget, same
+    // reasoning as the mode/usage lines above it.
+    if let Some(attachment) = &engine.acp_pending_attachment {
+        header.push_str(&format!(
+            "  \u{b7} {}",
+            attachment.chip(&engine.acp_workspace_cwd())
+        ));
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
 }
 

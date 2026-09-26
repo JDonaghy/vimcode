@@ -22924,6 +22924,148 @@ fn test_ai_send_message_ollama_needs_no_key() {
     );
 }
 
+/// #1450: `:'<,'>AI <message>` reaches `Engine::ai_attach_range` through the
+/// normal ex-range parser (`Engine::try_execute_ranged_command`'s new
+/// `name == "AI"` branch), not just via a direct call — stages exactly the
+/// buffer lines the Visual selection covered and still sends the message.
+/// Uses the no-agent-no-key fail-fast path (same lock/guards as
+/// `test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message`)
+/// so the user's turn lands in the transcript without a real subprocess.
+///
+/// RED verified: with the `name == "AI"` branch removed from
+/// `try_execute_ranged_command`, this fails — `acp_pending_attachment` stays
+/// `None`, because a leading range prefix means the plain `:AI ` fallback in
+/// `execute_command` never sees the command (its `cmd` still starts with
+/// `'<,'>`, not `"AI "`).
+#[test]
+fn test_ranged_ai_command_via_ex_parser_stages_attachment_and_sends() {
+    let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+    let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!("vimcode_test_1450_ex_{}.rs", std::process::id()));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    // Visual-line select lines 0-1, then run the range command while still
+    // in Visual mode — same setup `test_substitute_visual_range` uses.
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    engine.execute_command("'<,'>AI explain this");
+
+    let attachment = engine
+        .acp_pending_attachment
+        .as_ref()
+        .expect("the ex-range form should stage an attachment");
+    assert_eq!(attachment.start_line, 0);
+    assert_eq!(attachment.end_line, 1);
+    assert_eq!(attachment.text, "one\ntwo\n");
+    assert!(engine.ai_has_focus);
+    assert_eq!(
+        engine.ai_messages.first().map(|m| m.content.as_str()),
+        Some("explain this"),
+        "the message must still be sent, not just the attachment staged: {:?}",
+        engine.ai_messages
+    );
+
+    let _ = std::fs::remove_file(&file_path);
+}
+
+/// Companion: `:'<,'>AI` with no trailing message stages the attachment and
+/// focuses the panel without sending anything — reachable through the ex
+/// parser too, not just a direct `Engine::ai_attach_range` call.
+#[test]
+fn test_ranged_ai_command_via_ex_parser_with_no_message_does_not_send() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!(
+        "vimcode_test_1450_ex_empty_{}.rs",
+        std::process::id()
+    ));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    engine.execute_command("'<,'>AI");
+
+    assert!(
+        engine.acp_pending_attachment.is_some(),
+        "the attachment must still be staged"
+    );
+    assert!(engine.ai_has_focus);
+    assert!(
+        engine.ai_messages.is_empty(),
+        "no message means nothing is sent yet: {:?}",
+        engine.ai_messages
+    );
+
+    let _ = std::fs::remove_file(&file_path);
+}
+
+/// #1450 point 2: the Visual-mode `<leader>ai` mapping reaches
+/// `Engine::acp_attach_visual_selection_and_focus` through the real leader
+/// key-dispatch path (`Engine::handle_leader_key`, driven via
+/// `Engine::handle_key`), not just a direct call — proves the "ai" leader
+/// sequence is actually wired into `handle_visual_key`'s leader-mode
+/// routing.
+///
+/// RED verified: with `"ai"` removed from `handle_leader_key`'s `SEQUENCES`
+/// and match arms, this fails — pressing `<leader>a` alone (no known
+/// sequence starts with "a" otherwise) surfaces "Unknown leader sequence"
+/// and never attaches or focuses anything.
+#[test]
+fn test_leader_ai_in_visual_mode_attaches_selection_via_real_key_dispatch() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!(
+        "vimcode_test_1450_leader_{}.rs",
+        std::process::id()
+    ));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    let leader = engine.settings.leader;
+    engine.handle_key(&leader.to_string(), Some(leader), false);
+    engine.handle_key("a", Some('a'), false);
+    engine.handle_key("i", Some('i'), false);
+
+    assert_eq!(
+        engine.mode,
+        Mode::Normal,
+        "the mapping should exit Visual mode"
+    );
+    assert!(engine.ai_has_focus);
+    let attachment = engine
+        .acp_pending_attachment
+        .as_ref()
+        .expect("the leader mapping should stage an attachment");
+    assert_eq!(attachment.text, "one\ntwo\n");
+
+    let _ = std::fs::remove_file(&file_path);
+}
+
 #[test]
 fn test_command_center_chat_with_question() {
     let mut e = engine_with_text("hello");

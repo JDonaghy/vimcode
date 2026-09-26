@@ -6245,6 +6245,86 @@ second line here
         );
     }
 
+    /// #1450 point 2 acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_leader_ai_visual_mapping_shows_chip_and_focuses_input_via_shell_app`:
+    /// selecting two lines in `V` (linewise Visual) and pressing `<leader>ai`
+    /// (Space, then `a`, `i`) must open the AI panel, show the `⧉`-chip
+    /// naming the file and line range in the panel header, and put keyboard
+    /// focus in its input.
+    ///
+    /// Unlike the TUI twin, GTK needs no dedicated focus-sync wiring for
+    /// this — `render::route_focus_key` reads `Engine::sidebar_has_focus()`
+    /// fresh every keystroke rather than a cached bool, so
+    /// `Engine::focus_sidebar_panel`'s `ai_has_focus = true` (set inside
+    /// `Engine::acp_attach_visual_selection_and_focus`, itself called from
+    /// deep inside `Engine::handle_key`) is already enough. This test is
+    /// still required by the multi-backend rule: it's the only coverage that
+    /// the GTK key-dispatch path reaches the same engine method at all.
+    ///
+    /// RED verified: with `Engine::acp_attach_visual_selection_and_focus`
+    /// stubbed to a no-op, the panel/chip never appear and the typed `x`
+    /// lands in the editor buffer (turning "two" into "wo") instead of the
+    /// chat input.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_leader_ai_visual_mapping_shows_chip_and_focuses_input_via_gtk_driver() {
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1450_gtk_leader_ws_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        let file_path = workspace.join("t.rs");
+        std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(file_path.clone());
+        }
+        engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+        let mut h = harness(engine, 1400, 900);
+
+        // `V` + `j` selects lines 1-2 (0-based 0-1), linewise.
+        h.driver.type_char('V');
+        h.driver.type_char('j');
+        h.driver.type_char(' ');
+        h.driver.type_char('a');
+        h.driver.type_char('i');
+
+        assert!(
+            h.driver.screen_contains("AI ASSISTANT"),
+            "the AI panel must be visible after <leader>ai"
+        );
+        assert!(
+            h.driver.screen_contains("\u{29c9}") && h.driver.screen_contains("t.rs"),
+            "the attachment chip naming the file must be visible in the panel header"
+        );
+        assert!(
+            h.driver.screen_contains("1-2"),
+            "the chip must show the 1-based line range"
+        );
+
+        // Prove the input, not the editor buffer, has keyboard focus: a
+        // stray `x` reaching the editor in Normal mode would delete a
+        // character (Vim's `x`) instead of inserting one.
+        h.driver.type_char('x');
+        assert!(
+            h.driver.screen_contains("two"),
+            "the editor buffer must be untouched by the stray keystroke"
+        );
+        assert!(
+            h.driver.screen_contains("x"),
+            "typing after <leader>ai must land in the AI panel's input, not \
+             be swallowed as an editor command"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_tool_call_status_transitions_via_shell_app`: a tool call's
     /// transcript summary shows `title` + `kind`, and its status glyph

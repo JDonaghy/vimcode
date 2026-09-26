@@ -822,6 +822,133 @@ pub fn parse_prompt_capabilities(agent_capabilities: &serde_json::Value) -> AcpP
 }
 
 // ---------------------------------------------------------------------------
+// Prompt context — Visual selection / `:{range}AI` (#1450)
+// ---------------------------------------------------------------------------
+
+/// A buffer line-range staged for the *next* prompt (#1450): either a
+/// `:{range}AI` ex command (whole lines, built by
+/// `Engine::acp_build_range_attachment` with `exact_text: None`) or the
+/// Visual-mode `<leader>ai` mapping (`Engine::
+/// acp_attach_visual_selection_and_focus`, exact text for a characterwise/
+/// blockwise selection per point 5 of the issue — a linewise selection
+/// still gets whole lines, same as the ex form).
+///
+/// Lives in `Engine::acp_pending_attachment` from the moment it's staged
+/// until [`crate::core::engine::Engine::acp_prompt_content_blocks`] consumes
+/// it on the next `session/prompt` — which is what lets the Visual mapping
+/// open the panel and wait for the user to type a message before anything
+/// is sent, while `:{range}AI <message>` (which already has the message)
+/// sends immediately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpRangeAttachment {
+    /// Resolved, workspace-relative-safe path (see
+    /// [`resolve_path_within_roots`]) — never the raw, possibly-relative
+    /// buffer path.
+    pub path: std::path::PathBuf,
+    /// 0-based, inclusive.
+    pub start_line: usize,
+    /// 0-based, inclusive.
+    pub end_line: usize,
+    /// The exact text to attach — the buffer's live content, unsaved edits
+    /// included (point 5: "send the exact selected text").
+    pub text: String,
+}
+
+impl AcpRangeAttachment {
+    /// The `⧉ <path>:<range>` chip shown in the AI panel while this
+    /// attachment is pending (#1450 point 4) — `path` relative to
+    /// `workspace_cwd` when possible, matching
+    /// `Engine::acp_current_buffer_attachment`'s chip convention. A
+    /// single-line range renders as `path:N`, not `path:N-N`.
+    pub fn chip(&self, workspace_cwd: &std::path::Path) -> String {
+        let display = self
+            .path
+            .strip_prefix(workspace_cwd)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| self.path.display().to_string());
+        let (start1, end1) = (self.start_line + 1, self.end_line + 1);
+        if start1 == end1 {
+            format!("\u{29c9} {display}:{start1}")
+        } else {
+            format!("\u{29c9} {display}:{start1}-{end1}")
+        }
+    }
+
+    /// `file:///…#L<start>-L<end>` — the ACP-conventional line-range
+    /// fragment appended to the file URI, 1-based per the issue's example
+    /// (`#L10-L24`).
+    fn uri_with_range(&self) -> String {
+        format!(
+            "{}#L{}-L{}",
+            crate::core::lsp::path_to_uri(&self.path),
+            self.start_line + 1,
+            self.end_line + 1
+        )
+    }
+
+    /// This attachment's `session/prompt` content block(s) (#1450 point 3),
+    /// chosen per `caps.embedded_context`:
+    ///
+    /// * `true` — a single `resource` block whose `resource.text` is the
+    ///   exact attached text (unsaved edits included), `resource.uri`
+    ///   carries the `#L<start>-L<end>` fragment, and `resource.mimeType`
+    ///   is derived from the file extension (`text/x-<lang>`, falling back
+    ///   to `text/plain` for an unrecognized one).
+    /// * `false` — baseline ACP v1 has no line-range-aware block at all, so
+    ///   this falls back to a `resource_link` (the whole file, same shape
+    ///   `Engine::acp_current_buffer_attachment` sends) plus a `text` block
+    ///   naming the path/range with a fenced copy of the selection, so an
+    ///   agent that only understands `text`/`resource_link` still gets the
+    ///   exact selection content.
+    pub fn content_blocks(&self, caps: AcpPromptCapabilities) -> Vec<serde_json::Value> {
+        if caps.embedded_context {
+            vec![serde_json::json!({
+                "type": "resource",
+                "resource": {
+                    "uri": self.uri_with_range(),
+                    "mimeType": mime_type_for_path(&self.path),
+                    "text": self.text,
+                },
+            })]
+        } else {
+            let name = self
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| self.path.display().to_string());
+            let link = serde_json::json!({
+                "type": "resource_link",
+                "uri": crate::core::lsp::path_to_uri(&self.path),
+                "name": name,
+            });
+            let (start1, end1) = (self.start_line + 1, self.end_line + 1);
+            let lang = crate::core::lsp::language_id_from_path(&self.path).unwrap_or_default();
+            let fallback = serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "{name} (lines {start1}-{end1}):\n```{lang}\n{}\n```",
+                    self.text
+                ),
+            });
+            vec![link, fallback]
+        }
+    }
+}
+
+/// `text/x-<lang>` from the file's LSP language id
+/// ([`crate::core::lsp::language_id_from_path`]), or `text/plain` when the
+/// extension isn't recognized — there is no registry of real IANA mime
+/// types in this codebase, and every ACP agent this has been tested against
+/// treats `text/x-*` as an informational hint, not a strict content-type
+/// negotiation.
+fn mime_type_for_path(path: &std::path::Path) -> String {
+    match crate::core::lsp::language_id_from_path(path) {
+        Some(lang) => format!("text/x-{lang}"),
+        None => "text/plain".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // authMethods — wire-shape parsing (#957, ACP-6)
 // ---------------------------------------------------------------------------
 

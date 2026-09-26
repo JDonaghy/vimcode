@@ -575,9 +575,20 @@ impl Engine {
     /// `@`-mention in `text` that resolves to a real workspace path
     /// ([`Self::acp_mention_resource_link`]). `resource_link` is baseline
     /// ACP v1 — every agent must accept it, no `promptCapabilities` check
-    /// needed (unlike a future embedded-context/image block, which would
-    /// branch on `self.acp_prompt_capabilities`).
-    pub(crate) fn acp_prompt_content_blocks(&self, text: &str) -> Vec<serde_json::Value> {
+    /// needed (unlike the embedded-context block below).
+    ///
+    /// #1450: also consumes `self.acp_pending_attachment` (the Visual
+    /// selection / `:{range}AI` attachment), if one is staged, into its own
+    /// content block(s) via [`crate::core::acp::AcpRangeAttachment::
+    /// content_blocks`] — the one call in this codebase that reads
+    /// `self.acp_prompt_capabilities` to choose `resource` vs.
+    /// `resource_link` + fenced text. `&mut self` (not `&self`, unlike
+    /// #1449's original signature) purely for the `.take()` — the
+    /// attachment is consumed exactly once, whichever of this function's
+    /// two call sites ends up sending it (immediately in
+    /// `Self::ai_send_message_via_acp`, or after the handshake completes in
+    /// `Self::poll_acp`'s `SessionCreated` arm).
+    pub(crate) fn acp_prompt_content_blocks(&mut self, text: &str) -> Vec<serde_json::Value> {
         let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
         if let Some((block, _chip)) = self.acp_current_buffer_attachment() {
             blocks.push(block);
@@ -587,7 +598,122 @@ impl Engine {
                 blocks.push(block);
             }
         }
+        if let Some(attachment) = self.acp_pending_attachment.take() {
+            blocks.extend(attachment.content_blocks(self.acp_prompt_capabilities));
+        }
         blocks
+    }
+
+    // ── prompt context: Visual selection / `:{range}AI` (#1450) ─────────────
+
+    /// Build an [`crate::core::acp::AcpRangeAttachment`] for lines
+    /// `[start_line, end_line]` (0-based, inclusive) of the active buffer.
+    /// `exact_text`, when given, overrides the whole-lines default with the
+    /// precise selected text — the Visual mapping's characterwise/blockwise
+    /// case (point 5: "send the exact selected text; the URI range still
+    /// names whole lines"). `None` when there's no file to link to (mirrors
+    /// [`Self::acp_current_buffer_attachment`]'s unnamed-buffer/outside-
+    /// workspace bail-outs) — a scratch buffer has nothing on disk an agent
+    /// could resolve the URI against.
+    pub(crate) fn acp_build_range_attachment(
+        &self,
+        start_line: usize,
+        end_line: usize,
+        exact_text: Option<String>,
+    ) -> Option<crate::core::acp::AcpRangeAttachment> {
+        let path = self.active_buffer_state().file_path.clone()?;
+        let roots = self.acp_workspace_roots();
+        let resolved = crate::core::acp::resolve_path_within_roots(&path, &roots).ok()?;
+        let (start_line, end_line) = (start_line.min(end_line), start_line.max(end_line));
+        let text = match exact_text {
+            Some(t) => t,
+            None => {
+                let last = self.buffer().len_lines().saturating_sub(1);
+                let end_line = end_line.min(last);
+                let start_char = self.buffer().line_to_char(start_line.min(end_line));
+                let end_char = if end_line + 1 < self.buffer().len_lines() {
+                    self.buffer().line_to_char(end_line + 1)
+                } else {
+                    self.buffer().len_chars()
+                };
+                self.buffer()
+                    .content
+                    .slice(start_char..end_char)
+                    .to_string()
+            }
+        };
+        Some(crate::core::acp::AcpRangeAttachment {
+            path: resolved,
+            start_line,
+            end_line,
+            text,
+        })
+    }
+
+    /// `:{range}AI [message]` (#1450 point 1) — stage lines `[start_line,
+    /// end_line]` of the current buffer as the next attachment, then either
+    /// send `message` immediately (mirroring plain `:AI <message>`) or, if
+    /// `message` is empty (`:'<,'>AI` alone), just focus the panel so the
+    /// user can type one — the attachment stays staged either way, so it's
+    /// not lost by typing the message separately.
+    pub(crate) fn ai_attach_range(&mut self, start_line: usize, end_line: usize, message: &str) {
+        if let Some(attachment) = self.acp_build_range_attachment(start_line, end_line, None) {
+            self.acp_pending_attachment = Some(attachment);
+        }
+        if !message.is_empty() {
+            self.ai_send_message(message.to_string());
+        }
+        self.acp_focus_ai_panel_for_keyboard();
+    }
+
+    /// `<leader>ai` in Visual mode (#1450 point 2): stage the current
+    /// selection as the next attachment (exact text for characterwise/
+    /// blockwise, whole lines for linewise — point 5), exit Visual mode,
+    /// and focus the AI panel with the cursor in its input — without
+    /// sending; the user still types and submits a message. Outside Visual
+    /// mode, or with nothing to attach to (no active selection, or the
+    /// active buffer has no file), this just focuses the panel — the same
+    /// "no attachment, just open the panel" fallback `chat_open` already
+    /// has.
+    pub(crate) fn acp_attach_visual_selection_and_focus(&mut self) {
+        if let Some((start, end)) = self.get_visual_selection_range() {
+            let linewise = matches!(self.mode, Mode::VisualLine);
+            let exact_text = if linewise {
+                None
+            } else {
+                self.get_visual_selection_text().map(|(t, _)| t)
+            };
+            if let Some(attachment) =
+                self.acp_build_range_attachment(start.line, end.line, exact_text)
+            {
+                self.acp_pending_attachment = Some(attachment);
+            }
+            self.mode = Mode::Normal;
+            self.visual_anchor = None;
+            self.visual_dollar = false;
+            self.count = None;
+        }
+        self.acp_focus_ai_panel_for_keyboard();
+    }
+
+    /// Shared by [`Self::ai_attach_range`] and
+    /// [`Self::acp_attach_visual_selection_and_focus`]: a genuine
+    /// programmatic reveal, not a bare `self.ai_has_focus = true` — the AI
+    /// panel may not already be the visible sidebar content, and
+    /// `render::sidebar_owner`/`Engine::active_panel_is` (what actually
+    /// decides what paints, on both backends) need `app_shell.show_panel` to
+    /// have run for it to show up at all, per [`Self::focus_sidebar_panel`]'s
+    /// own doc ("used for programmatic reveals like DAP session start").
+    ///
+    /// This still doesn't put keyboard input in the panel's input on TUI by
+    /// itself: `sidebar.has_focus` there is a cached copy of "is the sidebar
+    /// band focused", updated ad hoc by mouse/shell-event handlers, not
+    /// re-derived every keystroke the way GTK's `Engine::sidebar_has_focus`
+    /// call is (see that method's doc) — so `TuiShellApp::handle_key_pressed`
+    /// has a matching one-line sync right after the "general fallback"
+    /// dispatch, reading this same `ai_has_focus` flag this call sets.
+    fn acp_focus_ai_panel_for_keyboard(&mut self) {
+        self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
     }
 
     /// Answer a parked `fs/read_text_file` request. A malformed request
@@ -1097,6 +1223,8 @@ impl Engine {
 mod tests {
     use crate::core::engine::Engine;
     use crate::core::lsp::{self, FormattingEdit, WorkspaceEdit};
+    use crate::core::{Cursor, Mode};
+    use std::path::PathBuf;
 
     #[test]
     fn poll_acp_is_a_no_op_when_no_client_is_running() {
@@ -1614,6 +1742,340 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // ── #1450: Visual selection / `:{range}AI` range attachment ──────────
+
+    /// Write `contents` to a fresh temp file and point the active buffer's
+    /// `file_path` at it, returning the path for cleanup/comparison. Shared
+    /// setup for every #1450 test below — none of them care about anything
+    /// but "a real file the active buffer is backed by".
+    fn setup_range_attachment_buffer(engine: &mut Engine, tag: &str, contents: &str) -> PathBuf {
+        let workspace = std::env::temp_dir();
+        engine.workspace_root = Some(workspace.clone());
+        let file_path = workspace.join(format!(
+            "vimcode_test_acp1450_{tag}_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, contents).expect("write test buffer file");
+        engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+        // Load the same content into the buffer itself — `:{range}AI`/the
+        // Visual mapping read the *live* buffer, not the file on disk, so a
+        // test that only wrote the file (leaving the buffer's default empty
+        // rope) would pass vacuously with an empty attachment text.
+        let len = engine.buffer().len_chars();
+        engine.delete_with_undo(0, len);
+        engine.insert_with_undo(0, contents);
+        file_path
+    }
+
+    /// Acceptance (point 3, `embeddedContext: true`): `:{range}AI` sends a
+    /// single `resource` block whose `resource.text` is the exact buffer
+    /// text for that range — including an edit made after the file was
+    /// written to disk (unsaved edits included, per the issue) — and whose
+    /// `resource.uri` carries the `#L<start>-L<end>` line-range fragment.
+    ///
+    /// RED verified: with `AcpRangeAttachment::content_blocks` stubbed to
+    /// always return the `resource_link` fallback shape, this fails (no
+    /// `resource` block on the wire at all).
+    #[cfg(unix)]
+    #[test]
+    fn ranged_ai_command_with_embedded_context_sends_exact_unsaved_text_and_range() {
+        let capture = capture_file_path("range_embedded");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+            ("ACP_FAKE_EMBEDDED_CONTEXT", "1"),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.ai_attach_current_buffer = false;
+        let file_path = setup_range_attachment_buffer(
+            &mut engine,
+            "embedded",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        );
+        // An unsaved edit — never written back to `file_path` — must still
+        // show up verbatim in the attached text.
+        let line1_start = engine.buffer().line_to_char(1);
+        engine.insert_with_undo(line1_start, "// unsaved edit\n");
+
+        // Wait for `Initialized` (and its `promptCapabilities`) to drain
+        // before staging the attachment/sending, so the capability is
+        // already known the moment `acp_prompt_content_blocks` runs.
+        poll_acp_until(&mut engine, |e| e.acp_prompt_capabilities.embedded_context);
+        assert!(
+            engine.acp_prompt_capabilities.embedded_context,
+            "fixture should have advertised embeddedContext: true"
+        );
+
+        // Lines 1-2 (0-based), i.e. the unsaved comment plus "fn two() {}".
+        engine.ai_attach_range(1, 2, "explain these lines");
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        let resource = blocks
+            .iter()
+            .find(|b| b["type"] == "resource")
+            .unwrap_or_else(|| panic!("expected a resource block: {blocks:?}"));
+        assert_eq!(
+            resource["resource"]["text"], "// unsaved edit\nfn two() {}\n",
+            "attached text must be the live buffer content, unsaved edit included"
+        );
+        let expected_uri = format!(
+            "{}#L2-L3",
+            crate::core::lsp::path_to_uri(&file_path.canonicalize().expect("file exists"))
+        );
+        assert_eq!(
+            resource["resource"]["uri"], expected_uri,
+            "the URI must carry the 1-based #L2-L3 range for 0-based lines 1-2"
+        );
+        assert_eq!(resource["resource"]["mimeType"], "text/x-rust");
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "resource_link"),
+            "the range attachment must not also send the whole-file fallback \
+             shape when embeddedContext is true (ai_attach_current_buffer is \
+             off in this test): {blocks:?}"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance (point 3, no `embeddedContext`): without the capability,
+    /// `:{range}AI` falls back to a `resource_link` for the file plus a
+    /// `text` block naming the path/range with a fenced copy of the exact
+    /// selection — never a `resource` block.
+    ///
+    /// RED verified: with `AcpPromptCapabilities::embedded_context` ignored
+    /// and `content_blocks` always taking the `resource` branch, this fails
+    /// (a `resource` block appears where a `resource_link` + fenced text
+    /// was expected).
+    #[cfg(unix)]
+    #[test]
+    fn ranged_ai_command_without_embedded_context_falls_back_to_resource_link_and_fenced_text() {
+        let capture = capture_file_path("range_fallback");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.ai_attach_current_buffer = false;
+        let file_path = setup_range_attachment_buffer(
+            &mut engine,
+            "fallback",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        );
+        poll_acp_until(&mut engine, |e| {
+            e.acp_session_id.is_some() || e.acp_client.is_none()
+        });
+        assert!(
+            !engine.acp_prompt_capabilities.embedded_context,
+            "fixture must not advertise embeddedContext by default"
+        );
+
+        engine.ai_attach_range(0, 1, "explain these lines");
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "resource"),
+            "must not send an embedded `resource` block without the capability: {blocks:?}"
+        );
+        let expected_uri =
+            crate::core::lsp::path_to_uri(&file_path.canonicalize().expect("file exists"));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == "resource_link" && b["uri"] == expected_uri),
+            "expected a resource_link fallback for the file: {blocks:?}"
+        );
+        let fenced = blocks
+            .iter()
+            .find(|b| b["type"] == "text" && b["text"] != "explain these lines")
+            .unwrap_or_else(|| panic!("expected a fenced-text fallback block: {blocks:?}"));
+        let fenced_text = fenced["text"].as_str().unwrap_or_default();
+        assert!(
+            fenced_text.contains("fn one() {}\nfn two() {}\n"),
+            "fenced fallback must contain the exact selected lines: {fenced_text:?}"
+        );
+        assert!(
+            fenced_text.contains("lines 1-2"),
+            "fenced fallback must name the 1-based line range: {fenced_text:?}"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance (point 1): `:'<,'>AI` with no message stages the
+    /// attachment and focuses the panel without sending — the message can
+    /// still be typed and submitted afterward.
+    #[test]
+    fn ai_attach_range_with_no_message_stages_attachment_and_focuses_without_sending() {
+        let mut engine = Engine::new_for_test();
+        let file_path = setup_range_attachment_buffer(&mut engine, "stage", "one\ntwo\nthree\n");
+
+        assert!(!engine.ai_has_focus);
+        engine.ai_attach_range(0, 1, "");
+
+        assert!(
+            engine.ai_has_focus,
+            "an empty message must still focus the panel"
+        );
+        assert!(engine.ai_messages.is_empty(), "nothing should be sent yet");
+        let attachment = engine
+            .acp_pending_attachment
+            .as_ref()
+            .expect("attachment should be staged");
+        assert_eq!(attachment.start_line, 0);
+        assert_eq!(attachment.end_line, 1);
+        assert_eq!(attachment.text, "one\ntwo\n");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// Acceptance (point 5): the Visual mapping's characterwise selection
+    /// keeps the exact selected text, not whole lines — even though the
+    /// selection spans only part of each of two lines.
+    #[test]
+    fn visual_mapping_characterwise_selection_attaches_exact_text_not_whole_lines() {
+        let mut engine = Engine::new_for_test();
+        let file_path =
+            setup_range_attachment_buffer(&mut engine, "charwise", "abcdefgh\nijklmnop\n");
+
+        // Select from col 3 on line 0 ('d') through col 2 on line 1 ('k'),
+        // inclusive — a characterwise span crossing a line boundary.
+        engine.mode = Mode::Visual;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 3 });
+        engine.view_mut().cursor = Cursor { line: 1, col: 2 };
+
+        engine.acp_attach_visual_selection_and_focus();
+
+        assert_eq!(engine.mode, Mode::Normal, "should exit Visual mode");
+        assert!(engine.ai_has_focus);
+        let attachment = engine
+            .acp_pending_attachment
+            .as_ref()
+            .expect("attachment should be staged");
+        assert_eq!(
+            attachment.text, "defgh\nijk",
+            "must be the exact characterwise span, not whole lines 0-1"
+        );
+        assert_eq!(attachment.start_line, 0);
+        assert_eq!(attachment.end_line, 1);
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// Acceptance (point 5): a linewise (`V`) Visual selection attaches
+    /// whole lines, same as the ex-range form — the "exact text" carve-out
+    /// is specific to characterwise/blockwise.
+    #[test]
+    fn visual_mapping_linewise_selection_attaches_whole_lines() {
+        let mut engine = Engine::new_for_test();
+        let file_path =
+            setup_range_attachment_buffer(&mut engine, "linewise", "abcdefgh\nijklmnop\n");
+
+        engine.mode = Mode::VisualLine;
+        engine.visual_anchor = Some(Cursor { line: 0, col: 3 });
+        engine.view_mut().cursor = Cursor { line: 0, col: 3 };
+
+        engine.acp_attach_visual_selection_and_focus();
+
+        let attachment = engine
+            .acp_pending_attachment
+            .as_ref()
+            .expect("attachment should be staged");
+        assert_eq!(
+            attachment.text, "abcdefgh\n",
+            "linewise must attach the whole line, not just the column span"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// Acceptance: outside Visual mode, the `<leader>ai` mapping just
+    /// focuses the panel — no attachment, matching the palette's plain
+    /// `chat_open` fallback.
+    #[test]
+    fn visual_mapping_outside_visual_mode_only_focuses_panel() {
+        let mut engine = Engine::new_for_test();
+        assert_eq!(engine.mode, Mode::Normal);
+        engine.acp_attach_visual_selection_and_focus();
+        assert!(engine.ai_has_focus);
+        assert!(engine.acp_pending_attachment.is_none());
+    }
+
+    /// Acceptance (point 4): Ctrl+R while the panel has focus removes a
+    /// staged attachment without sending anything.
+    #[test]
+    fn ctrl_r_removes_a_staged_attachment_without_sending() {
+        let mut engine = Engine::new_for_test();
+        let file_path = setup_range_attachment_buffer(&mut engine, "remove", "one\ntwo\n");
+        engine.ai_attach_range(0, 1, "");
+        assert!(engine.acp_pending_attachment.is_some());
+
+        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+            key: "Char('r')".to_string(),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                cmd: false,
+            },
+        });
+
+        assert!(kept_focus, "Ctrl+R must not drop panel focus");
+        assert!(
+            engine.acp_pending_attachment.is_none(),
+            "attachment must be removed"
+        );
+        assert!(engine.ai_messages.is_empty(), "nothing should be sent");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// Acceptance: `ai_clear` drops a staged attachment too — composed but
+    /// unsent content, same as everything else it resets.
+    #[test]
+    fn ai_clear_drops_a_staged_attachment() {
+        let mut engine = Engine::new_for_test();
+        let file_path = setup_range_attachment_buffer(&mut engine, "clear", "one\ntwo\n");
+        engine.ai_attach_range(0, 1, "");
+        assert!(engine.acp_pending_attachment.is_some());
+
+        engine.ai_clear();
+
+        assert!(engine.acp_pending_attachment.is_none());
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// The `⧉`-chip shown while an attachment is staged (point 4) — plain
+    /// data-shape coverage; the driver-tier tests
+    /// (`tui_main::shell_app`/`gtk::testing`) cover it actually being
+    /// painted in the panel header.
+    #[test]
+    fn range_attachment_chip_format() {
+        let workspace = std::path::PathBuf::from("/ws");
+        let single = crate::core::acp::AcpRangeAttachment {
+            path: std::path::PathBuf::from("/ws/src/main.rs"),
+            start_line: 9,
+            end_line: 9,
+            text: "let x = 1;\n".to_string(),
+        };
+        assert_eq!(single.chip(&workspace), "\u{29c9} src/main.rs:10");
+
+        let range = crate::core::acp::AcpRangeAttachment {
+            path: std::path::PathBuf::from("/ws/src/main.rs"),
+            start_line: 9,
+            end_line: 23,
+            text: String::new(),
+        };
+        assert_eq!(range.chip(&workspace), "\u{29c9} src/main.rs:10-24");
     }
 
     /// Review regression (#952): a `RequestFailed` for `session/new` — a
