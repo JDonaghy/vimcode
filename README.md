@@ -763,16 +763,72 @@ board over an external-tool JSON seam, no specific provider hardcoded.
 
 ### AI Assistant
 
-Built-in AI chat panel. Click the chat icon in the activity bar to open.
+Built-in AI chat panel. Click the chat icon in the activity bar to open. The input box
+is always focused — there's no separate "input mode" to enter.
 
-Two transports, picked by whether `acp_agent_command` is set:
+Two transports, picked by whether `acp_agent_command` (or the `acp_agents` registry,
+below) is configured:
 
-- **ACP (Agent Client Protocol)** — set `acp_agent_command` in `settings.json` to a live agent's command line (e.g. `"claude-code-acp"`). vimcode spawns it, drives the `initialize` → `session/new` → `session/prompt` handshake, and streams the agent's reply into the panel as it's generated. Requires the agent binary on `PATH`.
-- **Direct provider** (no agent binary required) — leave `acp_agent_command` empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
+- **ACP (Agent Client Protocol)** — set `acp_agent_command` in `settings.json` to a live
+  agent's command line, e.g. `"npx -y @agentclientprotocol/claude-agent-acp"` (Node ≥
+  22; requires `npx`/Node on `PATH`). vimcode spawns it, drives the `initialize` →
+  `session/new` → `session/prompt` handshake, and streams the agent's reply into the
+  panel as it's generated.
+  - **Multiple agents** — register two or more named profiles in `acp_agents` instead
+    of the single `acp_agent_command` string, and pick which one is live with
+    `acp_active_agent` or at runtime with `:AiAgent <name>` (no restart needed):
+    ```json
+    "acp_agents": [
+      { "name": "claude", "command": "npx -y @agentclientprotocol/claude-agent-acp" },
+      { "name": "gemini", "command": "gemini --acp" }
+    ],
+    "acp_active_agent": "claude"
+    ```
+    `:AiAgent` with no argument lists the configured agents and which is active.
+    Switching agents ends any session currently in progress — a new agent process
+    shares no context with the old one. Once `acp_agents` is non-empty,
+    `acp_agent_command` is ignored.
+  - **Sign-in** — if the agent advertises auth methods on startup (e.g. Claude
+    subscription login), the panel opens a dialog to pick one, or "Continue without
+    auth". A `type: "terminal"` method (like `claude-ai-login`) opens an interactive
+    login in the terminal panel; completing it there resumes the AI panel
+    automatically. A `type: "agent"` method authenticates in place, no terminal needed.
+  - **Permission prompts** — when the agent wants to run a tool call, a dialog asks
+    allow/reject, with "always allow"/"always reject" options that are remembered for
+    the rest of the session (per tool-call kind).
+  - **Cancelling** — `Ctrl+C` while a turn is streaming aborts just that turn
+    (`session/cancel`) without ending the session or losing history; `Ctrl+C` while
+    idle clears the conversation (same as `:AiClear`).
+- **Direct provider** (no agent binary required) — leave `acp_agent_command`/`acp_agents`
+  empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local
+  Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
 
-- `i` — enter input mode; type and press `Enter` to send
-- `:AI <message>` — send from command mode; `:AiClear` — clear history
+**Keys** (same for both transports, from `quadraui`'s `ChatController`):
+
+- `Enter` — insert a newline in the input (it does **not** send)
+- `Ctrl+S` or `Alt+Enter` — send the message. `Ctrl+Enter` also works, but only under
+  the Kitty keyboard protocol (kitty, Alacritty ≥ 0.12, WezTerm, foot) — not most other
+  terminals.
+- `Esc` — dismiss/cancel (closes an open permission or auth dialog; cancels the input)
+- `Ctrl+C` — clear the conversation (same as `:AiClear`); with an ACP agent, while a
+  reply is actively streaming it instead cancels just that turn, see "Cancelling" above
+- `↑`/`↓` at the input's first/last line — navigate message history; mid-input, moves
+  the cursor
+- `PageUp`/`PageDown` — scroll the transcript
+- `:AI <message>` — send from command mode; `:AiClear` — clear history; `:AiAgent
+  [name]` — list/switch configured agents; `:AiMode [name]` — show/switch the active
+  agent's declared modes
 - **AI inline completions** — set `ai_completions: true` for ghost-text suggestions in insert mode (`Tab` accepts, `Alt-]`/`Alt-[` cycle alternatives)
+
+**macOS terminal notes:** `Alt+Enter` requires the terminal to send Option as Meta —
+iTerm2: *Profiles → Keys → General → Left Option key: Esc+*; Terminal.app: check "Use
+Option as Meta key". `Ctrl+S` is the terminal's XON/XOFF flow-control key in some shell
+configurations and can appear to freeze the terminal; run `stty -ixon` to disable that,
+or just use `Alt+Enter`.
+
+**Editing `settings.json` by hand:** close vimcode first. A running instance holds its
+settings in memory and writes them back on change/exit, which will silently overwrite a
+hand edit made while it's still open.
 
 ---
 
@@ -1266,6 +1322,8 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:config reload` | Reload settings from disk |
 | `:AI <message>` | Send a message to the AI assistant |
 | `:AiClear` | Clear the AI conversation history |
+| `:AiAgent [name]` | List configured ACP agents (`acp_agents`) and the active one, or switch to `name` |
+| `:AiMode [name]` | Show the active ACP agent's declared modes, or switch to `name` |
 | `:MarkdownPreview` / `:MdPreview` | Open side-by-side styled markdown preview (live-updates on edit, scroll sync, scaled headings in GTK) |
 | `:Explore [dir]` / `:Ex [dir]` | Open netrw-style in-buffer directory listing |
 | `:Sexplore [dir]` / `:Sex [dir]` | Horizontal split + netrw directory listing |
