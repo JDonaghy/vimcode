@@ -3623,6 +3623,21 @@ pub struct Engine {
     /// handshake takes at least one `poll_acp` round trip). Drained by
     /// `poll_acp` the moment `AcpEvent::SessionCreated` lands.
     pub acp_pending_prompt: Option<String>,
+    /// The chip-decorated *displayed* text for [`Self::acp_pending_prompt`],
+    /// held back from `ai_messages` specifically when the
+    /// `acp_reopen_last_session` auto-resume path
+    /// (`Engine::ai_send_message_via_acp`) is about to replay an older
+    /// session's history on top of it (#1459 review). Pushing the
+    /// brand-new message immediately (like the non-resume cold-start path
+    /// does) would put it *above* the "past" conversation the resume is
+    /// meant to continue, since the replayed `session/update` history
+    /// lands after whatever is already in `ai_messages` — so this is shown
+    /// instead once the resume actually finishes (`AcpEvent::SessionLoaded`)
+    /// or is abandoned in favour of a fresh session
+    /// (`AcpEvent::RequestFailed` for `session/load`). `None` on every
+    /// other path, which keeps pushing its message eagerly exactly as
+    /// before.
+    pub acp_pending_prompt_display: Option<String>,
     /// The `ai_messages` index + role of the transcript turn currently
     /// being streamed via `session/update` chunks, so consecutive chunks
     /// of the same kind (`AcpChunkKind`) append to it instead of each
@@ -4997,6 +5012,7 @@ impl Engine {
             acp_client: None,
             acp_session_id: None,
             acp_pending_prompt: None,
+            acp_pending_prompt_display: None,
             acp_streaming_turn: None,
             acp_pending_permission: None,
             acp_remembered_decisions: HashMap::new(),

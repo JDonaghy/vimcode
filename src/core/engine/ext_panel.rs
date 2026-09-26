@@ -3056,12 +3056,6 @@ impl Engine {
         } else {
             format!("{}\n{text}", chip_lines.join("\n"))
         };
-        self.ai_messages.push(AiMessage {
-            role: "user".to_string(),
-            content: displayed_text,
-        });
-        self.ai_streaming = true;
-        self.acp_streaming_turn = None;
 
         // #1459: on the very first `:AI`/message of the process, and only
         // then, honour `acp_reopen_last_session` — resume the most recent
@@ -3069,22 +3063,51 @@ impl Engine {
         // of starting empty. `acp_client.is_none()` guards against this
         // ever firing on a message sent to an agent that's already running
         // (that's a continuation of a session already chosen, not a fresh
-        // start to redirect).
+        // start to redirect). #1459 review: also honours the learned
+        // `loadSession` capability the same way `acp_open_sessions_picker`
+        // does — an agent that has already told us it doesn't support
+        // resume must fall straight through to a fresh session below, not
+        // attempt one that can only fail on the wire.
+        let mut auto_resume_session_id: Option<String> = None;
         if !self.acp_startup_reopen_attempted {
             self.acp_startup_reopen_attempted = true;
             if self.settings.acp_reopen_last_session && self.acp_client.is_none() {
                 let agent_name = self.acp_active_agent_name();
-                let cwd = self.acp_workspace_cwd();
-                if let Some(record) = self
-                    .acp_session_index
-                    .sessions_for(&agent_name, &cwd)
-                    .into_iter()
-                    .next()
-                {
-                    self.acp_pending_resume = Some(record.session_id);
+                if self.acp_session_index.load_session_capability(&agent_name) != Some(false) {
+                    let cwd = self.acp_workspace_cwd();
+                    auto_resume_session_id = self
+                        .acp_session_index
+                        .sessions_for(&agent_name, &cwd)
+                        .into_iter()
+                        .next()
+                        .map(|record| record.session_id);
                 }
             }
         }
+
+        if let Some(session_id) = auto_resume_session_id {
+            // #1459 review: pushing the just-typed message immediately
+            // (like the no-resume branch below does) would put it *above*
+            // the replayed history that's about to land after it — the
+            // resumed session's `session/update` notifications append to
+            // whatever is already in `ai_messages`. Reset first (matching
+            // the picker's `acp_resume_session` — a no-op here in practice
+            // since this is the first message of the process, but keeps
+            // the two resume entry points consistent) and hold the display
+            // line back until the resume actually finishes or is abandoned
+            // — see `AcpEvent::SessionLoaded`/`AcpEvent::RequestFailed` in
+            // `acp_ops.rs`, and the `Err(e)` spawn-failure arm below.
+            self.acp_reset_transcript_for_resume();
+            self.acp_pending_resume = Some(session_id);
+            self.acp_pending_prompt_display = Some(displayed_text);
+        } else {
+            self.ai_messages.push(AiMessage {
+                role: "user".to_string(),
+                content: displayed_text,
+            });
+        }
+        self.ai_streaming = true;
+        self.acp_streaming_turn = None;
 
         if self.acp_client.is_some() {
             if let Some(session_id) = self.acp_session_id.clone() {
@@ -3121,6 +3144,17 @@ impl Engine {
                 // silently empty panel — so this lands in the transcript
                 // itself, not just the status line.
                 self.ai_streaming = false;
+                // #1459: the auto-resume path deferred showing the user's
+                // typed message until the resume finished — it never will
+                // now (there's no client to finish it), so show it here
+                // instead of silently dropping it.
+                self.acp_pending_resume = None;
+                if let Some(display) = self.acp_pending_prompt_display.take() {
+                    self.ai_messages.push(AiMessage {
+                        role: "user".to_string(),
+                        content: display,
+                    });
+                }
                 self.message = format!("ACP agent failed to start: {e}");
                 self.ai_messages.push(AiMessage {
                     role: "assistant-thought".to_string(),
@@ -3191,8 +3225,11 @@ impl Engine {
         self.acp_pending_prompt = None;
         // #1459: an unconsumed resume request (`:AiSessions` picked a
         // session, then the user ran `:AiClear` before the handshake
-        // finished) must not resurface on whatever session starts next.
+        // finished) must not resurface on whatever session starts next —
+        // same for its deferred display line, if the auto-resume path had
+        // queued one.
         self.acp_pending_resume = None;
+        self.acp_pending_prompt_display = None;
         self.acp_streaming_turn = None;
         // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
         // clearing the conversation ends the session, so none of it should

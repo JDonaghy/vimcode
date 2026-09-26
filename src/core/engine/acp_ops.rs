@@ -67,8 +67,12 @@ impl Engine {
                     self.acp_session_id = None;
                     self.acp_pending_prompt = None;
                     // #1459: a resume the agent died before completing must
-                    // not silently apply to whatever agent starts next.
+                    // not silently apply to whatever agent starts next, and
+                    // its deferred display line (if any) goes with it — the
+                    // agent is gone, so there's no transcript left for it to
+                    // land after.
                     self.acp_pending_resume = None;
+                    self.acp_pending_prompt_display = None;
                     self.acp_streaming_turn = None;
                     // #956 (ACP-5): session-scoped, same as the decisions
                     // map above — see `Engine::ai_clear`'s matching reset.
@@ -212,6 +216,30 @@ impl Engine {
                         self.acp_current_mode_id = current;
                     }
                     if let Some(session_id) = self.acp_session_id.clone() {
+                        // #1459 review: refresh this record's `updated_at`
+                        // (idempotent by id, see `record_session`'s doc) so a
+                        // session just resumed and used again bubbles back
+                        // to the top of a later `:AiSessions` picker instead
+                        // of looking stale next to sessions that were merely
+                        // created, never resumed.
+                        let agent_name = self.acp_active_agent_name();
+                        let cwd = self.acp_workspace_cwd();
+                        self.acp_session_index
+                            .record_session(&session_id, &agent_name, &cwd, "");
+                        self.acp_session_index.save();
+                        // #1459 review: a message deferred by the
+                        // `acp_reopen_last_session` auto-resume path
+                        // (`ai_send_message_via_acp`) is shown now — only
+                        // after the replayed `session/update` history above
+                        // has finished landing in `ai_messages` — so it
+                        // appears *after* the "past" conversation it's
+                        // continuing, not spliced in ahead of it.
+                        if let Some(display) = self.acp_pending_prompt_display.take() {
+                            self.ai_messages.push(AiMessage {
+                                role: "user".to_string(),
+                                content: display,
+                            });
+                        }
                         if let Some(text) = self.acp_pending_prompt.take() {
                             let content = self.acp_prompt_content_blocks(&text);
                             if let Some(client) = self.acp_client.as_mut() {
@@ -261,17 +289,57 @@ impl Engine {
                     // lands in the transcript, but the spinner never clears
                     // and `ai_send_message` silently no-ops on every
                     // subsequent call (see `ext_panel.rs`'s early return on
-                    // `self.ai_streaming`). `acp_pending_prompt` is also
-                    // dropped so a queued prompt from the failed handshake
-                    // isn't replayed against a later, unrelated session.
+                    // `self.ai_streaming`).
                     self.ai_streaming = false;
                     self.acp_streaming_turn = None;
-                    self.acp_pending_prompt = None;
                     self.message = format!("ACP {method} failed: {message}");
                     self.ai_messages.push(AiMessage {
                         role: "assistant-thought".to_string(),
                         content: format!("\u{26a0} {method} failed: {message}"),
                     });
+                    if method == "session/load" {
+                        // #1459 review: `acp_begin_session`'s resume branch
+                        // sets `acp_session_id` to the resumed id *before*
+                        // the request goes out (see its doc, and
+                        // `ACP_FAKE_LOAD_SESSION_ERROR`'s fixture doc for the
+                        // exact "agent doesn't actually still have this
+                        // session" regression this guards). If the agent
+                        // then rejects the load, that id must not linger —
+                        // the agent never actually created it, so every
+                        // later `session/prompt` against it would fail the
+                        // same way, silently and forever. Reset it and fall
+                        // back to a fresh session instead, matching
+                        // `acp_reopen_last_session`'s own doc ("silently
+                        // falls back to a fresh session"): any message the
+                        // auto-resume path deferred display of is shown now
+                        // (there is no history left to land it after), and
+                        // `acp_begin_session` — with `acp_pending_resume`
+                        // already consumed by the failed attempt — takes its
+                        // no-pending-resume branch and sends a plain
+                        // `session/new`, which will pick `acp_pending_prompt`
+                        // back up via `SessionCreated` exactly like a cold
+                        // start.
+                        self.acp_session_id = None;
+                        if let Some(display) = self.acp_pending_prompt_display.take() {
+                            self.ai_messages.push(AiMessage {
+                                role: "user".to_string(),
+                                content: display,
+                            });
+                        }
+                        if self.acp_pending_prompt.is_some() {
+                            self.ai_streaming = true;
+                        }
+                        self.acp_begin_session();
+                    } else {
+                        // `acp_pending_prompt` is dropped for every other
+                        // failure so a queued prompt from a failed handshake
+                        // isn't replayed against a later, unrelated session
+                        // — `session/load` is the one exception, handled
+                        // above, where the fallback session is what it's
+                        // meant to reach.
+                        self.acp_pending_prompt = None;
+                        self.acp_pending_prompt_display = None;
+                    }
                     redraw = true;
                 }
                 AcpEvent::ClientRequest {
@@ -480,7 +548,23 @@ impl Engine {
     ///   deferral, `acp_begin_session` hasn't run for it yet either.
     /// - A live session already: call `acp_begin_session` immediately —
     ///   there is no handshake left to wait for.
+    ///
+    /// #1459 review: every branch first cancels whatever turn might still
+    /// be streaming on the *current* session and clears the displayed
+    /// transcript — see [`Self::acp_reset_transcript_for_resume`] — so the
+    /// resumed session's replayed history starts from a blank transcript
+    /// rather than being spliced onto whatever was already on screen.
     pub(crate) fn acp_resume_session(&mut self, session_id: String) {
+        self.acp_cancel_turn();
+        self.acp_reset_transcript_for_resume();
+        // #1459 review: mark busy from the moment the resume is requested
+        // — `AcpEvent::SessionLoaded`'s "no pending prompt" branch is the
+        // one thing that turns this back off, whichever of the branches
+        // below gets there; leaving it `false` in between would show the
+        // panel as idle while a `session/load` round trip is genuinely in
+        // flight.
+        self.ai_streaming = true;
+
         if self.acp_client.is_some() && self.acp_session_id.is_some() {
             self.acp_pending_resume = Some(session_id);
             self.acp_begin_session();
@@ -501,9 +585,45 @@ impl Engine {
             }
             Err(e) => {
                 self.acp_pending_resume = None;
+                self.ai_streaming = false;
                 self.message = format!("Could not start ACP agent \"{agent_label}\": {e}");
             }
         }
+    }
+
+    /// Session-scoped transcript/UI state that must not survive switching
+    /// to a different session (#1459 review) — shared by every branch of
+    /// [`Self::acp_resume_session`] so the resumed session's `session/
+    /// update` replay always lands on a blank transcript, never spliced
+    /// onto whatever conversation (if any) was already displayed. Before
+    /// this existed, every resume test happened to call `:AiClear`
+    /// immediately beforehand, which cleared this same state only as a
+    /// side effect of killing the client entirely — masking the "resume a
+    /// *different* session while the current one is still live" path,
+    /// which never cleared anything.
+    ///
+    /// Deliberately leaves the connection itself untouched
+    /// (`acp_client`/`acp_session_id`/`acp_authenticated`/
+    /// `acp_prompt_capabilities`/`acp_auth_methods`) — those describe the
+    /// live agent process, which a same-agent resume reuses rather than
+    /// replaces, unlike `Engine::ai_clear`'s superset of this reset which
+    /// also drops the client.
+    ///
+    /// `pub(crate)` so `ext_panel.rs`'s `ai_send_message_via_acp` (the
+    /// `acp_reopen_last_session` auto-resume path) can call it directly —
+    /// the other call site is in this same module.
+    pub(crate) fn acp_reset_transcript_for_resume(&mut self) {
+        self.acp_remembered_decisions.clear();
+        self.ai_messages.clear();
+        self.acp_plan.clear();
+        self.acp_available_commands.clear();
+        self.acp_command_completion_idx = 0;
+        self.acp_modes.clear();
+        self.acp_current_mode_id = None;
+        self.acp_usage = None;
+        self.acp_tool_calls.clear();
+        self.change_review = None;
+        self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
     }
 
     // ── authMethods / authenticate / terminal login (#957, ACP-6) ───────────
@@ -633,6 +753,11 @@ impl Engine {
         self.ai_streaming = false;
         self.acp_streaming_turn = None;
         self.acp_pending_prompt = None;
+        // #1459: same reasoning as `AgentExited` — an abandoned/failed
+        // login drops the client entirely, so any deferred resume display
+        // line has nowhere left to land.
+        self.acp_pending_prompt_display = None;
+        self.acp_pending_resume = None;
         self.acp_client = None;
         self.acp_session_id = None;
         self.acp_auth_methods.clear();
@@ -3989,6 +4114,223 @@ mod tests {
             engine.message.contains("does not support"),
             "a message must explain the refusal: {:?}",
             engine.message
+        );
+    }
+
+    /// Review blocking finding: resuming a *different* session while the
+    /// current one is still live must replace the displayed transcript,
+    /// not splice the resumed history onto whatever was already on
+    /// screen. `Engine::acp_resume_session`'s own doc names this exact
+    /// state ("a live session already: call `acp_begin_session`
+    /// immediately") — every other resume test calls `:AiClear`
+    /// immediately beforehand, which happens to also empty `ai_messages`
+    /// as a side effect of killing the client, so none of them ever
+    /// actually exercised it.
+    ///
+    /// RED verified: with `Engine::acp_reset_transcript_for_resume`'s call
+    /// removed from `acp_resume_session`, this fails — the live session's
+    /// own "hello from session A" turn (and its reply) survive in
+    /// `ai_messages` alongside the resumed session's replayed history.
+    #[cfg(unix)]
+    #[test]
+    fn acp_resume_session_replaces_a_still_live_transcript_not_splices_it() {
+        let mut engine = engine_with_registered_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_LOAD_SESSION", "1"),
+        ]);
+
+        engine.ai_send_message("hello from session A".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            engine.acp_client.is_some() && engine.acp_session_id.is_some(),
+            "the live session must still be connected going into the resume"
+        );
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("hello from session A")),
+            "sanity: the live session's own turn must be on screen before \
+             resuming: {:?}",
+            engine.ai_messages
+        );
+
+        // The picker's confirm action, with no intervening `:AiClear` —
+        // the live client and its session stay connected until
+        // `acp_resume_session` itself tears the turn down. This fixture's
+        // `session/load` reply hardcodes "sess-1" on every replayed
+        // `session/update` notification (see its top-of-file doc), which
+        // happens to be the same id `session/new` assigned above — that's
+        // fine and deliberate: what this test checks is that the resume
+        // clears the transcript *before* the replay lands, not that the
+        // resumed id differs from the one already live.
+        engine.acp_resume_session("sess-1".to_string());
+        poll_acp_until(&mut engine, |e| {
+            e.ai_messages
+                .iter()
+                .any(|m| m.content.contains("It prints hello."))
+        });
+
+        assert_eq!(
+            engine.acp_session_id.as_deref(),
+            Some("sess-1"),
+            "must resume the requested session id"
+        );
+        assert!(
+            !engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("hello from session A")),
+            "the previous live session's transcript must be gone, not \
+             spliced in ahead of the resumed history: {:?}",
+            engine.ai_messages
+        );
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("what does main.rs do")),
+            "the resumed session's replayed history must be the only \
+             thing on screen: {:?}",
+            engine.ai_messages
+        );
+    }
+
+    /// Review blocking finding: the `acp_reopen_last_session` auto-resume
+    /// path must not put the brand-new message *above* the "past"
+    /// conversation it's meant to continue. `ai_send_message_via_acp` used
+    /// to push the typed message onto `ai_messages` unconditionally before
+    /// checking whether an auto-resume was about to happen, so the
+    /// replayed `session/update` history (which lands after whatever is
+    /// already in `ai_messages`) ended up sandwiched *between* the new
+    /// message and its own reply.
+    ///
+    /// RED verified: reverting `ai_send_message_via_acp` to push
+    /// `displayed_text` unconditionally before the `acp_reopen_last_session`
+    /// check (and dropping the `acp_pending_prompt_display` deferral) makes
+    /// this fail — "continuing the chat" (the new message) sorts before
+    /// "what does main.rs do" (the replayed history) in `ai_messages`.
+    #[cfg(unix)]
+    #[test]
+    fn acp_reopen_last_session_defers_the_new_message_after_the_replayed_history() {
+        let mut engine = engine_with_registered_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_LOAD_SESSION", "1"),
+        ]);
+        engine.settings.acp_reopen_last_session = true;
+        let cwd = engine.acp_workspace_cwd();
+        engine
+            .acp_session_index
+            .record_session("sess-1", "claude", &cwd, "an older conversation");
+        engine
+            .acp_session_index
+            .set_load_session_capability("claude", true);
+
+        // The very first `:AI` message of the process — this is the one
+        // and only chance `acp_reopen_last_session` gets to fire.
+        engine.ai_send_message("continuing the chat".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+
+        assert_eq!(
+            engine.acp_session_id.as_deref(),
+            Some("sess-1"),
+            "must have resumed the recorded session, not started a fresh one"
+        );
+
+        let contents: Vec<String> = engine
+            .ai_messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        let idx_replayed = contents
+            .iter()
+            .position(|c| c.contains("what does main.rs do"))
+            .unwrap_or_else(|| panic!("replayed history must be present: {contents:?}"));
+        let idx_new_message = contents
+            .iter()
+            .position(|c| c.contains("continuing the chat"))
+            .unwrap_or_else(|| panic!("the new message must be present: {contents:?}"));
+        let idx_new_reply = contents
+            .iter()
+            .position(|c| c.contains("Hello world"))
+            .unwrap_or_else(|| panic!("the new reply must be present: {contents:?}"));
+
+        assert!(
+            idx_replayed < idx_new_message,
+            "replayed history must come before the newly typed message: \
+             {contents:?}"
+        );
+        assert!(
+            idx_new_message < idx_new_reply,
+            "the newly typed message must come before its own reply: \
+             {contents:?}"
+        );
+    }
+
+    /// Review blocking finding: a failed `session/load` must not leave
+    /// `acp_session_id` pointing at a session id the live agent never
+    /// actually created — the next prompt must fall back to a fresh
+    /// session rather than silently talking to an id nothing on the other
+    /// end recognises. `tests/fixtures/fake_acp_agent.sh`'s
+    /// `$ACP_FAKE_LOAD_SESSION_ERROR` flag exists specifically for this
+    /// regression path but, before this test, was never referenced by any
+    /// Rust test.
+    ///
+    /// RED verified: with the `AcpEvent::RequestFailed` handler's
+    /// `method == "session/load"` branch reverted to the generic case
+    /// (no `acp_session_id` reset, no fallback `acp_begin_session` call),
+    /// `engine.acp_session_id` stays `Some("sess-stale")` forever and the
+    /// follow-up `ai_send_message` sends a bare `session/prompt` against
+    /// it instead of falling back to a fresh session — the fixture doesn't
+    /// recognise that id for `session/prompt` either, so no reply ever
+    /// lands and this test's final assertion times out.
+    #[cfg(unix)]
+    #[test]
+    fn failed_session_load_resets_session_id_and_falls_back_to_a_fresh_session() {
+        let mut engine = engine_with_registered_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_LOAD_SESSION", "1"),
+            ("ACP_FAKE_LOAD_SESSION_ERROR", "1"),
+        ]);
+        let cwd = engine.acp_workspace_cwd();
+        engine.acp_session_index.record_session(
+            "sess-stale",
+            "claude",
+            &cwd,
+            "a session the agent has forgotten",
+        );
+        engine
+            .acp_session_index
+            .set_load_session_capability("claude", true);
+
+        engine.acp_resume_session("sess-stale".to_string());
+        poll_acp_until(&mut engine, |e| e.message.contains("session/load failed"));
+
+        assert_eq!(
+            engine.acp_session_id, None,
+            "a failed session/load must not leave acp_session_id pointing \
+             at a session the agent never actually created"
+        );
+
+        // The fallback `session/new` this triggers is a separate round
+        // trip — let it land before driving the panel further.
+        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        assert_ne!(
+            engine.acp_session_id.as_deref(),
+            Some("sess-stale"),
+            "the fallback session must not silently reuse the stale id"
+        );
+
+        // The panel must still be usable afterwards.
+        engine.ai_send_message("hello after the failed resume".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "the fallback session must actually work: {:?}",
+            engine.ai_messages
         );
     }
 }
