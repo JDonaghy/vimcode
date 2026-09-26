@@ -3035,23 +3035,34 @@ impl Engine {
     /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
     /// `AcpClient::poll` — nothing here blocks the tick.
     fn ai_send_message_via_acp(&mut self, text: String) {
+        // #1449: chip line naming what got attached (if anything) goes on
+        // the *displayed* transcript message — the wire content built
+        // below (`acp_prompt_content_blocks`) carries the actual
+        // `resource_link` block regardless of whether this chip is shown,
+        // so the two never disagree about what was attached.
+        let displayed_text = match self.acp_current_buffer_attachment() {
+            Some((_, chip)) => format!("{chip}\n{text}"),
+            None => text.clone(),
+        };
         self.ai_messages.push(AiMessage {
             role: "user".to_string(),
-            content: text.clone(),
+            content: displayed_text,
         });
         self.ai_streaming = true;
         self.acp_streaming_turn = None;
 
-        if let Some(client) = self.acp_client.as_mut() {
+        if self.acp_client.is_some() {
             if let Some(session_id) = self.acp_session_id.clone() {
-                client.prompt(
-                    &session_id,
-                    vec![serde_json::json!({"type": "text", "text": text})],
-                );
+                let content = self.acp_prompt_content_blocks(&text);
+                if let Some(client) = self.acp_client.as_mut() {
+                    client.prompt(&session_id, content);
+                }
             } else {
                 // The initialize -> session/new handshake from a previous
                 // message is still in flight; `poll_acp`'s `SessionCreated`
-                // handler sends this the moment the session id lands.
+                // handler sends this the moment the session id lands,
+                // rebuilding the content blocks fresh at that point (see
+                // its doc for why that's the correct order).
                 self.acp_pending_prompt = Some(text);
             }
             return;
@@ -3157,6 +3168,9 @@ impl Engine {
         // #957 (ACP-6): session-scoped, same as the rest above.
         self.acp_auth_methods.clear();
         self.acp_authenticated = false;
+        // #1449: `promptCapabilities` came off the same `initialize`
+        // response as `authMethods` — reset alongside it.
+        self.acp_prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
         // #955 (ACP-4): tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
@@ -3237,6 +3251,127 @@ impl Engine {
         let mut chat = self.ai_chat.borrow_mut();
         chat.clear_input();
         chat.input_insert_str(&format!("{chosen} "));
+        true
+    }
+
+    /// `@`-mention completions for the AI panel input (#1449): open
+    /// buffers first, then workspace files, filtered by whatever's typed
+    /// after the `@` in the trailing word currently under construction
+    /// (see [`crate::core::acp::trailing_at_mention_query`] for why it's
+    /// the *trailing* word rather than the *whole* input, unlike the
+    /// slash-command case above). `None` — never an empty popup — when the
+    /// trailing word isn't a `@mention` in progress, or nothing matches.
+    /// Reuses `render::CompletionMenu`, same shape/widget as
+    /// [`Self::ai_command_completions`] — there is no second popup here,
+    /// only a different feeder.
+    pub fn ai_mention_completions(&self) -> Option<crate::render::CompletionMenu> {
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let (_, query) = crate::core::acp::trailing_at_mention_query(&input)?;
+        let query_lower = query.to_lowercase();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Open buffers first (#1449's ordering requirement).
+        let mut buffer_matches: Vec<String> = self
+            .buffer_manager
+            .iter()
+            .filter_map(|(_, state)| {
+                let path = state.file_path.as_ref()?;
+                let rel = path.strip_prefix(&self.cwd).unwrap_or(path);
+                Some(rel.to_string_lossy().into_owned())
+            })
+            .filter(|display| display.to_lowercase().contains(&query_lower))
+            .filter(|display| seen.insert(display.clone()))
+            .collect();
+        buffer_matches.sort();
+
+        // Then workspace files — same ignore-aware walk
+        // `picker_populate_files` uses, capped so a huge repo can't make
+        // every keystroke slow.
+        const MAX_CANDIDATES: usize = 20;
+        const MAX_SCANNED: usize = 5000;
+        let mut file_matches: Vec<String> = Vec::new();
+        if buffer_matches.len() < MAX_CANDIDATES {
+            let show_hidden = self.settings.show_hidden_files;
+            let walker = ignore::WalkBuilder::new(&self.cwd)
+                .hidden(!show_hidden)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .build();
+            for (scanned, entry) in walker.enumerate() {
+                if file_matches.len() + buffer_matches.len() >= MAX_CANDIDATES
+                    || scanned >= MAX_SCANNED
+                {
+                    break;
+                }
+                let Ok(entry) = entry else { continue };
+                if !entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Ok(rel) = entry.path().strip_prefix(&self.cwd) else {
+                    continue;
+                };
+                let display = rel.to_string_lossy().into_owned();
+                if display.to_lowercase().contains(&query_lower) && seen.insert(display.clone()) {
+                    file_matches.push(display);
+                }
+            }
+            file_matches.sort();
+        }
+
+        let candidates: Vec<String> = buffer_matches
+            .into_iter()
+            .chain(file_matches)
+            .take(MAX_CANDIDATES)
+            .map(|display| format!("@{display}"))
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let max_width = candidates
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0);
+        let selected_idx = self.acp_mention_completion_idx.min(candidates.len() - 1);
+        Some(crate::render::CompletionMenu {
+            candidates,
+            selected_idx,
+            max_width,
+        })
+    }
+
+    /// Advance the `@`-mention completion selection to the next candidate
+    /// (wrapping), if the popup is currently showing. Returns `false` (a
+    /// no-op) when [`Self::ai_mention_completions`] is `None`.
+    pub fn ai_mention_completion_cycle(&mut self) -> bool {
+        let Some(menu) = self.ai_mention_completions() else {
+            return false;
+        };
+        self.acp_mention_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        true
+    }
+
+    /// Accept the currently-selected `@`-mention completion: splice
+    /// `"@path "` (trailing space) in place of the `@`-word currently under
+    /// construction, leaving the rest of the input untouched. Returns
+    /// `false` (a no-op) when [`Self::ai_mention_completions`] is `None`.
+    pub fn ai_mention_accept_selected(&mut self) -> bool {
+        let Some(menu) = self.ai_mention_completions() else {
+            return false;
+        };
+        let chosen = menu.candidates[menu.selected_idx].clone();
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let Some((start, _)) = crate::core::acp::trailing_at_mention_query(&input) else {
+            return false;
+        };
+        self.acp_mention_completion_idx = 0;
+        let mut new_input = input[..start].to_string();
+        new_input.push_str(&chosen);
+        new_input.push(' ');
+        let mut chat = self.ai_chat.borrow_mut();
+        chat.clear_input();
+        chat.input_insert_str(&new_input);
         true
     }
 

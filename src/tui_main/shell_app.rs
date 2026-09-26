@@ -17091,6 +17091,131 @@ mod tests {
         );
     }
 
+    /// #1449 acceptance: with `ai_attach_current_buffer` on (the default)
+    /// and the active buffer pointing at a real workspace file, sending a
+    /// message must show a `⧉`-prefixed chip naming that file above the
+    /// user's own text in the transcript — the visible half of "attach the
+    /// current buffer" (`core::engine::acp_ops::tests::
+    /// ai_send_message_via_acp_attaches_current_buffer_as_resource_link`
+    /// covers the wire-content half, a `resource_link` block, which this
+    /// harness has no way to inspect from the outside).
+    ///
+    /// RED verified: with `Engine::acp_current_buffer_attachment` stubbed
+    /// to always return `None`, the screen never shows `"\u{29c9}"` — the
+    /// chip is simply absent, same failure shape the engine-level test
+    /// sees on the wire side.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_attached_current_buffer_chip_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        app.engine.cwd = cwd.clone();
+        let buf = app.engine.active_buffer_id();
+        if let Some(state) = app.engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(cwd.join("src").join("main.rs"));
+        }
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &std::env::temp_dir(),
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "what does this file do?".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains('\u{29c9}') && screen.contains("main.rs"),
+            "the attached-buffer chip naming main.rs must be visible in the \
+             transcript; screen:\n{screen}"
+        );
+    }
+
+    /// #1449 acceptance: typing `@` with a matching prefix opens a
+    /// completion popup listing open buffers before workspace-only files,
+    /// and Tab/Enter accepts one into the input as `@path ` — the same
+    /// intercept shape #956's slash-command popup uses
+    /// (`ai_panel_slash_command_completions_via_shell_app` above), reused
+    /// for a different feeder rather than a second widget.
+    ///
+    /// RED verified: with `Engine::ai_mention_completions` stubbed to
+    /// always return `None`, typing `@` never paints a popup and Tab/Enter
+    /// fall through to ordinary text input instead of being intercepted.
+    #[test]
+    fn ai_panel_at_mention_completions_list_open_buffer_first_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_acp1449_tui_mention_ws_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        std::fs::write(workspace.join("mentionable.rs"), "").expect("write open buffer file");
+        std::fs::write(workspace.join("mentionable_other.rs"), "").expect("write extra file");
+        app.engine.cwd = workspace.clone();
+        app.engine.workspace_root = Some(workspace.clone());
+        let buf = app.engine.active_buffer_id();
+        if let Some(state) = app.engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(workspace.join("mentionable.rs"));
+        }
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "look at @mentionable".chars() {
+            driver.type_char(c);
+        }
+        let screen = driver.screen();
+        assert!(
+            screen.contains("@mentionable.rs") && screen.contains("@mentionable_other.rs"),
+            "both the open buffer and the workspace-only file sharing the \
+             prefix must appear as completions; screen:\n{screen}"
+        );
+
+        // The open buffer ("mentionable.rs") is listed first, so it's
+        // selected by default — Tab/Enter should accept it, not the other
+        // one.
+        driver.press_named(quadraui::NamedKey::Tab);
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("@mentionable_other.rs "),
+            "cycling once (Tab) then accepting (Enter) must fill the input \
+             with the SECOND candidate plus a trailing space; screen:\n{screen}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// How long the two #957 (ACP-6) driver tests below wait on a real
     /// child process before giving up.
     ///

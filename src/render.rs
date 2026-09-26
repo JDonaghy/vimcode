@@ -8302,6 +8302,23 @@ pub fn route_ai_chat_event(
                 }
                 _ => {}
             }
+        // #1449: same intercept, for the `@`-mention popup — mutually
+        // exclusive with the slash-command one above (a slash command only
+        // ever occupies the *whole* input, a mention only the trailing
+        // word, so `ai_command_completions` being `Some` already claims
+        // this key).
+        } else if no_modifiers && engine.ai_mention_completions().is_some() {
+            match key {
+                quadraui::Key::Named(quadraui::NamedKey::Tab) => {
+                    engine.ai_mention_completion_cycle();
+                    return engine.ai_has_focus;
+                }
+                quadraui::Key::Named(quadraui::NamedKey::Enter) => {
+                    engine.ai_mention_accept_selected();
+                    return engine.ai_has_focus;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -19783,9 +19800,12 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
 }
 
-/// Paint the slash-command completion popup above the AI panel's input box
-/// when [`Engine::ai_command_completions`] has a match (#956, ACP-5).
-/// Reuses [`completion_menu_to_quadraui_completions`] and the
+/// Paint the slash-command or `@`-mention completion popup above the AI
+/// panel's input box, whichever [`Engine::ai_command_completions`] /
+/// [`Engine::ai_mention_completions`] (#1449) currently has a match — the
+/// two are mutually exclusive by construction (see
+/// `route_ai_chat_event`'s intercept). Reuses
+/// [`completion_menu_to_quadraui_completions`] and the
 /// `quadraui::Completions` primitive verbatim — the same machinery the
 /// editor's own word-completion popup uses — rather than a bespoke widget.
 ///
@@ -19805,7 +19825,10 @@ pub fn paint_ai_command_completions(
     if chat_rect.width <= 0.0 || chat_rect.height <= 0.0 {
         return;
     }
-    let Some(menu) = engine.ai_command_completions() else {
+    let Some(menu) = engine
+        .ai_command_completions()
+        .or_else(|| engine.ai_mention_completions())
+    else {
         return;
     };
     let completions = completion_menu_to_quadraui_completions(&menu);

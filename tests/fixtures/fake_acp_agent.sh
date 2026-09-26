@@ -32,7 +32,15 @@
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
 #                           against.
-#   - session/prompt     -> emits a session/update "agent_thought_chunk"
+#   - session/prompt     -> (#1449) if $ACP_FAKE_CAPTURE_PROMPT_TO names a
+#                           file, the raw request line is appended to it
+#                           first, unconditionally — lets a test assert on
+#                           the actual `prompt` content-block array
+#                           (`resource_link` for an attached buffer/
+#                           mention, plain `text` otherwise) via
+#                           `serde_json` on the Rust side, without teaching
+#                           this jq/python/node-free script to parse JSON.
+#                           Then, emits a session/update "agent_thought_chunk"
 #                           notification, then two "agent_message_chunk"
 #                           notifications (split across two lines, to prove
 #                           chunk *streaming* rather than one whole-turn
@@ -281,6 +289,18 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/prompt"'*)
       id=$(extract_id "$line")
+      # #1449: when $ACP_FAKE_CAPTURE_PROMPT_TO names a file, the whole
+      # raw `session/prompt` request line is appended to it before any
+      # other handling — the client-side content-block shape (`resource_
+      # link` for the attached buffer / `@`-mention, plain `text` for
+      # everything else) is easiest to assert on from the Rust side by
+      # reading this file and running it through `serde_json`, rather than
+      # teaching this jq/python/node-free `/bin/sh` script to parse JSON
+      # itself. Append (not overwrite) so a test that sends more than one
+      # message in the same session can inspect each turn's params.
+      if [ -n "$ACP_FAKE_CAPTURE_PROMPT_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_PROMPT_TO"
+      fi
       # #958 (ACP-7): $ACP_FAKE_AGENT_LABEL, if set, is folded into the
       # first message chunk so a test can run this exact same script as two
       # differently-configured `settings.acp_agents` registry entries and
