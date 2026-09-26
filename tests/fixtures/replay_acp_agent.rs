@@ -48,6 +48,10 @@
 //!
 //! Reads NDJSON on stdin, writes NDJSON on stdout — the same shape
 //! `AcpClient::spawn`/`spawn_with_env` expects from any agent subprocess.
+//! Once the transcript's last step is replayed this process stays alive,
+//! idle, until its stdin reaches EOF — mirroring a real agent, which does not
+//! exit just because a turn ended. See the comment at the end of `main` for
+//! why exiting there instead made contract tests flaky.
 //! A mismatch between what the live client actually sent and what the
 //! transcript expected next is a loud failure: a diagnostic line to stderr
 //! and a non-zero exit, never a silent skip — a contract test whose replay
@@ -187,6 +191,38 @@ fn main() {
                     fail("client closed stdout; cannot continue replay");
                 }
             }
+        }
+    }
+
+    // The transcript is exhausted — now *stay alive* until the client
+    // disconnects (stdin EOF), the way a real ACP agent does. It does not
+    // exit the instant a turn reaches `stopReason: end_turn`; it sits idle
+    // waiting for the next prompt, and only dies when the client closes the
+    // connection (`AcpClient::drop` kills the child explicitly, so nothing
+    // is orphaned when a test ends).
+    //
+    // Returning from `main` here instead — which is what this binary used to
+    // do — made every contract test that asserts on state a turn *leaves
+    // behind* racy. Process exit makes `AcpClient`'s reader thread emit
+    // `AcpEvent::AgentExited`, and the engine treats a dead agent as the end
+    // of the whole session: `acp_dispatch_events`' `AgentExited` arm wipes
+    // the session-scoped state, `self.change_review = None` included (#955).
+    // Because `poll_acp` drains every queued event before returning, a test
+    // whose poll tick happened to land after the exit saw the review opened
+    // and cleared again inside one `poll_acp()` call — so
+    // `fragment_diff_transcript_preserves_surrounding_file_content_on_accept`
+    // failed roughly half its runs on its 30s deadline with `change_review`
+    // never observably `Some`, on `develop` as much as on any branch. Staying
+    // up removes the exit from the middle of the scenario entirely rather
+    // than papering over it with a longer deadline or a retry.
+    //
+    // Client traffic arriving after the transcript's last step is drained and
+    // ignored rather than failed on: "loud failure" above is about a client
+    // message that *contradicts the next expected step*, and once the
+    // transcript is done there is no next step left to contradict.
+    for line in lines {
+        if line.is_err() {
+            break;
         }
     }
 }
