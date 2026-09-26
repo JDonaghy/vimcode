@@ -635,26 +635,17 @@ impl TuiShellApp {
             .unwrap_or_else(|| "VimCode".to_string())
     }
 
-    /// Editor mode → hardware caret shape (#1109): block for Normal/Visual,
-    /// bar for Insert, underline for a pending replace-char (`r`) command —
-    /// the same three-way mapping the old hand-rolled crossterm cursor-style
-    /// write used, now feeding `backend.set_caret_shape` (quadraui#1015)
-    /// instead. Split out as a
-    /// pure function, separate from `tick()`'s `self.live`-gated write right
-    /// below it, specifically so the *decision* is unit-testable —
-    /// `set_caret_shape`'s `TuiBackend` impl writes straight to the real
-    /// process `std::io::stdout()` with no test-mode guard (see its own doc
-    /// comment), so the write itself can't be observed from this crate's
-    /// test suite any more than `tick_title_sync_is_reachable_but_gated_on_live_so_black_box_untestable`'s
-    /// title write can — that's a `SMOKE_TESTS` item, not a driver test.
+    /// Editor mode → hardware caret shape (#1109). #1428 moved the actual
+    /// decision into [`render::caret_shape_for_mode`] (shared with `App`,
+    /// now that it also needs to feed `Backend::set_caret_shape`) — this
+    /// stays as a thin wrapper over `self`'s own fields so every existing
+    /// call site (and the unit test right below) is unchanged. See the
+    /// shared function's doc for why the *decision* is unit-testable while
+    /// `set_caret_shape`'s write itself is not (`TuiBackend`'s impl writes
+    /// straight to the real process `std::io::stdout()` with no test-mode
+    /// guard) — that's a `SMOKE_TESTS` item, not a driver test.
     fn caret_shape_for_mode(&self) -> quadraui::EditorCursorShape {
-        if !self.sidebar.has_focus && self.engine.pending_key == Some('r') {
-            quadraui::EditorCursorShape::Underline
-        } else if !self.sidebar.has_focus && self.engine.mode == Mode::Insert {
-            quadraui::EditorCursorShape::Bar
-        } else {
-            quadraui::EditorCursorShape::Block
-        }
+        render::caret_shape_for_mode(&self.engine, self.sidebar.has_focus)
     }
 
     /// Compose the **bottom band** (#765, #735 slice 4): the chrome vimcode
