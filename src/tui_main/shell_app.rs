@@ -15566,7 +15566,7 @@ mod tests {
             .show_panel(&quadraui::WidgetId::new(PANEL_AI));
         app.engine.ai_has_focus = true;
         app.sidebar.has_focus = true;
-        app.engine.ai_messages = (0..60)
+        app.engine.acp_mut().ai_messages = (0..60)
             .map(|i| crate::core::ai::AiMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("MSG_MARKER_{i}"),
@@ -15620,7 +15620,7 @@ mod tests {
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_AI));
-        app.engine.ai_messages = (0..60)
+        app.engine.acp_mut().ai_messages = (0..60)
             .map(|i| crate::core::ai::AiMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("MSG_MARKER_{i}"),
@@ -15693,7 +15693,7 @@ mod tests {
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_AI));
-        app.engine.ai_messages = (0..60)
+        app.engine.acp_mut().ai_messages = (0..60)
             .map(|i| crate::core::ai::AiMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("MSG_MARKER_{i}"),
@@ -15776,7 +15776,7 @@ mod tests {
         app.engine
             .app_shell
             .show_panel(&quadraui::WidgetId::new(PANEL_AI));
-        app.engine.ai_messages = (0..60)
+        app.engine.acp_mut().ai_messages = (0..60)
             .map(|i| crate::core::ai::AiMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("MSG_MARKER_{i}"),
@@ -15869,7 +15869,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         // Only needs to be non-empty: routing checks emptiness to pick the
         // transport, but the client above already exists, so
         // `ai_send_message` takes the "reuse existing client" branch, never
@@ -15959,7 +15959,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16042,6 +16042,168 @@ mod tests {
         assert!(
             !screen.contains("Edit src/main.rs"),
             "the dialog must be gone once answered; screen:\n{screen}"
+        );
+    }
+
+    /// #1463 (multiple concurrent ACP sessions) through the real
+    /// `TuiShellApp`/`TuiDriver` stack: two sessions' tab strip paints in
+    /// the AI panel header (active tab marked `*`, a backgrounded session's
+    /// parked permission request marked `!`) without stealing the modal
+    /// dialog away from the foreground tab, and `:AiNext` — typed as a
+    /// real ex command, not a direct engine call — switches to the badged
+    /// tab and reveals *its* dialog, whose "Allow Once" answers session
+    /// B's own client (session A's transcript never sees session B's
+    /// prompt). Every assertion below is on `driver.screen()` — the driver
+    /// wraps its app crate-privately (see `tui_ext_panel_reveal_by_short_
+    /// hash_selects_the_commit_row_not_the_separator`'s doc above for why
+    /// no test can peek at `engine` state after construction), which is
+    /// also exactly this repo's own "rendered output, not state" rule.
+    ///
+    /// RED verified (2026-09-26, this session): reverting `Engine::
+    /// acp_handle_permission_request`'s `is_foreground` gate (always
+    /// calling `show_dialog`) makes session B's dialog paint immediately
+    /// (`"Edit src/main.rs"` already on screen before `:AiNext` ever
+    /// runs), failing the `!screen.contains("Edit src/main.rs")` assertion
+    /// below.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_session_tab_strip_badges_background_permission_and_ainext_switches_to_it_via_shell_app(
+    ) {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture.to_string()];
+        let cwd = std::env::temp_dir();
+
+        // Session 0 ("claude"): already spawned, idle.
+        let mut client_a = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client_a.initialize();
+        app.engine.acp_mut().client = Some(client_a);
+        app.engine.acp_mut().label = "claude".to_string();
+
+        // Session 1 ("gemini"): a second tab whose agent requests
+        // permission on its next prompt — simulating a turn left running
+        // in the background while the human works in tab A.
+        app.engine
+            .acp_sessions
+            .push(crate::core::acp_session::AcpSession::new());
+        app.engine.acp_active_session = 1;
+        let mut client_b = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client_b.initialize();
+        app.engine.acp_mut().client = Some(client_b);
+        app.engine.acp_mut().label = "gemini".to_string();
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        app.engine.ai_send_message("please edit".to_string());
+        // Back to the foreground tab *before* B's request necessarily
+        // lands — same "switch away first" shape the engine-level
+        // `background_session_permission_request_badges_and_switching_
+        // reveals_its_own_dialog` test in `acp_ops.rs` uses.
+        app.engine.acp_active_session = 0;
+        // Chat input unfocused from the start: `:AiNext`/`:AiPrev` below
+        // are typed as real ex commands, and a focused chat box would
+        // swallow the leading `:` as literal text instead of opening the
+        // command line.
+        app.sidebar.has_focus = false;
+        // Wide enough that "AI ASSISTANT (thinking…) [*claude | gemini!]"
+        // doesn't clip off the right edge of the default (narrower)
+        // sidebar width — the busy spinner and the tab strip share the
+        // same header row.
+        app.sidebar_width = 70;
+
+        let mut driver = driver_with_shell(app, config(), 140, 24);
+        // Force one real dispatch so `AppShell`'s sidebar width actually
+        // picks up the wider `sidebar_width` set above (synced "on the way
+        // out of every dispatch" — see `TuiShellApp::on_shell_event_ctx`'s
+        // doc — not on a bare `tick()`/`render()`) before measuring the
+        // header text below; otherwise the first frame paints at
+        // `ShellConfig`'s own (narrower) default width and clips the tab
+        // strip regardless of `sidebar_width`.
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("gemini!") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("*claude"),
+            "the active tab must be marked in the painted header; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("gemini!"),
+            "the backgrounded tab's parked permission request must paint a \
+             badge within 5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Edit src/main.rs"),
+            "a backgrounded session's permission request must not steal the \
+             modal dialog away from the foreground tab; screen:\n{screen}"
+        );
+
+        // `:AiNext` for real, through the actual command-line pipeline.
+        run_ex_command(&mut driver, ":AiNext");
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("*gemini"),
+            "AiNext must switch the active tab; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Edit src/main.rs"),
+            "switching to the badged tab must reveal *its* parked permission \
+             dialog; screen:\n{screen}"
+        );
+
+        // "Allow Once" is button 0, hotkey 'a' (see the single-session
+        // permission test above for why that's unambiguous).
+        driver.type_char('a');
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while screen.contains("(thinking") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            !screen.contains("Edit src/main.rs"),
+            "the dialog must be gone once answered; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Hello world"),
+            "answering from the revealed dialog must reply to session B's \
+             own client, letting its turn actually complete: {screen}"
+        );
+
+        // Switch back to session A and confirm its transcript never saw
+        // session B's prompt.
+        run_ex_command(&mut driver, ":AiPrev");
+        let screen = driver.screen();
+        assert!(
+            screen.contains("*claude"),
+            "AiPrev must switch back to session A; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("please edit"),
+            "session A's transcript must never show session B's prompt; \
+             screen:\n{screen}"
         );
     }
 
@@ -16483,7 +16645,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16587,7 +16749,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16628,7 +16790,7 @@ mod tests {
     /// `TuiDriver` stack.
     ///
     /// RED verified: changing `Engine::acp_handle_session_update`'s
-    /// `self.acp_plan = entries` to `self.acp_plan.extend(entries)` (the
+    /// `self.acp_mut().plan = entries` to `self.acp_mut().plan.extend(entries)` (the
     /// append-only bug #956 explicitly calls out as "the single most common
     /// way to get this wrong") makes the "exactly one occurrence" assertion
     /// below fail — "Write the fix" then appears twice (once in_progress
@@ -16657,7 +16819,7 @@ mod tests {
             crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
                 .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16742,7 +16904,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16826,7 +16988,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -16925,7 +17087,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -17015,7 +17177,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -17117,7 +17279,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -17488,7 +17650,7 @@ mod tests {
             crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &[("ACP_FAKE_PLAN", "1")])
                 .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -17594,7 +17756,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -17935,7 +18097,7 @@ mod tests {
     ///
     /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
     /// changed to call `self.acp_begin_session()` unconditionally (skipping
-    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// the `!self.acp_mut().authenticated && !self.acp_mut().auth_methods.is_empty()`
     /// check), no dialog ever opens and this test times out waiting for
     /// `"Authenticate"` — the loop below exits on the deadline and the
     /// final assertion fails. Restored before committing.
@@ -17964,7 +18126,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
 
         let mut driver = driver_with_shell(app, config(), 80, 24);
@@ -18078,7 +18240,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
         // Read directly by `acp_launch_terminal_login` — distinct from (and
         // independent of) the NDJSON client spawned above. Quoted because
         // `CARGO_MANIFEST_DIR` may contain spaces (a coord worktree under
@@ -18189,7 +18351,7 @@ mod tests {
         )
         .expect("fixture agent should spawn");
         client.initialize();
-        app.engine.acp_client = Some(client);
+        app.engine.acp_mut().client = Some(client);
 
         // The repro shape from #1443: `acp_agent_command` is empty, and the
         // only place the command lives is a registry entry selected via

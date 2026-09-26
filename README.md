@@ -808,6 +808,14 @@ below) is configured:
     Set `acp_reopen_last_session: true` to automatically resume the most recent session
     for the active agent/workspace on the first `:AI`/message after startup, instead of
     always starting empty (off by default).
+  - **Multiple concurrent sessions** — `:AiNew [agent]` opens a new session tab (reusing
+    the current tab if it's still blank); `:AiNext`/`:AiPrev` switch between tabs;
+    `:AiClose` ends the active session (resetting it in place if it's the last tab).
+    Every open session keeps streaming even while backgrounded — a permission request
+    from a session you're not looking at shows a `!` badge on its tab in the AI panel
+    header instead of stealing focus with a dialog; switching to that tab reveals the
+    dialog so you can answer it. The tab strip (`[*claude | gemini!]`) only appears once
+    a second session exists.
 - **Direct provider** (no agent binary required) — leave `acp_agent_command`/`acp_agents`
   empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local
   Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
@@ -1335,6 +1343,9 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:AiAgent [name]` | List configured ACP agents (`acp_agents`) and the active one, or switch to `name` |
 | `:AiMode [name]` | Show the active ACP agent's declared modes, or switch to `name` |
 | `:AiSessions` | List past sessions for the active ACP agent + workspace and resume one via `session/load`; refuses if the agent doesn't advertise `loadSession` |
+| `:AiNew [agent]` | Open a new AI session tab (optionally on a different configured agent), reusing the current tab if it's still blank |
+| `:AiNext` / `:AiPrev` | Switch the AI panel to the next/previous session tab (wraps around) |
+| `:AiClose` | End the active AI session and remove its tab (resets it in place if it's the only one) |
 | `:MarkdownPreview` / `:MdPreview` | Open side-by-side styled markdown preview (live-updates on edit, scroll sync, scaled headings in GTK) |
 | `:Explore [dir]` / `:Ex [dir]` | Open netrw-style in-buffer directory listing |
 | `:Sexplore [dir]` / `:Sex [dir]` | Horizontal split + netrw directory listing |

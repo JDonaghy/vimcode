@@ -107,7 +107,7 @@ fn engine_with_replay(transcript_name: &str, fixture_dir: &Path) -> Engine {
     vimcode_core::core::session::suppress_disk_loads();
     let mut engine = Engine::new();
     engine.settings = vimcode_core::core::settings::Settings::default();
-    engine.acp_client = Some(client);
+    engine.acp_mut().client = Some(client);
     // Routes `ai_send_message` onto the already-spawned client above rather
     // than trying to spawn a new one from this (nonexistent) command line.
     engine.settings.acp_agent_command = "already-spawned-above".to_string();
@@ -150,19 +150,22 @@ fn basic_session_transcript_streams_and_completes_via_replay() {
     let mut engine = engine_with_replay("basic_session.transcript", &dir);
 
     engine.ai_send_message("hello".to_string());
-    assert!(engine.ai_streaming, "sending a message must mark it busy");
-
-    poll_acp_until(&mut engine, |e| !e.ai_streaming);
     assert!(
-        !engine.ai_streaming,
+        engine.acp().ai_streaming,
+        "sending a message must mark it busy"
+    );
+
+    poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+    assert!(
+        !engine.acp().ai_streaming,
         "the turn should reach stopReason: end_turn within {TEST_DEADLINE:?}"
     );
     assert_eq!(
-        engine.ai_messages.last().map(|m| m.content.as_str()),
+        engine.acp().ai_messages.last().map(|m| m.content.as_str()),
         Some("Hello world"),
         "the two streamed agent_message_chunk notifications must merge into \
          one assistant turn: {:?}",
-        engine.ai_messages
+        engine.acp().ai_messages
     );
 
     let _ = std::fs::remove_dir_all(&dir);

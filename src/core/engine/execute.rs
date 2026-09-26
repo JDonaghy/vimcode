@@ -1200,6 +1200,31 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiNew [agent] / :AiNext / :AiPrev / :AiClose — multiple
+        // concurrent ACP session tabs (#1463). See `Engine::acp_new_
+        // session`'s doc for the "reuse a still-blank tab" policy and
+        // `Engine::acp_close_session`'s for what closing the last tab does.
+        if cmd == "AiNew" {
+            self.acp_new_session(None);
+            return EngineAction::None;
+        }
+        if let Some(agent) = cmd.strip_prefix("AiNew ").map(|s| s.trim()) {
+            self.acp_new_session(if agent.is_empty() { None } else { Some(agent) });
+            return EngineAction::None;
+        }
+        if cmd == "AiNext" {
+            self.acp_next_session();
+            return EngineAction::None;
+        }
+        if cmd == "AiPrev" {
+            self.acp_prev_session();
+            return EngineAction::None;
+        }
+        if cmd == "AiClose" {
+            self.acp_close_session();
+            return EngineAction::None;
+        }
+
         // :AiAttach <path> — stage a file or image at `path` as the next
         // prompt's attachment (#1464). See `Engine::acp_attach_file`'s doc
         // for the workspace-resolution, `promptCapabilities.image` gate and

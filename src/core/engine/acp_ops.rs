@@ -15,17 +15,61 @@ use super::*;
 use crate::core::acp::{AcpChunkKind, AcpEvent};
 
 impl Engine {
-    /// Non-blocking drain of the live ACP agent's events, if one is
-    /// running. Returns `true` if a redraw is needed.
-    pub fn poll_acp(&mut self) -> bool {
-        let Some(client) = self.acp_client.as_mut() else {
-            return false;
-        };
-        let events = client.poll();
-        if events.is_empty() {
-            return false;
-        }
+    /// Read-only access to the *active* ACP session — the one the AI panel
+    /// currently paints (#1463). Every other session in `acp_sessions`
+    /// keeps its client polled by [`Self::poll_acp`] regardless of which
+    /// one this points at.
+    pub fn acp(&self) -> &crate::core::acp_session::AcpSession {
+        &self.acp_sessions[self.acp_active_session]
+    }
 
+    /// Mutable access to the active ACP session. See [`Self::acp`].
+    pub fn acp_mut(&mut self) -> &mut crate::core::acp_session::AcpSession {
+        &mut self.acp_sessions[self.acp_active_session]
+    }
+
+    /// Non-blocking drain of every live ACP session's events (#1463) — not
+    /// just the active one, so a backgrounded session keeps its agent's
+    /// stdout drained (and its turn progressing) while another session is
+    /// in the foreground. Returns `true` if a redraw is needed (a visible
+    /// change on the *active* session, or a badge-worthy change — e.g. a
+    /// permission request — on a background one).
+    ///
+    /// Each session's events are dispatched through
+    /// [`Self::acp_dispatch_events`] with `acp_active_session` temporarily
+    /// pointed at that session, so the dispatcher's `self.acp_mut()` /
+    /// `self.acp()` calls resolve to the session whose events are actually
+    /// being processed — the exact same event-handling this module used
+    /// when there was only ever one session. `acp_active_session` is
+    /// restored to the real foreground session before returning.
+    pub fn poll_acp(&mut self) -> bool {
+        let mut redraw = false;
+        let foreground = self.acp_active_session;
+        for idx in 0..self.acp_sessions.len() {
+            let events = match self.acp_sessions[idx].client.as_mut() {
+                Some(client) => client.poll(),
+                None => continue,
+            };
+            if events.is_empty() {
+                continue;
+            }
+            self.acp_active_session = idx;
+            redraw |= self.acp_dispatch_events(events, idx == foreground);
+        }
+        self.acp_active_session = foreground.min(self.acp_sessions.len().saturating_sub(1));
+        redraw
+    }
+
+    /// The per-session `AcpEvent` handling `poll_acp` used to inline
+    /// directly — split out so it can be invoked once per session that
+    /// produced events, always operating on whichever session
+    /// `acp_active_session` currently names (see `poll_acp`'s doc).
+    /// `is_foreground` is `true` only when that session is the one the AI
+    /// panel is actually showing right now — a `session/request_permission`
+    /// on a backgrounded session must never pop the modal dialog on top of
+    /// whatever the human is looking at (#1463's "without stealing focus");
+    /// see [`Self::acp_handle_permission_request`].
+    fn acp_dispatch_events(&mut self, events: Vec<AcpEvent>, is_foreground: bool) -> bool {
         let mut redraw = false;
         for event in events {
             match event {
@@ -42,7 +86,7 @@ impl Engine {
                     } else {
                         let snippet: String = stderr.chars().take(200).collect();
                         self.message = format!("ACP agent failed to start: {snippet}");
-                        self.ai_messages.push(AiMessage {
+                        self.acp_mut().ai_messages.push(AiMessage {
                             role: "assistant-thought".to_string(),
                             content: format!("\u{26a0} ACP agent failed to start: {snippet}"),
                         });
@@ -54,7 +98,7 @@ impl Engine {
                     // (#953's "agent death with a dialog open" acceptance
                     // criterion) and drop the bookkeeping — there is no one
                     // left to answer.
-                    if self.acp_pending_permission.take().is_some()
+                    if self.acp_mut().pending_permission.take().is_some()
                         && self
                             .dialog
                             .as_ref()
@@ -62,34 +106,34 @@ impl Engine {
                     {
                         self.dialog = None;
                     }
-                    self.acp_remembered_decisions.clear();
-                    self.acp_client = None;
-                    self.acp_session_id = None;
-                    self.acp_pending_prompt = None;
+                    self.acp_mut().remembered_decisions.clear();
+                    self.acp_mut().client = None;
+                    self.acp_mut().session_id = None;
+                    self.acp_mut().pending_prompt = None;
                     // #1459: a resume the agent died before completing must
                     // not silently apply to whatever agent starts next, and
                     // its deferred display line (if any) goes with it — the
                     // agent is gone, so there's no transcript left for it to
                     // land after.
                     self.acp_pending_resume = None;
-                    self.acp_pending_prompt_display = None;
-                    self.acp_streaming_turn = None;
+                    self.acp_mut().pending_prompt_display = None;
+                    self.acp_mut().streaming_turn = None;
                     // #956 (ACP-5): session-scoped, same as the decisions
                     // map above — see `Engine::ai_clear`'s matching reset.
-                    self.acp_plan.clear();
-                    self.acp_available_commands.clear();
-                    self.acp_command_completion_idx = 0;
-                    self.acp_modes.clear();
-                    self.acp_current_mode_id = None;
-                    self.acp_usage = None;
+                    self.acp_mut().plan.clear();
+                    self.acp_mut().available_commands.clear();
+                    self.acp_mut().command_completion_idx = 0;
+                    self.acp_mut().modes.clear();
+                    self.acp_mut().current_mode_id = None;
+                    self.acp_mut().usage = None;
                     // #957 (ACP-6): session-scoped, same as the rest above.
-                    self.acp_auth_methods.clear();
-                    self.acp_authenticated = false;
-                    self.acp_prompt_capabilities =
+                    self.acp_mut().auth_methods.clear();
+                    self.acp_mut().authenticated = false;
+                    self.acp_mut().prompt_capabilities =
                         crate::core::acp::AcpPromptCapabilities::default();
                     // #955 (ACP-4): session-scoped, same as the rest above
                     // — see `Engine::ai_clear`'s matching reset.
-                    self.acp_tool_calls.clear();
+                    self.acp_mut().tool_calls.clear();
                     self.change_review = None;
                     // #1460: deliberately NOT cleared here, unlike
                     // `acp_tool_calls`/`change_review` above — a dead agent
@@ -101,7 +145,7 @@ impl Engine {
                     // the conversation). Losing that history just because
                     // the agent process happened to exit would defeat the
                     // whole point of a checkpoint being a restore point.
-                    self.ai_streaming = false;
+                    self.acp_mut().ai_streaming = false;
                     redraw = true;
                 }
                 AcpEvent::Initialized {
@@ -114,7 +158,7 @@ impl Engine {
                     // straight-to-session branches below need it available
                     // for the first `session/prompt` either way, and
                     // `agent_capabilities` isn't read again after this.
-                    self.acp_prompt_capabilities =
+                    self.acp_mut().prompt_capabilities =
                         crate::core::acp::parse_prompt_capabilities(&agent_capabilities);
                     // #1459: cache whether this agent supports `session/
                     // load` — keyed by agent name so `:AiSessions` can
@@ -136,8 +180,9 @@ impl Engine {
                     // pre-#957 agent and test — or auth already resolved,
                     // e.g. this is the re-`initialize()` after a successful
                     // terminal login) proceed exactly as before.
-                    self.acp_auth_methods = crate::core::acp::parse_auth_methods(&auth_methods);
-                    if !self.acp_authenticated && !self.acp_auth_methods.is_empty() {
+                    self.acp_mut().auth_methods =
+                        crate::core::acp::parse_auth_methods(&auth_methods);
+                    if !self.acp_mut().authenticated && !self.acp_mut().auth_methods.is_empty() {
                         self.acp_show_auth_choice();
                     } else {
                         self.acp_begin_session();
@@ -152,7 +197,7 @@ impl Engine {
                     // existing generic handling already clears the busy
                     // state and surfaces a message — no special-casing
                     // needed there.
-                    self.acp_authenticated = true;
+                    self.acp_mut().authenticated = true;
                     self.message = "Authenticated.".to_string();
                     self.acp_begin_session();
                     redraw = true;
@@ -160,7 +205,7 @@ impl Engine {
                 AcpEvent::SessionCreated {
                     session_id, modes, ..
                 } => {
-                    self.acp_session_id = Some(session_id.clone());
+                    self.acp_mut().session_id = Some(session_id.clone());
                     // #1459: remember this session (id, agent, cwd, first
                     // prompt) so `:AiSessions` can offer it again in a later
                     // run — `acp_pending_prompt` is read, not taken, so the
@@ -168,7 +213,8 @@ impl Engine {
                     {
                         let agent_name = self.acp_active_agent_name();
                         let cwd = self.acp_workspace_cwd();
-                        let first_prompt = self.acp_pending_prompt.clone().unwrap_or_default();
+                        let first_prompt =
+                            self.acp_mut().pending_prompt.clone().unwrap_or_default();
                         self.acp_session_index.record_session(
                             &session_id,
                             &agent_name,
@@ -183,10 +229,10 @@ impl Engine {
                     // not an error.
                     if let Some(modes_json) = modes {
                         let (current, list) = crate::core::acp::parse_session_modes(&modes_json);
-                        self.acp_modes = list;
-                        self.acp_current_mode_id = current;
+                        self.acp_mut().modes = list;
+                        self.acp_mut().current_mode_id = current;
                     }
-                    if let Some(text) = self.acp_pending_prompt.take() {
+                    if let Some(text) = self.acp_mut().pending_prompt.take() {
                         // #1449: rebuilt fresh here (rather than carrying
                         // pre-built blocks in `acp_pending_prompt` itself)
                         // so the attachment reflects whatever's the active
@@ -195,13 +241,13 @@ impl Engine {
                         // `acp_client` borrow below, since both need
                         // `&self`/`&mut self` on the same field.
                         let content = self.acp_prompt_content_blocks(&text);
-                        if let Some(client) = self.acp_client.as_mut() {
+                        if let Some(client) = self.acp_mut().client.as_mut() {
                             client.prompt(&session_id, content);
                         }
                     } else {
                         // No prompt was waiting on this handshake — nothing
                         // to stream, so the panel shouldn't sit "thinking".
-                        self.ai_streaming = false;
+                        self.acp_mut().ai_streaming = false;
                     }
                     redraw = true;
                 }
@@ -222,10 +268,10 @@ impl Engine {
                     // was.
                     if let Some(modes_json) = modes {
                         let (current, list) = crate::core::acp::parse_session_modes(&modes_json);
-                        self.acp_modes = list;
-                        self.acp_current_mode_id = current;
+                        self.acp_mut().modes = list;
+                        self.acp_mut().current_mode_id = current;
                     }
-                    if let Some(session_id) = self.acp_session_id.clone() {
+                    if let Some(session_id) = self.acp_mut().session_id.clone() {
                         // #1459 review: refresh this record's `updated_at`
                         // (idempotent by id, see `record_session`'s doc) so a
                         // session just resumed and used again bubbles back
@@ -244,19 +290,19 @@ impl Engine {
                         // has finished landing in `ai_messages` — so it
                         // appears *after* the "past" conversation it's
                         // continuing, not spliced in ahead of it.
-                        if let Some(display) = self.acp_pending_prompt_display.take() {
-                            self.ai_messages.push(AiMessage {
+                        if let Some(display) = self.acp_mut().pending_prompt_display.take() {
+                            self.acp_mut().ai_messages.push(AiMessage {
                                 role: "user".to_string(),
                                 content: display,
                             });
                         }
-                        if let Some(text) = self.acp_pending_prompt.take() {
+                        if let Some(text) = self.acp_mut().pending_prompt.take() {
                             let content = self.acp_prompt_content_blocks(&text);
-                            if let Some(client) = self.acp_client.as_mut() {
+                            if let Some(client) = self.acp_mut().client.as_mut() {
                                 client.prompt(&session_id, content);
                             }
                         } else {
-                            self.ai_streaming = false;
+                            self.acp_mut().ai_streaming = false;
                             self.message = "Session resumed.".to_string();
                         }
                     }
@@ -269,7 +315,7 @@ impl Engine {
                     // the inner tagged union `session_update_chunk` parses;
                     // unwrap one level first.
                     let inner = update.get("update");
-                    if self.acp_session_id.as_deref() == Some(session_id.as_str()) {
+                    if self.acp_mut().session_id.as_deref() == Some(session_id.as_str()) {
                         if let Some(inner) = inner {
                             self.acp_handle_session_update(inner);
                         }
@@ -277,10 +323,10 @@ impl Engine {
                     redraw = true;
                 }
                 AcpEvent::PromptStopped { stop_reason, .. } => {
-                    self.ai_streaming = false;
-                    self.acp_streaming_turn = None;
+                    self.acp_mut().ai_streaming = false;
+                    self.acp_mut().streaming_turn = None;
                     if stop_reason != "end_turn" {
-                        self.ai_messages.push(AiMessage {
+                        self.acp_mut().ai_messages.push(AiMessage {
                             role: "assistant-thought".to_string(),
                             content: format!("[turn stopped: {stop_reason}]"),
                         });
@@ -303,11 +349,11 @@ impl Engine {
                     // lands in the transcript, but the spinner never clears
                     // and `ai_send_message` silently no-ops on every
                     // subsequent call (see `ext_panel.rs`'s early return on
-                    // `self.ai_streaming`).
-                    self.ai_streaming = false;
-                    self.acp_streaming_turn = None;
+                    // `self.acp_mut().ai_streaming`).
+                    self.acp_mut().ai_streaming = false;
+                    self.acp_mut().streaming_turn = None;
                     self.message = format!("ACP {method} failed: {message}");
-                    self.ai_messages.push(AiMessage {
+                    self.acp_mut().ai_messages.push(AiMessage {
                         role: "assistant-thought".to_string(),
                         content: format!("\u{26a0} {method} failed: {message}"),
                     });
@@ -333,15 +379,15 @@ impl Engine {
                         // `session/new`, which will pick `acp_pending_prompt`
                         // back up via `SessionCreated` exactly like a cold
                         // start.
-                        self.acp_session_id = None;
-                        if let Some(display) = self.acp_pending_prompt_display.take() {
-                            self.ai_messages.push(AiMessage {
+                        self.acp_mut().session_id = None;
+                        if let Some(display) = self.acp_mut().pending_prompt_display.take() {
+                            self.acp_mut().ai_messages.push(AiMessage {
                                 role: "user".to_string(),
                                 content: display,
                             });
                         }
-                        if self.acp_pending_prompt.is_some() {
-                            self.ai_streaming = true;
+                        if self.acp_mut().pending_prompt.is_some() {
+                            self.acp_mut().ai_streaming = true;
                         }
                         self.acp_begin_session();
                     } else {
@@ -351,8 +397,8 @@ impl Engine {
                         // — `session/load` is the one exception, handled
                         // above, where the fallback session is what it's
                         // meant to reach.
-                        self.acp_pending_prompt = None;
-                        self.acp_pending_prompt_display = None;
+                        self.acp_mut().pending_prompt = None;
+                        self.acp_mut().pending_prompt_display = None;
                     }
                     redraw = true;
                 }
@@ -363,7 +409,7 @@ impl Engine {
                 } => {
                     match method.as_str() {
                         "session/request_permission" => {
-                            self.acp_handle_permission_request(request_id, params);
+                            self.acp_handle_permission_request(request_id, params, is_foreground);
                         }
                         "fs/read_text_file" => {
                             self.acp_handle_read_text_file(request_id, params);
@@ -511,7 +557,9 @@ impl Engine {
             return;
         };
         let name = profile.name.clone();
-        if name.eq_ignore_ascii_case(&self.acp_active_agent_name()) && self.acp_client.is_none() {
+        if name.eq_ignore_ascii_case(&self.acp_active_agent_name())
+            && self.acp_mut().client.is_none()
+        {
             self.message = format!("Already using agent \"{name}\"");
             return;
         }
@@ -519,6 +567,180 @@ impl Engine {
         self.settings.acp_active_agent = name.clone();
         self.message =
             format!("Switched to agent \"{name}\" \u{2014} starts fresh on next message");
+    }
+
+    // ── multiple concurrent sessions (#1463) ────────────────────────────────
+
+    /// `:AiNew [agent]` — open a new ACP session tab and make it active.
+    /// If the currently active tab has never been used
+    /// (`AcpSession::is_blank`), it's reused in place instead of piling up
+    /// an extra empty tab — mirrors opening `:AiNew` twice in a row before
+    /// ever sending a message doing nothing surprising. `agent`, if given,
+    /// must name an entry in `settings.acp_agents` (matched the same way
+    /// `:AiAgent <name>` does); it becomes the agent the *new* tab's first
+    /// message spawns — the session(s) left behind are untouched, since an
+    /// agent choice only matters at the moment a blank tab's client is
+    /// actually spawned (`Engine::acp_resolve_agent_launch` reads the
+    /// active-agent setting then, not before).
+    pub fn acp_new_session(&mut self, agent: Option<&str>) {
+        if let Some(name) = agent {
+            let known = self
+                .settings
+                .acp_agents
+                .iter()
+                .any(|a| a.name.eq_ignore_ascii_case(name));
+            if !known {
+                self.message = format!("Unknown ACP agent: {name}");
+                return;
+            }
+        }
+        if !self.acp().is_blank() {
+            self.acp_sessions
+                .push(crate::core::acp_session::AcpSession::new());
+            self.acp_active_session = self.acp_sessions.len() - 1;
+        }
+        if let Some(name) = agent {
+            // Only the setting needs updating here — the new tab has no
+            // client to tear down (`acp_switch_agent`'s `ai_clear()` call
+            // is a no-op on an already-blank session), and its label is
+            // captured fresh from this setting the moment it actually
+            // spawns (`Engine::ai_send_message_via_acp`).
+            self.settings.acp_active_agent = name.to_string();
+        }
+        self.message = format!(
+            "New AI session ({} of {})",
+            self.acp_active_session + 1,
+            self.acp_sessions.len()
+        );
+    }
+
+    /// `:AiNext` — switch the AI panel to the next session tab (wraps
+    /// around). No-op message (not silent — the issue's "closing one
+    /// leaves the other working" acceptance bar implies visible tab
+    /// feedback) when there is only one tab.
+    pub fn acp_next_session(&mut self) {
+        if self.acp_sessions.len() < 2 {
+            self.message = "Only one AI session".to_string();
+            return;
+        }
+        self.acp_activate_session((self.acp_active_session + 1) % self.acp_sessions.len());
+        self.message = self.acp_session_tab_status_line();
+    }
+
+    /// `:AiPrev` — the reverse of [`Self::acp_next_session`].
+    pub fn acp_prev_session(&mut self) {
+        if self.acp_sessions.len() < 2 {
+            self.message = "Only one AI session".to_string();
+            return;
+        }
+        self.acp_activate_session(
+            (self.acp_active_session + self.acp_sessions.len() - 1) % self.acp_sessions.len(),
+        );
+        self.message = self.acp_session_tab_status_line();
+    }
+
+    /// Switch the AI panel to session `idx` (clamped into range) — the one
+    /// place `:AiNext`/`:AiPrev`/a session-tab click all funnel through, so
+    /// "switching to a tab reveals whatever permission request it was
+    /// badging" (#1463) can't be forgotten by a future third caller. If
+    /// `idx` has a `session/request_permission` parked from while it was
+    /// backgrounded (`acp_handle_permission_request` deliberately withheld
+    /// its dialog then — see that method's doc) and no other dialog is
+    /// currently up, its dialog opens now: the human just navigated
+    /// straight to it, so this is answering their click, not stealing
+    /// focus out from under them.
+    pub fn acp_activate_session(&mut self, idx: usize) {
+        self.acp_active_session = idx.min(self.acp_sessions.len().saturating_sub(1));
+        if self.dialog.is_none() {
+            if let Some((_, req)) = self.acp().pending_permission.clone() {
+                let (title, body, buttons) = Self::acp_permission_dialog_parts(&req);
+                self.show_dialog("acp_permission", &title, body, buttons);
+            }
+        }
+    }
+
+    /// `:AiClose` — end the active session and remove its tab. The last
+    /// remaining tab can't be removed outright (the AI panel always has at
+    /// least one, same invariant `acp_sessions` has held since
+    /// `Engine::new`) — closing it instead resets it in place via
+    /// [`Self::ai_clear`], same end state a fresh `:AiNew` tab starts in.
+    /// Otherwise the tab is dropped and the tab strip's active index moves
+    /// to a neighbor — never past the end (`saturating_sub`/`min` below),
+    /// so closing the last tab in the list activates the new last one, not
+    /// an out-of-bounds index.
+    pub fn acp_close_session(&mut self) {
+        if self.acp_sessions.len() == 1 {
+            self.ai_clear();
+            self.message = "AI session closed (last tab reset, not removed)".to_string();
+            return;
+        }
+        let idx = self.acp_active_session;
+        // Reuse `ai_clear`'s full teardown (replies to any parked
+        // permission request, kills the client, closes any dialog
+        // referencing this session) before dropping the slot — a session
+        // being closed out from under a live agent process must still get
+        // exactly the same "don't leave the agent hanging" treatment a
+        // foreground `:AiClear` does, not a silent `Vec::remove`.
+        self.ai_clear();
+        self.acp_sessions.remove(idx);
+        self.acp_active_session = idx.min(self.acp_sessions.len() - 1);
+        self.message = format!(
+            "AI session closed ({} of {} remain)",
+            self.acp_active_session + 1,
+            self.acp_sessions.len()
+        );
+    }
+
+    /// Human-readable label for session `idx`'s tab — the agent name
+    /// captured when it was spawned, "New session" before that, mirroring
+    /// [`crate::core::acp_session::AcpSession::label`]'s doc.
+    pub fn acp_session_tab_label(&self, idx: usize) -> String {
+        self.acp_sessions
+            .get(idx)
+            .map(|s| {
+                if s.label.is_empty() {
+                    "New session".to_string()
+                } else {
+                    s.label.clone()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// One line per tab summary for `:AiNext`/`:AiPrev`'s status message
+    /// and the `:AiSessions`-adjacent status line — "2/3 (claude)".
+    fn acp_session_tab_status_line(&self) -> String {
+        format!(
+            "AI session {} of {} ({})",
+            self.acp_active_session + 1,
+            self.acp_sessions.len(),
+            self.acp_session_tab_label(self.acp_active_session)
+        )
+    }
+
+    /// Every tab's `(index, label, is_active, has_permission_badge)` for
+    /// the AI panel's session strip (#1463) — both backends paint from
+    /// this, never from `acp_sessions` directly, so the "background
+    /// session surfaces its pending permission request as a badge, not a
+    /// stolen focus" acceptance bar has exactly one source of truth.
+    pub fn acp_session_tabs(&self) -> Vec<(usize, String, bool, bool)> {
+        self.acp_sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let label = if s.label.is_empty() {
+                    "New session".to_string()
+                } else {
+                    s.label.clone()
+                };
+                (
+                    i,
+                    label,
+                    i == self.acp_active_session,
+                    s.has_pending_permission(),
+                )
+            })
+            .collect()
     }
 
     // ── session history / resume (#1459) ────────────────────────────────────
@@ -577,14 +799,14 @@ impl Engine {
         // below gets there; leaving it `false` in between would show the
         // panel as idle while a `session/load` round trip is genuinely in
         // flight.
-        self.ai_streaming = true;
+        self.acp_mut().ai_streaming = true;
 
-        if self.acp_client.is_some() && self.acp_session_id.is_some() {
+        if self.acp_mut().client.is_some() && self.acp_mut().session_id.is_some() {
             self.acp_pending_resume = Some(session_id);
             self.acp_begin_session();
             return;
         }
-        if self.acp_client.is_some() {
+        if self.acp_mut().client.is_some() {
             self.acp_pending_resume = Some(session_id);
             return;
         }
@@ -595,11 +817,11 @@ impl Engine {
         match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
             Ok(mut client) => {
                 client.initialize();
-                self.acp_client = Some(client);
+                self.acp_mut().client = Some(client);
             }
             Err(e) => {
                 self.acp_pending_resume = None;
-                self.ai_streaming = false;
+                self.acp_mut().ai_streaming = false;
                 self.message = format!("Could not start ACP agent \"{agent_label}\": {e}");
             }
         }
@@ -627,15 +849,15 @@ impl Engine {
     /// `acp_reopen_last_session` auto-resume path) can call it directly —
     /// the other call site is in this same module.
     pub(crate) fn acp_reset_transcript_for_resume(&mut self) {
-        self.acp_remembered_decisions.clear();
-        self.ai_messages.clear();
-        self.acp_plan.clear();
-        self.acp_available_commands.clear();
-        self.acp_command_completion_idx = 0;
-        self.acp_modes.clear();
-        self.acp_current_mode_id = None;
-        self.acp_usage = None;
-        self.acp_tool_calls.clear();
+        self.acp_mut().remembered_decisions.clear();
+        self.acp_mut().ai_messages.clear();
+        self.acp_mut().plan.clear();
+        self.acp_mut().available_commands.clear();
+        self.acp_mut().command_completion_idx = 0;
+        self.acp_mut().modes.clear();
+        self.acp_mut().current_mode_id = None;
+        self.acp_mut().usage = None;
+        self.acp_mut().tool_calls.clear();
         self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
     }
@@ -668,19 +890,19 @@ impl Engine {
     pub(crate) fn acp_begin_session(&mut self) {
         let cwd = self.acp_workspace_cwd();
         if let Some(session_id) = self.acp_pending_resume.take() {
-            self.acp_session_id = Some(session_id.clone());
+            self.acp_mut().session_id = Some(session_id.clone());
             self.message = format!("Resuming session {session_id}\u{2026}");
-            if let Some(client) = self.acp_client.as_mut() {
+            if let Some(client) = self.acp_mut().client.as_mut() {
                 client.load_session(&session_id, &cwd, vec![]);
             }
             return;
         }
-        if let Some(client) = self.acp_client.as_mut() {
+        if let Some(client) = self.acp_mut().client.as_mut() {
             client.new_session(&cwd, vec![]);
         }
     }
 
-    /// Open the `"acp_auth_choice"` dialog listing `self.acp_auth_methods`
+    /// Open the `"acp_auth_choice"` dialog listing `self.acp_mut().auth_methods`
     /// plus a "Continue without auth" fallback — an agent advertising
     /// `authMethods` doesn't necessarily mean auth is *required* right now
     /// (it may already be logged in from a previous run), so the human can
@@ -694,7 +916,8 @@ impl Engine {
     /// method's letter or vice versa.
     fn acp_show_auth_choice(&mut self) {
         let mut labeled_actions: Vec<(String, String)> = self
-            .acp_auth_methods
+            .acp_mut()
+            .auth_methods
             .iter()
             .map(|m| (m.name.clone(), m.id.clone()))
             .collect();
@@ -747,9 +970,9 @@ impl Engine {
     /// against a client that will never send another `session/new`.
     pub(crate) fn acp_finish_terminal_login(&mut self, exit_code: Option<u32>) {
         if exit_code == Some(0) {
-            self.acp_authenticated = true;
+            self.acp_mut().authenticated = true;
             self.message = "Sign-in complete, resuming\u{2026}".to_string();
-            if let Some(client) = self.acp_client.as_mut() {
+            if let Some(client) = self.acp_mut().client.as_mut() {
                 client.initialize();
             }
             return;
@@ -760,23 +983,23 @@ impl Engine {
             None => "was abandoned".to_string(),
         };
         self.message = format!("ACP sign-in {detail} \u{2014} try again from the AI panel");
-        self.ai_messages.push(AiMessage {
+        self.acp_mut().ai_messages.push(AiMessage {
             role: "assistant-thought".to_string(),
             content: format!("\u{26a0} Sign-in {detail}."),
         });
-        self.ai_streaming = false;
-        self.acp_streaming_turn = None;
-        self.acp_pending_prompt = None;
+        self.acp_mut().ai_streaming = false;
+        self.acp_mut().streaming_turn = None;
+        self.acp_mut().pending_prompt = None;
         // #1459: same reasoning as `AgentExited` — an abandoned/failed
         // login drops the client entirely, so any deferred resume display
         // line has nowhere left to land.
-        self.acp_pending_prompt_display = None;
+        self.acp_mut().pending_prompt_display = None;
         self.acp_pending_resume = None;
-        self.acp_client = None;
-        self.acp_session_id = None;
-        self.acp_auth_methods.clear();
-        self.acp_authenticated = false;
-        self.acp_prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
+        self.acp_mut().client = None;
+        self.acp_mut().session_id = None;
+        self.acp_mut().auth_methods.clear();
+        self.acp_mut().authenticated = false;
+        self.acp_mut().prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
     }
 
     // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
@@ -867,7 +1090,7 @@ impl Engine {
     /// selection / `:{range}AI` attachment), if one is staged, into its own
     /// content block(s) via [`crate::core::acp::AcpRangeAttachment::
     /// content_blocks`] — the one call in this codebase that reads
-    /// `self.acp_prompt_capabilities` to choose `resource` vs.
+    /// `self.acp_mut().prompt_capabilities` to choose `resource` vs.
     /// `resource_link` + fenced text. `&mut self` (not `&self`, unlike
     /// #1449's original signature) purely for the `.take()` — the
     /// attachment is consumed exactly once, whichever of this function's
@@ -885,7 +1108,7 @@ impl Engine {
             }
         }
         if let Some(attachment) = self.acp_pending_attachment.take() {
-            blocks.extend(attachment.content_blocks(self.acp_prompt_capabilities));
+            blocks.extend(attachment.content_blocks(self.acp_mut().prompt_capabilities));
         }
         // #1464: every manually attached file/image, in the order they were
         // attached — `drain(..)` so a removed-before-send attachment (Ctrl+R)
@@ -909,7 +1132,7 @@ impl Engine {
     ///
     /// An image extension ([`crate::core::acp::image_mime_type_for_path`])
     /// stages an `image` content block instead of a `resource_link` — gated
-    /// on `self.acp_prompt_capabilities.image` (refused with a clear message
+    /// on `self.acp_mut().prompt_capabilities.image` (refused with a clear message
     /// when the agent hasn't declared support — there is no baseline-ACP
     /// fallback for binary image data) and on
     /// [`crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES`] (refused the
@@ -938,7 +1161,7 @@ impl Engine {
         }
 
         if let Some(mime_type) = crate::core::acp::image_mime_type_for_path(&resolved) {
-            if !self.acp_prompt_capabilities.image {
+            if !self.acp().prompt_capabilities.image {
                 self.message = "This agent doesn't support image attachments \
                     (promptCapabilities.image is false)"
                     .to_string();
@@ -997,7 +1220,7 @@ impl Engine {
             self.message = "This platform can't paste an image from the clipboard".to_string();
             return;
         };
-        if !self.acp_prompt_capabilities.image {
+        if !self.acp().prompt_capabilities.image {
             self.message = "This agent doesn't support image attachments \
                 (promptCapabilities.image is false)"
                 .to_string();
@@ -1182,7 +1405,7 @@ impl Engine {
         };
         match self.acp_read_text_file(std::path::Path::new(&req.path), req.line, req.limit) {
             Ok(content) => {
-                if let Some(client) = self.acp_client.as_ref() {
+                if let Some(client) = self.acp_mut().client.as_ref() {
                     client.respond_to_client_request(
                         request_id,
                         Ok(crate::core::acp::read_text_file_result(&content)),
@@ -1235,7 +1458,7 @@ impl Engine {
         };
         match self.acp_write_text_file(std::path::Path::new(&req.path), &req.content) {
             Ok(()) => {
-                if let Some(client) = self.acp_client.as_ref() {
+                if let Some(client) = self.acp_mut().client.as_ref() {
                     client.respond_to_client_request(request_id, Ok(serde_json::Value::Null));
                 }
             }
@@ -1375,13 +1598,13 @@ impl Engine {
     /// the shared "surface it, never swallow it" tail every `fs/*` handler
     /// above funnels through.
     fn acp_respond_error(&self, request_id: i64, message: &str) {
-        if let Some(client) = self.acp_client.as_ref() {
+        if let Some(client) = self.acp().client.as_ref() {
             client.respond_to_client_request(request_id, Err((-32000, message.to_string())));
         }
     }
 
     /// Append one `session/update` chunk to the AI panel transcript
-    /// (`self.ai_messages`), appending to the in-progress streamed turn
+    /// (`self.acp_mut().ai_messages`), appending to the in-progress streamed turn
     /// when `kind` matches it and starting a new turn otherwise — the
     /// "streamed assistant turn" ACP-1 asks for rather than one message
     /// per chunk. Empty chunks (a still-loading tool-adjacent update with
@@ -1390,9 +1613,9 @@ impl Engine {
         if text.is_empty() {
             return;
         }
-        if let Some((idx, streaming_kind)) = self.acp_streaming_turn {
-            if streaming_kind == kind && idx < self.ai_messages.len() {
-                self.ai_messages[idx].content.push_str(&text);
+        if let Some((idx, streaming_kind)) = self.acp_mut().streaming_turn {
+            if streaming_kind == kind && idx < self.acp_mut().ai_messages.len() {
+                self.acp_mut().ai_messages[idx].content.push_str(&text);
                 return;
             }
         }
@@ -1405,11 +1628,11 @@ impl Engine {
             AcpChunkKind::Thought => "assistant-thought",
             AcpChunkKind::UserEcho => "user",
         };
-        self.ai_messages.push(AiMessage {
+        self.acp_mut().ai_messages.push(AiMessage {
             role: role.to_string(),
             content: text,
         });
-        self.acp_streaming_turn = Some((self.ai_messages.len() - 1, kind));
+        self.acp_mut().streaming_turn = Some((self.acp_mut().ai_messages.len() - 1, kind));
     }
 
     // ── plan, available_commands_update, current_mode_update, usage_update
@@ -1427,14 +1650,14 @@ impl Engine {
         if let Some((kind, text)) = crate::core::acp::session_update_chunk(inner) {
             self.acp_append_chunk(kind, text);
         } else if let Some(entries) = crate::core::acp::parse_plan_update(inner) {
-            self.acp_plan = entries;
+            self.acp_mut().plan = entries;
         } else if let Some(commands) = crate::core::acp::parse_available_commands_update(inner) {
-            self.acp_available_commands = commands;
-            self.acp_command_completion_idx = 0;
+            self.acp_mut().available_commands = commands;
+            self.acp_mut().command_completion_idx = 0;
         } else if let Some(mode_id) = crate::core::acp::parse_current_mode_update(inner) {
-            self.acp_current_mode_id = Some(mode_id);
+            self.acp_mut().current_mode_id = Some(mode_id);
         } else if let Some(usage) = crate::core::acp::parse_usage_update(inner) {
-            self.acp_usage = Some(usage);
+            self.acp_mut().usage = Some(usage);
         } else if let Some(call) = crate::core::acp::parse_tool_call(inner) {
             // #955 (ACP-4).
             self.acp_upsert_tool_call(call);
@@ -1449,16 +1672,21 @@ impl Engine {
 
     // ── tool_call / tool_call_update (#955, ACP-4) ──────────────────────────
 
-    /// Insert or replace `call` in `self.acp_tool_calls`, keyed by
+    /// Insert or replace `call` in `self.acp_mut().tool_calls`, keyed by
     /// `AcpToolCall::id` — the "addressable collection, not an
     /// append-only log" the issue asks for. Any `diff` content block the
     /// call already carries opens (or extends) the change-review surface
     /// immediately, same as a `tool_call_update` adding one later.
     fn acp_upsert_tool_call(&mut self, call: crate::core::acp::AcpToolCall) {
         self.acp_open_review_for_diffs(&call.content);
-        match self.acp_tool_calls.iter_mut().find(|t| t.id == call.id) {
+        match self
+            .acp_mut()
+            .tool_calls
+            .iter_mut()
+            .find(|t| t.id == call.id)
+        {
             Some(existing) => *existing = call,
-            None => self.acp_tool_calls.push(call),
+            None => self.acp_mut().tool_calls.push(call),
         }
     }
 
@@ -1474,7 +1702,12 @@ impl Engine {
         if let Some(blocks) = &update.content {
             self.acp_open_review_for_diffs(blocks);
         }
-        let Some(call) = self.acp_tool_calls.iter_mut().find(|t| t.id == update.id) else {
+        let Some(call) = self
+            .acp_mut()
+            .tool_calls
+            .iter_mut()
+            .find(|t| t.id == update.id)
+        else {
             return;
         };
         if let Some(status) = update.status {
@@ -1604,14 +1837,15 @@ impl Engine {
     /// Human-readable summary of the ACP agent's declared modes and which
     /// one is current, for `:AiMode` with no argument.
     pub(crate) fn acp_mode_status_line(&self) -> String {
-        if self.acp_modes.is_empty() {
+        if self.acp().modes.is_empty() {
             return "ACP agent has no modes".to_string();
         }
         let names: Vec<String> = self
-            .acp_modes
+            .acp()
+            .modes
             .iter()
             .map(|m| {
-                if Some(m.id.as_str()) == self.acp_current_mode_id.as_deref() {
+                if Some(m.id.as_str()) == self.acp().current_mode_id.as_deref() {
                     format!("*{}", m.name)
                 } else {
                     m.name.clone()
@@ -1629,12 +1863,13 @@ impl Engine {
     /// follows `current_mode_update`" acceptance criterion rather than the
     /// request succeeding.
     pub(crate) fn acp_set_mode(&mut self, target: &str) {
-        let Some(session_id) = self.acp_session_id.clone() else {
+        let Some(session_id) = self.acp_mut().session_id.clone() else {
             self.message = "No active ACP session".to_string();
             return;
         };
         let Some(mode) = self
-            .acp_modes
+            .acp_mut()
+            .modes
             .iter()
             .find(|m| m.id.eq_ignore_ascii_case(target) || m.name.eq_ignore_ascii_case(target))
         else {
@@ -1642,7 +1877,7 @@ impl Engine {
             return;
         };
         let mode_id = mode.id.clone();
-        if let Some(client) = self.acp_client.as_mut() {
+        if let Some(client) = self.acp_mut().client.as_mut() {
             client.set_mode(&session_id, &mode_id);
             self.message = format!("Switching to mode: {mode_id}\u{2026}");
         }
@@ -1663,16 +1898,21 @@ impl Engine {
     /// nothing a human could meaningfully select — never silence.
     ///
     /// Unlike the `SessionUpdate` handler a few lines above this in
-    /// `poll_acp` (which filters on `self.acp_session_id`), this does not
+    /// `poll_acp` (which filters on `self.acp_mut().session_id`), this does not
     /// check `req.session_id` before opening the dialog. That's harmless
     /// today — only one `AcpClient`/session is ever live at a time, so
     /// there is no *other* session's request this could ever be — but if a
     /// future slice ever hosts more than one concurrent session, add the
     /// same filter here for symmetry (a permission prompt is far more
     /// consequential to mis-route than a transcript chunk).
-    fn acp_handle_permission_request(&mut self, request_id: i64, params: serde_json::Value) {
+    fn acp_handle_permission_request(
+        &mut self,
+        request_id: i64,
+        params: serde_json::Value,
+        is_foreground: bool,
+    ) {
         let Some(req) = crate::core::acp::parse_request_permission(&params) else {
-            if let Some(client) = self.acp_client.as_ref() {
+            if let Some(client) = self.acp_mut().client.as_ref() {
                 client.respond_to_client_request(
                     request_id,
                     Err((
@@ -1697,14 +1937,14 @@ impl Engine {
         // reopening the dialog. Falls through to the dialog if this
         // request's own `options` don't offer a matching option kind (an
         // agent is free to omit "always" options on a later ask).
-        if let Some(&always_allow) = self.acp_remembered_decisions.get(&req.tool_call.kind) {
+        if let Some(&always_allow) = self.acp_mut().remembered_decisions.get(&req.tool_call.kind) {
             let wanted_prefix = if always_allow { "allow_" } else { "reject_" };
             if let Some(opt) = req
                 .options
                 .iter()
                 .find(|o| o.kind.starts_with(wanted_prefix))
             {
-                if let Some(client) = self.acp_client.as_ref() {
+                if let Some(client) = self.acp_mut().client.as_ref() {
                     client.respond_to_client_request(
                         request_id,
                         Ok(crate::core::acp::permission_outcome_selected(
@@ -1716,6 +1956,34 @@ impl Engine {
             }
         }
 
+        let (title, body, buttons) = Self::acp_permission_dialog_parts(&req);
+
+        // A backgrounded session's permission request must not pop a modal
+        // over whatever the human is actually looking at (#1463) — it
+        // still gets parked below (`pending_permission`, read by
+        // `Engine::acp_session_tabs` for the tab strip's badge), just
+        // without `show_dialog`. Switching to that session later
+        // (`Engine::acp_activate_session`) reveals the same dialog then.
+        //
+        // `show_dialog` itself guards against a *stale* `acp_permission`
+        // dialog by cancelling it (`acp_cancel_pending_permission`) before
+        // opening whatever's requested — including this very one. Set the
+        // new pending request only *after* that call, or the guard would
+        // immediately cancel the request this method is in the middle of
+        // parking.
+        if is_foreground {
+            self.show_dialog("acp_permission", &title, body, buttons);
+        }
+        self.acp_mut().pending_permission = Some((request_id, req));
+    }
+
+    /// The `(title, body, buttons)` a `session/request_permission`'s parked
+    /// request renders as — shared by [`Self::acp_handle_permission_request`]
+    /// (the foreground path) and [`Self::acp_activate_session`] (revealing a
+    /// background session's badge once the human switches to its tab).
+    fn acp_permission_dialog_parts(
+        req: &crate::core::acp::AcpPermissionRequest,
+    ) -> (String, Vec<String>, Vec<DialogButton>) {
         let title = req.tool_call.title.clone();
         let mut body = vec![format!("Tool kind: {}", req.tool_call.kind)];
         if !req.tool_call.locations.is_empty() {
@@ -1759,15 +2027,7 @@ impl Engine {
                 }
             })
             .collect();
-
-        // `show_dialog` itself guards against a *stale* `acp_permission`
-        // dialog by cancelling it (`acp_cancel_pending_permission`) before
-        // opening whatever's requested — including this very one. Set the
-        // new pending request only *after* that call, or the guard would
-        // immediately cancel the request this method is in the middle of
-        // parking.
-        self.show_dialog("acp_permission", &title, body, buttons);
-        self.acp_pending_permission = Some((request_id, req));
+        (title, body, buttons)
     }
 
     /// Reply `cancelled` to a parked `session/request_permission` and close
@@ -1781,8 +2041,8 @@ impl Engine {
     /// — see `poll_acp`'s `AgentExited` arm, which must not write to a dead
     /// stdin and clears the same state without calling this.
     pub(crate) fn acp_cancel_pending_permission(&mut self) {
-        if let Some((request_id, _)) = self.acp_pending_permission.take() {
-            if let Some(client) = self.acp_client.as_ref() {
+        if let Some((request_id, _)) = self.acp_mut().pending_permission.take() {
+            if let Some(client) = self.acp_mut().client.as_ref() {
                 client.respond_to_client_request(
                     request_id,
                     Ok(crate::core::acp::permission_outcome_cancelled()),
@@ -1808,17 +2068,17 @@ impl Engine {
     /// A no-op when no ACP session is running — callers don't need to
     /// guard on that themselves.
     pub fn acp_cancel_turn(&mut self) {
-        let Some(session_id) = self.acp_session_id.clone() else {
+        let Some(session_id) = self.acp_mut().session_id.clone() else {
             return;
         };
         self.acp_cancel_pending_permission();
-        if let Some(client) = self.acp_client.as_ref() {
+        if let Some(client) = self.acp_mut().client.as_ref() {
             client.cancel(&session_id);
         }
-        if self.ai_streaming {
-            self.ai_streaming = false;
-            self.acp_streaming_turn = None;
-            self.ai_messages.push(AiMessage {
+        if self.acp_mut().ai_streaming {
+            self.acp_mut().ai_streaming = false;
+            self.acp_mut().streaming_turn = None;
+            self.acp_mut().ai_messages.push(AiMessage {
                 role: "assistant-thought".to_string(),
                 content: "[cancelled by user]".to_string(),
             });
@@ -1836,7 +2096,7 @@ mod tests {
     #[test]
     fn poll_acp_is_a_no_op_when_no_client_is_running() {
         let mut engine = Engine::new_for_test();
-        assert!(engine.acp_client.is_none());
+        assert!(engine.acp_mut().client.is_none());
         assert!(!engine.poll_acp());
     }
 
@@ -1866,7 +2126,7 @@ mod tests {
         client.initialize();
 
         let mut engine = Engine::new_for_test();
-        engine.acp_client = Some(client);
+        engine.acp_mut().client = Some(client);
         engine
     }
 
@@ -1972,9 +2232,9 @@ mod tests {
         // `poll_acp_stays_alive_while_the_agent_is_alive` below covers the
         // "doesn't clear it early" half deterministically, against an agent
         // that is still running rather than against a scheduling race.
-        poll_acp_until(&mut engine, |e| e.acp_client.is_none());
+        poll_acp_until(&mut engine, |e| e.acp().client.is_none());
         assert!(
-            engine.acp_client.is_none(),
+            engine.acp_mut().client.is_none(),
             "agent exit should clear the client within {TEST_DEADLINE:?} \
              (message was {:?})",
             engine.message
@@ -2013,7 +2273,7 @@ mod tests {
             engine.poll_acp();
         }
         assert!(
-            engine.acp_client.is_some(),
+            engine.acp_mut().client.is_some(),
             "a live agent must stay attached after Initialized"
         );
         assert_ne!(
@@ -2045,37 +2305,49 @@ mod tests {
 
         engine.ai_send_message("hello agent".to_string());
         assert!(
-            engine.ai_streaming,
+            engine.acp_mut().ai_streaming,
             "sending a message must mark the panel busy"
         );
         assert_eq!(
-            engine.ai_messages.last().map(|m| m.content.as_str()),
+            engine
+                .acp_mut()
+                .ai_messages
+                .last()
+                .map(|m| m.content.as_str()),
             Some("hello agent"),
             "the user's turn should be recorded immediately, before the handshake completes"
         );
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "the turn should reach stopReason: end_turn within {TEST_DEADLINE:?}"
         );
 
-        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        let roles: Vec<&str> = engine
+            .acp()
+            .ai_messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
         assert_eq!(
             roles,
             vec!["user", "assistant-thought", "assistant"],
             "thought and message chunks must land as separate turns, not merged \
              into one another: {:?}",
-            engine.ai_messages
+            engine.acp().ai_messages
         );
-        assert_eq!(engine.ai_messages[0].content, "hello agent");
+        assert_eq!(engine.acp_mut().ai_messages[0].content, "hello agent");
         assert!(
-            engine.ai_messages[1].content.contains("pondering"),
+            engine.acp_mut().ai_messages[1]
+                .content
+                .contains("pondering"),
             "thought turn content: {:?}",
-            engine.ai_messages[1]
+            engine.acp_mut().ai_messages[1]
         );
         assert_eq!(
-            engine.ai_messages[2].content, "Hello world",
+            engine.acp_mut().ai_messages[2].content,
+            "Hello world",
             "the two agent_message_chunk notifications must merge into one \
              streamed turn, not create a turn each"
         );
@@ -2148,8 +2420,11 @@ mod tests {
         engine.active_buffer_state_mut().file_path = Some(file_path.clone());
 
         engine.ai_send_message("hello agent".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         let expected_uri =
@@ -2162,9 +2437,9 @@ mod tests {
              captured blocks: {blocks:?}"
         );
         assert!(
-            engine.ai_messages[0].content.contains('\u{29c9}'),
+            engine.acp_mut().ai_messages[0].content.contains('\u{29c9}'),
             "displayed user turn should show the attachment chip: {:?}",
-            engine.ai_messages[0]
+            engine.acp_mut().ai_messages[0]
         );
 
         let _ = std::fs::remove_file(&file_path);
@@ -2196,8 +2471,11 @@ mod tests {
         engine.active_buffer_state_mut().file_path = Some(file_path.clone());
 
         engine.ai_send_message("hello agent".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         assert!(
@@ -2205,9 +2483,9 @@ mod tests {
             "setting off must send no resource_link at all: {blocks:?}"
         );
         assert!(
-            !engine.ai_messages[0].content.contains('\u{29c9}'),
+            !engine.acp_mut().ai_messages[0].content.contains('\u{29c9}'),
             "setting off must show no attachment chip: {:?}",
-            engine.ai_messages[0]
+            engine.acp_mut().ai_messages[0]
         );
 
         let _ = std::fs::remove_file(&file_path);
@@ -2233,8 +2511,11 @@ mod tests {
         );
 
         engine.ai_send_message("hello agent".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         assert!(
@@ -2242,9 +2523,9 @@ mod tests {
             "a scratch buffer has nothing to attach: {blocks:?}"
         );
         assert!(
-            !engine.ai_messages[0].content.contains('\u{29c9}'),
+            !engine.acp_mut().ai_messages[0].content.contains('\u{29c9}'),
             "a scratch buffer must show no attachment chip: {:?}",
-            engine.ai_messages[0]
+            engine.acp_mut().ai_messages[0]
         );
 
         let _ = std::fs::remove_file(&capture);
@@ -2282,8 +2563,11 @@ mod tests {
 
         let text = format!("please check @{mention_name} for bugs");
         engine.ai_send_message(text.clone());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         let expected_uri =
@@ -2410,16 +2694,21 @@ mod tests {
         // Wait for `Initialized` (and its `promptCapabilities`) to drain
         // before staging the attachment/sending, so the capability is
         // already known the moment `acp_prompt_content_blocks` runs.
-        poll_acp_until(&mut engine, |e| e.acp_prompt_capabilities.embedded_context);
+        poll_acp_until(&mut engine, |e| {
+            e.acp().prompt_capabilities.embedded_context
+        });
         assert!(
-            engine.acp_prompt_capabilities.embedded_context,
+            engine.acp_mut().prompt_capabilities.embedded_context,
             "fixture should have advertised embeddedContext: true"
         );
 
         // Lines 1-2 (0-based), i.e. the unsaved comment plus "fn two() {}".
         engine.ai_attach_range(1, 2, "explain these lines");
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         let resource = blocks
@@ -2476,16 +2765,19 @@ mod tests {
             "fn one() {}\nfn two() {}\nfn three() {}\n",
         );
         poll_acp_until(&mut engine, |e| {
-            e.acp_session_id.is_some() || e.acp_client.is_none()
+            e.acp().session_id.is_some() || e.acp().client.is_none()
         });
         assert!(
-            !engine.acp_prompt_capabilities.embedded_context,
+            !engine.acp_mut().prompt_capabilities.embedded_context,
             "fixture must not advertise embeddedContext by default"
         );
 
         engine.ai_attach_range(0, 1, "explain these lines");
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         assert!(
@@ -2533,7 +2825,10 @@ mod tests {
             engine.ai_has_focus,
             "an empty message must still focus the panel"
         );
-        assert!(engine.ai_messages.is_empty(), "nothing should be sent yet");
+        assert!(
+            engine.acp_mut().ai_messages.is_empty(),
+            "nothing should be sent yet"
+        );
         let attachment = engine
             .acp_pending_attachment
             .as_ref()
@@ -2641,7 +2936,10 @@ mod tests {
             engine.acp_pending_attachment.is_none(),
             "attachment must be removed"
         );
-        assert!(engine.ai_messages.is_empty(), "nothing should be sent");
+        assert!(
+            engine.acp_mut().ai_messages.is_empty(),
+            "nothing should be sent"
+        );
 
         let _ = std::fs::remove_file(&file_path);
     }
@@ -2663,7 +2961,7 @@ mod tests {
         let mut engine = Engine::new_for_test();
         let (name, file_path) = setup_attach_workspace(&mut engine, "ctrlr", "notes.txt", b"hi");
         engine.acp_attach_file(&name);
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         let bytes = vec![0x89, 0x50, 0x4e, 0x47];
         let workspace = file_path.parent().unwrap().to_path_buf();
         std::fs::write(workspace.join("shot.png"), &bytes).expect("write second attach target");
@@ -2701,7 +2999,10 @@ mod tests {
             "removal message should name what was removed: {}",
             engine.message
         );
-        assert!(engine.ai_messages.is_empty(), "nothing should be sent");
+        assert!(
+            engine.acp_mut().ai_messages.is_empty(),
+            "nothing should be sent"
+        );
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
@@ -2753,7 +3054,7 @@ mod tests {
     /// state `if method == "session/prompt"`, so this exact sequence left
     /// `ai_streaming` stuck `true` forever and `ai_send_message` would
     /// silently no-op on every subsequent call (`ext_panel.rs`'s early
-    /// return on `self.ai_streaming`) — a permanently wedged panel with no
+    /// return on `self.acp_mut().ai_streaming`) — a permanently wedged panel with no
     /// crash and no further transcript growth.
     ///
     /// RED verified: reverting the `RequestFailed` arm to only reset state
@@ -2767,7 +3068,7 @@ mod tests {
 
         engine.ai_send_message("hello agent".to_string());
         assert!(
-            engine.ai_streaming,
+            engine.acp_mut().ai_streaming,
             "sending a message must mark the panel busy immediately"
         );
 
@@ -2775,31 +3076,33 @@ mod tests {
         // warning `poll_acp` pushes on `RequestFailed` is the signal the
         // error was actually drained (not just that the busy flag flipped
         // some other way).
-        poll_acp_until(&mut engine, |e| e.ai_messages.len() > 1);
+        poll_acp_until(&mut engine, |e| e.acp().ai_messages.len() > 1);
         assert_eq!(
-            engine.ai_messages.len(),
+            engine.acp_mut().ai_messages.len(),
             2,
             "the session/new error should land as one warning turn: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         assert!(
-            engine.ai_messages[1].content.contains("session/new failed"),
+            engine.acp_mut().ai_messages[1]
+                .content
+                .contains("session/new failed"),
             "warning should name the failed method: {:?}",
-            engine.ai_messages[1]
+            engine.acp_mut().ai_messages[1]
         );
 
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "a non-fatal error response to session/new must clear the busy \
              state, not just a failed session/prompt — otherwise the panel \
              is wedged and silently drops every further message"
         );
         assert!(
-            engine.acp_streaming_turn.is_none(),
+            engine.acp_mut().streaming_turn.is_none(),
             "no turn was ever streamed, so this must stay None"
         );
         assert!(
-            engine.acp_pending_prompt.is_none(),
+            engine.acp_mut().pending_prompt.is_none(),
             "the queued prompt from the failed handshake must not survive \
              to be replayed against a later, unrelated session"
         );
@@ -2807,21 +3110,21 @@ mod tests {
         // And the panel must actually be usable again, not just internally
         // "not streaming": a second send should reach the transport instead
         // of being silently swallowed by ai_send_message's busy-check
-        // (`if text.is_empty() || self.ai_streaming { return; }` in
+        // (`if text.is_empty() || self.acp_mut().ai_streaming { return; }` in
         // `ext_panel.rs`). Checking `ai_streaming` alone would pass
         // vacuously even with the bug reinstated — it was already `true` —
         // so assert the message was actually recorded.
         engine.ai_send_message("still there?".to_string());
         assert_eq!(
-            engine.ai_messages.len(),
+            engine.acp_mut().ai_messages.len(),
             3,
             "a second message after the failed handshake must actually be \
              recorded, not silently dropped by a still-stuck busy flag: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
-        assert_eq!(engine.ai_messages[2].content, "still there?");
+        assert_eq!(engine.acp_mut().ai_messages[2].content, "still there?");
         assert!(
-            engine.ai_streaming,
+            engine.acp_mut().ai_streaming,
             "the panel must accept a new message after the failed handshake \
              cleared the busy state"
         );
@@ -2885,7 +3188,7 @@ mod tests {
     #[test]
     fn ai_attach_file_refuses_an_image_when_the_agent_lacks_the_capability() {
         let mut engine = Engine::new_for_test();
-        assert!(!engine.acp_prompt_capabilities.image);
+        assert!(!engine.acp_mut().prompt_capabilities.image);
         let (name, file_path) =
             setup_attach_workspace(&mut engine, "noimg", "shot.png", b"not-really-a-png");
 
@@ -2912,7 +3215,7 @@ mod tests {
     #[test]
     fn ai_attach_file_attaches_an_image_with_base64_data_when_the_capability_is_present() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         let bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a];
         let (name, file_path) = setup_attach_workspace(&mut engine, "img", "shot.png", &bytes);
 
@@ -2942,7 +3245,7 @@ mod tests {
     #[test]
     fn ai_attach_file_rejects_an_oversize_image() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         let oversize = vec![0u8; (crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES + 1) as usize];
         let (name, file_path) = setup_attach_workspace(&mut engine, "big", "huge.png", &oversize);
 
@@ -3008,9 +3311,9 @@ mod tests {
         ]);
         engine.settings.acp_agent_command = "already-spawned-above".to_string();
         engine.settings.ai_attach_current_buffer = false;
-        poll_acp_until(&mut engine, |e| e.acp_prompt_capabilities.image);
+        poll_acp_until(&mut engine, |e| e.acp().prompt_capabilities.image);
         assert!(
-            engine.acp_prompt_capabilities.image,
+            engine.acp_mut().prompt_capabilities.image,
             "fixture should have advertised promptCapabilities.image: true"
         );
 
@@ -3025,8 +3328,11 @@ mod tests {
         );
 
         engine.ai_send_message("look at this".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "turn should complete within deadline");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "turn should complete within deadline"
+        );
 
         let blocks = captured_prompt_blocks(&capture);
         let image_block = blocks
@@ -3097,7 +3403,7 @@ mod tests {
     #[test]
     fn paste_clipboard_image_refuses_when_no_callback_is_wired() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         assert!(engine.clipboard_read_image.is_none());
 
         engine.acp_attach_clipboard_image();
@@ -3110,14 +3416,14 @@ mod tests {
         );
     }
 
-    /// RED verified: with the `!self.acp_prompt_capabilities.image` check
+    /// RED verified: with the `!self.acp_mut().prompt_capabilities.image` check
     /// removed, this fails — a pasted image attaches even though the agent
     /// never declared `promptCapabilities.image`, same trap as
     /// `ai_attach_file_refuses_an_image_when_the_agent_lacks_the_capability`.
     #[test]
     fn paste_clipboard_image_refuses_when_the_agent_lacks_the_capability() {
         let mut engine = Engine::new_for_test();
-        assert!(!engine.acp_prompt_capabilities.image);
+        assert!(!engine.acp_mut().prompt_capabilities.image);
         engine.clipboard_read_image = Some(Box::new(|| Ok(small_rgba_image())));
 
         engine.acp_attach_clipboard_image();
@@ -3138,7 +3444,7 @@ mod tests {
     #[test]
     fn paste_clipboard_image_reports_unsupported_as_a_clear_refusal() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         engine.clipboard_read_image = Some(Box::new(|| Err(quadraui::BackendError::Unsupported)));
 
         engine.acp_attach_clipboard_image();
@@ -3157,7 +3463,7 @@ mod tests {
     #[test]
     fn paste_clipboard_image_surfaces_other_backend_errors() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         engine.clipboard_read_image = Some(Box::new(|| {
             Err(quadraui::BackendError::PlatformFailure {
                 context: "test failure".to_string(),
@@ -3180,7 +3486,7 @@ mod tests {
     #[test]
     fn paste_clipboard_image_rejects_an_oversize_image() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         engine.clipboard_read_image = Some(Box::new(|| Ok(oversize_rgba_image())));
 
         engine.acp_attach_clipboard_image();
@@ -3208,7 +3514,7 @@ mod tests {
     #[test]
     fn paste_clipboard_image_stages_a_png_attachment_when_the_capability_is_present() {
         let mut engine = Engine::new_for_test();
-        engine.acp_prompt_capabilities.image = true;
+        engine.acp_mut().prompt_capabilities.image = true;
         let image = small_rgba_image();
         let expected_png =
             crate::core::acp::encode_png_rgba8(image.width, image.height, &image.pixels)
@@ -3286,7 +3592,7 @@ mod tests {
              hardcoded yes/no"
         );
         assert!(
-            engine.acp_pending_permission.is_some(),
+            engine.acp_mut().pending_permission.is_some(),
             "the request must be tracked as parked while its dialog is open"
         );
     }
@@ -3325,13 +3631,13 @@ mod tests {
             "the dialog must close the moment a button is clicked"
         );
         assert!(
-            engine.acp_pending_permission.is_none(),
+            engine.acp_mut().pending_permission.is_none(),
             "answering the request must clear the parked-request bookkeeping"
         );
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "the turn must reach stopReason: end_turn within {TEST_DEADLINE:?} \
              once the reply unblocks the fixture's read"
         );
@@ -3357,11 +3663,11 @@ mod tests {
 
         engine.dialog_cancel();
         assert!(engine.dialog.is_none());
-        assert!(engine.acp_pending_permission.is_none());
+        assert!(engine.acp_mut().pending_permission.is_none());
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "a cancelled reply must still unblock the fixture and let the \
              turn end cleanly within {TEST_DEADLINE:?}, not hang forever"
         );
@@ -3391,10 +3697,10 @@ mod tests {
             .position(|b| b.label == "Always Allow")
             .expect("Always Allow button should be present");
         engine.dialog_click_button(idx);
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming, "first turn should complete");
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(!engine.acp_mut().ai_streaming, "first turn should complete");
         assert_eq!(
-            engine.acp_remembered_decisions.get("edit"),
+            engine.acp_mut().remembered_decisions.get("edit"),
             Some(&true),
             "picking Always Allow must remember the decision, keyed by the \
              tool-call kind"
@@ -3404,9 +3710,9 @@ mod tests {
         // session/request_permission and block on its reply exactly like
         // the first time — but the dialog must never reopen.
         engine.ai_send_message("second edit".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "the second turn must complete within {TEST_DEADLINE:?} — a \
              hang here means the remembered decision wasn't applied and \
              the fixture is still blocked waiting for a reply"
@@ -3450,9 +3756,9 @@ mod tests {
         // not a real assertion). What's actually guaranteed — and what
         // #953 asks for — is the *end* state: drive polls until the death
         // is fully drained, then confirm nothing was left dangling.
-        poll_acp_until(&mut engine, |e| e.acp_client.is_none());
+        poll_acp_until(&mut engine, |e| e.acp().client.is_none());
         assert!(
-            engine.acp_client.is_none(),
+            engine.acp_mut().client.is_none(),
             "agent death should clear the client within {TEST_DEADLINE:?}"
         );
         assert!(
@@ -3461,7 +3767,7 @@ mod tests {
              agent is gone"
         );
         assert!(
-            engine.acp_pending_permission.is_none(),
+            engine.acp_mut().pending_permission.is_none(),
             "the parked request must be dropped, not left to answer later"
         );
     }
@@ -3489,7 +3795,7 @@ mod tests {
         engine.ai_send_message("please edit".to_string());
         poll_until_permission_dialog(&mut engine);
         assert!(
-            engine.ai_streaming,
+            engine.acp_mut().ai_streaming,
             "sanity: the turn must still be streaming/parked before Ctrl+C"
         );
 
@@ -3505,7 +3811,7 @@ mod tests {
         // wait for a `PromptStopped` a hung/misbehaving agent might never
         // send.
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "Ctrl+C must clear the busy state immediately, not wait for the \
              agent to acknowledge"
         );
@@ -3515,29 +3821,30 @@ mod tests {
              cancelled"
         );
         assert!(
-            engine.acp_pending_permission.is_none(),
+            engine.acp_mut().pending_permission.is_none(),
             "the parked permission request must be answered (not left to \
              hang) as part of cancelling the turn"
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .last()
                 .is_some_and(|m| m.content.contains("cancelled by user")),
             "a cancellation notice should land in the transcript: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         // Ctrl+C's ACP-2 behaviour is scoped abort of the turn, NOT
         // `ai_clear`'s full teardown — the session/process must stay alive
         // so the user can send another message without re-spawning the
         // agent.
         assert!(
-            engine.acp_client.is_some(),
+            engine.acp_mut().client.is_some(),
             "cancelling a turn must not tear down the agent session — that \
              is ai_clear's job, not Ctrl+C's, while a turn is in flight"
         );
         assert!(
-            !engine.ai_messages.is_empty(),
+            !engine.acp_mut().ai_messages.is_empty(),
             "unlike ai_clear, cancelling an in-flight turn must not wipe \
              the transcript"
         );
@@ -3565,7 +3872,7 @@ mod tests {
 
         engine.ai_send_message("please edit".to_string());
         poll_until_permission_dialog(&mut engine);
-        assert!(engine.acp_pending_permission.is_some());
+        assert!(engine.acp_mut().pending_permission.is_some());
 
         // An unrelated event opens a completely different dialog over the
         // still-parked permission prompt — e.g. the app deciding to confirm
@@ -3578,14 +3885,14 @@ mod tests {
             "the unrelated dialog must actually take over the screen"
         );
         assert!(
-            engine.acp_pending_permission.is_none(),
+            engine.acp_mut().pending_permission.is_none(),
             "the replaced permission request must be answered (cancelled), \
              not silently dropped or left parked behind the new dialog"
         );
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "the cancelled reply must actually reach the (fake) agent and \
              let the turn end cleanly within {TEST_DEADLINE:?}, not hang \
              forever behind the unrelated dialog"
@@ -3606,9 +3913,9 @@ mod tests {
 
         engine.ai_send_message("please edit".to_string());
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "the error reply must actually reach the (fake) agent and let \
              the turn end cleanly within {TEST_DEADLINE:?}, not hang \
              forever waiting for a dialog that never opens"
@@ -3619,7 +3926,7 @@ mod tests {
              select — it must never open a dialog"
         );
         assert!(
-            engine.acp_pending_permission.is_none(),
+            engine.acp_mut().pending_permission.is_none(),
             "a malformed request must never be tracked as parked"
         );
     }
@@ -3692,13 +3999,14 @@ mod tests {
         }
 
         engine.ai_send_message("please read".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "turn should complete within {TEST_DEADLINE:?}"
         );
 
         let transcript: Vec<&str> = engine
+            .acp_mut()
             .ai_messages
             .iter()
             .map(|m| m.content.as_str())
@@ -3772,13 +4080,14 @@ mod tests {
         );
 
         engine.ai_send_message("please write".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "turn should complete within {TEST_DEADLINE:?}"
         );
 
         let transcript: Vec<&str> = engine
+            .acp_mut()
             .ai_messages
             .iter()
             .map(|m| m.content.as_str())
@@ -3869,9 +4178,9 @@ mod tests {
         engine.workspace_root = Some(dir.clone());
 
         engine.ai_send_message("please write three files".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp().ai_streaming,
             "turn should complete within {TEST_DEADLINE:?}"
         );
 
@@ -4220,9 +4529,9 @@ mod tests {
         let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_MODES", "1")]);
         // `Engine::poll_acp`'s `Initialized` handler drives `session/new`
         // itself once the (already-sent) `initialize` response lands.
-        poll_acp_until(&mut engine, |e| e.acp_current_mode_id.is_some());
+        poll_acp_until(&mut engine, |e| e.acp().current_mode_id.is_some());
 
-        assert_eq!(engine.acp_current_mode_id.as_deref(), Some("code"));
+        assert_eq!(engine.acp_mut().current_mode_id.as_deref(), Some("code"));
         engine.execute_command("AiMode");
         assert_eq!(engine.message, "Modes: *Code, Plan");
     }
@@ -4287,19 +4596,19 @@ mod tests {
         let mut engine = engine_with_fixture_agent(&[]);
         engine.settings.acp_agent_command = "already-spawned-above".to_string();
         engine.ai_send_message("hello agent".to_string());
-        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        poll_acp_until(&mut engine, |e| e.acp().session_id.is_some());
         assert!(
             engine.dialog.is_none(),
             "an agent with no authMethods must never see an auth dialog"
         );
-        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(engine.acp_mut().session_id.as_deref(), Some("sess-1"));
     }
 
     /// An agent that offers `authMethods` must present the choice — with
     /// both the agent-kind and terminal-kind methods rendered as their own
     /// buttons — instead of silently opening a session.
     ///
-    /// RED verified: with the `!self.acp_auth_methods.is_empty()` branch of
+    /// RED verified: with the `!self.acp_mut().auth_methods.is_empty()` branch of
     /// `poll_acp`'s `Initialized` handler deleted (always calling
     /// `acp_begin_session()` unconditionally, i.e. #957 reverted), this
     /// test fails — `engine.dialog` stays `None` and `acp_session_id`
@@ -4313,7 +4622,7 @@ mod tests {
         poll_until_auth_choice_dialog(&mut engine);
 
         assert!(
-            engine.acp_session_id.is_none(),
+            engine.acp_mut().session_id.is_none(),
             "session/new must wait for the auth choice, not fire immediately"
         );
         let dialog = engine.dialog.as_ref().unwrap();
@@ -4347,9 +4656,9 @@ mod tests {
         engine.dialog_click_button(idx);
 
         assert!(engine.dialog.is_none());
-        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
-        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
-        assert!(engine.acp_authenticated);
+        poll_acp_until(&mut engine, |e| e.acp().session_id.is_some());
+        assert_eq!(engine.acp_mut().session_id.as_deref(), Some("sess-1"));
+        assert!(engine.acp_mut().authenticated);
     }
 
     /// A `type: "agent"` auth method calls the plain `authenticate` RPC and,
@@ -4373,14 +4682,19 @@ mod tests {
             .expect("API Key button should be present");
         engine.dialog_click_button(idx);
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(engine.acp_authenticated);
-        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
-        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(engine.acp_mut().authenticated);
+        assert_eq!(engine.acp_mut().session_id.as_deref(), Some("sess-1"));
+        let roles: Vec<&str> = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
         assert!(
             roles.contains(&"assistant"),
             "the turn queued before auth should resume and complete: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
     }
 
@@ -4409,8 +4723,8 @@ mod tests {
             .expect("API Key button should be present");
         engine.dialog_click_button(idx);
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(!engine.acp_mut().ai_streaming);
         assert!(
             engine.message.contains("authenticate failed"),
             "expected a clear failure message: {:?}",
@@ -4418,11 +4732,12 @@ mod tests {
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("authenticate")),
             "the failure should land in the transcript: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
     }
 
@@ -4470,16 +4785,21 @@ mod tests {
             engine.terminal_panes.is_empty(),
             "the login pane should have exited (exit 0) and been reaped"
         );
-        assert!(engine.acp_authenticated);
+        assert!(engine.acp_mut().authenticated);
 
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
-        assert!(!engine.ai_streaming);
-        assert_eq!(engine.acp_session_id.as_deref(), Some("sess-1"));
-        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(!engine.acp_mut().ai_streaming);
+        assert_eq!(engine.acp_mut().session_id.as_deref(), Some("sess-1"));
+        let roles: Vec<&str> = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
         assert!(
             roles.contains(&"assistant"),
             "the turn queued before login should resume and complete: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
     }
 
@@ -4511,9 +4831,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(engine.terminal_panes.is_empty());
-        assert!(!engine.acp_authenticated);
+        assert!(!engine.acp_mut().authenticated);
         assert!(
-            !engine.ai_streaming,
+            !engine.acp_mut().ai_streaming,
             "a failed login must clear the busy state, not wedge the panel"
         );
         assert!(
@@ -4522,7 +4842,7 @@ mod tests {
             engine.message
         );
         assert!(
-            engine.acp_client.is_none(),
+            engine.acp_mut().client.is_none(),
             "a failed login should drop the client so the next attempt \
              starts a clean handshake"
         );
@@ -4565,14 +4885,14 @@ mod tests {
         engine.terminal_close_active_tab();
 
         assert!(engine.terminal_panes.is_empty());
-        assert!(!engine.acp_authenticated);
-        assert!(!engine.ai_streaming);
+        assert!(!engine.acp_mut().authenticated);
+        assert!(!engine.acp_mut().ai_streaming);
         assert!(
             engine.message.contains("abandoned"),
             "expected a clear abandon message: {:?}",
             engine.message
         );
-        assert!(engine.acp_client.is_none());
+        assert!(engine.acp_mut().client.is_none());
     }
 
     // ── acp_open_review_for_diffs fragment safety (#1454) ───────────────────
@@ -4804,16 +5124,17 @@ mod tests {
         ]);
 
         engine.ai_send_message("remember this please".to_string());
-        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        poll_acp_until(&mut engine, |e| e.acp().session_id.is_some());
         let first_session_id = engine
-            .acp_session_id
+            .acp_mut()
+            .session_id
             .clone()
             .expect("the handshake should have produced a session id");
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
 
         engine.ai_clear();
         assert!(
-            engine.acp_client.is_none(),
+            engine.acp_mut().client.is_none(),
             ":AiClear must kill the live agent subprocess"
         );
 
@@ -4833,56 +5154,65 @@ mod tests {
         // Confirm the (only) entry.
         engine.picker_confirm();
         poll_acp_until(&mut engine, |e| {
-            e.ai_messages
+            e.acp()
+                .ai_messages
                 .iter()
                 .any(|m| m.content.contains("It prints hello."))
         });
 
         assert_eq!(
-            engine.acp_session_id.as_deref(),
+            engine.acp_mut().session_id.as_deref(),
             Some(first_session_id.as_str()),
             "resuming must reuse the exact session id that was recorded, \
              not a freshly assigned one"
         );
 
-        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        let roles: Vec<&str> = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
         assert!(
             roles.contains(&"user"),
             "the replayed user turn must rebuild: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("what does main.rs do")),
             "the replayed user turn's text must survive: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.role == "assistant" && m.content.contains("It prints hello.")),
             "the replayed assistant turn must rebuild: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         assert!(
             engine
-                .acp_tool_calls
+                .acp_mut()
+                .tool_calls
                 .iter()
                 .any(|c| c.title == "Read README.md"),
             "the replayed tool-call turn must rebuild too, not just \
              message chunks: {:?}",
-            engine.acp_tool_calls
+            engine.acp_mut().tool_calls
         );
 
         // The resumed session must still answer a further prompt, under
         // the exact same session id.
         engine.ai_send_message("thanks".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert_eq!(
-            engine.acp_session_id.as_deref(),
+            engine.acp_mut().session_id.as_deref(),
             Some(first_session_id.as_str()),
             "a further prompt after resuming must not change the session id"
         );
@@ -4899,7 +5229,7 @@ mod tests {
         let mut engine = engine_with_registered_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
 
         engine.ai_send_message("hello".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert_eq!(
             engine.acp_session_index.load_session_capability("claude"),
             Some(false)
@@ -4942,19 +5272,20 @@ mod tests {
         ]);
 
         engine.ai_send_message("hello from session A".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
-            engine.acp_client.is_some() && engine.acp_session_id.is_some(),
+            engine.acp_mut().client.is_some() && engine.acp_mut().session_id.is_some(),
             "the live session must still be connected going into the resume"
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("hello from session A")),
             "sanity: the live session's own turn must be on screen before \
              resuming: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
 
         // The picker's confirm action, with no intervening `:AiClear` —
@@ -4968,33 +5299,36 @@ mod tests {
         // resumed id differs from the one already live.
         engine.acp_resume_session("sess-1".to_string());
         poll_acp_until(&mut engine, |e| {
-            e.ai_messages
+            e.acp()
+                .ai_messages
                 .iter()
                 .any(|m| m.content.contains("It prints hello."))
         });
 
         assert_eq!(
-            engine.acp_session_id.as_deref(),
+            engine.acp_mut().session_id.as_deref(),
             Some("sess-1"),
             "must resume the requested session id"
         );
         assert!(
             !engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("hello from session A")),
             "the previous live session's transcript must be gone, not \
              spliced in ahead of the resumed history: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("what does main.rs do")),
             "the resumed session's replayed history must be the only \
              thing on screen: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
         );
     }
 
@@ -5031,15 +5365,16 @@ mod tests {
         // The very first `:AI` message of the process — this is the one
         // and only chance `acp_reopen_last_session` gets to fire.
         engine.ai_send_message("continuing the chat".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
 
         assert_eq!(
-            engine.acp_session_id.as_deref(),
+            engine.acp_mut().session_id.as_deref(),
             Some("sess-1"),
             "must have resumed the recorded session, not started a fresh one"
         );
 
         let contents: Vec<String> = engine
+            .acp_mut()
             .ai_messages
             .iter()
             .map(|m| m.content.clone())
@@ -5081,7 +5416,7 @@ mod tests {
     /// RED verified: with the `AcpEvent::RequestFailed` handler's
     /// `method == "session/load"` branch reverted to the generic case
     /// (no `acp_session_id` reset, no fallback `acp_begin_session` call),
-    /// `engine.acp_session_id` stays `Some("sess-stale")` forever and the
+    /// `engine.acp_mut().session_id` stays `Some("sess-stale")` forever and the
     /// follow-up `ai_send_message` sends a bare `session/prompt` against
     /// it instead of falling back to a fresh session — the fixture doesn't
     /// recognise that id for `session/prompt` either, so no reply ever
@@ -5109,30 +5444,336 @@ mod tests {
         poll_acp_until(&mut engine, |e| e.message.contains("session/load failed"));
 
         assert_eq!(
-            engine.acp_session_id, None,
+            engine.acp_mut().session_id,
+            None,
             "a failed session/load must not leave acp_session_id pointing \
              at a session the agent never actually created"
         );
 
         // The fallback `session/new` this triggers is a separate round
         // trip — let it land before driving the panel further.
-        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        poll_acp_until(&mut engine, |e| e.acp().session_id.is_some());
         assert_ne!(
-            engine.acp_session_id.as_deref(),
+            engine.acp_mut().session_id.as_deref(),
             Some("sess-stale"),
             "the fallback session must not silently reuse the stale id"
         );
 
         // The panel must still be usable afterwards.
         engine.ai_send_message("hello after the failed resume".to_string());
-        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
         assert!(
             engine
+                .acp_mut()
                 .ai_messages
                 .iter()
                 .any(|m| m.content.contains("Hello world")),
             "the fallback session must actually work: {:?}",
-            engine.ai_messages
+            engine.acp_mut().ai_messages
+        );
+    }
+
+    // ── #1463: multiple concurrent sessions ─────────────────────────────────
+
+    /// A still-blank tab (nothing ever sent through it) is reused in place;
+    /// only a tab that's actually been used gets a genuine new slot —
+    /// otherwise `:AiNew` pressed twice before typing anything would pile
+    /// up empty tabs.
+    #[test]
+    fn acp_new_session_reuses_a_still_blank_tab_instead_of_piling_up_empties() {
+        let mut e = Engine::new_for_test();
+        assert_eq!(e.acp_sessions.len(), 1);
+
+        e.acp_new_session(None);
+        assert_eq!(
+            e.acp_sessions.len(),
+            1,
+            "the only tab was blank — reuse it in place"
+        );
+
+        e.acp_mut().label = "claude".to_string();
+        e.acp_new_session(None);
+        assert_eq!(
+            e.acp_sessions.len(),
+            2,
+            "a tab that's actually been used must get a real second slot"
+        );
+        assert_eq!(e.acp_active_session, 1);
+    }
+
+    /// `:AiNext`/`:AiPrev` wrap around the tab list, and a single-tab panel
+    /// reports it rather than silently doing nothing.
+    #[test]
+    fn acp_next_prev_wrap_and_single_session_is_a_visible_no_op() {
+        let mut e = Engine::new_for_test();
+        e.acp_next_session();
+        assert_eq!(e.message, "Only one AI session");
+
+        e.acp_mut().label = "claude".to_string();
+        e.acp_new_session(None);
+        e.acp_mut().label = "gemini".to_string();
+        assert_eq!(e.acp_sessions.len(), 2);
+        assert_eq!(e.acp_active_session, 1);
+
+        e.acp_next_session();
+        assert_eq!(
+            e.acp_active_session, 0,
+            "next from the last tab wraps to the first"
+        );
+        e.acp_prev_session();
+        assert_eq!(
+            e.acp_active_session, 1,
+            "prev from the first tab wraps to the last"
+        );
+    }
+
+    /// Closing the last remaining tab resets it in place (same end state a
+    /// fresh `:AiNew` tab starts in) rather than leaving the AI panel with
+    /// no session at all.
+    #[test]
+    fn acp_close_session_resets_the_last_tab_in_place_instead_of_removing_it() {
+        let mut e = Engine::new_for_test();
+        e.acp_mut().label = "claude".to_string();
+        e.acp_mut().ai_messages.push(crate::core::ai::AiMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        });
+
+        e.acp_close_session();
+
+        assert_eq!(
+            e.acp_sessions.len(),
+            1,
+            "the last tab is reset, not removed"
+        );
+        assert!(e.acp_mut().ai_messages.is_empty());
+        assert!(e.acp().label.is_empty());
+    }
+
+    /// `acp_session_tabs()` — the AI panel's tab-strip feed — reports each
+    /// tab's label, which one is active, and whether it has a permission
+    /// request badged, purely from engine bookkeeping (no subprocess
+    /// needed for this half of the coverage; the fixture-driven tests below
+    /// cover the real end-to-end wiring).
+    #[test]
+    fn acp_session_tabs_reports_label_active_flag_and_badge() {
+        let mut e = Engine::new_for_test();
+        e.acp_mut().label = "claude".to_string();
+        e.acp_new_session(None);
+        e.acp_mut().label = "gemini".to_string();
+        e.acp_mut().pending_permission = Some((
+            1,
+            crate::core::acp::AcpPermissionRequest {
+                session_id: "sess-1".to_string(),
+                tool_call: crate::core::acp::AcpToolCallInfo {
+                    kind: "execute".to_string(),
+                    title: "Run tests".to_string(),
+                    locations: Vec::new(),
+                },
+                options: Vec::new(),
+            },
+        ));
+
+        let tabs = e.acp_session_tabs();
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0], (0, "claude".to_string(), false, false));
+        assert_eq!(tabs[1], (1, "gemini".to_string(), true, true));
+    }
+
+    /// Sets up a second, independent fixture-agent session by pushing a
+    /// blank `AcpSession` and driving `ai_send_message` against it once
+    /// activated — mirrors `:AiNew` followed by typing a message, using
+    /// the registered-agent fixture so a real spawn happens (not a
+    /// hand-spliced client), same realism bar every other fixture-driven
+    /// test in this file holds itself to.
+    #[cfg(unix)]
+    fn open_second_fixture_session(
+        engine: &mut Engine,
+        agent: Option<&str>,
+        message: &str,
+    ) -> usize {
+        engine.acp_new_session(agent);
+        let idx = engine.acp_active_session;
+        engine.ai_send_message(message.to_string());
+        idx
+    }
+
+    /// The issue's first acceptance bar: two sessions on the fake agent
+    /// keep separate transcripts, and a backgrounded session's agent
+    /// keeps making progress — `poll_acp` must drain *every* session each
+    /// tick, not just whichever one is currently in the foreground.
+    ///
+    /// RED verified (2026-09-26, this session): reverting `poll_acp` to
+    /// only ever poll `acp_sessions[acp_active_session]` (the pre-#1463
+    /// shape) makes this test hang until `TEST_DEADLINE` and fail both
+    /// final assertions — session B's `agent_message_chunk`s never arrive
+    /// because its process's stdout is never read while A is foreground.
+    #[cfg(unix)]
+    #[test]
+    fn two_sessions_keep_separate_transcripts_and_both_keep_streaming_in_background() {
+        let mut engine = engine_with_registered_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
+
+        engine.ai_send_message("hello A".to_string());
+        let idx_b = open_second_fixture_session(&mut engine, None, "hello B");
+        assert_eq!(idx_b, 1);
+
+        // Switch back to A *before* either turn has necessarily finished —
+        // the whole point is that B's fixture process keeps being drained
+        // regardless of which tab is in the foreground.
+        engine.acp_activate_session(0);
+        poll_acp_until(&mut engine, |e| {
+            !e.acp_sessions[0].ai_streaming && !e.acp_sessions[1].ai_streaming
+        });
+
+        assert!(!engine.acp_sessions[0].ai_streaming);
+        assert!(!engine.acp_sessions[1].ai_streaming);
+        assert_eq!(engine.acp_sessions[0].ai_messages[0].content, "hello A");
+        assert_eq!(engine.acp_sessions[1].ai_messages[0].content, "hello B");
+        assert!(
+            engine.acp_sessions[0]
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "session A must have completed its own turn: {:?}",
+            engine.acp_sessions[0].ai_messages
+        );
+        assert!(
+            engine.acp_sessions[1]
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "session B must have completed its own turn while backgrounded: {:?}",
+            engine.acp_sessions[1].ai_messages
+        );
+    }
+
+    /// The issue's second acceptance bar: a permission request from a
+    /// backgrounded session shows a badge (not a stolen-focus modal), and
+    /// its dialog — once revealed by switching to that tab — answers the
+    /// *right* session.
+    ///
+    /// RED verified: with `acp_handle_permission_request`'s `is_foreground`
+    /// gate removed (always calling `show_dialog`), this test's
+    /// `engine.dialog.is_none()` assertion fails the instant session B's
+    /// request lands while A is still in the foreground.
+    #[cfg(unix)]
+    #[test]
+    fn background_session_permission_request_badges_and_switching_reveals_its_own_dialog() {
+        let mut engine = engine_with_registered_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
+        engine.ai_send_message("hello A".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp_sessions[0].ai_streaming);
+
+        // A second, distinct agent profile whose own env makes its next
+        // prompt trigger a request_permission — a separate registry entry
+        // (not the "claude" one session A already spawned against) so the
+        // two sessions' fixture behavior can't cross-contaminate: `ACP_
+        // FAKE_NO_TOOL_REQUEST` on "claude"'s env would otherwise take
+        // precedence over `ACP_FAKE_REQUEST_PERMISSION` inside the fixture
+        // script (see its own header) if both landed on the same profile.
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        engine
+            .settings
+            .acp_agents
+            .push(crate::core::acp::AcpAgentProfile {
+                name: "gemini".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_REQUEST_PERMISSION=1".to_string()],
+            });
+        open_second_fixture_session(&mut engine, Some("gemini"), "please edit");
+
+        // Switch away before the request necessarily lands.
+        engine.acp_activate_session(0);
+        poll_acp_until(&mut engine, |e| {
+            e.acp_sessions[1].pending_permission.is_some()
+        });
+
+        assert!(
+            engine.dialog.is_none(),
+            "a backgrounded session's permission request must not pop a modal \
+             over whatever the human is looking at"
+        );
+        let tabs = engine.acp_session_tabs();
+        assert!(!tabs[0].3, "the foreground tab has no badge");
+        assert!(
+            tabs[1].3,
+            "the background tab must badge its parked permission request"
+        );
+        assert!(!tabs[1].2, "the badged tab is not the active one yet");
+
+        engine.acp_next_session();
+        assert_eq!(engine.acp_active_session, 1);
+        assert!(
+            engine
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_permission"),
+            "switching to the badged tab must reveal its parked dialog"
+        );
+
+        let button_idx = engine
+            .dialog
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .position(|b| b.label == "Allow Once")
+            .expect("Allow Once button should be present");
+        engine.dialog_click_button(button_idx);
+
+        poll_acp_until(&mut engine, |e| !e.acp_sessions[1].ai_streaming);
+        assert!(
+            engine.acp_sessions[1]
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "answering from the revealed dialog must reply to session B's own \
+             client, letting its turn actually complete: {:?}",
+            engine.acp_sessions[1].ai_messages
+        );
+        assert!(
+            engine.acp_sessions[0]
+                .ai_messages
+                .iter()
+                .all(|m| !m.content.contains("please edit")),
+            "session A's transcript must never see session B's prompt"
+        );
+    }
+
+    /// The issue's third acceptance bar: closing one session leaves the
+    /// other one working.
+    #[cfg(unix)]
+    #[test]
+    fn acp_close_session_removes_the_tab_and_leaves_the_other_session_working() {
+        let mut engine = engine_with_registered_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
+        engine.ai_send_message("hello A".to_string());
+        poll_acp_until(&mut engine, |e| e.acp_sessions[0].session_id.is_some());
+
+        open_second_fixture_session(&mut engine, None, "hello B");
+        poll_acp_until(&mut engine, |e| e.acp_sessions[1].session_id.is_some());
+
+        // Close the active (B) tab while its turn may still be in flight.
+        engine.acp_close_session();
+        assert_eq!(
+            engine.acp_sessions.len(),
+            1,
+            "closing a tab actually removes it"
+        );
+        assert_eq!(engine.acp_active_session, 0);
+
+        // A must still be usable — and finish its own turn — after B's
+        // process is gone.
+        poll_acp_until(&mut engine, |e| !e.acp_sessions[0].ai_streaming);
+        assert!(
+            engine.acp_sessions[0]
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "session A must keep working after session B was closed: {:?}",
+            engine.acp_sessions[0].ai_messages
         );
     }
 }
