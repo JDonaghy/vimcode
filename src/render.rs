@@ -24,7 +24,8 @@
 use crate::core::buffer::Buffer;
 use crate::core::dap::DapVariable;
 use crate::core::engine::sidebar::{
-    PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+    HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
+    PANEL_SEARCH, PANEL_SETTINGS,
 };
 use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
@@ -5611,6 +5612,380 @@ pub fn sync_shell_event_shadow(
             engine.app_shell.set_sidebar_width(*new_width);
         }
         _ => {}
+    }
+}
+
+// ─── Shared menu-bar reveal/hide routing (#1427) ────────────────────────────
+//
+// A backend whose menu bar can be fully hidden (`Engine::menu_bar_toggleable`
+// — pre-#1427 only `TuiShellApp::setup` ever set this; now also `App::setup`
+// on any backend whose `BackendCaps::window_chrome` is `false`, i.e. no real
+// window chrome to double as the titlebar the way GTK's does — #901/#552)
+// needs three pieces of behaviour a permanently-visible menu bar
+// (GTK/macOS/Win) never does: an Alt+<letter> shim so a hidden bar's
+// accelerators still work (#318), a one-shot guard that hides the bar again
+// on the stale click a hamburger reveal leaves behind (#988/#1029), and a
+// hamburger `PanelDefinition` click that reveals the bar instead of
+// switching the (nonexistent) "Menu" sidebar panel. All five functions below
+// were `TuiShellApp` private methods before #1427; they are pure
+// `&mut Engine` (plus, where a hit-test needs one, `&dyn Backend`/
+// `&ShellContext`) so both `App` and `TuiShellApp` can call the same body.
+// Every one is a documented no-op on a backend that never sets
+// `menu_bar_toggleable`/never registers the hamburger panel (GTK/macOS/Win
+// today) — see each function's own doc — so callers wire them in
+// unconditionally rather than branching on `BackendCaps` themselves.
+
+/// #1029: one-shot spend of [`Engine::hamburger_stale_click_guard`] for
+/// `event`, on the *direct-dispatch* path (`ShellApp::handle`/
+/// `handle_dispatch`) — call at the very top, before any early exit, so the
+/// guard is spent for exactly one event no matter which arm of the caller's
+/// own dispatch that event ends up in. Returns `true` only for the one
+/// `MouseDown` this guard exists to catch (the caller's own corner-position
+/// check, [`route_menu_bar_reveal`], decides whether it actually landed on
+/// the stale corner). See [`Engine::hamburger_stale_click_guard`]'s own doc
+/// for the full one-shot lifecycle and why pointer/window plumbing
+/// (`MouseMoved`/`MouseUp`/focus/resize/DPI) leaves the guard armed instead
+/// of spending it.
+pub fn consume_hamburger_stale_click_guard(engine: &mut Engine, event: &quadraui::UiEvent) -> bool {
+    if !engine.hamburger_stale_click_guard {
+        return false;
+    }
+    match event {
+        quadraui::UiEvent::MouseDown { .. } => {
+            engine.hamburger_stale_click_guard = false;
+            true
+        }
+        quadraui::UiEvent::MouseUp { .. }
+        | quadraui::UiEvent::MouseMoved { .. }
+        | quadraui::UiEvent::MouseEntered { .. }
+        | quadraui::UiEvent::MouseLeft { .. }
+        | quadraui::UiEvent::WindowResized { .. }
+        | quadraui::UiEvent::WindowFocused(_)
+        | quadraui::UiEvent::DpiChanged(_)
+        | quadraui::UiEvent::WindowStateChanged { .. } => false,
+        _ => {
+            engine.hamburger_stale_click_guard = false;
+            false
+        }
+    }
+}
+
+/// #1029: spend [`Engine::hamburger_stale_click_guard`] on the
+/// *shell-consumed* path — the half [`consume_hamburger_stale_click_guard`]
+/// can never see, because `ShellAdapter` hit-tests the activity bar itself
+/// and reports a real panel click as a semantic `AppShellEvent` without ever
+/// falling through to `ShellApp::handle`. Call from every `on_shell_event`/
+/// `on_shell_event_ctx` arm that represents genuine user input (a real panel
+/// icon, a divider drag, a bottom item) — every one of those is exactly as
+/// much "the user moved on" as a keystroke is, so the guard has to die there
+/// too, or a `File` click arriving afterwards is misread as the stale corner.
+/// Not called for the hamburger's own reveal (that arm *arms* the guard) nor
+/// for a suppressed `take_requested_panel` echo (the app reconciling itself,
+/// not user input).
+pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
+    engine.hamburger_stale_click_guard = false;
+}
+
+/// #318/#1029: the Alt+<letter> reveal shim plus the stale-hamburger-corner
+/// hide. Takes `stale_hamburger_corner_click` — the result of
+/// [`consume_hamburger_stale_click_guard`] — as a parameter rather than
+/// calling it internally, because that consume has to happen at the very
+/// top of `handle`/`handle_dispatch`, before *any* early exit (including
+/// ones this function's caller can't see, e.g. `TuiShellApp::handle`'s
+/// panel-accelerator dispatch), while this function itself is called later,
+/// immediately before the caller's own `MenuSystem` intercept — see
+/// `consume_hamburger_stale_click_guard`'s own doc for why the two calls
+/// can't be merged into one without narrowing that guarantee.
+///
+/// 1. **Alt+<letter> shim** — when the bar is hidden, Alt+<letter> must
+///    still reveal *and* activate the matching menu (otherwise the bare
+///    letter falls through to `Engine::handle_key`, which ignores Alt, and
+///    triggers a Vim motion instead — Alt+T → t-motion). Sets
+///    `engine.menu_bar_visible = true` and lets the event keep flowing: the
+///    caller's own `MenuSystem` intercept, called immediately after this
+///    returns `None`, is what actually opens the menu using the
+///    just-flipped flag.
+/// 2. **Stale hamburger-corner click** — revealing the bar shifts the whole
+///    activity bar (hamburger included) down one row; a second click at the
+///    *exact screen position* that revealed it (muscle memory) lands one row
+///    too high, on the title-bar band, where it would otherwise open
+///    whatever menu happens to paint at that column (`File`, at the default
+///    sidebar width — the #988 symptom). Recognised structurally (a
+///    `MouseDown` inside the title-bar band whose column still falls within
+///    the activity bar's own width) and bounded to the one click immediately
+///    following a reveal by `stale_hamburger_corner_click`'s one-shot
+///    source, so a later, deliberate click on `File` falls through to the
+///    caller's `MenuSystem` intercept like any other menu click.
+///
+/// Returns `Some(Reaction::Redraw)` only for case 2 — the caller must return
+/// immediately, without running its own dispatch for this event. `None`
+/// means "not consumed" (including case 1's reveal — see above).
+///
+/// A no-op on a backend that never sets `menu_bar_toggleable` (so
+/// `menu_bar_visible` is always already `true` — GTK/macOS/Win): the shim's
+/// `!menu_bar_visible` gate never opens, and the guard this reads is only
+/// ever armed by a hamburger panel click, which those backends never
+/// register (`App::shell_config`'s `px` profile has no hamburger
+/// `PanelDefinition` — see that method's own doc).
+pub fn route_menu_bar_reveal(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    stale_hamburger_corner_click: bool,
+    backend: &mut dyn quadraui::Backend,
+    ctx: &quadraui::ShellContext<'_>,
+) -> Option<quadraui::Reaction> {
+    if !engine.menu_bar_visible {
+        if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+            if modifiers.alt {
+                if let quadraui::Key::Char(c) = key {
+                    let bar = engine.menu_system.borrow().menu_bar();
+                    if bar.find_alt_target(*c).is_some() {
+                        engine.menu_bar_visible = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if stale_hamburger_corner_click && engine.menu_bar_visible {
+        if let quadraui::UiEvent::MouseDown { position, .. } = event {
+            let viewport = backend.viewport();
+            let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+            let layout = ctx.shell().layout(area, backend.line_height());
+            let ab = layout.activity_bar_bounds;
+            let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
+                && position.x >= ab.x
+                && position.x < ab.x + ab.width;
+            if in_hamburger_corner {
+                engine.menu_bar_visible = false;
+                ctx.shell_mut().hide_sidebar();
+                ctx.shell_mut().set_title_bar_visible(false);
+                return Some(quadraui::Reaction::Redraw);
+            }
+        }
+    }
+
+    None
+}
+
+/// #695/#1029: resolve the rect [`quadraui::MenuSystem::handle`]/`::render`
+/// should hit-test/paint against for a toggleable-menu-bar backend, given
+/// this frame's cached title-bar-band rect (`App::menu_items_rect`/
+/// `Engine::menu_bar_rect`, both written once per paint).
+///
+/// [`route_menu_bar_reveal`]'s Alt+<letter> shim can flip `menu_bar_visible`
+/// from `false` to `true` and the caller's `MenuSystem` intercept can fire
+/// in that *same* dispatch — before `render_content` ever runs again to
+/// refresh the cache, so it can still hold the empty/never-painted rect
+/// from the last frame the bar was hidden. Handing `MenuSystem::handle` that
+/// rect makes it lay out zero visible items and then index into that empty
+/// list assuming at least one fits — a panic, not a no-op. Falls back to a
+/// full-viewport-width, one-row rect (matching every toggleable profile's
+/// `title_bar_height_lh == 1.0`) for exactly that one just-revealed-but-not-
+/// yet-painted frame; checks both `width` and `height` against the cached
+/// rect, not `height` alone, so a viewport whose computed width collapses to
+/// zero can't sneak a real-but-zero-width rect past this guard either.
+///
+/// `toggleable` gates the whole fallback: `false` (GTK/macOS/Win, whose
+/// `menu_bar_visible` is pinned before this can ever matter) always returns
+/// `cached` unchanged, byte-for-byte the pre-#1427 behaviour on those
+/// backends.
+pub fn menu_bar_intercept_rect(
+    toggleable: bool,
+    cached: quadraui::Rect,
+    viewport_width: f32,
+) -> quadraui::Rect {
+    if !toggleable || (cached.width >= 1.0 && cached.height >= 1.0) {
+        cached
+    } else {
+        quadraui::Rect::new(0.0, 0.0, viewport_width, 1.0)
+    }
+}
+
+/// #635 (Stage 6b item A): keep the runner's `AppShell` title-bar row
+/// reservation in sync with `engine.menu_bar_visible` — that flag can flip
+/// via [`route_menu_bar_reveal`] above, `render::dispatch_panel_accelerator`,
+/// `:set menu`, or (for the hamburger specifically) [`route_hamburger_panel_
+/// changed`]/[`route_hamburger_sidebar_hidden`] below, and none of those
+/// touch the runner's own `AppShell` on their own — only
+/// `AppShell::set_title_bar_visible` does. Call unconditionally on the way
+/// out of every dispatch (`handle`/`handle_dispatch`'s tail,
+/// `on_shell_event_ctx`'s tail) rather than only from the specific arms that
+/// change the flag, per `AppShell::set_title_bar_visible`'s own doc
+/// (quadraui#532): "toggling this and calling [layout/render] next is
+/// sufficient". A no-op whenever the flag hasn't changed since the last
+/// call.
+pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine) {
+    ctx.shell_mut()
+        .set_title_bar_visible(engine.menu_bar_visible);
+}
+
+/// #1029: the hamburger's own `AppShellEvent::PanelChanged` — reveals the
+/// menu bar and, on a genuine reveal (the `false -> true` transition, not a
+/// `take_requested_panel` echo of an already-open bar), arms the stale-click
+/// guard [`route_menu_bar_reveal`] later reads. Returns `true` when
+/// `panel_id` names the hamburger, in which case the caller must skip its
+/// own generic `PanelChanged` handling for this event (there is no shadow
+/// `PanelDefinition` for the hamburger to switch to — see
+/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc).
+pub fn route_hamburger_panel_changed(engine: &mut Engine, panel_id: &quadraui::WidgetId) -> bool {
+    if panel_id.as_str() != HAMBURGER_PANEL_ID {
+        return false;
+    }
+    let just_revealed = !engine.menu_bar_visible;
+    engine.menu_bar_visible = true;
+    if just_revealed {
+        engine.hamburger_stale_click_guard = true;
+    }
+    true
+}
+
+/// #1029 (defect 2 of #988): the hamburger's own second click — reported as
+/// `AppShellEvent::SidebarHidden` for whichever panel the runner's `AppShell`
+/// currently has active — hides the menu bar again. Only `ctx.shell()`, the
+/// *runner's* own state, can tell "this `SidebarHidden` is the hamburger
+/// closing" apart from a real panel's own second click (the shadow
+/// `engine.app_shell` has no hamburger entry to check against), so the
+/// caller must guard this call itself:
+/// `ctx.shell().active_panel_id() == Some(HAMBURGER_PANEL_ID)`, checked
+/// *before* delegating to its own generic `SidebarHidden` handling (none of
+/// that generic handling applies here — the reveal never touched the shadow
+/// sidebar in the first place).
+pub fn route_hamburger_sidebar_hidden(engine: &mut Engine, ctx: &quadraui::ShellContext<'_>) {
+    disarm_hamburger_stale_click_guard(engine);
+    engine.menu_bar_visible = false;
+    ctx.shell_mut().set_title_bar_visible(false);
+}
+
+/// #1029: correct a frame's [`quadraui::AppShellLayout`] for the hamburger's
+/// own phantom sidebar reservation. The hamburger is a top-row
+/// `PanelDefinition` in the *runner's* `AppShell` (so a click on it produces
+/// a real `PanelChanged`/hit-testable activity-bar icon) but has no matching
+/// entry in the shadow `engine.app_shell` (see
+/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc) — so while the
+/// hamburger is the runner's active panel, `AppShellLayout` still reserves a
+/// sidebar column for it even though nothing real is behind it. Left alone,
+/// `render_content` would paint that reservation as an empty sidebar band
+/// (or worse, stale content from whatever panel was active before).
+///
+/// A no-op — returns `layout.clone()` unchanged — unless all three hold:
+/// `engine.menu_bar_toggleable` (only ever `true` alongside a runner that
+/// can register the hamburger panel at all), `engine.menu_bar_visible`
+/// (there is a reservation to reclaim only while the bar — and therefore the
+/// hamburger's reveal — is showing), and the shadow's own sidebar is hidden
+/// (`!engine.app_shell.sidebar_visible()` — if a *real* panel is genuinely
+/// visible, e.g. the very first frame before any dispatch has run the
+/// sidebar-visibility sync yet, this must not blank out its real content).
+/// Reclaims the sidebar + divider width back onto `main_content_bounds`,
+/// mirroring `AppShellLayout`'s own `!sidebar_visible` branch.
+pub fn reclaim_hamburger_sidebar_reservation(
+    engine: &Engine,
+    layout: &quadraui::AppShellLayout,
+) -> quadraui::AppShellLayout {
+    if !engine.menu_bar_toggleable
+        || !engine.menu_bar_visible
+        || engine.app_shell.sidebar_visible()
+        || layout.sidebar_content_bounds.is_none()
+    {
+        return layout.clone();
+    }
+    let ab = layout.activity_bar_bounds;
+    let main = layout.main_content_bounds;
+    let reclaimed_main = quadraui::Rect::new(
+        ab.x + ab.width,
+        main.y,
+        (layout.window_bounds.x + layout.window_bounds.width - (ab.x + ab.width)).max(0.0),
+        main.height,
+    );
+    quadraui::AppShellLayout {
+        sidebar_header_bounds: None,
+        sidebar_content_bounds: None,
+        divider_bounds: None,
+        main_content_bounds: reclaimed_main,
+        ..layout.clone()
+    }
+}
+
+/// #634 smoke retry (widened #1427): keep the runner `AppShell`'s sidebar
+/// *visibility* in sync with the shadow `engine.app_shell`'s. Every keyboard
+/// path (Ctrl+B-style toggles, `toggle_sidebar_panel` via panel
+/// accelerators, autohide, Ctrl+W overflow) mutates the shadow, while the
+/// *runner's* own `AppShell` owns whether `sidebar_content_bounds` exists at
+/// all in the painted layout — so this has to be pushed through explicitly.
+/// The active-*panel* half of this sync lives in `ShellApp::
+/// take_requested_panel` (also covers tick-driven switches, which never
+/// reach here); this is the visibility half, with no adapter hook of its
+/// own, so callers push it unconditionally and idempotently on the way out
+/// of every dispatch.
+///
+/// #1029 (defect 2 of #988, widened #1427): the hamburger is special-cased
+/// out of this sync entirely while it's the reveal actually in effect. The
+/// shadow has no hamburger `PanelDefinition` at all (see
+/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc), so
+/// `shadow_visible` can never reflect a hamburger reveal — it's always
+/// whatever the last *real* panel click left behind. Without the
+/// `runner_shows_hamburger` guard, the very next dispatch after a hamburger
+/// click (a `WindowFocused` pump, or any other unrelated keypress) would
+/// read that stale `false` and force-hide the runner's own sidebar in
+/// response — leaving `active_panel == Some(hamburger)` but
+/// `sidebar_visible == false` by the time a second click lands. That
+/// permanently blocks `AppShell::handle_activity_click`'s "already active +
+/// visible → hide" branch for the hamburger: every click, first or Nth,
+/// resolves as a fresh `PanelChanged` reveal, never a `SidebarHidden` — the
+/// second click that's supposed to hide the menu bar again does nothing
+/// (#988).
+///
+/// Gated on `engine.menu_bar_visible` too, not just "is the runner showing
+/// the hamburger" — `AppShell::new` defaults `active_panel` to index 0,
+/// which the hamburger occupies (`App::shell_config`'s `cell`-profile
+/// branch / `TuiShellApp::build_shell_config` both put it first), so a
+/// *fresh* runner starts "showing the hamburger" before any click ever
+/// happens. `menu_bar_visible` is what distinguishes an actual, user-driven
+/// reveal from that construction-time default — without it, this guard
+/// would also suppress the very first dispatch's correction of
+/// `AppShell::new`'s own `sidebar_visible: true` default, leaving a phantom
+/// "Menu" sidebar pane reserved forever (and, on the toggleable-menu-bar
+/// profile specifically, permanently blocking the very first hamburger
+/// click from ever registering as a reveal in the first place — the
+/// runner's own construction-time default already reads "active +
+/// visible", so without this correction running once, unconditionally,
+/// before the first real click, that click would resolve as the toggle-hide
+/// branch instead).
+pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellContext<'_>) {
+    let shadow_visible = engine.app_shell.sidebar_visible();
+    let runner_visible = ctx.shell().sidebar_visible();
+    let runner_shows_hamburger = engine.menu_bar_visible
+        && ctx
+            .shell()
+            .active_panel_id()
+            .map(quadraui::WidgetId::as_str)
+            == Some(HAMBURGER_PANEL_ID);
+    if runner_visible != shadow_visible && !runner_shows_hamburger {
+        if shadow_visible {
+            // #557: while a plugin panel is open the shadow's active-panel
+            // id still names the built-in that preceded it (extension
+            // panels never touch it), so reveal *that* panel and the
+            // runner's highlight jumps off the extension icon — same
+            // reason `ShellApp::take_requested_panel` prefers
+            // `ext_panel_active`.
+            let id = engine
+                .ext_panel_active
+                .as_deref()
+                .map(|n| quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(n)))
+                .or_else(|| engine.app_shell.active_panel_id().cloned());
+            if let Some(id) = id {
+                ctx.shell_mut().show_panel(&id);
+            }
+            // `AppShell::show_panel` only searches its top `panels` list —
+            // the Settings cog is a bottom item, so the call above can
+            // no-op. Force visibility alone in that case; the runner's
+            // active-panel index (header title) is untouched.
+            if !ctx.shell().sidebar_visible() {
+                ctx.shell_mut().toggle_sidebar();
+            }
+        } else {
+            ctx.shell_mut().hide_sidebar();
+        }
     }
 }
 

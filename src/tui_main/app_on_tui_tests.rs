@@ -94,15 +94,28 @@ mod tests {
         engine
     }
 
-    /// Click the already-active Explorer activity-bar icon a second time — the
-    /// real production toggle-closed gesture
+    /// Click the Explorer activity-bar icon, twice, to collapse the
+    /// sidebar's screen-space reservation — the real production
+    /// toggle-closed gesture
     /// [`sidebar_panels::search_icon_second_click_toggles_sidebar_closed`]
-    /// exercises directly — collapsing the sidebar's screen-space reservation.
-    /// Several tests below want the full terminal width for the editor/tab
-    /// bar/bottom band rather than competing with the sidebar for the same
-    /// narrow 80-column budget. Only works when Explorer is the fixture's
-    /// already-active panel — true of every fixture built from
-    /// [`plain_engine`] (`new_for_test`'s own default).
+    /// exercises directly. Several tests below want the full terminal width
+    /// for the editor/tab bar/bottom band rather than competing with the
+    /// sidebar for the same narrow 80-column budget.
+    ///
+    /// Two clicks, not one (#1427): `App::shell_config`'s `cell`-profile
+    /// hamburger `PanelDefinition` now occupies index 0 in the *runner's*
+    /// fresh `AppShell` (`quadraui::AppShell::new` always activates index
+    /// 0), so a fixture built from [`plain_engine`] no longer starts with
+    /// Explorer as the runner's already-active panel the way it did before
+    /// hamburger existed — the first click on Explorer's icon *activates*
+    /// it (a fresh `PanelChanged`, different panel than the hamburger
+    /// default) rather than collapsing it. The second click, now that
+    /// Explorer genuinely is the active + visible panel, hits
+    /// `AppShell::handle_activity_click`'s toggle-closed branch as
+    /// originally intended. Re-locates the icon between clicks (cheap,
+    /// and the row it paints on is unaffected either way) rather than
+    /// assuming its position is stable, matching every other zone lookup
+    /// in this file.
     ///
     /// Mutating `engine.app_shell` directly (`hide_sidebar()`) does **not**
     /// achieve this, and is deliberately not used here: `App`'s own
@@ -112,18 +125,31 @@ mod tests {
     /// `AppShell::handle_activity_click`'s toggle-closed branch flips it.
     /// Confirmed while writing this module: mutating the shadow alone left
     /// the sidebar column painted regardless.
-    fn collapse_sidebar<D: ConformanceDriver + DriverInput>(driver: &mut D) {
-        let explorer_zone = driver
-            .inventory()
-            .zones()
-            .iter()
-            .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
-            .map(|z| z.bounds)
-            .expect("the Explorer activity-bar icon must register a chrome zone");
-        driver.click(
-            explorer_zone.x + explorer_zone.width / 2.0,
-            explorer_zone.y + explorer_zone.height / 2.0,
-        );
+    fn collapse_sidebar(driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>) {
+        // Two real, independent clicks: without disabling folding, two
+        // `driver.click()` calls with no simulated time between them fold
+        // into a single `UiEvent::DoubleClick` (same reasoning
+        // `shell_app.rs`'s own `hamburger_relocated_click_after_reveal_
+        // hides_menu_bar` documents), which would only ever activate
+        // Explorer once, never reach the toggle-closed branch. Needs the
+        // concrete `TuiDriver` type (not the generic `ConformanceDriver`/
+        // `DriverInput` bound this helper used before #1427), since
+        // `set_double_click_folding` is TUI-only — fine here, this whole
+        // module is TUI-only by construction (see its own doc).
+        driver.set_double_click_folding(false);
+        let explorer_bounds = |driver: &mut quadraui::tui::testing::TuiDriver<_>| {
+            driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .expect("the Explorer activity-bar icon must register a chrome zone")
+        };
+        for _ in 0..2 {
+            let zone = explorer_bounds(driver);
+            driver.click(zone.x + zone.width / 2.0, zone.y + zone.height / 2.0);
+        }
     }
 
     /// [`harness`], with the sidebar immediately collapsed via
@@ -669,12 +695,16 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: feature — App unconditionally reserves and paints its own
-            // GTK-style menu-bar row (File Edit View Go Run Terminal Help) on
-            // every backend; the shipped TUI shell only shows that row in
-            // vscode-mode or when Alt-revealed, so its tab bar sits on row 0
-            // where TuiShellApp's own mirrored test expects it and App's
-            // does not. Target: menu-bar caps (conditional menu-bar reveal).
+            // #1425 gate, closed by #1427: `App` used to unconditionally
+            // reserve and paint its own GTK-style menu-bar row (File Edit
+            // View Go Run Terminal Help) on every backend; the shipped TUI
+            // shell only ever showed that row in vscode-mode or when
+            // Alt-revealed, so its tab bar sat on row 0 where TuiShellApp's
+            // own mirrored test expects it and `App`'s did not.
+            // `App::setup`'s `BackendCaps::window_chrome`/`native_menu`
+            // three-way branch now matches — this label is no longer in
+            // `KNOWN_BUGS`, so `known_bug_gate` treats a pass here as
+            // ordinary green, not `FixLanded`.
             known_bug_gate(
                 "app_on_tui::render_content_paints_single_group_tab_bar_via_shell_app",
                 || {
@@ -703,9 +733,9 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: feature — same permanent-menu-bar-row divergence as
-            // render_content_paints_single_group_tab_bar_via_shell_app above.
-            // Target: menu-bar caps (conditional menu-bar reveal).
+            // #1425 gate, closed by #1427: same permanent-menu-bar-row
+            // divergence as `render_content_paints_single_group_tab_bar_
+            // via_shell_app` above — see that test's own comment.
             known_bug_gate("app_on_tui::two_groups_paint_two_tab_bars", || {
                 let screen = driver.screen();
                 let tab_row = screen
@@ -1143,6 +1173,17 @@ mod tests {
             engine.cwd = dir.clone();
             engine.explorer_rebuild_rows();
             engine.session.explorer_visible = true;
+            // #1427: `session.explorer_visible` alone leaves the shadow
+            // `engine.app_shell`'s `sidebar_visible()` stale — see
+            // `crate::harness`'s `engine_with_collapsed_explorer_dir`'s
+            // identical fix for the full mechanics (`render::sync_runner_
+            // sidebar_visibility`, called unconditionally on every
+            // dispatch, would otherwise collapse the sidebar the very
+            // first time this scenario dispatches anything, e.g. its own
+            // `Enter` confirm below).
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
             engine.open_explorer_context_menu(dir, true, 5, 5);
             engine.context_menu.as_mut().unwrap().selected = selected_idx;
             engine

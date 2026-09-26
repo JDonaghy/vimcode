@@ -162,15 +162,22 @@ impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
     }
 }
 
-/// [`render::ShellShadowSyncHost`] impl for GTK (#1062): GTK has no panel id
-/// that's absent from the shadow `engine.app_shell` other than the `ext:`
-/// ids `render::sync_shell_event_shadow` already excludes itself, so this is
-/// a unit struct answering `false` unconditionally.
+/// [`render::ShellShadowSyncHost`] impl for `App` (#1062, widened #1427):
+/// the shadow `engine.app_shell` has no `PanelDefinition` for the hamburger
+/// (`Self::shell_config` only registers it on the `cell` profile, and even
+/// there it's runner-only, never mirrored into the shadow — see
+/// `render::reclaim_hamburger_sidebar_reservation`'s doc), so a
+/// `PanelChanged` for it must skip the generic shadow sync. On GTK/macOS/Win
+/// (the `px` profile) the hamburger panel is never registered in the first
+/// place, so this arm is unreachable there and the impl is exactly as inert
+/// as the old GTK-only unit struct it replaces — same name kept
+/// (`GtkShellShadowHost`) since `App::on_shell_event` is the one call site,
+/// on every backend.
 struct GtkShellShadowHost;
 
 impl render::ShellShadowSyncHost for GtkShellShadowHost {
-    fn panel_absent_from_shadow(&self, _panel_id: &quadraui::WidgetId) -> bool {
-        false
+    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool {
+        panel_id.as_str() == crate::core::engine::sidebar::HAMBURGER_PANEL_ID
     }
 }
 
@@ -1622,6 +1629,7 @@ impl App {
             "panel:ai" => crate::icons::AI_CHAT.s(),
             "panel:board" => crate::icons::BOARD.s(),
             "bottom:settings" => crate::icons::SETTINGS.s(),
+            crate::core::engine::sidebar::HAMBURGER_PANEL_ID => crate::icons::HAMBURGER.s(),
             _ => return None,
         })
     }
@@ -1688,6 +1696,33 @@ impl App {
         // so the id→glyph match above deliberately needs no arm for them.
         top_panels.extend(self.engine.borrow().ext_activity_panels());
 
+        // #1427: on the `cell` profile (TUI, and any future `App`-hosted
+        // backend whose `BackendCaps::window_chrome` is `false` — see
+        // `App::setup`'s three-way branch) the menu bar starts hidden and is
+        // fully hideable, so it needs a hamburger `PanelDefinition` to
+        // reveal it — the pre-#1427 `TuiShellApp::build_shell_config`'s own
+        // first panel, ported here verbatim (same id/icon/title/tooltip).
+        // `px()` backends (GTK/macOS/Win) never take this branch, so their
+        // shadow-`app_shell`-derived `top_panels` list is unaffected — the
+        // hamburger is *runner-only* either way (see
+        // `render::reclaim_hamburger_sidebar_reservation`'s doc for why the
+        // shadow never gets a matching entry).
+        if !self.units.is_gui_backend {
+            top_panels.insert(
+                0,
+                quadraui::PanelDefinition {
+                    id: quadraui::WidgetId::new(crate::core::engine::sidebar::HAMBURGER_PANEL_ID),
+                    icon: Self::resolve_builtin_panel_icon(
+                        crate::core::engine::sidebar::HAMBURGER_PANEL_ID,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
+                    title: "Menu".to_string(),
+                    tooltip: "Menu".to_string(),
+                },
+            );
+        }
+
         // (#552/#710) Reserve a full-width title-bar band across the top of
         // the shell. `App::render_content` paints vimcode's own menu bar and
         // inline window controls into it, so a GUI backend that does not
@@ -1729,6 +1764,20 @@ impl App {
         let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
             .with_bottom_items(bottom_items)
             .with_title_bar(self.units.title_bar_lh);
+        // #1427: `with_title_bar` above always sets `has_title_bar: true` —
+        // correct for GTK/macOS/Win, whose menu bar is either the CSD
+        // titlebar (`window_chrome`) or hidden behind a real OS one
+        // (`native_menu`), so the band is reserved unconditionally from
+        // frame zero. The `cell` profile's menu bar is fully hideable
+        // instead (`App::setup`'s three-way branch), so its *initial*
+        // reservation has to follow the engine's own already-resolved
+        // `menu_bar_visible` (true only in vscode-mode — `Engine::new`'s own
+        // default) the same way `TuiShellApp::build_shell_config`'s
+        // `menu_bar_visible` parameter did pre-#1427. Every dispatch after
+        // frame zero keeps this in sync via `render::sync_menu_bar_title_row`.
+        if !self.units.is_gui_backend {
+            cfg.has_title_bar = self.engine.borrow().menu_bar_visible;
+        }
         // #940/quadraui#947: opt into the client-side titlebar so a
         // capable backend (macOS today) puts the reserved band *in* the
         // real titlebar, beside the native traffic lights, instead of
@@ -2906,16 +2955,11 @@ impl App {
     /// went red at the second-click assertion — the engine-side state
     /// (`sidebar_visible()`) was already correct, only the paint wasn't.
     fn sync_runner_sidebar_visibility(&self, ctx: &quadraui::ShellContext<'_>) {
-        let shadow_visible = self.engine.borrow().app_shell.sidebar_visible();
-        if ctx.shell().sidebar_visible() != shadow_visible {
-            if shadow_visible {
-                if let Some(id) = self.engine.borrow().app_shell.active_panel_id().cloned() {
-                    ctx.shell_mut().show_panel(&id);
-                }
-            } else {
-                ctx.shell_mut().hide_sidebar();
-            }
-        }
+        // #1427: moved to `render::sync_runner_sidebar_visibility`, shared
+        // with `TuiShellApp` — see its own doc, including the #1029/#988
+        // hamburger guard this method used to lack entirely (harmless on
+        // GTK/macOS/Win, which never register the hamburger panel).
+        render::sync_runner_sidebar_visibility(&self.engine.borrow(), ctx);
     }
 
     /// GTK's half of the shared after-every-editor-keypress epilogue.
@@ -7364,6 +7408,36 @@ impl App {
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, UiEvent};
 
+        // ── #1427: shared menu-bar reveal/hide routing ───────────────────────
+        // The #318 Alt+<letter> shim (only fires while the bar is hidden —
+        // GTK's is always visible, see `ShellApp::setup`'s three-way branch)
+        // and the #988/#1029 stale-hamburger-corner-click guard (only ever
+        // armed by a hamburger panel click, which GTK/macOS/Win never
+        // register — see `Self::shell_config`'s `cell`-profile branch). A
+        // no-op on those backends; see `render::route_menu_bar_reveal`'s own
+        // doc. Must run before the `MenuSystem` intercept just below, since
+        // the shim's reveal has to take effect in the *same* dispatch that
+        // intercept reads `menu_bar_visible` from.
+        let menu_bar_reveal_reaction = {
+            let mut engine = self.engine.borrow_mut();
+            // Nothing in `handle_dispatch` returns before this point, so
+            // consuming the one-shot guard here is equivalent to TUI's "at
+            // the very top of `handle`, before any early exit" placement —
+            // see `consume_hamburger_stale_click_guard`'s own doc.
+            let stale_hamburger_corner_click =
+                render::consume_hamburger_stale_click_guard(&mut engine, &event);
+            render::route_menu_bar_reveal(
+                &mut engine,
+                &event,
+                stale_hamburger_corner_click,
+                backend,
+                ctx,
+            )
+        };
+        if let Some(reaction) = menu_bar_reveal_reaction {
+            return reaction;
+        }
+
         // ── Menu system intercept (#552) ─────────────────────────────────────
         // GTK's menu bar is always visible (see `ShellApp::setup`) and its
         // dropdown overlay must intercept keys/clicks before the sidebar or
@@ -7384,9 +7458,13 @@ impl App {
         // regardless (`menu_system.borrow().is_open()`), matching every
         // other "topmost modal wins" precedent in this function — only the
         // idle bar itself yields.
-        let (menu_bar_visible, menu_system) = {
+        let (menu_bar_visible, menu_bar_toggleable, menu_system) = {
             let eng = self.engine.borrow();
-            (eng.menu_bar_visible, eng.menu_system.clone())
+            (
+                eng.menu_bar_visible,
+                eng.menu_bar_toggleable,
+                eng.menu_system.clone(),
+            )
         };
         let menu_open = menu_system.borrow().is_open();
         let change_review_open = self.engine.borrow().change_review.is_some();
@@ -7398,7 +7476,19 @@ impl App {
             // whatever label now sits a slot to its left. `render_content`
             // writes this from the same `split_menu_row_for_app_icon` call
             // that positions the paint.
-            let bar_rect = self.menu_items_rect.get();
+            //
+            // #1427: on the toggleable-menu-bar profile, `route_menu_bar_
+            // reveal`'s Alt+<letter> shim (just above) can reveal the bar in
+            // this very dispatch, before any paint has refreshed
+            // `menu_items_rect` — `render::menu_bar_intercept_rect` falls
+            // back to a synthetic full-width row for exactly that frame; see
+            // its own doc. Always `cached` unchanged on GTK/macOS/Win
+            // (`menu_bar_toggleable` is never `true` there).
+            let bar_rect = render::menu_bar_intercept_rect(
+                menu_bar_toggleable,
+                self.menu_items_rect.get(),
+                backend.viewport().width,
+            );
             let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {
@@ -8173,8 +8263,22 @@ impl quadraui::ShellApp for App {
                 );
             }
             self.engine.borrow_mut().menu_bar_visible = false;
-        } else {
+        } else if backend.backend_caps().window_chrome {
+            // GTK's (and any future Win-GUI's) drawn menu bar doubles as the
+            // client-side titlebar — pinned visible always, same as before
+            // #1427 (this `else` used to be the only other arm).
             self.engine.borrow_mut().menu_bar_visible = true;
+        } else {
+            // #1427: no OS menu bar to hide behind (`native_menu`) and no
+            // window chrome for the drawn row to double as (`window_chrome`)
+            // — the `cell` profile (TUI-via-`App`) today. The bar is fully
+            // hideable at runtime (mirrors pre-#1427 `TuiShellApp::setup`,
+            // `event_loop`'s `mod.rs:797`) and starts however
+            // `Engine::new` already resolved `menu_bar_visible` (`true`
+            // only in vscode-mode) — left untouched here, unlike the two
+            // arms above, which both *force* a value regardless of what the
+            // engine was constructed with.
+            self.engine.borrow_mut().menu_bar_toggleable = true;
         }
         self.engine
             .borrow()
@@ -8221,6 +8325,15 @@ impl quadraui::ShellApp for App {
         // the bottom of every single-row band, breadcrumbs included.
         self.painted_line_height.set(Some(lh));
         self.painted_char_width.set(Some(cw));
+
+        // #1427: correct this frame's layout for the hamburger's own
+        // phantom sidebar reservation — a no-op unless
+        // `engine.menu_bar_toggleable` (the `cell` profile; always `false`
+        // on GTK/macOS/Win). See `render::reclaim_hamburger_sidebar_
+        // reservation`'s own doc; mirrors pre-#1427
+        // `TuiShellApp::render_content`'s identical rebind.
+        let corrected_layout = render::reclaim_hamburger_sidebar_reservation(&engine, layout);
+        let layout = &corrected_layout;
 
         let main = layout.main_content_bounds;
         let (x, y, w, h) = (
@@ -8984,6 +9097,61 @@ impl quadraui::ShellApp for App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         let reaction = self.handle_dispatch(event, backend, ctx);
+        // #1427: keep the runner's `AppShell` title-bar reservation in sync
+        // with `engine.menu_bar_visible` — that flag can flip from any one
+        // of several places inside `handle_dispatch` (the #1427 reveal/hide
+        // routing at its top, a `:set menu`/`nomenu` ex-command, the
+        // status-bar `[M]` toggle segment's `Engine::handle_status_action`,
+        // ...), each with its own early `return`, so this single choke point
+        // — run once, after every path through `handle_dispatch` has
+        // already returned — is what makes the sync unconditional rather
+        // than requiring one call per mutation site. See
+        // `render::sync_menu_bar_title_row`'s own doc.
+        //
+        // Gated on `menu_bar_toggleable`, not unconditional: on GTK/macOS/
+        // Win the title-bar *band* is a permanent, construction-time
+        // reservation (`shell_config`'s `with_title_bar`) that survives
+        // `menu_bar_visible` going `false` on its own — only the *drawn*
+        // row/dropdown inside it are coupled to that flag (#939's own
+        // regression pin, `gtk::testing::command_center_stays_live_when_
+        // menu_bar_is_hidden`: a native-menu backend, or a test forcing the
+        // flag false directly, must not lose the Command Center's anchor
+        // band). Calling `set_title_bar_visible` there unconditionally
+        // would collapse that reservation the moment anything sets the
+        // flag false, which is wrong for every profile except the
+        // toggleable one, where the band genuinely is meant to come and go
+        // with the flag.
+        if self.engine.borrow().menu_bar_toggleable {
+            render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
+        }
+        // #1427: keep the runner's `AppShell` sidebar *visibility* in sync
+        // with the shadow's too, unconditionally — not just from the two
+        // narrower call sites this method already had
+        // (`run_post_key_epilogue`, `on_shell_event_ctx`'s `BottomItemClicked`
+        // arm) — but *only* on the toggleable-menu-bar profile
+        // (`menu_bar_toggleable`), where it's what corrects `AppShell::
+        // new`'s "active + visible" construction-time default away from the
+        // hamburger *before* the very first hamburger click ever lands, so
+        // that click resolves as a reveal rather than `AppShell::
+        // handle_activity_click`'s already-active toggle-hide branch — see
+        // `render::sync_runner_sidebar_visibility`'s own doc.
+        //
+        // Deliberately gated, not unconditional like the title-row sync
+        // above: GTK/macOS/Win's existing two call sites already keep their
+        // runner/shadow sidebar visibility converged on every path that
+        // needs it, and a *third*, blanket call on every dispatch surfaced
+        // a pre-existing staleness in numerous test fixtures that mutate
+        // `session.explorer_visible` post-construction without also calling
+        // `Engine::sync_app_shell_sidebar_visibility`/`AppShell::show_panel`
+        // (harmless before #1427, since nothing ever read the shadow's
+        // `sidebar_visible()` this eagerly) — collapsing their sidebar
+        // reservation the moment any dispatch ran. The toggleable profile
+        // needs the correction regardless (that's the whole fix), but
+        // GTK/macOS/Win do not, so this stays scoped to where #1427
+        // actually requires it.
+        if self.engine.borrow().menu_bar_toggleable {
+            self.sync_runner_sidebar_visibility(ctx);
+        }
         if self.exit_requested.get() {
             return quadraui::Reaction::Exit;
         }
@@ -9062,6 +9230,18 @@ impl quadraui::ShellApp for App {
         }
         match event {
             AppShellEvent::PanelChanged { panel_id } => {
+                // #1427: the hamburger panel only exists on the `cell`
+                // profile (`Self::shell_config`) — reveal the menu bar
+                // instead of switching to a nonexistent shadow panel.
+                // Mirrors pre-#1427 `TuiShellApp::on_shell_event`'s own
+                // hamburger arm, now shared via
+                // `render::route_hamburger_panel_changed`; see its own doc.
+                // A no-op check on GTK/macOS/Win, which never register this
+                // panel id in the first place.
+                if render::route_hamburger_panel_changed(&mut self.engine.borrow_mut(), panel_id) {
+                    self.last_shell_panel = Some(panel_id.clone());
+                    return;
+                }
                 // #1064: record what the runner's own `AppShell` now
                 // believes is active, whether this notification came from
                 // a real click or from `take_requested_panel`'s own echo
@@ -9088,9 +9268,15 @@ impl quadraui::ShellApp for App {
                 // through the existing `switch_panel` handler that owns the
                 // ext-panel focus/toggle bookkeeping.
                 if is_ext_panel_id(panel_id.as_str()) {
+                    // #1427: a real activity-bar click is exactly as much
+                    // "the user moved on" as a keystroke — spend the guard
+                    // (mirrors TUI's identical call in this arm). A no-op
+                    // when never armed (GTK/macOS/Win).
+                    render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                     self.switch_panel(panel_id.as_str().to_string());
                     return;
                 }
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // #1360: a built-in panel's activity-bar icon click must move
                 // keyboard focus into that panel, exactly as TUI's own
                 // `PanelChanged` arm does (`focus_sidebar_panel` +
@@ -9114,6 +9300,11 @@ impl quadraui::ShellApp for App {
                 self.draw_needed.set(true);
             }
             AppShellEvent::SidebarHidden => {
+                // #1427: a real panel's own second click — the hamburger's
+                // is intercepted by `Self::on_shell_event_ctx` before it
+                // ever reaches this ctx-less method (see that method's own
+                // doc) — so spend the guard here too (mirrors TUI).
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // #557: this is also how a *second* click on an open
                 // extension panel's icon arrives — `sync_shell_event_shadow`
                 // already dropped the plugin panel's claim (its
@@ -9122,10 +9313,31 @@ impl quadraui::ShellApp for App {
                 // `AppShell::handle_activity_click` reports a click on the
                 // active panel as `PanelChanged`, not `SidebarHidden`, once
                 // the sidebar is hidden.
+                //
+                // #1427: `Engine::clear_sidebar_focus()` — a real second
+                // click must clear the sidebar's own keyboard focus the
+                // same way the keyboard-driven `ActivityBarKeyAction::
+                // Collapse` arm above already does (via the wider
+                // `Engine::collapse_sidebar`, which also touches
+                // `session.explorer_visible` — not appropriate here, since
+                // this arm fires for *any* panel's close, not just
+                // Explorer's), or a subsequent keystroke keeps routing to
+                // whichever sidebar panel last held focus instead of the
+                // editor. A pre-existing gap on every backend (this arm
+                // never cleared focus before), invisible until #1427's own
+                // `App`-on-TUI driver tests started clicking a real panel's
+                // icon twice in a row (reveal, then collapse) — the
+                // pre-#1427 "tui" arm never needed a first click at all,
+                // since Explorer was already the runner's default-active
+                // panel.
+                self.engine.borrow_mut().clear_sidebar_focus();
                 self.draw_needed.set(true);
             }
-            AppShellEvent::SidebarResized { .. } => {}
+            AppShellEvent::SidebarResized { .. } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+            }
             AppShellEvent::BottomItemClicked { id } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
                 // The runner treats bottom activity-bar items as action
                 // buttons (not sidebar panels), so it never toggles or
                 // hides on its own — it only ever reports the click
@@ -9143,7 +9355,11 @@ impl quadraui::ShellApp for App {
                 // one place instead of drifting again.
                 self.switch_panel(id.as_str().to_string());
             }
-            _ => {}
+            // #1427: every remaining `AppShellEvent` variant is likewise a
+            // shell-consumed user interaction — spend the guard and let any
+            // variant quadraui adds later default to the safe direction
+            // (mirrors TUI's identical catch-all).
+            _ => render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut()),
         }
     }
 
@@ -9182,6 +9398,26 @@ impl quadraui::ShellApp for App {
         event: &quadraui::AppShellEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) {
+        // #1427: a `SidebarHidden` for the hamburger — the runner's second
+        // click on it while the menu is open — has to be special-cased
+        // *here*, before delegating to the ctx-less `Self::on_shell_event`
+        // below, because only `ctx` (the runner's own `AppShell`) can tell
+        // the hamburger apart from a real panel's own second click; the
+        // shadow `engine.app_shell` has no hamburger `PanelDefinition` at
+        // all (see `render::route_hamburger_panel_changed`'s doc). Mirrors
+        // pre-#1427 `TuiShellApp::on_shell_event_ctx`'s identical check, now
+        // shared via `render::route_hamburger_sidebar_hidden`. A no-op check
+        // on GTK/macOS/Win, which never register this panel id.
+        if matches!(event, quadraui::AppShellEvent::SidebarHidden)
+            && ctx
+                .shell()
+                .active_panel_id()
+                .map(quadraui::WidgetId::as_str)
+                == Some(crate::core::engine::sidebar::HAMBURGER_PANEL_ID)
+        {
+            render::route_hamburger_sidebar_hidden(&mut self.engine.borrow_mut(), ctx);
+            return;
+        }
         #[allow(deprecated)]
         self.on_shell_event(event);
         // #1356 (quadraui bump for quadraui#1055): a bottom item's click
@@ -9202,6 +9438,19 @@ impl quadraui::ShellApp for App {
             }
         }
         self.sync_runner_sidebar_visibility(ctx);
+        // #1427: `ShellAdapter::handle` consumes a `PanelChanged`/
+        // `SidebarHidden` for a top-row panel itself and returns without
+        // ever calling `Self::handle` — the one place `Self::handle`'s own
+        // `render::sync_menu_bar_title_row` call can never reach. Mirrors
+        // pre-#1427 `TuiShellApp::on_shell_event_ctx`'s identical tail call
+        // — see that function's own doc for why running this on every path
+        // (not just the hamburger arm above) is what makes any *future* arm
+        // that flips `menu_bar_visible` get the same same-frame guarantee
+        // for free. Gated on `menu_bar_toggleable` for the same reason as
+        // `Self::handle`'s own identical call — see that call site's doc.
+        if self.engine.borrow().menu_bar_toggleable {
+            render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
+        }
     }
 }
 
