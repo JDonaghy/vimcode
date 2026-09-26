@@ -306,6 +306,362 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Activity bar
+    //
+    // #1430 tranche 1: the activity-bar half of the "key dispatch, activity
+    // bar, sidebar panels" slice. Every test below is a mechanical port of
+    // its `shell_app.rs` namesake (`TuiShellApp::new_for_test`/`TuiShellApp::
+    // new(None)` → [`plain_engine`]/[`harness`], `app.engine.*` → the local
+    // `Engine` before it's handed to [`harness`]) — see this module's own
+    // "No production code here" doc at the top of the file.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod activity_bar {
+        use super::*;
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#757): Ctrl-L
+        /// while the activity bar holds the keyboard must **not** activate
+        /// the selected item (`render::activity_bar_key_action` guards
+        /// `Activate` on `!ctrl`, shared by both backends) — a bare `l`
+        /// immediately afterwards must still activate, pairing the negative
+        /// with a positive so a fixture that simply cannot activate could
+        /// not pass this test by accident.
+        #[test]
+        fn activity_bar_ctrl_l_does_not_activate_via_shell_app() {
+            use crate::core::engine::sidebar::TOOLBAR_IDX_SETTINGS;
+
+            let mut engine = plain_engine();
+            engine.activity_bar_focus_in_at(TOOLBAR_IDX_SETTINGS);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::activity_bar_ctrl_l_does_not_activate_via_shell_app",
+                || {
+                    let before = driver.screen();
+                    assert!(
+                        !before.contains("Settings"),
+                        "precondition: the Settings panel must not already be \
+                         open; screen:\n{before}"
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('l'),
+                        modifiers: quadraui::Modifiers {
+                            ctrl: true,
+                            ..quadraui::Modifiers::default()
+                        },
+                        repeat: false,
+                    });
+
+                    let after_ctrl = driver.screen();
+                    assert!(
+                        !after_ctrl.contains("Settings"),
+                        "Ctrl-L in the activity bar must not activate the \
+                         selected item; screen:\n{after_ctrl}"
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('l'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after_plain = driver.screen();
+                    // Either casing: unlike the click path (title-case
+                    // `"Settings"`, from `AppShell`'s own `PanelDefinition`
+                    // tooltip — see `render.rs:19074`), the keyboard-
+                    // activation path paints the settings panel's own
+                    // all-caps `"SETTINGS"` header. Not a functional gap —
+                    // both headers name the same panel — so this checks
+                    // either, matching `sidebar_panels::extensions_icon_
+                    // click_paints_header`'s identical `||` for the same
+                    // reason.
+                    assert!(
+                        after_plain.contains("Settings") || after_plain.contains("SETTINGS"),
+                        "a bare `l` on the Settings slot must still activate \
+                         it; screen:\n{after_plain}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1053): clicking
+        /// each activity-bar icon in turn must switch the sidebar's own
+        /// *content*, not just its chrome — every icon located via
+        /// `driver.find`, never a stored coordinate (this file's own
+        /// `collapse_sidebar` doc explains why a stale coordinate can
+        /// silently exercise a different code path). The hamburger is
+        /// clicked last, after every real panel, for the same reason the
+        /// mirrored test does: revealing the menu bar shifts the whole
+        /// activity bar down by one row, and there is nothing left to
+        /// click afterwards.
+        #[test]
+        fn driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1053_activity_bar_all_targets_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker_file = dir.join("zqxw1053.txt");
+            std::fs::write(&marker_file, "marker").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_reveal_path(&marker_file);
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app",
+                || {
+                    // Unlike the mirrored `shell_app.rs` test, `App`'s shadow
+                    // `engine.app_shell` defaults its *own* active panel to
+                    // Explorer regardless of the runner chrome's separate
+                    // hamburger-active default (this module's own
+                    // `collapse_sidebar` doc) — so the marker is already
+                    // painted here, not hidden. Confirmed by
+                    // `key_dispatch`/`sidebar_panels`' own fixtures, which
+                    // never depend on this precondition either way.
+                    assert!(
+                        driver.screen_has("zqxw1053.txt"),
+                        "precondition: Explorer is the shadow engine's default \
+                         active panel, so its content paints even before any \
+                         click; screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        !driver.screen_has("File"),
+                        "precondition: menu bar starts hidden; screen:\n{}",
+                        driver.screen()
+                    );
+
+                    // Located by chrome zone id, not `driver.find`'s glyph
+                    // search: several fallback icons (Nerd Fonts off, same
+                    // as every other fixture in this module) are single
+                    // ASCII characters that also occur in a previously-
+                    // opened panel's own body text — `EXTENSIONS.s()` is
+                    // `"#"`, and the fixed activity-bar rail is not the
+                    // *only* `"#"` `find` can match once a panel with body
+                    // text is showing. A chrome zone's `id` is exact, so
+                    // this can never collide.
+                    let mut click_icon_and_expect = |panel_id: &str, marker: &str, label: &str| {
+                        let bounds = driver
+                            .inventory()
+                            .zones()
+                            .iter()
+                            .find(|z| z.id.as_str() == panel_id)
+                            .map(|z| z.bounds)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "{label} icon must register a chrome zone; \
+                                     screen:\n{}",
+                                    driver.screen()
+                                )
+                            });
+                        driver.click(
+                            bounds.x + bounds.width / 2.0,
+                            bounds.y + bounds.height / 2.0,
+                        );
+                        let screen = driver.screen();
+                        assert!(
+                            screen.contains(marker),
+                            "clicking the {label} icon must open its panel via \
+                             the real App path (marker {marker:?} missing); \
+                             screen:\n{screen}"
+                        );
+                    };
+
+                    use crate::core::engine::sidebar::{
+                        PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+                    };
+                    click_icon_and_expect(PANEL_SEARCH, "Replace…", "Search");
+                    click_icon_and_expect(PANEL_GIT, "SOURCE CONTROL", "Source Control");
+                    // #1430 gate: this specific step — clicking Extensions
+                    // *right after* Source Control — is where the gap lives.
+                    // Confirmed in isolation (Search → Extensions, no SC in
+                    // between) that the Extensions panel itself opens fine
+                    // and paints its own all-caps "EXTENSIONS" header (the
+                    // marker below), so this is not an Extensions-panel bug;
+                    // with SC opened first the click on Extensions' own
+                    // chrome zone lands (verified: same coordinates as the
+                    // isolated case) but the sidebar body never switches —
+                    // the SC panel's own commit-message input most likely
+                    // captures the click before it reaches the activity-bar
+                    // dispatch. category: product (the SC panel's own click
+                    // handling needs to release/ignore clicks outside its
+                    // own bounds) — target: needs its own filed issue.
+                    click_icon_and_expect(PANEL_EXTENSIONS, "EXTENSIONS", "Extensions");
+                    click_icon_and_expect(PANEL_SETTINGS, "Settings", "Settings");
+                    click_icon_and_expect(
+                        crate::core::engine::sidebar::PANEL_EXPLORER,
+                        "zqxw1053.txt",
+                        "Explorer",
+                    );
+
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    assert!(
+                        driver.screen_has("File"),
+                        "clicking the hamburger must reveal the menu bar via \
+                         the real App path; screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#694): a
+        /// hamburger click with the sidebar closed beforehand must not
+        /// panic through the real dispatch pipeline, and must reveal the
+        /// menu bar.
+        ///
+        /// Uses [`harness_no_sidebar`], not the bare [`harness`] the
+        /// mirrored `shell_app.rs` test uses: `App`'s fresh runner
+        /// `AppShell` boots with the hamburger (index 0) already active
+        /// (this module's own `collapse_sidebar` doc), so a hamburger
+        /// click against an *un*collapsed fixture lands on
+        /// `handle_activity_click`'s "already active" branch and never
+        /// reaches the reveal this test means to exercise —
+        /// `harness_no_sidebar`'s two real Explorer clicks move the active
+        /// panel off the hamburger first, so this click genuinely is the
+        /// hamburger's first activation, sidebar collapsed, same as the
+        /// mirrored test's own precondition.
+        #[test]
+        fn driver_hamburger_click_sidebar_closed_does_not_panic() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_hamburger_click_sidebar_closed_does_not_panic",
+                || {
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("File"),
+                        "hamburger click should have opened the menu bar; \
+                         screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#694): the
+        /// hamburger clicked twice in a row — the second click lands on the
+        /// now-active hamburger item and toggles it back off — must not
+        /// panic. See [`driver_hamburger_click_sidebar_closed_does_not_panic`]'s
+        /// own doc for why this uses [`harness_no_sidebar`].
+        #[test]
+        fn driver_hamburger_click_twice_does_not_panic() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_hamburger_click_twice_does_not_panic",
+                || {
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    assert!(
+                        driver.screen_has("File"),
+                        "first hamburger click should open the menu bar; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+                    driver.click(hx, hy);
+                    let _ = driver.screen();
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#694): hamburger
+        /// click with the sidebar already open on a real panel (Explorer)
+        /// beforehand must not panic.
+        #[test]
+        fn driver_hamburger_click_with_sidebar_open_does_not_panic() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_hamburger_click_with_sidebar_open_does_not_panic",
+                || {
+                    let (ex, ey) = driver
+                        .find(crate::icons::EXPLORER.s())
+                        .expect("explorer icon must paint on the activity bar");
+                    driver.click(ex, ey); // opens the sidebar
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    let _ = driver.screen();
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#694): the first
+        /// real key event after a hamburger click must not panic. See
+        /// [`driver_hamburger_click_sidebar_closed_does_not_panic`]'s own
+        /// doc for why this uses [`harness_no_sidebar`].
+        #[test]
+        fn driver_hamburger_click_then_key_does_not_panic() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_hamburger_click_then_key_does_not_panic",
+                || {
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    assert!(
+                        driver.screen_has("File"),
+                        "hamburger click must open the menu bar so the \
+                         following key press reaches the menu-system \
+                         dispatch; screen:\n{}",
+                        driver.screen()
+                    );
+                    let _ = driver.press(quadraui::Key::Char('j'));
+                    let _ = driver.screen();
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#694): combines
+        /// the previous two — sidebar open on a real panel, then a
+        /// hamburger click, then a key — must not panic.
+        #[test]
+        fn driver_hamburger_click_then_key_with_sidebar_open_does_not_panic() {
+            let mut h = harness(plain_engine());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_hamburger_click_then_key_with_sidebar_open_does_not_panic",
+                || {
+                    let (ex, ey) = driver
+                        .find(crate::icons::EXPLORER.s())
+                        .expect("explorer icon must paint on the activity bar");
+                    driver.click(ex, ey);
+                    let (hx, hy) = driver
+                        .find(crate::icons::HAMBURGER.s())
+                        .expect("hamburger icon must paint on the activity bar");
+                    driver.click(hx, hy);
+                    let _ = driver.press(quadraui::Key::Char('j'));
+                    let _ = driver.screen();
+                },
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Sidebar panels
     // ─────────────────────────────────────────────────────────────────────────
     mod sidebar_panels {
@@ -505,6 +861,243 @@ mod tests {
                         !driver.screen_has("Replace…"),
                         "a second click on the active Search icon must close the \
                  sidebar; screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// An explorer sidebar showing one real file, revealed and focused,
+        /// with a temp `cwd` the caller must clean up — the `App`-on-TUI
+        /// twin of `shell_app.rs`'s `app_with_focused_explorer`. Returns the
+        /// engine plus the temp dir so the test can remove it.
+        fn engine_with_focused_explorer(tag: &str) -> (crate::core::Engine, std::path::PathBuf) {
+            let dir = std::env::temp_dir().join(format!(
+                "vc1430focus_{tag}_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("zqxw757.txt");
+            std::fs::write(&marker, "marker").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_reveal_path(&marker);
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.explorer_has_focus = true;
+            (engine, dir)
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#757 divergence
+        /// 3): a plugin panel's own focus must outrank a stale
+        /// `explorer_has_focus` left set alongside it — reached via the
+        /// *real* keyboard-activation path (`Engine::activity_bar_activate`'s
+        /// ext-panel branch), not by hand-set fields.
+        #[test]
+        fn focused_plugin_panel_outranks_a_stale_explorer_flag_via_shell_app() {
+            use crate::core::engine::sidebar::TOOLBAR_IDX_EXT_BASE;
+
+            let (mut engine, dir) = engine_with_focused_explorer("ext_panel_stale");
+            engine.explorer_tree.borrow_mut().start_editing(
+                vec![0u16],
+                "ZQXWEXT757".to_string(),
+                "ZQXWEXT757".len(),
+                None,
+                None,
+            );
+            engine.ext_panels.clear();
+            engine.ext_panels.insert(
+                "git-insights".to_string(),
+                crate::core::plugin::PanelRegistration {
+                    name: "git-insights".to_string(),
+                    title: "Git Insights".to_string(),
+                    icon: '\u{f113}',
+                    fallback_icon: Some('Ж'),
+                    sections: Vec::new(),
+                },
+            );
+            // Park the activity bar's keyboard cursor on the (only) plugin
+            // panel.
+            engine.activity_bar_focus_in_at(TOOLBAR_IDX_EXT_BASE);
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::focused_plugin_panel_outranks_a_stale_explorer_flag_via_shell_app",
+                || {
+                    let before = driver.screen();
+                    assert!(
+                        before.contains("ZQXWEXT757"),
+                        "precondition: the explorer's inline edit must paint \
+                         before the activity bar is activated; screen:\n{before}"
+                    );
+
+                    // Activate the plugin panel — the real
+                    // `Engine::activity_bar_activate` ext-panel branch, which
+                    // leaves `explorer_has_focus` stale-true.
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Char('l'),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+                    let mid = driver.screen();
+                    assert!(
+                        !mid.contains("ZQXWEXT757"),
+                        "precondition: the plugin panel must now own the \
+                         sidebar body; screen:\n{mid}"
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    // Reveal: click the explorer's own activity-bar icon to
+                    // switch the visible panel back — the same production
+                    // panel-changed path a real click takes.
+                    let (ex, ey) = driver
+                        .find(crate::icons::EXPLORER.s())
+                        .expect("explorer icon must paint on the activity bar");
+                    driver.click(ex, ey);
+
+                    let after = driver.screen();
+                    assert!(
+                        after.contains("ZQXWEXT757"),
+                        "a focused plugin panel must outrank a stale explorer \
+                         focus flag — Backspace must not have reached the \
+                         explorer's inline edit; screen:\n{after}"
+                    );
+                },
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#757 divergence
+        /// 4): a real focus flag must outrank the merely *visible* explorer
+        /// panel — the explorer is left as the default visible panel while
+        /// `settings_has_focus` is set directly, the state a plugin or
+        /// future codepath that sets the flag without also calling
+        /// `app_shell.show_panel` would produce.
+        #[test]
+        fn focused_settings_panel_outranks_the_default_visible_explorer_via_shell_app() {
+            let (mut engine, dir) =
+                engine_with_focused_explorer("settings_flag_vs_visible_explorer");
+            engine.explorer_tree.borrow_mut().start_editing(
+                vec![0u16],
+                "ZQXWFLAG757".to_string(),
+                "ZQXWFLAG757".len(),
+                None,
+                None,
+            );
+            // A real, current focus flag — but the visible panel (app_shell's
+            // untouched default) is still the explorer.
+            engine.settings_has_focus = true;
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::focused_settings_panel_outranks_the_default_visible_explorer_via_shell_app",
+                || {
+                    let before = driver.screen();
+                    assert!(
+                        before.contains("ZQXWFLAG757"),
+                        "precondition: the explorer's inline edit must paint \
+                         (it is still the visible panel); screen:\n{before}"
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Backspace),
+                        modifiers: quadraui::Modifiers::default(),
+                        repeat: false,
+                    });
+
+                    let after = driver.screen();
+                    assert!(
+                        after.contains("ZQXWFLAG757"),
+                        "a real settings_has_focus must outrank the \
+                         merely-visible explorer panel — Backspace must not \
+                         reach the explorer's inline edit; screen:\n{after}"
+                    );
+                },
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#759): Alt+Right
+        /// must widen the painted sidebar by one column, pushing the editor
+        /// one column right; Alt+Left must narrow it straight back.
+        /// Asserted through the editor text's painted column, never through
+        /// sidebar-width state (CLAUDE.md rule 1: rendered output, not
+        /// state). Runs at `(120, 24)`, not this module's usual `(80, 24)`
+        /// — the sidebar plus a widened-by-one column needs the extra room.
+        #[test]
+        fn alt_right_widens_the_painted_sidebar_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.buffer_mut().insert(0, "ZQXW759W");
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 24);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::alt_right_widens_the_painted_sidebar_via_shell_app",
+                || {
+                    let alt_press =
+                        |driver: &mut quadraui::tui::testing::TuiDriver<_>, key, shift| {
+                            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                                key,
+                                modifiers: quadraui::Modifiers {
+                                    alt: true,
+                                    shift,
+                                    ..Default::default()
+                                },
+                                repeat: false,
+                            });
+                        };
+
+                    let before = driver
+                        .find_bounds("ZQXW759W")
+                        .expect("the editor marker must paint before the resize");
+                    alt_press(
+                        driver,
+                        quadraui::Key::Named(quadraui::NamedKey::Right),
+                        false,
+                    );
+                    let after = driver
+                        .find_bounds("ZQXW759W")
+                        .expect("the editor marker must still paint after the resize");
+                    assert_eq!(
+                        after.x,
+                        before.x + 1.0,
+                        "Alt+Right must widen the painted sidebar by one \
+                         column, pushing the editor one column right; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+
+                    alt_press(
+                        driver,
+                        quadraui::Key::Named(quadraui::NamedKey::Left),
+                        false,
+                    );
+                    let back = driver
+                        .find_bounds("ZQXW759W")
+                        .expect("the editor marker must still paint after Alt+Left");
+                    assert_eq!(
+                        back.x,
+                        before.x,
+                        "Alt+Left must narrow it straight back; screen:\n{}",
                         driver.screen()
                     );
                 },

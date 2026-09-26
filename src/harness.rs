@@ -1633,6 +1633,18 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // doesn't open a terminal pane through `App` — a dispatch gap unrelated
     // to geometry units) — target: TBD, needs its own filed issue.
     "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
+    // ── #1430 tranche 1 (key dispatch, activity bar, sidebar panels) ────
+    // category: product — after Source Control is opened, clicking a
+    // *different* activity-bar icon (confirmed with Extensions; the SC
+    // panel's own commit-message input is the suspected culprit) never
+    // switches the sidebar body, even though the click lands on the
+    // correct chrome zone (same coordinates that work when SC was never
+    // opened first). See the test's own `#1430 gate:` comment in
+    // `app_on_tui_tests.rs` for the isolation that ruled out the
+    // Extensions panel itself. Target: needs its own filed issue (SC
+    // panel's click handling should release/ignore clicks outside its own
+    // bounds).
+    "app_on_tui::driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app",
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
