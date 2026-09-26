@@ -14332,7 +14332,8 @@ mod command_line_selection {
 
     /// #1239: `App::sync_plus_register_to_clipboard` (now a thin wrapper over
     /// `render::sync_register_to_clipboard`, the same function TUI's
-    /// `sync_tui_clipboard` delegates to) must keep mirroring the explicit
+    /// now-deleted `sync_tui_clipboard` used to delegate to) must keep
+    /// mirroring the explicit
     /// `+` register ahead of the unnamed `"` register — this is the parity
     /// half of #1239's fix: GTK's existing (correct) behaviour must survive
     /// the refactor into the shared function untouched.

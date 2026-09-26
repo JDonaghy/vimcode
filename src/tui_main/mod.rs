@@ -1,23 +1,13 @@
-//! TUI (terminal UI) entry point for VimCode.
+//! TUI entry point for VimCode. Activated with `--tui`; renders the same
+//! `ScreenLayout` the GTK backend consumes, via ratatui + crossterm instead
+//! of Cairo. No GTK/Cairo/Pango imports — editor logic is `core`'s,
+//! rendering data is `render`'s.
 //!
-//! Activated with the `--tui` CLI flag. Uses ratatui + crossterm to render
-//! the same `ScreenLayout` produced by `render::build_screen_layout` that the
-//! GTK backend consumes — just rendered to a terminal instead of a Cairo
-//! surface.
-//!
-//! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
-//! All rendering data comes from `render`.
-//!
-//! #1433 flipped [`run`] onto the shared [`crate::app::App`] — the same
-//! cross-backend shell GTK/macOS/Win-GUI run; #1434 deleted the
-//! independently hand-written production TUI shell this module used to
-//! build before that flip (see `docs/IRREDUCIBLE_SURFACE.md` §4 and
-//! `GOALS.md`'s sizing table for the before/after line counts). What's
-//! left is thin wiring: the `TuiBackend` construction and panic/crash-
-//! recovery scaffolding [`run`] wraps around
-//! `quadraui::tui::shell_runner::run_with_shell`, and the [`testing`] seam
-//! the driver-tier suite (`app_on_tui_tests.rs`) and the sealed acceptance
-//! crate (`feature = "test-support"`) build on.
+//! #1433 flipped [`run`] onto the shared [`crate::app::App`]; #1434 deleted
+//! the independently hand-written production TUI shell this module used to
+//! build (see `docs/IRREDUCIBLE_SURFACE.md` §4, `GOALS.md`'s sizing table).
+//! What's left: `TuiBackend` construction, crash-recovery scaffolding around
+//! `quadraui::tui::shell_runner::run_with_shell`, and the [`testing`] seam.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -27,11 +17,9 @@ use std::sync::Mutex;
 mod app_on_tui_tests;
 mod backend;
 
-/// [`crate::app::TextMetricsBackend`] for quadraui's `TuiBackend` (#982) —
-/// the TUI sibling of `impl TextMetricsBackend for GtkBackend`/`WinBackend`
-/// (`src/app.rs`) and `MacBackend` (`src/macos/mod.rs`). Both setters are
-/// genuine no-ops: one ratatui cell is one row/column by construction, so
-/// there is no pixel metric here to ever disagree with (#540/#819).
+/// [`crate::app::TextMetricsBackend`] for quadraui's `TuiBackend` (#982),
+/// the TUI sibling of the GTK/Win/Mac impls. Both setters are no-ops: one
+/// ratatui cell is one row/column by construction (#540/#819).
 impl crate::app::TextMetricsBackend for backend::TuiBackend {
     fn set_current_line_height(&mut self, _line_height: f64) {}
     fn set_current_char_width(&mut self, _char_width: f64) {}
@@ -66,13 +54,11 @@ macro_rules! debug_log {
     };
 }
 
-/// The TUI entry point: initialise the shared [`crate::app::App`] and drive
-/// it through `quadraui::tui::shell_runner::run_with_shell` — the TUI twin
-/// of `crate::macos::run`. `run_with_shell` already does all raw-mode /
-/// alternate-screen / mouse-capture setup and teardown internally, and
-/// always restores the terminal — even on panic — before propagating; the
-/// outer `catch_unwind` below only exists to print the crash message after
-/// the terminal is already back to normal.
+/// The TUI entry point: build the shared [`crate::app::App`] and drive it
+/// through `quadraui::tui::shell_runner::run_with_shell` (the TUI twin of
+/// `crate::macos::run`), which handles all raw-mode/mouse-capture setup and
+/// teardown, restoring the terminal even on panic. The outer `catch_unwind`
+/// only exists to print the crash message afterward.
 pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     if let Some(ref path) = debug_log_path {
         init_debug_log(path);
@@ -117,25 +103,16 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
     }
 }
 
-/// Test/acceptance driver seam — the TUI half of what the in-crate
-/// driver-tier suite (`app_on_tui_tests.rs`) and the sealed acceptance
-/// crate (`tests/acceptance.rs`, via `feature = "test-support"`) need to
-/// drive [`crate::app::App`] on a `quadraui::tui::TuiDriver`.
-///
-/// # `tui` vs `tui_prod` (#1043, converged #1434)
+/// Test/acceptance driver seam: what `app_on_tui_tests.rs` and the sealed
+/// `tests/acceptance.rs` (via `feature = "test-support"`) use to drive
+/// [`crate::app::App`] on a `quadraui::tui::TuiDriver`.
 ///
 /// `crate::harness`'s `backend_conformance!` macro still registers two TUI
-/// arms, `tui` (via [`conformance_harness`]) and `tui_prod` (via
-/// [`conformance_harness_prod`]). Before #1433 these wrapped two
-/// independently-implemented shells — the shared [`crate::app::App`] and a
-/// hand-rolled, TUI-only production shell — so a scenario green on `tui`
-/// but red on `tui_prod` meant the two had diverged. #1433 flipped
-/// production [`run`] onto `App`, and #1434 deleted the hand-rolled shell
-/// entirely, so both arms now build the identical `App` —
-/// [`conformance_harness_prod`] is a thin alias of [`conformance_harness`].
-/// Both names are kept (rather than collapsing `backend_conformance!` back
-/// to two arms) so the many existing `tui_prod`-suffixed scenarios and
-/// `KNOWN_BUGS` labels in `src/harness.rs` keep resolving unchanged.
+/// arms, `tui` ([`conformance_harness`]) and `tui_prod`
+/// ([`conformance_harness_prod`]), which diverged before #1433/#1434 but now
+/// both build the identical `App`; `tui_prod` is a thin alias, kept only so
+/// existing `tui_prod`-suffixed scenarios and `KNOWN_BUGS` labels in
+/// `src/harness.rs` keep resolving unchanged.
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing {
     use std::cell::RefCell;
@@ -151,21 +128,12 @@ pub mod testing {
     use crate::render::UnitProfile;
 
     /// The `TuiDriver` instantiation of `crate::harness::ConformanceHarness`
-    /// (#982) — mirrors `crate::gtk::testing::conformance_harness`
-    /// (`src/gtk/testing.rs`) exactly, modulo the backend-specific pieces:
-    /// `TuiBackend` instead of `GtkBackend`, and `width`/`height` in
-    /// terminal cells (`u16`) rather than pixels (`i32`), matching
-    /// `quadraui::tui::testing::driver_with_shell`'s own signature.
+    /// (#982) — mirrors `crate::gtk::testing::conformance_harness`, modulo
+    /// `TuiBackend` and cell (`u16`) vs pixel (`i32`) dimensions.
     ///
-    /// `TuiDriver` does not implement `quadraui::testing::PixelClickConformance`
-    /// (only `GtkDriver`/`MacDriver`/`WinDriver` do — pixel-precise native
-    /// click delivery has no ratatui equivalent). A scenario bounded by
-    /// `ConformanceDriver + DriverInput` (e.g.
-    /// `crate::harness::sweep_hit_band_integrity`, which only needs
-    /// `DriverInput::click`) still runs on both; one that needs
-    /// `PixelClickConformance` specifically stays GTK-only. See
-    /// `crate::harness`'s own module doc for this boundary spelled out once,
-    /// rather than re-explained at every call site.
+    /// `TuiDriver` doesn't implement `PixelClickConformance` (no ratatui
+    /// equivalent for pixel-precise clicks); see `crate::harness`'s module
+    /// doc for that boundary.
     pub fn conformance_harness(
         engine: Engine,
         width: u16,
@@ -226,25 +194,14 @@ pub mod testing {
     }
 
     /// Bundles a [`TuiDriver`] built by [`tui_driver`]/[`tui_driver_with`]
-    /// with the two process-wide guards
-    /// ([`crate::test_paint::PaintGuard`], [`crate::test_cwd::CwdReadGuard`])
-    /// every other App/Engine-backed driver constructor in this codebase
-    /// takes before handing back a driver — [`conformance_harness`] and
-    /// [`conformance_harness_prod`] above, and every GTK/macOS/Win
-    /// equivalent (`src/gtk/testing.rs`, `src/macos/mod.rs`,
-    /// `src/win/mod.rs`). See `crate::test_paint`'s and `crate::test_cwd`'s
-    /// own module docs for the concurrent-Pango segfault and CWD-read race
-    /// this protects against; `App::new_portable_for_test`'s real
-    /// `Engine::startup` (explorer root, ambient sidebar restore) is exactly
-    /// the CWD-dependent read `crate::test_cwd`'s doc warns about.
+    /// with the two process-wide guards ([`crate::test_paint::PaintGuard`],
+    /// [`crate::test_cwd::CwdReadGuard`]) every App/Engine-backed driver
+    /// constructor here takes — see those guards' own module docs for the
+    /// Pango-segfault/CWD-race they cover.
     ///
-    /// Implements `Deref`/`DerefMut` to the wrapped driver, so a caller
-    /// drives it exactly like a bare `TuiDriver` (`driver.render()`,
-    /// `driver.screen()`, `driver.screen_contains(..)`, …) — this wrapper
-    /// only exists to keep the two guards alive for the driver's whole
-    /// lifetime, the same "held for the harness's whole lifetime" contract
-    /// [`crate::harness::ConformanceHarness`]'s own `_paint`/`_cwd` fields
-    /// document, not to add a new API surface a test would need to learn.
+    /// `Deref`/`DerefMut`s to the wrapped driver, so a caller drives it
+    /// exactly like a bare `TuiDriver`; this only exists to keep the guards
+    /// alive for the driver's whole lifetime.
     pub struct TuiAppDriver<D> {
         driver: D,
         _paint: crate::test_paint::PaintGuard,
@@ -264,17 +221,12 @@ pub mod testing {
         }
     }
 
-    /// Build a TUI driver of the given cell size with no other setup, built
-    /// through the shared `App` construction path
-    /// (`App::new_portable_for_test` + `App::shell_config`).
+    /// Build a TUI driver of the given cell size via the shared `App`
+    /// construction path (`App::new_portable_for_test` + `shell_config`).
     ///
-    /// Runs the real `Engine::startup` (via `App::new_portable_for_test`),
-    /// so sidebar visibility, scroll offsets, and restored session state
-    /// are *ambient*, read from the developer's real `~/.config/vimcode`,
-    /// not fixed. A caller that needs a known starting buffer/scroll
-    /// position (so a marker painted at a known location can't drift by
-    /// whatever the machine's own session happens to restore) should use
-    /// [`tui_driver_with`] instead.
+    /// Runs the real `Engine::startup`, so sidebar/scroll/session state is
+    /// *ambient* (read from `~/.config/vimcode`), not fixed. Use
+    /// [`tui_driver_with`] instead if a caller needs a known starting state.
     pub fn tui_driver(
         file_path: Option<PathBuf>,
         width: u16,
@@ -283,28 +235,17 @@ pub mod testing {
         tui_driver_with(file_path, width, height, |_| {})
     }
 
-    /// [`tui_driver`], plus a `setup` hook that runs against the live
-    /// `Engine` after construction but before the first frame renders —
-    /// e.g. seeding buffer text and pinning every window's
-    /// `view.scroll_top` to `0`.
+    /// [`tui_driver`], plus a `setup` hook run against the live `Engine`
+    /// after construction but before the first frame renders (e.g. seeding
+    /// buffer text, pinning scroll positions).
     ///
-    /// `App` stores its `Engine` behind `Rc<RefCell<Engine>>` (`App::engine`
-    /// in `src/app.rs`) rather than owning it directly, and `App` itself is
-    /// `pub(crate)` — so a public accessor handing back the `Rc` would
-    /// either leak `App`'s crate-private shape through the accessor's own
-    /// return type, or need a wrapper type solely to hide it. A
-    /// `FnOnce(&mut Engine)` callback sidesteps both: the caller gets a
-    /// mutable window onto the same engine [`tui_driver`] would otherwise
-    /// hand straight to `driver_with_shell` unseen, without `App` ever
-    /// crossing the module boundary.
+    /// Takes a `FnOnce(&mut Engine)` rather than exposing `App`'s
+    /// `Rc<RefCell<Engine>>` directly, since `App` is `pub(crate)` and a
+    /// public accessor would leak its shape.
     ///
-    /// Acquires [`crate::test_paint::PaintGuard`] and
-    /// [`crate::test_cwd::CwdReadGuard`] *before* constructing the `App` (so
-    /// `Engine::startup`'s own CWD reads are covered, not just the later
-    /// `render()` calls a caller makes on the returned driver) and returns
-    /// them bundled into the driver via [`TuiAppDriver`] — see that type's
-    /// own doc for why they must outlive this function's return, not just
-    /// its body.
+    /// Acquires the paint/cwd guards *before* constructing `App` (covering
+    /// `Engine::startup`'s own CWD reads) and returns them bundled via
+    /// [`TuiAppDriver`].
     pub fn tui_driver_with(
         file_path: Option<PathBuf>,
         width: u16,

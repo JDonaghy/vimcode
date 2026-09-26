@@ -5012,10 +5012,12 @@ pub fn post_key_epilogue(
 /// yank/delete (which only ever touches `"`, never `+`) could clobber the
 /// clipboard mirror of an earlier explicit `+` write instead of leaving it
 /// alone (see the `..._1239` tests in `gtk/testing.rs` and
-/// `tui_main/shell_app.rs` for the exact repro). Both now call this one
-/// function; each backend's own name survives only as a thin wrapper (GTK:
-/// `App::sync_plus_register_to_clipboard`; TUI: `sync_tui_clipboard`) so
-/// their existing call sites don't need to change. (The issue that raised
+/// `tui_main/shell_app.rs` for the exact repro — the latter deleted by
+/// #1434). Both called this one function; GTK's own name survives as a
+/// thin wrapper (`App::sync_plus_register_to_clipboard`) so its existing
+/// call sites don't need to change — TUI's `sync_tui_clipboard` wrapper
+/// was deleted along with the rest of the pre-#1434 TUI shell, its callers
+/// now going through `App`. (The issue that raised
 /// this bug illustrated the explicit-write case as `:let @+='...'` — that
 /// ex command isn't actually implemented in vimcode, `VIM_COMPATIBILITY.md`
 /// marks `:let` N/A; every real write path to `+`, from `"+yy` to the Lua
@@ -5640,7 +5642,7 @@ pub fn sync_shell_event_shadow(
 // on the stale click a hamburger reveal leaves behind (#988/#1029), and a
 // hamburger `PanelDefinition` click that reveals the bar instead of
 // switching the (nonexistent) "Menu" sidebar panel. All five functions below
-// were the pre-#1434 TUI shell private methods before #1427; they are pure
+// were the pre-#1434 TUI shell's private methods before #1427; they are pure
 // `&mut Engine` (plus, where a hit-test needs one, `&dyn Backend`/
 // `&ShellContext`) so both `App` and the pre-#1434 TUI shell can call the same body.
 // Every one is a documented no-op on a backend that never sets
@@ -10072,13 +10074,14 @@ pub fn paint_tab_drop_overlay(
 //   * the **activity bar** and the **sidebar separator**. On both live paths
 //     `AppShell::render` (quadraui `compose::app_shell`) paints these *before*
 //     `render_content` is entered, out of the same `AppShellLayout` vimcode
-//     consumes verbatim. The only vimcode code that still paints them itself is
-//     the **test-only** `tui_main::render_impl::draw_frame` (raw
+//     consumes verbatim. The only vimcode code that once painted them itself
+//     was the test-only `tui_main::render_impl::draw_frame` (raw
 //     `frame.buffer_mut()` — `panels::render_activity_bar` and the `set_cell`
-//     separator column); it has had no production caller since the the pre-#1434 TUI shell
-//     cutover. So the "check quadraui first" verdict for these two rungs is
-//     *quadraui already owns them, and vimcode has already adopted it* — there
-//     is nothing to compose and no adoption issue to file.
+//     separator column), which had no production caller since the pre-#1434
+//     TUI shell cutover and was deleted outright by #1434. So the "check
+//     quadraui first" verdict for these two rungs is *quadraui already owns
+//     them, and vimcode has already adopted it* — there is nothing to
+//     compose and no adoption issue to file.
 //   * the **debug toolbar**, **quickfix panel** and **bottom panel**. These are
 //     vimcode's own stacked bottom chrome, which `AppShellLayout` has no concept
 //     of (its `bottom_panel_bounds` is a single generic drawer, and is `None` for

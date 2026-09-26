@@ -358,7 +358,7 @@ impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
 }
 
 /// [`render::TickHost`] impl for GTK — the tick-time background chores
-/// `App::handle_poll_tick` shares with TUI's the pre-#1434 TUI shell's `tick` (#1248).
+/// `App::handle_poll_tick` shares with the pre-#1434 TUI shell's `tick` (#1248).
 /// Holds `app: &mut App` and `backend` as plain borrows, same shape as
 /// [`GtkEngineActionHost`]/[`GtkAccelHost`] above.
 ///
@@ -1341,8 +1341,7 @@ pub(crate) struct App {
 /// from the runner's own, each with its own independent `PlatformServices` —
 /// is safe: `Clipboard::read_text`/`write_text` talk straight to the OS
 /// clipboard (`arboard` on GTK, matching what TUI's `TuiPlatformServices`
-/// already uses — see `tui_main::mod::setup_tui_clipboard`), not to any
-/// runner-owned state.
+/// already uses), not to any runner-owned state.
 ///
 /// `TextMetricsBackend: quadraui::Backend` (see that trait's doc), so this
 /// names no concrete toolkit type and works unchanged for GTK, macOS, and
@@ -2699,7 +2698,9 @@ impl App {
     /// whenever their content changes (clipboard=unnamedplus semantics).
     ///
     /// Thin wrapper — see [`render::sync_register_to_clipboard`] (#1239) for
-    /// the shared implementation TUI's `sync_tui_clipboard` also delegates to.
+    /// the shared implementation TUI's `sync_tui_clipboard` also delegated to
+    /// before #1434 deleted that wrapper along with the rest of the
+    /// pre-#1434 TUI shell.
     fn sync_plus_register_to_clipboard(&mut self) {
         render::sync_register_to_clipboard(
             &mut self.engine.borrow_mut(),
