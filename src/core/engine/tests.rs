@@ -22848,6 +22848,69 @@ fn test_command_center_chat_with_acp_agent_configured_shows_open_panel() {
     );
 }
 
+/// #1446: `:AI hello` with no ACP agent configured and no API key
+/// resolvable for the (default) `anthropic` provider must fail with an
+/// actionable message naming both missing pieces, instead of spawning curl
+/// and reporting whatever (often empty) stderr the doomed request produces
+/// — the reported bug was a bare "AI error: curl failed:".
+///
+/// RED verified: reverting `ai_send_message`'s new pre-flight check makes
+/// this fail — `e.message` stays empty and `e.ai_streaming` flips to
+/// `true` because the (real, unmocked) `curl` subprocess is spawned
+/// instead.
+#[test]
+fn test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message() {
+    let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+    let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+    let mut e = engine_with_text("hello");
+    assert!(e.settings.ai_api_key.is_empty());
+    assert!(e.settings.acp_agent_command.trim().is_empty());
+    assert!(e.settings.acp_agents.is_empty());
+
+    e.ai_send_message("hello".to_string());
+
+    assert!(
+        !e.ai_streaming,
+        "should not spawn the curl transport when unconfigured"
+    );
+    assert!(
+        e.ai_rx.is_none(),
+        "no background request should have been started"
+    );
+    assert!(
+        e.message.contains("no ACP agent configured"),
+        "message should explain the ACP side is unconfigured: {}",
+        e.message
+    );
+    assert!(
+        e.message.contains("no API key for provider \"anthropic\""),
+        "message should explain the API key side is unconfigured: {}",
+        e.message
+    );
+}
+
+/// Companion to the above: an Ollama provider needs no API key at all, so
+/// the pre-flight check must not block it — it should still fall through
+/// to the curl transport (and thus start streaming).
+#[test]
+fn test_ai_send_message_ollama_needs_no_key() {
+    let mut e = engine_with_text("hello");
+    e.settings.ai_provider = "ollama".to_string();
+    assert!(e.settings.ai_api_key.is_empty());
+
+    e.ai_send_message("hello".to_string());
+
+    assert!(
+        e.ai_streaming,
+        "ollama needs no API key, so the curl transport should still start: {}",
+        e.message
+    );
+}
+
 #[test]
 fn test_command_center_chat_with_question() {
     let mut e = engine_with_text("hello");

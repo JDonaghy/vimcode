@@ -14856,6 +14856,38 @@ mod tests {
         );
     }
 
+    /// #1446: with no ACP agent configured and no resolvable API key,
+    /// `Engine::ai_send_message` sets an actionable `engine.message` instead
+    /// of the old bare "curl failed:" — and that message must actually
+    /// reach the screen, not just the field. `build_command_line` renders
+    /// `engine.message` verbatim on the command-line row (same surface
+    /// `render_content_paints_command_line_via_shell_app` covers), so this
+    /// asserts on painted text rather than on `engine.message` being set.
+    ///
+    /// RED verified: with `ai_send_message`'s pre-flight check reverted,
+    /// this fails — the (real) curl transport is spawned instead, so
+    /// `engine.message` (and thus the screen) never gets the new text.
+    #[test]
+    fn render_content_paints_ai_no_key_error_via_shell_app() {
+        let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let mut app = TuiShellApp::new(None);
+        app.engine.ai_send_message("hello".to_string());
+
+        // Wide enough that the full message isn't clipped by the command
+        // line's column width (#605's status-bar rule row).
+        let driver = driver_with_shell(app, config(), 160, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("no API key for provider"),
+            "the pre-flight AI error should paint on the command line; screen:\n{screen}"
+        );
+    }
+
     /// Install a mock board provider — an installed extension whose
     /// manifest declares `[board]` (#522's seam). No coordinator (or any
     /// other specific provider) anywhere in this test, per #521's "generic
