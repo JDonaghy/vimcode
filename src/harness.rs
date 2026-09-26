@@ -5642,7 +5642,8 @@ mod issue_1418_explorer_context_menu {
     // one: TUI opened the (workspace-wide) Grep picker,
     // GTK just focused the Search sidebar panel — neither actually
     // scoped to the clicked folder the menu label names. Confirming must
-    // now open the Grep picker (`"Live Grep"` title) scoped to
+    // now open the Grep picker, titled `"Grep in scoped_dir/"` (#1438's
+    // "show the scope in the picker title" requirement), scoped to
     // `scoped_dir` (`Engine::open_grep_picker_scoped`): typing the marker
     // query both fixture files share must surface only `scoped_dir`'s own
     // match.
@@ -5651,11 +5652,12 @@ mod issue_1418_explorer_context_menu {
     // `"find_in_folder"` arm changed to a bare `_ => {}`, no picker ever
     // opens on either arm below — the same failure both actual pre-fix
     // behaviors would also hit, since neither GTK's old
-    // `self.toggle_focus_search()` (opens the Search panel, no
-    // `"Live Grep"` title at all) nor TUI's old unscoped
+    // `self.toggle_focus_search()` (opens the Search panel, no scoped
+    // "Grep in ..." title at all) nor TUI's old unscoped
     // `engine.open_picker(PickerSource::Grep)` (would fail this scenario's
-    // *last* assertion instead, surfacing `other_dir`'s match too) leaves
-    // this scenario green.
+    // *last* assertion instead, surfacing `other_dir`'s match too, and
+    // would show the plain "Live Grep" title rather than a scoped one)
+    // leaves this scenario green.
     crate::backend_conformance! {
         label: context_menu_find_in_folder_scopes_grep_to_the_folder,
         backends: [gtk, tui_prod],
@@ -5663,15 +5665,16 @@ mod issue_1418_explorer_context_menu {
         size: (800, 480),
         body: |driver| {
             assert!(
-                !driver.screen_has("Live Grep"),
-                "precondition: the Grep picker is not open yet"
+                !driver.screen_has("Grep in scoped_dir"),
+                "precondition: the scoped Grep picker is not open yet"
             );
             driver.press_named(NamedKey::Enter);
             assert!(
-                driver.screen_has("Live Grep"),
+                driver.screen_has("Grep in scoped_dir"),
                 "confirming 'Find in Folder...' must open the Grep picker \
-                 (GTK used to just focus the Search panel instead — a \
-                 different feature, not a scoped version of this one)"
+                 titled with the scoped folder (GTK used to just focus \
+                 the Search panel instead — a different feature, not a \
+                 scoped version of this one)"
             );
             driver.type_text(SCOPED_GREP_COMMON);
             assert!(
