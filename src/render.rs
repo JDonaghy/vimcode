@@ -11,10 +11,13 @@
 // `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
 // `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
 // and `TabBarHits`/`SyntaxSpan` (quadraui#822/#823) that this file still uses.
-// Migrating every call site to the `_interactive` hover/pressed API and the
-// new `TabBarLayout`/`MinimapSpan` shapes is an unrelated, cross-backend
-// refactor, not part of #937's nerd-font fix; tracked for follow-up instead
-// of bundled in here.
+// #1490 migrated every `draw_status_bar` call site to
+// `draw_status_bar_interactive`; `draw_toolbar`/`draw_sidebar_panel`/
+// `draw_tab_bar`/`SyntaxSpan` are still deprecated and still used here —
+// migrating those to the `_interactive` hover/pressed API and the new
+// `TabBarLayout`/`MinimapSpan` shapes is unrelated, cross-backend follow-up
+// work (the `TabBarHits` follow-up), not part of this file-level allow's
+// removal.
 //
 // `dead_code` dropped by #1489: the ~600 lines it was silently covering
 // (two whole dead data pipelines plus five dead helpers) are gone; any new
@@ -9626,7 +9629,7 @@ pub fn paint_separated_status_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
-    let _ = b.draw_status_bar(rect, &bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, &bar)
 }
 
@@ -9720,7 +9723,11 @@ pub fn paint_bottom_panel_rung(
             let toolbar_rect = quadraui::Rect::new(rect.x, rect.y + lh, rect.width, lh);
             let toolbar_hits = match build_terminal_toolbar(term, theme) {
                 TerminalToolbar::FindBar(bar) => {
-                    let _ = b.draw_status_bar(toolbar_rect, &bar, None, None);
+                    let _ = b.draw_status_bar_interactive(
+                        toolbar_rect,
+                        &bar,
+                        &quadraui::InteractionState::new(),
+                    );
                     // No raw `pango::Layout` is reachable from a `&mut dyn
                     // Backend`-only signature (the #669 gap), so segment widths
                     // are approximated by char count * `cw` rather than exact
@@ -9772,7 +9779,11 @@ pub fn paint_bottom_panel_rung(
                 for i in 0..visible_rows {
                     let row =
                         quadraui::Rect::new(rect.x, content_y + i as f32 * lh, rect.width, lh);
-                    let _ = b.draw_status_bar(row, &bg_bar, None, None);
+                    let _ = b.draw_status_bar_interactive(
+                        row,
+                        &bg_bar,
+                        &quadraui::InteractionState::new(),
+                    );
                 }
             }
 
@@ -9967,7 +9978,8 @@ pub fn paint_breadcrumb_bars(
     terminal_maximized: bool,
 ) {
     for t in breadcrumb_draw_targets(screen, terminal_maximized) {
-        let layout = backend.draw_status_bar(t.rect, t.bar, None, None);
+        let layout =
+            backend.draw_status_bar_interactive(t.rect, t.bar, &quadraui::InteractionState::new());
         *t.draw_layout.borrow_mut() = Some(layout);
     }
 }
@@ -10491,7 +10503,7 @@ pub fn paint_wildmenu_rung(
     rect: quadraui::Rect,
 ) {
     let bar = wildmenu_to_status_bar(wm, theme);
-    let _ = b.draw_status_bar(rect, &bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
 }
 
 /// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
@@ -10509,7 +10521,7 @@ pub fn paint_global_status_bar_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     engine.global_status_rect.set(rect);
-    let _ = b.draw_status_bar(rect, bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, bar)
 }
 
@@ -23624,7 +23636,7 @@ pub fn tab_hover_tooltip_paint(
         right_segments: vec![],
     };
     let rect = quadraui::Rect::new(x, y, w_chars * uw, unit_h);
-    let _ = backend.draw_status_bar(rect, &bar, None, None);
+    let _ = backend.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
 }
 
 pub fn build_command_line(engine: &Engine) -> CommandLineData {

@@ -85,12 +85,13 @@
 //! backend-neutral window-chrome/file-watcher/file-picker surface) rather
 //! than new per-backend code — see `docs/IRREDUCIBLE_SURFACE.md`.
 //!
-//! #937's quadraui pin bump deprecated `Backend::draw_status_bar`
-//! (quadraui#819, replacement is `draw_status_bar_interactive`) that this
-//! file's status-bar paint calls still use; migrating them to the
-//! hover/pressed `InteractionState` API is an unrelated refactor deferred to
-//! a follow-up, so it's silenced here rather than left as a stray warning
-//! under `-D warnings`.
+//! #1490 migrated this file's `Backend::draw_status_bar` (quadraui#819)
+//! calls to `draw_status_bar_interactive`, so the file-level allow below no
+//! longer covers that. It stays for the unrelated deprecated
+//! `ShellApp::on_shell_event` shim `on_shell_event_ctx` still calls
+//! (`#[allow(deprecated)]`'d at that one call site too, but this test
+//! module also calls it directly) — silenced here rather than left as a
+//! stray warning under `-D warnings`.
 #![allow(deprecated)]
 
 #[cfg(feature = "gui")]
@@ -3638,7 +3639,11 @@ impl App {
             // #764: this is the layout the *paint* resolved, not a second
             // `status_bar_layout` re-measure of the same bar as it used to be —
             // same reasoning as `render::PaintedTabBar::hits`.
-            let sb_layout = backend.draw_status_bar(sb_rect, &win_bar, None, None);
+            let sb_layout = backend.draw_status_bar_interactive(
+                sb_rect,
+                &win_bar,
+                &quadraui::InteractionState::new(),
+            );
             self.status_segment_map.borrow_mut().insert(
                 rw.window_id.0,
                 render::status_bar_zones_from_layout(&sb_layout),
@@ -3836,7 +3841,11 @@ impl App {
                         );
                         self.cached_sc_bands.set(Some(bands));
                         let header_bar = render::sc_header_status_bar(sc, theme);
-                        let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
+                        let _ = backend.draw_status_bar_interactive(
+                            bands.header,
+                            &header_bar,
+                            &quadraui::InteractionState::new(),
+                        );
 
                         let ti = render::sc_commit_message_to_text_input(sc);
                         backend.draw_text_input(bands.commit_input, &ti);
@@ -3851,7 +3860,11 @@ impl App {
                         // has focus) so it can't show unreserved space.
                         if let Some(hint_rect) = bands.hint {
                             let hint_bar = render::sc_hint_status_bar(theme);
-                            let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+                            let _ = backend.draw_status_bar_interactive(
+                                hint_rect,
+                                &hint_bar,
+                                &quadraui::InteractionState::new(),
+                            );
                         }
                         let body_rect = engine
                             .sc_panel_layout
@@ -3973,7 +3986,11 @@ impl App {
                         if let Some(ref status) = board.status {
                             let bar = render::board_status_bar(status, theme);
                             let rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
-                            let _ = backend.draw_status_bar(rect, &bar, None, None);
+                            let _ = backend.draw_status_bar_interactive(
+                                rect,
+                                &bar,
+                                &quadraui::InteractionState::new(),
+                            );
                         }
                     }
                 }
@@ -7676,11 +7693,13 @@ impl App {
                 .unwrap_or(false);
             let controls_bar = render::window_controls_status_bar(theme, maximized);
             let interaction = self.title_bar_interaction.borrow();
-            let hits = backend.draw_status_bar(
+            let hits = backend.draw_status_bar_interactive(
                 controls_rect,
                 &controls_bar,
-                interaction.hovered_id(),
-                interaction.pressed_id(),
+                &quadraui::InteractionState::from_parts(
+                    interaction.hovered_id().cloned(),
+                    interaction.pressed_id().cloned(),
+                ),
             );
             interaction.set_layout(hits);
         }
