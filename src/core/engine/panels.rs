@@ -687,7 +687,7 @@ impl Engine {
                         }
                     }
                     crate::core::acp::AcpAuthMethodKind::Terminal => {
-                        self.acp_launch_terminal_login(&method.name);
+                        self.acp_launch_terminal_login(&method.name, &method.args);
                     }
                 }
                 EngineAction::None
