@@ -80,14 +80,23 @@ impl Engine {
     }
 
     /// Open the Grep picker scoped to `dir` — the explorer context menu's
-    /// "Find in Folder..." action (#1418). Search results are restricted to
-    /// `dir` (via [`Self::picker_grep_scope`]) instead of the whole
-    /// workspace, matching the menu label. `open_picker` already reset
-    /// `picker_grep_scope` to `None`, so this only needs to set it
-    /// afterwards.
+    /// "Find in Folder..." action (#1418/#1438). Search results are
+    /// restricted to `dir` (via [`Self::picker_grep_scope`]) instead of the
+    /// whole workspace, matching the menu label. `open_picker` already
+    /// reset `picker_grep_scope` to `None`, so this only needs to set it
+    /// afterwards. The picker title is switched from the plain "Live Grep"
+    /// to `"Grep in <dir relative to cwd>/"` so the scope is visible in the
+    /// UI, not just in search behavior (#1438).
     pub fn open_grep_picker_scoped(&mut self, dir: &Path) {
         self.open_picker(PickerSource::Grep);
         self.picker_grep_scope = Some(dir.to_path_buf());
+        let rel = dir.strip_prefix(&self.cwd).unwrap_or(dir);
+        let rel_str = rel.to_string_lossy();
+        self.picker_title = if rel_str.is_empty() {
+            "Live Grep".to_string()
+        } else {
+            format!("Grep in {}/", rel_str.trim_end_matches(['/', '\\']))
+        };
     }
 
     /// Open the Command Center picker (called from menu bar search box click).
@@ -1449,14 +1458,19 @@ impl Engine {
     /// Shared between the standalone Grep picker source and Command Center `%` prefix.
     ///
     /// Searches under [`Self::picker_grep_scope`] when set (the "Find in
-    /// Folder..." context-menu action, #1418) — [`Self::cwd`] otherwise.
+    /// Folder..." context-menu action, #1418/#1438) — [`Self::cwd`]
+    /// otherwise. Displayed paths always stay relative to [`Self::cwd`]
+    /// (the workspace root), even when the search itself is scoped to a
+    /// subfolder, so opening a result behaves exactly as it does for the
+    /// unscoped picker (#1438).
     fn picker_cc_grep_search(&mut self, query: &str) {
         let options = project_search::SearchOptions::default();
-        let cwd = self
+        let search_root = self
             .picker_grep_scope
             .clone()
             .unwrap_or_else(|| self.cwd.clone());
-        match project_search::search_in_project(&cwd, query, &options) {
+        let display_root = self.cwd.clone();
+        match project_search::search_in_project(&search_root, query, &options) {
             Ok(mut results) => {
                 results.truncate(200);
                 self.picker_items = results
@@ -1464,7 +1478,7 @@ impl Engine {
                     .map(|m| {
                         let rel = m
                             .file
-                            .strip_prefix(&cwd)
+                            .strip_prefix(&display_root)
                             .unwrap_or(&m.file)
                             .to_string_lossy()
                             .into_owned();
@@ -2834,5 +2848,148 @@ impl Engine {
             }
             _ => EngineAction::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod grep_scope_tests {
+    use super::*;
+
+    /// Marker token shared by files both inside and outside the scoped
+    /// folder, so a query matching it alone cannot tell scoped from
+    /// unscoped — the per-file suffix below is what a scope must filter
+    /// on (mirrors `src/harness.rs`'s
+    /// `issue_1418_explorer_context_menu::SCOPED_GREP_COMMON` fixture).
+    const MARKER: &str = "zqxw1438grepscope";
+
+    /// Build an engine rooted at a fresh temp workspace containing
+    /// `dir/in_scope.txt` (matching `MARKER` + `"in"`) and a sibling
+    /// `other/out_of_scope.txt` (matching `MARKER` + `"out"`). Returns
+    /// `(engine, dir)`.
+    fn engine_with_scoped_and_unscoped_files(tag: &str) -> (Engine, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "vimcode_test_1438_grep_scope_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("dir");
+        let other = root.join("other");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(dir.join("in_scope.txt"), format!("{MARKER}in")).unwrap();
+        std::fs::write(other.join("out_of_scope.txt"), format!("{MARKER}out")).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.cwd = root;
+        (engine, dir)
+    }
+
+    /// `open_grep_picker_scoped(dir)` + a query matching files both inside
+    /// and outside `dir` must return only the match under `dir` (#1438).
+    #[test]
+    fn open_grep_picker_scoped_only_returns_matches_under_dir() {
+        let (mut engine, dir) = engine_with_scoped_and_unscoped_files("scoped_only");
+
+        engine.open_grep_picker_scoped(&dir);
+        engine.picker_query = MARKER.to_string();
+        engine.picker_filter();
+
+        assert_eq!(
+            engine.picker_items.len(),
+            1,
+            "expected exactly one match under the scoped folder, got: {:?}",
+            engine
+                .picker_items
+                .iter()
+                .map(|i| &i.display)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            engine.picker_items[0].display.contains("in_scope.txt"),
+            "the scoped folder's own match must appear: {}",
+            engine.picker_items[0].display
+        );
+    }
+
+    /// The scoped picker's title must show the folder being searched
+    /// (#1438's "Show the scope in the picker title" requirement).
+    #[test]
+    fn open_grep_picker_scoped_shows_folder_in_title() {
+        let (mut engine, dir) = engine_with_scoped_and_unscoped_files("title");
+
+        engine.open_grep_picker_scoped(&dir);
+
+        assert_eq!(engine.picker_title, "Grep in dir/");
+    }
+
+    /// The ordinary (unscoped) Grep picker must keep searching the whole
+    /// workspace — matches both inside and outside `dir` must appear.
+    #[test]
+    fn unscoped_grep_picker_still_returns_matches_from_everywhere() {
+        let (mut engine, _dir) = engine_with_scoped_and_unscoped_files("unscoped");
+
+        engine.open_picker(PickerSource::Grep);
+        engine.picker_query = MARKER.to_string();
+        engine.picker_filter();
+
+        assert_eq!(
+            engine.picker_items.len(),
+            2,
+            "expected matches from both folders when unscoped, got: {:?}",
+            engine
+                .picker_items
+                .iter()
+                .map(|i| &i.display)
+                .collect::<Vec<_>>()
+        );
+        assert!(engine
+            .picker_items
+            .iter()
+            .any(|i| i.display.contains("in_scope.txt")));
+        assert!(engine
+            .picker_items
+            .iter()
+            .any(|i| i.display.contains("out_of_scope.txt")));
+    }
+
+    /// Right-clicking a *file* (not a folder) must scope the grep picker
+    /// to the file's parent directory, per #1438's acceptance criteria —
+    /// `apply_explorer_context_action`'s `"find_in_folder"` arm resolves
+    /// this via `explorer_ctx_action_dir` before calling
+    /// `open_grep_picker_scoped`.
+    #[test]
+    fn find_in_folder_on_a_file_target_scopes_to_its_parent_directory() {
+        let (mut engine, dir) = engine_with_scoped_and_unscoped_files("file_target");
+        let file_target = dir.join("in_scope.txt");
+
+        let mut host = NoopHost;
+        crate::render::apply_explorer_context_action(
+            &mut engine,
+            "find_in_folder",
+            &file_target,
+            false,
+            &mut host,
+        );
+        engine.picker_query = MARKER.to_string();
+        engine.picker_filter();
+
+        assert_eq!(
+            engine.picker_items.len(),
+            1,
+            "right-clicking a file must scope the search to its parent \
+             directory, not the whole workspace: {:?}",
+            engine
+                .picker_items
+                .iter()
+                .map(|i| &i.display)
+                .collect::<Vec<_>>()
+        );
+        assert!(engine.picker_items[0].display.contains("in_scope.txt"));
+    }
+
+    struct NoopHost;
+    impl crate::render::ExplorerContextHost for NoopHost {
+        fn open_terminal_at(&mut self, _engine: &mut Engine, _dir: std::path::PathBuf) {}
     }
 }
