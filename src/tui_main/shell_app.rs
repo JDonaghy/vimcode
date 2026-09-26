@@ -15559,6 +15559,180 @@ mod tests {
         );
     }
 
+    /// #1445: opening the AI panel through the real click UI (an
+    /// activity-bar icon click, exactly how a user opens it) must give the
+    /// panel keyboard focus, so a subsequent Ctrl+S submits the chat input
+    /// instead of falling through to the editor's save binding. Every other
+    /// AI panel test in this file sets `app.engine.ai_has_focus = true;
+    /// app.sidebar.has_focus = true` directly, which is why none of them
+    /// covered the path a user actually takes.
+    #[test]
+    fn clicking_the_ai_icon_gives_the_panel_keyboard_focus_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1445_ai_panel_click_focus_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("editme1445.txt");
+        std::fs::write(&file_path, "original content\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_file_with_mode(&file_path, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let (x, y) = driver.find(crate::icons::AI_CHAT.s()).unwrap_or_else(|| {
+            panic!(
+                "AI icon must paint on the activity bar; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(x, y);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("AI ASSISTANT"),
+            "precondition: clicking the icon must open the AI panel; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        for c in "hello assistant".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello assistant") && screen.contains("You"),
+            "typing after clicking the AI icon must land in the chat input, \
+             and Ctrl+S must submit it as a transcript turn rather than \
+             falling through to a buffer save (#1445); screen:\n{screen}"
+        );
+
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            on_disk, "original content\n",
+            "Ctrl+S with the AI panel open via a real click must not save \
+             the editor buffer to disk (#1445)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1445: clicking *into* the already-open AI panel's body (its status
+    /// line / input box, not its activity-bar icon) must (re-)give it
+    /// keyboard focus, exactly like every other sidebar panel's own body
+    /// click already does (`mouse::handle_mouse`'s `SidebarOwner::Debug` /
+    /// `::Git` / `::Search` / `::Settings` / `::Board` arms). Reproduces the
+    /// bug report's second scenario: open the panel, let focus move to the
+    /// editor (clearing `sidebar.has_focus`/`ai_has_focus` the same way a
+    /// real click on the buffer does), then click back into the panel and
+    /// try to type — before the fix, `SidebarOwner::Ai` had no arm at all in
+    /// that `if`/`else if` chain, so the click was silently swallowed
+    /// (`return sidebar_width` right after the chain) without setting either
+    /// focus flag, and the follow-up keystrokes (including Ctrl+S) kept
+    /// going to the editor.
+    #[test]
+    fn clicking_into_the_ai_panel_body_gives_it_keyboard_focus_via_shell_app() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1445_ai_panel_body_click_focus_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("editme1445b.txt");
+        std::fs::write(&file_path, "original content\n").unwrap();
+
+        let mut app = TuiShellApp::new_for_test();
+        app.engine
+            .open_file_with_mode(&file_path, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut driver = driver_with_shell(app, TuiShellApp::build_shell_config(false), 100, 30);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+
+        let (ai_x, ai_y) = driver.find(crate::icons::AI_CHAT.s()).unwrap_or_else(|| {
+            panic!(
+                "AI icon must paint on the activity bar; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(ai_x, ai_y);
+        driver.mouse_up(ai_x, ai_y);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        assert!(
+            driver.screen_contains("AI ASSISTANT"),
+            "precondition: clicking the icon must open the AI panel; \
+             screen:\n{}",
+            driver.screen()
+        );
+
+        // Move focus to the editor, the same way a real click on the buffer
+        // does — this is the `sidebar.has_focus = false; clear_sidebar_focus()`
+        // rung in `mouse::handle_mouse`'s editor-area arm. `mouse_up` matters
+        // here: a real terminal always pairs a button press with a release,
+        // and without it this click's own text-selection drag stays "active"
+        // (`quadraui::DragState`) for the *next* click below — which would
+        // then spuriously match the stale `explorer:sb` scroll-surface arm's
+        // `&& drag_state.is_active()` guard (`mouse::handle_mouse`) and get
+        // swallowed before ever reaching the sidebar-owner dispatch this test
+        // means to exercise.
+        let (ed_x, ed_y) = driver.find("original content").unwrap_or_else(|| {
+            panic!(
+                "the open buffer must be painted in the editor pane; \
+                 screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(ed_x, ed_y);
+        driver.mouse_up(ed_x, ed_y);
+        driver.render();
+
+        // Click back into the still-visible AI panel's own body (its status
+        // line), not its activity-bar icon.
+        let (body_x, body_y) = driver.find("AI ASSISTANT").unwrap_or_else(|| {
+            panic!(
+                "the AI panel must still be visible after the editor click; \
+                 screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(body_x, body_y);
+        driver.mouse_up(body_x, body_y);
+        driver.render();
+
+        for c in "hello again".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello again") && screen.contains("You"),
+            "typing after clicking into the AI panel's body must land in \
+             the chat input, and Ctrl+S must submit it as a transcript turn \
+             rather than falling through to a buffer save (#1445); \
+             screen:\n{screen}"
+        );
+
+        let on_disk = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            on_disk, "original content\n",
+            "Ctrl+S after clicking into the AI panel's body must not save \
+             the editor buffer to disk (#1445)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// AI: the transcript must scroll — `ChatController` follows the tail by
     /// default (#819), so a long conversation shows only its most recent
     /// turns until the user scrolls up, at which point earlier messages
