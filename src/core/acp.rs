@@ -327,6 +327,14 @@ pub struct AcpAgentProfile {
     /// skipped rather than erroring.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Per-agent override of `settings.acp_mcp_servers` (#1487): any entry
+    /// here whose `name` matches a global entry replaces it; any other
+    /// entry is appended. Empty (the default, every pre-#1487 profile)
+    /// leaves the global list untouched. See
+    /// `Engine::acp_resolve_mcp_servers` (`src/core/engine/acp_ops.rs`),
+    /// the one place that reads this field.
+    #[serde(default)]
+    pub mcp_servers: Vec<AcpMcpServerConfig>,
 }
 
 /// Parse an [`AcpAgentProfile::env`] list into `(key, value)` pairs for
@@ -338,6 +346,163 @@ pub fn parse_agent_env(env: &[String]) -> Vec<(String, String)> {
         .filter_map(|entry| entry.split_once('='))
         .map(|(k, v)| (k.trim().to_string(), v.to_string()))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// User-configured MCP servers (#1487, redo of #1462 on the multi-session
+// engine — see this module's session-scoped `AcpSession::mcp_capabilities`/
+// `AcpSession::active_mcp_servers`, not a global `Engine` field)
+// ---------------------------------------------------------------------------
+
+/// One entry in the user-configured MCP server list — `settings.
+/// acp_mcp_servers` (global) and optionally overridden per-agent by
+/// [`AcpAgentProfile::mcp_servers`]. Shape mirrors ACP's `McpServer` wire
+/// type: the `stdio` transport (`command`/`args`/`env`) is baseline ACP v1
+/// and always eligible; `http`/`sse` (`url`/`headers`) are optional
+/// transports gated on the live agent's own
+/// `agentCapabilities.mcpCapabilities` — see [`build_mcp_servers_wire`],
+/// the one place that turns this config shape into the wire array
+/// `session/new`/`session/load` sends.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AcpMcpServerConfig {
+    /// Display name, also the wire `McpServer.name` — shown back in the
+    /// `:AiAgent` status line (`Engine::acp_agent_registry_status_line`)
+    /// once the session actually started with it.
+    pub name: String,
+    /// `"stdio"` (the default, including when empty/absent), `"http"`, or
+    /// `"sse"`, matched case-insensitively. Any other value is treated as
+    /// `"stdio"` — same "a config typo degrades quietly" posture as
+    /// [`parse_agent_command`]'s empty-token handling.
+    #[serde(default)]
+    pub transport: String,
+    /// `stdio` only: the subprocess command.
+    #[serde(default)]
+    pub command: String,
+    /// `stdio` only: command-line arguments.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// `stdio` only: extra environment variables for the MCP server
+    /// subprocess, each `"KEY=VALUE"` ([`parse_agent_env`]).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// `http`/`sse` only: the server URL.
+    #[serde(default)]
+    pub url: String,
+    /// `http`/`sse` only: extra HTTP headers, each `"KEY=VALUE"` — parsed
+    /// with the same [`parse_agent_env`] a key/value pair is parsed with
+    /// everywhere else in this module.
+    #[serde(default)]
+    pub headers: Vec<String>,
+}
+
+impl AcpMcpServerConfig {
+    fn is_http(&self) -> bool {
+        self.transport.eq_ignore_ascii_case("http")
+    }
+
+    fn is_sse(&self) -> bool {
+        self.transport.eq_ignore_ascii_case("sse")
+    }
+}
+
+/// `["KEY=VALUE", ...]` -> ACP's `[{"name": "KEY", "value": "VALUE"}, ...]`
+/// wire shape — shared by `env` and `headers`, both key/value pairs parsed
+/// the same way ([`parse_agent_env`]).
+fn kv_pairs_to_wire(pairs: &[String]) -> Vec<serde_json::Value> {
+    parse_agent_env(pairs)
+        .into_iter()
+        .map(|(name, value)| serde_json::json!({"name": name, "value": value}))
+        .collect()
+}
+
+/// Turn user-configured MCP server entries into the wire `McpServer` array
+/// for `session/new`/`session/load`'s `mcpServers` field (#1487), dropping
+/// any `http`/`sse` entry the live agent hasn't advertised support for via
+/// `caps` (`agentCapabilities.mcpCapabilities`, see
+/// [`parse_mcp_capabilities`]). `stdio` entries are never dropped — that
+/// transport is baseline ACP v1, no capability gate exists for it.
+///
+/// Returns `(wire_servers, dropped_names)`; `dropped_names` is empty when
+/// nothing was filtered, and is what `Engine::acp_begin_session`
+/// (`src/core/engine/acp_ops.rs`) turns into the "dropped MCP server(s)
+/// ..." status-line warning the issue asks for.
+///
+/// Wire shapes (matching ACP's `McpServer` schema):
+/// * stdio: `{"name", "command", "args", "env": [{"name","value"}, ...]}`
+///   — no `"type"` tag; `stdio` is the implicit default variant.
+/// * http: `{"name", "type": "http", "url", "headers": [{"name","value"}, ...]}`
+/// * sse: `{"name", "type": "sse", "url", "headers": [{"name","value"}, ...]}`
+pub fn build_mcp_servers_wire(
+    configs: &[AcpMcpServerConfig],
+    caps: AcpMcpCapabilities,
+) -> (Vec<serde_json::Value>, Vec<String>) {
+    let mut wire = Vec::new();
+    let mut dropped = Vec::new();
+    for cfg in configs {
+        if cfg.is_http() {
+            if !caps.http {
+                dropped.push(cfg.name.clone());
+                continue;
+            }
+            wire.push(serde_json::json!({
+                "name": cfg.name,
+                "type": "http",
+                "url": cfg.url,
+                "headers": kv_pairs_to_wire(&cfg.headers),
+            }));
+        } else if cfg.is_sse() {
+            if !caps.sse {
+                dropped.push(cfg.name.clone());
+                continue;
+            }
+            wire.push(serde_json::json!({
+                "name": cfg.name,
+                "type": "sse",
+                "url": cfg.url,
+                "headers": kv_pairs_to_wire(&cfg.headers),
+            }));
+        } else {
+            wire.push(serde_json::json!({
+                "name": cfg.name,
+                "command": cfg.command,
+                "args": cfg.args,
+                "env": kv_pairs_to_wire(&cfg.env),
+            }));
+        }
+    }
+    (wire, dropped)
+}
+
+/// Which optional MCP server transports the agent's `initialize` response
+/// declared support for (`agentCapabilities.mcpCapabilities`, #1487) —
+/// `stdio` needs no such flag (baseline ACP v1); this is only `http`/
+/// `sse`. Captured per-session (`AcpSession::mcp_capabilities`) so
+/// [`build_mcp_servers_wire`] can drop a user-configured `http`/`sse` MCP
+/// server the live agent doesn't actually support, rather than sending it
+/// and letting `session/new`/`session/load` fail or silently ignore it.
+///
+/// An agent that omits `mcpCapabilities` entirely (every pre-#1487 agent,
+/// and the fake fixture by default) parses as all-`false`, never an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpMcpCapabilities {
+    pub http: bool,
+    pub sse: bool,
+}
+
+/// Parse `agentCapabilities.mcpCapabilities` out of the whole
+/// `agentCapabilities` object — same shape [`parse_prompt_capabilities`]
+/// reads a different field of.
+pub fn parse_mcp_capabilities(agent_capabilities: &serde_json::Value) -> AcpMcpCapabilities {
+    let caps = agent_capabilities.get("mcpCapabilities");
+    let bool_field = |name: &str| {
+        caps.and_then(|c| c.get(name))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    AcpMcpCapabilities {
+        http: bool_field("http"),
+        sse: bool_field("sse"),
+    }
 }
 
 /// Which kind of `session/update` chunk a notification carries, as mapped
@@ -3343,6 +3508,103 @@ mod tests {
         // Every pre-#1449 fixture/agent omits the field entirely.
         let absent = parse_prompt_capabilities(&serde_json::Value::Null);
         assert_eq!(absent, AcpPromptCapabilities::default());
+    }
+
+    // ---- User-configured MCP servers (#1487, redo of #1462) ----
+
+    #[test]
+    fn parse_mcp_capabilities_reads_declared_flags_and_defaults_absent_to_false() {
+        let caps = serde_json::json!({"mcpCapabilities": {"http": true, "sse": false}});
+        let parsed = parse_mcp_capabilities(&caps);
+        assert!(parsed.http);
+        assert!(!parsed.sse);
+
+        // Every pre-#1487 fixture/agent omits the field entirely.
+        let absent = parse_mcp_capabilities(&serde_json::Value::Null);
+        assert_eq!(absent, AcpMcpCapabilities::default());
+    }
+
+    #[test]
+    fn build_mcp_servers_wire_always_sends_stdio() {
+        let configs = vec![AcpMcpServerConfig {
+            name: "fs".to_string(),
+            command: "mcp-fs".to_string(),
+            args: vec!["--root".to_string(), "/tmp".to_string()],
+            env: vec!["TOKEN=secret".to_string()],
+            ..Default::default()
+        }];
+        let (wire, dropped) = build_mcp_servers_wire(&configs, AcpMcpCapabilities::default());
+        assert!(dropped.is_empty());
+        assert_eq!(
+            wire,
+            vec![serde_json::json!({
+                "name": "fs",
+                "command": "mcp-fs",
+                "args": ["--root", "/tmp"],
+                "env": [{"name": "TOKEN", "value": "secret"}],
+            })]
+        );
+    }
+
+    #[test]
+    fn build_mcp_servers_wire_drops_http_without_capability_and_sends_it_with() {
+        let configs = vec![AcpMcpServerConfig {
+            name: "remote".to_string(),
+            transport: "http".to_string(),
+            url: "https://mcp.example.com".to_string(),
+            headers: vec!["Authorization=Bearer tok".to_string()],
+            ..Default::default()
+        }];
+
+        let (wire, dropped) = build_mcp_servers_wire(&configs, AcpMcpCapabilities::default());
+        assert!(
+            wire.is_empty(),
+            "http server must be dropped when the agent doesn't advertise it: {wire:?}"
+        );
+        assert_eq!(dropped, vec!["remote".to_string()]);
+
+        let (wire, dropped) = build_mcp_servers_wire(
+            &configs,
+            AcpMcpCapabilities {
+                http: true,
+                sse: false,
+            },
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(
+            wire,
+            vec![serde_json::json!({
+                "name": "remote",
+                "type": "http",
+                "url": "https://mcp.example.com",
+                "headers": [{"name": "Authorization", "value": "Bearer tok"}],
+            })]
+        );
+    }
+
+    #[test]
+    fn build_mcp_servers_wire_drops_sse_without_capability_and_sends_it_with() {
+        let configs = vec![AcpMcpServerConfig {
+            name: "events".to_string(),
+            transport: "sse".to_string(),
+            url: "https://mcp.example.com/sse".to_string(),
+            ..Default::default()
+        }];
+
+        let (wire, dropped) = build_mcp_servers_wire(&configs, AcpMcpCapabilities::default());
+        assert!(wire.is_empty());
+        assert_eq!(dropped, vec!["events".to_string()]);
+
+        let (wire, dropped) = build_mcp_servers_wire(
+            &configs,
+            AcpMcpCapabilities {
+                http: false,
+                sse: true,
+            },
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(wire[0]["type"], "sse");
+        assert_eq!(wire[0]["name"], "events");
     }
 
     /// Review nit: direct unit coverage for [`parse_load_session_capability`]

@@ -31,7 +31,13 @@
 #                           result also carries a `modes` field with two
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
-#                           against.
+#                           against. (#1487) If $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+#                           names a file, the raw request line is appended to
+#                           it first, unconditionally — lets a test assert on
+#                           the actual `mcpServers` array `session/new`
+#                           carried, the same "capture the raw line, parse it
+#                           with serde_json on the Rust side" shape
+#                           $ACP_FAKE_CAPTURE_PROMPT_TO already uses below.
 #   - session/load       -> (#1459) only reachable when $ACP_FAKE_LOAD_SESSION
 #                           also made `initialize` advertise the capability
 #                           (see below), matching the real Claude ACP
@@ -49,7 +55,13 @@
 #                           $ACP_FAKE_LOAD_SESSION_ERROR is set, replies with
 #                           a JSON-RPC error instead, for the "resume against
 #                           an agent that doesn't actually support it"
-#                           regression path.
+#                           regression path. (#1487) If
+#                           $ACP_FAKE_CAPTURE_SESSION_LOAD_TO names a file,
+#                           the raw request line is appended to it first,
+#                           unconditionally — same shape as
+#                           $ACP_FAKE_CAPTURE_SESSION_NEW_TO above, for the
+#                           "a resume also resends the configured MCP
+#                           servers" acceptance bar.
 #   - session/prompt     -> (#1449) if $ACP_FAKE_CAPTURE_PROMPT_TO names a
 #                           file, the raw request line is appended to it
 #                           first, unconditionally — lets a test assert on
@@ -223,6 +235,14 @@
 # (capability absent/false) and the actual resume path (capability true)
 # against the same fixture.
 #
+# #1487 (redo of #1462 on the multi-session engine): `initialize`'s
+# `agentCapabilities.mcpCapabilities.http`/`.sse` are each `false`/absent
+# unless the matching $ACP_FAKE_MCP_HTTP/$ACP_FAKE_MCP_SSE is set, in which
+# case that one flag is `true` — independently of one another, so a test can
+# drive `parse_mcp_capabilities`/`build_mcp_servers_wire`'s "dropped without
+# the capability, sent with it" branches against the same fixture, for
+# either transport on its own.
+#
 # #957 (ACP-6) interactive terminal-auth login. When this script's own
 # stdin is a real TTY — i.e. it was launched by `Engine::
 # acp_launch_terminal_login`'s `TerminalSession` (a real PTY) rather than
@@ -363,6 +383,24 @@ while IFS= read -r line; do
         fi
         caps_fields="${caps_fields}\"loadSession\":true"
       fi
+      # #1487: mcpCapabilities.http/.sse, each independently gated on its
+      # own env var — see this file's top-of-file doc.
+      mcp_caps_fields=""
+      if [ -n "$ACP_FAKE_MCP_HTTP" ]; then
+        mcp_caps_fields='"http":true'
+      fi
+      if [ -n "$ACP_FAKE_MCP_SSE" ]; then
+        if [ -n "$mcp_caps_fields" ]; then
+          mcp_caps_fields="${mcp_caps_fields},"
+        fi
+        mcp_caps_fields="${mcp_caps_fields}\"sse\":true"
+      fi
+      if [ -n "$mcp_caps_fields" ]; then
+        if [ -n "$caps_fields" ]; then
+          caps_fields="${caps_fields},"
+        fi
+        caps_fields="${caps_fields}\"mcpCapabilities\":{${mcp_caps_fields}}"
+      fi
       agent_caps='{}'
       if [ -n "$caps_fields" ]; then
         agent_caps="{${caps_fields}}"
@@ -374,6 +412,11 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/new"'*)
       id=$(extract_id "$line")
+      # #1487: same capture-to-file shape as $ACP_FAKE_CAPTURE_PROMPT_TO —
+      # let a test assert on the real `mcpServers` array via serde_json.
+      if [ -n "$ACP_FAKE_CAPTURE_SESSION_NEW_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_NEW_TO"
+      fi
       if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
       elif [ -n "$ACP_FAKE_SESSION_MODES" ]; then
@@ -390,6 +433,12 @@ while IFS= read -r line; do
       # answering, matching the real Claude ACP adapter's documented
       # behaviour, then answers with an empty result (no `sessionId` of its
       # own to echo — the caller already knows it).
+      # #1487: same capture-to-file shape as $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+      # — a resume must resend `mcpServers` too, and a test needs to be
+      # able to see that.
+      if [ -n "$ACP_FAKE_CAPTURE_SESSION_LOAD_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_LOAD_TO"
+      fi
       if [ -n "$ACP_FAKE_LOAD_SESSION_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"unknown session"}}\n' "$id"
       else
