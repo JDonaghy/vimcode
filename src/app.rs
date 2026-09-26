@@ -1634,6 +1634,52 @@ impl App {
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
         units: render::UnitProfile,
     ) -> Self {
+        let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
+        // SAFETY: identical contract to `App::new`'s own call — the `Rc` is
+        // moved into the returned `App`, which the caller hands straight to
+        // a `run_with_shell` that owns it for the rest of the process, so
+        // the pointer never dangles. `crate::macos::run` is the only caller
+        // and does exactly that. [`Self::new_portable_for_test`] below is a
+        // second caller of [`Self::build_portable_engine`], but deliberately
+        // **not** of `register_emergency_engine` — see its own doc for why a
+        // second, test-scoped caller of that unsafe fn would be unsound.
+        unsafe {
+            crate::core::swap::register_emergency_engine(
+                engine.as_ptr() as *const crate::core::Engine
+            );
+        }
+
+        Self::assemble(
+            engine,
+            DeferredQueue::new(),
+            None,
+            last_colorscheme,
+            backend,
+            units,
+            true,
+        )
+    }
+
+    /// Shared prologue for [`Self::new_portable`] and
+    /// [`Self::new_portable_for_test`]: build the real, startup-run `Engine`
+    /// (not the headless fixture [`Self::new_headless_with_backend`] wraps)
+    /// plus the clipboard wiring and last-known colorscheme both callers
+    /// need before deciding what to do about the emergency-engine pointer
+    /// and `App::live`.
+    #[cfg_attr(
+        not(any(
+            feature = "win",
+            all(feature = "macos", target_os = "macos"),
+            test,
+            feature = "test-support"
+        )),
+        allow(dead_code)
+    )]
+    fn build_portable_engine(
+        file_path: Option<PathBuf>,
+        backend: &Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        units: render::UnitProfile,
+    ) -> (Rc<RefCell<Engine>>, String) {
         let mut engine = {
             let mut e = Engine::new();
             // #999: same GUI-backend-then-resolve ordering as `App::new`
@@ -1652,19 +1698,44 @@ impl App {
         setup_gtk_clipboard(&mut engine, backend.clone());
 
         let last_colorscheme = engine.settings.colorscheme.clone();
+        (Rc::new(RefCell::new(engine)), last_colorscheme)
+    }
 
-        let engine = Rc::new(RefCell::new(engine));
-        // SAFETY: identical contract to `App::new`'s own call — the `Rc` is
-        // moved into the returned `App`, which the caller hands straight to
-        // a `run_with_shell` that owns it for the rest of the process, so
-        // the pointer never dangles. `crate::macos::run` is the only caller
-        // and does exactly that.
-        unsafe {
-            crate::core::swap::register_emergency_engine(
-                engine.as_ptr() as *const crate::core::Engine
-            );
-        }
-
+    /// Test/headless twin of [`Self::new_portable`] — the seam
+    /// `tui_main::testing::tui_driver`/`tui_driver_with` (#1500) build on,
+    /// so an App-on-TUI scenario runs through the *exact same* construction
+    /// path `tui_main::run`/`crate::macos::run` use (real `Engine::startup`,
+    /// real clipboard wiring), rather than the headless
+    /// [`Self::new_headless_with_backend`] shortcut every `crate::harness`
+    /// scenario uses on a caller-supplied fixture `Engine`.
+    ///
+    /// Differs from [`Self::new_portable`] in exactly two ways, both because
+    /// this `App` is dropped at the end of a test function rather than
+    /// living "for the rest of the process":
+    ///
+    /// - **No `core::swap::register_emergency_engine` call.** That fn's own
+    ///   safety contract requires the pointee to outlive the process;
+    ///   registering it here would leave the process-global
+    ///   `EMERGENCY_ENGINE` static holding a dangling `*const Engine` the
+    ///   moment this function's caller's `App`/driver drops — a
+    ///   use-after-free the next test's panic hook (or an external crate's
+    ///   own crash hook, since this constructor backs a `test-support`
+    ///   seam) could dereference. Exactly the hazard
+    ///   [`Self::new_headless_with_backend`]'s own doc names, and the one
+    ///   `TuiShellApp::setup`'s `if self.live` gate exists to avoid on the
+    ///   production TUI path (`src/tui_main/shell_app.rs`).
+    /// - **Passes `live: false`** to [`Self::assemble`], not `true` — see
+    ///   `App::live`'s own doc: that flag gates `tick_dispatch`'s
+    ///   `backend.set_caret_shape` call, whose only real-writing override
+    ///   (`TuiBackend`) writes a raw DECSCUSR escape sequence straight to
+    ///   the test process's real stdout with no test-mode guard of its own.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_portable_for_test(
+        file_path: Option<PathBuf>,
+        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        units: render::UnitProfile,
+    ) -> Self {
+        let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
         Self::assemble(
             engine,
             DeferredQueue::new(),
@@ -1672,7 +1743,7 @@ impl App {
             last_colorscheme,
             backend,
             units,
-            true,
+            false,
         )
     }
 
