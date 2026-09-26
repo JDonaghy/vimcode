@@ -137,7 +137,7 @@ pub(super) fn render_sidebar_content(
         // rule-row trick.
         Some(PANEL_SETTINGS) => render_settings_panel(backend, area, theme, engine),
         Some(PANEL_GIT) => render_source_control(backend, screen, area, engine, theme),
-        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, screen, area, engine, theme),
+        Some(PANEL_EXTENSIONS) => render_ext_sidebar(backend, area, engine, theme),
         // #635 (Stage 6b item C): AI is no longer deferred — `render_ai_sidebar`
         // dropped its `buf: &mut Buffer` parameter for `&mut dyn Backend`.
         Some(PANEL_AI) => render_ai_sidebar(backend, area, engine, theme),
@@ -940,18 +940,11 @@ pub(super) fn render_panel_hover_popup(
 /// helper.
 pub(super) fn render_ext_sidebar(
     backend: &mut dyn quadraui::Backend,
-    screen: &render::ScreenLayout,
     area: Rect,
     engine: &Engine,
     theme: &Theme,
 ) {
     if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    // #1252: reads the frame's own `screen` — see `render_sidebar_content`'s
-    // doc comment.
-    if screen.ext_sidebar.is_none() {
         return;
     }
 

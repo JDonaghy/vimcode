@@ -144,30 +144,6 @@ pub(crate) const SC_COMMIT_BORDER_PX: f32 = 2.0;
 pub(crate) type StatusSegmentMap =
     HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
 
-/// Calculate gutter width in pixels based on line number mode and buffer size
-#[allow(dead_code)]
-fn calculate_gutter_width(
-    mode: core::settings::LineNumberMode,
-    total_lines: usize,
-    char_width: f64,
-) -> f64 {
-    use core::settings::LineNumberMode;
-    match mode {
-        LineNumberMode::None => 0.0,
-        LineNumberMode::Absolute => {
-            // Width = number of digits + 2 chars padding (1 on each side)
-            let digits = total_lines.to_string().len().max(1);
-            (digits + 2) as f64 * char_width
-        }
-        LineNumberMode::Relative | LineNumberMode::Hybrid => {
-            // Relative numbers can be large for long files, use at least 3 digits + 2 padding
-            let max_relative = total_lines.saturating_sub(1);
-            let digits = max_relative.to_string().len().max(3);
-            (digits + 2) as f64 * char_width
-        }
-    }
-}
-
 /// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
 /// so that group rects and divider positions are consistent across draw and click.
 /// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
