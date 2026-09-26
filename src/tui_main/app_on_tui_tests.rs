@@ -65,7 +65,7 @@ mod tests {
     //! band collapses. That is exactly the gap this module exists to inventory
     //! test-by-test rather than leave as a single paragraph in an issue body.
 
-    use quadraui::testing::{ConformanceDriver, DriverInput};
+    use quadraui::testing::ConformanceDriver;
 
     use crate::core::window::SplitDirection;
     use crate::harness::known_bug_gate;
@@ -1266,6 +1266,383 @@ mod tests {
                 );
             });
         }
+
+        // ── #1431 tranche 2: completion/hover popup anchoring ───────────
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1237): the
+        /// completion popup must anchor at the cursor's real *display*
+        /// column, not its raw character column — on a tab-indented line the
+        /// two disagree. See the mirrored test's own doc for the full
+        /// rationale; ported unmodified here since it only drives
+        /// `TuiDriver`'s public `type_char`/`terminal_cursor_position`/
+        /// `find_bounds` API, none of which is `TuiShellApp`-specific.
+        #[test]
+        fn completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.expand_tab = false;
+            engine.buffer_mut().insert(0, "ZQXWFOOBAR\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app",
+                || {
+                    driver.type_char('G');
+                    driver.type_char('o');
+                    driver.type_char('\t');
+                    driver.type_char('\t');
+                    for c in "ZQXWFOO".chars() {
+                        driver.type_char(c);
+                    }
+
+                    let screen = driver.screen();
+                    assert_eq!(
+                        screen.matches("ZQXWFOOBAR").count(),
+                        2,
+                        "precondition: the popup must be showing the \
+                         \"ZQXWFOOBAR\" candidate (once in the dictionary line, \
+                         once in the popup); screen:\n{screen}"
+                    );
+
+                    let (cursor_x, _) = driver
+                        .terminal_cursor_position()
+                        .expect("insert-mode cursor must be visible after typing");
+                    let popup_bounds = driver
+                        .find_bounds("│ ZQXWFOOBAR")
+                        .expect("completion popup must be visible on screen");
+
+                    assert!(
+                        (popup_bounds.x - cursor_x as f32).abs() <= 1.0,
+                        "completion popup (x={}) must anchor at the real \
+                         cursor's display column (x={cursor_x}), not the raw \
+                         character column; screen:\n{screen}",
+                        popup_bounds.x,
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1237 review): the
+        /// LSP hover popup (`ScreenLayout::hover`) must anchor at the same
+        /// tab-expanded display column as the completion popup above.
+        #[test]
+        fn editor_hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.expand_tab = false;
+            engine.buffer_mut().insert(0, "\t\tZZQ\n");
+            engine.view_mut().cursor.col = 5;
+            engine.lsp_hover_text = Some("QXZZYHVR".to_string());
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::editor_hover_popup_anchors_at_the_visual_column_on_tab_indented_line_via_shell_app",
+                || {
+                    let screen = driver.screen();
+                    let zzq_bounds = driver
+                        .find_bounds("ZZQ")
+                        .expect("the tab-indented buffer line must be visible");
+                    let hover_bounds = driver
+                        .find_bounds("QXZZYHVR")
+                        .expect("hover popup must be visible on screen");
+
+                    let expected_x = zzq_bounds.x + zzq_bounds.width + 2.0;
+                    assert!(
+                        (hover_bounds.x - expected_x).abs() <= 1.0,
+                        "hover popup (x={}) must anchor at the tab-expanded \
+                         display column (x≈{expected_x}, right after \"ZZQ\"); \
+                         screen:\n{screen}",
+                        hover_bounds.x,
+                    );
+                },
+            );
+        }
+
+        // ── #1431 tranche 2: tab switcher popup clicks ──────────────────
+
+        /// `count` file tabs, zero-padded so no name is a substring of
+        /// another. Mirrors `shell_app.rs`'s `app_with_many_file_tabs_and_
+        /// switcher_open` fixture builder, minus the `TuiShellApp`-specific
+        /// sidebar-hiding (this module's [`harness_no_sidebar`] does that
+        /// after construction instead).
+        fn engine_with_two_file_tabs_and_switcher_open() -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1431_tab_switcher_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file_a = dir.join("a1431.txt");
+            let file_b = dir.join("b1431.txt");
+            let content: String = (0..40).map(|i| format!("AAA1431 line {i}\n")).collect();
+            std::fs::write(&file_a, &content).unwrap();
+            std::fs::write(&file_b, &content).unwrap();
+
+            let mut engine = plain_engine();
+            engine
+                .open_file_with_mode(&file_a, crate::core::engine::OpenMode::Permanent)
+                .unwrap();
+            engine.new_tab(Some(&file_b));
+            engine.open_tab_switcher();
+            assert!(
+                engine.tab_switcher_open,
+                "fixture must actually open the tab switcher"
+            );
+            engine
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#733): a click
+        /// that lands inside the painted tab-switcher popup must dismiss it
+        /// **and be consumed**, so the editor underneath never sees it.
+        #[test]
+        fn driver_click_inside_tab_switcher_popup_dismisses_and_is_consumed() {
+            let mut h = harness_no_sidebar(engine_with_two_file_tabs_and_switcher_open());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_click_inside_tab_switcher_popup_dismisses_and_is_consumed",
+                || {
+                    let title = driver
+                        .find_bounds("Open Tabs")
+                        .expect("the tab-switcher popup must paint its title");
+                    assert!(
+                        driver.screen_contains("Ln 1, Col 1"),
+                        "precondition: the cursor starts on line 1; screen:\n{}",
+                        driver.screen()
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+                    driver.render();
+
+                    driver.click(title.x + 1.0, title.y + 2.0);
+
+                    let screen = driver.screen();
+                    assert!(
+                        !screen.contains("Open Tabs"),
+                        "a click inside the tab-switcher popup must dismiss \
+                         it; screen:\n{screen}"
+                    );
+                    assert!(
+                        screen.contains("Ln 1, Col 1"),
+                        "the click must be consumed by the popup, not leak \
+                         through to the editor and move the cursor; \
+                         screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name: the complementary
+        /// half — a click *outside* the popup still dismisses it, but
+        /// propagates to the editor underneath.
+        #[test]
+        fn driver_click_outside_tab_switcher_popup_dismisses_and_propagates() {
+            let mut h = harness_no_sidebar(engine_with_two_file_tabs_and_switcher_open());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::driver_click_outside_tab_switcher_popup_dismisses_and_propagates",
+                || {
+                    let title = driver
+                        .find_bounds("Open Tabs")
+                        .expect("the tab-switcher popup must paint its title");
+                    assert!(
+                        driver.screen_contains("Ln 1, Col 1"),
+                        "precondition: the cursor starts on line 1"
+                    );
+
+                    driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+                    driver.render();
+
+                    // Plain editor body, well left of the centred popup.
+                    driver.click(6.0, title.y + 2.0);
+                    driver.render();
+
+                    let screen = driver.screen();
+                    assert!(
+                        !screen.contains("Open Tabs"),
+                        "a click outside the tab-switcher popup must dismiss \
+                         it too; screen:\n{screen}"
+                    );
+                    assert!(
+                        !screen.contains("Ln 1, Col 1"),
+                        "an outside click must propagate to the editor \
+                         underneath and move the cursor off line 1; \
+                         screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        // ── #1431 tranche 2: unified-picker row clicks ──────────────────
+
+        /// Mirrors `shell_app.rs`'s test of the same name: a click on the
+        /// *already selected* palette row confirms it and closes the
+        /// palette.
+        #[test]
+        fn second_click_on_a_picker_row_confirms_it_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "fn main() {}\n");
+            engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+            assert_eq!(
+                engine.picker_selected, 0,
+                "fixture assumes the palette opens on row 0, so row 1 is a \
+                 not-yet-selected row"
+            );
+            let title = engine.picker_title.clone();
+            let row1_label = engine.picker_items[1].display.clone();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::second_click_on_a_picker_row_confirms_it_via_shell_app",
+                || {
+                    let row1 = driver
+                        .find_bounds(&row1_label)
+                        .unwrap_or_else(|| panic!("the palette must paint its {row1_label:?} row"));
+
+                    driver.click(row1.x, row1.y);
+                    assert!(
+                        driver.screen_contains(&title),
+                        "the first click only selects — the palette must \
+                         still be painted; screen:\n{}",
+                        driver.screen()
+                    );
+
+                    driver.click(row1.x, row1.y);
+                    let screen = driver.screen();
+                    assert!(
+                        !screen.contains(&title),
+                        "a second click on the already-selected row must \
+                         confirm it and close the palette; screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#831): a click
+        /// outside the painted picker popup must dismiss it.
+        #[test]
+        fn click_outside_picker_popup_dismisses_it_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "fn main() {}\n");
+            engine.open_picker(crate::core::engine::PickerSource::LineEndings);
+            let title = engine.picker_title.clone();
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::click_outside_picker_popup_dismisses_it_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_contains(&title),
+                        "precondition: the picker's title must paint; \
+                         screen:\n{}",
+                        driver.screen()
+                    );
+
+                    driver.click(6.0, 10.0);
+                    driver.render();
+                    let screen = driver.screen();
+                    assert!(
+                        !screen.contains(&title),
+                        "a click outside the painted popup must dismiss the \
+                         picker (route_modal_overlay_click's \
+                         PickerRoute::Dismiss arm); screen:\n{screen}"
+                    );
+                },
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pickers (folder/workspace picker — #1431 tranche 2)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod pickers {
+        use super::*;
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#815): the shared
+        /// folder/workspace picker must actually paint its entries through
+        /// `FolderPickerController::render`, typing must reach
+        /// `FolderPickerController::handle` and filter the list, and Esc
+        /// must dismiss it.
+        ///
+        /// Needs [`harness_with_folder_picker`] rather than [`harness`]: the
+        /// picker has to exist on `App` *before* it is moved into
+        /// `driver_with_shell`, and `ConformanceHarness` gives no hook back
+        /// to the (by-then-moved) `App` once [`harness`] returns — see
+        /// `crate::tui_main::testing::conformance_harness_with_folder_picker`'s
+        /// own doc, added by this same change alongside
+        /// `crate::gtk::testing::conformance_harness_with_folder_picker`,
+        /// which this scenario doesn't yet have a `gtk`-side twin test for.
+        fn harness_with_folder_picker(
+            dir: std::path::PathBuf,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            crate::tui_main::testing::conformance_harness_with_folder_picker(
+                plain_engine(),
+                dir,
+                100,
+                24,
+            )
+        }
+
+        #[test]
+        fn folder_picker_paints_and_filters_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1431_folder_picker_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("distinctive_child_dir_1431")).unwrap();
+            std::fs::create_dir_all(dir.join("another_unrelated_dir_1431")).unwrap();
+
+            let mut h = harness_with_folder_picker(dir.clone());
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::folder_picker_paints_and_filters_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_contains("distinctive_child_dir_1431"),
+                        "the open picker must paint its entries via \
+                         `FolderPickerController::render`; screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_contains("another_unrelated_dir_1431"),
+                        "screen:\n{}",
+                        driver.screen()
+                    );
+
+                    for c in "distinctive".chars() {
+                        driver.type_char(c);
+                    }
+                    assert!(
+                        driver.screen_contains("distinctive_child_dir_1431"),
+                        "typing must reach `FolderPickerController::handle` \
+                         and keep matching entries visible; screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        !driver.screen_contains("another_unrelated_dir_1431"),
+                        "typing a query that only matches one entry must \
+                         filter the other one out; screen:\n{}",
+                        driver.screen()
+                    );
+
+                    driver.press_named(quadraui::NamedKey::Escape);
+                    assert!(
+                        !driver.screen_contains("distinctive_child_dir_1431"),
+                        "Esc must dismiss the picker; screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1441,6 +1818,197 @@ mod tests {
                 );
             });
         }
+
+        // ── #1431 tranche 2: tab drag / hover / :tabonly ────────────────
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#609): the
+        /// tab-drag ghost overlay must paint a third `"[No Name]"` occurrence
+        /// (the two static tab labels, plus the drag ghost) once a drag has
+        /// started but not yet released.
+        #[test]
+        fn render_content_paints_tab_drag_ghost_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.new_tab(None);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_tab_drag_ghost_via_shell_app",
+                || {
+                    let (tx, ty) = driver
+                        .find("[No Name]")
+                        .expect("tab label should be painted on screen");
+                    driver.mouse_down(tx, ty);
+                    driver.mouse_move(tx + 4.0, ty + 3.0);
+
+                    let screen = driver.screen();
+                    let occurrences = screen.matches("[No Name]").count();
+                    assert!(
+                        occurrences >= 3,
+                        "expected the two static tab labels plus a drag-ghost \
+                         label (>= 3 occurrences of \"[No Name]\"), got \
+                         {occurrences}; screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#753): dragging a
+        /// tab past a neighbour on the unsplit tab bar must actually reorder
+        /// the painted tab labels, not just paint a ghost overlay.
+        #[test]
+        fn tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1431_tui_tab_drag_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("zqa1431.txt");
+            let b = dir.join("zqb1431.txt");
+            std::fs::write(&a, "a\n").unwrap();
+            std::fs::write(&b, "b\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.new_tab(Some(&a));
+            engine.new_tab(Some(&b));
+            assert_eq!(
+                engine.group_layout.leaf_count(),
+                1,
+                "this test covers the unsplit single-group tab bar arm"
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::tui_tab_drag_past_a_neighbour_reorders_the_painted_tab_bar",
+                || {
+                    let left_before = driver
+                        .find_bounds("zqa1431.txt")
+                        .expect("tab a should be painted on the tab bar");
+                    let right_before = driver
+                        .find_bounds("zqb1431.txt")
+                        .expect("tab b should be painted on the tab bar");
+                    assert!(
+                        left_before.x < right_before.x,
+                        "new_tab appends, so a's tab should paint left of \
+                         b's; a={left_before:?} b={right_before:?}"
+                    );
+
+                    let from = (
+                        left_before.x + left_before.width / 2.0,
+                        left_before.y + left_before.height / 2.0,
+                    );
+                    let to = (
+                        right_before.x + right_before.width * 0.75,
+                        right_before.y + right_before.height / 2.0,
+                    );
+                    driver.mouse_down(from.0, from.1);
+                    driver.mouse_move(to.0, to.1);
+                    driver.mouse_move(to.0, to.1);
+                    driver.mouse_up(to.0, to.1);
+
+                    let left_after = driver
+                        .find_bounds("zqa1431.txt")
+                        .expect("tab a should still be painted after the drop");
+                    let right_after = driver
+                        .find_bounds("zqb1431.txt")
+                        .expect("tab b should still be painted after the drop");
+                    assert!(
+                        left_after.x > right_after.x,
+                        "dragging a onto b must repaint it to the right of b \
+                         (was {} < {}, now {} vs {})",
+                        left_before.x,
+                        right_before.x,
+                        left_after.x,
+                        right_after.x
+                    );
+                },
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#609): the
+        /// tab-hover tooltip must paint from `engine.tab_hover_tooltip`
+        /// alone, with no live hover-dwell timer needed.
+        #[test]
+        fn render_content_paints_tab_hover_tooltip_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.tab_hover_tooltip = Some("ZQXW_609_TOOLTIP_MARKER".to_string());
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_tab_hover_tooltip_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("ZQXW_609_TOOLTIP_MARKER"),
+                        "tab-hover tooltip should paint via \
+                         App::render_content; screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1154): `:tabonly`
+        /// must collapse the painted tab bar to a single `"[No Name]"`
+        /// label — located by content, not assumed to be row 0 (see
+        /// `render_content_paints_single_group_tab_bar_via_shell_app`'s own
+        /// doc on why).
+        #[test]
+        fn ex_tabonly_collapses_tab_bar_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.hide_single_tab = false;
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::ex_tabonly_collapses_tab_bar_via_shell_app",
+                || {
+                    for _ in 0..2 {
+                        driver.type_char(':');
+                        for c in "tabnew".chars() {
+                            driver.type_char(c);
+                        }
+                        driver.press_named(quadraui::NamedKey::Enter);
+                    }
+                    driver.render();
+
+                    let screen = driver.screen();
+                    let sanity_row = screen
+                        .lines()
+                        .find(|line| line.contains("[No Name]"))
+                        .unwrap_or("");
+                    assert_eq!(
+                        sanity_row.matches("[No Name]").count(),
+                        3,
+                        "sanity: 3 tabs must be open before :tabonly; \
+                         row:\n{sanity_row}"
+                    );
+
+                    driver.type_char(':');
+                    for c in "tabonly".chars() {
+                        driver.type_char(c);
+                    }
+                    driver.press_named(quadraui::NamedKey::Enter);
+                    driver.render();
+
+                    let screen = driver.screen();
+                    let tab_row = screen
+                        .lines()
+                        .find(|line| line.contains("[No Name]"))
+                        .unwrap_or("");
+                    assert_eq!(
+                        tab_row.matches("[No Name]").count(),
+                        1,
+                        ":tabonly must collapse the tab bar to a single tab; \
+                         row:\n{tab_row}"
+                    );
+                },
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1593,6 +2161,163 @@ mod tests {
                 driver.screen()
             );
         }
+
+        // ── #1431 tranche 2: quickfix / location-list rows and E42 ──────
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#608): the
+        /// quickfix panel's own content must paint via
+        /// `App::render_content`, not just get recorded in `engine.quickfix`.
+        #[test]
+        fn render_content_paints_quickfix_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine
+                .quickfix
+                .items
+                .push(crate::core::project_search::ProjectMatch {
+                    file: std::path::PathBuf::from("zqxw608.rs"),
+                    line: 0,
+                    col: 0,
+                    line_text: "ZQXW_608_QUICKFIX_MARKER".to_string(),
+                });
+            engine.quickfix.open = true;
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_quickfix_panel_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("ZQXW_608_QUICKFIX_MARKER"),
+                        "quickfix panel content should paint via \
+                         App::render_content; screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1155): the
+        /// active window's location list shares the quickfix panel's bottom
+        /// rung, painting its own distinct "LOCATION LIST" title.
+        #[test]
+        fn render_content_paints_location_list_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            let win = engine.active_window_id();
+            let list = engine.location_lists.entry(win).or_default();
+            list.items.push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1155.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1155_LOCLIST_MARKER".to_string(),
+            });
+            list.open = true;
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::render_content_paints_location_list_panel_via_shell_app",
+                || {
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("ZQXW_1155_LOCLIST_MARKER"),
+                        "location-list panel content should paint via \
+                         App::render_content; screen:\n{screen}"
+                    );
+                    assert!(
+                        screen.contains("LOCATION LIST"),
+                        "the shared bottom rung must show the location-list \
+                         title, not \"QUICKFIX\", when the global quickfix \
+                         list is empty/closed; screen:\n{screen}"
+                    );
+                    assert!(
+                        !screen.contains("QUICKFIX ("),
+                        "the global quickfix panel must not also paint; \
+                         screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1155): when both
+        /// the global quickfix list and the active window's location list
+        /// are open, the shared bottom rung shows quickfix.
+        #[test]
+        fn quickfix_panel_takes_priority_over_location_list_via_shell_app() {
+            let mut engine = plain_engine();
+            engine
+                .quickfix
+                .items
+                .push(crate::core::project_search::ProjectMatch {
+                    file: std::path::PathBuf::from("zqxw1155qf.rs"),
+                    line: 0,
+                    col: 0,
+                    line_text: "ZQXW_1155_QF_MARKER".to_string(),
+                });
+            engine.quickfix.open = true;
+            let win = engine.active_window_id();
+            let list = engine.location_lists.entry(win).or_default();
+            list.items.push(crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zqxw1155loc.rs"),
+                line: 0,
+                col: 0,
+                line_text: "ZQXW_1155_LOC_MARKER".to_string(),
+            });
+            list.open = true;
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::quickfix_panel_takes_priority_over_location_list_via_shell_app",
+                || {
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("ZQXW_1155_QF_MARKER"),
+                        "quickfix must win the shared bottom rung when both \
+                         lists are open; screen:\n{screen}"
+                    );
+                    assert!(
+                        !screen.contains("ZQXW_1155_LOC_MARKER"),
+                        "the location list must not also paint while \
+                         quickfix has the rung; screen:\n{screen}"
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#1283): `:cnext`
+        /// on an empty quickfix list must paint Neovim's `E42: No Errors` on
+        /// the command line — driven through the real command line, not by
+        /// calling `qf_next` directly (the state-only trap #587/#592 calls
+        /// out).
+        #[test]
+        fn cnext_on_empty_quickfix_list_paints_e42_via_shell_app() {
+            let engine = plain_engine();
+            assert!(
+                engine.quickfix.items.is_empty(),
+                "precondition: a fresh engine has an empty quickfix list"
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            known_bug_gate(
+                "app_on_tui::cnext_on_empty_quickfix_list_paints_e42_via_shell_app",
+                || {
+                    driver.type_char(':');
+                    for c in "cnext".chars() {
+                        driver.type_char(c);
+                    }
+                    driver.press_named(quadraui::NamedKey::Enter);
+                    driver.render();
+
+                    let screen = driver.screen();
+                    assert!(
+                        screen.contains("E42: No Errors"),
+                        ":cnext on an empty quickfix list must paint \
+                         Neovim's E42 on the command line; screen:\n{screen}"
+                    );
+                },
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1731,6 +2456,93 @@ mod tests {
                         driver.screen_has("FIND"),
                         "Ctrl-F with the terminal focused must open its find bar; \
                  screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Dialogs (#1431 tranche 2)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod dialogs {
+        use super::*;
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#605): a modal
+        /// dialog must paint via `App::render_content`.
+        #[test]
+        fn render_content_paints_dialog_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.dialog = Some(crate::core::engine::Dialog {
+                title: "ZQXW605DIALOG".to_string(),
+                body: vec!["body line".to_string()],
+                buttons: vec![crate::core::engine::DialogButton {
+                    label: "OK".to_string(),
+                    hotkey: 'o',
+                    action: "ok".to_string(),
+                }],
+                selected: 0,
+                tag: String::new(),
+                input: None,
+            });
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+
+            // Same root cause as `popups::dialog_intercepts_all_keys` (moved
+            // here from the pre-#1431 `popups` module — category: quadraui,
+            // `quadraui::native_dialog_options` reports this button-only,
+            // no-input `Dialog` as natively expressible with no
+            // `BackendCaps` gate, so `App::render_content` queues a native
+            // `PlatformServices::show_message_dialog` present instead of
+            // painting the in-canvas `Dialog` rung, on every backend — TUI
+            // has none. Target: quadraui.
+            known_bug_gate(
+                "app_on_tui::render_content_paints_dialog_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_has("ZQXW605DIALOG"),
+                        "modal dialog should paint via App::render_content; \
+                     screen:\n{}",
+                        driver.screen()
+                    );
+                },
+            );
+        }
+
+        /// Mirrors `shell_app.rs`'s test of the same name (#999): `:CheckNerdFonts`
+        /// must paint on a real driver frame, with both the Nerd Font glyph
+        /// row and the ASCII fallback row visible on the same screen.
+        #[test]
+        fn check_nerd_fonts_dialog_paints_both_variants_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.execute_command("CheckNerdFonts");
+            assert!(
+                engine.dialog.is_some(),
+                "fixture must actually open the dialog"
+            );
+            let h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
+            let driver = &h.driver;
+
+            known_bug_gate(
+                "app_on_tui::check_nerd_fonts_dialog_paints_both_variants_via_shell_app",
+                || {
+                    assert!(
+                        driver.screen_contains(crate::icons::FILE_RUST.nerd),
+                        "the painted dialog must show the Nerd Font glyph \
+                         row; screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_contains(crate::icons::FILE_RUST.fallback),
+                        "the painted dialog must show the ASCII fallback \
+                         row; screen:\n{}",
+                        driver.screen()
+                    );
+                    assert!(
+                        driver.screen_contains("Check Nerd Fonts"),
+                        "the painted dialog must show its own title; \
+                         screen:\n{}",
                         driver.screen()
                     );
                 },
