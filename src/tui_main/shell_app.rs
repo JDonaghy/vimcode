@@ -17660,6 +17660,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
+    /// #1464 acceptance, clipboard-paste half: `:AiPasteImage` on the TUI
+    /// backend — which never wires `Engine::clipboard_read_image` (no
+    /// terminal clipboard-image channel, per that field's own doc) — must
+    /// paint a clear "can't paste an image here" refusal on the command
+    /// line, never silently no-op. `core::engine::acp_ops::tests::
+    /// paste_clipboard_image_refuses_when_no_callback_is_wired` covers the
+    /// same refusal at the engine level; this proves the ex-command
+    /// actually reaches the screen through the real key-driven `:` command
+    /// line, the one surface a pure engine-level test can't exercise.
+    ///
+    /// RED verified: with `Engine::acp_attach_clipboard_image`'s "no
+    /// callback wired" early return stubbed to a silent no-op (empty
+    /// `self.message`), this fails — the screen shows no refusal text at
+    /// all.
+    #[test]
+    fn ai_panel_paste_image_shows_a_clear_refusal_on_tui_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        assert!(
+            app.engine.clipboard_read_image.is_none(),
+            "the TUI backend must never wire a clipboard-image callback"
+        );
+
+        // Wide enough that the full message isn't clipped by the command
+        // line's column width (#605's status-bar rule row), same as
+        // `render_content_paints_ai_no_key_error_via_shell_app`.
+        let mut driver = driver_with_shell(app, config(), 160, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+        driver.type_char(':');
+        for c in "AiPasteImage".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("can't paste an image"),
+            "the clipboard-paste refusal should paint on the command line; \
+             screen:\n{screen}"
+        );
+    }
+
     /// #1449 acceptance: typing `@` with a matching prefix opens a
     /// completion popup listing open buffers before workspace-only files,
     /// and Tab/Enter accepts one into the input as `@path ` — the same

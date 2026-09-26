@@ -2564,6 +2564,66 @@ mod tests {
         let _ = std::fs::remove_file(&file_path);
     }
 
+    /// #1464: with no range attachment staged, Ctrl+R falls through to
+    /// popping the most-recently manually-attached file/image instead —
+    /// same "one key, most-recent-first" removal `dispatch_ai_chat_event`'s
+    /// doc promises, just the other one of the two attachment kinds it
+    /// checks. (`setup_attach_workspace` is defined further down in this
+    /// module alongside the rest of the `:AiAttach` tests.)
+    ///
+    /// RED verified: with the `else if let Some(removed) =
+    /// self.acp_manual_attachments.pop()` fallthrough branch stubbed out
+    /// (leaving only the range-attachment check), this fails —
+    /// `acp_manual_attachments` still holds both attachments after Ctrl+R.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_r_falls_through_to_popping_the_last_manual_attachment_when_none_is_staged() {
+        let mut engine = Engine::new_for_test();
+        let (name, file_path) = setup_attach_workspace(&mut engine, "ctrlr", "notes.txt", b"hi");
+        engine.acp_attach_file(&name);
+        engine.acp_prompt_capabilities.image = true;
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47];
+        let workspace = file_path.parent().unwrap().to_path_buf();
+        std::fs::write(workspace.join("shot.png"), &bytes).expect("write second attach target");
+        engine.acp_attach_file("shot.png");
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            2,
+            "{:?}",
+            engine.message
+        );
+        assert!(engine.acp_pending_attachment.is_none());
+
+        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+            key: "Char('r')".to_string(),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                cmd: false,
+            },
+        });
+
+        assert!(kept_focus, "Ctrl+R must not drop panel focus");
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            1,
+            "only the most-recently attached (the image) should be popped"
+        );
+        assert_eq!(
+            engine.acp_manual_attachments[0].chip(),
+            "\u{1f4ce} notes.txt"
+        );
+        assert!(
+            engine.message.contains("shot.png"),
+            "removal message should name what was removed: {}",
+            engine.message
+        );
+        assert!(engine.ai_messages.is_empty(), "nothing should be sent");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
     /// Acceptance: `ai_clear` drops a staged attachment too — composed but
     /// unsent content, same as everything else it resets.
     #[test]
@@ -2905,6 +2965,195 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(file_path.parent().unwrap());
         let _ = std::fs::remove_file(&capture);
+    }
+
+    // ── #1464: clipboard image paste (`:AiPasteImage`) ──────────────────────
+    //
+    // Mirrors the `:AiAttach` engine-level tests above, mocking
+    // `engine.clipboard_read_image` the same way `engine.clipboard_read` is
+    // mocked throughout this crate (see the dozen+ `clipboard_read = Some(
+    // Box::new(...))` call sites), rather than driving a real clipboard.
+
+    /// A flat 2x2 opaque-red RGBA8 image — small enough that its PNG
+    /// encoding is always well under the size limit, for the "capability
+    /// present, paste succeeds" tests.
+    fn small_rgba_image() -> quadraui::RgbaImage {
+        quadraui::RgbaImage {
+            width: 2,
+            height: 2,
+            pixels: vec![255, 0, 0, 255].repeat(4),
+        }
+    }
+
+    /// A large, incompressible RGBA8 image whose PNG encoding exceeds
+    /// [`crate::core::acp::ACP_MAX_IMAGE_ATTACHMENT_BYTES`] — unlike an
+    /// all-zero buffer, deflate can't crush pseudo-random noise down below
+    /// the limit, so this actually exercises the *encoded*-size check the
+    /// doc on `Engine::acp_attach_clipboard_image` calls out.
+    fn oversize_rgba_image() -> quadraui::RgbaImage {
+        let (width, height) = (2000u32, 1200u32);
+        let len = (width as usize) * (height as usize) * 4;
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let pixels = (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 33) as u8
+            })
+            .collect();
+        quadraui::RgbaImage {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// RED verified: with the `self.clipboard_read_image.as_ref()` early
+    /// return removed (falling through to a bare `Ok`/default image), this
+    /// fails — `:AiPasteImage` on a platform/backend that never wired the
+    /// callback (TUI, today) would silently invent a paste instead of
+    /// refusing.
+    #[test]
+    fn paste_clipboard_image_refuses_when_no_callback_is_wired() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        assert!(engine.clipboard_read_image.is_none());
+
+        engine.acp_attach_clipboard_image();
+
+        assert!(engine.acp_manual_attachments.is_empty());
+        assert!(
+            engine.message.contains("can't paste an image"),
+            "message: {}",
+            engine.message
+        );
+    }
+
+    /// RED verified: with the `!self.acp_prompt_capabilities.image` check
+    /// removed, this fails — a pasted image attaches even though the agent
+    /// never declared `promptCapabilities.image`, same trap as
+    /// `ai_attach_file_refuses_an_image_when_the_agent_lacks_the_capability`.
+    #[test]
+    fn paste_clipboard_image_refuses_when_the_agent_lacks_the_capability() {
+        let mut engine = Engine::new_for_test();
+        assert!(!engine.acp_prompt_capabilities.image);
+        engine.clipboard_read_image = Some(Box::new(|| Ok(small_rgba_image())));
+
+        engine.acp_attach_clipboard_image();
+
+        assert!(engine.acp_manual_attachments.is_empty());
+        assert!(
+            engine.message.contains("doesn't support image attachments"),
+            "message: {}",
+            engine.message
+        );
+    }
+
+    /// The backend reports "no image on the clipboard right now" via
+    /// `BackendError::Unsupported` (same variant `Clipboard::read_image`
+    /// itself returns for that case) — must surface the same clear "can't
+    /// paste here" message as a platform with no callback at all, not a
+    /// raw `{e:?}` dump.
+    #[test]
+    fn paste_clipboard_image_reports_unsupported_as_a_clear_refusal() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        engine.clipboard_read_image = Some(Box::new(|| Err(quadraui::BackendError::Unsupported)));
+
+        engine.acp_attach_clipboard_image();
+
+        assert!(engine.acp_manual_attachments.is_empty());
+        assert!(
+            engine.message.contains("can't paste an image"),
+            "message: {}",
+            engine.message
+        );
+    }
+
+    /// Any other backend error (a genuine platform failure, not "nothing to
+    /// paste") must still surface *some* message rather than being
+    /// swallowed — distinct from the `Unsupported` case above.
+    #[test]
+    fn paste_clipboard_image_surfaces_other_backend_errors() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        engine.clipboard_read_image = Some(Box::new(|| {
+            Err(quadraui::BackendError::PlatformFailure {
+                context: "test failure".to_string(),
+            })
+        }));
+
+        engine.acp_attach_clipboard_image();
+
+        assert!(engine.acp_manual_attachments.is_empty());
+        assert!(
+            engine.message.contains("Clipboard paste failed"),
+            "message: {}",
+            engine.message
+        );
+    }
+
+    /// RED verified: with `Engine::acp_attach_clipboard_image`'s size check
+    /// against the PNG-*encoded* length removed, this fails — a large image
+    /// attaches instead of being refused.
+    #[test]
+    fn paste_clipboard_image_rejects_an_oversize_image() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        engine.clipboard_read_image = Some(Box::new(|| Ok(oversize_rgba_image())));
+
+        engine.acp_attach_clipboard_image();
+
+        assert!(
+            engine.acp_manual_attachments.is_empty(),
+            "oversize clipboard image must not be staged: {:?}",
+            engine.acp_manual_attachments
+        );
+        assert!(
+            engine.message.contains("larger than the 5.0 MB limit"),
+            "message: {}",
+            engine.message
+        );
+    }
+
+    /// The issue's own acceptance line applied to the clipboard-paste half:
+    /// "Assert an image block is sent with the right mime and base64 when
+    /// the capability is present" — stages the attachment with the exact
+    /// PNG bytes `encode_png_rgba8` would produce for the mocked image.
+    ///
+    /// RED verified: with `AcpManualAttachment::Image`'s push in
+    /// `Engine::acp_attach_clipboard_image` stubbed to a no-op, this fails —
+    /// `acp_manual_attachments` stays empty after a successful paste.
+    #[test]
+    fn paste_clipboard_image_stages_a_png_attachment_when_the_capability_is_present() {
+        let mut engine = Engine::new_for_test();
+        engine.acp_prompt_capabilities.image = true;
+        let image = small_rgba_image();
+        let expected_png =
+            crate::core::acp::encode_png_rgba8(image.width, image.height, &image.pixels)
+                .expect("encode should succeed");
+        engine.clipboard_read_image = Some(Box::new(|| Ok(small_rgba_image())));
+
+        engine.acp_attach_clipboard_image();
+
+        assert_eq!(
+            engine.acp_manual_attachments.len(),
+            1,
+            "{:?}",
+            engine.message
+        );
+        let block = engine.acp_manual_attachments[0].content_block();
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            block["data"],
+            base64::engine::general_purpose::STANDARD.encode(&expected_png)
+        );
+        assert!(
+            engine.message.contains("Attached clipboard image"),
+            "message: {}",
+            engine.message
+        );
     }
 
     // ── ACP-2 (#953): session/request_permission human-in-the-loop dialog ──
