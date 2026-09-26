@@ -17073,6 +17073,118 @@ mod tests {
         );
     }
 
+    /// #1443: terminal-auth login must route through the *registry*
+    /// (`settings.acp_agents` / `acp_active_agent`) when one is configured,
+    /// not unconditionally through `settings.acp_agent_command` — the twin
+    /// of the previous test, but with `acp_agent_command` left **empty**
+    /// and the fixture command living only in a single `acp_agents` entry,
+    /// matching the issue's exact repro shape. Before the fix,
+    /// `Engine::acp_launch_terminal_login` read `acp_agent_command`
+    /// directly, found it empty, and bailed out with "No ACP agent command
+    /// configured" instead of opening the login pane — this proves the
+    /// pane actually **paints** (the fixture's own PTY output), not just
+    /// that some engine flag flipped.
+    ///
+    /// **Verified RED against unfixed `develop`:** with
+    /// `acp_launch_terminal_login` reading `self.settings.acp_agent_command`
+    /// directly (pre-#1443), this test's status-line assertion fails
+    /// immediately — the message is "No ACP agent command configured" and
+    /// no login pane ever opens, so the later `screen.contains("interactive
+    /// login succeeded")` wait times out.
+    #[test]
+    fn ai_panel_terminal_auth_choice_uses_acp_agents_registry_via_shell_app() {
+        #[cfg(unix)]
+        ensure_no_zsh_newuser_wizard();
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+
+        let fixture_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture_path.to_string()];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[
+                ("ACP_FAKE_AUTH_METHODS", "1"),
+                ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+
+        // The repro shape from #1443: `acp_agent_command` is empty, and the
+        // only place the command lives is a registry entry selected via
+        // `acp_active_agent`. Quoted for the same reason as the sibling
+        // test above (`CARGO_MANIFEST_DIR` may contain spaces).
+        app.engine.settings.acp_agent_command = String::new();
+        app.engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: format!("sh \"{fixture_path}\" succeed-slow"),
+            cwd: String::new(),
+            env: Vec::new(),
+        }];
+        app.engine.settings.acp_active_agent = "claude".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        for c in "hello agent".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut screen = driver.screen();
+        while !screen.contains("Authenticate") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("[C]laude Subscription"),
+            "the auth-choice dialog must paint the Claude Subscription \
+             option within ACP_DRIVER_DEADLINE; screen:\n{screen}"
+        );
+
+        driver.type_char('c');
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("Authenticate"),
+            "the dialog must close the moment the hotkey is pressed; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("No ACP agent command"),
+            "choosing a terminal auth method with a registry-only config \
+             (empty `acp_agent_command`) must not paint the legacy \
+             'No ACP agent command configured' fallback message; \
+             screen:\n{screen}"
+        );
+
+        let deadline = Instant::now() + ACP_DRIVER_DEADLINE;
+        let mut saw_login_pane = false;
+        while Instant::now() < deadline {
+            driver.tick();
+            if driver.screen().contains("interactive login succeeded") {
+                saw_login_pane = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            saw_login_pane,
+            "the registry-resolved login pane's own PTY output must \
+             actually be painted on the surface within ACP_DRIVER_DEADLINE, \
+             not just recorded in engine state"
+        );
+    }
+
     /// Toasts are the last thing painted, on top of every other surface.
     #[test]
     fn render_content_paints_toast_via_shell_app() {

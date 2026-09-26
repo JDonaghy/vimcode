@@ -191,30 +191,43 @@ impl Engine {
     /// then re-initialize once that process exits
     /// (`Engine::acp_finish_terminal_login`, called from `poll_terminal`
     /// below / `terminal_close_active_tab`). This re-runs the exact same
-    /// `settings.acp_agent_command` used for the NDJSON transport — vimcode
-    /// has no agent-specific knowledge of what flag would force "login
-    /// mode" (nor should it, per the ACP track's agent-neutral design), so
-    /// the same command is trusted to behave differently when its stdio is
-    /// a real PTY instead of piped NDJSON (`isatty(stdin)`, in practice).
+    /// command used for the NDJSON transport — resolved through
+    /// `acp_resolve_agent_launch` (the registry's active profile if one is
+    /// configured, else the legacy single-string `acp_agent_command`,
+    /// #958 ACP-7 / #1443) so terminal-auth login always launches whatever
+    /// agent the AI panel actually spawned, not a stale unconditional read
+    /// of `acp_agent_command`. vimcode has no agent-specific knowledge of
+    /// what flag would force "login mode" (nor should it, per the ACP
+    /// track's agent-neutral design), so the same command is trusted to
+    /// behave differently when its stdio is a real PTY instead of piped
+    /// NDJSON (`isatty(stdin)`, in practice).
     ///
     /// `TerminalSession::spawn` takes a shell *path*, not an argv
     /// (`quadraui::terminal_engine::TerminalSession::spawn`) — the same
     /// constraint `terminal_run_command` above already works around: spawn
-    /// the user's interactive shell, then inject the command as PTY input
+    /// the user's interactive shell (in the resolved profile's `cwd`),
+    /// then inject the command plus its `env` as PTY input
     /// (`build_acp_auth_wrapper`), reusing that existing pattern rather
     /// than inventing a second one.
     pub fn acp_launch_terminal_login(&mut self, method_name: &str) {
-        let agent_cmd = self.settings.acp_agent_command.trim().to_string();
+        // #1443: route through the same registry-aware resolver the
+        // NDJSON transport path uses (`ai_send_message_via_acp`), not
+        // `settings.acp_agent_command` directly — that field is empty
+        // whenever the agent came from `settings.acp_agents`, which made
+        // this path fail with "No ACP agent command configured" even
+        // though the very auth-method dialog it is answering only exists
+        // because a registry agent just spawned successfully.
+        let (_argv, cwd, env, agent_cmd) = self.acp_resolve_agent_launch();
+        let agent_cmd = agent_cmd.trim().to_string();
         if agent_cmd.is_empty() {
             self.message = "No ACP agent command configured".to_string();
             return;
         }
-        let cwd = self.acp_workspace_cwd();
         let history_cap = self.settings.terminal_scrollback_lines;
         let shell = default_shell();
         let is_powershell =
             shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
-        let wrapped = build_acp_auth_wrapper(&agent_cmd, is_powershell);
+        let wrapped = build_acp_auth_wrapper(&agent_cmd, &env, is_powershell);
         // Reuse an already-open pane's dimensions if one exists (the most
         // recently painted size); otherwise fall back to a conventional
         // default — no viewport is available from this call site (invoked
@@ -1551,11 +1564,34 @@ pub fn build_terminal_install_wrapper(
 ///
 /// Extracted as a pure function, same rationale as
 /// [`build_terminal_install_wrapper`]: testable without a real PTY.
-pub fn build_acp_auth_wrapper(command: &str, is_powershell: bool) -> String {
+///
+/// `env` carries the active agent profile's extra environment variables
+/// (`AcpAgentProfile::env` / `acp_resolve_agent_launch`, #958 ACP-7,
+/// #1443). Unlike the NDJSON transport path (`AcpClient::spawn_with_env`,
+/// a real subprocess `env` map), these vars are injected as shell
+/// statements ahead of the command since the whole wrapper is text typed
+/// into an interactive shell, not argv — `export KEY=VALUE` for POSIX,
+/// `$env:KEY = "VALUE"` for PowerShell. Values are not shell-quoted
+/// beyond that: same "operator-configured, not attacker input" posture
+/// `parse_agent_command`'s doc comment already accepts for the command
+/// string itself.
+pub fn build_acp_auth_wrapper(
+    command: &str,
+    env: &[(String, String)],
+    is_powershell: bool,
+) -> String {
     if is_powershell {
-        format!("{command}\nExit $LASTEXITCODE\n")
+        let env_lines: String = env
+            .iter()
+            .map(|(k, v)| format!("$env:{k} = \"{v}\"\n"))
+            .collect();
+        format!("{env_lines}{command}\nExit $LASTEXITCODE\n")
     } else {
-        format!("{command}\nexit $?\n")
+        let env_lines: String = env
+            .iter()
+            .map(|(k, v)| format!("export {k}=\"{v}\"\n"))
+            .collect();
+        format!("{env_lines}{command}\nexit $?\n")
     }
 }
 
@@ -1673,7 +1709,7 @@ mod tests {
     /// status directly.
     #[test]
     fn acp_auth_wrapper_posix_ends_with_bare_exit_of_command_status() {
-        let script = build_acp_auth_wrapper("sh login.sh", false);
+        let script = build_acp_auth_wrapper("sh login.sh", &[], false);
         assert_eq!(
             script, "sh login.sh\nexit $?\n",
             "POSIX ACP auth wrapper must be exactly the command followed by \
@@ -1683,11 +1719,38 @@ mod tests {
 
     #[test]
     fn acp_auth_wrapper_powershell_ends_with_bare_exit_of_last_exit_code() {
-        let script = build_acp_auth_wrapper("sh login.sh", true);
+        let script = build_acp_auth_wrapper("sh login.sh", &[], true);
         assert_eq!(
             script, "sh login.sh\nExit $LASTEXITCODE\n",
             "PowerShell ACP auth wrapper must be exactly the command \
              followed by `Exit $LASTEXITCODE`, nothing else; got:\n{script}"
+        );
+    }
+
+    /// #1443: a registry profile's `env` must reach the terminal-auth
+    /// login pane, not just the NDJSON transport's `spawn_with_env` — the
+    /// wrapper injects it as `export KEY=VALUE` ahead of the command since
+    /// the whole thing is typed into an interactive POSIX shell.
+    #[test]
+    fn acp_auth_wrapper_posix_exports_env_before_command() {
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let script = build_acp_auth_wrapper("sh login.sh", &env, false);
+        assert_eq!(
+            script, "export FOO=\"bar\"\nsh login.sh\nexit $?\n",
+            "POSIX ACP auth wrapper must export env vars ahead of the \
+             command; got:\n{script}"
+        );
+    }
+
+    /// Same as above, PowerShell flavour (`$env:KEY = "VALUE"`).
+    #[test]
+    fn acp_auth_wrapper_powershell_sets_env_before_command() {
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let script = build_acp_auth_wrapper("sh login.sh", &env, true);
+        assert_eq!(
+            script, "$env:FOO = \"bar\"\nsh login.sh\nExit $LASTEXITCODE\n",
+            "PowerShell ACP auth wrapper must set env vars ahead of the \
+             command; got:\n{script}"
         );
     }
 
