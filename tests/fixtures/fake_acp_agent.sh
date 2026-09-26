@@ -148,7 +148,7 @@
 #                           itself against a turn that touches more than
 #                           one file, not just a repeated single-file
 #                           scenario.
-#                           shape as the read case. With $ACP_FAKE_PLAN set
+#                           With $ACP_FAKE_PLAN set
 #                           (#956, ACP-5): emits an available_commands_update
 #                           (two commands, "commit" and "compact", sharing
 #                           the "co" prefix on purpose so a test can confirm
