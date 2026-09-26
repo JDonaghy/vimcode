@@ -4666,20 +4666,17 @@ impl Engine {
         // #948 review (non-blocking): this real-spawn branch is
         // `#[cfg(not(test))]`, with the `#[cfg(test)]` no-op stub below
         // standing in under `cargo test` — pre-existing (not introduced by
-        // #948), but it means `shell_command()`'s use here has zero
-        // automated coverage under either the engine-level or driver-tier
-        // test styles: `cargo test` never compiles this arm at all, and a
+        // #948), but it means `shell_cmd()`'s use here has zero automated
+        // coverage under either the engine-level or driver-tier test
+        // styles: `cargo test` never compiles this arm at all, and a
         // driver test couldn't close the gap either since it hits the exact
         // same `cfg(test)` stub. Manually verified: `:1,3!sort` on a real
         // (non-test) build honours `$SHELL` the same way `:!` does, via the
-        // identical `shell_command()` call.
+        // identical `shell_cmd()` call (#1492).
         #[cfg(not(test))]
         let result = {
             use std::io::Write;
-            let (shell, flag) = shell_command();
-            let mut child = match std::process::Command::new(shell)
-                .arg(flag)
-                .arg(filter_cmd)
+            let mut child = match crate::core::terminal::shell_cmd(filter_cmd)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())

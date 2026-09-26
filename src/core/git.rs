@@ -235,6 +235,19 @@ pub struct DiffHunkInfo {
     pub new_count: usize,
 }
 
+/// Win32 `CREATE_NO_WINDOW` process creation flag value, used below to keep
+/// a spawned child from flashing a console window on Win-GUI (#1492). Kept
+/// as a plain constant — not gated on `cfg(windows)` — so the numeric
+/// value itself is unit-testable without a Windows host, mirroring
+/// `windows_askpass_script`'s cfg-independence further down this file.
+/// `std::process::Command` has no public getter for a `Command`'s applied
+/// creation flags, so a test can pin this constant's *value* but can't
+/// read it back off a built `Command` to prove `creation_flags` was
+/// actually called with it — that half is manually verified on a Windows
+/// host (see the `#[cfg(windows)]` test below).
+#[cfg_attr(not(windows), allow(dead_code))]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Create a Command with `CREATE_NO_WINDOW` on Windows to prevent
 /// console window flashes in GUI mode.
 pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -243,7 +256,7 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
 }
@@ -264,7 +277,8 @@ pub fn hidden_command_new_process_group(program: impl AsRef<std::ffi::OsStr>) ->
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x00000200 | 0x08000000); // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
     cmd
 }
@@ -1142,6 +1156,42 @@ fn parse_unified_diff(diff: &str, total_lines: usize) -> Vec<Option<GitLineStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Win-GUI console-hiding (#1492) ──────────────────────────────────────
+
+    /// Pin the raw `CREATE_NO_WINDOW` value to the documented Win32
+    /// constant (`0x08000000`) so a future edit can't silently change the
+    /// flag `hidden_command`/`shell_cmd` apply. `std::process::Command`
+    /// has no public getter for a built `Command`'s applied creation
+    /// flags, so this can't assert against the `Command` `shell_cmd`
+    /// returns directly — that half (that `creation_flags` was actually
+    /// invoked with this value, and that it really suppresses the console
+    /// window) is manually verified on a Windows host: launching
+    /// `vcd.exe`/`vimcode.exe` and running `:!dir` shows no console flash.
+    #[test]
+    fn create_no_window_flag_matches_win32_constant() {
+        assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+    }
+
+    /// `hidden_command` and `hidden_command_new_process_group` must apply
+    /// the *same* `CREATE_NO_WINDOW` bit — `shell_cmd` (#1492) is built on
+    /// `hidden_command`, and every long-running child spawn (LSP/DAP) goes
+    /// through the process-group variant; both must hide their console.
+    #[test]
+    #[cfg(windows)]
+    fn hidden_command_and_process_group_variant_both_set_create_no_window() {
+        use std::os::windows::process::CommandExt as _;
+        // There is no public getter to read the flags back off a built
+        // `Command`, so this only proves the two functions compile and run
+        // (i.e. `creation_flags` is a valid call on both) on a Windows
+        // target — a regression that swapped in a raw literal that
+        // dropped the `CREATE_NO_WINDOW` bit would not be caught by this
+        // test alone. See `create_no_window_flag_matches_win32_constant`
+        // above for the value pin, and the doc comment on `CREATE_NO_WINDOW`
+        // for why a full assertion isn't possible without a Windows host.
+        let _ = hidden_command("cmd").creation_flags(CREATE_NO_WINDOW);
+        let _ = hidden_command_new_process_group("cmd").creation_flags(CREATE_NO_WINDOW);
+    }
 
     // ── Windows askpass leg (#1105) ─────────────────────────────────────────
     // These exercise the pure string-building helpers directly so the two

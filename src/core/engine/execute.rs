@@ -2077,17 +2077,12 @@ impl Engine {
 
         // Handle :! {command} — run a shell command and show output
         if let Some(shell_cmd_raw) = cmd.strip_prefix('!') {
-            let shell_cmd = shell_cmd_raw.trim();
-            if shell_cmd.is_empty() {
+            let shell_cmd_str = shell_cmd_raw.trim();
+            if shell_cmd_str.is_empty() {
                 self.message = "Usage: :!command".to_string();
                 return EngineAction::None;
             }
-            let (shell, flag) = shell_command();
-            match std::process::Command::new(shell)
-                .arg(flag)
-                .arg(shell_cmd)
-                .output()
-            {
+            match crate::core::terminal::shell_cmd(shell_cmd_str).output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2117,18 +2112,13 @@ impl Engine {
         // Handle :r[ead] {file} / :r[ead] !{cmd} — read a file, or the stdout
         // of a shell command, and insert it after the cursor line (#879).
         if let Some(arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
-            if let Some(shell_cmd) = arg.strip_prefix('!') {
-                let shell_cmd = shell_cmd.trim();
-                if shell_cmd.is_empty() {
+            if let Some(shell_cmd_raw) = arg.strip_prefix('!') {
+                let shell_cmd_str = shell_cmd_raw.trim();
+                if shell_cmd_str.is_empty() {
                     self.message = "Usage: :r !command".to_string();
                     return EngineAction::None;
                 }
-                let (shell, flag) = shell_command();
-                match std::process::Command::new(shell)
-                    .arg(flag)
-                    .arg(shell_cmd)
-                    .output()
-                {
+                match crate::core::terminal::shell_cmd(shell_cmd_str).output() {
                     Ok(output) => {
                         let content = String::from_utf8_lossy(&output.stdout).to_string();
                         let inserted_lines = self.insert_read_content(&content);

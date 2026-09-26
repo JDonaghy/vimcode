@@ -1041,20 +1041,17 @@ impl LspManager {
             ));
 
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
-            // `shell_command()` (quadraui#970) picks `sh -c` vs `cmd /C` —
-            // this used to be a hand-rolled cfg split duplicating that same
-            // decision; #948 collapsed it into the shared seam. The only
-            // platform-specific bit left is hiding the console window on
-            // Windows, which has no portable equivalent.
+            // `shell_cmd()` (#1492, built on quadraui#970's `shell_command()`)
+            // picks `sh -c` vs `cmd /C` and hides the console window on
+            // Windows — the single construction point every shell spawn
+            // site now goes through, so this call site can't drift from
+            // the others.
             //
             // #948 review (non-blocking): no dedicated regression test for
-            // this call site — same identical `shell_command()` pattern
+            // this call site — same identical `shell_cmd()` pattern
             // already covered by `:!`'s tests, so a future divergence here
             // wouldn't be caught by this PR's tests.
-            let (shell, flag) = crate::core::terminal::shell_command();
-            let mut command = crate::core::git::hidden_command(&shell);
-            command.args([&flag, &install_cmd]);
-            let result = command.output();
+            let result = crate::core::terminal::shell_cmd(&install_cmd).output();
 
             match result {
                 Ok(out) => {
