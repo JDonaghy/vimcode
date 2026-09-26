@@ -7396,8 +7396,15 @@ pub enum MouseDragRoute {
     /// The sidebar separator is being dragged to resize the sidebar.
     SidebarResize,
     /// The sidebar body owns the gesture: the search / settings form
-    /// controllers' own drag handling, or an explorer drag-and-drop in flight.
+    /// controllers' own drag handling.
     SidebarBody,
+    /// An explorer drag-and-drop is in flight (#1429) — a file/folder row
+    /// was picked up and the gesture tracks the row under the pointer until
+    /// release, wherever the pointer strays. See [`apply_explorer_drag_move`]
+    /// for the apply and [`apply_explorer_drop`] for the release. Split out
+    /// of [`Self::SidebarBody`] (which used to carry this too) so the two
+    /// gestures are independently testable and neither can shadow the other.
+    ExplorerDnd,
     /// The tab drag machine ([`TabDragState`]) is armed or already tracking.
     TabDrag,
     /// Command-line / message-line text selection.
@@ -7471,15 +7478,12 @@ pub struct MouseDragState<'a> {
     pub modal_hit: bool,
     /// The sidebar separator is being dragged.
     pub sidebar_resizing: bool,
-    /// An explorer drag-and-drop is in flight. Armed rather than geometric:
-    /// once a row is picked up the gesture belongs to the tree even while the
-    /// pointer is outside the sidebar (that is how "dragged away, no target"
-    /// is expressed), so a geometric test alone would hand the move to the
-    /// editor the moment the user left the panel.
-    pub sidebar_dnd: bool,
     /// The sidebar body's painted bounds, when that body wants drag events
-    /// (search / settings form controllers, or an explorer DnD in flight).
-    /// `None` when the sidebar is hidden or its panel has no drag behaviour.
+    /// (the search / settings form controllers). `None` when the sidebar is
+    /// hidden or its panel has no drag behaviour. Explorer DnD used to be
+    /// folded in here too (armed rather than geometric) — see
+    /// [`Self::explorer_dnd_active`], which replaced it (#1429) so the two
+    /// gestures route to distinct [`MouseDragRoute`] variants.
     pub sidebar_body: Option<quadraui::Rect>,
     /// [`TabDragState`] is armed or dragging.
     pub tab_dragging: bool,
@@ -7491,11 +7495,20 @@ pub struct MouseDragState<'a> {
     pub terminal_split_dragging: bool,
     /// The bottom panel is being resized.
     pub terminal_panel_resizing: bool,
+    /// An explorer drag-and-drop is in flight (#1429). Armed rather than
+    /// geometric, for the same reason [`Self::tab_dragging`]/
+    /// `text_selection_active` are: once a row has been picked up the
+    /// gesture belongs to the tree even while the pointer is outside the
+    /// sidebar (dragged away, no target yet), so a geometric test alone
+    /// would hand the move to the editor the moment the pointer left the
+    /// panel. Callers compute this as
+    /// `explorer_drag_src.is_some() || explorer_drag_active.is_some()`.
+    pub explorer_dnd_active: bool,
     /// `Engine::mouse_drag_active` — a previous move in this same gesture
     /// already extended the editor's visual selection.
     ///
-    /// Armed rather than geometric, for the same reason `sidebar_dnd` is:
-    /// once a selection has started extending, a later move that strays over
+    /// Armed rather than geometric, for the same reason `explorer_dnd_active`
+    /// is: once a selection has started extending, a later move that strays over
     /// the minimap strip or the terminal-panel rect must not get stolen by
     /// that geometry — it must keep extending the selection, exactly like
     /// dragging a native text selection past a window's edge. Set from the
@@ -7525,13 +7538,13 @@ impl Default for MouseDragState<'_> {
             hover_popup_selecting: false,
             modal_hit: false,
             sidebar_resizing: false,
-            sidebar_dnd: false,
             sidebar_body: None,
             tab_dragging: false,
             command_line_selecting: false,
             divider_grabbed: false,
             terminal_split_dragging: false,
             terminal_panel_resizing: false,
+            explorer_dnd_active: false,
             text_selection_active: false,
             in_terminal_content: false,
             // Cell metrics default to the TUI's whole-cell grid; GTK always
@@ -7566,8 +7579,8 @@ pub fn route_mouse_drag(state: &MouseDragState<'_>, x: f64, y: f64) -> MouseDrag
     if state.sidebar_resizing {
         return MouseDragRoute::SidebarResize;
     }
-    if state.sidebar_dnd {
-        return MouseDragRoute::SidebarBody;
+    if state.explorer_dnd_active {
+        return MouseDragRoute::ExplorerDnd;
     }
     if state.tab_dragging {
         return MouseDragRoute::TabDrag;
@@ -8551,6 +8564,163 @@ pub fn route_explorer_tree_event(
         return None;
     }
     Some(tree_event)
+}
+
+// ─── Explorer drag-and-drop (#1429) ────────────────────────────────────────
+//
+// TUI has carried this since before `App` existed (`explorer_drag_src`/
+// `explorer_drag_active` in `tui_main/shell_app.rs`, applied by hand-rolled
+// row arithmetic in `tui_main/mouse.rs`); GTK/`App` never got a twin, which
+// would have silently dropped the feature the day TUI cuts over onto `App`
+// (the epic this issue is part of). The three functions below are that
+// twin, shared: both backends keep their own two `Option` fields (they are
+// plain row indices, not GTK/TUI structures) and call these to update them.
+
+/// Row index under `(x, y)` inside the explorer tree's own painted `rect`,
+/// in the caller's native unit (`row_height` is `1.0` cell on TUI, the
+/// measured line height in pixels on GTK — the same first element of the
+/// `metrics` tuple [`route_explorer_tree_event`]'s callers already re-apply
+/// before dispatch). `None` when the point is outside `rect`'s columns, above
+/// its first row, or past the last populated row — "no row here", used by
+/// both the drag-and-drop rung below and the empty-space right-click
+/// fallback ([`route_tree_empty_space_context_menu`]) to tell "over a real
+/// row" (owned by [`route_explorer_tree_event`]) from "over empty tree
+/// space".
+pub fn explorer_row_at(
+    engine: &Engine,
+    rect: quadraui::Rect,
+    row_height: f64,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    if x < rect.x as f64 || x >= (rect.x + rect.width) as f64 {
+        return None;
+    }
+    let rel_y = y - rect.y as f64;
+    if rel_y < 0.0 {
+        return None;
+    }
+    let row_height = row_height.max(1.0);
+    let row_in_view = (rel_y / row_height) as usize;
+    let idx = row_in_view + engine.explorer_tree.borrow().scroll_offset();
+    if idx < engine.explorer_rows.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Apply one [`MouseDragRoute::ExplorerDnd`] move: promote a pending
+/// `explorer_drag_src` into an active `(src, target)` pair once the pointer
+/// has moved off the source row, slide the target row while it stays over
+/// the tree, or clear the target (keeping the drag itself armed) once the
+/// pointer strays outside `rect` — mirrors what `tui_main::mouse`'s
+/// hand-rolled version used to do inline, now shared so `App` gets the same
+/// behaviour without re-deriving it.
+pub fn apply_explorer_drag_move(
+    engine: &Engine,
+    rect: quadraui::Rect,
+    row_height: f64,
+    x: f64,
+    y: f64,
+    explorer_drag_src: &mut Option<usize>,
+    explorer_drag_active: &mut Option<(usize, Option<usize>)>,
+) {
+    match explorer_row_at(engine, rect, row_height, x, y) {
+        Some(idx) => {
+            if let Some(src_row) = *explorer_drag_src {
+                // Only activate the drag once the target differs from the
+                // source — a press-then-tiny-jitter must not fire a move.
+                if idx != src_row {
+                    *explorer_drag_active = Some((src_row, Some(idx)));
+                    *explorer_drag_src = None;
+                }
+            } else if let Some((src, _)) = explorer_drag_active {
+                *explorer_drag_active = Some((*src, Some(idx)));
+            }
+        }
+        None => {
+            if let Some((src, _)) = explorer_drag_active {
+                // Dragged outside the tree (or over empty space below the
+                // last row) — clear the target but keep the drag active.
+                *explorer_drag_active = Some((*src, None));
+            }
+        }
+    }
+}
+
+/// Apply an explorer drag-and-drop release: move `src_row` into
+/// `target_row`'s directory (or `target_row`'s own parent, if it is a file)
+/// via [`Engine::confirm_move_file`]. A no-op if either index is out of
+/// range (the tree can shrink mid-drag, e.g. a watcher-driven refresh) or
+/// `target_row` is `None` (dropped outside the tree).
+pub fn apply_explorer_drop(engine: &mut Engine, src_row: usize, target_row: Option<usize>) {
+    let Some(target_row) = target_row else {
+        return;
+    };
+    if src_row >= engine.explorer_rows.len() || target_row >= engine.explorer_rows.len() {
+        return;
+    }
+    let src_path = engine.explorer_rows[src_row].path.clone();
+    let target = &engine.explorer_rows[target_row];
+    let dest_dir = if target.is_dir {
+        target.path.clone()
+    } else {
+        target
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    engine.confirm_move_file(&src_path, &dest_dir);
+}
+
+/// Right-click fallback for empty tree space below the explorer's last row
+/// (#1429). Temporary shared workaround for quadraui#1045 item 4 (upstream:
+/// `TreeController::right_click` resolving a `TreeViewHit::Empty` to a
+/// container-level `ContextMenuRequested` instead of plain `Consumed`) —
+/// delete this function and its two call sites (`tui_main::mouse`,
+/// `App::explorer_ui_event`) once that lands, per this repo's
+/// Platform-Neutrality Rule (shared code now, not per-backend, but still a
+/// stopgap for a gap that belongs upstream).
+///
+/// #1025 intentionally dropped the pre-existing "right-click below the last
+/// row opens the root folder's context menu" fallback when it moved the
+/// row/chevron case onto `route_explorer_tree_event` (which only resolves
+/// `Row`/`Chevron` hits — an `Empty` hit reaches here instead, on both
+/// backends alike, restoring the fallback without re-diverging them).
+///
+/// `rect`/`metrics`/`pos` share `route_explorer_tree_event`'s own contract:
+/// `rect` is the tree's last painted rect, `metrics` is `(line_height,
+/// char_width)` in the caller's native unit, `pos` is in that same space.
+/// Returns `true` if the fallback fired (opened the cwd/root context menu);
+/// `false` for a hit that either missed `rect` entirely or landed on a real
+/// row (`route_explorer_tree_event` already owns that case).
+pub fn route_tree_empty_space_context_menu(
+    engine: &mut Engine,
+    rect: quadraui::Rect,
+    metrics: (f64, f64),
+    pos: quadraui::Point,
+) -> bool {
+    let (lh, cw) = metrics;
+    if explorer_row_at(engine, rect, lh, pos.x as f64, pos.y as f64).is_some() {
+        return false;
+    }
+    let inside = pos.x >= rect.x
+        && pos.x < rect.x + rect.width
+        && pos.y >= rect.y
+        && pos.y < rect.y + rect.height;
+    if !inside {
+        return false;
+    }
+    let cx = (pos.x / (cw.max(1.0) as f32)) as u16;
+    let cy = (pos.y / (lh.max(1.0) as f32)) as u16;
+    let root = engine.cwd.clone();
+    engine.open_explorer_context_menu(root, true, cx, cy);
+    true
 }
 
 /// Dispatch a mouse/scroll event to the debug ("run and debug") sidebar's
@@ -25363,6 +25533,29 @@ pub struct UnitProfile {
     pub client_side_titlebar: bool,
     /// [`crate::icons::set_gui_backend`]'s argument.
     pub is_gui_backend: bool,
+    /// The explorer tree's own per-row pixel/cell pitch, given the
+    /// current line height — GTK: `quadraui::gtk::tree`'s own
+    /// `item_height = (line_height * 1.4).round()` (no public accessor;
+    /// duplicated here rather than re-derived from a `TreeController` hit
+    /// test, since building the `TreeView` its layout needs is a private
+    /// method — see `apply_explorer_drag_move`'s doc for the #1429
+    /// consumer this feeds and the upstream gap this constant is a
+    /// stand-in for). TUI: one whole cell (`|lh| lh`) — `quadraui::tui::
+    /// tree`'s own doc states `TreeStyle::row_height` is "a GUI-pixel"
+    /// concept only.
+    pub explorer_row_h: fn(f64) -> f64,
+    /// `(pad_x, pad_y)` the editor hover popup insets its content by,
+    /// matching whichever rasteriser actually painted it:
+    /// `quadraui::gtk::rich_text_popup`'s fixed 4px border/inset on GTK,
+    /// `quadraui::tui::rich_text_popup`'s 2-cell-x/1-cell-y frame on TUI.
+    /// `App::route_and_apply_editor_hover_popup` (press) and
+    /// `handle_mouse_drag_msg`'s `HoverPopupSelection` arm (drag) both
+    /// need the same value, or the two disagree about which content cell
+    /// a given pixel/cell maps to (#1429: found hardcoded to the GTK pair
+    /// in both places, which is why a TUI-native `App`, the `tui` harness
+    /// arm, resolved a drag one row short of wherever the press itself
+    /// had already been landing).
+    pub hover_popup_pad: (f32, f32),
 }
 
 impl UnitProfile {
@@ -25386,6 +25579,8 @@ impl UnitProfile {
             title_bar_lh: 2.0,
             client_side_titlebar: true,
             is_gui_backend: true,
+            explorer_row_h: |lh| (lh * 1.4).round(),
+            hover_popup_pad: (4.0, 4.0),
         }
     }
 
@@ -25424,6 +25619,8 @@ impl UnitProfile {
             title_bar_lh: 1.0,
             client_side_titlebar: false,
             is_gui_backend: false,
+            explorer_row_h: |lh| lh,
+            hover_popup_pad: (2.0, 1.0),
         }
     }
 }
@@ -32935,9 +33132,9 @@ mod mouse_drag_router_tests {
                 MouseDragRoute::SidebarResize,
             ),
             (
-                "sidebar drag-and-drop",
-                |s| s.sidebar_dnd = true,
-                MouseDragRoute::SidebarBody,
+                "explorer drag-and-drop",
+                |s| s.explorer_dnd_active = true,
+                MouseDragRoute::ExplorerDnd,
             ),
             (
                 "tab drag",
@@ -32993,6 +33190,48 @@ mod mouse_drag_router_tests {
         }
     }
 
+    /// #1429: `apply_explorer_drag_move` promotes an armed source into an
+    /// active `(src, target)` pair once the pointer reaches a different
+    /// row, and `apply_explorer_drop` turns that pair into the same
+    /// move-confirm dialog `Engine::confirm_move_file` always opens.
+    #[test]
+    fn explorer_drag_move_then_drop_opens_confirm_move_dialog() {
+        let mut engine = Engine::new_for_test();
+        engine.explorer_rows = vec![
+            crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: "afile".into(),
+                path: std::path::PathBuf::from("/tmp/afile"),
+                is_dir: false,
+                is_expanded: false,
+            },
+            crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: "adir".into(),
+                path: std::path::PathBuf::from("/tmp/adir"),
+                is_dir: true,
+                is_expanded: false,
+            },
+        ];
+        let rect = quadraui::Rect::new(0.0, 0.0, 40.0, 10.0);
+        let mut src = Some(0usize);
+        let mut active: Option<(usize, Option<usize>)> = None;
+        apply_explorer_drag_move(&engine, rect, 1.0, 5.0, 1.0, &mut src, &mut active);
+        assert_eq!(
+            active,
+            Some((0, Some(1))),
+            "moving onto row 1 must activate the drag with that row as the target"
+        );
+        if let Some((s, t)) = active.take() {
+            apply_explorer_drop(&mut engine, s, t);
+        }
+        assert!(
+            engine.dialog.is_some(),
+            "dropping a file row onto a directory row must open the \
+             move-confirm dialog"
+        );
+    }
+
     /// A held drag over the minimap strip belongs to the minimap.
     ///
     /// Red against unfixed `develop`: there was no shared drag router at all,
@@ -33044,8 +33283,8 @@ mod mouse_drag_router_tests {
     /// instead of continuing to extend the editor selection. `text_selection_active`
     /// is the guard: pins that once a selection has started extending
     /// (`Engine::mouse_drag_active`), it keeps winning over both geometric
-    /// rungs, the same way `sidebar_dnd` keeps winning over the editor once an
-    /// explorer drag has been picked up.
+    /// rungs, the same way `explorer_dnd_active` keeps winning over the
+    /// editor once an explorer drag has been picked up.
     #[test]
     fn a_selection_already_extending_beats_the_minimap_and_terminal_geometry() {
         let engine = drag_engine();

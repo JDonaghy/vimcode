@@ -823,6 +823,20 @@ pub(crate) struct App {
     pub(crate) mouse_pos_cell: Rc<Cell<(f64, f64)>>,
     /// True while user is drag-selecting text inside a find/replace input field.
     pub(crate) fr_input_dragging: bool,
+    /// Explorer drag-and-drop source row, armed on press
+    /// (`TreeControllerEvent::RowSelected`) and disarmed either into
+    /// [`Self::explorer_drag_active`] (once the pointer moves to a
+    /// different row) or back to `None` on release. Plain row indices, not
+    /// GTK-specific state — mirrors `TuiShellApp`'s identically-named field
+    /// (#1429; see `render::apply_explorer_drag_move`/`apply_explorer_drop`,
+    /// the shared functions both backends apply this through).
+    pub(crate) explorer_drag_src: Option<usize>,
+    /// `(src_row, target_row)` once an explorer drag-and-drop gesture has
+    /// actually started (moved off the source row) — `target_row` is `None`
+    /// while the pointer is outside the tree, keeping the gesture armed
+    /// without a drop target. Mirrors `TuiShellApp::explorer_drag_active`
+    /// (#1429).
+    pub(crate) explorer_drag_active: Option<(usize, Option<usize>)>,
     pub(crate) deferred: DeferredQueue,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
@@ -1953,6 +1967,8 @@ impl App {
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
             fr_input_dragging: false,
+            explorer_drag_src: None,
+            explorer_drag_active: None,
             deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
@@ -3241,11 +3257,13 @@ impl App {
                 links: &links,
                 scrollbar: self.editor_hover_scrollbar.get(),
                 has_focus,
-                // `draw_editor_hover_popup` insets its text by 4px on both
-                // axes; the content grid is the editor's own cell size.
+                // #1429: `units.hover_popup_pad` — was hardcoded to GTK's
+                // 4px/4px inset even on the `tui` harness arm (`App` on
+                // `TuiBackend`), disagreeing with that arm's own painted
+                // 2-cell/1-cell popup frame.
                 content: render::PopupContentMetrics {
-                    pad_x: 4.0,
-                    pad_y: 4.0,
+                    pad_x: self.units.hover_popup_pad.0,
+                    pad_y: self.units.hover_popup_pad.1,
                     col_width: self.cached_char_width.max(1.0) as f32,
                     line_height: self.cached_line_height.max(1.0) as f32,
                 },
@@ -5804,10 +5822,10 @@ impl App {
                         y: y as f32,
                     })
                     .is_some(),
-                // GTK has no canvas sidebar separator or explorer drag-and-drop:
-                // the separator is a `gtk::Paned` and the file tree is a native
-                // widget with its own DnD. Stated here rather than omitted so
-                // the asymmetry is visible at the call site.
+                // GTK has no canvas sidebar separator: it's a `gtk::Paned`.
+                // Explorer drag-and-drop *is* shared now (#1429) — see
+                // `explorer_dnd_active` below; this used to read `false`
+                // unconditionally, the App-side gap that issue closes.
                 //
                 // Command-line selection *is* shared now (#816):
                 // `engine.cmd_dragging` is armed by `handle_mouse_click_msg`'s
@@ -5816,7 +5834,8 @@ impl App {
                 // closed the "no character hit test" gap the old comment here
                 // recorded.
                 sidebar_resizing: false,
-                sidebar_dnd: false,
+                explorer_dnd_active: self.explorer_drag_src.is_some()
+                    || self.explorer_drag_active.is_some(),
                 sidebar_body: None,
                 command_line_selecting: engine.cmd_dragging.get(),
                 tab_dragging: self.tab_drag.is_armed_or_dragging(),
@@ -5891,7 +5910,13 @@ impl App {
                 {
                     let px = px as f64;
                     let py = py as f64;
-                    let padding = 4.0;
+                    // #1429: same `units.hover_popup_pad` the press rung
+                    // (`route_and_apply_editor_hover_popup`) now reads —
+                    // was hardcoded `4.0`/`4.0` here too, which is why a
+                    // TUI-native `App` (`tui` harness arm) picked a
+                    // different content cell mid-drag than the press had
+                    // already landed on.
+                    let (pad_x, pad_y) = self.units.hover_popup_pad;
                     let lh = self.cached_line_height.max(1.0);
                     let scroll = self
                         .engine
@@ -5900,8 +5925,8 @@ impl App {
                         .as_ref()
                         .map(|h| h.scroll_top)
                         .unwrap_or(0);
-                    let rel_x = x - px - padding;
-                    let rel_y = y - py - padding;
+                    let rel_x = x - px - pad_x as f64;
+                    let rel_y = y - py - pad_y as f64;
                     let content_line = (rel_y / lh).max(0.0) as usize + scroll;
                     let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
                     self.engine
@@ -6064,6 +6089,30 @@ impl App {
                     }
                 }
             }
+            render::MouseDragRoute::ExplorerDnd => {
+                // #1429: shared with TUI's `mouse::handle_mouse` — the row
+                // under the pointer is resolved against `explorer_tree_rect`
+                // (the rect this frame's `paint_sidebar_panel_rung` painted
+                // the tree into) and the row's own pixel/cell pitch
+                // (`units.explorer_row_h`, GTK: `quadraui::gtk::tree`'s
+                // `item_height = (line_height * 1.4).round()`; TUI: one
+                // whole cell) applied to `cached_explorer_metrics`'s
+                // paint-time line-height (#540's re-apply, same value the
+                // press rung already uses). Plain `cached_explorer_metrics`
+                // alone under-counts every row past the first on GTK — its
+                // row pitch is *not* the bare line height.
+                let rect = self.engine.borrow().explorer_tree_rect.get();
+                let row_height = (self.units.explorer_row_h)(self.cached_explorer_metrics.get().0);
+                render::apply_explorer_drag_move(
+                    &self.engine.borrow(),
+                    rect,
+                    row_height,
+                    x,
+                    y,
+                    &mut self.explorer_drag_src,
+                    &mut self.explorer_drag_active,
+                );
+            }
             // #192: a drag inside an open modal with nothing armed is swallowed
             // so it cannot leak to the editor underneath.
             render::MouseDragRoute::ModalSwallow
@@ -6109,6 +6158,19 @@ impl App {
         // clears any armed-but-never-dragged press, which is what the bare
         // `tab_drag_start = None` this replaced was for).
         if self.tab_drag.handle_release(&mut self.engine.borrow_mut()) {
+            self.draw_needed.set(true);
+        }
+        // Explorer drag-and-drop: execute the move on release (#1429 —
+        // shared with TUI's identical `mouse.rs` release arm). Also clears
+        // `sidebar_pointer_captured` — `try_route_sidebar_mouse_event` left
+        // it set (it stopped resetting it once a DnD gesture bypassed that
+        // function to reach here) and a future unrelated press must not
+        // start out already "dragging".
+        if self.explorer_drag_src.take().is_some() || self.explorer_drag_active.is_some() {
+            self.sidebar_pointer_captured.set(false);
+        }
+        if let Some((src_row, target_row)) = self.explorer_drag_active.take() {
+            render::apply_explorer_drop(&mut self.engine.borrow_mut(), src_row, target_row);
             self.draw_needed.set(true);
         }
         if self.terminal_split_dragging {
@@ -6415,11 +6477,37 @@ impl App {
             self.draw_needed.set(true);
             return;
         };
+        // #1429: shared empty-space right-click fallback, mirroring
+        // `tui_main::mouse`'s right-click arm — see
+        // `route_tree_empty_space_context_menu`'s doc for the upstream
+        // quadraui#1045 gap this stands in for and the deletion plan.
+        if let quadraui::UiEvent::MouseDown {
+            button: quadraui::MouseButton::Right,
+            position,
+            ..
+        } = ev
+        {
+            render::route_tree_empty_space_context_menu(
+                &mut self.engine.borrow_mut(),
+                rect,
+                metrics,
+                position,
+            );
+        }
         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
             self.engine
                 .borrow_mut()
                 .dispatch_explorer_tree_event(tree_event);
         } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
+            // #1429: record a potential drag-and-drop source — mirrors
+            // TUI's identical arm in `mouse::handle_mouse` — only a genuine
+            // row selection (not a chevron toggle or a scrollbar drag) arms
+            // one.
+            if let quadraui::TreeControllerEvent::RowSelected { ref path } = tree_event {
+                if let Some(&row_idx) = path.first() {
+                    self.explorer_drag_src = Some(row_idx as usize);
+                }
+            }
             self.engine
                 .borrow_mut()
                 .handle_explorer_mouse_event(tree_event);
@@ -6501,20 +6589,32 @@ impl App {
             return false;
         };
         let dragging = self.sidebar_pointer_captured.get();
+        // #1429: once an explorer row has been picked up (`explorer_drag_src`)
+        // or the drag is already active (`explorer_drag_active`), the *move*
+        // and *release* that follow the initial press must reach
+        // `handle_mouse_drag_msg`/`handle_mouse_up_msg` — the
+        // `MouseDragRoute::ExplorerDnd` rung and `render::apply_explorer_drop`
+        // — not loop back through here into `explorer_ui_event`, which would
+        // hand a plain `MouseMoved` to `TreeController::handle` and get its
+        // *scrollbar*-drag `drag_to`, never the row-under-pointer tracking a
+        // DnD gesture needs. The press itself still claims capture as usual
+        // (`explorer_ui_event` arms `explorer_drag_src` from that same press).
+        let explorer_dnd_active =
+            self.explorer_drag_src.is_some() || self.explorer_drag_active.is_some();
         let pos = match event {
             UiEvent::MouseDown { position, .. }
             | UiEvent::DoubleClick { position, .. }
             | UiEvent::Scroll { position, .. } => *position,
             // Follow-through only: never *start* an interaction from a move or
             // a release (see the doc comment above).
-            UiEvent::MouseUp { position, .. } if dragging => {
+            UiEvent::MouseUp { position, .. } if dragging && !explorer_dnd_active => {
                 self.sidebar_pointer_captured.set(false);
                 *position
             }
             UiEvent::MouseMoved {
                 position,
                 buttons: quadraui::ButtonMask { left: true, .. },
-            } if dragging => *position,
+            } if dragging && !explorer_dnd_active => *position,
             _ => return false,
         };
         // A captured drag keeps its grab even when the pointer leaves the

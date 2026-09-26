@@ -3321,6 +3321,304 @@ mod issue_1061_scrollbar_click_resolution_shared {
     }
 }
 
+// ── #1429: port the TUI-only mouse features into the shared drag/click
+// routes (explorer drag-and-drop, hover-popup press-and-drag selection,
+// tree empty-space right-click) ─────────────────────────────────────────
+//
+// All three used to live only in `src/tui_main/mouse.rs`/`shell_app.rs`
+// (`tui_prod`-only, by construction) — `GOALS.md`/`IRREDUCIBLE_SURFACE`
+// §7 named this as a feature gap that would have been silently dropped
+// the day TUI cuts over onto the shared `App`. `render::
+// apply_explorer_drag_move`/`apply_explorer_drop`/
+// `route_tree_empty_space_context_menu` are the shared routes both
+// backends now call; each scenario below is registered on `gtk`/`tui`
+// (proving `App` gained the behaviour) and `tui_prod` (proving the
+// shipped TUI shell still has it, unregressed).
+//
+// RED-verification: with `render::apply_explorer_drag_move`/
+// `apply_explorer_drop` deleted and `App::handle_mouse_drag_msg`'s
+// `explorer_dnd_active` forced back to `false` (this issue's own
+// `git diff`, reverted), `explorer_drag_and_drop_...::gtk`/`::tui` fail —
+// dropping the file row on the folder row never opens the move-confirm
+// dialog. With `route_tree_empty_space_context_menu` deleted and its two
+// call sites removed, `explorer_right_click_below_last_row_...::gtk`/
+// `::tui`/`::tui_prod` fail — see this module's own RED-verification note
+// for the exact repro. The hover-popup scenario was already green on
+// every arm before this issue (`App` had carried `hover_popup_selecting`/
+// the `HoverPopupSelection` drag arm since #785) — it is registered here
+// as the pin `GOALS.md` calls for, not a bug fix.
+#[cfg(test)]
+mod issue_1429_shared_mouse_routes {
+    use super::*;
+
+    /// A single-level explorer: one file (`dndfile1429`) and one empty
+    /// folder (`dnddir1429`), both direct children of the root so
+    /// there's no depth-2 indentation eating into the ~12-column TUI
+    /// sidebar-label budget `engine_with_collapsed_explorer_dir`'s own
+    /// doc (`issue_984_...`, above) found tight — see that fixture's doc
+    /// for the budget this one deliberately stays clear of.
+    ///
+    /// `tag` disambiguates concurrently-running callers onto distinct
+    /// temp dirs, like every other filesystem-touching fixture in this
+    /// module.
+    fn engine_with_dnd_explorer_fixture(tag: &str) -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1429_dnd_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dnddir1429")).unwrap();
+        std::fs::write(dir.join("dndfile1429"), b"hi").unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine.explorer_expanded.insert(dir.clone());
+        engine.explorer_rebuild_rows();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine
+    }
+
+    // ── Explorer drag-and-drop (mouse.rs:83-112/:1003-1022, GOALS.md §7)
+
+    // `tui_prod`-only via the macro: `confirm_move_file`'s Yes/No dialog
+    // has no table/input, so `quadraui::native_dialog_options` resolves it
+    // to a *native* message dialog wherever `App` is the shell — that's
+    // `render_content`'s own `native_dialog_shown` edge-trigger rung
+    // (#727), shared code with no backend check at all, so it fires for
+    // `gtk` *and* `tui` (both wrap `App`) alike, not just `gtk`. Only
+    // `tui_prod` (`TuiShellApp`, its own independent paint path, never
+    // touches that rung) actually composes the dialog in-canvas, so only
+    // that arm gets `screen_has("Confirm Move")` — `gtk` gets the
+    // `native_dialog_shown`/`pending_native_dialog` edge-trigger hand-
+    // written twin below instead, mirroring `context_menu_delete_opens_
+    // confirm_dialog`'s own `gtk`/`tui_prod` split.
+    //
+    // No `tui` (App-on-`TuiBackend`) driver twin: unlike `gtk`, its
+    // `crate::tui_main::testing::conformance_harness` has no bespoke
+    // `Harness`-with-cloned-`Rc`-fields constructor the way `crate::gtk::
+    // testing::harness` does (`explorer_drag_and_drop_opens_confirm_move_
+    // dialog_gtk`, below) — `ConformanceHarness`'s own `driver.app()`
+    // returns an opaque `&impl AppLogic` on every backend, with no way to
+    // reach `native_dialog_shown`/`pending_native_dialog` through it. The
+    // `render.rs` unit test `explorer_drag_move_then_drop_opens_confirm_
+    // move_dialog` already covers the exact same shared `render::
+    // apply_explorer_drag_move`/`apply_explorer_drop` calls `App`'s `tui`
+    // arm would otherwise re-prove backend-neutrally, so this is not an
+    // uncovered gap, only a driver-level one.
+    crate::backend_conformance! {
+        label: explorer_drag_and_drop_opens_confirm_move_dialog,
+        backends: [tui_prod],
+        engine: engine_with_dnd_explorer_fixture("dnd"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("dndfile1429") && driver.screen_has("dnddir1429"),
+                "precondition: both the file and folder rows must be \
+                 painted; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            driver.drag_text("dndfile1429", "dnddir1429");
+            assert!(
+                driver.screen_has("Confirm Move"),
+                "dragging the file row onto the folder row and releasing \
+                 must open the move-confirmation dialog, via the shared \
+                 `render::apply_explorer_drag_move`/`apply_explorer_drop` \
+                 (#1429); painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+
+    /// GTK twin of the scenario above, via the bespoke `crate::gtk::
+    /// testing::harness` (not `conformance_harness`) — the same
+    /// `native_dialog_shown`/`pending_native_dialog` idiom
+    /// `explorer_context_menu_delete_opens_native_confirm_dialog`
+    /// (`src/gtk/testing.rs`) uses, for the same reason: those two fields
+    /// are `Rc` handles cloned out of `App` *before* it moves into the
+    /// opaque `driver_with_shell(...)` return, which `ConformanceHarness`
+    /// has no equivalent for (see this module's own doc, just above).
+    #[cfg(feature = "gui")]
+    #[test]
+    fn explorer_drag_and_drop_opens_confirm_move_dialog_gtk() {
+        let mut h =
+            crate::gtk::testing::harness(engine_with_dnd_explorer_fixture("dnd_gtk"), 800, 480);
+        assert!(
+            h.driver.screen_has("dndfile1429") && h.driver.screen_has("dnddir1429"),
+            "precondition: both the file and folder rows must be painted"
+        );
+        h.driver.drag_text("dndfile1429", "dnddir1429");
+        assert!(
+            h.native_dialog_shown.get(),
+            "dragging the file row onto the folder row and releasing must \
+             open the move-confirmation dialog -- `App` presents any \
+             table/input-free dialog as a native message dialog \
+             (quadraui#666's `native_dialog_options`), so the edge-trigger \
+             flag is this arm's proof instead of `screen_has` (#1429)"
+        );
+        let opts = h.pending_native_dialog.take();
+        assert!(
+            opts.as_ref()
+                .is_some_and(|o| o.body.contains("dndfile1429") && o.body.contains("dnddir1429")),
+            "the queued native dialog must name both the moved file and \
+             its destination folder; got {opts:?}"
+        );
+    }
+
+    // ── Hover-popup press-and-drag text selection (mouse.rs:242,1661) ───
+
+    /// A one-character buffer (`z`) so a post-copy `P` (paste-before) has
+    /// an unambiguous, single-row target, plus a focused hover popup over
+    /// six short, distinct words — short enough that the popup's
+    /// content-driven width (#1429's own risk: a wrapped line would break
+    /// a `drag_text` needle across two painted rows) never has to wrap in
+    /// either backend's 800-wide fixture.
+    fn engine_with_hover_popup_drag_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        let buf = engine.active_buffer_id();
+        if let Some(st) = engine.buffer_manager.get_mut(buf) {
+            st.buffer.content = ropey::Rope::from_str("z\n");
+        }
+        // Hermetic in-memory clipboard -- mirrors `setup_gtk_clipboard`'s
+        // shape without touching the real desktop clipboard.
+        // `tui_prod`'s own `TuiShellApp::from_engine` installs its
+        // equally-hermetic thread-local stand-in over this (see
+        // `tui_main::setup_tui_clipboard`'s `#[cfg(test)]` twin) -- either
+        // way the write-then-read round trip this scenario drives through
+        // Ctrl+C then `P` stays in-process.
+        let clip: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let clip_w = clip.clone();
+        engine.clipboard_write = Some(Box::new(move |text: &str| {
+            *clip_w.borrow_mut() = Some(text.to_string());
+            Ok(())
+        }));
+        engine.clipboard_read = Some(Box::new(move || {
+            clip.borrow().clone().ok_or_else(|| "empty".to_string())
+        }));
+        // Two markdown *paragraphs* (a blank line between them), not one
+        // line with an inline space — `hover_markdown_structure`'s real
+        // markdown parser folds a single embedded `\n` into the same
+        // rendered line (CommonMark soft-break), which would paint
+        // "alpha"/"zulu" as substrings of the *same* text run. GTK paints
+        // one combined run per rendered line (see
+        // `sweep_hit_band_integrity`'s own "TUI paints multi-word labels
+        // as one run per word" doc, just above, for the converse on TUI);
+        // `find`/`drag_text` locate a run's *center*, so two needles
+        // sharing one run would resolve to the same point and the drag
+        // below would be a same-point no-op. Two rows makes "alpha" and
+        // "zulu" land in two distinct, independently-locatable runs.
+        engine.show_editor_hover(
+            0,
+            0,
+            "alpha beta gamma\n\ndelta epsilon zulu",
+            crate::core::engine::EditorHoverSource::Lsp,
+            true,
+            false,
+        );
+        engine
+    }
+
+    // Registered on `gtk`/`tui` (proving `App` carries the drag
+    // follow-through — it has since #785, this pins it) and `tui_prod`
+    // (the original `hover_selecting` owner). Drives the *drag itself*,
+    // not just the press: a zero-length selection from the press alone
+    // would still paste something, but never "gamma"/"delta" — the words
+    // strictly between the drag's start (row 0, "alpha beta gamma") and
+    // end (row 1, "delta epsilon zulu").
+    crate::backend_conformance! {
+        label: hover_popup_press_and_drag_extends_selection,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_hover_popup_drag_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("gamma") && driver.screen_has("delta"),
+                "precondition: the focused hover popup's content must be \
+                 painted; painted: {:?}",
+                driver.inventory().text_runs()
+            );
+            driver.drag_text("alpha", "zulu");
+            driver.ctrl_char('c');
+            driver.press_named(NamedKey::Escape);
+            driver.type_char('P');
+            assert!(
+                driver.screen_has("gamma") && driver.screen_has("delta"),
+                "dragging from \"alpha\" to \"zulu\" inside the hover \
+                 popup must extend the selection past the press point -- \
+                 after Ctrl+C then a normal-mode `P`, the pasted text must \
+                 contain the words strictly between the drag's two rows \
+                 (#1429); painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+
+    // ── Right-click on the explorer tree's empty space (mouse.rs:1352-1368)
+
+    // Registered on all three arms: `route_tree_empty_space_context_menu`
+    // is the one genuinely shared stopgap (Files list: `src/render.rs`)
+    // for the still-open quadraui#1045 item 4 — see that function's own
+    // doc for the deletion plan once it ships.
+    crate::backend_conformance! {
+        label: explorer_right_click_below_last_row_opens_root_context_menu,
+        backends: [gtk, tui, tui_prod],
+        engine: engine_with_dnd_explorer_fixture("emptyspace"),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("dndfile1429"),
+                "precondition: the explorer must have at least one \
+                 painted row"
+            );
+            assert!(
+                !driver.screen_has("New File"),
+                "precondition: no context menu is open yet"
+            );
+            // `app-shell:sidebar-content` (the quadraui `AppShell` chrome
+            // zone) is only registered by the shared `App` — `tui_prod`'s
+            // `TuiShellApp` doesn't compose through `AppShell` at all (its
+            // own doc: "the independently hand-written shell"), so the
+            // empty-space point is instead derived from the last painted
+            // row's own bounds, which every arm paints identically: several
+            // row-heights straight down from it, same column. Never a
+            // hardcoded coordinate.
+            let last_row = driver
+                .inventory()
+                .text_runs()
+                .iter()
+                .find(|r| r.text.contains("dndfile1429"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "\"dndfile1429\"'s row must be painted; painted: {:?}",
+                        driver.inventory().text_runs()
+                    )
+                })
+                .bounds;
+            let x = last_row.x;
+            let y = last_row.y + last_row.height * 5.0;
+            driver.dispatch(quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Right,
+                position: quadraui::Point::new(x, y),
+                modifiers: quadraui::Modifiers::default(),
+            });
+            assert!(
+                driver.screen_has("New File"),
+                "right-clicking empty tree space below the last row must \
+                 open the root folder's context menu, via the shared \
+                 `render::route_tree_empty_space_context_menu` (#1429); \
+                 painted: {:?}",
+                driver.inventory().text_runs()
+            );
+        },
+    }
+}
+
 // ── #986: v0.11.0 bug suite -- oracle-backed `:s///c` confirm-prompt spec
 // (#801 Phase 2 never built) ────────────────────────────────────────────
 //

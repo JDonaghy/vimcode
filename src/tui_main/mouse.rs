@@ -65,55 +65,27 @@ fn text_drag_origin_window(region: &quadraui::WidgetId) -> Option<crate::core::W
 struct SidebarBodyDragGeometry {
     ab_width: u16,
     sidebar_width: u16,
-    menu_rows: u16,
     sb_visible: bool,
 }
 
-/// Apply a [`render::MouseDragRoute::SidebarBody`] drag.
+/// Apply a [`render::MouseDragRoute::SidebarBody`] drag — the search/settings
+/// form controllers' own drag handling. (Explorer drag-and-drop used to live
+/// here too; it is now [`render::MouseDragRoute::ExplorerDnd`], applied via
+/// the shared [`render::apply_explorer_drag_move`] at its own match arm —
+/// #1429.)
 ///
 /// The *ordering* question — does the sidebar body win this move at all — is
 /// [`render::route_mouse_drag`]'s and is shared with GTK. What is left here is
-/// the apply, which is TUI-shaped: the explorer's row arithmetic counts cells,
-/// and the search/settings form controllers are handed a cell-space `Rect`.
+/// the apply: the search/settings form controllers are handed a cell-space
+/// `Rect`.
 fn apply_tui_sidebar_body_drag(
     engine: &mut Engine,
     col: u16,
     row: u16,
     geo: SidebarBodyDragGeometry,
-    explorer_drag_src: &mut Option<usize>,
-    explorer_drag_active: &mut Option<(usize, Option<usize>)>,
 ) {
     let in_sidebar_cols =
         geo.sb_visible && col >= geo.ab_width && col < geo.ab_width + geo.sidebar_width;
-
-    // Explorer drag-and-drop: activate or update the target row.
-    if explorer_drag_src.is_some() || explorer_drag_active.is_some() {
-        if in_sidebar_cols && engine.active_panel_is(PANEL_EXPLORER) {
-            let sidebar_row = row.saturating_sub(geo.menu_rows);
-            if sidebar_row >= 1 {
-                let tree_row = (sidebar_row as usize).saturating_sub(1)
-                    + engine.explorer_tree.borrow().scroll_offset();
-                if tree_row < engine.explorer_rows.len() {
-                    if let Some(src_row) = *explorer_drag_src {
-                        // Only activate the drag if the target differs from the source.
-                        if tree_row != src_row {
-                            *explorer_drag_active = Some((src_row, Some(tree_row)));
-                            *explorer_drag_src = None;
-                        }
-                    } else if let Some((src, _)) = explorer_drag_active {
-                        *explorer_drag_active = Some((*src, Some(tree_row)));
-                    }
-                }
-            }
-        } else if let Some((src, _)) = explorer_drag_active {
-            // Dragged outside the sidebar — clear the target but keep the drag active.
-            *explorer_drag_active = Some((*src, None));
-        }
-        if explorer_drag_active.is_some() {
-            return;
-        }
-    }
-
     if !in_sidebar_cols {
         return;
     }
@@ -795,7 +767,7 @@ pub(super) fn handle_mouse(
                 // early return, so the flag is the backend's to set.
                 modal_hit: false,
                 sidebar_resizing: *dragging_sidebar,
-                sidebar_dnd: explorer_drag_src.is_some() || explorer_drag_active.is_some(),
+                explorer_dnd_active: explorer_drag_src.is_some() || explorer_drag_active.is_some(),
                 sidebar_body: sidebar_panel_drags.then(|| {
                     quadraui::Rect::new(
                         ab_width as f32,
@@ -847,6 +819,22 @@ pub(super) fn handle_mouse(
                         engine.editor_hover_extend_selection(content_line, content_col);
                     }
                 }
+                render::MouseDragRoute::ExplorerDnd => {
+                    // #1429: shared with GTK's `App::handle_mouse_drag_msg` —
+                    // the row-under-pointer math used to be hand-rolled here
+                    // (`sidebar_row = row - menu_rows`, `-1` for the header),
+                    // re-deriving what `explorer_tree_rect` (the rect the
+                    // press path already reads) already states.
+                    render::apply_explorer_drag_move(
+                        engine,
+                        engine.explorer_tree_rect.get(),
+                        1.0,
+                        col as f64,
+                        row as f64,
+                        explorer_drag_src,
+                        explorer_drag_active,
+                    );
+                }
                 render::MouseDragRoute::SidebarBody => {
                     apply_tui_sidebar_body_drag(
                         engine,
@@ -855,11 +843,8 @@ pub(super) fn handle_mouse(
                         SidebarBodyDragGeometry {
                             ab_width,
                             sidebar_width,
-                            menu_rows,
                             sb_visible,
                         },
-                        explorer_drag_src,
-                        explorer_drag_active,
                     );
                 }
                 render::MouseDragRoute::TabDrag => {
@@ -997,23 +982,11 @@ pub(super) fn handle_mouse(
             if tab_drag.handle_release(engine) {
                 return sidebar_width;
             }
-            // Explorer drag-and-drop: execute move on release.
-            if let Some((src_row, Some(target_row))) = explorer_drag_active.take() {
+            // Explorer drag-and-drop: execute move on release (#1429 — shared
+            // apply with GTK's `App::handle_mouse_up_msg`).
+            if let Some((src_row, target_row)) = explorer_drag_active.take() {
                 *explorer_drag_src = None;
-                if src_row < engine.explorer_rows.len() && target_row < engine.explorer_rows.len() {
-                    let src_path = engine.explorer_rows[src_row].path.clone();
-                    let target = &engine.explorer_rows[target_row];
-                    let dest_dir = if target.is_dir {
-                        target.path.clone()
-                    } else {
-                        target
-                            .path
-                            .parent()
-                            .unwrap_or(std::path::Path::new("."))
-                            .to_path_buf()
-                    };
-                    engine.confirm_move_file(&src_path, &dest_dir);
-                }
+                render::apply_explorer_drop(engine, src_row, target_row);
                 return sidebar_width;
             }
             *explorer_drag_src = None;
@@ -1340,34 +1313,6 @@ pub(super) fn handle_mouse(
                 };
                 let theme = render::Theme::from_name(&engine.settings.colorscheme);
                 let mut tui_backend = super::backend::TuiBackend::default();
-                // #1025 review: intentional, discussed behavior change —
-                // the pre-fix hand-rolled arithmetic this replaced had an
-                // `else` fallback for a miss (added deliberately in
-                // `19eabbe`): right-clicking empty space below the last row
-                // opened a context menu for the root/`cwd` folder. That
-                // fallback does not survive this fix, and it is not being
-                // silently dropped — it's being called out here.
-                //
-                // `TreeController::right_click` (quadraui
-                // `compose/tree_controller.rs`) resolves a
-                // `TreeViewHit::Empty` — the empty-space case — to
-                // `TreeControllerEvent::Consumed`, not
-                // `ContextMenuRequested`, so `route_explorer_tree_event`
-                // has nothing to turn into an `open_explorer_context_menu`
-                // call; the binding below is genuinely `Consumed` (or
-                // `Ignored`, if the click missed `rect` entirely) in that
-                // case, not a return value being thrown away. GTK's
-                // `explorer_ui_event` (`src/app.rs`) already goes through
-                // this same shared function and never had the fallback
-                // either, so dropping it here makes the two backends match
-                // — consistent with this repo's Platform-Neutrality Rule,
-                // which forbids adding TUI-only geometry/logic to restore
-                // it here. Restoring the old UX (if still wanted) belongs
-                // in quadraui itself — e.g. `right_click` returning a
-                // container-level `ContextMenuRequested` for `Empty` — so
-                // both backends would pick it up identically; that has not
-                // been filed as a quadraui issue yet.
-                //
                 // Right-click no longer needs anything back from this call
                 // (unlike the left-click arm below, which still dispatches
                 // `Row`/`Chevron`/scrollbar-drag results itself) — a
@@ -1381,6 +1326,25 @@ pub(super) fn handle_mouse(
                     (1.0, 1.0),
                     &theme,
                     &mut tui_backend,
+                );
+                // #1429: #1025 dropped the pre-existing "right-click below
+                // the last row opens the root folder's context menu"
+                // fallback when the row/chevron case above moved onto the
+                // shared `route_explorer_tree_event` (`TreeController::
+                // right_click` resolves the empty-space case to `Consumed`,
+                // not `ContextMenuRequested`, so that function had nothing
+                // to turn into a menu). This restores it through
+                // `route_tree_empty_space_context_menu` instead — shared
+                // with GTK's `explorer_ui_event`, not re-added as TUI-only
+                // geometry — as a stopgap for the still-open quadraui#1045
+                // item 4 (upstream: `right_click` itself resolving `Empty`
+                // to a container-level `ContextMenuRequested`); see that
+                // function's own doc for the deletion plan once it lands.
+                render::route_tree_empty_space_context_menu(
+                    engine,
+                    rect,
+                    (1.0, 1.0),
+                    quadraui::Point::new(col as f32, row as f32),
                 );
             } else if render::sidebar_owner(engine) == render::SidebarOwner::Board {
                 // #523: mirrors `App::route_board_sidebar_event`'s GTK
@@ -3043,28 +3007,21 @@ mod tests {
         );
     }
 
-    /// #1025 review: pins an intentional, discussed behavior change.
+    /// #1429: right-clicking empty tree space below the last explorer row
+    /// opens the root/`cwd` folder's context menu again.
     ///
-    /// Pre-fix, this arm hand-rolled its own row arithmetic and had an
-    /// `else` fallback (added deliberately in `19eabbe`) for a miss:
-    /// right-clicking empty space below the last explorer row opened a
-    /// context menu for the root/`cwd` folder. Routing the right-click arm
-    /// through the shared `render::route_explorer_tree_event` — the same
-    /// function the left-click arm and GTK's `explorer_ui_event` already
-    /// use, and which never had this fallback — drops it:
-    /// `TreeController::right_click` resolves a `TreeViewHit::Empty` to
-    /// `TreeControllerEvent::Consumed`, not `ContextMenuRequested`, so
-    /// there is nothing left to turn into an `open_explorer_context_menu`
-    /// call.
-    ///
-    /// This brings TUI in line with GTK (which never had the fallback
-    /// either) and with this repo's Platform-Neutrality Rule, which
-    /// forbids re-adding TUI-only geometry/logic to restore it. See the
-    /// comment at the `mouse.rs` call site for the full rationale and the
-    /// quadraui-side path that *would* restore it for both backends at
-    /// once, if that UX is still wanted.
+    /// #1025 had dropped this (see that fix's own review comment, once
+    /// here, for the "not silently lost" history) when it moved the
+    /// row/chevron case onto the shared `render::route_explorer_tree_event`,
+    /// which never resolves `TreeController::right_click`'s
+    /// `TreeViewHit::Empty` to a menu. #1429 restores it via the shared
+    /// `render::route_tree_empty_space_context_menu` stopgap (called from
+    /// both backends — see that function's doc for the upstream
+    /// quadraui#1045 item 4 this replaces once it ships), rather than
+    /// re-adding TUI-only geometry, so this is back to matching the fixture's
+    /// pre-#1025 name and expectation.
     #[test]
-    fn right_click_below_last_explorer_row_is_a_no_op() {
+    fn right_click_below_last_explorer_row_opens_root_folder_context_menu() {
         let mut engine = Engine::new();
         engine.focus_sidebar_panel(PANEL_EXPLORER);
         // `Engine::new()` calls `explorer_rebuild_rows()` internally,
@@ -3090,10 +3047,11 @@ mod tests {
         dispatch_right_click(&mut engine, ACTIVITY_BAR_WIDTH + 1, 5);
 
         assert!(
-            engine.context_menu.is_none(),
+            engine.context_menu.is_some(),
             "right-clicking empty space below the last explorer row must \
-             not open any context menu — the pre-#754 root-folder fallback \
-             was intentionally dropped by #1025's fix, not silently lost"
+             open the root folder's context menu (#1429 restores the \
+             #1025-dropped fallback via the shared \
+             route_tree_empty_space_context_menu)"
         );
     }
 

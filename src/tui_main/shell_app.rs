@@ -1623,7 +1623,9 @@ impl TuiShellApp {
                             self.engine.dispatch_explorer_tree_event(tree_event);
                         }
                     }
-                    UiEvent::MouseDown { .. } => {
+                    UiEvent::MouseDown {
+                        button, position, ..
+                    } => {
                         if let Some(tree_event) = tree_event {
                             let is_scrollbar =
                                 matches!(tree_event, quadraui::TreeControllerEvent::ScrollChanged);
@@ -1632,8 +1634,37 @@ impl TuiShellApp {
                             } else {
                                 self.engine.explorer_has_focus = true;
                                 self.sidebar.has_focus = true;
+                                // #1429: record a potential drag-and-drop
+                                // source -- only a genuine row selection
+                                // (not a chevron toggle or a scrollbar
+                                // drag) arms one, mirroring
+                                // `mouse::handle_mouse`'s identical press
+                                // arm (this early intercept is the real
+                                // production dispatch for an explorer
+                                // press -- that arm only ever runs from a
+                                // direct unit-test call to `handle_mouse`).
+                                if let quadraui::TreeControllerEvent::RowSelected { ref path } =
+                                    tree_event
+                                {
+                                    if let Some(&row_idx) = path.first() {
+                                        self.explorer_drag_src = Some(row_idx as usize);
+                                    }
+                                }
                             }
                             self.engine.handle_explorer_mouse_event(tree_event);
+                        }
+                        if *button == quadraui::MouseButton::Right {
+                            // #1429/quadraui#1045 item 4: empty-space
+                            // right-click fallback, shared with
+                            // `App::explorer_ui_event` -- see
+                            // `route_tree_empty_space_context_menu`'s own
+                            // doc for the upstream gap and deletion plan.
+                            render::route_tree_empty_space_context_menu(
+                                &mut self.engine,
+                                rect,
+                                (1.0, 1.0),
+                                *position,
+                            );
                         }
                     }
                     UiEvent::MouseUp { .. } => {
