@@ -61,6 +61,24 @@ path = "src/main.rs"
 name = "vcd"
 path = "src/tui_bin.rs"
 
+# #1461: the ACP contract-test corpus's replay agent — plays the "agent"
+# side of a transcript recorded by `AcpClient::spawn_with_recording`
+# (`src/core/acp.rs`) back at a real `AcpClient`, so a contract test drives
+# the engine's actual NDJSON parsing + dispatch path against realistic wire
+# shapes instead of only calling engine functions directly. A `[[bin]]`
+# (not a `tests/fixtures/*.sh` script, unlike `fake_acp_agent.sh`) because
+# faithfully rewriting a client-request `id` to match what the live client
+# actually sent — the one bit of real JSON logic replay needs, see its own
+# module doc — is impractical in the jq/python/node-free `/bin/sh` this
+# repo otherwise insists on for ACP fixtures; `serde_json` is already an
+# unconditional dependency, so this costs nothing new in the graph.
+# Located via `env!("CARGO_BIN_EXE_acp-replay-agent")` from
+# `tests/acp_contract.rs`, same mechanism `tests/nvim_conformance.rs` etc.
+# use for `env!("CARGO_BIN_EXE_vimcode")`.
+[[bin]]
+name = "acp-replay-agent"
+path = "tests/fixtures/replay_acp_agent.rs"
+
 # #657: `tests/acceptance.rs` — the sealed oracle-loop suite root — is entirely
 # `#![cfg(all(feature = "test-support", feature = "gui"))]`. Without this
 # stanza a driver invocation that forgot the flags would compile the target

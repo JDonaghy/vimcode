@@ -222,11 +222,7 @@ impl Engine {
     /// reviewed card behind this surface at all — an ACP tool-call diff,
     /// say) degrades to a status message rather than doing nothing
     /// silently.
-    pub(crate) fn handle_change_review_key(
-        &mut self,
-        key_name: &str,
-        unicode: Option<char>,
-    ) -> bool {
+    pub fn handle_change_review_key(&mut self, key_name: &str, unicode: Option<char>) -> bool {
         match key_name {
             "Escape" | "q" => {
                 self.close_change_review();
