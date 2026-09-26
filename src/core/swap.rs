@@ -106,24 +106,46 @@ pub fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) -> Option<PathBuf> 
 /// change to the message or the flush/log call order only has to be made
 /// once, and it can never be made in only two of the three by accident.
 ///
-/// **Not shared with the TUI entry point** (`tui_main::mod::run`) — that is
-/// an essential difference, not a fourth accidental copy to fold in here.
-/// TUI's hook writes via `debug_log!` instead of `eprintln!`, because a
-/// terminal backend runs in raw mode / the alternate screen: writing to
-/// stderr mid-panic there is invisible to the user (or corrupts the
-/// terminal state they're looking at) in a way that isn't a concern for any
-/// GUI backend. See #950's decomposition doc for the full essential-vs-
-/// accidental accounting.
+/// Thin wrapper over [`install_gui_crash_hook_with_sink`] with a no-op sink
+/// — every GUI entry point only needs `eprintln!`, which the sink'd variant
+/// always does regardless of the sink.
 pub fn install_gui_crash_hook() {
+    install_gui_crash_hook_with_sink(|_line: &str| {});
+}
+
+/// [`install_gui_crash_hook`], plus an extra `sink` invoked with each of the
+/// three message lines the hook writes via `eprintln!` (#1433, closing
+/// #1423's item 1).
+///
+/// This is the TUI entry point's (`tui_main::mod::run`) way of sharing this
+/// hook instead of carrying its own copy: a terminal backend runs in raw
+/// mode / the alternate screen, so writing to stderr mid-panic there is
+/// invisible to the user (or corrupts the terminal state they're looking
+/// at) in a way that isn't a concern for any GUI backend — `eprintln!`
+/// alone is not enough there. TUI passes a sink that also writes the line
+/// to the `--debug` log (`tui_main::debug_log!`), so the crash message
+/// survives even though the terminal itself never shows it. Every GUI
+/// caller passes a no-op sink via [`install_gui_crash_hook`] — `eprintln!`
+/// is all they need, so there is nothing for a sink to add there.
+pub fn install_gui_crash_hook_with_sink<F>(sink: F)
+where
+    F: Fn(&str) + Send + Sync + 'static,
+{
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Emergency: flush swap files for all dirty buffers.
         run_emergency_flush();
 
         if let Some(path) = write_crash_log(info) {
-            eprintln!("VimCode crashed. Details written to {}", path.display());
-            eprintln!("Unsaved buffers written to swap files for recovery.");
-            eprintln!("Please report this at https://github.com/JDonaghy/vimcode/issues");
+            let lines = [
+                format!("VimCode crashed. Details written to {}", path.display()),
+                "Unsaved buffers written to swap files for recovery.".to_string(),
+                "Please report this at https://github.com/JDonaghy/vimcode/issues".to_string(),
+            ];
+            for line in &lines {
+                eprintln!("{line}");
+                sink(line);
+            }
         }
         prev_hook(info);
     }));
