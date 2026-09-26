@@ -779,13 +779,42 @@ pub struct AcpAuthMethod {
     /// `parse_request_permission`'s doc for the same call elsewhere).
     pub name: String,
     pub kind: AcpAuthMethodKind,
+    /// Extra argv words a [`AcpAuthMethodKind::Terminal`] method's own
+    /// launch command must be run with to actually perform *this specific*
+    /// login (#1444). Empty for `Agent` methods (unused — those authenticate
+    /// via the plain `authenticate` RPC, not a subprocess launch) and for
+    /// any `Terminal` method whose wire entry omits `args`.
+    ///
+    /// The reference Claude ACP adapter (`@agentclientprotocol/
+    /// claude-agent-acp`) advertises three distinct `terminal` methods that
+    /// all share one underlying command but differ *only* in these args —
+    /// e.g. `["--cli", "auth", "login", "--claudeai"]` for its subscription
+    /// login vs `["--cli", "auth", "login", "--console"]` for its console
+    /// login. Running the bare command (pre-#1444 behavior) starts the
+    /// adapter's NDJSON server instead of any login flow, so it just sits
+    /// there until the pane is closed — read by a user as "abandoned".
+    /// `Engine::acp_launch_terminal_login` (`src/core/engine/
+    /// terminal_ops.rs`) appends these to the resolved agent command before
+    /// launching it.
+    ///
+    /// Not yet handled: the adapter's alternate `_meta["terminal-auth"]`
+    /// field (a full `{command, args, label}` override), which only
+    /// applies when the client advertises a `_meta` capability this client
+    /// does not yet send — `args` on the method itself is what the client
+    /// actually receives today. Likewise, no wire example of a `terminal`
+    /// method carrying its own `env` has been observed yet (only `args`,
+    /// per the adapter source cited above), so `env` isn't parsed here —
+    /// revisit if that ever appears on the wire.
+    pub args: Vec<String>,
 }
 
 /// Parse `initialize`'s `authMethods` result field: an array of `{id, name,
-/// type}`. An entry missing `id` is dropped (nothing a user could
+/// type, args}`. An entry missing `id` is dropped (nothing a user could
 /// meaningfully select or key `authenticate` on); every other field is
 /// defaulted rather than dropping the whole entry — see [`AcpAuthMethod::
-/// name`] and [`AcpAuthMethodKind`]'s docs for the specific defaults and why.
+/// name`] and [`AcpAuthMethodKind`]'s docs for the specific defaults and
+/// why, and [`AcpAuthMethod::args`]'s doc for why a `Terminal` method's
+/// `args` must not be dropped (#1444).
 pub fn parse_auth_methods(methods: &[serde_json::Value]) -> Vec<AcpAuthMethod> {
     methods
         .iter()
@@ -800,7 +829,21 @@ pub fn parse_auth_methods(methods: &[serde_json::Value]) -> Vec<AcpAuthMethod> {
                 Some("terminal") => AcpAuthMethodKind::Terminal,
                 _ => AcpAuthMethodKind::Agent,
             };
-            Some(AcpAuthMethod { id, name, kind })
+            let args = m
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AcpAuthMethod {
+                id,
+                name,
+                kind,
+                args,
+            })
         })
         .collect()
 }
@@ -2042,6 +2085,42 @@ mod tests {
         let methods = vec![serde_json::json!({"id": "api-key", "type": "agent"})];
         let parsed = parse_auth_methods(&methods);
         assert_eq!(parsed[0].name, "api-key");
+    }
+
+    /// #1444: a `type: "terminal"` method's own `args` — the reference
+    /// Claude ACP adapter's exact wire shape
+    /// (`@agentclientprotocol/claude-agent-acp` 0.81.2,
+    /// `dist/acp-agent.js:1048-1061`) — must survive parsing so
+    /// `Engine::acp_launch_terminal_login` can append them to the resolved
+    /// agent command. Dropping them (pre-#1444 behavior) makes the client
+    /// launch the bare command, which a real adapter answers by starting
+    /// its NDJSON server and never actually logging in.
+    ///
+    /// A `type: "agent"` entry with no `args` at all must not error or
+    /// synthesize one — it defaults to empty, matching every pre-#1444
+    /// fixture response that never carried the field.
+    #[test]
+    fn parse_auth_methods_carries_terminal_args_and_defaults_agent_args_to_empty() {
+        let methods = vec![
+            serde_json::json!({"id": "api-key", "name": "API Key", "type": "agent"}),
+            serde_json::json!({
+                "id": "claude-ai-login",
+                "name": "Claude Subscription",
+                "type": "terminal",
+                "args": ["--cli", "auth", "login", "--claudeai"],
+            }),
+        ];
+        let parsed = parse_auth_methods(&methods);
+        assert_eq!(parsed[0].args, Vec::<String>::new());
+        assert_eq!(
+            parsed[1].args,
+            vec![
+                "--cli".to_string(),
+                "auth".to_string(),
+                "login".to_string(),
+                "--claudeai".to_string(),
+            ]
+        );
     }
 
     #[test]

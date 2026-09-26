@@ -182,11 +182,12 @@ impl Engine {
         }
     }
 
-    /// Launch the ACP agent's own command line as an *interactive* process
-    /// in a visible terminal pane, for a `type: "terminal"` auth method
-    /// (#957, ACP-6). Terminal auth is not the `authenticate` RPC — per the
-    /// ACP spec's distinction (`core::acp`'s module doc), the client must
-    /// run the adapter attached to a real TTY so its own CLI can drive an
+    /// Launch the ACP agent's own command line, plus the chosen auth
+    /// method's own `args` (#1444), as an *interactive* process in a
+    /// visible terminal pane, for a `type: "terminal"` auth method (#957,
+    /// ACP-6). Terminal auth is not the `authenticate` RPC — per the ACP
+    /// spec's distinction (`core::acp`'s module doc), the client must run
+    /// the adapter attached to a real TTY so its own CLI can drive an
     /// interactive login (a browser OAuth flow, a device code prompt, ...),
     /// then re-initialize once that process exits
     /// (`Engine::acp_finish_terminal_login`, called from `poll_terminal`
@@ -196,20 +197,33 @@ impl Engine {
     /// configured, else the legacy single-string `acp_agent_command`,
     /// #958 ACP-7 / #1443) so terminal-auth login always launches whatever
     /// agent the AI panel actually spawned, not a stale unconditional read
-    /// of `acp_agent_command`. vimcode has no agent-specific knowledge of
-    /// what flag would force "login mode" (nor should it, per the ACP
-    /// track's agent-neutral design), so the same command is trusted to
-    /// behave differently when its stdio is a real PTY instead of piped
-    /// NDJSON (`isatty(stdin)`, in practice).
+    /// of `acp_agent_command`.
+    ///
+    /// Running that resolved command *bare* is wrong: the reference Claude
+    /// ACP adapter starts its NDJSON server and waits on stdin when given no
+    /// arguments, even attached to a real TTY — no login flow ever runs, and
+    /// the pane just sits there until the user closes it (read as
+    /// "abandoned"). What actually selects *which* login this specific
+    /// method performs is `login_args`, taken verbatim from the chosen
+    /// [`crate::core::acp::AcpAuthMethod::args`] the agent advertised on the
+    /// wire (e.g. `["--cli", "auth", "login", "--claudeai"]`) and appended
+    /// after the resolved command — vimcode has no agent-specific knowledge
+    /// of what those args mean (nor should it, per the ACP track's
+    /// agent-neutral design); it only forwards what the agent itself said
+    /// this method needs.
     ///
     /// `TerminalSession::spawn` takes a shell *path*, not an argv
     /// (`quadraui::terminal_engine::TerminalSession::spawn`) — the same
     /// constraint `terminal_run_command` above already works around: spawn
     /// the user's interactive shell (in the resolved profile's `cwd`),
-    /// then inject the command plus its `env` as PTY input
-    /// (`build_acp_auth_wrapper`), reusing that existing pattern rather
-    /// than inventing a second one.
-    pub fn acp_launch_terminal_login(&mut self, method_name: &str) {
+    /// then inject the command (plus `login_args`) and its `env` as PTY
+    /// input (`build_acp_auth_wrapper`), reusing that existing pattern
+    /// rather than inventing a second one. `login_args` are shell-quoted
+    /// (`quote_shell_arg`) before being appended — they came off the wire,
+    /// not the operator's own keyboard, so unlike the base command string
+    /// itself (`parse_agent_command`'s doc comment) they get no benefit of
+    /// the doubt about containing shell metacharacters.
+    pub fn acp_launch_terminal_login(&mut self, method_name: &str, login_args: &[String]) {
         // #1443: route through the same registry-aware resolver the
         // NDJSON transport path uses (`ai_send_message_via_acp`), not
         // `settings.acp_agent_command` directly — that field is empty
@@ -227,6 +241,15 @@ impl Engine {
         let shell = default_shell();
         let is_powershell =
             shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        let agent_cmd = if login_args.is_empty() {
+            agent_cmd
+        } else {
+            let quoted_args: Vec<String> = login_args
+                .iter()
+                .map(|a| quote_shell_arg(a, is_powershell))
+                .collect();
+            format!("{agent_cmd} {}", quoted_args.join(" "))
+        };
         let wrapped = build_acp_auth_wrapper(&agent_cmd, &env, is_powershell);
         // Reuse an already-open pane's dimensions if one exists (the most
         // recently painted size); otherwise fall back to a conventional
@@ -1592,6 +1615,24 @@ pub fn build_acp_auth_wrapper(
             .map(|(k, v)| format!("export {k}=\"{v}\"\n"))
             .collect();
         format!("{env_lines}{command}\nexit $?\n")
+    }
+}
+
+/// Shell-quote a single argv word for injection into the interactive shell
+/// wrapper `build_acp_auth_wrapper` builds — used for a `type: "terminal"`
+/// auth method's own `args` (#1444, [`crate::core::acp::AcpAuthMethod::
+/// args`]), which arrive off the wire rather than from the operator's own
+/// keyboard, unlike the base command string (`parse_agent_command`'s doc
+/// comment explains that string's own, more permissive, posture). POSIX
+/// gets single-quoting with the standard `'\''`-splice for an embedded
+/// single quote; PowerShell gets double-quoting with backtick-escaped
+/// backticks and double quotes, matching `build_acp_auth_wrapper`'s own
+/// per-shell split.
+fn quote_shell_arg(arg: &str, is_powershell: bool) -> String {
+    if is_powershell {
+        format!("\"{}\"", arg.replace('`', "``").replace('"', "`\""))
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
     }
 }
 

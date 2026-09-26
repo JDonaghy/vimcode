@@ -173,14 +173,14 @@
 # unmodified through `settings.acp_agent_command`'s own trailing word — no
 # environment variable or other test-only side channel needed, since both
 # the NDJSON spawn and the interactive re-spawn share that one string)
-# selects the outcome: "fail" simulates a declined/failed login (exit 1);
-# "hang" skips this shortcut entirely and falls into the ordinary
-# NDJSON-shaped `read` loop below, which blocks forever on this real TTY
-# instead of a piped-closed one — simulating a login a human abandons by
-# closing the pane before it ever exits, for a test to race against with
-# `Engine::terminal_close_active_tab`. "succeed-slow" is the same success
-# path plus a two-second `sleep` before exiting — for a `TuiDriver` black-box
-# test (`tui_main::shell_app::tests::
+# selects the outcome, and is optional: "fail" simulates a declined/failed
+# login (exit 1); "hang" skips this shortcut entirely and falls into the
+# ordinary NDJSON-shaped `read` loop below, which blocks forever on this
+# real TTY instead of a piped-closed one — simulating a login a human
+# abandons by closing the pane before it ever exits, for a test to race
+# against with `Engine::terminal_close_active_tab`. "succeed-slow" is the
+# same success path plus a two-second `sleep` before exiting — for a
+# `TuiDriver` black-box test (`tui_main::shell_app::tests::
 # ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`)
 # that needs a real window to poll-and-render the login pane's own painted
 # PTY output ("...login succeeded") before the pane closes itself and is
@@ -188,18 +188,41 @@
 # only asserting `terminal_panes.len()` / `acp_authenticated` state (#957
 # review). GTK's twin test uses a different visibility proof instead (the
 # bottom panel's tab-strip chrome, not PTY cell text — see that test's own
-# doc comment for why) so it doesn't need this arg. Anything else
-# (including no arg) succeeds (exit 0) immediately.
-if [ -t 0 ] && [ "$1" != "hang" ]; then
-  if [ "$1" = "fail" ]; then
-    echo "fake-acp-agent: interactive login failed" 1>&2
-    exit 1
+# doc comment for why) so it doesn't need this arg.
+#
+# #1444: after that optional control word, every remaining arg must be
+# exactly the "claude-ai-login" method's own `args` above
+# (`--cli auth login --claudeai`) — `Engine::acp_launch_terminal_login` is
+# responsible for appending them to the resolved command
+# (`AcpAuthMethod::args`), and this fixture *refuses to "log in"* (exit 1,
+# distinct stderr message) if they are missing or wrong, so a regression
+# that drops them (the exact bug #1444 reported: the bare command was run,
+# which a real adapter answers by starting its NDJSON server and never
+# logging in at all) fails every test below this comment, not just a
+# dedicated one.
+if [ -t 0 ]; then
+  ctrl=""
+  case "$1" in
+    fail | hang | succeed-slow)
+      ctrl="$1"
+      shift
+      ;;
+  esac
+  if [ "$ctrl" != "hang" ]; then
+    if [ "$1 $2 $3 $4" != "--cli auth login --claudeai" ] || [ -n "$5" ]; then
+      echo "fake-acp-agent: interactive login refused: expected args '--cli auth login --claudeai', got '$*'" 1>&2
+      exit 1
+    fi
+    if [ "$ctrl" = "fail" ]; then
+      echo "fake-acp-agent: interactive login failed" 1>&2
+      exit 1
+    fi
+    echo "fake-acp-agent: interactive login succeeded"
+    if [ "$ctrl" = "succeed-slow" ]; then
+      sleep 2
+    fi
+    exit 0
   fi
-  echo "fake-acp-agent: interactive login succeeded"
-  if [ "$1" = "succeed-slow" ]; then
-    sleep 2
-  fi
-  exit 0
 fi
 
 echo "fake-acp-agent: starting" 1>&2
@@ -236,7 +259,7 @@ while IFS= read -r line; do
       auth_methods='[]'
       if [ -n "$ACP_FAKE_AUTH_METHODS" ]; then
         if [ "$saw_auth_terminal" = "true" ]; then
-          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"},{"id":"claude-ai-login","name":"Claude Subscription","type":"terminal"}]'
+          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"},{"id":"claude-ai-login","name":"Claude Subscription","type":"terminal","args":["--cli","auth","login","--claudeai"]}]'
         else
           auth_methods='[{"id":"api-key","name":"API Key","type":"agent"}]'
         fi
