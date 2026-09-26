@@ -106,6 +106,18 @@ fn apply_tui_sidebar_body_drag(
         // that drifts whenever the sidebar's own origin isn't `y == 0`.
         let rect = engine.settings_form_rect.get();
         render::handle_settings_form_ui_event(engine, &move_ev, rect);
+    } else if engine.active_panel_is(PANEL_AI) {
+        // #1452: same "controller does its own hit-test against the
+        // painted rect" shape as the two arms above — `ChatController`'s
+        // `transcript_drag` (armed by the `MouseDown` in the click ladder
+        // above, via `route_ai_chat_event`) needs this `MouseMoved`
+        // follow-through to actually move the thumb; without it, the panel
+        // fell into `MouseDragRoute::None` on every drag exactly like the
+        // wheel and `MouseUp` gaps this issue also fixes.
+        let rect = engine.ai_chat_rect.get();
+        let theme = render::Theme::from_name(&engine.settings.colorscheme);
+        let mut tui_backend = super::backend::TuiBackend::default();
+        render::route_ai_chat_event(engine, &move_ev, rect, &theme, &mut tui_backend);
     }
 }
 
@@ -756,8 +768,16 @@ pub(super) fn handle_mouse(
                 panel_left: editor_left as f64,
                 col_width: 1.0,
             };
+            // #1452: `PANEL_AI` joins the other two — its `ChatController`
+            // scrollbar-thumb drag is exactly the same "controller owns its
+            // own hit-test, just needs the raw `MouseMoved` follow-through"
+            // shape as search/settings, not the `drag_state`-armed path
+            // debug/git/board/explorer use (see `apply_tui_sidebar_body_drag`'s
+            // new arm below).
             let sidebar_panel_drags = sb_visible
-                && (engine.active_panel_is(PANEL_SEARCH) || engine.active_panel_is(PANEL_SETTINGS));
+                && (engine.active_panel_is(PANEL_SEARCH)
+                    || engine.active_panel_is(PANEL_SETTINGS)
+                    || engine.active_panel_is(PANEL_AI));
             let state = render::MouseDragState {
                 layout: last_layout,
                 armed_target: render::drag_state_arms_scrollbar(drag_state),
@@ -974,6 +994,25 @@ pub(super) fn handle_mouse(
             };
             engine.handle_search_sidebar_ui_event(up_ev);
         }
+        // #1452: release the AI panel's `ChatController::transcript_drag`
+        // (an internal `Option<ScrollDrag>` the controller itself owns,
+        // unlike the search/settings controllers above which have no
+        // equivalent) — without this the scrollbar thumb kept rendering
+        // "dragging" after the button came up, until the next click on the
+        // thumb happened to reset it. Mirrors the `PANEL_SEARCH` arm above;
+        // GTK gets this for free from `try_route_sidebar_mouse_event`'s
+        // generic `MouseUp` follow-through (`sidebar_pointer_captured`).
+        MouseEventKind::Up(MouseButton::Left) if sb_visible && engine.active_panel_is(PANEL_AI) => {
+            let up_ev = quadraui::UiEvent::MouseUp {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(col as f32, row as f32),
+            };
+            let rect = engine.ai_chat_rect.get();
+            let theme = render::Theme::from_name(&engine.settings.colorscheme);
+            let mut tui_backend = super::backend::TuiBackend::default();
+            render::route_ai_chat_event(engine, &up_ev, rect, &theme, &mut tui_backend);
+        }
         MouseEventKind::Up(MouseButton::Left) => {
             // Tab drag-and-drop: execute drop on release (#753 — the same
             // `handle_release` GTK calls; it also clears any armed-but-never-
@@ -1090,6 +1129,32 @@ pub(super) fn handle_mouse(
                 // `y = 2` rect — see `apply_tui_sidebar_body_drag`'s twin.
                 let rect = engine.settings_form_rect.get();
                 render::handle_settings_form_ui_event(engine, &scroll_ev, rect);
+                return sidebar_width;
+            }
+            // #1452: the AI assistant panel's transcript never got a wheel
+            // arm here at all — every other scrollable sidebar panel above
+            // does, so a wheel notch over the AI panel fell all the way
+            // through to the generic scroll-surface dispatch below (which
+            // has no entry for it) and then the editor-scroll fallback,
+            // silently doing nothing. `ChatController::handle`'s own
+            // `UiEvent::Scroll` arm is the shared (GTK+TUI) scroll math —
+            // see `route_ai_chat_event`'s doc for the metrics re-apply this
+            // needs before calling it.
+            if sb_visible
+                && col >= ab_width
+                && col < ab_width + sidebar_width
+                && !ext_panel_showing
+                && engine.active_panel_is(PANEL_AI)
+            {
+                let scroll_ev = quadraui::UiEvent::Scroll {
+                    widget: None,
+                    delta: quadraui::ScrollDelta::new(0.0, if scroll_up { 3.0 } else { -3.0 }),
+                    position: quadraui::Point::new(col as f32, row as f32),
+                };
+                let rect = engine.ai_chat_rect.get();
+                let theme = render::Theme::from_name(&engine.settings.colorscheme);
+                let mut tui_backend = super::backend::TuiBackend::default();
+                render::route_ai_chat_event(engine, &scroll_ev, rect, &theme, &mut tui_backend);
                 return sidebar_width;
             }
             // Terminal panel scroll now routes through dispatch_scroll
