@@ -2953,9 +2953,14 @@ impl Engine {
     ///
     /// #1446: when neither transport is usable — no ACP agent *and* no
     /// resolvable API key for a provider that needs one — this fails
-    /// synchronously with an actionable `self.message` instead of spawning
-    /// curl, which used to surface as a bare "AI error: curl failed:" once
-    /// the doomed request predictably failed.
+    /// synchronously with an actionable message instead of spawning curl,
+    /// which used to surface as a bare "AI error: curl failed:" once the
+    /// doomed request predictably failed. The failure follows the same
+    /// shape as `ai_send_message_via_acp`'s spawn-failure arm: the user's
+    /// turn still lands in the transcript (the panel must not silently
+    /// swallow what was typed) and the explanation lands *in the
+    /// transcript* as an `assistant-thought`, not only on the status line
+    /// a chat user is not looking at.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
@@ -2974,10 +2979,23 @@ impl Engine {
         if crate::core::ai::provider_needs_api_key(&provider)
             && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
         {
+            self.ai_messages.push(AiMessage {
+                role: "user".to_string(),
+                content: text,
+            });
             self.message = format!(
                 "AI: no ACP agent configured (acp_agents / acp_agent_command) and no \
                  API key for provider \"{provider}\""
             );
+            self.ai_messages.push(AiMessage {
+                role: "assistant-thought".to_string(),
+                content: format!(
+                    "\u{26a0} Cannot send: no ACP agent is configured (set `acp_agents` or \
+                     `acp_agent_command`) and no API key is available for provider \
+                     \"{provider}\" (set `ai_api_key`, or the provider's API-key \
+                     environment variable)."
+                ),
+            });
             return;
         }
         self.ai_send_message_via_curl(text);
