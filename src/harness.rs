@@ -1583,6 +1583,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     "app_on_tui::key_press_inserts_text_via_shell_app_general_fallback",
     "app_on_tui::dd_deletes_the_current_line",
     "app_on_tui::undo_restores_after_dd",
+    "app_on_tui::escape_returns_to_normal_mode_after_insert",
     "app_on_tui::status_bar_paints_cursor_position",
     "app_on_tui::two_tabs_paint_both_labels",
     "app_on_tui::render_content_paints_group_divider_via_shell_app",
@@ -1590,6 +1591,7 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     "app_on_tui::group_divider_click_without_move_leaves_the_divider_put_via_shell_app",
     "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
     "app_on_tui::minimap_paints_braille_when_enabled",
+    "app_on_tui::no_minimap_braille_when_setting_is_off",
     "app_on_tui::split_paints_minimap_in_both_panes",
     "app_on_tui::focused_terminal_swallows_editor_keys_via_shell_app",
     "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
@@ -4876,16 +4878,19 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// [`sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar`] — see those
 /// scenarios' own docs for the repro and the assertions' rationale.
 ///
-/// No `tui` arm on the `l` proof, same shape and same reason as
-/// `issue_1360_activity_bar_click_focuses_panel`'s own note just above:
-/// `App` driven by `quadraui::tui::TuiBackend` never paints the editor's
-/// `"Ln N, Col N"` status-bar segment at this harness's viewport size, a
-/// pre-existing gap in that control fixture unrelated to this issue's
-/// `Ctrl-W` chord fix. `gtk` and `tui_prod` are the two *real* shells users
-/// run, and both are covered. The `h` proof only reads panel-title text
-/// (already gap-free on `tui`, per `activity_bar_click_focuses_search_panel`
-/// above running clean there in spirit) but is still pinned to `[gtk,
-/// tui_prod]` for symmetry with its sibling.
+/// The `l` proof's `tui` arm used to be omitted on the same by-hand claim
+/// `issue_1360_activity_bar_click_focuses_panel`'s own note above once made:
+/// "`App` driven by `quadraui::tui::TuiBackend` never paints the editor's
+/// `Ln N, Col N` status-bar segment at this harness's viewport size". #1425's
+/// App-on-TUI gap inventory re-checked that claim here too (same engine
+/// fixture and `(800, 480)` size as `issue_1360`'s scenario) and it no
+/// longer reproduces — registering the `tui` arm plain (no `KNOWN_BUGS`
+/// gate) is itself the record that this gap has closed, for the same
+/// likely reason (#700's fixed-pixel row heights) given there. The `h`
+/// proof only reads panel-title text (already gap-free on `tui`, per
+/// `activity_bar_click_focuses_search_panel` above running clean there in
+/// spirit) but is still pinned to `[gtk, tui_prod]` for symmetry with its
+/// sibling.
 #[cfg(test)]
 mod issue_406_sidebar_ctrl_w_navigates {
     fn engine_fixture() -> crate::core::Engine {
@@ -4901,7 +4906,7 @@ mod issue_406_sidebar_ctrl_w_navigates {
 
     crate::backend_conformance! {
         label: sidebar_ctrl_w_l_returns_focus_to_the_editor_proof,
-        backends: [gtk, tui_prod],
+        backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
         size: (800, 480),
         body: |driver| {

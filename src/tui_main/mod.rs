@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 mod app_on_tui_tests;
 mod backend;
 mod events;
