@@ -1609,10 +1609,11 @@ mod tests {
         // ── #1431 tranche 2: tab switcher popup clicks ──────────────────
 
         /// `count` file tabs, zero-padded so no name is a substring of
-        /// another. Mirrors `shell_app.rs`'s `app_with_many_file_tabs_and_
-        /// switcher_open` fixture builder, minus the the pre-#1434 TUI shell-specific
-        /// sidebar-hiding (this module's [`harness_no_sidebar`] does that
-        /// after construction instead).
+        /// another. Mirrored the deleted `shell_app.rs`'s (#1434)
+        /// `app_with_many_file_tabs_and_switcher_open` fixture builder,
+        /// minus the pre-#1434 TUI shell-specific sidebar-hiding (this
+        /// module's [`harness_no_sidebar`] does that after construction
+        /// instead).
         fn engine_with_two_file_tabs_and_switcher_open() -> crate::core::Engine {
             let dir = std::env::temp_dir().join(format!(
                 "vimcode_test_1431_tab_switcher_{:?}",

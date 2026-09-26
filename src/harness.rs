@@ -93,30 +93,30 @@
 //! — a `DriverInput`-bounded body written against `GtkDriver` costs nothing
 //! extra to also run on `TuiDriver` via [`crate::tui_main::testing::conformance_harness`].
 //!
-//! # `tui` vs `tui_prod` — which TUI shell a scenario actually drives (#1043)
+//! # `tui` vs `tui_prod` — two arms, one shell since #1434 (#1043)
 //!
-//! "TUI" above names one *bound*, but [`backend_conformance!`] wires it to
-//! **two different shells**, each its own arm:
+//! [`backend_conformance!`] still registers two TUI arms:
 //!
 //! - `tui` → [`crate::tui_main::testing::conformance_harness`], wrapping
 //!   [`App`] (the cross-backend-shared shell every other arm also wraps) on
-//!   `quadraui::tui::TuiBackend`. This is the *control*: a scenario failing
-//!   only here means the two rasterisers disagree, nothing about the TUI
-//!   binary users actually run.
-//! - `tui_prod` → [`crate::tui_main::testing::conformance_harness_prod`],
-//!   wrapping [`crate::tui_main::testing::the pre-#1434 TUI shell`] — the independently
-//!   hand-written shell `tui_main::run` really ships (its own mouse
-//!   routing, its own render path). A scenario green on `gtk`+`tui` but red
-//!   on `tui_prod` is, by construction, the shipped TUI diverging from the
-//!   shared shell — exactly the class of bug #1025 was, caught mechanically
-//!   here instead of by a user.
+//!   `quadraui::tui::TuiBackend`.
+//! - `tui_prod` → [`crate::tui_main::testing::conformance_harness_prod`], a
+//!   thin alias of the same [`crate::tui_main::testing::conformance_harness`].
 //!
-//! Before #1043 only `tui` existed, so nothing in this file could ever see
-//! the second kind of divergence. `tui_prod` cannot yet accept every
-//! scenario — see [`crate::tui_main::testing::conformance_harness_prod`]'s
-//! own doc for the `ConformanceHarness::engine`/`::screen_layout` gap that
-//! currently excludes the #987 scrollbar-drag family and #983's
-//! `_resetting` sweep from it.
+//! Before #1433/#1434 these wrapped two independently-implemented shells —
+//! the shared [`App`] and a hand-rolled, TUI-only production shell — so a
+//! scenario green on `tui` but red on `tui_prod` meant the two had diverged
+//! (the class of bug #1025 was, caught mechanically here instead of by a
+//! user). #1433 flipped production `tui_main::run` onto `App`, and #1434
+//! deleted the hand-rolled shell entirely, so both arms now build the
+//! identical `App`. Both names are kept (rather than collapsing back to one
+//! arm) so the many existing `tui_prod`-suffixed scenarios and
+//! `KNOWN_BUGS` labels in this file keep resolving unchanged. `tui_prod`
+//! still cannot accept every scenario — see
+//! [`crate::tui_main::testing::conformance_harness_prod`]'s own doc for the
+//! `ConformanceHarness::engine`/`::screen_layout` gap that currently
+//! excludes the #987 scrollbar-drag family and #983's `_resetting` sweep
+//! from it.
 
 #![cfg(any(test, feature = "test-support"))]
 
@@ -1888,20 +1888,20 @@ where
 /// no gate — `quadraui/tui` is an unconditional feature of the pinned
 /// dependency (see `Cargo.toml`), not an optional vimcode one.
 ///
-/// # `tui` vs `tui_prod` (#1043)
+/// # `tui` vs `tui_prod` (#1043, converged #1434)
 ///
-/// These are **two different TUI arms**, not a typo for one — see
-/// `crate::tui_main::testing`'s own "Two TUI arms" doc for the full
-/// reasoning. In short: `tui` wraps [`crate::app::App`] (the
+/// Not a typo for one arm — see `crate::tui_main::testing`'s own "two TUI
+/// arms" doc for the full reasoning. `tui` wraps [`crate::app::App`] (the
 /// cross-backend-shared shell, also what `gtk` wraps) on
-/// `quadraui::tui::TuiBackend` — it is the *control* that isolates
-/// "rasteriser difference" from "implementation difference". `tui_prod`
-/// wraps [`crate::tui_main::testing::the pre-#1434 TUI shell`] — the independently
-/// hand-written shell `tui_main::run` actually ships. A scenario green on
-/// `gtk`+`tui` but red on `tui_prod` is, by construction, the shipped TUI
-/// diverging from the shared shell, not a paint-surface artifact — exactly
-/// the class of bug #1025 was before a user found it by hand. Not every
-/// scenario can run on `tui_prod` yet — see
+/// `quadraui::tui::TuiBackend`. `tui_prod` wraps the same `App` via a thin
+/// alias ([`crate::tui_main::testing::conformance_harness_prod`]); before
+/// #1433/#1434 it wrapped an independently hand-written shell
+/// `tui_main::run` actually shipped, so a scenario green on `gtk`+`tui` but
+/// red on `tui_prod` meant the shipped TUI had diverged from the shared
+/// shell — exactly the class of bug #1025 was before a user found it by
+/// hand. Both names are kept so existing `tui_prod`-suffixed scenarios and
+/// `KNOWN_BUGS` labels keep resolving unchanged. Not every scenario can run
+/// on `tui_prod` yet — see
 /// `crate::tui_main::testing::conformance_harness_prod`'s own doc for
 /// which trait bounds it satisfies and which (`ConformanceHarness::engine`/
 /// `::screen_layout`) it does not.
@@ -3547,12 +3547,13 @@ mod issue_1429_shared_mouse_routes {
             st.buffer.content = ropey::Rope::from_str("z\n");
         }
         // Hermetic in-memory clipboard -- mirrors `setup_gtk_clipboard`'s
-        // shape without touching the real desktop clipboard.
-        // `tui_prod`'s own the pre-#1434 TUI shell's `from_engine` installs its
-        // equally-hermetic thread-local stand-in over this (see
-        // `tui_main::setup_tui_clipboard`'s `#[cfg(test)]` twin) -- either
-        // way the write-then-read round trip this scenario drives through
-        // Ctrl+C then `P` stays in-process.
+        // shape without touching the real desktop clipboard. Both the
+        // `tui` and `tui_prod` arms build through the same
+        // `App::new_headless_with_backend` (#1434 deleted the pre-#1434
+        // TUI shell's separate `from_engine`/`setup_tui_clipboard`), so
+        // neither arm overrides these hooks -- the write-then-read round
+        // trip this scenario drives through Ctrl+C then `P` stays
+        // in-process on both.
         let clip: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let clip_w = clip.clone();
         engine.clipboard_write = Some(Box::new(move |text: &str| {
@@ -5668,9 +5669,9 @@ mod issue_1418_explorer_context_menu {
 /// `App::setup` rather than reimplemented per backend.
 ///
 /// These are `tui`-arm ports of scenarios that, before #1427, only existed
-/// as the pre-#1434 TUI shell-only unit tests in `src/tui_main/shell_app.rs` (still
-/// present there, unchanged, as the `tui_prod` proof the shipped TUI binary
-/// keeps agreeing with the shared implementation): `alt_letter_reveals_
+/// as the pre-#1434 TUI shell-only unit tests in `src/tui_main/shell_app.rs`
+/// (deleted outright by #1434, once `App` on `quadraui::tui::TuiBackend`
+/// became the only TUI shell there was to prove): `alt_letter_reveals_
 /// menu_bar_via_shell_app`, `driver_click_on_settings_toggle_with_menu_bar_
 /// visible_flips_its_own_row_via_shell_app`, `hamburger_relocated_click_
 /// after_reveal_hides_menu_bar`, and `hamburger_stale_click_position_after_
