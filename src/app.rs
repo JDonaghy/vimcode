@@ -209,12 +209,10 @@ impl GtkEngineActionHost<'_> {
     /// against the already-borrowed `engine` instead of calling it (see this
     /// struct's own doc for why).
     fn save_session_and_exit(app: &App, engine: &mut Engine) {
-        // #1234: reads `App::cached_window_width`/`cached_window_height`
-        // (refreshed every tick from `WindowControl::bounds()`) rather than
-        // querying a live `backend` handle — this call chain
-        // (`EngineActionHost`) carries none; see those fields' own doc.
-        engine.session.window.width = app.cached_window_width.get();
-        engine.session.window.height = app.cached_window_height.get();
+        // See `App::cached_window_geometry`'s own doc for why this reads
+        // cached cells rather than querying a live `backend` handle — this
+        // call chain (`EngineActionHost`) carries none (#1234, #1529).
+        engine.session.window = app.cached_window_geometry();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
@@ -435,8 +433,7 @@ impl render::TickHost for GtkTickHost<'_> {
     /// Inlines `App::save_session_and_exit`'s body against `engine` directly
     /// — see this struct's own doc for why it can't call that method.
     fn quit_after_format_save(&mut self, engine: &mut Engine) {
-        engine.session.window.width = self.app.cached_window_width.get();
-        engine.session.window.height = self.app.cached_window_height.get();
+        engine.session.window = self.app.cached_window_geometry();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
@@ -461,11 +458,19 @@ impl render::TickHost for GtkTickHost<'_> {
         let win_title = render::window_title(engine);
         if let Some(w) = self.backend.window() {
             let _ = w.set_title(&win_title);
-            // Refresh the session-restore size cache (#1234) — see
-            // `cached_window_width`'s doc for why this is cached here rather
-            // than read live from `save_session_and_exit`, and why it's
-            // gated on `!is_maximized()`.
-            if matches!(w.is_maximized(), Ok(false)) {
+            // Refresh the session-restore maximized cache (#1529)
+            // unconditionally — unlike size/position below, this is exactly
+            // the one moment those freeze, so it must always be current.
+            let maximized = w.is_maximized();
+            if let Ok(m) = maximized {
+                self.app.cached_window_maximized.set(m);
+            }
+            // Refresh the session-restore size/position cache (#1234,
+            // extended #1529 for position) — see `cached_window_width`'s
+            // doc for why this is cached here rather than read live from
+            // `save_session_and_exit`, and why it's gated on
+            // `!is_maximized()`.
+            if matches!(maximized, Ok(false)) {
                 if let Ok(bounds) = w.bounds() {
                     self.app
                         .cached_window_width
@@ -473,6 +478,15 @@ impl render::TickHost for GtkTickHost<'_> {
                     self.app
                         .cached_window_height
                         .set(bounds.height.round() as i32);
+                    // `WindowControl::bounds`'s own doc: GTK/Wayland always
+                    // reports `x: 0.0, y: 0.0` here, meaning "unknown", not
+                    // "at the screen origin" — cached (and later saved)
+                    // regardless, since `set_bounds` on that same backend
+                    // is unconditionally `Unsupported` and so never acts on
+                    // it at restore time either; see
+                    // `cached_window_x`/`y`'s own doc.
+                    self.app.cached_window_x.set(Some(bounds.x.round() as i32));
+                    self.app.cached_window_y.set(Some(bounds.y.round() as i32));
                 }
             }
         }
@@ -1008,6 +1022,34 @@ pub(crate) struct App {
     /// un-maximizes again.
     pub(crate) cached_window_width: Cell<i32>,
     pub(crate) cached_window_height: Cell<i32>,
+    /// Cached window position, refreshed alongside `cached_window_width`/
+    /// `cached_window_height` in `sync_window_title` (#1529). `None` only
+    /// before the first successful `bounds()` read (or while maximized —
+    /// same freeze as width/height). On GTK/Wayland, `WindowControl::
+    /// bounds` structurally always answers `x: 0.0, y: 0.0` (see that
+    /// method's own doc) — this cell ends up caching that sentinel
+    /// unchanged, which is harmless: `WindowControl::set_bounds` is
+    /// unconditionally `Unsupported` on the very same backend, so
+    /// `App::restore_window_geometry` never acts on the saved value there
+    /// either. macOS/Win-GUI report (and later restore) a real position.
+    pub(crate) cached_window_x: Cell<Option<i32>>,
+    pub(crate) cached_window_y: Cell<Option<i32>>,
+    /// Cached maximized state, refreshed every tick from
+    /// `WindowControl::is_maximized()` (#1529) — unlike
+    /// `cached_window_width`/`height`/`x`/`y`, this one is read
+    /// *unconditionally*, specifically so it can flip to `true` at the one
+    /// moment those size/position caches freeze (see their own docs).
+    pub(crate) cached_window_maximized: Cell<bool>,
+    /// Whether `App::restore_window_geometry` has already applied
+    /// `session.window` to the runner's window this run (#1529). Mirrors
+    /// `csd_applied`'s "retry every tick until the window is mapped" gate —
+    /// `Backend::window()` is `None` on the `setup()` fast path (the
+    /// runner hasn't called `window.present()` yet) and reliably `Some` by
+    /// the first `tick()`, same as `capture_window_and_apply_csd`'s own doc
+    /// explains. Idempotent either way (re-applying the same geometry is
+    /// harmless), but this avoids fighting a user resize/move that happens
+    /// to land before the window is confirmed mapped.
+    pub(crate) window_geometry_restored: Cell<bool>,
     /// Editor content bounds + tab-bar height as used by the LAST
     /// `render_content` pass, in the same **absolute** DA coordinate frame
     /// that mouse events arrive in (#550, #582).
@@ -2064,6 +2106,10 @@ impl App {
             // used before #1234 when `self.window` was `None`.
             cached_window_width: Cell::new(800),
             cached_window_height: Cell::new(600),
+            cached_window_x: Cell::new(None),
+            cached_window_y: Cell::new(None),
+            cached_window_maximized: Cell::new(false),
+            window_geometry_restored: Cell::new(false),
             cached_editor_bounds: Cell::new(None),
             cached_main_content_height: Cell::new(600.0),
             menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
@@ -2626,6 +2672,32 @@ impl App {
         self.queue_explorer_draw();
     }
 
+    /// Snapshot the cached window geometry (#1234, extended #1529 for
+    /// position/maximized) into a [`core::session::WindowGeometry`] ready to
+    /// write into `engine.session.window` before `Engine::save_session_state`
+    /// persists it.
+    ///
+    /// Reads the `cached_window_*` cells rather than a live `backend`
+    /// handle: every call site that needs to save on quit
+    /// (`GtkEngineActionHost::save_session_and_exit`, `GtkTickHost::
+    /// quit_after_format_save`, and `Self::save_session_and_exit` below)
+    /// runs through `EngineActionHost`/menu/dialog call chains with no live
+    /// `backend: &mut dyn quadraui::Backend` in scope — only `tick`/`setup`/
+    /// paint entry points have one — the same "no backend in scope" problem
+    /// `cached_line_height`/`cached_char_width` solve for text metrics,
+    /// solved the same way here. A free function (shared by all three sites)
+    /// rather than three duplicated field-copies keeps the five-field list
+    /// in one place.
+    fn cached_window_geometry(&self) -> core::session::WindowGeometry {
+        core::session::WindowGeometry {
+            width: self.cached_window_width.get(),
+            height: self.cached_window_height.get(),
+            x: self.cached_window_x.get(),
+            y: self.cached_window_y.get(),
+            maximized: self.cached_window_maximized.get(),
+        }
+    }
+
     /// Save the current session state and request a clean shutdown.
     ///
     /// Sets [`App::exit_requested`] rather than calling `process::exit`
@@ -2637,13 +2709,10 @@ impl App {
         let mut engine = self.engine.borrow_mut();
         // Capture the cached window geometry into session state *before*
         // `save_session_state` persists it — `Engine` has no window handle
-        // of its own to read this from (#823 item 5). Reads
-        // `cached_window_width`/`cached_window_height` (refreshed every
-        // tick from `WindowControl::bounds()`) rather than a live `backend`
-        // handle, which this call chain carries none of — see those
-        // fields' own doc (#1234).
-        engine.session.window.width = self.cached_window_width.get();
-        engine.session.window.height = self.cached_window_height.get();
+        // of its own to read this from (#823 item 5). See
+        // `cached_window_geometry`'s own doc for why this reads cached
+        // cells rather than a live `backend` handle (#1234, #1529).
+        engine.session.window = self.cached_window_geometry();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
@@ -6660,6 +6729,61 @@ impl App {
         }
     }
 
+    /// Restore the window's saved size, position and maximized state
+    /// (#1529), the first time each run `Backend::window()` returns `Some`.
+    /// Called from both `setup()` (fast path, usually too early — the
+    /// runner hasn't called `window.present()` yet, so `backend.window()`
+    /// is still `None`) and `tick()` (reliable path — retried every frame
+    /// via `window_geometry_restored` until it succeeds), mirroring
+    /// `capture_window_and_apply_csd`'s own identical two-call-site shape
+    /// and doc (#552).
+    ///
+    /// Order matters: size and (clamped) position are applied first, then
+    /// maximized state last — `Backend::toggle_window_maximize` is a
+    /// *toggle*, not a setter (`WindowControl` has no `maximize()`; see
+    /// that trait's own doc), so it only flips from "restored" to
+    /// "maximized" correctly if the restored geometry is already in place
+    /// underneath it, the same way GTK's own `restore()` falls back to the
+    /// pre-maximize size/position rather than a hardcoded one.
+    ///
+    /// `saved.x`/`y` are clamped against the live display list
+    /// (`WindowGeometry::clamp_to_displays`) before use, so a monitor that
+    /// was unplugged since the position was saved can never strand the
+    /// restored window off-screen; an unclamped position (or no displays
+    /// at all) falls back to `None`, leaving placement to the OS/window
+    /// manager default. `set_size`/`set_bounds` failing (e.g. GTK's
+    /// structural inability to reposition at all — see
+    /// `WindowControl::set_bounds`'s own doc) is not an error here — every
+    /// call is best-effort, exactly like `capture_window_and_apply_csd`'s
+    /// own `set_decorated` call.
+    fn restore_window_geometry(&mut self, backend: &mut dyn quadraui::Backend) {
+        if self.window_geometry_restored.get() {
+            return;
+        }
+        let saved = self.engine.borrow().session.window.clone();
+        let displays = backend.services().displays().unwrap_or_default();
+        let clamped = saved.clamp_to_displays(&displays);
+        let already_maximized = {
+            let Some(w) = backend.window() else {
+                return;
+            };
+            let _ = w.set_size(clamped.width as f32, clamped.height as f32);
+            if let Some((x, y)) = clamped.x.zip(clamped.y) {
+                let _ = w.set_bounds(quadraui::Rect::new(
+                    x as f32,
+                    y as f32,
+                    clamped.width as f32,
+                    clamped.height as f32,
+                ));
+            }
+            matches!(w.is_maximized(), Ok(true))
+        };
+        self.window_geometry_restored.set(true);
+        if clamped.maximized && !already_maximized {
+            backend.toggle_window_maximize();
+        }
+    }
+
     /// Forward a pointer event over the sidebar content area to the active panel's
     /// controller. In ShellApp mode the sidebar has no dedicated per-panel
     /// `DrawingArea`, so events the Relm4 build delivered straight to each panel's
@@ -8535,6 +8659,11 @@ impl App {
         // `csd_applied` is set.
         self.capture_window_and_apply_csd(backend);
 
+        // Retry restoring the saved window size/position/maximized state
+        // until the runner's window is mapped — see `restore_window_geometry`
+        // (#1529). No-ops once `window_geometry_restored` is set.
+        self.restore_window_geometry(backend);
+
         // Drain the actions async GTK callbacks queued for this frame.
         for action in self.deferred.drain() {
             match action {
@@ -8637,6 +8766,11 @@ impl quadraui::ShellApp for App {
         // still `None` here. `tick()` retries every frame until the window
         // is mapped, which is the reliable path (#552).
         self.capture_window_and_apply_csd(backend);
+
+        // Same "very likely still None here, tick() retries" story as the
+        // CSD drop above, for restoring the saved window size/position/
+        // maximized state instead (#1529).
+        self.restore_window_geometry(backend);
 
         // GTK draws its own VSCode-style menu bar (File/Edit/View/...) — it
         // acts as the client-side titlebar, always visible (unlike TUI, which
@@ -10121,7 +10255,14 @@ mod portable_entry_point_tests {
     /// `PlatformWindowHandle`/`gtk4::Window` seam that used to back them.
     /// They inherit the identical structural gap this test documents — this
     /// assertion covering all of them, not just title-sync/minimize, is why
-    /// it was not split into one copy per call site.
+    /// it was not split into one copy per call site. #1529's
+    /// `App::restore_window_geometry` (the `set_size`/`set_bounds`/
+    /// `toggle_window_maximize` restore) and `sync_window_title`'s new
+    /// `cached_window_x`/`y`/`maximized` caching are the same story again:
+    /// both gate on this identical `Some`/`None` split, so both are live-
+    /// smoke-only for the same reason — see `restore_window_geometry_*`
+    /// tests below for what *is* covered headlessly (the retry-until-mapped
+    /// contract and the pure clamp/snapshot logic feeding it).
     #[cfg(feature = "gui")]
     #[test]
     fn gtk_backend_window_is_none_without_a_live_window_so_title_sync_and_minimize_stay_black_box_untestable(
@@ -10244,5 +10385,87 @@ mod portable_entry_point_tests {
             "the take_requested_panel echo must only update the runner-state \
              belief, not steal focus like a user click"
         );
+    }
+
+    /// #1529: `App::restore_window_geometry` gates on `Backend::window()`
+    /// returning `Some`, exactly like `capture_window_and_apply_csd` does
+    /// for CSD (see `gtk_backend_window_is_none_without_a_live_window_
+    /// so_title_sync_and_minimize_stay_black_box_untestable`'s doc above)
+    /// — so the one thing headlessly testable here is the
+    /// retry-until-mapped contract: calling it against a `GtkBackend`
+    /// nobody has attached a window to must be a complete no-op (no
+    /// panic, and crucially `window_geometry_restored` stays `false` so
+    /// `tick()` keeps retrying next frame instead of giving up on a
+    /// window that simply isn't mapped yet).
+    ///
+    /// RED-verification note: symmetric with the neighbouring
+    /// `gtk_backend_window_is_none_...` test's own note — before this fix
+    /// `restore_window_geometry` did not exist at all (nothing restored
+    /// anything, the bug this issue is about), so there is no
+    /// "unfixed but present" version of *this* method to turn red. Its
+    /// job is guarding the fix's shape (idempotent no-op until mapped)
+    /// against regression going forward; the actual restore-something
+    /// behaviour this issue fixes can only be confirmed on a live window
+    /// — see this PR's `SMOKE_TESTS`.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_window_geometry_is_a_noop_until_the_window_is_mapped() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        engine.borrow_mut().session.window = core::session::WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(10),
+            y: Some(20),
+            maximized: true,
+        };
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
+
+        app.restore_window_geometry(&mut backend);
+
+        assert!(
+            !app.window_geometry_restored.get(),
+            "restore_window_geometry must not mark itself done before \
+             Backend::window() ever returns Some, or tick() would give up \
+             retrying and the saved geometry would never actually be \
+             applied once the window is mapped"
+        );
+    }
+
+    /// #1529: `App::cached_window_geometry` is the save-side snapshot
+    /// `GtkEngineActionHost::save_session_and_exit`/`GtkTickHost::
+    /// quit_after_format_save`/`App::save_session_and_exit` all funnel
+    /// through before `Engine::save_session_state` persists it. Before
+    /// this fix each of those three sites wrote only `width`/`height`
+    /// into `engine.session.window` — `x`/`y`/`maximized` were never
+    /// saved no matter what `sync_window_title` cached, the exact "save
+    /// is partial" bug this issue reports. This drives the cells
+    /// directly (`sync_window_title`'s own live-window dependency is the
+    /// same structural gap `gtk_backend_window_is_none_...` documents,
+    /// so it can't be exercised headlessly) and asserts the snapshot
+    /// carries all five fields through — a data-plumbing assertion, not
+    /// a painted one: these cells feed a session-file write, not a
+    /// screen, so CLAUDE.md's "assert on rendered output" rule (aimed at
+    /// paint paths that never consume the state they populate) has no
+    /// paint path to apply to here.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn cached_window_geometry_snapshots_position_and_maximized() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(Rc::clone(&engine));
+
+        app.cached_window_width.set(1000);
+        app.cached_window_height.set(700);
+        app.cached_window_x.set(Some(50));
+        app.cached_window_y.set(Some(75));
+        app.cached_window_maximized.set(true);
+
+        let geo = app.cached_window_geometry();
+
+        assert_eq!(geo.width, 1000);
+        assert_eq!(geo.height, 700);
+        assert_eq!(geo.x, Some(50));
+        assert_eq!(geo.y, Some(75));
+        assert!(geo.maximized);
     }
 }
