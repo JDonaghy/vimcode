@@ -3063,6 +3063,29 @@ impl Engine {
         self.ai_streaming = true;
         self.acp_streaming_turn = None;
 
+        // #1459: on the very first `:AI`/message of the process, and only
+        // then, honour `acp_reopen_last_session` — resume the most recent
+        // recorded session for the about-to-launch agent/workspace instead
+        // of starting empty. `acp_client.is_none()` guards against this
+        // ever firing on a message sent to an agent that's already running
+        // (that's a continuation of a session already chosen, not a fresh
+        // start to redirect).
+        if !self.acp_startup_reopen_attempted {
+            self.acp_startup_reopen_attempted = true;
+            if self.settings.acp_reopen_last_session && self.acp_client.is_none() {
+                let agent_name = self.acp_active_agent_name();
+                let cwd = self.acp_workspace_cwd();
+                if let Some(record) = self
+                    .acp_session_index
+                    .sessions_for(&agent_name, &cwd)
+                    .into_iter()
+                    .next()
+                {
+                    self.acp_pending_resume = Some(record.session_id);
+                }
+            }
+        }
+
         if self.acp_client.is_some() {
             if let Some(session_id) = self.acp_session_id.clone() {
                 let content = self.acp_prompt_content_blocks(&text);
@@ -3166,6 +3189,10 @@ impl Engine {
         self.acp_client = None;
         self.acp_session_id = None;
         self.acp_pending_prompt = None;
+        // #1459: an unconsumed resume request (`:AiSessions` picked a
+        // session, then the user ran `:AiClear` before the handshake
+        // finished) must not resurface on whatever session starts next.
+        self.acp_pending_resume = None;
         self.acp_streaming_turn = None;
         // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
         // clearing the conversation ends the session, so none of it should

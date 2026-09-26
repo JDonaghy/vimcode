@@ -16154,6 +16154,231 @@ mod tests {
         );
     }
 
+    /// #1459 acceptance: `:AiSessions` lists past sessions for the active
+    /// agent + workspace (vimcode's own local index — ACP has no
+    /// `session/list` method) and resumes one via `session/load` through
+    /// the real `TuiShellApp`/`TuiDriver` stack, rebuilding the transcript
+    /// from the agent's replayed history through the exact same
+    /// chunk-mapping path a live turn uses
+    /// (`Engine::acp_handle_session_update`), not a second renderer, and
+    /// leaving the resumed session able to answer a further message.
+    ///
+    /// The fixture's `initialize` only advertises
+    /// `agentCapabilities.loadSession` when `$ACP_FAKE_LOAD_SESSION` is set
+    /// (`fake_acp_agent.sh`'s own doc); its `session/load` handler replays
+    /// one user turn ("what does main.rs do") and one assistant turn ("It
+    /// prints hello.") as `session/update` notifications before answering.
+    ///
+    /// RED verified: with `Engine::acp_begin_session`'s resume branch
+    /// deleted (so `acp_pending_resume` is silently ignored and every
+    /// `:AiSessions` confirm just starts a fresh `session/new` instead),
+    /// this test fails at the "It prints hello." wait — the resumed
+    /// history never appears because no `session/load` request is ever
+    /// sent.
+    #[cfg(unix)]
+    #[test]
+    fn ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_transcript_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec![
+                "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                "ACP_FAKE_LOAD_SESSION=1".to_string(),
+            ],
+        }];
+        app.engine.settings.acp_active_agent = "claude".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // First session: send a message, let it complete, so the local
+        // index has something to remember.
+        driver.type_char(':');
+        for c in "AI remember this please".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello world"),
+            "the first session must complete within 5s; screen:\n{screen}"
+        );
+
+        // End the session (kills the agent subprocess, wipes the on-screen
+        // transcript) — but the local index the session was recorded into
+        // survives, since it lives on `Engine::acp_session_index`, not on
+        // the now-dead client.
+        driver.type_char(':');
+        for c in "AiClear".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("remember this please"),
+            ":AiClear must wipe the transcript before the resume test below \
+             can prove anything; screen:\n{screen}"
+        );
+
+        // `:AiSessions` must list the just-recorded session, keyed by its
+        // first prompt (a bare session id means nothing to a human).
+        driver.type_char(':');
+        for c in "AiSessions".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AI Sessions"),
+            "the picker title must paint; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("remember this please"),
+            "the recorded session's first prompt must list as the picker \
+             entry; screen:\n{screen}"
+        );
+
+        // Confirm the (only) entry — resumes via `session/load`, spawning a
+        // fresh agent subprocess (the old one died at `:AiClear`) through
+        // the exact same registered profile, since `loadSession` is a
+        // property of the agent binary, not of any one process.
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("It prints hello.") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("It prints hello."),
+            "the assistant turn replayed via session/load must rebuild in \
+             the transcript within 5s; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("what does main.rs do"),
+            "the user turn replayed via session/load must rebuild too -- \
+             history replay covers both roles, not just the assistant \
+             side; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Read README.md"),
+            "a replayed tool-call turn must also rebuild, not just message \
+             chunks; screen:\n{screen}"
+        );
+
+        // The resumed session must still be live and answerable, not a
+        // dead end.
+        driver.type_char(':');
+        for c in "AI thanks".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("pondering the question") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("pondering the question"),
+            "a further message after resuming must still reach the \
+             (resumed) session within 5s; screen:\n{screen}"
+        );
+    }
+
+    /// #1459's other acceptance half: when the active agent's most
+    /// recently learned `agentCapabilities.loadSession` is `false` (the
+    /// fixture's default — every pre-#1459 test relies on this), `:AiSessions`
+    /// must refuse outright: no picker opens, and a message says why.
+    /// Learning the capability requires an `initialize` round trip, so this
+    /// sends one ordinary message first (through the real ex-command path)
+    /// before trying `:AiSessions` — exactly the sequence a real user hits.
+    #[cfg(unix)]
+    #[test]
+    fn ai_sessions_refuses_when_agent_does_not_advertise_load_session_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        app.engine.acp_client = Some(client);
+        app.engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        driver.type_char(':');
+        for c in "AI hello".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("Hello world"),
+            "the handshake must complete so the capability is learned; \
+             screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AiSessions".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            !screen.contains("AI Sessions"),
+            "the picker must not open for an agent that doesn't advertise \
+             loadSession; screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("does not support"),
+            "a status message must explain the refusal; screen:\n{screen}"
+        );
+    }
+
     /// #954 (ACP-3) acceptance: `fs/read_text_file` must serve an open,
     /// **dirty** buffer's unsaved in-memory content, not stale on-disk
     /// text — the single most important correctness property in the

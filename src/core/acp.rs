@@ -106,6 +106,19 @@ pub enum AcpEvent {
         modes: Option<serde_json::Value>,
         config_options: Option<serde_json::Value>,
     },
+    /// Response to our `session/load` request (#1459) — the agent has
+    /// finished (or acknowledged) resuming a previously-created session.
+    /// Unlike [`AcpEvent::SessionCreated`], the response carries no
+    /// `sessionId` of its own (the caller already knows it — it's the id
+    /// being resumed), so there is none to hoist out here; the caller sets
+    /// `acp_session_id` itself before sending the request (see
+    /// `Engine::acp_begin_session`'s doc for why that ordering matters: a
+    /// resuming agent may emit its history as `session/update`
+    /// notifications *before* this response line arrives).
+    SessionLoaded {
+        request_id: i64,
+        modes: Option<serde_json::Value>,
+    },
     /// Response to our `session/prompt` request — the turn has ended.
     PromptStopped {
         request_id: i64,
@@ -852,6 +865,19 @@ pub fn parse_prompt_capabilities(agent_capabilities: &serde_json::Value) -> AcpP
         image: bool_field("image"),
         audio: bool_field("audio"),
     }
+}
+
+/// Parse `agentCapabilities.loadSession` (#1459) out of the whole
+/// `agentCapabilities` object — the same shape [`parse_prompt_capabilities`]
+/// reads, just a top-level sibling field rather than a nested object.
+/// Absent (every pre-#1459 fixture, and any agent that doesn't support
+/// resume) parses as `false`, never an error, same "optional means
+/// unsupported" convention as the rest of this handshake.
+pub fn parse_load_session_capability(agent_capabilities: &serde_json::Value) -> bool {
+    agent_capabilities
+        .get("loadSession")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1707,6 +1733,34 @@ impl AcpClient {
         )
     }
 
+    /// Send `session/load` (#1459) — resume a previously-created session by
+    /// id, rather than `session/new`'s "start empty". Only meaningful when
+    /// the most recent `initialize` response's `agentCapabilities.
+    /// loadSession` was `true` (see [`parse_load_session_capability`]);
+    /// sending it to an agent that never advertised the capability is a
+    /// protocol violation the agent is free to reject, surfaced generically
+    /// through [`AcpEvent::RequestFailed`] like any other failed request.
+    /// Per the ACP spec, a resuming agent replays the session's prior turns
+    /// as ordinary `session/update` notifications before answering this
+    /// request — the caller must already treat `session_id` as current
+    /// (`Engine::acp_begin_session`) so those notifications aren't dropped
+    /// as belonging to an unknown session.
+    pub fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: &Path,
+        mcp_servers: Vec<serde_json::Value>,
+    ) -> i64 {
+        self.send_request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id,
+                "cwd": absolute_path_string(cwd),
+                "mcpServers": mcp_servers,
+            }),
+        )
+    }
+
     /// Send `session/set_mode` (#956, ACP-5). The displayed mode does not
     /// change from this call's response — only from the agent's own
     /// `current_mode_update` notification afterward; see
@@ -1959,6 +2013,10 @@ fn reader_thread_main(
                             }
                         })
                     }
+                    Some("session/load") => Some(AcpEvent::SessionLoaded {
+                        request_id: id,
+                        modes: result.get("modes").cloned(),
+                    }),
                     Some("session/prompt") => Some(AcpEvent::PromptStopped {
                         request_id: id,
                         stop_reason: result

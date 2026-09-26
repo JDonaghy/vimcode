@@ -9629,6 +9629,7 @@ impl Engine {
             "AiClear",
             "AiMode",
             "AiAgent",
+            "AiSessions",
             // Markdown
             "MarkdownPreview",
             "MdPreview",

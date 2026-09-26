@@ -66,6 +66,9 @@ impl Engine {
                     self.acp_client = None;
                     self.acp_session_id = None;
                     self.acp_pending_prompt = None;
+                    // #1459: a resume the agent died before completing must
+                    // not silently apply to whatever agent starts next.
+                    self.acp_pending_resume = None;
                     self.acp_streaming_turn = None;
                     // #956 (ACP-5): session-scoped, same as the decisions
                     // map above — see `Engine::ai_clear`'s matching reset.
@@ -99,6 +102,16 @@ impl Engine {
                     // `agent_capabilities` isn't read again after this.
                     self.acp_prompt_capabilities =
                         crate::core::acp::parse_prompt_capabilities(&agent_capabilities);
+                    // #1459: cache whether this agent supports `session/
+                    // load` — keyed by agent name so `:AiSessions` can
+                    // answer without spawning the agent first, and
+                    // persisted so the answer survives a vimcode restart.
+                    let load_session_supported =
+                        crate::core::acp::parse_load_session_capability(&agent_capabilities);
+                    let active_agent_name = self.acp_active_agent_name();
+                    self.acp_session_index
+                        .set_load_session_capability(&active_agent_name, load_session_supported);
+                    self.acp_session_index.save();
                     // Handshake step 2. #957 (ACP-6): if the agent offers
                     // any `authMethods` and this client hasn't resolved
                     // auth yet for this session (skipped, a `type: "agent"`
@@ -134,6 +147,22 @@ impl Engine {
                     session_id, modes, ..
                 } => {
                     self.acp_session_id = Some(session_id.clone());
+                    // #1459: remember this session (id, agent, cwd, first
+                    // prompt) so `:AiSessions` can offer it again in a later
+                    // run — `acp_pending_prompt` is read, not taken, so the
+                    // "send the queued prompt" branch below still sees it.
+                    {
+                        let agent_name = self.acp_active_agent_name();
+                        let cwd = self.acp_workspace_cwd();
+                        let first_prompt = self.acp_pending_prompt.clone().unwrap_or_default();
+                        self.acp_session_index.record_session(
+                            &session_id,
+                            &agent_name,
+                            &cwd,
+                            &first_prompt,
+                        );
+                        self.acp_session_index.save();
+                    }
                     // #956 (ACP-5): `session/new`'s optional `modes` field —
                     // an agent that doesn't support modes at all simply omits
                     // it, which `parse_session_modes` treats as "no modes",
@@ -159,6 +188,39 @@ impl Engine {
                         // No prompt was waiting on this handshake — nothing
                         // to stream, so the panel shouldn't sit "thinking".
                         self.ai_streaming = false;
+                    }
+                    redraw = true;
+                }
+                AcpEvent::SessionLoaded { modes, .. } => {
+                    // #1459: `acp_session_id` was already set to the
+                    // resumed id by `Engine::acp_begin_session` before the
+                    // `session/load` request was even sent — see that
+                    // function's doc for why (a resuming agent may emit
+                    // the session's history as `session/update`
+                    // notifications before this response line arrives, and
+                    // `SessionUpdate`'s handler drops updates for a session
+                    // id it doesn't recognise yet). This handler only needs
+                    // to finish what `SessionCreated` does after that:
+                    // apply any `modes` the response carries, then send
+                    // whatever prompt was waiting on the handshake (the
+                    // `acp_reopen_last_session` "resume, then send the
+                    // typed message" path) or clear the busy state if none
+                    // was.
+                    if let Some(modes_json) = modes {
+                        let (current, list) = crate::core::acp::parse_session_modes(&modes_json);
+                        self.acp_modes = list;
+                        self.acp_current_mode_id = current;
+                    }
+                    if let Some(session_id) = self.acp_session_id.clone() {
+                        if let Some(text) = self.acp_pending_prompt.take() {
+                            let content = self.acp_prompt_content_blocks(&text);
+                            if let Some(client) = self.acp_client.as_mut() {
+                                client.prompt(&session_id, content);
+                            }
+                        } else {
+                            self.ai_streaming = false;
+                            self.message = "Session resumed.".to_string();
+                        }
                     }
                     redraw = true;
                 }
@@ -377,6 +439,73 @@ impl Engine {
             format!("Switched to agent \"{name}\" \u{2014} starts fresh on next message");
     }
 
+    // ── session history / resume (#1459) ────────────────────────────────────
+
+    /// `:AiSessions` entry point. Lists past sessions for the active agent
+    /// and workspace from the local index (`acp_session_index` — ACP has no
+    /// `session/list` method, see that type's module doc). Refuses outright
+    /// — no picker opens — when the agent's most recently learned
+    /// `agentCapabilities.loadSession` is `false`: attempting `session/load`
+    /// against such an agent would just fail on the wire, so there is
+    /// nothing useful to pick from (this issue's acceptance bar: "says so
+    /// and does nothing else"). `None` (never learned — this agent has
+    /// never been `initialize`d, in this run or a previous one) is treated
+    /// the same as "supported": the picker still opens (possibly empty),
+    /// and an actual unsupported `session/load` would surface generically
+    /// via `AcpEvent::RequestFailed` like any other failed request.
+    pub fn acp_open_sessions_picker(&mut self) {
+        let agent_name = self.acp_active_agent_name();
+        if self.acp_session_index.load_session_capability(&agent_name) == Some(false) {
+            self.message = format!(
+                "Agent \"{agent_name}\" does not support resuming sessions \
+                 (loadSession not advertised)"
+            );
+            return;
+        }
+        self.open_picker(PickerSource::AcpSessions);
+    }
+
+    /// Resume a past session by id (#1459) — the `:AiSessions` picker's
+    /// confirm action. Handles every state `acp_client` can be in by
+    /// funnelling all three through the same [`Self::acp_begin_session`]
+    /// that already implements the resume-vs-fresh branch and the
+    /// "`acp_session_id` set before the request goes out" ordering
+    /// guarantee, rather than duplicating that logic here:
+    /// - No client at all: spawn + `initialize` one (the same launch path
+    ///   `ai_send_message_via_acp`'s cold start uses), then let the
+    ///   `Initialized` handler's call to `acp_begin_session` pick up
+    ///   `acp_pending_resume` once the handshake completes.
+    /// - A client whose handshake is already in flight (a message sent
+    ///   moments ago is still waiting on its own `session/new`): same
+    ///   deferral, `acp_begin_session` hasn't run for it yet either.
+    /// - A live session already: call `acp_begin_session` immediately —
+    ///   there is no handshake left to wait for.
+    pub(crate) fn acp_resume_session(&mut self, session_id: String) {
+        if self.acp_client.is_some() && self.acp_session_id.is_some() {
+            self.acp_pending_resume = Some(session_id);
+            self.acp_begin_session();
+            return;
+        }
+        if self.acp_client.is_some() {
+            self.acp_pending_resume = Some(session_id);
+            return;
+        }
+        self.acp_pending_resume = Some(session_id);
+        let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
+        let env_refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
+            Ok(mut client) => {
+                client.initialize();
+                self.acp_client = Some(client);
+            }
+            Err(e) => {
+                self.acp_pending_resume = None;
+                self.message = format!("Could not start ACP agent \"{agent_label}\": {e}");
+            }
+        }
+    }
+
     // ── authMethods / authenticate / terminal login (#957, ACP-6) ───────────
 
     /// Send `session/new` for the live `acp_client` — the second half of
@@ -390,8 +519,28 @@ impl Engine {
     /// "Continue without auth" / cancel path, which produces no
     /// `AcpEvent`) can call it directly — the other three call sites are
     /// all in this same module.
+    ///
+    /// #1459: if [`Self::acp_pending_resume`] holds a session id (set by
+    /// `:AiSessions`'s resume action, or the `acp_reopen_last_session`
+    /// setting's "resume on first `:AI`" path), sends `session/load` for it
+    /// instead of `session/new` — folded into this one shared function so
+    /// all four call sites get resume support for free, exactly as they
+    /// already share the fresh-session path. `acp_session_id` is set to the
+    /// resumed id *before* the request goes out, not from the eventual
+    /// `AcpEvent::SessionLoaded` response: a resuming agent may replay the
+    /// session's history as `session/update` notifications before that
+    /// response line arrives, and `SessionUpdate`'s handler only accepts
+    /// updates for whatever `acp_session_id` already is.
     pub(crate) fn acp_begin_session(&mut self) {
         let cwd = self.acp_workspace_cwd();
+        if let Some(session_id) = self.acp_pending_resume.take() {
+            self.acp_session_id = Some(session_id.clone());
+            self.message = format!("Resuming session {session_id}\u{2026}");
+            if let Some(client) = self.acp_client.as_mut() {
+                client.load_session(&session_id, &cwd, vec![]);
+            }
+            return;
+        }
         if let Some(client) = self.acp_client.as_mut() {
             client.new_session(&cwd, vec![]);
         }
@@ -3672,5 +3821,174 @@ mod tests {
         let entry = review.current_entry().unwrap();
         assert_eq!(entry.change.old_text, None);
         assert_eq!(entry.change.new_text, "fn main() {}\n");
+    }
+
+    // ── #1459: session history / resume ─────────────────────────────────────
+
+    /// An `Engine` configured with a `settings.acp_agents` registry entry
+    /// naming this fixture, so `Engine::acp_resume_session`'s cold-start
+    /// spawn path (and `ai_send_message_via_acp`'s) can launch a *fresh*
+    /// subprocess through the real config path — unlike
+    /// [`engine_with_fixture_agent`], which pre-spawns one client directly
+    /// and cannot be used for a scenario that needs to spawn twice (once
+    /// for the original session, once more for the resumed one, since
+    /// `:AiClear` kills the first subprocess).
+    #[cfg(unix)]
+    fn engine_with_registered_fixture_agent(extra_env: &[(&str, &str)]) -> Engine {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: extra_env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        }];
+        engine.settings.acp_active_agent = "claude".to_string();
+        engine
+    }
+
+    /// The issue's core acceptance bar: resuming a past session rebuilds
+    /// the transcript's user, assistant *and* tool-call turns through the
+    /// same chunk/tool-call paths a live turn uses (asserted on
+    /// `ai_messages`/`acp_tool_calls` content — the exact data
+    /// `render::populate_ai_chat_controller` paints from, not a UI-layer
+    /// flag), and the next prompt after resuming continues the *same*
+    /// session id the picker resumed rather than silently starting a new
+    /// one.
+    ///
+    /// RED verified: with `Engine::acp_begin_session`'s resume branch
+    /// deleted, this fails at the first `poll_acp_until` past `ai_clear` —
+    /// `acp_session_id` never becomes `Some("sess-1")` again because no
+    /// `session/load` request is ever sent (a plain `session/new` would
+    /// still succeed, just with a *different* fixture-assigned id in
+    /// general — it only reads as "sess-1" here because this fixture
+    /// always assigns that same literal id, which is exactly the kind of
+    /// false-positive `record_session`'s "idempotent by id" test guards
+    /// against on the index side).
+    #[cfg(unix)]
+    #[test]
+    fn acp_resume_session_rebuilds_transcript_and_continues_the_same_session_id() {
+        let mut engine = engine_with_registered_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_LOAD_SESSION", "1"),
+        ]);
+
+        engine.ai_send_message("remember this please".to_string());
+        poll_acp_until(&mut engine, |e| e.acp_session_id.is_some());
+        let first_session_id = engine
+            .acp_session_id
+            .clone()
+            .expect("the handshake should have produced a session id");
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+
+        engine.ai_clear();
+        assert!(
+            engine.acp_client.is_none(),
+            ":AiClear must kill the live agent subprocess"
+        );
+
+        // The local index must still know about it, and must have learned
+        // this agent supports resume.
+        assert_eq!(
+            engine.acp_session_index.load_session_capability("claude"),
+            Some(true)
+        );
+        engine.acp_open_sessions_picker();
+        assert!(
+            engine.picker_open,
+            "the picker must open for an agent that advertises loadSession"
+        );
+        assert_eq!(engine.picker_items.len(), 1);
+
+        // Confirm the (only) entry.
+        engine.picker_confirm();
+        poll_acp_until(&mut engine, |e| {
+            e.ai_messages
+                .iter()
+                .any(|m| m.content.contains("It prints hello."))
+        });
+
+        assert_eq!(
+            engine.acp_session_id.as_deref(),
+            Some(first_session_id.as_str()),
+            "resuming must reuse the exact session id that was recorded, \
+             not a freshly assigned one"
+        );
+
+        let roles: Vec<&str> = engine.ai_messages.iter().map(|m| m.role.as_str()).collect();
+        assert!(
+            roles.contains(&"user"),
+            "the replayed user turn must rebuild: {:?}",
+            engine.ai_messages
+        );
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("what does main.rs do")),
+            "the replayed user turn's text must survive: {:?}",
+            engine.ai_messages
+        );
+        assert!(
+            engine
+                .ai_messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.content.contains("It prints hello.")),
+            "the replayed assistant turn must rebuild: {:?}",
+            engine.ai_messages
+        );
+        assert!(
+            engine
+                .acp_tool_calls
+                .iter()
+                .any(|c| c.title == "Read README.md"),
+            "the replayed tool-call turn must rebuild too, not just \
+             message chunks: {:?}",
+            engine.acp_tool_calls
+        );
+
+        // The resumed session must still answer a further prompt, under
+        // the exact same session id.
+        engine.ai_send_message("thanks".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert_eq!(
+            engine.acp_session_id.as_deref(),
+            Some(first_session_id.as_str()),
+            "a further prompt after resuming must not change the session id"
+        );
+    }
+
+    /// The other half of the issue's acceptance bar: when the active
+    /// agent's most recently learned `agentCapabilities.loadSession` is
+    /// `false` (this fixture's default), `:AiSessions` must refuse
+    /// outright — no picker opens, and nothing else happens (the local
+    /// index is never even consulted for its contents).
+    #[cfg(unix)]
+    #[test]
+    fn acp_open_sessions_picker_refuses_when_agent_does_not_advertise_load_session() {
+        let mut engine = engine_with_registered_fixture_agent(&[("ACP_FAKE_NO_TOOL_REQUEST", "1")]);
+
+        engine.ai_send_message("hello".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert_eq!(
+            engine.acp_session_index.load_session_capability("claude"),
+            Some(false)
+        );
+
+        engine.acp_open_sessions_picker();
+
+        assert!(
+            !engine.picker_open,
+            "the picker must not open for an agent that doesn't advertise \
+             loadSession"
+        );
+        assert!(
+            engine.message.contains("does not support"),
+            "a message must explain the refusal: {:?}",
+            engine.message
+        );
     }
 }
