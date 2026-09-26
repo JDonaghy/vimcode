@@ -24843,6 +24843,143 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
     }
 }
 
+/// One geometry unit [`crate::app::App`] paints in, chosen once by the
+/// caller that constructs it (#1426) — never inferred at runtime by `App`
+/// itself asking "am I GTK?", per the Platform-Neutrality Rule.
+///
+/// Before this struct existed, `App` hardcoded the pixel-flavoured half of
+/// every backend-specific sizing pair listed on each field below (the
+/// `gtk_*`/`GTK_*` name) directly in its own methods, which is correct for
+/// GTK/macOS/Win but wrong on a cell grid — e.g. `TAB_ROW_HEIGHT_PX` (35.0)
+/// read as 35 *rows* on an 80x24 terminal claims more rows than the terminal
+/// has, collapsing the entire editor content band. Every pair already had a
+/// `TUI_*`/cell-flavoured twin (built for the shipped `TuiShellApp`);
+/// `UnitProfile` just bundles "which half of each pair" into one value
+/// picked once, at construction, by code that already knows its own
+/// backend: [`Self::px`] for GTK/macOS/Win, [`Self::cell`] for the `tui`
+/// harness arm (`crate::tui_main::testing::conformance_harness` /
+/// `crate::harness::build_app_and_config`).
+///
+/// `#[derive(Clone, Copy)]`: every field is either a plain value/tuple or a
+/// capture-less `fn` pointer, so a whole profile is cheap to copy around
+/// (`App` stores one directly, no `Rc`/`Box` needed).
+#[derive(Clone, Copy)]
+pub struct UnitProfile {
+    /// [`tab_row_height_px`] (GTK: fixed 35px regardless of `lh`) vs a
+    /// single cell row (`|lh| lh`, TUI: `lh` is always `1.0`).
+    pub tab_row_h: fn(f64) -> f64,
+    /// [`tab_bar_height_px`] (GTK: fixed 35/57px) vs `lh` or `2*lh` when
+    /// breadcrumbs are on (TUI: one or two cell rows).
+    pub tab_bar_h: fn(f64, bool) -> f64,
+    /// [`BREADCRUMB_ROW_HEIGHT_PX`] (GTK: a fixed 22px regardless of `lh`)
+    /// vs one more full cell row (`|lh| lh`, TUI).
+    pub breadcrumb_row_h: fn(f64) -> f64,
+    /// [`gtk_minimap_sizing`] vs [`TUI_MINIMAP_SIZING`] — both plain values,
+    /// not functions, since neither depends on `line_height`.
+    pub minimap: quadraui::MinimapSizing,
+    /// [`gtk_picker_sizing`] vs [`TUI_PICKER_SIZING`] (ignores the `f32`).
+    pub picker: fn(f32) -> PickerSizing,
+    /// [`gtk_picker_rows`] vs [`TUI_PICKER_ROWS`] (ignores the `f32`).
+    pub picker_rows: fn(f32) -> PickerRowMetrics,
+    /// [`gtk_tab_switcher_sizing`] vs [`TUI_TAB_SWITCHER_SIZING`] (ignores
+    /// the `f32`).
+    pub tab_switcher: fn(f32) -> TabSwitcherSizing,
+    /// [`GTK_FIND_REPLACE_ANCHOR`] vs [`TUI_FIND_REPLACE_ANCHOR`].
+    pub find_replace_anchor: FindReplaceAnchor,
+    /// [`GTK_DIVIDER_METRICS`] (ignores the `bool`) vs the cell metrics
+    /// `tui_main::mouse`'s own divider rung builds inline. TUI's
+    /// `group_horizontal` band reaches across however many rows the tab bar
+    /// occupies (one, or two with breadcrumbs on) rather than back like
+    /// every other band, so this needs the same `breadcrumbs` flag
+    /// `App::render_content` already has in scope wherever it calls this.
+    pub divider_metrics: fn(bool) -> DividerMetrics,
+    /// [`gui_sidebar_system_metrics`] vs the fixed metrics
+    /// `TuiShellApp::from_engine` seeds every `SidebarSystem` with once at
+    /// startup (a cell grid never changes `line_height`, so TUI's never
+    /// depends on the `f32`).
+    pub sidebar_system_metrics: fn(f32) -> quadraui::MsvLayoutMetrics,
+    /// Divider/tab-close grab tolerance: `(6.0, 6.0)` device pixels on GTK,
+    /// `(1.0, 1.0)` cells on TUI — #1068's "irreducible" list.
+    pub hit_tolerance: (f64, f64),
+    /// [`quadraui::ShellConfig::with_activity_bar_width_px`]'s argument.
+    /// `Some(48.0)` on GTK/macOS/Win (VS Code parity, independent of line
+    /// height); `None` on TUI, which leaves
+    /// [`quadraui::ShellConfig::activity_bar_width`]'s own default (a
+    /// 3-line-height multiple) in charge — the same value
+    /// `TuiShellApp::build_shell_config` sets explicitly.
+    pub activity_bar_width_px: Option<f32>,
+    /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
+    pub title_bar_lh: f32,
+    /// Whether [`crate::app::App::shell_config`] should also request
+    /// [`quadraui::ShellConfig::with_client_side_titlebar`].
+    pub client_side_titlebar: bool,
+    /// [`crate::icons::set_gui_backend`]'s argument.
+    pub is_gui_backend: bool,
+}
+
+impl UnitProfile {
+    /// GTK/macOS/Win: every value `App` used to hardcode as a `gtk_*`/
+    /// `GTK_*` constant or function, unchanged — #1426's own acceptance bar
+    /// is "no behaviour change on GTK/macOS/Win".
+    pub fn px() -> Self {
+        UnitProfile {
+            tab_row_h: tab_row_height_px,
+            tab_bar_h: tab_bar_height_px,
+            breadcrumb_row_h: |_lh| BREADCRUMB_ROW_HEIGHT_PX,
+            minimap: gtk_minimap_sizing(),
+            picker: gtk_picker_sizing,
+            picker_rows: gtk_picker_rows,
+            tab_switcher: gtk_tab_switcher_sizing,
+            find_replace_anchor: GTK_FIND_REPLACE_ANCHOR,
+            divider_metrics: |_breadcrumbs| GTK_DIVIDER_METRICS,
+            sidebar_system_metrics: gui_sidebar_system_metrics,
+            hit_tolerance: (6.0, 6.0),
+            activity_bar_width_px: Some(48.0),
+            title_bar_lh: 2.0,
+            client_side_titlebar: true,
+            is_gui_backend: true,
+        }
+    }
+
+    /// The `tui` harness arm: `App` painted through
+    /// `quadraui::tui::TuiBackend`, whose `Backend::line_height`/
+    /// `char_width` are always `1.0` (one terminal cell) — see that
+    /// backend's own impl. Every value here is the cell-flavoured twin
+    /// `px()` reads instead, matching the constant the shipped
+    /// `TuiShellApp` already paints with (named in each field's own doc
+    /// above).
+    pub fn cell() -> Self {
+        UnitProfile {
+            tab_row_h: |lh| lh,
+            tab_bar_h: |lh, breadcrumbs| if breadcrumbs { lh * 2.0 } else { lh },
+            breadcrumb_row_h: |lh| lh,
+            minimap: TUI_MINIMAP_SIZING,
+            picker: |_lh| TUI_PICKER_SIZING,
+            picker_rows: |_lh| TUI_PICKER_ROWS,
+            tab_switcher: |_lh| TUI_TAB_SWITCHER_SIZING,
+            find_replace_anchor: TUI_FIND_REPLACE_ANCHOR,
+            divider_metrics: |breadcrumbs| DividerMetrics {
+                group_vertical: (1.0, 1.0),
+                group_horizontal: (0.0, if breadcrumbs { 2.0 } else { 1.0 }),
+                window_vertical: (1.0, 1.0),
+                window_horizontal: (1.0, 1.0),
+                quantize: true,
+            },
+            sidebar_system_metrics: |_lh| quadraui::MsvLayoutMetrics {
+                header_size: 1.0,
+                divider_size: 0.0,
+                scrollbar_size: 1.0,
+                cell_quantum: 1.0,
+            },
+            hit_tolerance: (1.0, 1.0),
+            activity_bar_width_px: None,
+            title_bar_lh: 1.0,
+            client_side_titlebar: false,
+            is_gui_backend: false,
+        }
+    }
+}
+
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
 ///
 /// `show_global_status` is [`global_status_bar_visible`]'s value, **not**

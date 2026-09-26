@@ -1207,6 +1207,22 @@ pub(crate) struct App {
     /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
     /// a bare `Box<dyn quadraui::Backend>` isn't quite enough on its own.
     pub(crate) backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    /// #1426: the geometry unit this `App` instance paints in, chosen once at
+    /// construction by the caller that already knows its own backend
+    /// (GTK/macOS/Win pass [`render::UnitProfile::px`], the `tui` harness arm
+    /// passes [`render::UnitProfile::cell`]) — never inferred from a runtime
+    /// "am I GTK?" check, per the Platform-Neutrality Rule. Every fork this
+    /// file used to hardcode as `render::gtk_*`/`render::GTK_*` (tab-row
+    /// height, minimap sizing, picker/tab-switcher/find-replace geometry,
+    /// divider hit tolerances, sidebar `MsvLayoutMetrics`, the activity-bar
+    /// width and title-bar height fed to [`Self::shell_config`], and
+    /// [`crate::icons::set_gui_backend`]'s argument) now reads from this
+    /// field instead. `UnitProfile::px()` reproduces every value this file
+    /// hardcoded before #1426 exactly, so GTK/macOS/Win behaviour is
+    /// unchanged; `UnitProfile::cell()` is what makes the *same* `App` paint
+    /// correctly on a cell grid — see `UnitProfile`'s own doc for the two
+    /// constructors.
+    pub(crate) units: render::UnitProfile,
     /// #1064: what this app believes the **runner's** `AppShell` (the
     /// `ShellAdapter`-owned instance that paints the activity bar and
     /// sidebar header — NOT `engine.app_shell`, the shadow copy
@@ -1442,7 +1458,14 @@ impl App {
         // now calls `Engine::check_settings_reload`'s portable mtime poll on
         // every tick, the same mechanism TUI has always used, so there is
         // nothing left for this constructor to set up.
-        Self::assemble(engine, deferred, css_provider, last_colorscheme, backend)
+        Self::assemble(
+            engine,
+            deferred,
+            css_provider,
+            last_colorscheme,
+            backend,
+            render::UnitProfile::px(),
+        )
     }
 
     /// Backend-neutral twin of [`App::new`] (#859) — what a wrapper over a
@@ -1529,13 +1552,19 @@ impl App {
     pub(crate) fn new_portable(
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        units: render::UnitProfile,
     ) -> Self {
         let mut engine = {
             let mut e = Engine::new();
             // #999: same GUI-backend-then-resolve ordering as `App::new`
             // above — every non-GTK GUI backend this constructor serves
-            // (macOS, Win-GUI) bundles the icon font too.
-            crate::icons::set_gui_backend(true);
+            // (macOS, Win-GUI) bundles the icon font too. #1426: reads
+            // `units.is_gui_backend` rather than a hardcoded `true` — every
+            // caller of this constructor today (macOS, Win-GUI) passes
+            // `UnitProfile::px()`, whose `is_gui_backend` is `true`, so this
+            // is not a behaviour change; it just stops the constructor from
+            // assuming its own answer.
+            crate::icons::set_gui_backend(units.is_gui_backend);
             crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
             e.startup(file_path.as_deref());
             e
@@ -1562,6 +1591,7 @@ impl App {
             None,
             last_colorscheme,
             backend,
+            units,
         )
     }
 
@@ -1685,9 +1715,9 @@ impl App {
         // band's pixel height from the *current* line height every frame —
         // there is no runtime hook to re-derive the multiple when the user
         // later shrinks their font, and no fixed-pixel-floor knob on
-        // `ShellConfig::with_title_bar` to fall back to (unlike
-        // `with_activity_bar_width_px` below, which exists for exactly this
-        // reason on the activity bar). Concretely: a user who runs
+        // `ShellConfig::with_title_bar` to fall back to (unlike the
+        // activity bar's own fixed-pixel-width field below, which exists
+        // for exactly this reason). Concretely: a user who runs
         // `:set font_size=6` at runtime can still shrink the band under
         // macOS's real traffic-light height, and nothing in this file can
         // stop that without quadraui growing a `with_title_bar_min_px`-style
@@ -1698,22 +1728,33 @@ impl App {
         // sizes; the pathological extreme remains open pending that API.
         let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
             .with_bottom_items(bottom_items)
-            .with_title_bar(2.0)
-            // #940/quadraui#947: opt into the client-side titlebar so a
-            // capable backend (macOS today) puts the reserved band *in* the
-            // real titlebar, beside the native traffic lights, instead of
-            // underneath it. Requested unconditionally rather than gated on
-            // `target_os = "macos"` (the Platform-Neutrality Rule) — GTK and
-            // Win-GUI simply don't honour this field yet
-            // (`ShellConfig::client_side_titlebar`'s own doc, and
-            // `ACCEPTED_DEFAULTS` in quadraui's `tests/conformance/caps.rs`),
-            // so setting it there is inert today and each backend adopts it
-            // on its own schedule with no vimcode-side change needed.
-            .with_client_side_titlebar()
-            // #719/quadraui#657: the activity bar's row height is the fixed
-            // `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so sizing its
-            // *width* from the editor font makes it oblong. Pin to 48px.
-            .with_activity_bar_width_px(48.0);
+            .with_title_bar(self.units.title_bar_lh);
+        // #940/quadraui#947: opt into the client-side titlebar so a
+        // capable backend (macOS today) puts the reserved band *in* the
+        // real titlebar, beside the native traffic lights, instead of
+        // underneath it. Requested unconditionally (via `self.units`, which
+        // is `true` on every GUI backend) rather than gated on `target_os =
+        // "macos"` (the Platform-Neutrality Rule) — GTK and Win-GUI simply
+        // don't honour this field yet (`ShellConfig::client_side_titlebar`'s
+        // own doc, and `ACCEPTED_DEFAULTS` in quadraui's
+        // `tests/conformance/caps.rs`), so setting it there is inert today
+        // and each backend adopts it on its own schedule with no
+        // vimcode-side change needed. `UnitProfile::cell()` (the `tui`
+        // harness arm) leaves it off, matching `TuiShellApp::
+        // build_shell_config`, which never calls this either.
+        if self.units.client_side_titlebar {
+            cfg = cfg.with_client_side_titlebar();
+        }
+        // #719/quadraui#657: on GTK/macOS/Win the activity bar's row height
+        // is fixed (VS Code parity), so sizing its *width* from the editor
+        // font makes it oblong — `UnitProfile::px()` pins a fixed-pixel
+        // width. `UnitProfile::cell()` leaves this `None`, so
+        // `ShellConfig::activity_bar_width`'s own default (a 3-line-height
+        // multiple) stays in charge, matching `TuiShellApp::
+        // build_shell_config`'s explicit `3.0`. Assigned to the field
+        // directly — `ShellConfig`'s own builder method does the identical
+        // one-line `Some(..)` assignment.
+        cfg.activity_bar_width_px = self.units.activity_bar_width_px;
         // #947: seed the *initial* editor font from `settings.font_family`/
         // `font_size` before the runner's first frame, not just via
         // `sync_per_frame_backend_state`'s per-frame `set_editor_font` call.
@@ -1775,6 +1816,7 @@ impl App {
         css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        units: render::UnitProfile,
     ) -> Self {
         App {
             engine,
@@ -1850,6 +1892,7 @@ impl App {
             css_provider,
             last_colorscheme,
             backend,
+            units,
             // #1064: seeded to `None` rather than the active panel — GTK
             // has no hamburger `PanelDefinition` (unlike TUI's `AppShell`,
             // which activates index 0 = hamburger at construction while
@@ -1904,6 +1947,7 @@ impl App {
         Self::new_headless_with_backend(
             engine,
             Rc::new(RefCell::new(Box::new(backend::GtkBackend::new()))),
+            render::UnitProfile::px(),
         )
     }
 
@@ -1927,12 +1971,18 @@ impl App {
     pub(crate) fn new_headless_with_backend(
         engine: Rc<RefCell<Engine>>,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        units: render::UnitProfile,
     ) -> Self {
-        // #999: this constructor is the shared headless `App` test seam for
-        // every GUI backend (GTK, and the macOS driver-tier test per this
-        // fn's own doc), so it's a GUI backend for `use_nerd_fonts()`
-        // resolution purposes the same as `App::new`/`App::new_portable`.
-        crate::icons::set_gui_backend(true);
+        // #999/#1426: this constructor is the shared headless `App` test
+        // seam for every backend `crate::harness::build_app_and_config`
+        // wraps — GTK, the macOS driver-tier test, and (since #1425) the
+        // `tui` harness arm — so `units.is_gui_backend` (not a hardcoded
+        // `true`) decides `use_nerd_fonts()` resolution the same way
+        // `App::new`/`App::new_portable` do for their own single backend.
+        // Before this, every `tui`-arm scenario built through
+        // `build_app_and_config` ran with `is_gui_backend` wrongly forced
+        // `true`.
+        crate::icons::set_gui_backend(units.is_gui_backend);
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
             (e.settings.use_nerd_fonts(), e.settings.colorscheme.clone())
@@ -1946,6 +1996,7 @@ impl App {
             None,
             last_colorscheme,
             backend,
+            units,
         )
     }
 }
@@ -3464,8 +3515,8 @@ impl App {
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
                 // called on this backend — the exact #971 gap
-                // (`gui_sidebar_system_metrics`'s own doc) that left
-                // `SidebarSystem::handle_cached` returning
+                // (`render::UnitProfile::sidebar_system_metrics`'s own doc)
+                // that left `SidebarSystem::handle_cached` returning
                 // `SidebarEvent::Ignored` unconditionally, fixed for
                 // `sc_sidebar_system` (this match's `PANEL_GIT` arm) and
                 // `ext_sidebar_system` (`refresh_ext_sidebar_metrics`) but
@@ -3478,7 +3529,7 @@ impl App {
                 engine
                     .search_sidebar_system
                     .borrow_mut()
-                    .set_backend_info(search_lh, render::gui_sidebar_system_metrics(search_lh));
+                    .set_backend_info(search_lh, (self.units.sidebar_system_metrics)(search_lh));
                 render::populate_search_sidebar_system(engine, &engine.cwd);
                 engine.search_sidebar_body_rect.set(q_sb);
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
@@ -3589,8 +3640,9 @@ impl App {
                         // #971: without this, `sc_sidebar_system.handle_cached`
                         // returns `Ignored` unconditionally and every
                         // content-row press (header collapse, row select) is a
-                        // silent no-op — see `render::gui_sidebar_system_metrics`'s
-                        // own doc for the full story. Reads `backend.line_height()`
+                        // silent no-op — see `render::UnitProfile::
+                        // sidebar_system_metrics`'s own doc for the full
+                        // story. Reads `backend.line_height()`
                         // directly — not the `lh` parameter above, whose
                         // `self.cached_line_height.max(backend.line_height())`
                         // derivation (`render_content`'s own top) can lag behind
@@ -3602,7 +3654,7 @@ impl App {
                         engine
                             .sc_sidebar_system
                             .borrow_mut()
-                            .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
+                            .set_backend_info(sc_lh, (self.units.sidebar_system_metrics)(sc_lh));
                         render::populate_sc_sidebar_system(engine, theme);
                         engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
@@ -3673,7 +3725,7 @@ impl App {
                     scrollbar_gutter: None,
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
-                    Self::refresh_ext_sidebar_metrics(backend, engine);
+                    Self::refresh_ext_sidebar_metrics(backend, engine, self.units);
                     render::populate_ext_sidebar_system(engine);
                     engine.ext_sidebar_body_rect.set(body_rect);
                     engine
@@ -3847,8 +3899,8 @@ impl App {
     /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
     /// unconditionally and every content-row press on the plugin ext panel
     /// (header collapse, row select) is a silent no-op — see
-    /// `render::gui_sidebar_system_metrics`'s own doc for the full story.
-    /// Reads `backend.line_height()` directly rather than accepting a
+    /// `render::UnitProfile::sidebar_system_metrics`'s own doc for the full
+    /// story. Reads `backend.line_height()` directly rather than accepting a
     /// cached `lh` parameter — see the `PANEL_GIT` arm's identical comment
     /// in [`Self::paint_sidebar_panel_rung`] on why: a cached value can lag
     /// behind what `backend` reports by the time `render()` actually reads
@@ -3857,12 +3909,16 @@ impl App {
     /// `PANEL_EXTENSIONS` arm and the `id if id.starts_with("ext:")` arm
     /// above, which were previously two verbatim copies of this same
     /// four-line snippet.
-    fn refresh_ext_sidebar_metrics(backend: &mut dyn quadraui::Backend, engine: &Engine) {
+    fn refresh_ext_sidebar_metrics(
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        units: render::UnitProfile,
+    ) {
         let ext_lh = backend.line_height();
         engine
             .ext_sidebar_system
             .borrow_mut()
-            .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
+            .set_backend_info(ext_lh, (units.sidebar_system_metrics)(ext_lh));
     }
 
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor
@@ -4601,7 +4657,7 @@ impl App {
                 rect,
                 lh,
                 engine_ref.picker_preview.is_some(),
-                &render::gtk_picker_rows(lh),
+                &(self.units.picker_rows)(lh),
                 &engine_ref,
             )
         });
@@ -4613,7 +4669,7 @@ impl App {
                 render::FindReplaceHitGeometry::from_panel(
                     panel,
                     (self.painted_char_width() as f32, lh),
-                    &render::GTK_FIND_REPLACE_ANCHOR,
+                    &(self.units.find_replace_anchor),
                 )
             });
 
@@ -4665,7 +4721,7 @@ impl App {
                 rect,
                 lh,
                 engine.picker_preview.is_some(),
-                &render::gtk_picker_rows(lh),
+                &(self.units.picker_rows)(lh),
                 &engine,
             )
         };
@@ -5266,19 +5322,22 @@ impl App {
 
                 // ── Divider hit-test (#753 shared rung) ───────────────────────
                 // Editor-group boundaries then `:split`/`:vsplit` boundaries
-                // (#582), sequenced by `render::route_divider_grab`. GTK's only
-                // contribution is its own painted geometry and its own grab
-                // margin — a symmetric 6px around the thin drawn line, against
-                // continuous positions (`quantize: false`); TUI's cell metrics
-                // differ, the ordering does not.
+                // (#582), sequenced by `render::route_divider_grab`. This
+                // backend's only contribution is its own painted geometry and
+                // its own grab margin — `self.units.divider_metrics`, a
+                // symmetric 6px around the thin drawn line on GTK
+                // (`quantize: false`) vs TUI's cell metrics (`quantize:
+                // true`, `group_horizontal` reaching across the tab bar's
+                // row count) — the ordering does not differ.
                 if let Some((group_dividers, window_dividers, on_tab_bar)) =
                     self.painted_divider_geometry(x, y)
                 {
+                    let breadcrumbs = self.engine.borrow().settings.breadcrumbs;
                     if let Some(grab) = render::route_divider_grab(
                         &render::DividerState {
                             group_dividers: &group_dividers,
                             window_dividers: &window_dividers,
-                            metrics: render::GTK_DIVIDER_METRICS,
+                            metrics: (self.units.divider_metrics)(breadcrumbs),
                             on_tab_bar,
                         },
                         x,
@@ -5457,9 +5516,9 @@ impl App {
                         &engine.calculate_window_dividers(&window_rects),
                         x,
                         y,
-                        (6.0, 6.0),
-                        (6.0, 6.0),
-                        false,
+                        self.units.hit_tolerance,
+                        self.units.hit_tolerance,
+                        (self.units.divider_metrics)(engine.settings.breadcrumbs).quantize,
                     )
                     .is_some()
                 });
@@ -5527,7 +5586,7 @@ impl App {
     /// #555: re-deriving was wrong on two counts, and together they put the
     /// hit rect in a different place than the pixels. `render_content` centres
     /// the popup in `backend.viewport()` (the whole window) at
-    /// `gtk_picker_sizing(line_height)`, whereas both callers here pass the
+    /// `self.units.picker`'s own sizing, whereas both callers here pass the
     /// `width`/`height` of `ctx.layout.main_content_bounds` — the editor area
     /// only, minus activity bar / sidebar / title bar — anchored at `(0, 0)`,
     /// and a `line_h: 1.0, header_h: 0.0` sizing. So with any shell chrome
@@ -5546,7 +5605,7 @@ impl App {
         let sizing = render::PickerSizing {
             header_h: 0.0,
             line_h: 1.0,
-            ..render::gtk_picker_sizing(1.0)
+            ..(self.units.picker)(1.0)
         };
         let geo =
             render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
@@ -5667,7 +5726,7 @@ impl App {
                         width as f32,
                         height as f32,
                         has_preview,
-                        &render::gtk_picker_sizing(lh as f32),
+                        &(self.units.picker)(lh as f32),
                     )
                     .visible_rows
                 } else {
@@ -8175,8 +8234,8 @@ impl quadraui::ShellApp for App {
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
-        let tab_row_h = render::tab_row_height_px(lh);
-        let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
+        let tab_row_h = (self.units.tab_row_h)(lh);
+        let tab_bar_h = (self.units.tab_bar_h)(lh, engine.settings.breadcrumbs);
         // Whether the *global* (non-per-window) status bar occupies its own
         // row — `global_status_bar_visible`, not `effective_window_status_line`
         // directly, since `'laststatus'` can hide the status line entirely
@@ -8226,9 +8285,9 @@ impl quadraui::ShellApp for App {
             lh,
             cw,
             false,
-            render::BREADCRUMB_ROW_HEIGHT_PX,
+            (self.units.breadcrumb_row_h)(lh),
             backend.scrollbar_reserve() as f64,
-            render::gtk_minimap_sizing(),
+            self.units.minimap,
         );
 
         // Cache for click handlers (move into RefCell, then borrow back for drawing).
@@ -8749,15 +8808,16 @@ impl quadraui::ShellApp for App {
                 // engine state (`picker_open = true`, items populated) but
                 // nothing ever painted — the "command palette fails to open
                 // silently" symptom. Geometry comes from the same generic
-                // helpers the legacy path used (`PickerGeometry` +
-                // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
+                // helpers the legacy path used (`PickerGeometry` + this
+                // profile's own picker sizing), so no Pango/Cairo access is
+                // needed here.
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         let rect = render::paint_picker_rung(
                             backend,
                             picker,
                             popup_viewport,
-                            &render::gtk_picker_sizing(lh as f32),
+                            &(self.units.picker)(lh as f32),
                         );
                         // Hand the *painted* rect to the click/drag handlers (#555).
                         self.picker_popup_rect.set(Some(rect));
@@ -8787,7 +8847,7 @@ impl quadraui::ShellApp for App {
                         if let Some(geo) = render::TabSwitcherGeometry::compute(
                             popup_viewport,
                             ts.items.len(),
-                            &render::gtk_tab_switcher_sizing(lh as f32),
+                            &(self.units.tab_switcher)(lh as f32),
                         ) {
                             let list =
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);

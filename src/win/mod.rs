@@ -105,7 +105,11 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
             Box::new(backend::WinBackend::new()),
         ));
 
-    let app = App::new_portable(file_path, text_metrics_backend);
+    let app = App::new_portable(
+        file_path,
+        text_metrics_backend,
+        crate::render::UnitProfile::px(),
+    );
     let config = app.shell_config();
     quadraui::win::shell_runner::run_with_shell(app, config)
 }
@@ -212,7 +216,11 @@ mod win_driver_tests {
         let engine = Rc::new(RefCell::new(engine));
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
-        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new(driver, engine, paint, cwd)
     }
@@ -228,7 +236,11 @@ mod win_driver_tests {
         let engine = Rc::new(RefCell::new(engine));
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
-        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         crate::harness::install_folder_picker(&app, dir);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new(driver, engine, paint, cwd)

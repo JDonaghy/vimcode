@@ -542,7 +542,11 @@ pub fn conformance_harness(
     let engine = Rc::new(RefCell::new(engine));
     let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
-    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let (app, config) = crate::harness::build_app_and_config(
+        Rc::clone(&engine),
+        backend,
+        crate::render::UnitProfile::px(),
+    );
     let screen_layout = Rc::clone(&app.cached_screen_layout);
     let driver = driver_with_shell(app, config, width, height);
     crate::harness::ConformanceHarness::new_with_screen_layout(
@@ -568,7 +572,11 @@ pub fn conformance_harness_with_folder_picker(
     let engine = Rc::new(RefCell::new(engine));
     let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
-    let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+    let (app, config) = crate::harness::build_app_and_config(
+        Rc::clone(&engine),
+        backend,
+        crate::render::UnitProfile::px(),
+    );
     crate::harness::install_folder_picker(&app, dir);
     let driver = driver_with_shell(app, config, width, height);
     crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
@@ -13773,7 +13781,11 @@ mod command_line_selection {
 
         engine.buffer_mut().insert(0, "QUADRAUI_991_ALPHA\nBETA\n");
         let engine = Rc::new(RefCell::new(engine));
-        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let mut driver = driver_with_shell(app, config, 1200, 800);
         driver.render();
 

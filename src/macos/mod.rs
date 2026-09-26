@@ -131,7 +131,7 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
         std::cell::RefCell::new(Box::new(quadraui::macos::MacBackend::new())),
     );
 
-    let app = App::new_portable(file_path, backend);
+    let app = App::new_portable(file_path, backend, crate::render::UnitProfile::px());
     let config = app.shell_config();
     quadraui::macos::shell_runner::run_with_shell(app, config)
 }
@@ -162,7 +162,11 @@ pub(crate) fn conformance_harness(
     let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
     let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Box::new(MacBackend::new())));
-    let (app, config) = crate::harness::build_app_and_config(std::rc::Rc::clone(&engine), backend);
+    let (app, config) = crate::harness::build_app_and_config(
+        std::rc::Rc::clone(&engine),
+        backend,
+        crate::render::UnitProfile::px(),
+    );
     let driver = driver_with_shell(app, config, width, height);
     crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
 }
@@ -245,7 +249,11 @@ mod mac_driver_tests {
         );
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
-        let app = App::new_headless_with_backend(Rc::new(RefCell::new(engine)), backend);
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(engine)),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let config = app.shell_config();
         // `driver_with_shell` paints the first frame inside `new` — which is
         // precisely where #896 aborted.
@@ -272,7 +280,11 @@ mod mac_driver_tests {
         let engine = Rc::new(RefCell::new(engine));
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
-        let app = App::new_headless_with_backend(Rc::clone(&engine), backend);
+        let app = App::new_headless_with_backend(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let config = app.shell_config();
         let driver = driver_with_shell(app, config, W, H);
         (guards, engine, driver)
@@ -308,7 +320,11 @@ mod mac_driver_tests {
             let engine = Rc::new(RefCell::new(engine));
             let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
-            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let (app, config) = crate::harness::build_app_and_config(
+                Rc::clone(&engine),
+                backend,
+                crate::render::UnitProfile::px(),
+            );
             let driver = driver_with_shell(app, config, width, height);
             ConformanceHarness::new(driver, engine, paint, cwd)
         }
@@ -325,7 +341,11 @@ mod mac_driver_tests {
             let engine = Rc::new(RefCell::new(engine));
             let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
-            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let (app, config) = crate::harness::build_app_and_config(
+                Rc::clone(&engine),
+                backend,
+                crate::render::UnitProfile::px(),
+            );
             crate::harness::install_folder_picker(&app, dir);
             let driver = driver_with_shell(app, config, width, height);
             ConformanceHarness::new(driver, engine, paint, cwd)
