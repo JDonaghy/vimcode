@@ -172,6 +172,31 @@ pub mod testing {
         ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
     }
 
+    #[cfg(test)]
+    pub fn conformance_harness_with_folder_picker(
+        engine: Engine,
+        dir: std::path::PathBuf,
+        width: u16,
+        height: u16,
+    ) -> ConformanceHarness<TuiDriver<impl quadraui::AppLogic>> {
+        // #1431: the TUI twin of `crate::gtk::testing::conformance_harness_
+        // with_folder_picker` — needed because the picker has to be seeded
+        // on `App` before it is moved into `driver_with_shell`.
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(TuiBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::cell(),
+        );
+        crate::harness::install_folder_picker(&app, dir);
+        let driver = driver_with_shell(app, config, width, height);
+        ConformanceHarness::new(driver, engine, paint, cwd)
+    }
+
     // ── #1043: TUI wiring for `crate::harness::ConformanceHarness`, wrapping
     // the *production* TUI shell rather than the cross-backend-shared `App`
     // wrapped above ──────────────────────────────────────────────────────

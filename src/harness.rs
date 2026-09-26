@@ -1645,6 +1645,31 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // panel's click handling should release/ignore clicks outside its own
     // bounds).
     "app_on_tui::driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app",
+    // ── #1431 tranche 2 (popups, pickers, tab bar/drag, bottom band,
+    // terminal, dialogs) ─────────────────────────────────────────────────
+    // category: unit — `render::editor_popup_anchors`'s completion-popup
+    // anchor lands at the window's own local x=0 rather than the real
+    // terminal column, i.e. it omits the active window's own rect.x
+    // offset. On the shipped TUI (`TuiShellApp`) the editor window's rect
+    // always starts at terminal column 0 (no persistent left chrome), so
+    // the two coincide and the bug never surfaces there; `App`'s
+    // `AppShell` reserves a permanent activity-bar column even with the
+    // sidebar body collapsed, so its editor window starts a few columns
+    // in and the omission becomes visible — observed popup x=2 (matching
+    // the activity-bar+divider width) against a real terminal cursor at
+    // x=19. Target: TBD, needs its own filed issue
+    // (`render::editor_popup_anchors`).
+    "app_on_tui::completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app",
+    // category: quadraui — same root cause as `popups::dialog_intercepts_
+    // all_keys` above: `quadraui::native_dialog_options` reports a
+    // button-only, no-input `Dialog` (or the `:CheckNerdFonts` dialog,
+    // also button-only) as natively expressible with no `BackendCaps`
+    // gate, so `App::render_content` queues a native
+    // `PlatformServices::show_message_dialog` present instead of painting
+    // the in-canvas `Dialog` rung, on every backend — TUI has none.
+    // Target: quadraui.
+    "app_on_tui::render_content_paints_dialog_via_shell_app",
+    "app_on_tui::check_nerd_fonts_dialog_paints_both_variants_via_shell_app",
 ];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
