@@ -2173,6 +2173,33 @@ pub(super) fn handle_mouse(
             engine.board_has_focus = true;
             let pos = quadraui::Point::new(col as f32, row as f32);
             render::route_board_click(engine, pos, is_double_click);
+        } else if owner == render::SidebarOwner::Ai {
+            // #1445: this arm was missing entirely, unlike every other panel
+            // above — a `MouseDown` that landed inside the AI panel's body
+            // (as opposed to its activity-bar icon, which does go through
+            // `sidebar.has_focus = true` via `on_shell_event`'s
+            // `PanelChanged` arm) fell straight through this `if`/`else if`
+            // chain and did nothing, leaving `sidebar.has_focus` false.
+            // `render::route_focus_key` then routed every subsequent
+            // keystroke — including Ctrl+S — to the editor instead of the
+            // panel, since `!sidebar_band_focused` returns `FocusKeyRoute::
+            // None` before it ever checks `engine.ai_has_focus`. Mirrors
+            // GTK's `App::route_ai_sidebar_event`, the same
+            // `render::route_ai_chat_event` dispatch through a live
+            // `Backend` (`ChatController::handle` needs one for its own
+            // layout/hit-test math, like the `Debug` arm above).
+            sidebar.has_focus = true;
+            engine.ai_has_focus = true;
+            let rect = engine.ai_chat_rect.get();
+            let theme = render::Theme::from_name(&engine.settings.colorscheme);
+            let click_ev = quadraui::UiEvent::MouseDown {
+                widget: None,
+                button: quadraui::MouseButton::Left,
+                position: quadraui::Point::new(col as f32, row as f32),
+                modifiers: quadraui::Modifiers::default(),
+            };
+            let mut tui_backend = super::backend::TuiBackend::default();
+            render::route_ai_chat_event(engine, &click_ev, rect, &theme, &mut tui_backend);
         }
         return sidebar_width;
     }
