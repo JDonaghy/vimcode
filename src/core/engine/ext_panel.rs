@@ -2950,6 +2950,12 @@ impl Engine {
     /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
     /// no-agent-binary escape hatch per #952's "Decide in this slice"
     /// through ACP-7.
+    ///
+    /// #1446: when neither transport is usable — no ACP agent *and* no
+    /// resolvable API key for a provider that needs one — this fails
+    /// synchronously with an actionable `self.message` instead of spawning
+    /// curl, which used to surface as a bare "AI error: curl failed:" once
+    /// the doomed request predictably failed.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
         if text.is_empty() || self.ai_streaming {
@@ -2959,9 +2965,22 @@ impl Engine {
             || !self.settings.acp_agents.is_empty();
         if acp_configured {
             self.ai_send_message_via_acp(text);
-        } else {
-            self.ai_send_message_via_curl(text);
+            return;
         }
+        // #1446: fail fast with an actionable message when neither transport
+        // is usable, instead of spawning curl and reporting whatever (often
+        // empty) stderr it produces once the request inevitably fails.
+        let provider = self.settings.ai_provider.clone();
+        if crate::core::ai::provider_needs_api_key(&provider)
+            && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
+        {
+            self.message = format!(
+                "AI: no ACP agent configured (acp_agents / acp_agent_command) and no \
+                 API key for provider \"{provider}\""
+            );
+            return;
+        }
+        self.ai_send_message_via_curl(text);
     }
 
     /// Direct-provider transport: spawns the blocking `curl` background

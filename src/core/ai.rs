@@ -61,6 +61,31 @@ pub fn complete(
     send_chat(provider, api_key, base_url, model, &messages, system)
 }
 
+/// Whether `provider` needs an API key at all. Ollama is local/no-auth;
+/// Anthropic and OpenAI (and OpenAI-compatible providers routed through
+/// `send_openai`) require one.
+pub fn provider_needs_api_key(provider: &str) -> bool {
+    provider != "ollama"
+}
+
+/// Resolve the effective API key for `provider`: the provider's environment
+/// variable (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) takes priority over
+/// `setting_key`, matching `send_anthropic`/`send_openai`'s own resolution
+/// order below. Ollama never needs a key, so this returns empty for it.
+pub fn resolve_api_key(provider: &str, setting_key: &str) -> String {
+    let env_var = match provider {
+        "openai" => "OPENAI_API_KEY",
+        "ollama" => return String::new(),
+        _ => "ANTHROPIC_API_KEY",
+    };
+    let env_val = std::env::var(env_var).unwrap_or_default();
+    if !env_val.is_empty() {
+        env_val
+    } else {
+        setting_key.to_string()
+    }
+}
+
 /// Send a chat request to an AI provider and return the assistant's reply.
 ///
 /// Runs synchronously (blocking curl); call from a background thread.
@@ -96,12 +121,8 @@ fn send_anthropic(
     system: &str,
 ) -> Result<String, String> {
     // Env var takes priority; settings value is a fallback.
-    let key_env = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
-    let api_key = if !key_env.is_empty() {
-        &key_env
-    } else {
-        api_key
-    };
+    let resolved_key = resolve_api_key("anthropic", api_key);
+    let api_key = &resolved_key;
 
     let url = if base_url.is_empty() {
         "https://api.anthropic.com/v1/messages".to_string()
@@ -128,7 +149,7 @@ fn send_anthropic(
 
     let output = crate::core::git::hidden_command("curl")
         .args([
-            "-sf",
+            "-s",
             "--max-time",
             "120",
             "-X",
@@ -142,17 +163,28 @@ fn send_anthropic(
             "anthropic-version: 2023-06-01",
             "-d",
             &body,
+            "-w",
+            HTTP_STATUS_SUFFIX,
         ])
         .output()
         .map_err(|e| format!("curl error: {e}"))?;
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl failed: {err}"));
+        return Err(curl_process_failure_message(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
-    let resp: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let (resp_body, status) = split_curl_output(&output.stdout);
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "curl request failed: HTTP {status} — {}",
+            trim_body_for_error(&resp_body)
+        ));
+    }
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| e.to_string())?;
 
     // API-level error
     if resp.get("type").and_then(|t| t.as_str()) == Some("error") {
@@ -166,12 +198,7 @@ fn send_anthropic(
     resp.pointer("/content/0/text")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            format!(
-                "unexpected response: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })
+        .ok_or_else(|| format!("unexpected response: {resp_body}"))
 }
 
 // ── OpenAI-compatible ─────────────────────────────────────────────────────────
@@ -182,12 +209,8 @@ fn send_openai(
     model: &str,
     messages: &[AiMessage],
 ) -> Result<String, String> {
-    let key_env = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let api_key = if !key_env.is_empty() {
-        &key_env
-    } else {
-        api_key
-    };
+    let resolved_key = resolve_api_key("openai", api_key);
+    let api_key = &resolved_key;
 
     let url = if base_url.is_empty() {
         "https://api.openai.com/v1/chat/completions".to_string()
@@ -200,7 +223,7 @@ fn send_openai(
 
     let output = crate::core::git::hidden_command("curl")
         .args([
-            "-sf",
+            "-s",
             "--max-time",
             "120",
             "-X",
@@ -212,17 +235,28 @@ fn send_openai(
             &format!("Authorization: Bearer {api_key}"),
             "-d",
             &body,
+            "-w",
+            HTTP_STATUS_SUFFIX,
         ])
         .output()
         .map_err(|e| format!("curl error: {e}"))?;
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl failed: {err}"));
+        return Err(curl_process_failure_message(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
-    let resp: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let (resp_body, status) = split_curl_output(&output.stdout);
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "curl request failed: HTTP {status} — {}",
+            trim_body_for_error(&resp_body)
+        ));
+    }
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| e.to_string())?;
 
     if let Some(err_obj) = resp.get("error") {
         let msg = err_obj
@@ -235,12 +269,7 @@ fn send_openai(
     resp.pointer("/choices/0/message/content")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            format!(
-                "unexpected response: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })
+        .ok_or_else(|| format!("unexpected response: {resp_body}"))
 }
 
 // ── Ollama ────────────────────────────────────────────────────────────────────
@@ -279,7 +308,7 @@ fn send_ollama(
 
     let output = crate::core::git::hidden_command("curl")
         .args([
-            "-sf",
+            "-s",
             "--max-time",
             "120",
             "-X",
@@ -289,27 +318,100 @@ fn send_ollama(
             "Content-Type: application/json",
             "-d",
             &body,
+            "-w",
+            HTTP_STATUS_SUFFIX,
         ])
         .output()
         .map_err(|e| format!("curl error: {e}"))?;
 
     if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl failed: {err}"));
+        return Err(curl_process_failure_message(
+            output.status.code(),
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
-    let resp: serde_json::Value =
-        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let (resp_body, status) = split_curl_output(&output.stdout);
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "curl request failed: HTTP {status} — {}",
+            trim_body_for_error(&resp_body)
+        ));
+    }
+
+    let resp: serde_json::Value = serde_json::from_str(&resp_body).map_err(|e| e.to_string())?;
 
     resp.pointer("/message/content")
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            format!(
-                "unexpected response: {}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        })
+        .ok_or_else(|| format!("unexpected response: {resp_body}"))
+}
+
+// ── curl error reporting (#1446) ────────────────────────────────────────────────
+//
+// `-sf` (silent + fail-on-error) was the original flag combo: `-s` suppresses
+// curl's own progress/diagnostic output and `-f` makes curl exit nonzero
+// *and discard the response body* on a non-2xx HTTP status. Combined, a
+// failed request produced an empty stderr AND an empty stdout — the only
+// signal left was curl's exit code, which the old code didn't even read.
+// That's how `:AI hello` with no key configured produced the bare
+// "AI error: curl failed:" this issue is about.
+//
+// The fix drops `-f` and instead appends the HTTP status code to stdout via
+// `-w` so a non-2xx response can be reported with its real status and body
+// instead of being swallowed.
+
+/// `-w` write-out format appended to every curl invocation in this module:
+/// a newline followed by the HTTP status code, so a non-2xx response can be
+/// distinguished from success without relying on curl's own `-f` exit code
+/// (which discards the body).
+const HTTP_STATUS_SUFFIX: &str = "\n%{http_code}";
+
+/// Split curl's stdout (the response body followed by the `HTTP_STATUS_SUFFIX`
+/// write-out) into `(body, status_code)`. Returns status `0` if the trailing
+/// status line is missing or unparsable (should not happen given
+/// `HTTP_STATUS_SUFFIX` is always passed, but keeps this infallible).
+fn split_curl_output(stdout: &[u8]) -> (String, u16) {
+    let text = String::from_utf8_lossy(stdout);
+    match text.rsplit_once('\n') {
+        Some((body, status)) => (body.to_string(), status.trim().parse().unwrap_or(0)),
+        None => (String::new(), 0),
+    }
+}
+
+/// Trim a response body to a reasonable size for an inline error message.
+fn trim_body_for_error(body: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "(empty response body)".to_string();
+    }
+    if trimmed.chars().count() > MAX_CHARS {
+        let prefix: String = trimmed.chars().take(MAX_CHARS).collect();
+        format!("{prefix}...")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build a message for a curl *process*-level failure (nonzero exit before
+/// any HTTP response was even received — DNS failure, connection refused,
+/// TLS error, timeout, curl missing, etc). With `-s`, curl's own stderr is
+/// almost always empty, so the exit code is included unconditionally rather
+/// than being the thing that's silently dropped (#1446).
+fn curl_process_failure_message(exit_code: Option<i32>, stderr: &str) -> String {
+    let code = exit_code
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "unknown (terminated by signal)".to_string());
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!(
+            "curl failed with exit code {code} (no output from curl — check network \
+             connectivity and that curl is installed)"
+        )
+    } else {
+        format!("curl failed with exit code {code}: {stderr}")
+    }
 }
 
 // ── JSON helpers ──────────────────────────────────────────────────────────────
@@ -347,9 +449,150 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
+/// Serializes every test *anywhere in this crate* that mutates the
+/// process-global `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars (read by
+/// [`resolve_api_key`]) against every other one — `std::env::set_var` is
+/// process-global and Rust's default test runner executes `#[test]`s in
+/// parallel threads within one process, so this module's own env-var tests
+/// and `engine::tests`' #1446 coverage (which needs these vars reliably
+/// unset to exercise the "no API key configured" path) would otherwise race
+/// each other. See `crate::core::paths::VIMCODE_TEST_DATA_HOME_LOCK`'s doc
+/// comment for the same tradeoff applied to a different env var.
+#[cfg(test)]
+pub(crate) static AI_API_KEY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: snapshot + restore an environment variable across a test.
+#[cfg(test)]
+pub(crate) struct EnvVarGuard {
+    key: &'static str,
+    old: Option<String>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::set_var(key, value);
+        Self { key, old }
+    }
+
+    pub(crate) fn unset(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, old }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.old.take() {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_provider_needs_api_key() {
+        assert!(provider_needs_api_key("anthropic"));
+        assert!(provider_needs_api_key("openai"));
+        assert!(!provider_needs_api_key("ollama"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_ollama_always_empty() {
+        assert_eq!(resolve_api_key("ollama", "some-setting-key"), "");
+    }
+
+    #[test]
+    fn test_resolve_api_key_falls_back_to_setting_when_env_unset() {
+        let _lock = AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        assert_eq!(resolve_api_key("anthropic", "setting-key"), "setting-key");
+    }
+
+    #[test]
+    fn test_resolve_api_key_env_var_takes_priority_over_setting() {
+        let _lock = AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("ANTHROPIC_API_KEY", "env-key");
+        assert_eq!(resolve_api_key("anthropic", "setting-key"), "env-key");
+    }
+
+    #[test]
+    fn test_resolve_api_key_openai_uses_openai_env_var() {
+        let _lock = AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("OPENAI_API_KEY", "env-openai-key");
+        assert_eq!(resolve_api_key("openai", "setting-key"), "env-openai-key");
+    }
+
+    /// #1446 (2): a curl *process*-level failure (nonzero exit, e.g. DNS
+    /// failure or connection refused) with `-s`'s empty stderr must still
+    /// produce a non-empty, actionable message — not the bare "curl
+    /// failed:" the bug reported. RED verified: reverting to
+    /// `format!("curl failed: {err}")` with an empty `err` reproduces
+    /// exactly that bare string.
+    #[test]
+    fn test_curl_process_failure_message_nonempty_with_empty_stderr() {
+        let msg = curl_process_failure_message(Some(7), "");
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains('7'),
+            "message should mention the exit code: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_curl_process_failure_message_includes_stderr_when_present() {
+        let msg = curl_process_failure_message(Some(6), "Could not resolve host");
+        assert!(msg.contains('6'));
+        assert!(msg.contains("Could not resolve host"));
+    }
+
+    #[test]
+    fn test_curl_process_failure_message_handles_missing_exit_code() {
+        let msg = curl_process_failure_message(None, "");
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn test_split_curl_output_separates_body_and_status() {
+        let stdout = b"{\"ok\":true}\n200";
+        let (body, status) = split_curl_output(stdout);
+        assert_eq!(body, r#"{"ok":true}"#);
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn test_split_curl_output_http_error_status() {
+        let stdout = b"{\"error\":\"unauthorized\"}\n401";
+        let (body, status) = split_curl_output(stdout);
+        assert_eq!(body, r#"{"error":"unauthorized"}"#);
+        assert_eq!(status, 401);
+    }
+
+    #[test]
+    fn test_trim_body_for_error_empty_body() {
+        assert_eq!(trim_body_for_error(""), "(empty response body)");
+    }
+
+    #[test]
+    fn test_trim_body_for_error_truncates_long_body() {
+        let long = "x".repeat(1000);
+        let trimmed = trim_body_for_error(&long);
+        assert!(trimmed.ends_with("..."));
+        assert!(trimmed.len() < long.len());
+    }
 
     #[test]
     fn test_escape_json_string_basic() {
