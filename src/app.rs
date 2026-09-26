@@ -480,13 +480,15 @@ impl render::TickHost for GtkTickHost<'_> {
                         .set(bounds.height.round() as i32);
                     // `WindowControl::bounds`'s own doc: GTK/Wayland always
                     // reports `x: 0.0, y: 0.0` here, meaning "unknown", not
-                    // "at the screen origin" — cached (and later saved)
-                    // regardless, since `set_bounds` on that same backend
-                    // is unconditionally `Unsupported` and so never acts on
-                    // it at restore time either; see
-                    // `cached_window_x`/`y`'s own doc.
-                    self.app.cached_window_x.set(Some(bounds.x.round() as i32));
-                    self.app.cached_window_y.set(Some(bounds.y.round() as i32));
+                    // "at the screen origin" — skip caching that sentinel
+                    // rather than saving a fake position a `set_bounds`-
+                    // capable backend could later misapply; see
+                    // `cached_window_x`/`y`'s own doc for the #1529 review
+                    // finding this closes.
+                    if bounds.x != 0.0 || bounds.y != 0.0 {
+                        self.app.cached_window_x.set(Some(bounds.x.round() as i32));
+                        self.app.cached_window_y.set(Some(bounds.y.round() as i32));
+                    }
                 }
             }
         }
@@ -1023,15 +1025,23 @@ pub(crate) struct App {
     pub(crate) cached_window_width: Cell<i32>,
     pub(crate) cached_window_height: Cell<i32>,
     /// Cached window position, refreshed alongside `cached_window_width`/
-    /// `cached_window_height` in `sync_window_title` (#1529). `None` only
-    /// before the first successful `bounds()` read (or while maximized —
-    /// same freeze as width/height). On GTK/Wayland, `WindowControl::
-    /// bounds` structurally always answers `x: 0.0, y: 0.0` (see that
-    /// method's own doc) — this cell ends up caching that sentinel
-    /// unchanged, which is harmless: `WindowControl::set_bounds` is
-    /// unconditionally `Unsupported` on the very same backend, so
-    /// `App::restore_window_geometry` never acts on the saved value there
-    /// either. macOS/Win-GUI report (and later restore) a real position.
+    /// `cached_window_height` in `sync_window_title` (#1529). `None`
+    /// before the first successful *non-sentinel* `bounds()` read, while
+    /// maximized (same freeze as width/height), and permanently on
+    /// GTK/Wayland — `WindowControl::bounds` structurally always answers
+    /// `x: 0.0, y: 0.0` there (see that method's own doc), which
+    /// `sync_window_title` treats as "no real position" and skips caching
+    /// rather than writing `Some(0)` (#1529 review: an earlier version of
+    /// this cached the sentinel unconditionally on the theory that
+    /// `WindowControl::set_bounds` being unconditionally `Unsupported` on
+    /// the same backend made it harmless — true only for a GTK-authored
+    /// session file read back by GTK; a `Some(0), Some(0)` value read on a
+    /// `set_bounds`-capable backend, e.g. via synced dotfiles, would be
+    /// misapplied as a genuine position). macOS/Win-GUI report (and later
+    /// restore) a real, non-`(0, 0)` position in the overwhelming common
+    /// case, so this only misses the rare case of a window genuinely
+    /// parked at the screen origin — falling back to OS default placement
+    /// there, not a functional regression.
     pub(crate) cached_window_x: Cell<Option<i32>>,
     pub(crate) cached_window_y: Cell<Option<i32>>,
     /// Cached maximized state, refreshed every tick from
@@ -10467,5 +10477,164 @@ mod portable_entry_point_tests {
         assert_eq!(geo.x, Some(50));
         assert_eq!(geo.y, Some(75));
         assert!(geo.maximized);
+    }
+
+    /// #1529 review: the black-box GTK coverage the acceptance criteria
+    /// asked for ("start with a session holding e.g. 1000x700 and verify
+    /// the window's reported size; start with `maximized: true` and
+    /// verify it's maximized") and the review found missing.
+    /// `restore_window_geometry_is_a_noop_until_the_window_is_mapped`
+    /// above only proves the retry-until-mapped *contract* — it never
+    /// attaches a window, so it cannot observe a single pixel of the
+    /// restore behaviour this issue is actually about.
+    ///
+    /// This drives a real `gtk4::ApplicationWindow`, attached via
+    /// `quadraui::gtk::GtkBackend::set_window` (`pub fn`, the same call
+    /// `quadraui::gtk::run::activate` makes in production — see that
+    /// function for the identical `ApplicationWindow::builder()` shape
+    /// this mirrors), then calls the *production* `restore_window_geometry`
+    /// against it and reads back the *real* `WindowControl::bounds()`/
+    /// `is_maximized()` — not a cached `Cell`, not a struct field.
+    ///
+    /// **RED verification: NOT executed, and this says so explicitly**
+    /// rather than repeating the review's own complaint about an
+    /// unverifiable claim. This worker's sandbox is macOS with no live
+    /// desktop session attached to the test process, and — independent of
+    /// that — `cargo test`'s worker-thread model makes `gtk4::init()`
+    /// unusable here at all (see the macOS note below); there was no way
+    /// to actually run this test to green, let alone flip
+    /// `restore_window_geometry` back to a no-op and watch it go red, in
+    /// this environment. This test's own runtime probe (`catch_unwind`
+    /// around `gtk4::init()`) reflects that honestly by skipping rather
+    /// than asserting anything. Whoever next runs this on a Linux machine
+    /// with a live desktop should do that RED/GREEN check by hand — revert
+    /// `restore_window_geometry`'s body to a no-op, confirm both
+    /// assertions fail, restore it, confirm both pass — and record having
+    /// done so, since nobody has yet.
+    ///
+    /// `#[ignore]`d for the identical reason as `src/gtk/testing.rs`'s
+    /// `setup_gtk_clipboard_round_trips_yank_and_paste_through_real_
+    /// backend_1100`: `gtk4::init()` needs a live windowing session
+    /// (X11/Wayland, or macOS's native windowing). CI's headless
+    /// GUI-feature job asserts `DISPLAY`/`WAYLAND_DISPLAY` are both unset
+    /// before running `cargo test`, so this must stay `#[ignore]`d rather
+    /// than runtime-skip only; run manually with `cargo test -- --ignored
+    /// restore_window_geometry_applies_size_and_maximized_to_a_real_window`
+    /// on a machine with a live desktop.
+    ///
+    /// **macOS note**: `gtk4-rs` asserts `gtk4::init()` runs on the
+    /// process's main thread (Cocoa's own requirement) and *panics*
+    /// rather than returning `Err` when it doesn't — and `cargo test`
+    /// always runs each test on a worker thread, never the main one. The
+    /// probe below wraps the call in `catch_unwind` (with the panic hook
+    /// silenced for its duration, so a graceful skip doesn't print a
+    /// misleading backtrace) specifically to turn that unconditional
+    /// macOS panic into the same graceful skip a missing display gets on
+    /// Linux — so on macOS this test *always* skips under the ordinary
+    /// `cargo test` harness, `--ignored` or not; verifying it for real
+    /// requires a single-main-threaded runner (a plain `fn main` calling
+    /// the test function directly), which is out of scope for this issue.
+    /// Linux (X11/Wayland) has no such restriction and is the platform
+    /// this test can actually exercise end-to-end.
+    #[cfg(feature = "gui")]
+    #[test]
+    #[ignore = "needs a live windowing session — gtk4::init() has no display \
+                to talk to in headless CI; run with `cargo test -- --ignored` \
+                on a machine with a live desktop (see doc comment)"]
+    fn restore_window_geometry_applies_size_and_maximized_to_a_real_window() {
+        use gtk4::prelude::*;
+        use quadraui::Backend;
+
+        let _paint = crate::test_paint::PaintGuard::acquire();
+
+        // See this test's doc comment's "macOS note": `gtk4::init()`
+        // panics (does not return `Err`) when called off the main thread,
+        // which every `cargo test` worker thread is. Silence the panic
+        // hook for the duration of the probe so that expected panic
+        // doesn't print a backtrace that looks like a real failure.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let init_result = std::panic::catch_unwind(gtk4::init);
+        std::panic::set_hook(previous_hook);
+
+        if !matches!(init_result, Ok(Ok(()))) {
+            eprintln!(
+                "skipping restore_window_geometry_applies_size_and_maximized_to_a_real_window: \
+                 gtk4::init() did not succeed on this thread/platform (no live windowing \
+                 session, or — on macOS — cargo test's worker thread isn't the main thread; \
+                 see this test's doc comment)"
+            );
+            return;
+        }
+
+        let gapp = gtk4::Application::builder()
+            .application_id("dev.vimcode.test.restore-window-geometry-1529")
+            .build();
+        let window = gtk4::ApplicationWindow::builder()
+            .application(&gapp)
+            .default_width(320)
+            .default_height(240)
+            .build();
+        window.present();
+        // Let the initial `present()` request land before seeding the
+        // "before" measurement below, and after every later mutation, so
+        // `bounds()`/`is_maximized()` read the window's settled state
+        // rather than racing GTK4's asynchronous resize/maximize requests.
+        let pump = || while gtk4::glib::MainContext::default().iteration(false) {};
+        pump();
+
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        engine.borrow_mut().session.window = core::session::WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
+        backend.set_window(window.clone());
+
+        app.restore_window_geometry(&mut backend);
+        pump();
+
+        let bounds = backend
+            .window()
+            .expect("set_window was just called")
+            .bounds()
+            .expect("bounds() must succeed once a window is attached");
+        assert_eq!(
+            bounds.width.round() as i32,
+            1000,
+            "restore_window_geometry did not apply the saved width to the \
+             real window"
+        );
+        assert_eq!(
+            bounds.height.round() as i32,
+            700,
+            "restore_window_geometry did not apply the saved height to the \
+             real window"
+        );
+        assert!(
+            !matches!(backend.window().unwrap().is_maximized(), Ok(true)),
+            "window must not be maximized when the saved session says \
+             maximized: false"
+        );
+
+        // Second case, same window: `maximized: true` must actually
+        // maximize it. `window_geometry_restored` reset by hand since a
+        // real run only restores once per process lifetime; this test
+        // exercises both branches of `clamped.maximized` against the one
+        // window rather than tearing down and reattaching a second one.
+        app.window_geometry_restored.set(false);
+        engine.borrow_mut().session.window.maximized = true;
+        app.restore_window_geometry(&mut backend);
+        pump();
+
+        assert!(
+            matches!(backend.window().unwrap().is_maximized(), Ok(true)),
+            "restore_window_geometry did not maximize the real window when \
+             the saved session says maximized: true"
+        );
     }
 }
