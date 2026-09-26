@@ -20273,7 +20273,7 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 /// once before either (both [`route_ai_chat_event`] and the two backends'
 /// `PANEL_AI` render arms do).
 ///
-/// `engine.ai_messages` stays the business-logic source of truth (what
+/// `engine.acp().ai_messages` stays the business-logic source of truth (what
 /// `crate::core::ai::send_chat` actually sends); this rebuilds the
 /// controller's own `Vec<ChatTurn>` mirror from it on every call, matching
 /// [`quadraui::ChatController::set_transcript`]'s "replace, don't
@@ -20291,6 +20291,7 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     // "AI" label.
     let thought_fg = theme.comment;
     let mut turns: Vec<quadraui::ChatTurn> = engine
+        .acp()
         .ai_messages
         .iter()
         .map(|m| {
@@ -20316,7 +20317,7 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     // -> completed | failed` transition is visible here without any
     // expand/collapse state to track — every call always renders its
     // current status, every frame.
-    for call in &engine.acp_tool_calls {
+    for call in &engine.acp().tool_calls {
         turns.push(quadraui::ChatTurn {
             role: quadraui::ChatRole::System,
             text: quadraui::StyledText::colored(
@@ -20330,7 +20331,7 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
 
     // #956 (ACP-5): the agent's current plan, rendered as one synthetic
     // checklist turn appended *after* the real conversation — never mixed
-    // into `engine.ai_messages` itself. `engine.acp_plan` already holds
+    // into `engine.acp().ai_messages` itself. `engine.acp().plan` already holds
     // only the latest `plan` update (a full replacement, not a delta — see
     // that field's doc), so this turn is rebuilt fresh from it every call:
     // two successive `plan` updates leave exactly one checklist rendered,
@@ -20340,11 +20341,11 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     // visible without scrolling (`ChatController` stays stuck-to-bottom),
     // at the deliberate cost of it not being in strict chronological order
     // with any later message chunks in the same turn.
-    if !engine.acp_plan.is_empty() {
+    if !engine.acp().plan.is_empty() {
         turns.push(quadraui::ChatTurn {
             role: quadraui::ChatRole::System,
             text: quadraui::StyledText::colored(
-                crate::core::acp::plan_to_checklist_text(&engine.acp_plan),
+                crate::core::acp::plan_to_checklist_text(&engine.acp().plan),
                 thought_fg,
             ),
             timestamp_unix: None,
@@ -20354,28 +20355,53 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
 
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
-    chat.set_busy(engine.ai_streaming);
+    chat.set_busy(engine.acp().ai_streaming);
     let header_fg = theme.status_fg;
-    let mut header = if engine.ai_streaming {
+    let mut header = if engine.acp().ai_streaming {
         " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
     } else {
         " \u{f0e5} AI ASSISTANT".to_string()
     };
+    // #1463: the session tab strip. Folded into this same always-repainted
+    // header line — exactly like the mode/usage suffix below — rather than
+    // a bespoke widget in either backend, per the Platform-Neutrality Rule:
+    // both backends already paint this one string with zero backend-
+    // specific code, so a second session is "more text in the string
+    // that's already shared", not new GTK/TUI paint logic. Only shown once
+    // a second tab actually exists — the common single-session case looks
+    // exactly as it did before #1463. The active tab is marked `*`; a tab
+    // with a `session/request_permission` parked while backgrounded (see
+    // `Engine::acp_handle_permission_request`'s doc) is marked `!` — the
+    // badge #1463 asks for, painted, not just an engine flag (`Engine::
+    // acp_session_tabs` is the one source both this and the flag read).
+    let tabs = engine.acp_session_tabs();
+    if tabs.len() > 1 {
+        let strip: Vec<String> = tabs
+            .iter()
+            .map(|(_, label, is_active, badged)| {
+                let mark = if *is_active { "*" } else { "" };
+                let badge = if *badged { "!" } else { "" };
+                format!("{mark}{label}{badge}")
+            })
+            .collect();
+        header.push_str(&format!("  [{}]", strip.join(" | ")));
+    }
     // #956 (ACP-5): current mode + usage telemetry both fold into this one
     // existing status line rather than a new widget — "unobtrusive status
     // indicator" per the issue, and by construction can't steal focus or
     // churn layout since the header is already repainted every frame at a
     // fixed position.
-    if let Some(mode_id) = engine.acp_current_mode_id.as_deref() {
+    if let Some(mode_id) = engine.acp().current_mode_id.as_deref() {
         let mode_label = engine
-            .acp_modes
+            .acp()
+            .modes
             .iter()
             .find(|m| m.id == mode_id)
             .map(|m| m.name.as_str())
             .unwrap_or(mode_id);
         header.push_str(&format!("  \u{b7} mode: {mode_label}"));
     }
-    if let Some(usage) = &engine.acp_usage {
+    if let Some(usage) = &engine.acp().usage {
         let summary = crate::core::acp::format_usage_summary(usage);
         if !summary.is_empty() {
             header.push_str(&format!("  \u{b7} {summary}"));

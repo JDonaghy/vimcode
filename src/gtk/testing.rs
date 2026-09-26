@@ -5637,7 +5637,7 @@ second line here
         let mut h = panel_harness(PANEL_AI);
         {
             let mut engine = h.engine.borrow_mut();
-            engine.ai_messages = (0..60)
+            engine.acp_mut().ai_messages = (0..60)
                 .map(|i| crate::core::ai::AiMessage {
                     role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                     content: format!("MSG_MARKER_{i}"),
@@ -5695,7 +5695,7 @@ second line here
         let mut h = panel_harness(PANEL_AI);
         {
             let mut engine = h.engine.borrow_mut();
-            engine.acp_plan = vec![
+            engine.acp_mut().plan = vec![
                 crate::core::acp::AcpPlanEntry {
                     content: "PLAN_STEP_DONE".to_string(),
                     status: crate::core::acp::AcpPlanEntryStatus::Completed,
@@ -5769,7 +5769,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             // Only needs to be non-empty: routing checks emptiness to pick
             // the transport, but the client above already exists, so
             // `ai_send_message` takes the "reuse existing client" branch,
@@ -5862,7 +5862,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -5934,7 +5934,7 @@ second line here
         );
 
         assert!(
-            h.engine.borrow().ai_streaming,
+            h.engine.borrow().acp().ai_streaming,
             "the panel must still be busy while the permission dialog is \
              open, or the completion check below would pass trivially"
         );
@@ -5947,15 +5947,146 @@ second line here
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while h.engine.borrow().ai_streaming && std::time::Instant::now() < deadline {
+        while h.engine.borrow().acp().ai_streaming && std::time::Instant::now() < deadline {
             h.engine.borrow_mut().poll_acp();
             h.driver.render();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(
-            !h.engine.borrow().ai_streaming,
+            !h.engine.borrow().acp().ai_streaming,
             "the reply must actually reach the (fake) agent and let the \
              turn resume to completion within 5s"
+        );
+    }
+
+    /// #1463 (multiple concurrent ACP sessions), GTK twin of `tui_main::
+    /// shell_app::tests::
+    /// ai_panel_session_tab_strip_badges_background_permission_and_ainext_switches_to_it_via_shell_app`.
+    /// Two sessions' tab strip paints in the AI panel header (active tab
+    /// marked `*`, a backgrounded session's parked permission request
+    /// marked `!`), the request stays queued (not stolen into the
+    /// foreground) while the human is on the other tab, and switching to
+    /// the badged tab (`Engine::acp_next_session`, called directly — same
+    /// "simulate the action, assert the painted/queued result" convention
+    /// `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// above already uses for `dialog_click_button`) reveals *its* native
+    /// dialog and answers the right session's client.
+    ///
+    /// RED verified the same way as the TUI twin: reverting `Engine::
+    /// acp_handle_permission_request`'s `is_foreground` gate (always
+    /// calling `show_dialog`) makes session B's native dialog queue
+    /// immediately — `h.pending_native_dialog.take().is_none()` below
+    /// fails while session A is still the foreground tab.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_session_tab_strip_badges_background_permission_and_switching_reveals_it() {
+        let mut h = panel_harness(PANEL_AI);
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let argv = vec!["sh".to_string(), fixture.to_string()];
+        let cwd = std::env::temp_dir();
+        {
+            let mut engine = h.engine.borrow_mut();
+            let mut client_a = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client_a.initialize();
+            engine.acp_mut().client = Some(client_a);
+            engine.acp_mut().label = "claude".to_string();
+
+            // Session 1 ("gemini"): a second tab whose agent requests
+            // permission on its next prompt — a turn left running in the
+            // background while the human works in tab A.
+            engine
+                .acp_sessions
+                .push(crate::core::acp_session::AcpSession::new());
+            engine.acp_active_session = 1;
+            let mut client_b = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client_b.initialize();
+            engine.acp_mut().client = Some(client_b);
+            engine.acp_mut().label = "gemini".to_string();
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+            engine.ai_send_message("please edit".to_string());
+            // Back to the foreground tab before B's request necessarily
+            // lands.
+            engine.acp_active_session = 0;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("gemini!") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("*claude"),
+            "the active tab must be marked in the painted header"
+        );
+        assert!(
+            h.driver.screen_contains("gemini!"),
+            "the backgrounded tab's parked permission request must paint a \
+             badge within 5s"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "a backgrounded session's permission request must not queue a \
+             native dialog over whatever the human is looking at"
+        );
+
+        // Switch to the badged tab — reveals its parked dialog.
+        h.engine.borrow_mut().acp_next_session();
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("*gemini"),
+            "acp_next_session must switch the active tab"
+        );
+        let opts = h
+            .pending_native_dialog
+            .take()
+            .expect("switching to the badged tab must reveal its parked dialog");
+        assert_eq!(
+            opts.title, "Edit src/main.rs",
+            "the revealed dialog must be session B's own parked request"
+        );
+
+        // "Allow Once" (button index 0) must answer session B's client,
+        // not whatever was active when the request first arrived.
+        h.engine.borrow_mut().dialog_click_button(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.engine.borrow().acp_sessions[1].ai_streaming && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !h.engine.borrow().acp_sessions[1].ai_streaming,
+            "answering from the revealed dialog must reply to session B's \
+             own client, letting its turn actually complete within 5s"
+        );
+        assert!(
+            h.engine.borrow().acp_sessions[1]
+                .ai_messages
+                .iter()
+                .any(|m| m.content.contains("Hello world")),
+            "session B's own transcript must show its completed turn"
+        );
+        assert!(
+            h.engine.borrow().acp_sessions[0]
+                .ai_messages
+                .iter()
+                .all(|m| !m.content.contains("please edit")),
+            "session A's transcript must never see session B's prompt"
         );
     }
 
@@ -6012,7 +6143,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6083,7 +6214,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6368,7 +6499,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6502,7 +6633,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6574,7 +6705,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6666,7 +6797,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6765,7 +6896,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -6937,11 +7068,11 @@ second line here
     /// (`ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
     /// above): no text input, so `quadraui::native_dialog_options` takes it
     /// native — the queued `MessageDialogOptions` is the proof, not
-    /// `engine.dialog`/`engine.acp_auth_methods` state.
+    /// `engine.dialog`/`engine.acp_mut().auth_methods` state.
     ///
     /// RED verified: with `Engine::poll_acp`'s `Initialized` handler
     /// changed to call `self.acp_begin_session()` unconditionally (skipping
-    /// the `!self.acp_authenticated && !self.acp_auth_methods.is_empty()`
+    /// the `!self.acp_mut().authenticated && !self.acp_mut().auth_methods.is_empty()`
     /// check), no dialog ever opens and this test times out waiting for one
     /// — `pending_native_dialog.take()` panics on `None`. Restored before
     /// committing.
@@ -6967,7 +7098,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
 
@@ -7126,7 +7257,7 @@ second line here
             )
             .expect("fixture agent should spawn");
             client.initialize();
-            engine.acp_client = Some(client);
+            engine.acp_mut().client = Some(client);
             // Read directly by `acp_launch_terminal_login` — distinct from
             // (and independent of) the NDJSON client spawned above. Quoted
             // because `CARGO_MANIFEST_DIR` may contain spaces (a coord
@@ -7205,7 +7336,7 @@ second line here
             h.engine.borrow().terminal_panes.is_empty(),
             "the login pane should have exited (exit 0) and been reaped"
         );
-        assert!(h.engine.borrow().acp_authenticated);
+        assert!(h.engine.borrow().acp().authenticated);
 
         let deadline = std::time::Instant::now() + ACP_DRIVER_DEADLINE;
         while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {

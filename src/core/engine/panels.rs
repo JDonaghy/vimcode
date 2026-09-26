@@ -608,46 +608,64 @@ impl Engine {
                 // every branch — including a stray "acp_permission" result
                 // for a request that's somehow already gone — produces at
                 // most one reply.
-                let Some((request_id, req)) = self.acp_pending_permission.take() else {
+                let Some((request_id, req)) = self.acp_mut().pending_permission.take() else {
                     return EngineAction::None;
                 };
-                let Some(client) = self.acp_client.as_ref() else {
+                if self.acp().client.is_none() {
                     return EngineAction::None;
-                };
+                }
                 if action == "cancel" {
-                    client.respond_to_client_request(
-                        request_id,
-                        Ok(crate::core::acp::permission_outcome_cancelled()),
-                    );
+                    if let Some(client) = self.acp().client.as_ref() {
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_cancelled()),
+                        );
+                    }
                     return EngineAction::None;
                 }
                 // Otherwise `action` is the option_id of the button the
                 // human clicked/hotkeyed (`acp_handle_permission_request`
                 // built each `DialogButton::action` from `option_id`).
+                //
+                // Each `client.respond_to_client_request` call below
+                // re-borrows `self.acp().client` immediately before use,
+                // rather than holding one `client` reference across the
+                // `remembered_decisions` mutation in between — the two now
+                // live in the same `AcpSession` behind `Engine::acp_sessions`
+                // (#1463), and unlike separate top-level `Engine` fields, a
+                // `Vec` index can't be borrow-split field-by-field, so an
+                // in-flight `&AcpClient` borrowed via `self.acp()` would
+                // conflict with the `self.acp_mut()` mutation.
                 match req.options.iter().find(|o| o.option_id == action) {
                     Some(opt) => {
                         if opt.kind == "allow_always" {
-                            self.acp_remembered_decisions
+                            self.acp_mut()
+                                .remembered_decisions
                                 .insert(req.tool_call.kind.clone(), true);
                         } else if opt.kind == "reject_always" {
-                            self.acp_remembered_decisions
+                            self.acp_mut()
+                                .remembered_decisions
                                 .insert(req.tool_call.kind.clone(), false);
                         }
-                        client.respond_to_client_request(
-                            request_id,
-                            Ok(crate::core::acp::permission_outcome_selected(
-                                &opt.option_id,
-                            )),
-                        );
+                        if let Some(client) = self.acp().client.as_ref() {
+                            client.respond_to_client_request(
+                                request_id,
+                                Ok(crate::core::acp::permission_outcome_selected(
+                                    &opt.option_id,
+                                )),
+                            );
+                        }
                     }
                     None => {
                         // Shouldn't happen — every dialog button's action
                         // is one of `req.options`' ids — but never leave
                         // the request unanswered on an unrecognized action.
-                        client.respond_to_client_request(
-                            request_id,
-                            Ok(crate::core::acp::permission_outcome_cancelled()),
-                        );
+                        if let Some(client) = self.acp().client.as_ref() {
+                            client.respond_to_client_request(
+                                request_id,
+                                Ok(crate::core::acp::permission_outcome_cancelled()),
+                            );
+                        }
                     }
                 }
                 EngineAction::None
@@ -660,12 +678,13 @@ impl Engine {
                 // reject it. An agent advertising `authMethods` doesn't
                 // necessarily mean auth is *required* right now.
                 if action == "cancel" || action == "acp_auth_skip" {
-                    self.acp_authenticated = true;
+                    self.acp_mut().authenticated = true;
                     self.acp_begin_session();
                     return EngineAction::None;
                 }
                 let Some(method) = self
-                    .acp_auth_methods
+                    .acp_mut()
+                    .auth_methods
                     .iter()
                     .find(|m| m.id == action)
                     .cloned()
@@ -675,13 +694,13 @@ impl Engine {
                     // own ids — but never strand the handshake on an
                     // unrecognized action; fall back to unauthenticated
                     // the same as an explicit skip.
-                    self.acp_authenticated = true;
+                    self.acp_mut().authenticated = true;
                     self.acp_begin_session();
                     return EngineAction::None;
                 };
                 match method.kind {
                     crate::core::acp::AcpAuthMethodKind::Agent => {
-                        if let Some(client) = self.acp_client.as_mut() {
+                        if let Some(client) = self.acp_mut().client.as_mut() {
                             client.authenticate(&method.id);
                             self.message = format!("Authenticating via {}\u{2026}", method.name);
                         }

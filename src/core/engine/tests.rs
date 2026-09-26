@@ -22855,7 +22855,7 @@ fn test_command_center_chat_with_acp_agent_configured_shows_open_panel() {
 /// — the reported bug was a bare "AI error: curl failed:".
 ///
 /// RED verified: reverting `ai_send_message`'s new pre-flight check makes
-/// this fail — `e.message` stays empty and `e.ai_streaming` flips to
+/// this fail — `e.message` stays empty and `e.acp_mut().ai_streaming` flips to
 /// `true` because the (real, unmocked) `curl` subprocess is spawned
 /// instead.
 #[test]
@@ -22874,7 +22874,7 @@ fn test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message() {
     e.ai_send_message("hello".to_string());
 
     assert!(
-        !e.ai_streaming,
+        !e.acp_mut().ai_streaming,
         "should not spawn the curl transport when unconfigured"
     );
     assert!(
@@ -22895,14 +22895,19 @@ fn test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message() {
     // belongs in the transcript too — same shape as the ACP spawn-failure
     // arm. (Painted-output coverage for both lives in
     // `ai_panel_submit_without_transport_keeps_turn_and_paints_reason_via_shell_app`.)
-    assert_eq!(e.ai_messages.len(), 2, "{:?}", e.ai_messages);
-    assert_eq!(e.ai_messages[0].role, "user");
-    assert_eq!(e.ai_messages[0].content, "hello");
-    assert_eq!(e.ai_messages[1].role, "assistant-thought");
+    assert_eq!(
+        e.acp_mut().ai_messages.len(),
+        2,
+        "{:?}",
+        e.acp_mut().ai_messages
+    );
+    assert_eq!(e.acp_mut().ai_messages[0].role, "user");
+    assert_eq!(e.acp_mut().ai_messages[0].content, "hello");
+    assert_eq!(e.acp_mut().ai_messages[1].role, "assistant-thought");
     assert!(
-        e.ai_messages[1].content.contains("Cannot send"),
+        e.acp_mut().ai_messages[1].content.contains("Cannot send"),
         "transcript should explain why nothing was sent: {}",
-        e.ai_messages[1].content
+        e.acp_mut().ai_messages[1].content
     );
 }
 
@@ -22918,7 +22923,7 @@ fn test_ai_send_message_ollama_needs_no_key() {
     e.ai_send_message("hello".to_string());
 
     assert!(
-        e.ai_streaming,
+        e.acp_mut().ai_streaming,
         "ollama needs no API key, so the curl transport should still start: {}",
         e.message
     );
@@ -22971,10 +22976,10 @@ fn test_ranged_ai_command_via_ex_parser_stages_attachment_and_sends() {
     assert_eq!(attachment.text, "one\ntwo\n");
     assert!(engine.ai_has_focus);
     assert_eq!(
-        engine.ai_messages.first().map(|m| m.content.as_str()),
+        engine.acp().ai_messages.first().map(|m| m.content.as_str()),
         Some("explain this"),
         "the message must still be sent, not just the attachment staged: {:?}",
-        engine.ai_messages
+        engine.acp().ai_messages
     );
 
     let _ = std::fs::remove_file(&file_path);
@@ -23009,9 +23014,9 @@ fn test_ranged_ai_command_via_ex_parser_with_no_message_does_not_send() {
     );
     assert!(engine.ai_has_focus);
     assert!(
-        engine.ai_messages.is_empty(),
+        engine.acp_mut().ai_messages.is_empty(),
         "no message means nothing is sent yet: {:?}",
-        engine.ai_messages
+        engine.acp_mut().ai_messages
     );
 
     let _ = std::fs::remove_file(&file_path);

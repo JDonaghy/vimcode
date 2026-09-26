@@ -397,7 +397,7 @@ pub fn session_update_chunk(update: &serde_json::Value) -> Option<(AcpChunkKind,
 /// [`PlanEntryStatus`]/`plan_to_checklist_text` with a completely
 /// different feeder, so nothing ACP-specific belongs in the model itself.
 /// Re-exported here under their original names so every existing ACP call
-/// site (`Engine::acp_plan`, `render::populate_ai_chat_controller`) is
+/// site (`AcpSession::plan` (via `Engine::acp()`), `render::populate_ai_chat_controller`) is
 /// unaffected by the move.
 pub use crate::core::plan::{
     plan_to_checklist_text, PlanEntry as AcpPlanEntry, PlanEntryStatus as AcpPlanEntryStatus,
@@ -411,7 +411,7 @@ pub use crate::core::plan::{
 /// plan-preview producer.
 ///
 /// **Every call is a full replacement, never a delta** — see
-/// `Engine::acp_plan`'s doc. Treating consecutive `plan` updates as
+/// `AcpSession::plan` (via `Engine::acp()`)'s doc. Treating consecutive `plan` updates as
 /// append-only is the single most common way to get this variant wrong
 /// per #956's own scope note; nothing in this function accumulates state,
 /// by construction, since it takes no previous plan as input.
@@ -432,8 +432,8 @@ pub struct AcpAvailableCommand {
 /// Parse a `session/update`'s `available_commands_update` variant:
 /// `{"sessionUpdate": "available_commands_update", "availableCommands":
 /// [{"name", "description"}]}`. Like `plan`, this is a full replacement of
-/// whatever command set was known before — see `Engine::
-/// acp_available_commands`. An entry missing `name` is dropped (nothing a
+/// whatever command set was known before — see `AcpSession::
+/// available_commands`. An entry missing `name` is dropped (nothing a
 /// user could usefully type); a missing `description` defaults to `""`.
 pub fn parse_available_commands_update(
     update: &serde_json::Value,
@@ -1304,7 +1304,7 @@ pub struct AcpToolCallInfo {
     pub title: String,
     /// The tool-call's category (e.g. `"edit"`, `"execute"`, `"read"`) —
     /// coarser than a specific tool identity, and deliberately so: it is
-    /// what [`Engine::acp_remembered_decisions`](crate::core::engine::Engine)
+    /// what `AcpSession::remembered_decisions`
     /// keys `allow_always`/`reject_always` on, so "same tool" reads as
     /// "same category of action" rather than e.g. "same file path".
     pub kind: String,
@@ -1536,7 +1536,7 @@ fn parse_tool_call_locations(update: &serde_json::Value) -> Vec<(String, Option<
 /// One tool call the agent is executing or has executed — the addressable
 /// unit `tool_call`/`tool_call_update` operate on, keyed by `id`
 /// (`toolCallId` on the wire). Stored as an upserted `Vec` — not an
-/// append-only log — by `Engine::acp_tool_calls`.
+/// append-only log — by `AcpSession::tool_calls`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcpToolCall {
     pub id: String,
@@ -2767,7 +2767,7 @@ mod tests {
     /// #953 review (non-blocking concern): a missing per-option `kind` must
     /// default to something neutral, never to `"allow_once"` — the most
     /// permissive category — since that would let a request with a missing
-    /// `kind` silently match `Engine::acp_remembered_decisions`'s
+    /// `kind` silently match `AcpSession::remembered_decisions`'s
     /// `allow_`-prefix lookup as if a human had already approved it.
     #[test]
     fn parse_request_permission_defaults_missing_option_kind_to_neutral_not_allow_once() {
