@@ -413,7 +413,11 @@ pub(super) fn render_source_control(
         if let Some(hint_rect) = bands.hint {
             backend.set_theme(super::quadraui_tui::q_theme(theme));
             let hint_bar = render::sc_hint_status_bar(theme);
-            let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+            let _ = backend.draw_status_bar_interactive(
+                hint_rect,
+                &hint_bar,
+                &quadraui::InteractionState::new(),
+            );
         }
         // #1361 review: the pre-#1361 code additionally gated the whole hint
         // reservation on `area.height > 2`, guarding against a degenerate
@@ -1046,7 +1050,8 @@ pub(super) fn render_board_panel(
         if let Some(ref status) = board.status {
             let bar = render::board_status_bar(status, theme);
             let row = quadraui::Rect::new(q_area.x, q_area.y, q_area.width, 1.0);
-            let _ = backend.draw_status_bar(row, &bar, None, None);
+            let _ =
+                backend.draw_status_bar_interactive(row, &bar, &quadraui::InteractionState::new());
         }
     }
 }

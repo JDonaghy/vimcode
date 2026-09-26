@@ -959,7 +959,7 @@ pub(super) fn render_window_status_line(
     );
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width as f32, 1.0);
     backend.set_theme(super::quadraui_tui::q_theme(theme));
-    backend.draw_status_bar(q_rect, &bar, None, None)
+    backend.draw_status_bar_interactive(q_rect, &bar, &quadraui::InteractionState::new())
 }
 
 /// True when `w`'s own `Backend::draw_editor` scrollbar occupies its last
@@ -1234,10 +1234,10 @@ pub(super) fn draw_rule_row_q(
     };
     let width = text.chars().count() as f32;
     let q_rect = quadraui::Rect::new(x as f32, y as f32, width, 1.0);
-    let _ = backend.draw_status_bar(q_rect, &bar, None, None);
+    let _ = backend.draw_status_bar_interactive(q_rect, &bar, &quadraui::InteractionState::new());
 }
 
-/// Window/editor-group divider lines through `Backend::draw_status_bar`
+/// Window/editor-group divider lines through `Backend::draw_status_bar_interactive`
 /// (#609) — see [`draw_rule_cell_themed`]'s doc comment for the underlying trick.
 /// Draws both the vertical dividers *between windows within a split group*
 /// (e.g. `:vsplit`) and the horizontal ones (`:split`); the group-level
@@ -1788,19 +1788,17 @@ mod tests {
                     // ── Wildmenu / status / command line ──────────────────
                     if let Some(ref wm) = screen.wildmenu {
                         let bar = render::wildmenu_to_status_bar(wm, &theme);
-                        backend.draw_status_bar(
+                        backend.draw_status_bar_interactive(
                             super::shell_app::to_q_rect(chrome.wildmenu),
                             &bar,
-                            None,
-                            None,
+                            &quadraui::InteractionState::new(),
                         );
                     }
                     if let Some(ref bar) = screen.global_status_bar {
-                        backend.draw_status_bar(
+                        backend.draw_status_bar_interactive(
                             super::shell_app::to_q_rect(chrome.status),
                             bar,
-                            None,
-                            None,
+                            &quadraui::InteractionState::new(),
                         );
                     }
                     render_command_line(backend, chrome.cmd, &screen.command, &theme, None);
