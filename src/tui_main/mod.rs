@@ -13,8 +13,25 @@
 // `_interactive`/`TabBarLayout` replacements is an unrelated refactor
 // deferred to a follow-up, so it's silenced here rather than left as a stray
 // warning under `-D warnings`.
+//
+// `dead_code`: #1433 moved production `tui_main::run()` onto `crate::app::App`
+// — `TuiShellApp` and the rest of this module tree (`panels`, `mouse`,
+// `render_impl`, `shell_app`'s own dispatch functions) are reachable in a
+// plain, non-test, non-`test-support` build ONLY through doc comments now,
+// since their one remaining real caller, `tui_main::testing` (used by the
+// in-crate `#[cfg(test)]` suite and the sealed `tests/acceptance.rs` crate
+// via `feature = "test-support"`), is itself `#[cfg(any(test, feature =
+// "test-support"))]`-gated. #1434 tracks deleting `TuiShellApp` outright;
+// until it lands, a plain `cargo build`/`cargo clippy` sees this whole tree
+// as unreachable. (#1489: this used to be masked as a side effect of
+// `render.rs`'s own, unrelated, now-removed blanket `#[allow(dead_code)]` —
+// `#[allow(dead_code)]` seeds the items it covers into the reachability
+// worklist, so a big enough allow elsewhere in the crate can accidentally
+// keep a totally different module's dead code quiet. Named here explicitly
+// instead, where it actually belongs.)
 #![allow(
     unused_assignments,
+    dead_code,
     deprecated,
     clippy::collapsible_match,
     clippy::explicit_counter_loop

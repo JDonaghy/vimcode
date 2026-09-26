@@ -1861,17 +1861,15 @@ impl Engine {
     pub fn populate_ext_sidebar_system(&self) {
         use quadraui::{Decoration, StyledText, TreeRow};
 
-        let manifests = self.ext_available_manifests();
-        let q = self.ext_sidebar_query.to_lowercase();
-
-        let installed_rows: Vec<TreeRow> = manifests
+        // #1489: installed/available filtering used to be inlined here a
+        // third time, alongside the identical filter in `ext_installed_items`
+        // / `ext_available_items` (used by `dispatch_ext_sidebar_action_key`)
+        // and a since-deleted dead copy in `render.rs::build_ext_sidebar_data`.
+        // Reuse those two so there is exactly one definition of "installed"
+        // and "matches the search query" left.
+        let installed_rows: Vec<TreeRow> = self
+            .ext_installed_items()
             .iter()
-            .filter(|m| self.extension_state.is_installed(&m.name))
-            .filter(|m| {
-                q.is_empty()
-                    || m.name.to_lowercase().contains(&q)
-                    || m.display_name.to_lowercase().contains(&q)
-            })
             .enumerate()
             .map(|(i, m)| {
                 let display = if m.display_name.is_empty() {
@@ -1898,14 +1896,9 @@ impl Engine {
             })
             .collect();
 
-        let available_rows: Vec<TreeRow> = manifests
+        let available_rows: Vec<TreeRow> = self
+            .ext_available_items()
             .iter()
-            .filter(|m| !self.extension_state.is_installed(&m.name))
-            .filter(|m| {
-                q.is_empty()
-                    || m.name.to_lowercase().contains(&q)
-                    || m.display_name.to_lowercase().contains(&q)
-            })
             .enumerate()
             .map(|(i, m)| {
                 let display = if m.display_name.is_empty() {

@@ -7,10 +7,6 @@
 //! **Critical:** No GTK, Cairo, Pango, or Relm4 dependencies are allowed here.
 //! All types must be plain Rust structs with no platform coupling.
 
-// Many public fields and methods are part of the rendering API consumed by the
-// Cairo backend and reserved for the future TUI backend; dead_code warnings
-// are expected for unused-in-this-binary items.
-//
 // #937's mandatory quadraui pin bump (dbb3023 -> 68f0ef9, needed for
 // `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
 // `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
@@ -19,10 +15,13 @@
 // new `TabBarLayout`/`MinimapSpan` shapes is an unrelated, cross-backend
 // refactor, not part of #937's nerd-font fix; tracked for follow-up instead
 // of bundled in here.
-#![allow(dead_code, deprecated)]
+//
+// `dead_code` dropped by #1489: the ~600 lines it was silently covering
+// (two whole dead data pipelines plus five dead helpers) are gone; any new
+// dead code in this file is a real warning again.
+#![allow(deprecated)]
 
 use crate::core::buffer::Buffer;
-use crate::core::dap::DapVariable;
 use crate::core::engine::sidebar::{
     HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
     PANEL_SEARCH, PANEL_SETTINGS,
@@ -6282,7 +6281,7 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
 //
 // Same story as slice 1, one rung down. The geometry was already shared
 // (`resolve_breadcrumb_click`, `resolve_tab_bar_click`,
-// `compute_status_hit_regions`, `status_bar_zone_hit_test`) and the actions
+// `status_bar_zone_hit_test`) and the actions
 // were already shared (`Engine::handle_breadcrumb_click`,
 // `handle_tab_bar_click`, `handle_status_action`) — what was still transcribed
 // twice was the **router that sequences them**, and, as always when a sequence
@@ -10763,19 +10762,6 @@ pub fn reconcile_change_review_modal_stack(
     }
 }
 
-/// Does the backend's `quadraui::ModalStack` currently hold the
-/// change-review surface's entry? Test-facing: the regression guard for
-/// "the overlay closed but its full-viewport entry stayed registered and
-/// ate every later chrome click" (#955 review) asserts on this directly,
-/// since the symptom is otherwise only observable several clicks later.
-pub fn change_review_modal_registered(b: &mut dyn quadraui::Backend) -> bool {
-    let stack_rc = b.modal_stack_handle();
-    let stack = stack_rc.borrow();
-    let id = change_review_modal_id();
-    let registered = stack.iter_top_down().any(|e| e.id == id);
-    registered
-}
-
 /// The change-review surface's whole paint body (#955, shared with #525):
 /// a full-viewport `quadraui::DiffView` for the currently-shown entry,
 /// plus a one-row status footer ("file i of n", the entry's path, and key
@@ -11215,16 +11201,6 @@ fn quickfix_list_to_panel(list: &QuickfixList, title: &'static str) -> QuickfixP
     }
 }
 
-/// A single item rendered in the debug sidebar. Used by win-gui;
-/// TUI/GTK use `SidebarSystem` with `TreeRow` directly via
-/// `populate_dap_sidebar_system()`.
-#[derive(Debug, Clone)]
-pub struct DebugSidebarItem {
-    pub text: String,
-    pub indent: u8,
-    pub is_selected: bool,
-}
-
 // ─── SourceControlData ────────────────────────────────────────────────────────
 
 /// A single file-change item in the Source Control panel.
@@ -11315,48 +11291,12 @@ pub struct BranchPickerData {
     pub create_input: String,
 }
 
-// ─── ExtSidebarData ───────────────────────────────────────────────────────────
-
-/// A single extension item in the Extensions sidebar.
-#[derive(Debug, Clone)]
-pub struct ExtSidebarItem {
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    /// LSP binary name (empty string if none).
-    pub lsp_binary: String,
-    /// DAP adapter name (empty string if none).
-    pub dap_adapter: String,
-    /// Number of bundled Lua scripts.
-    pub script_count: usize,
-    pub installed: bool,
-    /// True when a newer version is available in the registry.
-    pub update_available: bool,
-}
-
-/// Rendering data for the Extensions sidebar panel.
-#[derive(Debug, Clone)]
-pub struct ExtSidebarData {
-    /// Installed extensions (filtered by query).
-    pub items_installed: Vec<ExtSidebarItem>,
-    /// Available (not yet installed) extensions (filtered by query).
-    pub items_available: Vec<ExtSidebarItem>,
-    /// Whether each section is expanded: [installed, available].
-    pub sections_expanded: [bool; 2],
-    /// Flat selection index (installed items first, then available).
-    pub selected: usize,
-    /// Whether the panel currently has keyboard focus.
-    pub has_focus: bool,
-    /// Current search query string.
-    pub query: String,
-    /// Whether the search input is in active edit mode.
-    pub input_active: bool,
-    /// True while a background registry fetch is in-flight.
-    pub fetching: bool,
-    /// Vertical scroll offset of the panel content in main-axis units
-    /// (cells / pixels). Drives `MultiSectionView::panel_scroll` (#293).
-    pub panel_scroll: f32,
-}
+// #1489: `ExtSidebarItem`/`ExtSidebarData`, `ext_sidebar_to_multi_section_view`
+// and `build_ext_sidebar_data` used to live here as a second, entirely dead
+// data pipeline for the Extensions sidebar — nothing ever read
+// `ScreenLayout.ext_sidebar` (removed alongside them). The live path is
+// `Engine::populate_ext_sidebar_system` (`core/engine/ext_panel.rs`), which
+// paints straight into `engine.ext_sidebar_system` (`quadraui::SidebarSystem`).
 
 // ─── BoardData ─────────────────────────────────────────────────────────────────
 
@@ -11708,23 +11648,18 @@ pub fn panel_hover_popup_paint(
 // SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
 // re-exported at the top of this file for backward compatibility.
 
-/// Always present in `ScreenLayout`; each section may be empty.
+/// Always present in `ScreenLayout`. Only the chrome-level fields that
+/// `debug_sidebar_chrome` and the bottom-panel Debug Output tab actually
+/// read survive here; the item lists (variables/watch/frames/breakpoints)
+/// were a dead second pipeline — the live rows come from
+/// `build_dap_{var,watch,stack,bp}_rows` → `populate_dap_sidebar_system`
+/// (#1489).
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
     pub session_active: bool,
     pub stopped: bool,
-    pub variables: Vec<DebugSidebarItem>,
-    pub watch: Vec<DebugSidebarItem>,
-    pub frames: Vec<DebugSidebarItem>,
-    pub breakpoints: Vec<DebugSidebarItem>,
-    pub active_section: DebugSidebarSection,
-    pub sidebar_selected: usize,
-    pub has_focus: bool,
     pub launch_config_name: Option<String>,
     pub debug_output_lines: Vec<String>,
-    pub eval_result: Option<String>,
-    pub scroll_offsets: [usize; 4],
-    pub section_heights: [u16; 4],
 }
 
 /// The two bottom panel tabs: Terminal and Debug Output.
@@ -12973,10 +12908,8 @@ pub struct ScreenLayout {
     /// backends walk, so "populated but never composed" is a compile error
     /// here rather than something a `grep` has to notice.
     pub group_dividers: Vec<GroupDivider>,
-    /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
-    pub ext_sidebar: Option<ExtSidebarData>,
     /// Board panel data (#521) — always `Some` so backends can check
-    /// `has_focus`, mirroring [`ExtSidebarData`]'s own doc.
+    /// `has_focus`.
     pub board: Option<BoardData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
     pub ext_panel: Option<ExtPanelData>,
@@ -16927,216 +16860,12 @@ pub fn build_screen_layout_with_breadcrumb_row(
         session_active: engine.dap_session_active,
     });
 
-    // Build the debug sidebar data (always present).
+    // Build the debug sidebar data (always present). The item lists
+    // themselves (variables/watch/frames/breakpoints) are painted by
+    // `populate_dap_sidebar_system`'s `build_dap_*_rows` helpers directly
+    // into `engine.dap_sidebar_system`, not through this struct (#1489) —
+    // only the chrome fields and the Debug Output tab's lines live here.
     let debug_sidebar = {
-        let selected = engine.dap_sidebar_selected;
-        let active_section = engine.dap_sidebar_section;
-
-        // Variables section: flat tree with ▶/▼ prefixes, recursive expansion.
-        let mut var_items: Vec<DebugSidebarItem> = Vec::new();
-        let mut flat_idx = 0usize;
-        #[allow(clippy::too_many_arguments)]
-        fn build_var_tree(
-            items: &mut Vec<DebugSidebarItem>,
-            vars: &[DapVariable],
-            depth: u8,
-            flat_idx: &mut usize,
-            expanded: &std::collections::HashSet<u64>,
-            children_map: &std::collections::HashMap<u64, Vec<DapVariable>>,
-            active_section: &DebugSidebarSection,
-            selected: usize,
-        ) {
-            for v in vars {
-                let prefix = if v.var_ref > 0 {
-                    if expanded.contains(&v.var_ref) {
-                        icons::EXPAND_DOWN.nerd
-                    } else {
-                        icons::COLLAPSE_RIGHT.nerd
-                    }
-                } else {
-                    "  "
-                };
-                items.push(DebugSidebarItem {
-                    text: if v.value.is_empty() {
-                        format!("{}{}", prefix, v.name)
-                    } else {
-                        format!("{}{} = {}", prefix, v.name, v.value)
-                    },
-                    indent: depth,
-                    is_selected: *active_section == DebugSidebarSection::Variables
-                        && *flat_idx == selected,
-                });
-                *flat_idx += 1;
-                if v.var_ref > 0 && expanded.contains(&v.var_ref) {
-                    if let Some(child_vars) = children_map.get(&v.var_ref) {
-                        build_var_tree(
-                            items,
-                            child_vars,
-                            depth + 1,
-                            flat_idx,
-                            expanded,
-                            children_map,
-                            active_section,
-                            selected,
-                        );
-                    }
-                }
-            }
-        }
-        if engine.dap_primary_scope_ref > 0 {
-            // Primary scope header (e.g. "▼ Locals").
-            let expanded = engine
-                .dap_expanded_vars
-                .contains(&engine.dap_primary_scope_ref);
-            let prefix = if expanded {
-                icons::EXPAND_DOWN.nerd
-            } else {
-                icons::COLLAPSE_RIGHT.nerd
-            };
-            var_items.push(DebugSidebarItem {
-                text: format!("{prefix}{}", engine.dap_primary_scope_name),
-                indent: 0,
-                is_selected: active_section == DebugSidebarSection::Variables
-                    && flat_idx == selected,
-            });
-            flat_idx += 1;
-            if expanded {
-                build_var_tree(
-                    &mut var_items,
-                    &engine.dap_variables,
-                    1,
-                    &mut flat_idx,
-                    &engine.dap_expanded_vars,
-                    &engine.dap_child_variables,
-                    &active_section,
-                    selected,
-                );
-            }
-        } else {
-            // No scope info (e.g. tests): show variables at root level.
-            build_var_tree(
-                &mut var_items,
-                &engine.dap_variables,
-                0,
-                &mut flat_idx,
-                &engine.dap_expanded_vars,
-                &engine.dap_child_variables,
-                &active_section,
-                selected,
-            );
-        }
-
-        // Additional scope groups (e.g. "Statics", "Registers") as expandable headers.
-        for (scope_name, var_ref) in &engine.dap_scope_groups {
-            let expanded = engine.dap_expanded_vars.contains(var_ref);
-            let prefix = if expanded {
-                icons::EXPAND_DOWN.nerd
-            } else {
-                icons::COLLAPSE_RIGHT.nerd
-            };
-            var_items.push(DebugSidebarItem {
-                text: format!("{prefix}{scope_name}"),
-                indent: 0,
-                is_selected: active_section == DebugSidebarSection::Variables
-                    && flat_idx == selected,
-            });
-            flat_idx += 1;
-            if expanded {
-                if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
-                    build_var_tree(
-                        &mut var_items,
-                        child_vars,
-                        1,
-                        &mut flat_idx,
-                        &engine.dap_expanded_vars,
-                        &engine.dap_child_variables,
-                        &active_section,
-                        selected,
-                    );
-                }
-            }
-        }
-
-        // Watch section: expressions with their evaluated values.
-        let watch_items: Vec<DebugSidebarItem> = engine
-            .dap_watch_expressions
-            .iter()
-            .zip(engine.dap_watch_values.iter())
-            .enumerate()
-            .map(|(i, (expr, val))| {
-                let val_str = val.as_deref().unwrap_or(if engine.dap_session_active {
-                    "…"
-                } else {
-                    "(not running)"
-                });
-                DebugSidebarItem {
-                    text: format!("{expr} = {val_str}"),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::Watch && i == selected,
-                }
-            })
-            .collect();
-
-        // Call Stack section.
-        let frame_items: Vec<DebugSidebarItem> = engine
-            .dap_stack_frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let src = f
-                    .source
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?");
-                let prefix = if i == engine.dap_active_frame {
-                    icons::COLLAPSE_RIGHT.nerd
-                } else {
-                    "  "
-                };
-                DebugSidebarItem {
-                    text: format!("{}{} ({}:{})", prefix, f.name, src, f.line),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::CallStack && i == selected,
-                }
-            })
-            .collect();
-
-        // Breakpoints section: all breakpoints across all files.
-        let mut bp_items: Vec<DebugSidebarItem> = Vec::new();
-        let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
-        sorted_bp.sort_by_key(|(path, _)| path.as_str());
-        let mut bp_global_idx = 0usize;
-        for (path, bps) in &sorted_bp {
-            let file_name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            for bp in *bps {
-                let suffix = if let Some(cond) = &bp.condition {
-                    format!(" [if {cond}]")
-                } else if let Some(hc) = &bp.hit_condition {
-                    format!(" [hits {hc}]")
-                } else if let Some(msg) = &bp.log_message {
-                    format!(" [log: {msg}]")
-                } else {
-                    String::new()
-                };
-                let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
-                    "\u{25c6}" // ◆ conditional
-                } else {
-                    icons::DBG_BREAKPOINTS.nerd
-                };
-                bp_items.push(DebugSidebarItem {
-                    text: format!("{} {}:{}{}", symbol, file_name, bp.line, suffix),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::Breakpoints
-                        && bp_global_idx == selected,
-                });
-                bp_global_idx += 1;
-            }
-        }
-
         // Output lines for the Debug Output tab (up to 200, oldest-first).
         let debug_output_lines: Vec<String> = engine
             .dap_output_lines
@@ -17157,18 +16886,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
         DebugSidebarData {
             session_active: engine.dap_session_active,
             stopped: engine.dap_stopped_thread.is_some(),
-            variables: var_items,
-            watch: watch_items,
-            frames: frame_items,
-            breakpoints: bp_items,
-            active_section,
-            sidebar_selected: selected,
-            has_focus: engine.dap_sidebar_has_focus,
             launch_config_name,
             debug_output_lines,
-            eval_result: engine.dap_eval_result.clone(),
-            scroll_offsets: engine.dap_sidebar_scroll,
-            section_heights: engine.dap_sidebar_section_heights,
         }
     };
 
@@ -17341,7 +17060,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         num_groups: n,
     });
 
-    let ext_sidebar = build_ext_sidebar_data(engine);
     let board = build_board_data(engine);
 
     // Build breadcrumbs for each editor group
@@ -17476,7 +17194,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         group_dividers,
         window_dividers,
         minimap,
-        ext_sidebar,
         board,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
@@ -19511,215 +19228,6 @@ impl quadraui::BackendWidget for ExtPanelTreeBody {
     }
 }
 
-/// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
-/// (#293).
-///
-/// Two sections — `"installed"` and `"available"` — each carries its own
-/// `TreeView` body of item rows only (the section title is rendered as
-/// the section header, not as a tree-row). Both sections size as
-/// `EqualShare` and scroll independently (`ScrollMode::PerSection`).
-///
-/// Selection mapping: `ExtSidebarData.selected` is a flat index across
-/// installed-then-available items. Within a section, each TreeView's
-/// `selected_path` is `vec![item_idx as u16]` for that section's items.
-///
-/// Empty-state rows (`(none installed)` / `(all installed)` /
-/// `Fetching registry…`) appear as `Decoration::Muted` rows in the
-/// section's tree, intentionally not in the selection mapping.
-pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::MultiSectionView {
-    use quadraui::{
-        Badge, Decoration, EmptyBody, MsvAxis, MultiSectionView, ScrollMode, Section, SectionBody,
-        SectionHeader, SectionSize, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
-        WidgetId,
-    };
-
-    let installed_count = ext.items_installed.len();
-    let available_count = ext.items_available.len();
-
-    let (sel_section, sel_item) = if ext.selected < installed_count {
-        (0u16, ext.selected)
-    } else {
-        (1u16, ext.selected.saturating_sub(installed_count))
-    };
-
-    // ── Build INSTALLED tree ─────────────────────────────────────────
-    let installed_rows: Vec<TreeRow> = if installed_count == 0 {
-        Vec::new()
-    } else {
-        ext.items_installed
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
-                let label = if item.update_available {
-                    format!("\u{25cf} {} \u{2191}", item.display_name)
-                } else {
-                    format!("\u{25cf} {}", item.display_name)
-                };
-                let badge = if is_sel {
-                    let hint = if item.update_available {
-                        "[u]update"
-                    } else {
-                        "[d]remove"
-                    };
-                    Some(Badge::plain(hint.to_string()))
-                } else {
-                    None
-                };
-                TreeRow {
-                    path: vec![i as u16],
-                    indent: 0,
-                    icon: None,
-                    text: StyledText::plain(label),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                }
-            })
-            .collect()
-    };
-
-    let installed_selected_path = if ext.has_focus && sel_section == 0 && sel_item < installed_count
-    {
-        Some(vec![sel_item as u16])
-    } else {
-        None
-    };
-
-    let installed_body = if installed_rows.is_empty() {
-        SectionBody::Empty(EmptyBody {
-            icon: None,
-            text: StyledText::plain("(none installed)".to_string()),
-            hint: None,
-            action: None,
-        })
-    } else {
-        SectionBody::Tree(TreeView {
-            id: WidgetId::new("ext-sidebar-installed-tree"),
-            rows: installed_rows,
-            selection_mode: SelectionMode::Single,
-            selected_path: installed_selected_path,
-            scroll_offset: 0,
-            style: TreeStyle::default(),
-            has_focus: ext.has_focus && sel_section == 0,
-        })
-    };
-
-    // ── Build AVAILABLE tree ─────────────────────────────────────────
-    let available_rows: Vec<TreeRow> = if available_count == 0 {
-        Vec::new()
-    } else {
-        ext.items_available
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
-                let badge = if is_sel {
-                    Some(Badge::plain("[i]install".to_string()))
-                } else {
-                    None
-                };
-                TreeRow {
-                    path: vec![i as u16],
-                    indent: 0,
-                    icon: None,
-                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                }
-            })
-            .collect()
-    };
-
-    let available_selected_path = if ext.has_focus && sel_section == 1 && sel_item < available_count
-    {
-        Some(vec![sel_item as u16])
-    } else {
-        None
-    };
-
-    let available_body = if available_rows.is_empty() {
-        let msg = if ext.fetching {
-            "Fetching registry\u{2026}"
-        } else {
-            "(all installed)"
-        };
-        SectionBody::Empty(EmptyBody {
-            icon: None,
-            text: StyledText::plain(msg.to_string()),
-            hint: None,
-            action: None,
-        })
-    } else {
-        SectionBody::Tree(TreeView {
-            id: WidgetId::new("ext-sidebar-available-tree"),
-            rows: available_rows,
-            selection_mode: SelectionMode::Single,
-            selected_path: available_selected_path,
-            scroll_offset: 0,
-            style: TreeStyle::default(),
-            has_focus: ext.has_focus && sel_section == 1,
-        })
-    };
-
-    let installed_section = Section {
-        id: "installed".to_string(),
-        header: SectionHeader {
-            icon: None,
-            title: StyledText::plain("INSTALLED".to_string()),
-            badge: Some(StyledText::plain(format!("({installed_count})"))),
-            actions: Vec::new(),
-            show_chevron: true,
-        },
-        body: installed_body,
-        aux: None,
-        size: SectionSize::EqualShare,
-        collapsed: !ext.sections_expanded[0],
-        min_size: None,
-        max_size: None,
-    };
-
-    let available_section = Section {
-        id: "available".to_string(),
-        header: SectionHeader {
-            icon: None,
-            title: StyledText::plain("AVAILABLE".to_string()),
-            badge: Some(StyledText::plain(format!("({available_count})"))),
-            actions: Vec::new(),
-            show_chevron: true,
-        },
-        body: available_body,
-        aux: None,
-        size: SectionSize::EqualShare,
-        collapsed: !ext.sections_expanded[1],
-        min_size: None,
-        max_size: None,
-    };
-
-    MultiSectionView {
-        id: WidgetId::new("ext-sidebar-msv"),
-        sections: vec![installed_section, available_section],
-        active_section: Some(sel_section as usize),
-        axis: MsvAxis::Vertical,
-        allow_resize: false,
-        allow_collapse: true,
-        // WholePanel mode: sections size to their own content height
-        // and stack at deterministic positions. The panel scrolls as a
-        // unit when total content exceeds the visible body area (matches
-        // VSCode Extensions panel UX: INSTALLED grows with item count,
-        // AVAILABLE flows below it). Critical for click hit-testing —
-        // section boundaries don't depend on the bounds.height the
-        // backend passes, so paint and click see the same layout
-        // regardless of which area each measures.
-        scroll_mode: ScrollMode::WholePanel,
-        has_focus: ext.has_focus,
-        panel_scroll: ext.panel_scroll,
-    }
-}
-
 pub use crate::core::engine::ExplorerRow;
 
 /// Adapt a flat explorer row list into a `quadraui::TreeView` for the
@@ -20112,67 +19620,6 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
         max_content_width: None,
         show_v_scrollbar: false,
     }
-}
-
-fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
-    // Always build so backends can check ext_sidebar_has_focus.
-    let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
-                            installed: bool,
-                            has_update: bool|
-     -> ExtSidebarItem {
-        ExtSidebarItem {
-            name: m.name.clone(),
-            display_name: if m.display_name.is_empty() {
-                m.name.clone()
-            } else {
-                m.display_name.clone()
-            },
-            description: m.description.clone(),
-            lsp_binary: m.lsp.binary.clone(),
-            dap_adapter: m.dap.adapter.clone(),
-            script_count: m.scripts.len(),
-            installed,
-            update_available: has_update,
-        }
-    };
-
-    let items_installed: Vec<ExtSidebarItem> = engine
-        .ext_available_manifests()
-        .iter()
-        .filter(|m| engine.extension_state.is_installed(&m.name))
-        .filter(|m| {
-            let q = engine.ext_sidebar_query.to_lowercase();
-            q.is_empty()
-                || m.name.to_lowercase().contains(&q)
-                || m.display_name.to_lowercase().contains(&q)
-        })
-        .map(|m| manifest_to_item(m, true, engine.ext_has_update(&m.name)))
-        .collect();
-
-    let items_available: Vec<ExtSidebarItem> = engine
-        .ext_available_manifests()
-        .iter()
-        .filter(|m| !engine.extension_state.is_installed(&m.name))
-        .filter(|m| {
-            let q = engine.ext_sidebar_query.to_lowercase();
-            q.is_empty()
-                || m.name.to_lowercase().contains(&q)
-                || m.display_name.to_lowercase().contains(&q)
-        })
-        .map(|m| manifest_to_item(m, false, false))
-        .collect();
-
-    Some(ExtSidebarData {
-        items_installed,
-        items_available,
-        sections_expanded: engine.ext_sidebar_sections_expanded,
-        selected: engine.ext_sidebar_selected,
-        has_focus: engine.ext_sidebar_has_focus,
-        query: engine.ext_sidebar_query.clone(),
-        input_active: engine.ext_sidebar_input_active,
-        fetching: engine.ext_registry_fetching,
-        panel_scroll: engine.ext_sidebar_panel_scroll,
-    })
 }
 
 /// Build [`BoardData`] from engine state (#521). Always builds so backends
@@ -20807,36 +20254,6 @@ pub fn compute_word_wrap_segments(
         pos = break_at.max(pos + 1);
     }
     segments
-}
-
-/// Map a visible row index (0-based from scroll_top) to the corresponding
-/// buffer line index, skipping lines hidden inside closed folds.
-/// Shared across all GUI backends for click hit-testing.
-pub fn view_row_to_buf_line(
-    view: &crate::core::view::View,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-) -> usize {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        if visible == view_row {
-            return buf_line;
-        }
-        visible += 1;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
-        }
-    }
-    // Clamp to last valid line
-    total_lines.saturating_sub(1)
 }
 
 /// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
@@ -23408,37 +22825,6 @@ pub fn build_window_status_line(
             right_segments: right,
         }
     }
-}
-
-/// Compute hit regions from status line segments.
-/// `bar_width` is the total width in char cells.
-/// Returns `(col, width, action)` tuples for all interactive segments.
-pub fn compute_status_hit_regions(
-    left: &[StatusSegment],
-    right: &[StatusSegment],
-    bar_width: usize,
-) -> Vec<(u16, u16, StatusAction)> {
-    let mut regions = Vec::new();
-    // Left segments: accumulate from col 0
-    let mut col: u16 = 0;
-    for seg in left {
-        let w = seg.text.chars().count() as u16;
-        if let Some(ref action) = seg.action {
-            regions.push((col, w, action.clone()));
-        }
-        col += w;
-    }
-    // Right segments: right-aligned
-    let right_width: usize = right.iter().map(|s| s.text.chars().count()).sum();
-    let mut col = bar_width.saturating_sub(right_width) as u16;
-    for seg in right {
-        let w = seg.text.chars().count() as u16;
-        if let Some(ref action) = seg.action {
-            regions.push((col, w, action.clone()));
-        }
-        col += w;
-    }
-    regions
 }
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────

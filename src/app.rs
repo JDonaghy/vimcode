@@ -1319,25 +1319,6 @@ pub(crate) struct App {
     pub(crate) live: bool,
 }
 
-/// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
-/// Dead in ShellApp mode until the activity bar DA is re-wired (#448-C follow-on).
-#[allow(dead_code)]
-fn activity_id_to_panel_id(id: &str) -> Option<String> {
-    match id {
-        "activity:explorer" => Some(PANEL_EXPLORER.to_string()),
-        "activity:search" => Some(PANEL_SEARCH.to_string()),
-        "activity:debug" => Some(PANEL_DEBUG.to_string()),
-        "activity:git" => Some(PANEL_GIT.to_string()),
-        "activity:extensions" => Some(PANEL_EXTENSIONS.to_string()),
-        "activity:ai" => Some(PANEL_AI.to_string()),
-        "activity:board" => Some(PANEL_BOARD.to_string()),
-        "activity:settings" => Some(PANEL_SETTINGS.to_string()),
-        other => other
-            .strip_prefix("activity:ext:")
-            .map(|name| format!("ext:{name}")),
-    }
-}
-
 /// Set up system clipboard callbacks on the engine via
 /// `backend.services().clipboard()` (issue #1100 — quadraui#991's
 /// `PlatformServices` seam, replacing the bespoke `copypasta_ext` stack).
