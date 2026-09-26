@@ -257,11 +257,20 @@ impl<D> ConformanceHarness<D> {
 /// place that pairs them, so the two can never drift out of the order
 /// [`App::shell_config`] expects (built from the *same* `App` it derives
 /// the config from).
+///
+/// `units` (#1426) is the one place this shared builder is *not*
+/// backend-neutral: the caller already knows which `quadraui::Backend` it's
+/// wrapping (`GtkBackend`, `MacBackend`, `TuiBackend`, ...), so it passes the
+/// matching [`crate::render::UnitProfile`] — `px()` from
+/// `crate::gtk::testing::conformance_harness`/`src/macos/mod.rs`/
+/// `src/win/mod.rs`, `cell()` from
+/// `crate::tui_main::testing::conformance_harness`.
 pub(crate) fn build_app_and_config(
     engine: Rc<RefCell<Engine>>,
     backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    units: crate::render::UnitProfile,
 ) -> (App, quadraui::ShellConfig) {
-    let app = App::new_headless_with_backend(engine, backend);
+    let app = App::new_headless_with_backend(engine, backend, units);
     let config = app.shell_config();
     (app, config)
 }
@@ -1570,33 +1579,53 @@ pub(crate) const KNOWN_BUGS: &[&str] = &[
     // tab-close rect fix.
     "tab_bar_click_closes_via_shared_dispatch::tui",
     "split_tab_bar_click_closes_via_shared_dispatch::tui",
+    // ── #1426: same "feature" menu-bar-row divergence as the two entries
+    // below, isolated to just the top-anchored row pair — see
+    // `issue_1426_app_on_tui_rows_match_shipped_tui`'s own module doc.
+    // target: menu-bar caps.
+    "render_content_paints_buffer_status_and_command_line_on_shipped_tui_rows::tui",
     // ── #1425: crate::tui_main::app_on_tui_tests driver-test inventory ──
     // Each entry's category/target-child rationale lives as a `// #1425
     // gate:` comment directly above its own `known_bug_gate` call in that
     // module — this list only needs to stay in sync with those labels.
     //
-    // category: unit (`App::render_content` reserves
+    // category: unit (`App::render_content` used to reserve
     // `render::TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` as cell-grid
     // *rows* rather than pixels, collapsing the editor content band — and,
     // transitively, everything anchored to it — at a realistic terminal
-    // height) — target: UnitProfile.
-    "app_on_tui::key_press_inserts_text_via_shell_app_general_fallback",
-    "app_on_tui::dd_deletes_the_current_line",
-    "app_on_tui::undo_restores_after_dd",
-    "app_on_tui::escape_returns_to_normal_mode_after_insert",
-    "app_on_tui::status_bar_paints_cursor_position",
-    "app_on_tui::two_tabs_paint_both_labels",
-    "app_on_tui::render_content_paints_group_divider_via_shell_app",
-    "app_on_tui::group_divider_drag_moves_the_painted_divider_via_shell_app",
-    "app_on_tui::group_divider_click_without_move_leaves_the_divider_put_via_shell_app",
-    "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
-    "app_on_tui::minimap_paints_braille_when_enabled",
-    "app_on_tui::no_minimap_braille_when_setting_is_off",
-    "app_on_tui::split_paints_minimap_in_both_panes",
-    "app_on_tui::focused_terminal_swallows_editor_keys_via_shell_app",
-    "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
+    // height). #1426 fixed this (target: `render::UnitProfile`) — the 13
+    // scenarios that gated purely on the collapsed band are gone from this
+    // list; `known_bug_gate`'s `FixLanded` panic on each confirmed it (every
+    // one was RED before #1426 and green after, verified by running this
+    // module both ways).
+    //
+    // The four scenarios below stayed gated even after #1426: with the band
+    // no longer collapsed, each now fails on a *different*, genuinely
+    // unrelated gap #1425 had misdiagnosed as the same collapse (all four
+    // ran short-circuited before #1426 — the collapsed band failed them
+    // first, so nothing ever exercised what actually breaks them). Each has
+    // its own `// #1426 gate:` comment in `app_on_tui_tests.rs` with the
+    // corrected root cause.
+    //
+    // category: quadraui (`quadraui::native_dialog_options` reports a
+    // `Dialog` as "natively expressible" whenever it has no table/input,
+    // with no backend-capability gate — so `App::render_content` queues a
+    // `PlatformServices::show_message_dialog` present and never paints the
+    // in-canvas `Dialog` rung, on *every* backend, not just ones that
+    // actually have a native alert facility. TUI has none. A quadraui issue
+    // for a `BackendCaps`-gated native-dialog capability must be filed) —
+    // target: quadraui.
     "app_on_tui::dialog_intercepts_all_keys",
     "app_on_tui::context_menu_delete_opens_confirm_dialog",
+    // category: product (`Ctrl-W v`'s key-dispatch route into
+    // `Engine::open_editor_group`/window-split creation doesn't produce a
+    // second window on this path — a dispatch gap unrelated to geometry
+    // units) — target: TBD, needs its own filed issue.
+    "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
+    // category: product (the `Terminal` menu's open-terminal accelerator
+    // doesn't open a terminal pane through `App` — a dispatch gap unrelated
+    // to geometry units) — target: TBD, needs its own filed issue.
+    "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
     // category: feature (`App` unconditionally reserves and paints its own
     // GTK-style menu-bar row on every backend; the shipped TUI shell only
     // shows that row in vscode-mode or when Alt-revealed, so the tab bar
@@ -4870,6 +4899,121 @@ mod issue_1360_activity_bar_click_focuses_panel {
         body: |driver| {
             crate::harness::activity_bar_click_focuses_search_panel(driver);
         },
+    }
+}
+
+/// #1426's own acceptance bar: at a realistic `(80, 24)` terminal, the
+/// shared `App` (driven by `quadraui::tui::TuiBackend`) must paint the
+/// buffer's first line directly below a 1-row tab bar, with the status bar
+/// on row 22 and the command line on row 23 — proof that
+/// `render::UnitProfile::cell()` reserves the tab bar as one cell row (not
+/// `TAB_ROW_HEIGHT_PX`'s 35 rows) rather than collapsing the whole editor
+/// content band the way the pre-#1426 hardcoded pixel constants did.
+///
+/// `tui_prod` (`TuiShellApp`) is not run as a second arm here: reaching an
+/// explorer-collapsed baseline on it needs two activity-bar clicks (its
+/// first click only selects Explorer — the runner's own `AppShell` starts
+/// on the hamburger panel while the engine's shadow copy already defaults
+/// to Explorer, so the very first click just reconciles the label, not the
+/// reservation — verified by hand while writing this scenario), and the
+/// resulting chrome shape then fuses the tab label into the same row as the
+/// hamburger icon and window-control glyphs, one row layout than `App`'s.
+/// That is a real, pre-existing quirk of `conformance_harness_prod`'s
+/// default reveal state — unrelated to `UnitProfile`, and orthogonal to
+/// what this scenario exists to pin down — so it is not encoded here as a
+/// hardcoded row expectation. `TuiShellApp`'s own row-0-tab-bar and
+/// last-two-rows-status/command-line facts are already established
+/// separately and extensively by `shell_app.rs`'s own test suite (e.g. the
+/// `#[test]` this file's `tab_bar` module mirrors,
+/// `render_content_paints_command_line_via_shell_app`, and the sibling
+/// tests around it) — this scenario's job is only to confirm `App` now
+/// matches that shape too, not to re-derive it a second time.
+///
+/// The row-0/row-1 pair is gated: `App::setup()` unconditionally sets
+/// `engine.menu_bar_visible = true` for any non-native-menu backend
+/// (`src/app.rs`), while `TuiShellApp::from_engine` only does so in
+/// vscode-mode or after an Alt-reveal — so `App`'s tab bar paints on row 1
+/// (below its own permanent menu-bar row) instead of row 0. This is the
+/// exact same "feature" divergence
+/// `tab_bar::render_content_paints_single_group_tab_bar_via_shell_app` /
+/// `tab_bar::two_groups_paint_two_tab_bars` (`crate::tui_main::
+/// app_on_tui_tests`) already gate — target: menu-bar caps (conditional
+/// menu-bar reveal on `App`), not `UnitProfile`. Row 22/row 23 (status bar,
+/// command line) are unaffected by the top-of-screen offset and pass
+/// ungated — only the top-anchored tab-bar/buffer-row pair is gated.
+#[cfg(test)]
+mod issue_1426_app_on_tui_rows_match_shipped_tui {
+    use quadraui::testing::ConformanceDriver;
+
+    fn engine_fixture() -> crate::core::Engine {
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.buffer_mut().insert(0, "ZQXW1426_ROWLINE\n");
+        engine.message = "ZQXW1426_CMDLINE".to_string();
+        engine
+    }
+
+    /// Click the already-active Explorer activity-bar icon a second time,
+    /// collapsing the sidebar's screen-space reservation — mirrors
+    /// `crate::tui_main::app_on_tui_tests`'s own `collapse_sidebar` helper
+    /// (not reusable directly: that one is private to its own module).
+    fn collapse_sidebar(driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>) {
+        let explorer_zone = driver
+            .inventory()
+            .zones()
+            .iter()
+            .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+            .map(|z| z.bounds)
+            .expect("the Explorer activity-bar icon must register a chrome zone");
+        driver.click(
+            explorer_zone.x + explorer_zone.width / 2.0,
+            explorer_zone.y + explorer_zone.height / 2.0,
+        );
+    }
+
+    #[test]
+    fn render_content_paints_buffer_status_and_command_line_on_shipped_tui_rows_tui() {
+        let mut h = crate::tui_main::testing::conformance_harness(engine_fixture(), 80, 24);
+        let driver = &mut h.driver;
+        collapse_sidebar(driver);
+        let screen = driver.screen();
+        let lines: Vec<&str> = screen.lines().collect();
+        assert_eq!(
+            lines.len(),
+            24,
+            "an 80x24 terminal must paint exactly 24 rows; screen:\n{screen}"
+        );
+        assert!(
+            lines[22].contains("Ln 1,"),
+            "row 22 (second-to-last) must paint the status bar's cursor \
+             position; row:\n{}",
+            lines[22]
+        );
+        assert!(
+            lines[23].contains("ZQXW1426_CMDLINE"),
+            "row 23 (last) must paint the command line; row:\n{}",
+            lines[23]
+        );
+
+        // #1426 gate: the top-anchored tab-bar/buffer-row pair, unlike the
+        // bottom-anchored rows above, shifts down by one on `App` — see
+        // this module's own doc.
+        crate::harness::known_bug_gate(
+            "render_content_paints_buffer_status_and_command_line_on_shipped_tui_rows::tui",
+            || {
+                assert!(
+                    lines[0].contains("[No Name]"),
+                    "row 0 must paint the tab bar; row:\n{}",
+                    lines[0]
+                );
+                assert!(
+                    lines[1].contains("ZQXW1426_ROWLINE"),
+                    "row 1, directly below the 1-row tab bar, must paint \
+                     the buffer's first line; row:\n{}",
+                    lines[1]
+                );
+            },
+        );
     }
 }
 

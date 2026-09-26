@@ -153,21 +153,19 @@ mod tests {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — typed text has nowhere to paint once the editor content band
-            // has collapsed. Target: UnitProfile.
-            known_bug_gate(
-                "app_on_tui::key_press_inserts_text_via_shell_app_general_fallback",
-                || {
-                    driver.type_char('i'); // Normal -> Insert
-                    for c in "ZQXW_TYPED".chars() {
-                        driver.type_char(c);
-                    }
-                    let screen = driver.screen();
-                    assert!(
-                    screen.contains("ZQXW_TYPED"),
-                    "typed text should reach the buffer via Engine::handle_key; screen:\n{screen}"
-                );
-                },
+            // #1425 gated this as "unit — typed text has nowhere to paint
+            // once the editor content band has collapsed"; #1426
+            // (`render::UnitProfile`) fixed the collapse and this now
+            // passes unwrapped — confirmed by `known_bug_gate`'s
+            // `FixLanded` panic before the KNOWN_BUGS entry was deleted.
+            driver.type_char('i'); // Normal -> Insert
+            for c in "ZQXW_TYPED".chars() {
+                driver.type_char(c);
+            }
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQXW_TYPED"),
+                "typed text should reach the buffer via Engine::handle_key; screen:\n{screen}"
             );
         }
 
@@ -205,23 +203,21 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — the editor content band never paints at all, so its
-            // precondition (the first line visible) can't be satisfied. Target:
-            // UnitProfile.
-            known_bug_gate("app_on_tui::dd_deletes_the_current_line", || {
-                assert!(
-                    driver.screen_has("ZQXW_LINE_ONE"),
-                    "precondition: the first line must be painted"
-                );
-                driver.type_char('d');
-                driver.type_char('d');
-                assert!(
-                    !driver.screen_has("ZQXW_LINE_ONE") && driver.screen_has("ZQXW_LINE_TWO"),
-                    "'dd' must delete the current (first) line and leave the \
+            // #1425 gated this as "unit — the editor content band never
+            // paints"; #1426 (`render::UnitProfile`) fixed the collapse and
+            // this now passes unwrapped.
+            assert!(
+                driver.screen_has("ZQXW_LINE_ONE"),
+                "precondition: the first line must be painted"
+            );
+            driver.type_char('d');
+            driver.type_char('d');
+            assert!(
+                !driver.screen_has("ZQXW_LINE_ONE") && driver.screen_has("ZQXW_LINE_TWO"),
+                "'dd' must delete the current (first) line and leave the \
                  second one painted; screen:\n{}",
-                    driver.screen()
-                );
-            });
+                driver.screen()
+            );
         }
 
         /// `u` after `dd` must restore the deleted line — the undo stack, same
@@ -233,18 +229,18 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — same editor-band collapse as the sibling key_dispatch tests
-            // above. Target: UnitProfile.
-            known_bug_gate("app_on_tui::undo_restores_after_dd", || {
-                driver.type_char('d');
-                driver.type_char('d');
-                driver.type_char('u');
-                assert!(
-                    driver.screen_has("ZQXW_UNDO_LINE"),
-                    "'u' after 'dd' must restore the deleted line; screen:\n{}",
-                    driver.screen()
-                );
-            });
+            // #1425 gated this alongside the sibling key_dispatch tests
+            // above (same editor-band collapse); #1426
+            // (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            driver.type_char('d');
+            driver.type_char('d');
+            driver.type_char('u');
+            assert!(
+                driver.screen_has("ZQXW_UNDO_LINE"),
+                "'u' after 'dd' must restore the deleted line; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// `i` then `Escape` must return to Normal mode — a typed key after
@@ -254,38 +250,31 @@ mod tests {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — same editor-band collapse as the sibling
-            // key_dispatch tests above (`dd_deletes_the_current_line`,
-            // `undo_restores_after_dd`): the precondition below (the typed
-            // marker text visible before Escape) can't be satisfied at this
-            // viewport, so the real Escape-vs-Insert assertion after it is
-            // unreachable either way. Target: UnitProfile.
-            known_bug_gate(
-                "app_on_tui::escape_returns_to_normal_mode_after_insert",
-                || {
-                    driver.type_char('i');
-                    for c in "ZQXWESC".chars() {
-                        driver.type_char(c);
-                    }
-                    assert!(
-                        driver.screen_has("ZQXWESC"),
-                        "precondition: the typed marker text must be painted \
+            // #1425 gated this alongside the sibling key_dispatch tests
+            // above (same editor-band collapse); #1426
+            // (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            driver.type_char('i');
+            for c in "ZQXWESC".chars() {
+                driver.type_char(c);
+            }
+            assert!(
+                driver.screen_has("ZQXWESC"),
+                "precondition: the typed marker text must be painted \
                  before Escape can be meaningfully tested; screen:\n{}",
-                        driver.screen()
-                    );
-                    driver.press_named(quadraui::NamedKey::Escape);
-                    // In Normal mode, 'x' deletes the character under the cursor
-                    // rather than inserting — if Escape didn't work, this 'x' would
-                    // instead insert a literal 'x' into the buffer.
-                    driver.type_char('x');
-                    assert!(
-                        !driver.screen_has("ZQXWESCx"),
-                        "'x' after Escape must delete under the cursor (Normal \
+                driver.screen()
+            );
+            driver.press_named(quadraui::NamedKey::Escape);
+            // In Normal mode, 'x' deletes the character under the cursor
+            // rather than inserting — if Escape didn't work, this 'x' would
+            // instead insert a literal 'x' into the buffer.
+            driver.type_char('x');
+            assert!(
+                !driver.screen_has("ZQXWESCx"),
+                "'x' after Escape must delete under the cursor (Normal \
                  mode), not insert a literal 'x' (would mean Escape never \
                  left Insert mode); screen:\n{}",
-                        driver.screen()
-                    );
-                },
+                driver.screen()
             );
         }
     }
@@ -589,11 +578,20 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — a plain modal Dialog never reaches the screen at this
-            // viewport at all (fails on its own precondition) — the same
-            // overlay-positioning symptom explorer_context_menu::
-            // context_menu_delete_opens_confirm_dialog hits for the
-            // delete-confirmation dialog specifically. Target: UnitProfile.
+            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
+            // wrong: the editor-band collapse #1426 fixed was never this
+            // scenario's blocker — with the band fixed, this still fails on
+            // the same precondition). category: quadraui —
+            // `quadraui::native_dialog_options` reports a `Dialog` with no
+            // table/input as "natively expressible" with no backend
+            // capability gate, so `App::render_content` queues a native
+            // `PlatformServices::show_message_dialog` present instead of
+            // painting the in-canvas `Dialog` rung — on every backend, not
+            // just ones with a real native alert facility. TUI has none.
+            // Same root cause as `explorer_context_menu::
+            // context_menu_delete_opens_confirm_dialog`. Target: quadraui
+            // (a `BackendCaps`-gated native-dialog capability must be
+            // filed).
             known_bug_gate("app_on_tui::dialog_intercepts_all_keys", || {
                 assert!(
                     driver.screen_has("ZQXW_1425_DIALOG_MARKER"),
@@ -746,19 +744,16 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: unit — only one of the two tabs' labels reaches the painted tab
-            // bar (confirmed by hand: the *active* one is missing, the
-            // *inactive* one paints) — suspected the same pixel/row unit
-            // confusion narrowing the tab bar's effective column budget, but
-            // unconfirmed; flag for its own follow-up once UnitProfile lands
-            // rather than assumed. Target: UnitProfile.
-            known_bug_gate("app_on_tui::two_tabs_paint_both_labels", || {
-                assert!(
-                    driver.screen_has("zqxwA1425.txt") && driver.screen_has("zqxwB1425.txt"),
-                    "both tabs' labels must paint on the tab bar; screen:\n{}",
-                    driver.screen()
-                );
-            });
+            // #1425 gated this as "unit — only one of the two tabs' labels
+            // reaches the painted tab bar", suspecting the same pixel/row
+            // unit confusion narrowing the tab bar's effective column
+            // budget; #1426 (`render::UnitProfile`) confirmed the
+            // suspicion and this now passes unwrapped.
+            assert!(
+                driver.screen_has("zqxwA1425.txt") && driver.screen_has("zqxwB1425.txt"),
+                "both tabs' labels must paint on the tab bar; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// A single-group frame must not paint a group-divider glyph ('│')
@@ -963,17 +958,17 @@ mod tests {
             let h = harness_no_sidebar(plain_engine());
             let driver = &h.driver;
 
-            // #1425 gate: unit — App::render_content reserves render::TAB_ROW_HEIGHT_PX/
-            // BREADCRUMB_ROW_HEIGHT_PX as cell-grid rows, collapsing the editor/
-            // status-bar band on a realistic terminal height. Target: UnitProfile.
-            known_bug_gate("app_on_tui::status_bar_paints_cursor_position", || {
-                assert!(
-                    driver.screen_has("Ln 1,"),
-                    "a fresh buffer's status bar must show the cursor on line \
+            // #1425 gated this as "unit — App::render_content reserves
+            // render::TAB_ROW_HEIGHT_PX/BREADCRUMB_ROW_HEIGHT_PX as
+            // cell-grid rows, collapsing the editor/status-bar band"; #1426
+            // (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            assert!(
+                driver.screen_has("Ln 1,"),
+                "a fresh buffer's status bar must show the cursor on line \
                  1; screen:\n{}",
-                    driver.screen()
-                );
-            });
+                driver.screen()
+            );
         }
     }
 
@@ -995,24 +990,22 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — the terminal pane itself paints (the leaked 'd' keystrokes are
-            // visible in its prompt, confirming the swallow claim is actually
-            // true), but the assertion has to read the editor buffer to prove
-            // it, and that band never paints. Target: UnitProfile.
-            known_bug_gate(
-                "app_on_tui::focused_terminal_swallows_editor_keys_via_shell_app",
-                || {
-                    // 'dd' would delete the line under Normal-mode dispatch; with
-                    // the terminal focused it must be swallowed by the PTY instead.
-                    driver.type_char('d');
-                    driver.type_char('d');
-                    assert!(
-                        driver.screen_has("ZQXW_TERM_FOCUS_LINE"),
-                        "keys must not reach the editor buffer while the terminal \
+            // #1425 gated this as "unit — the terminal pane itself paints
+            // (the leaked 'd' keystrokes are visible in its prompt,
+            // confirming the swallow claim is actually true), but the
+            // assertion has to read the editor buffer to prove it, and that
+            // band never paints"; #1426 (`render::UnitProfile`) fixed it
+            // and this now passes unwrapped.
+            //
+            // 'dd' would delete the line under Normal-mode dispatch; with
+            // the terminal focused it must be swallowed by the PTY instead.
+            driver.type_char('d');
+            driver.type_char('d');
+            assert!(
+                driver.screen_has("ZQXW_TERM_FOCUS_LINE"),
+                "keys must not reach the editor buffer while the terminal \
                  pane is focused; screen:\n{}",
-                        driver.screen()
-                    );
-                },
+                driver.screen()
             );
         }
 
@@ -1025,8 +1018,13 @@ mod tests {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — the bottom panel band is part of the same collapsed layout.
-            // Target: UnitProfile.
+            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
+            // wrong: with the editor-band collapse #1426 fixed, this still
+            // fails). category: product —
+            // `quadraui::UiEvent::Accelerator(ACC_OPEN_TERMINAL, ..)`
+            // dispatched directly at `App` (bypassing the menu click path)
+            // does not open a terminal pane; a dispatch gap unrelated to
+            // geometry units. Target: TBD, needs its own filed issue.
             known_bug_gate(
                 "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
                 || {
@@ -1193,14 +1191,21 @@ mod tests {
             let mut h = harness(engine_with_folder_ctx_menu("delete", 8));
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — the context menu itself paints fine (its sibling tests
-            // `context_menu_escape_dismisses`/`context_menu_new_file_starts_inline_edit`
-            // read it ungated), but the confirm dialog it opens does not paint at this
-            // viewport (confirmed alongside popups::dialog_intercepts_all_keys's
-            // identical symptom for a plain dialog) — the engine-level dispatch still
-            // runs (context_menu_new_file_starts_inline_edit's inline-edit result
-            // proves that half works), only the confirm-dialog overlay's own paint is
-            // missing. Target: UnitProfile.
+            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
+            // wrong: with the editor-band collapse #1426 fixed, this still
+            // fails). category: quadraui — same root cause as
+            // `popups::dialog_intercepts_all_keys`: the confirm dialog has
+            // no table/input, so `quadraui::native_dialog_options` reports
+            // it "natively expressible" with no backend-capability gate,
+            // and `App::render_content` queues a native present instead of
+            // painting the in-canvas `Dialog` rung. The engine-level
+            // dispatch itself is fine (this context menu's sibling tests
+            // `context_menu_escape_dismisses`/
+            // `context_menu_new_file_starts_inline_edit` read it ungated;
+            // `context_menu_new_file_starts_inline_edit`'s inline-edit
+            // result proves the dispatch half works) — only the paint is
+            // missing. Target: quadraui (see
+            // `popups::dialog_intercepts_all_keys`'s own doc).
             known_bug_gate(
                 "app_on_tui::context_menu_delete_opens_confirm_dialog",
                 || {
@@ -1288,16 +1293,16 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: unit — the minimap rung is part of the same collapsed editor content
-            // band. Target: UnitProfile.
-            known_bug_gate("app_on_tui::minimap_paints_braille_when_enabled", || {
-                assert!(
-                    has_braille(&driver.screen()),
-                    "a scrollable buffer with the minimap on must paint \
+            // #1425 gated this as "unit — the minimap rung is part of the
+            // same collapsed editor content band"; #1426
+            // (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            assert!(
+                has_braille(&driver.screen()),
+                "a scrollable buffer with the minimap on must paint \
                  braille somewhere; screen:\n{}",
-                    driver.screen()
-                );
-            });
+                driver.screen()
+            );
         }
 
         /// Mirrors `shell_app.rs`'s
@@ -1316,25 +1321,22 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: unit — same collapsed editor content band as
-            // `minimap_paints_braille_when_enabled`: the precondition below
-            // (the buffer's own text painting) can't be satisfied at this
-            // viewport, so there is no signal to distinguish "minimap off"
-            // from "minimap unreachable" either way. Target: UnitProfile.
-            known_bug_gate("app_on_tui::no_minimap_braille_when_setting_is_off", || {
-                assert!(
-                    driver.screen_has("line 1"),
-                    "precondition: buffer text must be painted before the \
+            // #1425 gated this alongside `minimap_paints_braille_when_enabled`
+            // (same collapsed editor content band); #1426
+            // (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            assert!(
+                driver.screen_has("line 1"),
+                "precondition: buffer text must be painted before the \
                  minimap setting can be meaningfully tested; screen:\n{}",
-                    driver.screen()
-                );
-                assert!(
-                    !has_braille(&driver.screen()),
-                    "`minimap: false` must reserve no strip, so no braille may \
+                driver.screen()
+            );
+            assert!(
+                !has_braille(&driver.screen()),
+                "`minimap: false` must reserve no strip, so no braille may \
                  reach the cells; screen:\n{}",
-                    driver.screen()
-                );
-            });
+                driver.screen()
+            );
         }
 
         /// A vertical split must paint minimap braille in *both* panes, not
@@ -1352,28 +1354,27 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: unit — same editor-band collapse, compounded by the split's second
-            // pane not painting at all (see the dividers module's own gated
-            // tests). Target: UnitProfile.
-            known_bug_gate("app_on_tui::split_paints_minimap_in_both_panes", || {
-                let screen = driver.screen();
-                let mut left_hit = false;
-                let mut right_hit = false;
-                for line in screen.lines() {
-                    let starts: Vec<usize> = line.match_indices("line ").map(|(i, _)| i).collect();
-                    let Some(&second) = starts.get(1) else {
-                        continue;
-                    };
-                    let (left, right) = line.split_at(second);
-                    left_hit |= has_braille(left);
-                    right_hit |= has_braille(right);
-                }
-                assert!(
-                    left_hit && right_hit,
-                    "a vertical split must paint minimap braille in both \
+            // #1425 gated this as "unit — same editor-band collapse,
+            // compounded by the split's second pane not painting at all";
+            // #1426 (`render::UnitProfile`) fixed it and this now passes
+            // unwrapped.
+            let screen = driver.screen();
+            let mut left_hit = false;
+            let mut right_hit = false;
+            for line in screen.lines() {
+                let starts: Vec<usize> = line.match_indices("line ").map(|(i, _)| i).collect();
+                let Some(&second) = starts.get(1) else {
+                    continue;
+                };
+                let (left, right) = line.split_at(second);
+                left_hit |= has_braille(left);
+                right_hit |= has_braille(right);
+            }
+            assert!(
+                left_hit && right_hit,
+                "a vertical split must paint minimap braille in both \
                  panes; screen:\n{screen}"
-                );
-            });
+            );
         }
     }
 
@@ -1407,50 +1408,44 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // #1425 gate: unit — the split's second pane's tab bar never paints (only one of
-            // the two "[No Name]" labels reaches the screen), so the divider
-            // between them has nothing to anchor to either. Target: UnitProfile.
-            known_bug_gate(
-                "app_on_tui::render_content_paints_group_divider_via_shell_app",
-                || {
-                    let screen = driver.screen();
-                    // Locate the tab row by content, not row 0 — see
-                    // `ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app`'s
-                    // own comment on why.
-                    let (tab_y, tab_row) = screen
-                        .lines()
-                        .enumerate()
-                        .find(|(_, line)| line.contains("[No Name]"))
-                        .unwrap_or((0, ""));
-                    let starts: Vec<usize> =
-                        tab_row.match_indices("[No Name]").map(|(i, _)| i).collect();
-                    assert_eq!(starts.len(), 2, "expected two tab bars; row:\n{tab_row}");
-                    let (left_tab_start, right_tab_start) = (starts[0], starts[1]);
+            // #1425 gated this as "unit — the split's second pane's tab bar
+            // never paints"; #1426 (`render::UnitProfile`) fixed it and
+            // this now passes unwrapped.
+            let screen = driver.screen();
+            // Locate the tab row by content, not row 0 — see
+            // `ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app`'s
+            // own comment on why.
+            let (tab_y, tab_row) = screen
+                .lines()
+                .enumerate()
+                .find(|(_, line)| line.contains("[No Name]"))
+                .unwrap_or((0, ""));
+            let starts: Vec<usize> = tab_row.match_indices("[No Name]").map(|(i, _)| i).collect();
+            assert_eq!(starts.len(), 2, "expected two tab bars; row:\n{tab_row}");
+            let (left_tab_start, right_tab_start) = (starts[0], starts[1]);
 
-                    let mut found_divider = false;
-                    for (y, line) in screen.lines().enumerate().skip(tab_y + 1).take(15) {
-                        let chars: Vec<char> = line.chars().collect();
-                        let Some(col) = chars
-                            .iter()
-                            .enumerate()
-                            .skip(left_tab_start)
-                            .find(|(_, &c)| c == '\u{2502}')
-                            .map(|(i, _)| i)
-                        else {
-                            continue;
-                        };
-                        found_divider = true;
-                        assert!(
-                            col > left_tab_start && col <= right_tab_start,
-                            "row {y}: divider at col {col} should land between the \
+            let mut found_divider = false;
+            for (y, line) in screen.lines().enumerate().skip(tab_y + 1).take(15) {
+                let chars: Vec<char> = line.chars().collect();
+                let Some(col) = chars
+                    .iter()
+                    .enumerate()
+                    .skip(left_tab_start)
+                    .find(|(_, &c)| c == '\u{2502}')
+                    .map(|(i, _)| i)
+                else {
+                    continue;
+                };
+                found_divider = true;
+                assert!(
+                    col > left_tab_start && col <= right_tab_start,
+                    "row {y}: divider at col {col} should land between the \
                      two panes' tab labels; line:\n{line}"
-                        );
-                    }
-                    assert!(
-                        found_divider,
-                        "expected the group divider glyph to paint; screen:\n{screen}"
-                    );
-                },
+                );
+            }
+            assert!(
+                found_divider,
+                "expected the group divider glyph to paint; screen:\n{screen}"
             );
         }
 
@@ -1465,35 +1460,31 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — same collapse as the sibling divider tests above. Target:
-            // UnitProfile.
-            known_bug_gate(
-                "app_on_tui::group_divider_drag_moves_the_painted_divider_via_shell_app",
-                || {
-                    driver.mouse_up(1.0, 1.0); // settle the layout, see mirrored test's own doc
-                    let (tab_x, _) = driver
-                        .find("[No Name]")
-                        .expect("each pane paints its own tab label");
-                    let after = tab_x as usize;
-                    let row = 5_usize;
-                    let before = divider_col_on_row(&driver.styled_row(row as u16), after)
-                        .expect("the vertical group split must paint a divider glyph");
+            // #1425 gated this alongside the sibling divider tests above
+            // (same editor-band collapse); #1426 (`render::UnitProfile`)
+            // fixed it and this now passes unwrapped.
+            driver.mouse_up(1.0, 1.0); // settle the layout, see mirrored test's own doc
+            let (tab_x, _) = driver
+                .find("[No Name]")
+                .expect("each pane paints its own tab label");
+            let after = tab_x as usize;
+            let row = 5_usize;
+            let before = divider_col_on_row(&driver.styled_row(row as u16), after)
+                .expect("the vertical group split must paint a divider glyph");
 
-                    let target = before.saturating_sub(4);
-                    driver.mouse_down(before as f32, row as f32);
-                    driver.mouse_move(target as f32, row as f32);
-                    driver.mouse_up(target as f32, row as f32);
+            let target = before.saturating_sub(4);
+            driver.mouse_down(before as f32, row as f32);
+            driver.mouse_move(target as f32, row as f32);
+            driver.mouse_up(target as f32, row as f32);
 
-                    let moved = divider_col_on_row(&driver.styled_row(row as u16), after)
-                        .expect("the divider must still be painted after the drag");
-                    let screen = driver.screen();
-                    assert!(
-                        moved < before,
-                        "dragging the divider from col {before} to col {target} \
+            let moved = divider_col_on_row(&driver.styled_row(row as u16), after)
+                .expect("the divider must still be painted after the drag");
+            let screen = driver.screen();
+            assert!(
+                moved < before,
+                "dragging the divider from col {before} to col {target} \
                      must repaint it further left, but it stayed at col \
                      {moved}; screen:\n{screen}"
-                    );
-                },
             );
         }
 
@@ -1508,32 +1499,29 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — the group divider glyph itself never paints once the editor
-            // content band has collapsed to zero rows. Target: UnitProfile.
-            known_bug_gate(
-                "app_on_tui::group_divider_click_without_move_leaves_the_divider_put_via_shell_app",
-                || {
-                    driver.mouse_up(1.0, 1.0);
-                    let (tab_x, _) = driver
-                        .find("[No Name]")
-                        .expect("each pane paints its own tab label");
-                    let after = tab_x as usize;
-                    let row = 5_usize;
-                    let before = divider_col_on_row(&driver.styled_row(row as u16), after)
-                        .expect("the vertical group split must paint a divider glyph");
+            // #1425 gated this as "unit — the group divider glyph itself
+            // never paints once the editor content band has collapsed to
+            // zero rows"; #1426 (`render::UnitProfile`) fixed it and this
+            // now passes unwrapped.
+            driver.mouse_up(1.0, 1.0);
+            let (tab_x, _) = driver
+                .find("[No Name]")
+                .expect("each pane paints its own tab label");
+            let after = tab_x as usize;
+            let row = 5_usize;
+            let before = divider_col_on_row(&driver.styled_row(row as u16), after)
+                .expect("the vertical group split must paint a divider glyph");
 
-                    driver.mouse_down(before as f32, row as f32);
-                    driver.mouse_up(before as f32, row as f32);
+            driver.mouse_down(before as f32, row as f32);
+            driver.mouse_up(before as f32, row as f32);
 
-                    let after_cells = driver.styled_row(row as u16);
-                    let screen = driver.screen();
-                    assert_eq!(
-                        divider_col_on_row(&after_cells, after),
-                        Some(before),
-                        "a press-and-release on the divider with no drag must \
+            let after_cells = driver.styled_row(row as u16);
+            let screen = driver.screen();
+            assert_eq!(
+                divider_col_on_row(&after_cells, after),
+                Some(before),
+                "a press-and-release on the divider with no drag must \
                      not move it; screen:\n{screen}"
-                    );
-                },
             );
         }
 
@@ -1550,8 +1538,15 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — same TAB_ROW_HEIGHT_PX-as-rows collapse: the split's second
-            // pane never paints its own tab bar at all. Target: UnitProfile.
+            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
+            // wrong: with the editor-band collapse #1426 fixed, this still
+            // fails). category: product — the `Ctrl-W v` key chord's
+            // dispatch route into `Engine::open_editor_group`/window-split
+            // creation doesn't produce a second window on `App`, unlike the
+            // sibling divider tests above (which drive the split via a
+            // direct `engine.open_editor_group` call, not the key chord) —
+            // a dispatch gap unrelated to geometry units. Target: TBD,
+            // needs its own filed issue.
             known_bug_gate(
                 "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
                 || {
