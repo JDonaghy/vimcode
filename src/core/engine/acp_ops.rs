@@ -1263,6 +1263,13 @@ impl Engine {
     pub(crate) fn acp_write_text_file(&mut self, path: &Path, content: &str) -> Result<(), String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
+        // #1460 review (non-blocking finding): must be checked *before*
+        // `open_file` below — which never touches disk for a path that
+        // doesn't exist yet, so this is still accurate afterward too, but
+        // reads clearest right next to path resolution — to tell "the
+        // agent is creating this path" (revert-by-delete) apart from "the
+        // path already existed, possibly empty" (revert-by-empty-write).
+        let existed_before = resolved.exists();
         let buffer_id = self
             .buffer_manager
             .open_file(&resolved)
@@ -1272,11 +1279,12 @@ impl Engine {
         // touched" acceptance bar — before anything below mutates the
         // buffer. `acp_record_turn_write` is a no-op (besides advancing the
         // "last written" value) on every write after the first this turn.
-        let pre_content = self
-            .buffer_manager
-            .get(buffer_id)
-            .map(|s| s.buffer.content.to_string())
-            .unwrap_or_default();
+        let pre_content = existed_before.then(|| {
+            self.buffer_manager
+                .get(buffer_id)
+                .map(|s| s.buffer.content.to_string())
+                .unwrap_or_default()
+        });
         self.acp_record_turn_write(
             &resolved.to_string_lossy(),
             pre_content,
@@ -1306,6 +1314,29 @@ impl Engine {
             .map_err(|e| format!("failed to open {}: {e}", resolved.display()))?;
         self.acp_replace_buffer_content(buffer_id, content);
         self.save_buffer_by_id(buffer_id)
+    }
+
+    /// Delete `path` from disk and close its buffer if one is open — the
+    /// revert counterpart to [`Self::acp_write_file_untracked`] for a turn
+    /// entry whose `pre_turn_content` is `None` (#1460 review non-blocking
+    /// finding): the agent *created* this path, so "revert" must undo the
+    /// creation rather than leave an emptied-but-present file behind. A
+    /// missing file is a silent no-op — reverting to "doesn't exist" when
+    /// it already doesn't exist is not an error.
+    pub(crate) fn acp_delete_file_untracked(&mut self, path: &Path) -> Result<(), String> {
+        let roots = self.acp_workspace_roots();
+        let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
+        if resolved.exists() {
+            std::fs::remove_file(&resolved)
+                .map_err(|e| format!("failed to delete {}: {e}", resolved.display()))?;
+        }
+        if let Some(buffer_id) = self
+            .buffer_manager
+            .find_by_path(&resolved.to_string_lossy())
+        {
+            let _ = self.delete_buffer(buffer_id, true);
+        }
+        Ok(())
     }
 
     /// Replace the entirety of `buffer_id`'s content with `new_content` as
@@ -3799,6 +3830,104 @@ mod tests {
             state.buffer.content.to_string(),
             "original content",
             "one undo must revert the whole write, like any other edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1460 review (non-blocking finding): the fixture's
+    /// `ACP_FAKE_FS_WRITE_PATH2`/`ACP_FAKE_FS_WRITE_PATH3` support (added
+    /// for this feature) was otherwise never exercised by any test — every
+    /// other #1460 test drives `Engine::acp_write_text_file` /
+    /// `Engine::acp_end_turn` as plain Rust calls, bypassing the real ACP
+    /// JSON-RPC wire path this feature actually adds
+    /// (`AcpEvent::PromptStopped` -> `Engine::acp_end_turn`, above). This
+    /// drives a real three-file agent turn end to end through the fixture
+    /// and asserts on both the turn-review surface and the checkpoint
+    /// bookkeeping `:AiRestore` depends on — not just that the writes
+    /// landed on disk.
+    #[cfg(unix)]
+    #[test]
+    fn acp_turn_with_three_fs_writes_over_the_wire_opens_a_three_file_turn_review() {
+        let dir = unique_temp_dir("wire-turn-three-writes");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        std::fs::write(&a, "orig a").unwrap();
+        std::fs::write(&b, "orig b").unwrap();
+        std::fs::write(&c, "orig c").unwrap();
+
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_FS_WRITE_PATH", &a.to_string_lossy()),
+            ("ACP_FAKE_FS_WRITE_CONTENT", "agent a"),
+            ("ACP_FAKE_FS_WRITE_PATH2", &b.to_string_lossy()),
+            ("ACP_FAKE_FS_WRITE_CONTENT2", "agent b"),
+            ("ACP_FAKE_FS_WRITE_PATH3", &c.to_string_lossy()),
+            ("ACP_FAKE_FS_WRITE_CONTENT3", "agent c"),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.workspace_root = Some(dir.clone());
+
+        engine.ai_send_message("please write three files".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(
+            !engine.ai_streaming,
+            "turn should complete within {TEST_DEADLINE:?}"
+        );
+
+        for (path, content) in [(&a, "agent a"), (&b, "agent b"), (&c, "agent c")] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                content,
+                "fs/write_text_file must persist every file the wire turn wrote"
+            );
+        }
+
+        // The real `PromptStopped` -> `acp_end_turn` wiring (not a direct
+        // call) must have produced exactly one checkpoint covering all
+        // three files, and opened the turn-review surface for it.
+        assert_eq!(
+            engine.acp_turn_checkpoints.len(),
+            1,
+            "one wire turn must produce exactly one checkpoint"
+        );
+        let checkpoint = &engine.acp_turn_checkpoints[0];
+        let mut checkpoint_paths: Vec<_> =
+            checkpoint.entries.iter().map(|e| e.path.clone()).collect();
+        checkpoint_paths.sort();
+        let mut expected_paths: Vec<_> = [&a, &b, &c]
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        expected_paths.sort();
+        assert_eq!(checkpoint_paths, expected_paths);
+
+        let review = engine
+            .change_review
+            .as_ref()
+            .expect("PromptStopped must open the turn review over the wire, same as a direct call");
+        assert_eq!(review.entries.len(), 3, "the review must list all 3 files");
+        let checkpoint_id = engine
+            .turn_review_checkpoint_id
+            .expect("a turn review opened from a wire turn must carry its checkpoint id");
+
+        // `:AiRestore` against this wire-produced checkpoint must revert
+        // all three files back to their pre-turn content.
+        let summary = engine.acp_restore_checkpoint(Some(checkpoint_id)).unwrap();
+        assert!(
+            summary.contains("a.txt") || summary.to_lowercase().contains("restored"),
+            "unexpected summary: {summary}"
+        );
+        for (path, orig) in [(&a, "orig a"), (&b, "orig b"), (&c, "orig c")] {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                orig,
+                "restoring the wire-produced checkpoint must revert every file it touched"
+            );
+        }
+        assert!(
+            engine.acp_turn_checkpoints.is_empty(),
+            "a fully-reverted checkpoint must be forgotten"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -29,20 +29,23 @@
 
 use super::*;
 use crate::core::acp_turn::{AcpTurnCheckpoint, RestorePlanItem};
-use crate::core::review::{ChangeReviewState, ProposedChange};
+use crate::core::review::ProposedChange;
 
 impl Engine {
     /// Record one `fs/write_text_file` write into the in-flight turn's
     /// tracking (#1460) — called from [`Self::acp_write_text_file`] just
     /// before it overwrites the buffer, `pre_content` being what the file
-    /// held immediately before this write. A no-op on the *checkpoint*
-    /// itself for a path already touched this turn (only the "last
-    /// written" value moves forward) — see
+    /// held immediately before this write, or `None` if the path did not
+    /// exist on disk yet (the agent is creating it) — see
+    /// [`crate::core::acp_turn::AcpTurnFileEntry`]'s doc for why that
+    /// distinction matters on revert. A no-op on the *checkpoint* itself
+    /// for a path already touched this turn (only the "last written"
+    /// value moves forward) — see
     /// [`crate::core::acp_turn::AcpTurnCheckpoint::record_write`].
     pub(crate) fn acp_record_turn_write(
         &mut self,
         path: &str,
-        pre_content: String,
+        pre_content: Option<String>,
         written_content: String,
     ) {
         if let Some(existing) = self
@@ -78,7 +81,7 @@ impl Engine {
     }
 
     /// Open the turn-review surface for `checkpoint_id` — one
-    /// [`ChangeReviewState`] entry per file the turn touched, pre-turn
+    /// [`crate::core::review::ChangeReviewState`] entry per file the turn touched, pre-turn
     /// content vs whatever the file holds *now* (buffer-first, same read
     /// [`Self::acp_current_file_content`] uses for a proposal review). A
     /// no-op if `checkpoint_id` doesn't name a real checkpoint (already
@@ -100,14 +103,55 @@ impl Engine {
                     .unwrap_or_else(|_| e.agent_written_content.clone());
                 ProposedChange {
                     path: e.path.clone(),
-                    old_text: Some(e.pre_turn_content.clone()),
+                    // `None` here (a path the agent created, no prior
+                    // content) makes the review render it as a pure
+                    // addition, same as a `diff` block on a brand-new
+                    // path (#955) — see `AcpTurnFileEntry`'s doc.
+                    old_text: e.pre_turn_content.clone(),
                     new_text: now,
                 }
             })
             .collect();
-        self.change_review = Some(ChangeReviewState::new(changes));
-        self.review_card_id = None;
-        self.turn_review_checkpoint_id = Some(checkpoint_id);
+        self.open_change_review_with_turn_marker(changes, Some(checkpoint_id));
+    }
+
+    /// Forget `paths`' bookkeeping in every checkpoint at or after
+    /// `target_id` once those paths' agent writes have actually been
+    /// reverted back to disk — shared by [`Self::acp_restore_checkpoint`]
+    /// (a whole-checkpoint restore) and
+    /// [`crate::core::engine::review_ops::Engine::change_review_reject_current`]'s
+    /// turn-review branch (a single-file revert via the `r` key on an open
+    /// turn review).
+    ///
+    /// Two things this buys, both from the review's findings on #1460:
+    /// - **A checkpoint survives a refusal.** Only the paths that were
+    ///   actually reverted are dropped, so a checkpoint with any refused
+    ///   (human-edited-since) file keeps that file's entry and remains in
+    ///   [`Self::acp_turn_checkpoints`] for a later retry — the whole point
+    ///   of a checkpoint as a rollback point. A checkpoint disappears only
+    ///   once *every* entry it holds has been reverted.
+    /// - **No stale `agent_written_content`.** A single-file revert through
+    ///   the turn-review `r` key writes the pre-turn content back via
+    ///   [`Self::acp_write_file_untracked`], which — by design — does not
+    ///   touch this bookkeeping. Without this call, a later `:AiRestore`
+    ///   would compare the now-reverted disk content against the stale
+    ///   `agent_written_content` still on file and wrongly report the
+    ///   already-reverted path as "refused (edited since)".
+    pub(crate) fn acp_forget_reverted_checkpoint_paths(
+        &mut self,
+        target_id: usize,
+        paths: &[String],
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        for cp in self.acp_turn_checkpoints.iter_mut() {
+            if cp.id >= target_id {
+                cp.entries.retain(|e| !paths.contains(&e.path));
+            }
+        }
+        self.acp_turn_checkpoints
+            .retain(|c| c.id < target_id || !c.entries.is_empty());
     }
 
     /// `:AiReview` — open the turn-review surface for the most recently
@@ -134,9 +178,16 @@ impl Engine {
     /// [`crate::core::acp_turn::plan_restore`]'s doc) is refused rather
     /// than clobbered; the summary names every reverted and every refused
     /// path so the human immediately sees which files need a manual look.
-    /// Checkpoints from `id` onward are dropped from
-    /// [`Self::acp_turn_checkpoints`] once restored — their writes no
-    /// longer exist to restore *to* a second time.
+    ///
+    /// Only the paths that were *actually* reverted are forgotten from
+    /// [`Self::acp_turn_checkpoints`] (via
+    /// [`Self::acp_forget_reverted_checkpoint_paths`]) — a refused path
+    /// keeps its checkpoint entry intact so a later retry (once the human
+    /// edit is dealt with) still has something to restore *to*. A
+    /// checkpoint only disappears once every one of its entries has been
+    /// reverted; a checkpoint with any refused file remains in history,
+    /// exactly the "checkpoint as a rollback point" contract a fully
+    /// destroyed-on-refusal checkpoint would otherwise break.
     pub fn acp_restore_checkpoint(&mut self, id: Option<usize>) -> Result<String, String> {
         let target_id = match id {
             Some(id) => id,
@@ -157,25 +208,33 @@ impl Engine {
 
         let mut reverted = Vec::new();
         let mut refused = Vec::new();
-        for item in plan {
+        for item in &plan {
             match item {
                 RestorePlanItem::Revert {
-                    path,
-                    pre_turn_content,
+                    pre_turn_content, ..
                 } => {
-                    if let Err(msg) = self
-                        .acp_write_file_untracked(std::path::Path::new(&path), &pre_turn_content)
-                    {
+                    let path = item.path().to_string();
+                    // `None` means the agent created this path — "revert"
+                    // means delete it, not write an empty file (#1460
+                    // review non-blocking finding; see
+                    // `AcpTurnFileEntry`'s doc).
+                    let result = match pre_turn_content {
+                        Some(content) => {
+                            self.acp_write_file_untracked(std::path::Path::new(&path), content)
+                        }
+                        None => self.acp_delete_file_untracked(std::path::Path::new(&path)),
+                    };
+                    if let Err(msg) = result {
                         return Err(format!("failed to restore {path}: {msg}"));
                     }
                     reverted.push(path);
                 }
-                RestorePlanItem::Refused { path, reason } => {
-                    refused.push(format!("{path} ({reason})"));
+                RestorePlanItem::Refused { reason, .. } => {
+                    refused.push(format!("{} ({reason})", item.path()));
                 }
             }
         }
-        self.acp_turn_checkpoints.retain(|c| c.id < target_id);
+        self.acp_forget_reverted_checkpoint_paths(target_id, &reverted);
         if self
             .turn_review_checkpoint_id
             .is_some_and(|open_id| open_id >= target_id)
@@ -330,6 +389,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1460 review (non-blocking finding): reverting a file the agent
+    /// *created* this turn (didn't exist beforehand) must delete it, not
+    /// leave an empty file behind — RED against the unfixed
+    /// `unwrap_or_default()` path (which wrote back `""`): this assertion
+    /// would see the file still present with empty content instead of
+    /// `!exists()`.
+    #[test]
+    fn revert_a_file_the_agent_created_this_turn_deletes_it_rather_than_emptying_it() {
+        let dir = unique_temp_dir("revert-created-file");
+        let new_file = dir.join("brand-new.txt");
+        assert!(!new_file.exists(), "sanity: must not exist yet");
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine
+            .acp_write_text_file(&new_file, "created by agent\n")
+            .unwrap();
+        engine.acp_end_turn();
+        assert!(engine.turn_review_checkpoint_id.is_some());
+
+        engine.handle_change_review_key("", Some('r'));
+
+        assert!(
+            !new_file.exists(),
+            "reverting an agent-created file must delete it, not leave it emptied"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same as above, but through `:AiRestore`'s whole-checkpoint path
+    /// rather than a single-file `r` in the review UI.
+    #[test]
+    fn restore_checkpoint_deletes_a_file_the_agent_created_this_turn() {
+        let dir = unique_temp_dir("restore-created-file");
+        let new_file = dir.join("brand-new.txt");
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine
+            .acp_write_text_file(&new_file, "created by agent\n")
+            .unwrap();
+        engine.acp_end_turn();
+        let checkpoint_id = engine.turn_review_checkpoint_id.unwrap();
+
+        let summary = engine.acp_restore_checkpoint(Some(checkpoint_id)).unwrap();
+
+        assert!(
+            !new_file.exists(),
+            ":AiRestore must delete an agent-created file, not empty it: {summary}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The `a`/keep key in turn-review mode must be a pure decision — no
     /// buffer write, since the file is already correct.
     #[test]
@@ -414,6 +528,105 @@ mod tests {
         assert!(
             summary.to_lowercase().contains("refused") || summary.to_lowercase().contains("edited"),
             "summary should call out the refused file: {summary}"
+        );
+
+        // #1460 review (blocking finding): a refused restore must not
+        // destroy the checkpoint — only the *reverted* path (b.txt) is
+        // forgotten; a.txt's refused entry must remain so a later retry
+        // (once the human edit is dealt with) still has something to
+        // restore. RED against the unfixed
+        // `self.acp_turn_checkpoints.retain(|c| c.id < target_id)` (which
+        // dropped checkpoint 1 wholesale here, regardless of a.txt's
+        // refusal): this assertion failed with an empty checkpoint list.
+        assert_eq!(
+            engine.acp_turn_checkpoints.len(),
+            1,
+            "checkpoint {checkpoint_id} must survive a partially-refused restore, not be destroyed"
+        );
+        let surviving = &engine.acp_turn_checkpoints[0];
+        assert_eq!(surviving.id, checkpoint_id);
+        assert_eq!(
+            surviving.entries.len(),
+            1,
+            "only a.txt's refused entry should remain — b.txt's was actually reverted"
+        );
+        assert_eq!(surviving.entries[0].path, a.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1460 review (blocking finding): once the human edit that caused a
+    /// refusal is discarded, a *later* `:AiRestore` retry against the same
+    /// checkpoint must actually work — proving the surviving checkpoint
+    /// from the test above isn't just present but inert. RED against the
+    /// unfixed blanket `retain`: the first restore already destroyed the
+    /// checkpoint, so this second call fails with "no such ACP turn
+    /// checkpoint" instead of reverting.
+    #[test]
+    fn restore_checkpoint_can_be_retried_after_the_human_edit_is_discarded() {
+        let dir = unique_temp_dir("restore-retry-after-refusal");
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "orig a\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "agent a\n").unwrap();
+        engine.acp_end_turn();
+        let checkpoint_id = engine.turn_review_checkpoint_id.unwrap();
+        engine.close_change_review();
+
+        // A human edit lands on top of the agent's write — first restore
+        // must refuse it. `acp_current_file_content` reads buffer-first
+        // (same as production `fs/read_text_file`), so the edit has to
+        // land in the buffer too, not just on disk, to be seen as a human
+        // edit rather than the agent's own still-buffered write.
+        std::fs::write(&a, "human edit\n").unwrap();
+        let buf_id = engine.buffer_manager.open_file(&a).unwrap();
+        {
+            let state = engine.buffer_manager.get_mut(buf_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "human edit\n");
+        }
+        let first = engine.acp_restore_checkpoint(Some(checkpoint_id)).unwrap();
+        assert!(
+            first.to_lowercase().contains("refused"),
+            "first restore must refuse: {first}"
+        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "human edit\n");
+        assert!(
+            engine
+                .acp_turn_checkpoints
+                .iter()
+                .any(|c| c.id == checkpoint_id),
+            "checkpoint must still exist after the refusal for a retry"
+        );
+
+        // The human discards their edit, putting the file back to exactly
+        // what the agent last wrote — matching `agent_written_content`
+        // again, so a retry should now succeed.
+        std::fs::write(&a, "agent a\n").unwrap();
+        let buf_id = engine.buffer_manager.open_file(&a).unwrap();
+        {
+            let state = engine.buffer_manager.get_mut(buf_id).unwrap();
+            let len = state.buffer.content.len_chars();
+            state.buffer.content.remove(0..len);
+            state.buffer.content.insert(0, "agent a\n");
+        }
+
+        let second = engine.acp_restore_checkpoint(Some(checkpoint_id)).unwrap();
+        assert!(
+            !second.to_lowercase().contains("refused"),
+            "retry after discarding the human edit must succeed: {second}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            "orig a\n",
+            "the retried restore must actually revert to the pre-turn content"
+        );
+        assert!(
+            engine.acp_turn_checkpoints.is_empty(),
+            "a fully-reverted checkpoint is forgotten once nothing is left refused"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

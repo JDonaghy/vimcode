@@ -18,10 +18,17 @@
 /// a file's *current* content against to detect a manual edit made after
 /// the agent's own last write — the "must not clobber an unsaved user
 /// edit" acceptance bar.
+///
+/// `pre_turn_content: None` means the path did not exist on disk before
+/// the agent's first write this turn (#1460 review non-blocking finding):
+/// reverting such an entry must *delete* the file, not write an empty
+/// string back — leaving an emptied-but-present file behind would be a
+/// surprising outcome for "keep or revert" and doesn't actually undo the
+/// agent's "created a new file" action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpTurnFileEntry {
     pub path: String,
-    pub pre_turn_content: String,
+    pub pre_turn_content: Option<String>,
     pub agent_written_content: String,
 }
 
@@ -39,7 +46,12 @@ impl AcpTurnCheckpoint {
     /// touched (later writes to the same path within the same turn only
     /// move `agent_written_content` forward) — the "captured the first
     /// time each file is touched" acceptance bar.
-    pub fn record_write(&mut self, path: &str, pre_content: String, written_content: String) {
+    pub fn record_write(
+        &mut self,
+        path: &str,
+        pre_content: Option<String>,
+        written_content: String,
+    ) {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.path == path) {
             entry.agent_written_content = written_content;
         } else {
@@ -55,11 +67,16 @@ impl AcpTurnCheckpoint {
 /// One file's planned outcome from [`plan_restore`]: either revert it to
 /// its pre-checkpoint content, or refuse because a human edit landed on
 /// top of the agent's own last write and would otherwise be clobbered.
+///
+/// `Revert { pre_turn_content: None, .. }` means the path didn't exist
+/// before the earliest relevant checkpoint touched it — reverting it means
+/// deleting it, not writing back an empty file (see
+/// [`AcpTurnFileEntry`]'s doc for why).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestorePlanItem {
     Revert {
         path: String,
-        pre_turn_content: String,
+        pre_turn_content: Option<String>,
     },
     Refused {
         path: String,
@@ -93,7 +110,7 @@ pub fn plan_restore(
     target_id: usize,
     current_content: impl Fn(&str) -> Option<String>,
 ) -> Vec<RestorePlanItem> {
-    let mut restore_to: std::collections::BTreeMap<String, String> =
+    let mut restore_to: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
     let mut last_written: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -113,7 +130,7 @@ pub fn plan_restore(
             let expected = last_written.get(&path).cloned().unwrap_or_default();
             let current = current_content(&path).unwrap_or_default();
             if current == expected {
-                let pre_turn_content = restore_to.get(&path).cloned().unwrap_or_default();
+                let pre_turn_content = restore_to.get(&path).cloned().flatten();
                 RestorePlanItem::Revert {
                     path,
                     pre_turn_content,
@@ -137,7 +154,7 @@ mod tests {
     fn entry(path: &str, pre: &str, written: &str) -> AcpTurnFileEntry {
         AcpTurnFileEntry {
             path: path.to_string(),
-            pre_turn_content: pre.to_string(),
+            pre_turn_content: Some(pre.to_string()),
             agent_written_content: written.to_string(),
         }
     }
@@ -148,15 +165,35 @@ mod tests {
             id: 1,
             entries: vec![],
         };
-        cp.record_write("f.rs", "orig".to_string(), "v1".to_string());
-        cp.record_write("f.rs", "should-be-ignored".to_string(), "v2".to_string());
+        cp.record_write("f.rs", Some("orig".to_string()), "v1".to_string());
+        cp.record_write(
+            "f.rs",
+            Some("should-be-ignored".to_string()),
+            "v2".to_string(),
+        );
         assert_eq!(
             cp.entries.len(),
             1,
             "same-turn re-write must not duplicate the entry"
         );
-        assert_eq!(cp.entries[0].pre_turn_content, "orig");
+        assert_eq!(cp.entries[0].pre_turn_content, Some("orig".to_string()));
         assert_eq!(cp.entries[0].agent_written_content, "v2");
+    }
+
+    /// #1460 review (non-blocking finding): a path that did not exist
+    /// before the agent's first write this turn must record `None`, not an
+    /// empty string — the two are indistinguishable to a naive `String`
+    /// "restore" (both mean "write back empty"), but only `None` correctly
+    /// tells [`plan_restore`] to plan a *delete* rather than an empty
+    /// overwrite.
+    #[test]
+    fn record_write_with_no_pre_content_records_none_for_a_brand_new_path() {
+        let mut cp = AcpTurnCheckpoint {
+            id: 1,
+            entries: vec![],
+        };
+        cp.record_write("new.rs", None, "created by agent".to_string());
+        assert_eq!(cp.entries[0].pre_turn_content, None);
     }
 
     #[test]
@@ -178,14 +215,14 @@ mod tests {
             plan[0],
             RestorePlanItem::Revert {
                 path: "a.rs".to_string(),
-                pre_turn_content: "orig-a".to_string(),
+                pre_turn_content: Some("orig-a".to_string()),
             }
         );
         assert_eq!(
             plan[1],
             RestorePlanItem::Revert {
                 path: "b.rs".to_string(),
-                pre_turn_content: "orig-b".to_string(),
+                pre_turn_content: Some("orig-b".to_string()),
             }
         );
     }
@@ -232,7 +269,7 @@ mod tests {
             plan,
             vec![RestorePlanItem::Revert {
                 path: "a.rs".to_string(),
-                pre_turn_content: "orig-a".to_string(),
+                pre_turn_content: Some("orig-a".to_string()),
             }],
             "restoring turn 1 must go all the way back to before turn 1 touched it, \
              not just undo turn 2"
@@ -258,8 +295,32 @@ mod tests {
             plan,
             vec![RestorePlanItem::Revert {
                 path: "b.rs".to_string(),
-                pre_turn_content: "orig-b".to_string(),
+                pre_turn_content: Some("orig-b".to_string()),
             }]
+        );
+    }
+
+    /// #1460 review (non-blocking finding): a file the agent *created*
+    /// (no pre-turn content on disk) must plan a `None` restore — a
+    /// delete — not `Some("")` — an empty-but-present file.
+    #[test]
+    fn plan_restore_plans_a_delete_for_a_file_the_agent_created() {
+        let checkpoints = vec![AcpTurnCheckpoint {
+            id: 1,
+            entries: vec![AcpTurnFileEntry {
+                path: "new.rs".to_string(),
+                pre_turn_content: None,
+                agent_written_content: "created by agent".to_string(),
+            }],
+        }];
+        let plan = plan_restore(&checkpoints, 1, |_| Some("created by agent".to_string()));
+        assert_eq!(
+            plan,
+            vec![RestorePlanItem::Revert {
+                path: "new.rs".to_string(),
+                pre_turn_content: None,
+            }],
+            "reverting an agent-created file must plan a delete (None), not an empty overwrite"
         );
     }
 }

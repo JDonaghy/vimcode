@@ -32,6 +32,23 @@ impl Engine {
     /// Public so a future source-agnostic feeder (a #525 git-branch diff
     /// list, say) can call it directly without going through ACP at all.
     pub fn open_change_review(&mut self, changes: Vec<ProposedChange>) {
+        // A *proposal* review (#955) never has a turn checkpoint behind it
+        // — see `Self::open_change_review_with_turn_marker`'s doc for why
+        // `None` here matters, not just what it does.
+        self.open_change_review_with_turn_marker(changes, None);
+    }
+
+    /// Shared reset-and-populate tail [`Self::open_change_review`] (a
+    /// *proposal* review, `turn_checkpoint_id: None`) and
+    /// [`crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`]
+    /// (a *turn* review, `turn_checkpoint_id: Some(id)`) both need — #1460
+    /// review nit: this used to be duplicated three lines in each caller.
+    /// A no-op on an empty `changes` list — nothing to review.
+    pub(crate) fn open_change_review_with_turn_marker(
+        &mut self,
+        changes: Vec<ProposedChange>,
+        turn_checkpoint_id: Option<usize>,
+    ) {
         if changes.is_empty() {
             return;
         }
@@ -42,12 +59,11 @@ impl Engine {
         // board card behind it) must never inherit a stale id left over
         // from an earlier board review.
         self.review_card_id = None;
-        // #1460: this method only ever opens a *proposal* review — a
-        // *turn* review is opened directly by `Engine::acp_open_turn_
-        // review`, which sets this field itself right after building its
-        // own `ChangeReviewState` — so never inherit a stale turn marker
-        // left over from an earlier turn review.
-        self.turn_review_checkpoint_id = None;
+        // #1460: `turn_checkpoint_id` names the turn review is for, or
+        // `None` for a proposal review — either way this always overwrites
+        // whatever was left over from an earlier review of either kind, so
+        // neither marker can ever outlive the surface it named.
+        self.turn_review_checkpoint_id = turn_checkpoint_id;
     }
 
     /// Build a source-agnostic change list from a local git branch diff
@@ -396,7 +412,7 @@ impl Engine {
     /// "revert it". Auto-closes the surface once every entry has a
     /// decision, same as accept.
     pub(crate) fn change_review_reject_current(&mut self) {
-        if self.turn_review_checkpoint_id.is_some() {
+        if let Some(checkpoint_id) = self.turn_review_checkpoint_id {
             let Some(review) = &mut self.change_review else {
                 return;
             };
@@ -405,11 +421,30 @@ impl Engine {
             };
             entry.decision = crate::core::review::ChangeDecision::Rejected;
             let path = entry.change.path.clone();
-            let old_text = entry.change.old_text.clone().unwrap_or_default();
-            if let Err(msg) = self.acp_write_file_untracked(std::path::Path::new(&path), &old_text)
-            {
+            let old_text = entry.change.old_text.clone();
+            // #1460 review (non-blocking finding): `None` means the agent
+            // created this path this turn (no pre-turn content) — revert
+            // means delete it, not write an empty file back. See
+            // `AcpTurnFileEntry`'s doc for the full reasoning.
+            let result = match &old_text {
+                Some(content) => {
+                    self.acp_write_file_untracked(std::path::Path::new(&path), content)
+                }
+                None => self.acp_delete_file_untracked(std::path::Path::new(&path)),
+            };
+            if let Err(msg) = result {
                 self.message = format!("Failed to revert {path}: {msg}");
             } else {
+                // #1460 review: reconcile the checkpoint's own bookkeeping
+                // now that this path is actually back at its pre-turn
+                // content, so a later `:AiRestore` on this checkpoint
+                // neither re-reverts an already-reverted file nor
+                // misreports it as "refused (edited since)" against the
+                // stale `agent_written_content` this write bypasses.
+                self.acp_forget_reverted_checkpoint_paths(
+                    checkpoint_id,
+                    std::slice::from_ref(&path),
+                );
                 self.message = format!("Reverted change to {path}");
             }
             self.close_turn_review_if_all_decided();
