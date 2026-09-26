@@ -20,6 +20,22 @@ fn engine() -> Engine {
     e
 }
 
+/// #1446: `Engine::ai_send_message` now refuses to spawn the direct-provider
+/// `curl` transport when *neither* transport is configured (no ACP agent and
+/// no resolvable API key), so the tests below that assert the send path
+/// actually runs must configure a key. Doing it through `settings.ai_api_key`
+/// rather than an env var keeps them deterministic on any machine —
+/// `core::ai::resolve_api_key` prefers the env var when one is set and falls
+/// back to this setting when it isn't, so either way the key is non-empty.
+/// (The unconfigured path's own coverage lives in
+/// `core::engine::tests::test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message`
+/// plus a painted-output test per backend.)
+fn engine_with_api_key() -> Engine {
+    let mut e = engine();
+    e.settings.ai_api_key = "test-key-1446".to_string();
+    e
+}
+
 #[test]
 fn test_ai_initial_state() {
     let e = engine();
@@ -82,7 +98,7 @@ fn test_ai_dispatch_cancelled_clears_focus() {
 /// the dispatch must also clear the box afterwards.
 #[test]
 fn test_ai_dispatch_submit_sends_and_clears_input() {
-    let mut e = engine();
+    let mut e = engine_with_api_key();
     e.ai_chat.borrow_mut().input_insert_str("hello world");
     let still_focused =
         e.dispatch_ai_chat_event(vimcode_core::quadraui::ChatControllerEvent::Submit {
@@ -131,7 +147,7 @@ fn test_ai_chat_scroll_transcript_by() {
 
 #[test]
 fn test_ai_command_sets_input_and_sends() {
-    let mut e = engine();
+    let mut e = engine_with_api_key();
     // :AI <message> should push user message and start streaming
     e.execute_command("AI hello world");
     // Message should be pushed and streaming started
