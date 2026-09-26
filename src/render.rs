@@ -12069,6 +12069,28 @@ pub const WINDOW_MINIMIZE_ACTION: &str = "window:minimize";
 pub const WINDOW_MAXIMIZE_ACTION: &str = "window:maximize";
 pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 
+/// Width, in pixels, of the outer-window resize grip passed to
+/// [`quadraui::AppShell::window_edge`] (#1528).
+///
+/// The grip used to be `backend.line_height()` — 16-22px, the full height of
+/// the title bar and command-line rows. That made the grip band as tall as
+/// those rows, so it always ran *underneath* them: the top-row title-bar drag
+/// check and the bottom-row command-line click always resolved first, and
+/// North/South resize was dead everywhere except the corners the title bar
+/// or command line didn't cover. The same oversized band on the East edge
+/// also swallowed the vertical scrollbar and the minimap's rightmost column
+/// with a single editor group, where both sit within that many pixels of the
+/// window's true right edge.
+///
+/// A few pixels — VS Code/Electron frameless windows use a comparable
+/// margin — is still comfortably grabbable with a mouse, is thinner than one
+/// scrollbar/minimap gutter (`app_support::v_scrollbar_thumb_geometry`'s
+/// track, `render::minimap`'s gutter offset), and is thin enough to sit
+/// *inside* the title bar and command-line rows instead of spanning them, so
+/// the edge grip can win only in that sliver and fall through to the
+/// row/scrollbar/minimap hit-test everywhere else in the row.
+pub const WINDOW_RESIZE_GRIP_PX: f32 = 4.0;
+
 /// Build the inline minimize/maximize/close window-control buttons for the
 /// GTK client-side titlebar (#552).
 ///
@@ -23763,6 +23785,15 @@ fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
 /// is basically always painted). Delegates to
 /// [`quadraui::Rect::contains`] — the shared point-in-rect primitive —
 /// instead of re-deriving both bounds by hand a second time.
+///
+/// #1528: the GTK `MouseDown` handler that used this to skip the whole
+/// command-line row before running `ctx.window_edge` no longer needs to —
+/// `render::WINDOW_RESIZE_GRIP_PX`'s thin margin already keeps `window_edge`
+/// from firing anywhere in the row except its own outermost sliver, so the
+/// guard's job (stop a full `line_height`-tall margin from eating the whole
+/// row) is now `window_edge`'s own margin's job instead. Kept as a public
+/// helper — still the correct both-axes point-in-`command_line_rect` check
+/// for anything that needs one — rather than deleted with its call site.
 pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> bool {
     rect.width > 0.0 && rect.contains(point)
 }
@@ -30203,6 +30234,56 @@ mod tests {
             empty,
             quadraui::Point::new(0.0, 0.0)
         ));
+    }
+
+    // ── Outer window resize grip (#1528) ─────────────────────────────────
+
+    /// #1528: the grip must be thin — a handful of pixels, VS Code/Electron
+    /// style — not `backend.line_height()` (16-22px). A full row-height grip
+    /// is exactly what made North/South resize dead: it made the grip band as
+    /// tall as the title bar / command-line rows, so those rows' own
+    /// unconditional click handling always resolved first. Pinned as an
+    /// upper bound well below any real line height so a future edit can't
+    /// silently widen the constant back into that failure mode; see
+    /// `WINDOW_RESIZE_GRIP_PX`'s own doc for the full rationale.
+    #[test]
+    fn window_resize_grip_is_a_thin_pixel_margin_not_a_row_height() {
+        assert!(
+            WINDOW_RESIZE_GRIP_PX > 0.0,
+            "a zero-width grip could never resize at all"
+        );
+        assert!(
+            WINDOW_RESIZE_GRIP_PX <= 8.0,
+            "grip {WINDOW_RESIZE_GRIP_PX}px is no longer a thin pixel margin \
+             — a real GTK title-bar/command-line row is comfortably taller \
+             than this, which is the whole point (#1528)"
+        );
+    }
+
+    /// #1528: the grip must stay inside the vertical scrollbar's own gutter
+    /// (`scroll_gutter_width`, `scrollbar_reserve.max(char_width)`) rather
+    /// than reach past it into the minimap strip, which paints a further
+    /// full gutter-width in from the pane's true right edge (see the doc
+    /// comment above `render_engine`'s `minimap_widths`/`minimap`
+    /// construction, #1094) — i.e. the minimap's rightmost column is always
+    /// safely beyond the grip as long as the grip doesn't exceed the
+    /// scrollbar's own column width. Checked across a realistic range of GTK
+    /// char widths — from a small readable font up to a very large one —
+    /// with `scrollbar_reserve` at its common `0.0` (overlay-scrollbar,
+    /// #828/quadraui#776) so the gutter collapses to `char_width` alone, the
+    /// tightest case.
+    #[test]
+    fn window_resize_grip_stays_inside_the_scrollbar_gutter() {
+        for char_width in [6.0_f64, 7.0, 8.8, 11.0, 16.0, 24.0] {
+            let gutter = scroll_gutter_width(0.0, char_width);
+            assert!(
+                f64::from(WINDOW_RESIZE_GRIP_PX) <= gutter,
+                "grip {WINDOW_RESIZE_GRIP_PX}px exceeds the scroll gutter \
+                 ({gutter}px) at char_width {char_width}px — it would reach \
+                 past the vertical scrollbar's own column into the minimap \
+                 strip beyond it"
+            );
+        }
     }
 
     #[test]
