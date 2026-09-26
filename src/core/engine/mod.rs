@@ -3714,6 +3714,21 @@ pub struct Engine {
     /// state — but `Engine::ai_clear` drops it anyway, matching "clear
     /// conversation" clearing everything else about to be typed.
     pub acp_pending_attachment: Option<crate::core::acp::AcpRangeAttachment>,
+    /// One-shot "the sidebar band should take the keyboard" request (#1450),
+    /// raised by a programmatic panel reveal that happens *inside*
+    /// `Engine::handle_key` (currently only the AI panel's
+    /// `acp_focus_ai_panel_for_keyboard`, i.e. Visual `<leader>ai` and
+    /// `:{range}AI` with no message) and drained by
+    /// `render::post_key_epilogue` into `PostKeyEpilogue::focus_sidebar`.
+    ///
+    /// Exists because TUI's `sidebar.has_focus` is a cached bool refreshed
+    /// only by mouse/shell-event handlers, so such a reveal has no event of
+    /// its own to hang the sync off; GTK re-derives focus from
+    /// `Engine::sidebar_has_focus()` every keystroke and needs no help. It's
+    /// a *request* rather than "whenever `ai_has_focus` is set" precisely so
+    /// that later keypresses aren't swallowed by the panel — see
+    /// `Engine::ai_attach_range`.
+    pub sidebar_focus_requested: bool,
     /// Tool calls the agent has announced this session (#955, ACP-4),
     /// upserted by `toolCallId` — an addressable collection, not an
     /// append-only log, so a `tool_call_update`'s status transition or
@@ -4962,6 +4977,7 @@ impl Engine {
             acp_authenticated: false,
             acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities::default(),
             acp_pending_attachment: None,
+            sidebar_focus_requested: false,
             acp_tool_calls: Vec::new(),
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
