@@ -20392,6 +20392,13 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
             attachment.chip(&engine.acp_workspace_cwd())
         ));
     }
+    // #1464: every manually attached file/image gets its own chip on this
+    // same always-repainted, focus-safe status line — same reasoning as
+    // the range attachment's chip immediately above, extended to a list
+    // since more than one file can be attached at once.
+    for attachment in &engine.acp_manual_attachments {
+        header.push_str(&format!("  \u{b7} {}", attachment.chip()));
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
 }
 

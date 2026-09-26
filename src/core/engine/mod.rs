@@ -3447,6 +3447,19 @@ pub struct Engine {
     /// Returns Err(error_message) on failure.
     #[allow(clippy::type_complexity)]
     pub clipboard_write: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
+    /// Read a decoded RGBA image off the system clipboard (#1464), for
+    /// `Engine::acp_attach_clipboard_image`. Set by the GTK backend at
+    /// startup the same way `clipboard_read`/`clipboard_write` above are —
+    /// straight through to `quadraui::Clipboard::read_image`, whose own
+    /// `ServiceResult<RgbaImage>` (`Result<_, BackendError>`) this reuses
+    /// verbatim rather than lossily flattening to `String`, so a caller can
+    /// tell `BackendError::Unsupported` (no terminal clipboard-image
+    /// channel — every TUI build, since OSC 52 is text-only) apart from a
+    /// real platform failure and phrase a "can't do this here" message
+    /// distinctly from "that failed". `None` (not wired) on any backend
+    /// that never overrides `read_image`'s `Err(Unsupported)` default.
+    #[allow(clippy::type_complexity)]
+    pub clipboard_read_image: Option<Box<dyn Fn() -> quadraui::ServiceResult<quadraui::RgbaImage>>>,
     /// Whether a mouse drag selection is currently active.
     pub mouse_drag_active: bool,
     /// Window where the current drag selection originated.  Drag events in
@@ -3763,6 +3776,19 @@ pub struct Engine {
     /// state — but `Engine::ai_clear` drops it anyway, matching "clear
     /// conversation" clearing everything else about to be typed.
     pub acp_pending_attachment: Option<crate::core::acp::AcpRangeAttachment>,
+    /// Manually attached files/images (#1464), staged via `:AiAttach <path>`
+    /// (`Engine::acp_attach_file`) or a clipboard image paste
+    /// (`Engine::acp_attach_clipboard_image`) — a `Vec`, unlike
+    /// `acp_pending_attachment` above, since more than one file can ride on
+    /// the same prompt. Each shows its own chip in the panel header
+    /// (`render::populate_ai_chat_controller`) until
+    /// `Engine::acp_prompt_content_blocks` drains all of them on the next
+    /// send, or the user removes the most-recently-attached one (Ctrl+R,
+    /// falling through from `acp_pending_attachment` once that's empty —
+    /// see `Engine::dispatch_ai_chat_event`). Not session-scoped — composed
+    /// content, not agent state — but `Engine::ai_clear` drops it anyway,
+    /// same reasoning as `acp_pending_attachment`.
+    pub acp_manual_attachments: Vec<crate::core::acp::AcpManualAttachment>,
     /// One-shot "the sidebar band should take the keyboard" request (#1450),
     /// raised by a programmatic panel reveal that happens *inside*
     /// `Engine::handle_key` (currently only the AI panel's
@@ -4951,6 +4977,7 @@ impl Engine {
             diff_peek: None,
             clipboard_read: None,
             clipboard_write: None,
+            clipboard_read_image: None,
             mouse_drag_active: false,
             mouse_drag_origin_window: None,
             mouse_drag_word_mode: false,
@@ -5030,6 +5057,7 @@ impl Engine {
             acp_pending_resume: None,
             acp_startup_reopen_attempted: false,
             acp_pending_attachment: None,
+            acp_manual_attachments: Vec::new(),
             sidebar_focus_requested: false,
             acp_tool_calls: Vec::new(),
             change_review: None,

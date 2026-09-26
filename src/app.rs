@@ -1392,6 +1392,7 @@ pub(crate) fn setup_gtk_clipboard(
     backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
 ) {
     let read_backend = backend.clone();
+    let read_image_backend = backend.clone();
     engine.clipboard_read = Some(Box::new(move || {
         read_backend
             .borrow()
@@ -1408,6 +1409,19 @@ pub(crate) fn setup_gtk_clipboard(
             .clipboard()
             .write_text_result(text)
             .map_err(|e| format!("clipboard write: {e:?}"))
+    }));
+
+    // #1464: `Engine::acp_attach_clipboard_image`'s image twin of
+    // `clipboard_read` above — GTK's `Clipboard` impl overrides
+    // `read_image`, so this is a real decoded-pixel read, not the
+    // `Err(BackendError::Unsupported)` default a backend without one
+    // returns.
+    engine.clipboard_read_image = Some(Box::new(move || {
+        read_image_backend
+            .borrow()
+            .services()
+            .clipboard()
+            .read_image()
     }));
 }
 

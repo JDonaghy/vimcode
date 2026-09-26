@@ -68,7 +68,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -1002,6 +1002,168 @@ fn mime_type_for_path(path: &std::path::Path) -> String {
         Some(lang) => format!("text/x-{lang}"),
         None => "text/plain".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt context — manual file/image attachments (#1464)
+// ---------------------------------------------------------------------------
+
+/// `image/<kind>` for a recognized raster-image file extension, or `None`
+/// for anything else (including no extension) — the gate
+/// [`crate::core::engine::Engine::acp_attach_file`] uses to decide "attach
+/// as an `image` content block" vs. "attach as a baseline `resource_link`"
+/// (#1464). A real IANA mime type, unlike [`mime_type_for_path`]'s
+/// `text/x-*` hint above — an ACP `image` block's `mimeType` is what the
+/// agent hands straight to a real image decoder, so it has to be one this
+/// codebase can't afford to make up.
+pub fn image_mime_type_for_path(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => return None,
+    })
+}
+
+/// Maximum raw byte size accepted for one image attachment (#1464) —
+/// 5&nbsp;MiB, checked *before* base64 inflation (~33% larger on the wire).
+/// There is no ACP-side limit `promptCapabilities` declares to match; this
+/// is a generous "definitely a screenshot, not a mistake" ceiling picked so
+/// a user pasting or `:AiAttach`-ing a large photo gets a clear refusal
+/// instead of a multi-second base64-encode-and-hang, not a value derived
+/// from any particular agent's own request-size cap.
+pub const ACP_MAX_IMAGE_ATTACHMENT_BYTES: u64 = 5 * 1024 * 1024;
+
+/// `"1.2 MB"` / `"512 KB"` / `"37 B"` — human-readable byte count for the
+/// oversize-attachment refusal message (#1464). Binary (1024-based) units,
+/// one decimal place above the `KB` tier, no tier above `MB` (nothing this
+/// codebase sizes ever needs `GB`).
+pub fn format_byte_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// A manually attached file or image (#1464): via `:AiAttach <path>` or a
+/// clipboard image paste (`Engine::acp_attach_clipboard_image`). Distinct
+/// from [`AcpRangeAttachment`] (#1450, a buffer line-range) — each of
+/// these represents a whole file the user explicitly attached, kept in
+/// `Engine::acp_manual_attachments` (a `Vec`, unlike the range
+/// attachment's single `Option`, since more than one file can ride on the
+/// same prompt) until the next `session/prompt` consumes all of them, or
+/// the user removes the most-recently-attached one (Ctrl+R while the panel
+/// has focus — the same key [`AcpRangeAttachment`] already uses, extended
+/// to fall through to this list once no range attachment is staged; see
+/// `Engine::dispatch_ai_chat_event`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AcpManualAttachment {
+    /// An arbitrary (non-image) file — sent as a baseline `resource_link`,
+    /// the same wire shape `Engine::acp_current_buffer_attachment` uses.
+    /// No `promptCapabilities` gate (`resource_link` is baseline ACP v1,
+    /// every agent must accept it) and no size limit — nothing is ever
+    /// read off disk for this variant, only the path/name.
+    File { path: PathBuf },
+    /// An image — from `:AiAttach <path>` (an image extension, see
+    /// [`image_mime_type_for_path`]) or a clipboard paste — sent as an
+    /// `{"type": "image", "mimeType", "data": <base64>}` content block.
+    /// Gated *at attach time* (`Engine::acp_attach_file`/
+    /// `Engine::acp_attach_clipboard_image` both refuse with a clear
+    /// message when `promptCapabilities.image` is `false`, rather than
+    /// staging something that can only fail later at send time — there is
+    /// no baseline-ACP fallback for binary image data the way
+    /// [`AcpRangeAttachment::content_blocks`] falls back to fenced text)
+    /// and by [`ACP_MAX_IMAGE_ATTACHMENT_BYTES`], same reasoning.
+    Image {
+        /// Display name for the chip and for a `:AiAttach` file's blocked
+        /// content — the file name for `:AiAttach`, `"(pasted image)"` for
+        /// a clipboard paste (there's no path to name it from).
+        name: String,
+        mime_type: String,
+        /// Raw, not-yet-base64-encoded bytes — encoded lazily in
+        /// [`Self::content_block`] so removing an attachment before it's
+        /// ever sent never pays for the encode.
+        data: Vec<u8>,
+    },
+}
+
+impl AcpManualAttachment {
+    /// The `\u{1f4ce} <name>` (file) / `\u{1f5bc} <name>` (image) chip
+    /// shown in the AI panel header while this attachment is pending
+    /// (#1464) — distinct icons from [`AcpRangeAttachment::chip`]'s `⧉` so
+    /// a whole-file/image attachment reads differently from a buffer
+    /// line-range at a glance.
+    pub fn chip(&self) -> String {
+        match self {
+            AcpManualAttachment::File { path } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                format!("\u{1f4ce} {name}")
+            }
+            AcpManualAttachment::Image { name, .. } => format!("\u{1f5bc} {name}"),
+        }
+    }
+
+    /// This attachment's single `session/prompt` content block (#1464).
+    pub fn content_block(&self) -> serde_json::Value {
+        match self {
+            AcpManualAttachment::File { path } => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                serde_json::json!({
+                    "type": "resource_link",
+                    "uri": crate::core::lsp::path_to_uri(path),
+                    "name": name,
+                })
+            }
+            AcpManualAttachment::Image {
+                mime_type, data, ..
+            } => {
+                use base64::Engine as _;
+                serde_json::json!({
+                    "type": "image",
+                    "mimeType": mime_type,
+                    "data": base64::engine::general_purpose::STANDARD.encode(data),
+                })
+            }
+        }
+    }
+}
+
+/// Encode `pixels` (straight RGBA8, row-major, `width * height * 4` bytes —
+/// [`quadraui::RgbaImage`]'s own contract) as a PNG byte stream (#1464) —
+/// what turns a clipboard-image paste's already-decoded pixels into the
+/// `data` an ACP `image` block's `mimeType: "image/png"` promises. `Err`
+/// only on a pixel-buffer/dimension mismatch or a write failure to the
+/// in-memory buffer, neither of which a real `RgbaImage` off the clipboard
+/// should ever produce.
+pub fn encode_png_rgba8(width: u32, height: u32, pixels: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("PNG header: {e}"))?;
+        writer
+            .write_image_data(pixels)
+            .map_err(|e| format!("PNG data: {e}"))?;
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2970,6 +3132,90 @@ mod tests {
 
         assert_eq!(attachment.chip(&link), "\u{29c9} t.rs:1-2");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── #1464: manual file/image attachments ───────────────────────────────
+
+    #[test]
+    fn image_mime_type_for_path_recognizes_common_raster_extensions_case_insensitively() {
+        assert_eq!(
+            image_mime_type_for_path(Path::new("shot.PNG")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_type_for_path(Path::new("photo.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_mime_type_for_path(Path::new("photo.jpg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_mime_type_for_path(Path::new("anim.gif")),
+            Some("image/gif")
+        );
+    }
+
+    #[test]
+    fn image_mime_type_for_path_rejects_non_image_extensions() {
+        assert_eq!(image_mime_type_for_path(Path::new("main.rs")), None);
+        assert_eq!(image_mime_type_for_path(Path::new("README")), None);
+    }
+
+    #[test]
+    fn format_byte_size_picks_the_right_unit_tier() {
+        assert_eq!(format_byte_size(37), "37 B");
+        assert_eq!(format_byte_size(512 * 1024), "512.0 KB");
+        assert_eq!(format_byte_size(ACP_MAX_IMAGE_ATTACHMENT_BYTES), "5.0 MB");
+    }
+
+    #[test]
+    fn manual_file_attachment_builds_a_baseline_resource_link_chip() {
+        let attachment = AcpManualAttachment::File {
+            path: PathBuf::from("/work/notes.txt"),
+        };
+        assert_eq!(attachment.chip(), "\u{1f4ce} notes.txt");
+        let block = attachment.content_block();
+        assert_eq!(block["type"], "resource_link");
+        assert_eq!(block["name"], "notes.txt");
+        assert!(
+            block.get("data").is_none(),
+            "a plain file attachment must never carry embedded bytes: {block:?}"
+        );
+    }
+
+    /// RED verified: with `content_block`'s `Image` arm stubbed to reuse the
+    /// `File` arm's `resource_link` shape, this fails (no `image`-typed
+    /// block, no `data` field at all).
+    #[test]
+    fn manual_image_attachment_builds_an_image_block_with_base64_data() {
+        let attachment = AcpManualAttachment::Image {
+            name: "shot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data: vec![0x89, 0x50, 0x4e, 0x47],
+        };
+        assert_eq!(attachment.chip(), "\u{1f5bc} shot.png");
+        let block = attachment.content_block();
+        assert_eq!(block["type"], "image");
+        assert_eq!(block["mimeType"], "image/png");
+        use base64::Engine as _;
+        assert_eq!(
+            block["data"],
+            base64::engine::general_purpose::STANDARD.encode([0x89, 0x50, 0x4e, 0x47])
+        );
+    }
+
+    #[test]
+    fn encode_png_rgba8_round_trips_through_the_png_decoder() {
+        // 2x1 RGBA8: one red pixel, one green pixel.
+        let pixels = [255u8, 0, 0, 255, 0, 255, 0, 255];
+        let png_bytes = encode_png_rgba8(2, 1, &pixels).expect("encode should succeed");
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder.read_info().expect("valid PNG header");
+        let mut buf = vec![0u8; reader.output_buffer_size().expect("known output size")];
+        let info = reader.next_frame(&mut buf).expect("valid PNG frame");
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(&buf[..info.buffer_size()], &pixels[..]);
     }
 
     #[test]

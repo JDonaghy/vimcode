@@ -1157,6 +1157,32 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiAttach <path> — stage a file or image at `path` as the next
+        // prompt's attachment (#1464). See `Engine::acp_attach_file`'s doc
+        // for the workspace-resolution, `promptCapabilities.image` gate and
+        // size-limit refusals.
+        if cmd == "AiAttach" {
+            self.message = "Usage: :AiAttach <path>".to_string();
+            return EngineAction::None;
+        }
+        if let Some(path_arg) = cmd.strip_prefix("AiAttach ") {
+            self.acp_attach_file(path_arg);
+            return EngineAction::None;
+        }
+
+        // :AiPasteImage — attach whatever image is currently on the system
+        // clipboard as the next prompt's attachment (#1464): the ex-command
+        // "paste an image" entry point, since a raw Ctrl+V that finds no
+        // *text* on the clipboard never reaches the app at all (quadraui's
+        // Ctrl+V interception swallows the keypress rather than forwarding
+        // it — no image-paste event exists yet to bind to a literal Ctrl+V
+        // uniformly across backends; see `Engine::acp_attach_clipboard_image`'s
+        // doc for the capability/size gates this shares with `:AiAttach`).
+        if cmd == "AiPasteImage" {
+            self.acp_attach_clipboard_image();
+            return EngineAction::None;
+        }
+
         // Handle :e[dit]! — reload current file from disk (discard changes)
         if cmd == "edit!" {
             let buf_id = self.active_buffer_id();

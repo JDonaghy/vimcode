@@ -9630,6 +9630,8 @@ impl Engine {
             "AiMode",
             "AiAgent",
             "AiSessions",
+            "AiAttach ",
+            "AiPasteImage",
             // Markdown
             "MarkdownPreview",
             "MdPreview",

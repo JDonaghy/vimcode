@@ -280,6 +280,16 @@ sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# #1464: ACP `image` content blocks are `{"type":"image","mimeType",
+# "data":<base64>}` — `base64` is already resolved transitively (via
+# `termwiz`, confirmed in `Cargo.lock`), so pinning it as a direct
+# dependency for `AcpManualAttachment::content_block` costs nothing new in
+# the graph. `png` encodes the `RgbaImage` a clipboard-image paste reads
+# off `quadraui::Clipboard::read_image` into the PNG bytes that block's
+# `data` carries — also already resolved transitively (via `image`, itself
+# a dependency of `arboard`'s clipboard-image support), same reasoning.
+base64 = "0.22"
+png = "0.18"
 
 [dev-dependencies]
 insta = "1.39"
