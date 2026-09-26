@@ -1119,6 +1119,49 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiReview — open the combined review of everything the most
+        // recently completed ACP turn wrote (#1460), the same surface
+        // `PromptStopped` already opens automatically — this is the manual
+        // "look at it again" path, e.g. after closing it with Esc to keep
+        // editing. A status message, not an error, when there's nothing to
+        // review yet.
+        if cmd == "AiReview" {
+            self.cmd_ai_review();
+            return EngineAction::None;
+        }
+
+        // :AiRestore [id] — revert to a past ACP turn's checkpoint (#1460):
+        // every file that checkpoint (or a later one) touched reverts to
+        // its pre-turn content, except one a human has since hand-edited
+        // (refused, never clobbered — see `Engine::acp_restore_checkpoint`).
+        // No `id` restores the most recently completed turn.
+        if cmd == "AiRestore" {
+            match self.acp_restore_checkpoint(None) {
+                Ok(summary) => self.message = summary,
+                Err(e) => {
+                    self.message = e;
+                    return EngineAction::Error;
+                }
+            }
+            return EngineAction::None;
+        }
+        if let Some(arg) = cmd.strip_prefix("AiRestore ").map(|s| s.trim()) {
+            match arg.parse::<usize>() {
+                Ok(id) => match self.acp_restore_checkpoint(Some(id)) {
+                    Ok(summary) => self.message = summary,
+                    Err(e) => {
+                        self.message = e;
+                        return EngineAction::Error;
+                    }
+                },
+                Err(_) => {
+                    self.message = format!("Usage: AiRestore [checkpoint id] — got {arg:?}");
+                    return EngineAction::Error;
+                }
+            }
+            return EngineAction::None;
+        }
+
         // :AiMode          — show the agent's declared modes + which is current
         // :AiMode <target> — switch mode (matched by id or name) via
         //                    `session/set_mode` (#956, ACP-5)

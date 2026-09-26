@@ -9632,6 +9632,8 @@ impl Engine {
             "AiSessions",
             "AiAttach ",
             "AiPasteImage",
+            "AiReview",
+            "AiRestore",
             // Markdown
             "MarkdownPreview",
             "MdPreview",

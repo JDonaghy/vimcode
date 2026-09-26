@@ -3868,6 +3868,38 @@ pub struct Engine {
     /// pluggable per #527's own acceptance bar rather than hardcoded to
     /// one provider's format.
     pub review_findings_serializer: crate::core::review::FindingsSerializer,
+    /// Every file the in-flight ACP turn has written via `fs/write_text_
+    /// file` (#1460, on top of #954), captured the first time each path is
+    /// touched this turn. Rolled into a new
+    /// [`crate::core::acp_turn::AcpTurnCheckpoint`] (pushed onto
+    /// [`Self::acp_turn_checkpoints`]) and cleared once the turn ends
+    /// (`AcpEvent::PromptStopped`, `crate::core::engine::acp_turn_ops`) —
+    /// see that module for the write-hooking and end-of-turn wiring.
+    pub acp_current_turn_entries: Vec<crate::core::acp_turn::AcpTurnFileEntry>,
+    /// Completed turns' checkpoints (#1460), oldest first — each one a
+    /// restore point `:AiRestore` can pick (`Engine::acp_restore_
+    /// checkpoint`), and what `Engine::acp_open_turn_review` builds the
+    /// turn-review surface from. Monotonically increasing `id`s
+    /// ([`Self::acp_turn_checkpoint_counter`]) so a restore never collides
+    /// with one dropped by an earlier restore.
+    pub acp_turn_checkpoints: Vec<crate::core::acp_turn::AcpTurnCheckpoint>,
+    /// The next id [`Self::acp_turn_checkpoints`] hands out — a plain
+    /// counter, never reused even across a restore that drops checkpoints
+    /// from the history, so an id a human might reference (a future `:AiRestore
+    /// <id>` UI) never silently means two different turns over a session's
+    /// lifetime.
+    pub acp_turn_checkpoint_counter: usize,
+    /// `Some(checkpoint_id)` while [`Self::change_review`] is showing a
+    /// *turn* review (#1460) rather than a proposal review (#955's `diff`
+    /// content blocks, not yet applied to disk) — the two need opposite
+    /// `a`/`r` semantics in [`Self::handle_change_review_key`]: a turn
+    /// review's files are already written, so "keep" is a no-op decision
+    /// and "revert" must actually restore the pre-turn content, whereas a
+    /// proposal review's "accept" is the one that writes and "reject" is
+    /// the no-op. `None` for a proposal review, same as every other field
+    /// here that's specific to one review flavour (`review_card_id`, `review_
+    /// target`).
+    pub turn_review_checkpoint_id: Option<usize>,
 
     // --- DAP (Debug Adapter Protocol) state ---
     /// Multi-adapter DAP coordinator. None until first debug session is started.
@@ -5066,6 +5098,10 @@ impl Engine {
             review_card_id: None,
             review_comment_target: None,
             review_findings_serializer: crate::core::review::markdown_findings_serializer,
+            acp_current_turn_entries: Vec::new(),
+            acp_turn_checkpoints: Vec::new(),
+            acp_turn_checkpoint_counter: 0,
+            turn_review_checkpoint_id: None,
             dap_manager: None,
             dap_stopped_thread: None,
             dap_breakpoints: HashMap::new(),
@@ -6196,6 +6232,7 @@ pub(crate) fn diff_state_from_hunks(
 
 mod accessors;
 mod acp_ops;
+mod acp_turn_ops;
 mod board_ops;
 /// Re-exported so the GTK black-box harness's board test can share the one
 /// deadline-bounded wait for a backgrounded provider command instead of
