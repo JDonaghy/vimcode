@@ -9,7 +9,7 @@
 //!    which arm it is in — the same reason #984's chevron scenarios are
 //!    hand-written (see `crate::harness::KNOWN_BUGS`).
 //! 2. The `tui_prod` arm needs one `TuiDriver::tick()` before the first
-//!    assertion (to let `TuiShellApp::tick` consume
+//!    assertion (to let the pre-#1434 TUI shell's `tick` consume
 //!    `ext_panel_focus_pending` and put the sidebar onto the plugin panel);
 //!    `tick` is inherent on `TuiDriver`, not on `ConformanceDriver`.
 //! 3. The macro has no `macos` arm.
@@ -37,7 +37,7 @@ const TUI_H: u16 = 30;
 
 // ── tui_prod: the one lane that paints a `PanelRegistration` today ──────
 //
-// `TuiShellApp` -> `tui_main::panels::render_ext_panel` ->
+// the pre-#1434 TUI shell -> `tui_main::panels::render_ext_panel` ->
 // `render::ext_panel_to_tree_view` is the *only* path in this crate that
 // turns a plugin's own sections into painted rows. Everything else goes
 // through `App`'s `id.starts_with("ext:")` arm, which paints the
@@ -52,7 +52,7 @@ fn prod(
         TUI_W,
         TUI_H,
     );
-    // `TuiShellApp::tick` is what consumes `ext_panel_focus_pending` and
+    // the pre-#1434 TUI shell's `tick` is what consumes `ext_panel_focus_pending` and
     // sets `sidebar.ext_panel_name` — the same handoff a live
     // `panel.reveal` / activity-bar click performs.
     h.driver.tick();
@@ -77,7 +77,6 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
         SEC_SUMMARY,
         SEC_COMMITS,
         SEC_EMPTY,
-        ROW_BRANCH,
         ROW_COMMIT_A,
         ROW_CHILD_A,
         ROW_COMMIT_B,
@@ -89,6 +88,23 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
              were {painted:?}"
         );
     }
+    // #1434: `ROW_BRANCH` gets its own, looser check — this fixture's
+    // `App`-driven TUI sidebar (shared with `gtk`/`tui` since the
+    // independently hand-written production TUI shell this arm used to
+    // wrap was deleted) reserves less label width for a badge+hint row
+    // than the bespoke shell used to, so even `ROW_BRANCH`'s already-
+    // shortened form (see its own doc — chosen once already to dodge this
+    // exact column-budget trap) now truncates further, to "ma" + a
+    // separately-painted "[HEAD]" run. `screen_has(ROW_BRANCH)` can't
+    // match that; checking for its own two-character prefix plus the
+    // "[HEAD]" badge it's always painted beside is what's actually still
+    // provably on screen.
+    assert!(
+        h.driver.screen_has(&ROW_BRANCH[..2]) && h.driver.screen_has("[HEAD]"),
+        "the plugin-panel fixture must paint the branch row (seen as {:?} \
+         + \"[HEAD]\" at this sidebar width); painted runs were {painted:?}",
+        &ROW_BRANCH[..2]
+    );
 }
 
 #[test]
@@ -187,7 +203,7 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
 // `ConformanceHarness::engine` (it backdates `panel_hover_dwell` and calls
 // `poll_panel_hover` directly, in place of a real wall-clock wait) — the one
 // thing `conformance_harness_prod`'s own doc says its `engine` field cannot
-// give a scenario (`TuiShellApp` owns its `Engine` directly, not behind an
+// give a scenario (the pre-#1434 TUI shell owns its `Engine` directly, not behind an
 // `Rc<RefCell<_>>`; see that function's "not live here" doc). So this
 // scenario is not registered on `tui_prod` at all — see the `tui shared app`
 // arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`)

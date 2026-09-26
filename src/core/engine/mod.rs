@@ -3494,7 +3494,7 @@ pub struct Engine {
     /// matching GTK's `unwrap_or_default()` convention.
     pub menu_bar_rect: std::cell::Cell<quadraui::Rect>,
     /// #1029 (review, fix iteration 1): one-shot guard for
-    /// `TuiShellApp::handle`'s "stale hamburger-corner" interception.
+    /// the pre-#1434 TUI shell's `handle`'s "stale hamburger-corner" interception.
     /// Armed `true` exactly on a genuine `false -> true` transition of
     /// [`Self::menu_bar_visible`] caused by the hamburger reveal (not on
     /// the `PanelChanged` echoes `ShellAdapter` re-fires after every
@@ -3504,17 +3504,17 @@ pub struct Engine {
     ///
     /// **Spent (set back to `false`) by the very next user interaction,
     /// on every path** — not just by events that happen to reach
-    /// `TuiShellApp::handle` (review, #1029 iteration 2). Two spenders,
+    /// the pre-#1434 TUI shell's `handle` (review, #1029 iteration 2). Two spenders,
     /// one per path:
     ///
-    /// - `TuiShellApp::consume_hamburger_stale_click_guard`, called at
+    /// - the pre-#1434 TUI shell's `consume_hamburger_stale_click_guard`, called at
     ///   the top of `handle` before its `'dispatch` block, for every
     ///   event that reaches the app directly: a `MouseDown` (the one the
     ///   corner check is for), a keystroke, a scroll, a paste …
     ///   Pointer/window plumbing — `MouseUp` (the release half of the
     ///   reveal's own click!), `MouseMoved`, focus/resize/DPI — is
     ///   deliberately excluded, since none of it is the user moving on.
-    /// - `TuiShellApp::disarm_hamburger_stale_click_guard`, called from
+    /// - the pre-#1434 TUI shell's `disarm_hamburger_stale_click_guard`, called from
     ///   `on_shell_event`, for every click `ShellAdapter` hit-tests and
     ///   consumes *upstream* of `handle` — a real activity-bar panel icon
     ///   (Explorer/Search/Git/an extension panel), the Settings cog, a
@@ -4526,7 +4526,7 @@ pub struct Engine {
     /// `Backend` handle of its own — see `PendingFileDialog` (#572, `app.rs`)
     /// for the identical reason file dialogs are deferred rather than
     /// actioned inline. Drained every frame by `App::tick_dispatch` (GTK)
-    /// and `TuiShellApp::tick` (TUI), in FIFO order, via
+    /// and the pre-#1434 TUI shell's `tick` (TUI), in FIFO order, via
     /// `backend.services().open_url_result(..)` /
     /// `.reveal_in_file_manager(..)`. A `Vec` rather than a single `Option`
     /// (unlike `PendingFileDialog`) because a single frame can legitimately
@@ -5179,7 +5179,7 @@ impl Engine {
             // `AppShell` (which `App::shell_config` reads through
             // `app_shell.panels()` on every GUI backend) can no longer
             // silently drift out of order with `sidebar::FIXED_ACTIVITY_PANEL_IDS`
-            // — the same constant `TuiShellApp::build_shell_config` iterates
+            // — the same constant the pre-#1434 TUI shell's `build_shell_config` iterates
             // directly. See that function's doc for the two-sources-of-truth
             // history this replaces.
             app_shell: quadraui::AppShell::new(sidebar::engine_app_shell_panel_definitions(), 30.0),
@@ -5192,7 +5192,7 @@ impl Engine {
         // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
         // so this only ever needs to *hide* it here — but it's expressed via
         // the same bidirectional `Engine::sync_app_shell_sidebar_visibility`
-        // every other caller uses (`TuiShellApp::from_engine`, #1117) rather
+        // every other caller uses (the pre-#1434 TUI shell's `from_engine`, #1117) rather
         // than a second copy of the `autohide_panels` / `explorer_visible`
         // derivation, so the formula lives in exactly one place.
         engine.sync_app_shell_sidebar_visibility();

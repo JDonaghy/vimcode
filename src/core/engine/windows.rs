@@ -2670,7 +2670,7 @@ impl Engine {
     /// Where each backend calls it (both post-#540 ShellApp migration —
     /// `tui_main/mod.rs`'s pre-migration `event_loop`/`win_gui/mod.rs` this
     /// doc used to cite are both gone):
-    /// - **TUI** (`TuiShellApp::tick`, `tui_main/shell_app.rs`): drains
+    /// - **TUI** (the pre-#1434 TUI shell's `tick`, `tui_main/shell_app.rs`): drains
     ///   `tab_visible_counts`, populated by the same frame's `TabBars` rung
     ///   in `render_content`. Setting `Reaction::Redraw` is the async
     ///   twin of the "schedule one more draw" GTK does below — quadraui's

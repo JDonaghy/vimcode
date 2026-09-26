@@ -2226,7 +2226,7 @@ pub fn tab_switcher_to_quadraui_list_view(
 // ─── TabSwitcherGeometry ──────────────────────────────────────────────────
 //
 // #733 slice 1: the tab-switcher popup rect used to be computed twice — in
-// `TuiShellApp::render_content` (cell units, percent-of-columns) and in
+// the pre-#1434 TUI shell's `render_content` (cell units, percent-of-columns) and in
 // `src/gtk/mod.rs::render_content` (pixel units, clamp(350, 600)) — and the
 // GTK copy was *also* the only one fed to a click handler, which is why TUI
 // had no tab-switcher rung at all. One `compute`, two sizing constants,
@@ -3121,7 +3121,7 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
 // through terminal-flavoured renaming it has no ambiguity to resolve.
 //
 // `keyboard_enhanced` is TUI's kitty-protocol / `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-// flag (`TuiShellApp::setup`, `supports_keyboard_enhancement`). With it off, a
+// flag (the pre-#1434 TUI shell's `setup`, `supports_keyboard_enhancement`). With it off, a
 // handful of Ctrl+symbol chords arrive from the terminal as byte sequences
 // crossterm cannot distinguish from `Ctrl+<digit>` (Ctrl+\ arrives identically
 // to Ctrl+4, Ctrl+/ to Ctrl+7, Ctrl+Shift+[ to Ctrl+3, Ctrl+Shift+] to
@@ -4144,13 +4144,13 @@ pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
 /// width, clamped to [`ALT_SIDEBAR_WIDTH_MIN`]..=[`ALT_SIDEBAR_WIDTH_MAX`].
 ///
 /// The width itself cannot live in the resolver: TUI's authoritative copy is
-/// `TuiShellApp::sidebar_width` (which its end-of-dispatch sync pushes into the
+/// the pre-#1434 TUI shell's `sidebar_width` (which its end-of-dispatch sync pushes into the
 /// runner's `AppShell`), while GTK's is the runner `AppShell` itself, reached
 /// through `ShellContext::shell_mut`. The *clamp* is shared so the two cannot
 /// drift apart — which is the only part a user can observe.
 ///
 /// Both backends additionally configure their `AppShell` with these same two
-/// bounds (`TuiShellApp::shell_config`, `gtk::build_shell_config`), so
+/// bounds (the pre-#1434 TUI shell's `shell_config`, `gtk::build_shell_config`), so
 /// `AppShell::set_sidebar_width`'s own internal clamp cannot narrow the rung's
 /// range on one backend and not the other. That was live on GTK before #759:
 /// quadraui's generic default is `8.0..=50.0`, which TUI had already overridden
@@ -4389,7 +4389,7 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 // ─── Closing rungs (#762 / #734 slice 7) ────────────────────────────────────
 //
 // Slices 1–6 lifted the ladder's big tiers into this module. What was left
-// behind in the two surviving entry points — `TuiShellApp`'s
+// behind in the two surviving entry points — the pre-#1434 TUI shell's
 // `handle_key_pressed` and `App::handle_key_press` — was the residue: five
 // small tiers that each backend still stated for itself, three of them only
 // on one backend and therefore silently missing on the other. They are stated
@@ -4504,7 +4504,7 @@ pub fn dispatch_sidebar_panel_key(
 ///
 /// #1243: TUI now honours the *full* semantics via
 /// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
-/// `TuiShellApp::handle_key_pressed` calls it on this chord before returning
+/// the pre-#1434 TUI shell's `handle_key_pressed` calls it on this chord before returning
 /// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
 /// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
 /// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
@@ -4513,7 +4513,7 @@ pub fn dispatch_sidebar_panel_key(
 /// `Backend::request_full_repaint`'s own doc for why that default is
 /// correct rather than a gap. The same hook also covers the
 /// popup-disappearance clear this comment used to point at —
-/// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
+/// the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay` transition check.
 ///
 /// **#1393 (quadraui#1060 consume side): the Ctrl+L call site now has a
 /// driver test that proves the repaint itself**, not just the decision
@@ -4552,7 +4552,7 @@ pub fn is_force_redraw_key(
 
 /// Did an editor-anchored popup (the completions/hover-doc picker or the
 /// modal folder picker) that was visible last frame close this frame?
-/// (#1243, TUI-only — `TuiShellApp::render_content`'s `had_popup_overlay`.)
+/// (#1243, TUI-only — the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay`.)
 ///
 /// The transition that must call `quadraui::Backend::request_full_repaint`
 /// (quadraui#1037): a popup staying open, staying closed, or newly opening
@@ -4834,7 +4834,7 @@ pub enum CmdSelKeyRoute {
 /// That one-column skew is the whole reason this is worth stating once.
 ///
 /// Both backends populate `sel` from `Engine::cmd_sel` (#816): TUI's
-/// `TuiShellApp::handle_mouse_event` (#602) and GTK's press/drag handlers
+/// the pre-#1434 TUI shell's `handle_mouse_event` (#602) and GTK's press/drag handlers
 /// (`handle_mouse_click_msg` / `handle_mouse_drag_msg`, driven through
 /// `quadraui::CommandLineLayout::hit_test`) both arm the same engine-level
 /// field, and `CommandLineState::command_line_selecting` mirrors
@@ -5372,7 +5372,7 @@ pub fn apply_engine_action(
             // #1134: queue rather than shell out here — `apply_engine_action`
             // is shared by both backends via `EngineActionHost` and has no
             // `backend` handle of its own. `App::tick_dispatch` (GTK) /
-            // `TuiShellApp::tick` (TUI) drain `pending_platform_actions`
+            // the pre-#1434 TUI shell's `tick` (TUI) drain `pending_platform_actions`
             // through `PlatformServices` (`is_safe_url` was already applied
             // by whichever engine path produced this `EngineAction`).
             engine
@@ -5497,7 +5497,7 @@ pub fn apply_explorer_context_action(
 // `show_file_save_dialog`, a nested draw-and-read loop over
 // `FilePickerController` — so TUI can call it too.
 //
-// TUI doesn't need GTK's `tick()` deferral: `TuiShellApp::handle` already has
+// TUI doesn't need GTK's `tick()` deferral: the pre-#1434 TUI shell's `handle` already has
 // `backend: &mut dyn quadraui::Backend` in scope at both call sites that can
 // open one of these dialogs (the `open_file_dialog` menu action, and
 // `EngineAction::SaveWorkspaceAsDialog` via `TuiEngineActionHost`, which now
@@ -5565,7 +5565,7 @@ pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadr
 // statement ran, because the sync was spelled out fresh at each call site
 // instead of owned by one function every call site is required to reach.
 // [`sync_shell_event_shadow`] is that one function. Both `App::on_shell_event`
-// (GTK) and `TuiShellApp::on_shell_event` (TUI) now call it unconditionally,
+// (GTK) and the pre-#1434 TUI shell's `on_shell_event` (TUI) now call it unconditionally,
 // as the first thing they do, before any of their own id-specific branching —
 // so the shadow mutation itself can no longer be skipped by an early
 // `return` reached before it. The only door left for a backend to exclude an
@@ -5597,7 +5597,7 @@ pub trait ShellShadowSyncHost {
 
 /// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
 /// `engine.app_shell` (#1062). Shared by `App::on_shell_event` (GTK) and
-/// `TuiShellApp::on_shell_event` (TUI) — call this first, unconditionally,
+/// the pre-#1434 TUI shell's `on_shell_event` (TUI) — call this first, unconditionally,
 /// before any of the event's other id-specific handling; see the rung's
 /// header comment above for why the call must come first.
 pub fn sync_shell_event_shadow(
@@ -5631,7 +5631,7 @@ pub fn sync_shell_event_shadow(
 // ─── Shared menu-bar reveal/hide routing (#1427) ────────────────────────────
 //
 // A backend whose menu bar can be fully hidden (`Engine::menu_bar_toggleable`
-// — pre-#1427 only `TuiShellApp::setup` ever set this; now also `App::setup`
+// — pre-#1427 only the pre-#1434 TUI shell's `setup` ever set this; now also `App::setup`
 // on any backend whose `BackendCaps::window_chrome` is `false`, i.e. no real
 // window chrome to double as the titlebar the way GTK's does — #901/#552)
 // needs three pieces of behaviour a permanently-visible menu bar
@@ -5640,9 +5640,9 @@ pub fn sync_shell_event_shadow(
 // on the stale click a hamburger reveal leaves behind (#988/#1029), and a
 // hamburger `PanelDefinition` click that reveals the bar instead of
 // switching the (nonexistent) "Menu" sidebar panel. All five functions below
-// were `TuiShellApp` private methods before #1427; they are pure
+// were the pre-#1434 TUI shell private methods before #1427; they are pure
 // `&mut Engine` (plus, where a hit-test needs one, `&dyn Backend`/
-// `&ShellContext`) so both `App` and `TuiShellApp` can call the same body.
+// `&ShellContext`) so both `App` and the pre-#1434 TUI shell can call the same body.
 // Every one is a documented no-op on a backend that never sets
 // `menu_bar_toggleable`/never registers the hamburger panel (GTK/macOS/Win
 // today) — see each function's own doc — so callers wire them in
@@ -5704,7 +5704,7 @@ pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
 /// [`consume_hamburger_stale_click_guard`] — as a parameter rather than
 /// calling it internally, because that consume has to happen at the very
 /// top of `handle`/`handle_dispatch`, before *any* early exit (including
-/// ones this function's caller can't see, e.g. `TuiShellApp::handle`'s
+/// ones this function's caller can't see, e.g. the pre-#1434 TUI shell's `handle`'s
 /// panel-accelerator dispatch), while this function itself is called later,
 /// immediately before the caller's own `MenuSystem` intercept — see
 /// `consume_hamburger_stale_click_guard`'s own doc for why the two calls
@@ -5951,7 +5951,7 @@ pub fn reclaim_hamburger_sidebar_reservation(
 /// Gated on `engine.menu_bar_visible` too, not just "is the runner showing
 /// the hamburger" — `AppShell::new` defaults `active_panel` to index 0,
 /// which the hamburger occupies (`App::shell_config`'s `cell`-profile
-/// branch / `TuiShellApp::build_shell_config` both put it first), so a
+/// branch / the pre-#1434 TUI shell's `build_shell_config` both put it first), so a
 /// *fresh* runner starts "showing the hamburger" before any click ever
 /// happens. `menu_bar_visible` is what distinguishes an actual, user-driven
 /// reveal from that construction-time default — without it, this guard
@@ -6004,7 +6004,7 @@ pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellCont
 
 // ─── Shared tick-chore rung (#1248) ──────────────────────────────────────────
 //
-// `App::handle_poll_tick`/`tick_dispatch` (GTK) and `TuiShellApp::tick` (TUI)
+// `App::handle_poll_tick`/`tick_dispatch` (GTK) and the pre-#1434 TUI shell's `tick` (TUI)
 // each ran the *same* dozen-item background chore list every frame, written
 // out twice: sync each window's viewport from the last paint, re-check
 // tab-bar scroll offsets against what that paint measured, clear an expired
@@ -6112,7 +6112,7 @@ pub trait TickHost {
 /// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
 /// <buffer name>"`, or the bare app name with none open. Used to be
 /// formatted identically, and independently, in `App::handle_poll_tick` and
-/// `TuiShellApp::tick`; now the one string both [`TickHost::sync_window_title`]
+/// the pre-#1434 TUI shell's `tick`; now the one string both [`TickHost::sync_window_title`]
 /// impls format (#1248).
 pub fn window_title(engine: &Engine) -> String {
     engine
@@ -6123,7 +6123,7 @@ pub fn window_title(engine: &Engine) -> String {
 
 /// Carry out a queued [`crate::core::engine::PendingPlatformAction`] (open
 /// URL / reveal in file manager) via `backend`'s `PlatformServices`. Was
-/// `App::run_pending_platform_action` / `TuiShellApp::run_pending_platform_action`
+/// `App::run_pending_platform_action` / the pre-#1434 TUI shell's `run_pending_platform_action`
 /// — two copies differing only in how each reaches its `Engine` (#1248).
 pub fn run_pending_platform_action(
     engine: &mut Engine,
@@ -6146,14 +6146,14 @@ pub fn run_pending_platform_action(
 }
 
 /// Editor mode → hardware caret shape (#1109, moved here from
-/// `TuiShellApp::caret_shape_for_mode` by #1428 so `App` can share it):
+/// the pre-#1434 TUI shell's `caret_shape_for_mode` by #1428 so `App` can share it):
 /// block for Normal/Visual, bar for Insert, underline for a pending
 /// replace-char (`r`) command — the same three-way mapping the old
 /// hand-rolled crossterm cursor-style write used, now feeding
 /// `Backend::set_caret_shape` (quadraui#1015) instead.
 ///
 /// `sidebar_has_focus` is the caller's own "is a sidebar panel, not the
-/// editor, holding keyboard focus" answer — `TuiShellApp` passes
+/// editor, holding keyboard focus" answer — the pre-#1434 TUI shell passes
 /// `self.sidebar.has_focus`, `App` passes `engine.sidebar_has_focus()` (see
 /// each caller). Pure function, deliberately separate from either caller's
 /// `self.live`/no-op-by-default write gate right after it — see
@@ -9060,7 +9060,7 @@ fn breadcrumb_is_drawn(bc: &BreadcrumbBar) -> bool {
 ///
 /// `drag_active` is the one input that is not derivable from `screen`: the
 /// drag lives in each backend's own `render::TabDragState` (GTK's
-/// `App::tab_drag`, TUI's `TuiShellApp::tab_drag`), not in `ScreenLayout`.
+/// `App::tab_drag`, TUI's the pre-#1434 TUI shell's `tab_drag`), not in `ScreenLayout`.
 /// Both pass `tab_drag.source().is_some()`.
 pub fn compose_editor_band(
     engine: &Engine,
@@ -9158,7 +9158,7 @@ pub struct EditorBandUnits {
 }
 
 impl EditorBandUnits {
-    /// One terminal cell — what `TuiShellApp::paint_editor_band` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `paint_editor_band` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         tab_row_h: 1.0,
@@ -9260,7 +9260,7 @@ pub trait EditorBandHost<'screen> {
 }
 
 /// The shared **editor band** walk (#1251): the single ordered loop both
-/// `TuiShellApp::paint_editor_band` and `App::compose_editor_band_rungs` run
+/// the pre-#1434 TUI shell's `paint_editor_band` and `App::compose_editor_band_rungs` run
 /// over [`compose_editor_band`], replacing what used to be two hand-written
 /// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
 /// `TabTooltip` paint identically on both backends (modulo `units`) and are
@@ -9352,7 +9352,7 @@ pub fn paint_editor_band_rungs<'screen>(
 //     [`BottomOp::PanelHover`] is now composed (or not) at the top level where
 //     the absent branch is reachable.
 //   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no `else`
-//     at all, so `TuiShellApp::debug_toolbar_rect` kept its last value when
+//     at all, so the pre-#1434 TUI shell's `debug_toolbar_rect` kept its last value when
 //     the toolbar hid — while GTK's `else` zeroed the equivalent two caches.
 //     Two backends, two different halves of the same cache-clearing rule.
 //   * **the separated status line was composed in two different places.** TUI
@@ -9374,7 +9374,7 @@ pub fn paint_editor_band_rungs<'screen>(
 // a `BottomPanelController` — and `AppShellLayout::bottom_panel_bounds` with
 // it — but it models a single generic drawer, not vimcode's stack of five
 // independently-gated bands with a hover popup overhanging them; it is `None`
-// for `TuiShellApp` and unwired on GTK for exactly that reason (see
+// for the pre-#1434 TUI shell and unwired on GTK for exactly that reason (see
 // `bottom_chrome_rects_for_shell_content`'s doc comment). What vimcode stacks
 // below its editor column, and in what order, is vimcode's own app-level
 // composition. The *rasterisers* underneath every rung are already quadraui's
@@ -9387,7 +9387,7 @@ pub fn paint_editor_band_rungs<'screen>(
 // filed against a grep that read "0 uses in `src/app.rs`" as an unstarted
 // adoption. It isn't: both backends' zero call sites are deliberate (this
 // paragraph, `bottom_chrome_rects_for_shell_content`'s doc comment in
-// `tui_main/render_impl.rs`, and `TuiShellApp::render_content`'s own note by
+// `tui_main/render_impl.rs`, and the pre-#1434 TUI shell's `render_content`'s own note by
 // `BottomChromeRects`'s construction all record the same verdict), and the
 // "3 mentions in the TUI" #820 read as partial progress are those three
 // rejection notes, not partial implementation. The blocker restated: `AppShell`
@@ -9582,7 +9582,7 @@ pub(crate) fn bottom_band_fixture(panel_hover: bool) -> Vec<BottomOp> {
 /// its one header row).
 ///
 /// GTK recomputes this statelessly every frame — it has no persistent
-/// `quickfix_scroll_top` to advance from key events, the way `TuiShellApp`
+/// `quickfix_scroll_top` to advance from key events, the way the pre-#1434 TUI shell
 /// does — so it lived inline in `render_content` as eight lines of arithmetic.
 /// Shared here so the two backends cannot disagree about what "keep the
 /// selection visible" means.
@@ -9599,7 +9599,7 @@ pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
 /// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`; the
 /// only thing the two call sites ever differed on was where `scroll_offset`
 /// came from, which stays the caller's (GTK recomputes it via
-/// [`quickfix_scroll_top`], TUI carries `TuiShellApp::quickfix_scroll_top`
+/// [`quickfix_scroll_top`], TUI carries the pre-#1434 TUI shell's `quickfix_scroll_top`
 /// across frames so `:cnext` can advance it).
 pub fn paint_quickfix_rung(
     b: &mut dyn quadraui::Backend,
@@ -9654,7 +9654,7 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `render_content` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         terminal_scrollbar: None,
@@ -10075,7 +10075,7 @@ pub fn paint_tab_drop_overlay(
 //     consumes verbatim. The only vimcode code that still paints them itself is
 //     the **test-only** `tui_main::render_impl::draw_frame` (raw
 //     `frame.buffer_mut()` — `panels::render_activity_bar` and the `set_cell`
-//     separator column); it has had no production caller since the `TuiShellApp`
+//     separator column); it has had no production caller since the the pre-#1434 TUI shell
 //     cutover. So the "check quadraui first" verdict for these two rungs is
 //     *quadraui already owns them, and vimcode has already adopted it* — there
 //     is nothing to compose and no adoption issue to file.
@@ -10110,7 +10110,7 @@ pub struct FrameMetrics {
 }
 
 impl FrameMetrics {
-    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `render_content` composes in.
     pub const CELL: Self = Self {
         line_height: 1.0,
         char_width: 1.0,
@@ -10542,7 +10542,7 @@ pub fn paint_find_replace_rung(
 ///
 /// Building the `quadraui::CommandCenter` descriptor itself (the title
 /// string in particular — GTK derives it from `engine.cwd`, TUI from
-/// `TuiShellApp::window_title_stem`) stays at the call site; this is only
+/// the pre-#1434 TUI shell's `window_title_stem`) stays at the call site; this is only
 /// the paint + cache-set once that descriptor and its rect exist.
 pub fn paint_command_center_rung(
     b: &mut dyn quadraui::Backend,
@@ -10912,7 +10912,7 @@ fn branch_review_provenance_segment(
 /// cursor at the `bounds.x` it was handed — so adding the band's own `x` back
 /// on double-counts it, which is the bug quadraui hit and fixed internally
 /// (quadraui#494). This existed as three separate hand-written copies of the
-/// same `visible_items.last()` fold (GTK, `TuiShellApp`, `draw_frame`), each
+/// same `visible_items.last()` fold (GTK, the pre-#1434 TUI shell, `draw_frame`), each
 /// carrying its own transcription of that warning; #763 states it once.
 ///
 /// `fallback_x` is what an item-less bar returns: the leading edge the items
@@ -11114,7 +11114,7 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 /// backends drive an equivalent engine state and assert their recorded
 /// `composed_frame` equals *this* value, so the two sequences are equal to each
 /// other by construction. A single test cannot drive both backends (the GTK
-/// `App` lives in the `vimcode` bin target, `TuiShellApp` in `vcd`), so "both
+/// `App` lives in the `vimcode` bin target, the pre-#1434 TUI shell in `vcd`), so "both
 /// backends emit the same `FrameOp` sequence for a given `ScreenLayout`" is
 /// expressed as two tests sharing one expected value — a single `#[cfg(test)]`
 /// fn compiled into both bin targets, so the compiler keeps them in step
@@ -18927,7 +18927,7 @@ pub fn build_activity_bar(
         (PANEL_BOARD, icons::BOARD.s(), "Board", "activity:board"),
     ];
 
-    // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
+    // #635 (Stage 6b): the pre-#1434 TUI shell's own `build_shell_config` derived
     // its own middle-panel `PanelDefinition` order from
     // `sidebar::FIXED_ACTIVITY_PANEL_IDS` rather than re-reading this array (it
     // can't — `fixed` is a local, and the two arrays carry different metadata
@@ -24901,7 +24901,7 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
 /// GTK/macOS/Win but wrong on a cell grid — e.g. `TAB_ROW_HEIGHT_PX` (35.0)
 /// read as 35 *rows* on an 80x24 terminal claims more rows than the terminal
 /// has, collapsing the entire editor content band. Every pair already had a
-/// `TUI_*`/cell-flavoured twin (built for the shipped `TuiShellApp`);
+/// `TUI_*`/cell-flavoured twin (built for the shipped the pre-#1434 TUI shell);
 /// `UnitProfile` just bundles "which half of each pair" into one value
 /// picked once, at construction, by code that already knows its own
 /// backend: [`Self::px`] for GTK/macOS/Win, [`Self::cell`] for the `tui`
@@ -24942,7 +24942,7 @@ pub struct UnitProfile {
     /// `App::render_content` already has in scope wherever it calls this.
     pub divider_metrics: fn(bool) -> DividerMetrics,
     /// [`gui_sidebar_system_metrics`] vs the fixed metrics
-    /// `TuiShellApp::from_engine` seeds every `SidebarSystem` with once at
+    /// the pre-#1434 TUI shell's `from_engine` seeds every `SidebarSystem` with once at
     /// startup (a cell grid never changes `line_height`, so TUI's never
     /// depends on the `f32`).
     pub sidebar_system_metrics: fn(f32) -> quadraui::MsvLayoutMetrics,
@@ -24954,7 +24954,7 @@ pub struct UnitProfile {
     /// height); `None` on TUI, which leaves
     /// [`quadraui::ShellConfig::activity_bar_width`]'s own default (a
     /// 3-line-height multiple) in charge — the same value
-    /// `TuiShellApp::build_shell_config` sets explicitly.
+    /// the pre-#1434 TUI shell's `build_shell_config` sets explicitly.
     pub activity_bar_width_px: Option<f32>,
     /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
     pub title_bar_lh: f32,
@@ -25019,7 +25019,7 @@ impl UnitProfile {
     /// `char_width` are always `1.0` (one terminal cell) — see that
     /// backend's own impl. Every value here is the cell-flavoured twin
     /// `px()` reads instead, matching the constant the shipped
-    /// `TuiShellApp` already paints with (named in each field's own doc
+    /// the pre-#1434 TUI shell already paints with (named in each field's own doc
     /// above).
     pub fn cell() -> Self {
         UnitProfile {
@@ -33133,7 +33133,7 @@ mod slice7_router_tests {
     ///
     /// **Verified RED by reordering one rung on one backend:** move
     /// `render::route_debug_fkey` above `render::route_terminal_key` in
-    /// `TuiShellApp::handle_key_pressed` and
+    /// the pre-#1434 TUI shell's `handle_key_pressed` and
     /// `terminal_keeps_its_own_function_keys` below fails — a focused PTY
     /// stops receiving F5 and the debugger starts a session instead.
     #[test]

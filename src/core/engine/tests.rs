@@ -473,7 +473,7 @@ fn test_qa_bang_force_quits() {
 /// `Engine::startup_without_session_restore` must ignore a per-workspace
 /// session file that `Engine::startup` would have honoured.
 ///
-/// This is the ambient-input class `TuiShellApp::new_for_test` exists to close:
+/// This is the ambient-input class the pre-#1434 TUI shell's `new_for_test` exists to close:
 /// `Engine::new_for_test()` only replaces the two *global* config reads
 /// (`settings.json` / `session.json`), while `restore_session_files()` does a
 /// second, independent `SessionState::load_for_workspace(&self.cwd)` read keyed

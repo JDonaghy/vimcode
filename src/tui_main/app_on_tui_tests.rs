@@ -8,7 +8,7 @@ mod tests {
     //! [`crate::tui_main::testing::conformance_harness`]. This module drives
     //! it through a representative slice of the same scenarios
     //! `src/tui_main/shell_app.rs`'s own `#[cfg(test)] mod tests` already
-    //! covers for the *shipped* TUI shell (`TuiShellApp`) — reusing that
+    //! covers for the *shipped* TUI shell (the pre-#1434 TUI shell) — reusing that
     //! module's test names where the assertion body transfers unmodified (so
     //! `grep`-ing a name finds both halves of the comparison), and picking a
     //! new, descriptive name where `App`'s own construction/fields differ
@@ -338,8 +338,8 @@ mod tests {
     //
     // #1430 tranche 1: the activity-bar half of the "key dispatch, activity
     // bar, sidebar panels" slice. Every test below is a mechanical port of
-    // its `shell_app.rs` namesake (`TuiShellApp::new_for_test`/`TuiShellApp::
-    // new(None)` → [`plain_engine`]/[`harness`], `app.engine.*` → the local
+    // its `shell_app.rs` namesake (the pre-#1434 TUI shell's `new_for_test`/
+    // `new(None)` → [`plain_engine`]/[`harness`], `app.engine.*` → the local
     // `Engine` before it's handed to [`harness`]) — see this module's own
     // "No production code here" doc at the top of the file.
     // ─────────────────────────────────────────────────────────────────────────
@@ -1483,7 +1483,7 @@ mod tests {
         /// needle bracketing *both* popup borders, restored below) since it
         /// only drives `TuiDriver`'s public `type_char`/
         /// `terminal_cursor_position`/`find_bounds` API, none of which is
-        /// `TuiShellApp`-specific.
+        /// the pre-#1434 TUI shell-specific.
         ///
         /// #1432 re-diagnosed this, in two layers:
         ///
@@ -1610,7 +1610,7 @@ mod tests {
 
         /// `count` file tabs, zero-padded so no name is a substring of
         /// another. Mirrors `shell_app.rs`'s `app_with_many_file_tabs_and_
-        /// switcher_open` fixture builder, minus the `TuiShellApp`-specific
+        /// switcher_open` fixture builder, minus the the pre-#1434 TUI shell-specific
         /// sidebar-hiding (this module's [`harness_no_sidebar`] does that
         /// after construction instead).
         fn engine_with_two_file_tabs_and_switcher_open() -> crate::core::Engine {
@@ -1917,7 +1917,7 @@ mod tests {
             // reserve and paint its own GTK-style menu-bar row (File Edit
             // View Go Run Terminal Help) on every backend; the shipped TUI
             // shell only ever showed that row in vscode-mode or when
-            // Alt-revealed, so its tab bar sat on row 0 where TuiShellApp's
+            // Alt-revealed, so its tab bar sat on row 0 where the pre-#1434 TUI shell's
             // own mirrored test expects it and `App`'s did not.
             // `App::setup`'s `BackendCaps::window_chrome`/`native_menu`
             // three-way branch now matches — this label is no longer in
@@ -2008,7 +2008,7 @@ mod tests {
         /// anywhere to the right of the tab label — paint-only twin of
         /// `shell_app.rs`'s `unsplit_editor_composes_no_group_divider_rung_via_shell_app`
         /// (that test additionally inspects `composed_editor_band`, a private
-        /// `TuiShellApp` field with no `App` equivalent reachable from this
+        /// the pre-#1434 TUI shell field with no `App` equivalent reachable from this
         /// harness).
         #[test]
         fn unsplit_editor_paints_no_group_divider_glyph() {
@@ -2024,7 +2024,7 @@ mod tests {
                     // Locate the tab row by content, not by assuming row 0 — `App`
                     // reserves its own permanent menu-bar row above the tab bar
                     // (see `tab_bar::render_content_paints_single_group_tab_bar_via_shell_app`'s
-                    // own doc), unlike the shipped TUI's `TuiShellApp` fixture the
+                    // own doc), unlike the shipped TUI's the pre-#1434 TUI shell fixture the
                     // mirrored `shell_app.rs` test assumes.
                     let (tab_y, tab_start) = screen
                         .lines()
@@ -3375,7 +3375,7 @@ mod tests {
     // #1428: terminal-shell behaviours keyed on `BackendCaps`
     // ─────────────────────────────────────────────────────────────────────────
     //
-    // Five behaviours the shipped TUI (`TuiShellApp`) had that `App` lacked —
+    // Five behaviours the shipped TUI (the pre-#1434 TUI shell) had that `App` lacked —
     // see issue #1428's own description for the full audit. Each is a
     // capability read or a no-op on GUI backends, not a platform fork, so
     // each got wired into the shared `App`/`render.rs` rather than staying
@@ -3469,7 +3469,7 @@ mod tests {
         /// now feeds `Backend::set_caret_shape` is the exact shared
         /// `render::caret_shape_for_mode` TUI's own
         /// `caret_shape_for_mode_tracks_engine_mode_and_pending_replace`
-        /// pins (moved there from `TuiShellApp::caret_shape_for_mode`) —
+        /// pins (moved there from the pre-#1434 TUI shell's `caret_shape_for_mode`) —
         /// ported here against `App`'s own `Engine::sidebar_has_focus()`
         /// wiring (TUI passes `TuiSidebar::has_focus` instead; see each
         /// caller in `app.rs`/`shell_app.rs`).
@@ -3554,7 +3554,7 @@ mod tests {
         /// incremental diff would otherwise skip — mirrors
         /// `tui_main::shell_app`'s
         /// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
-        /// verbatim, against `App` instead of `TuiShellApp`.
+        /// verbatim, against `App` instead of the pre-#1434 TUI shell.
         ///
         /// RED-verified: removing `App::handle_key_press`'s
         /// `backend.request_full_repaint()` call makes the final assertion
@@ -3605,7 +3605,7 @@ mod tests {
         /// must forward the resize to any open terminal PTY
         /// (`render::route_terminal_resize`) — previously a no-op on GTK
         /// (and, transitively, on this `App`-on-TUI arm), unlike TUI's own
-        /// `TuiShellApp::handle` (#758 / #734 slice 3).
+        /// the pre-#1434 TUI shell's `handle` (#758 / #734 slice 3).
         ///
         /// Two `WindowResized` dispatches, not one: `App::
         /// painted_editor_content_width` (what `terminal_panel_cols` feeds
@@ -3656,7 +3656,7 @@ mod tests {
 
         /// #1428 acceptance: `App::tick_dispatch` must drain
         /// `App::pending_startup_msg` into `engine.message` (and request a
-        /// redraw) exactly as `TuiShellApp::tick` does — previously
+        /// redraw) exactly as the pre-#1434 TUI shell's `tick` does — previously
         /// unread on `App`, so the one-shot nerd-font nudge never reached
         /// the user at all on this arm.
         ///
@@ -3951,7 +3951,7 @@ mod tests {
             // right after the command ran) leaves `ai_has_focus` set —
             // *persistently*, by design (the whole point of the reveal),
             // unlike the one-shot *request* itself. On `App` (unlike
-            // `TuiShellApp`'s own separate `TuiSidebar::has_focus` latch),
+            // the pre-#1434 TUI shell's own separate `TuiSidebar::has_focus` latch),
             // `route_focus_key`'s `sidebar_band_focused` gate is literally
             // `Engine::sidebar_has_focus()` — the disjunction that includes
             // `ai_has_focus` — so every keystroke, including `:`, now
@@ -4068,7 +4068,7 @@ mod tests {
     // not `crate::`-private items (`conformance_harness`,
     // `ConformanceHarness`, `App` itself). That restriction is the point:
     // it proves an *external* crate could write these same two tests once
-    // `seam_657.rs` is re-pointed at this seam instead of `TuiShellApp`
+    // `seam_657.rs` is re-pointed at this seam instead of the pre-#1434 TUI shell
     // (which #1434 is about to delete).
     // ─────────────────────────────────────────────────────────────────────
     mod app_on_tui_seam {

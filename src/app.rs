@@ -358,7 +358,7 @@ impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
 }
 
 /// [`render::TickHost`] impl for GTK — the tick-time background chores
-/// `App::handle_poll_tick` shares with TUI's `TuiShellApp::tick` (#1248).
+/// `App::handle_poll_tick` shares with TUI's the pre-#1434 TUI shell's `tick` (#1248).
 /// Holds `app: &mut App` and `backend` as plain borrows, same shape as
 /// [`GtkEngineActionHost`]/[`GtkAccelHost`] above.
 ///
@@ -790,7 +790,7 @@ pub(crate) struct App {
     /// old TUI-local `FolderPickerState`/native `gtk4::FileDialog` split.
     /// `render_content` (`&self`) needs to *read* it while `handle_key_press`
     /// (`&mut self`) mutates it, hence the `RefCell` — mirrors
-    /// `dialog_layout` above. `TuiShellApp` carries the identical field type.
+    /// `dialog_layout` above. the pre-#1434 TUI shell carries the identical field type.
     pub(crate) folder_picker: RefCell<Option<quadraui::FolderPickerController>>,
     /// Edge-trigger flag for #727's native message-dialog path: `true`
     /// once a native present has been queued (or already shown) for the
@@ -828,14 +828,14 @@ pub(crate) struct App {
     /// (`TreeControllerEvent::RowSelected`) and disarmed either into
     /// [`Self::explorer_drag_active`] (once the pointer moves to a
     /// different row) or back to `None` on release. Plain row indices, not
-    /// GTK-specific state — mirrors `TuiShellApp`'s identically-named field
+    /// GTK-specific state — mirrors the pre-#1434 TUI shell's identically-named field
     /// (#1429; see `render::apply_explorer_drag_move`/`apply_explorer_drop`,
     /// the shared functions both backends apply this through).
     pub(crate) explorer_drag_src: Option<usize>,
     /// `(src_row, target_row)` once an explorer drag-and-drop gesture has
     /// actually started (moved off the source row) — `target_row` is `None`
     /// while the pointer is outside the tree, keeping the gesture armed
-    /// without a drop target. Mirrors `TuiShellApp::explorer_drag_active`
+    /// without a drop target. Mirrors the pre-#1434 TUI shell's `explorer_drag_active`
     /// (#1429).
     pub(crate) explorer_drag_active: Option<(usize, Option<usize>)>,
     pub(crate) deferred: DeferredQueue,
@@ -1104,7 +1104,7 @@ pub(crate) struct App {
     /// `render_content` — every arm that draws pushes its own
     /// [`render::FrameOp`], and arms whose surface turned out to be absent do
     /// not. It is the *observable* that makes "both backends compose the frame
-    /// in the same order" testable: `TuiShellApp` keeps the identical field,
+    /// in the same order" testable: the pre-#1434 TUI shell keeps the identical field,
     /// and the two backends' recorded sequences are asserted equal against the
     /// same expected `Vec<FrameOp>` (`render::frame_sequence_fixture`).
     ///
@@ -1134,7 +1134,7 @@ pub(crate) struct App {
     /// once the sidebar collapsed.
     pub(crate) composed_bottom_band: Rc<RefCell<Vec<render::BottomOp>>>,
     /// Per-group tab-bar `available_cols`, as this frame's `TabBars` rung
-    /// actually painted them — the GTK twin of `TuiShellApp::tab_visible_counts`
+    /// actually painted them — the GTK twin of the pre-#1434 TUI shell's `tab_visible_counts`
     /// (#1165). `paint_tab_bars`'s doc used to say "TUI reads
     /// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
     /// `hits` for its pixel hit maps" as if that were a deliberate
@@ -1257,11 +1257,11 @@ pub(crate) struct App {
     /// **app-initiated** switch (e.g. `Engine::process_pending_sidebar`'s
     /// DAP `dap_wants_sidebar` reveal, or the `toggle_focus_explorer`/
     /// `toggle_focus_search` keyboard accelerators) the runner would
-    /// otherwise never learn about. Mirrors `TuiShellApp::last_shell_panel`
+    /// otherwise never learn about. Mirrors the pre-#1434 TUI shell's `last_shell_panel`
     /// verbatim — see that field's own doc for the full rationale. Plain
     /// field, not `Rc`/`RefCell`: `take_requested_panel` and
     /// [`Self::on_shell_event`] both take `&mut self`, so no interior
-    /// mutability is needed (matching `TuiShellApp`'s own field).
+    /// mutability is needed (matching the pre-#1434 TUI shell's own field).
     pub(crate) last_shell_panel: Option<quadraui::WidgetId>,
     /// #1064: set by `take_requested_panel` just before it returns `Some`,
     /// consumed by the `PanelChanged` arm of [`Self::on_shell_event`].
@@ -1272,14 +1272,14 @@ pub(crate) struct App {
     /// re-run the click path in `switch_panel`/`draw_needed`, which for an
     /// already-active `ext:` panel would toggle the sidebar back **off**
     /// (see `render::apply_activity_panel_switch`'s `already_showing`
-    /// arm). Mirrors `TuiShellApp::suppress_shell_panel_echo`.
+    /// arm). Mirrors the pre-#1434 TUI shell's `suppress_shell_panel_echo`.
     pub(crate) suppress_shell_panel_echo: bool,
     /// #1428: cached copy of `quadraui::BackendCaps::kitty_keyboard`, read
     /// once in `ShellApp::setup` (a live capability probe, not a
-    /// construction-time decision — see `TuiShellApp::keyboard_enhanced`'s
+    /// construction-time decision — see the pre-#1434 TUI shell's `keyboard_enhanced`'s
     /// own doc, ported here verbatim) and threaded into every
     /// `render::engine_key_from_ui` call this file makes. Defaults `false`
-    /// (every constructor's assembled default, same as `TuiShellApp::new`),
+    /// (every constructor's assembled default, same as the pre-#1434 TUI shell's `new`),
     /// which resolves the disambiguation the same conservative way a
     /// terminal without the kitty protocol needs — a hardcoded `true` here
     /// used to feed `engine_key_from_ui` the wrong answer on any such
@@ -1288,7 +1288,7 @@ pub(crate) struct App {
     pub(crate) keyboard_enhanced: bool,
     /// #1428: a one-shot startup notice queued in [`App::assemble`] and
     /// drained by the first `tick()`/`handle_poll_tick` — mirrors
-    /// `TuiShellApp::pending_startup_msg` verbatim (see that field's own
+    /// the pre-#1434 TUI shell's `pending_startup_msg` verbatim (see that field's own
     /// doc for why the nudge exists and why it can only be computed once,
     /// at construction, rather than every frame). `None` on every
     /// GUI-backend `App` (`units.is_gui_backend` — GTK/macOS/Win-GUI all
@@ -1302,7 +1302,7 @@ pub(crate) struct App {
     /// `App::new_portable`), `false` for every test/headless construction
     /// (`App::new_headless_with_backend`, which every test seam —
     /// `crate::gtk::testing`, the macOS driver-tier test, and the `tui`
-    /// harness arm — funnels through). Mirrors `TuiShellApp::live`'s own
+    /// harness arm — funnels through). Mirrors the pre-#1434 TUI shell's `live`'s own
     /// doc: gates exactly one call, `tick_dispatch`'s
     /// `backend.set_caret_shape` write, from running under a test harness.
     /// `Backend::set_caret_shape`'s only real-writing override
@@ -1311,11 +1311,11 @@ pub(crate) struct App {
     /// own — so calling it during a `conformance_harness`/`app_on_tui_
     /// tests` driver's `tick()` would emit a raw DECSCUSR escape sequence
     /// into the test process's real stdout on every tick, exactly the
-    /// corruption `TuiShellApp::live` exists to prevent. GTK/macOS/Win-GUI
+    /// corruption the pre-#1434 TUI shell's `live` exists to prevent. GTK/macOS/Win-GUI
     /// never override the hook (a genuine no-op there), so this gate only
     /// ever changes behaviour for a `TuiBackend`-backed `App` — today that
     /// is test-only, since no live TUI-via-`App` entry point exists yet
-    /// (`tui_main::run` still runs `TuiShellApp`, not `App` — see
+    /// (`tui_main::run` still runs the pre-#1434 TUI shell, not `App` — see
     /// `GOALS.md`'s milestone #7).
     pub(crate) live: bool,
 }
@@ -1704,7 +1704,7 @@ impl App {
     ///   own crash hook, since this constructor backs a `test-support`
     ///   seam) could dereference. Exactly the hazard
     ///   [`Self::new_headless_with_backend`]'s own doc names, and the one
-    ///   `TuiShellApp::setup`'s `if self.live` gate exists to avoid on the
+    ///   the pre-#1434 TUI shell's `setup`'s `if self.live` gate exists to avoid on the
     ///   production TUI path (`src/tui_main/shell_app.rs`).
     /// - **Passes `live: false`** to [`Self::assemble`], not `true` — see
     ///   `App::live`'s own doc: that flag gates `tick_dispatch`'s
@@ -1732,7 +1732,7 @@ impl App {
     /// Map a built-in activity-bar panel id to its glyph — the single table
     /// every backend's `shell_config` builder resolves icons from (#1107).
     ///
-    /// Before this, `tui_main::shell_app::TuiShellApp::shell_config` carried
+    /// Before this, the pre-#1434 TUI shell's own `build_shell_config` carried
     /// its own icon literal (zipped positionally against
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS`), entirely independent of this
     /// match — which is exactly how the search panel ended up resolving to
@@ -1827,7 +1827,7 @@ impl App {
         // backend whose `BackendCaps::window_chrome` is `false` — see
         // `App::setup`'s three-way branch) the menu bar starts hidden and is
         // fully hideable, so it needs a hamburger `PanelDefinition` to
-        // reveal it — the pre-#1427 `TuiShellApp::build_shell_config`'s own
+        // reveal it — the pre-#1434 TUI shell's `build_shell_config`'s own
         // first panel, ported here verbatim (same id/icon/title/tooltip).
         // `px()` backends (GTK/macOS/Win) never take this branch, so their
         // shadow-`app_shell`-derived `top_panels` list is unaffected — the
@@ -1899,7 +1899,7 @@ impl App {
         // instead (`App::setup`'s three-way branch), so its *initial*
         // reservation has to follow the engine's own already-resolved
         // `menu_bar_visible` (true only in vscode-mode — `Engine::new`'s own
-        // default) the same way `TuiShellApp::build_shell_config`'s
+        // default) the same way the pre-#1434 TUI shell's `build_shell_config`'s
         // `menu_bar_visible` parameter did pre-#1427. Every dispatch after
         // frame zero keeps this in sync via `render::sync_menu_bar_title_row`.
         if !self.units.is_gui_backend {
@@ -1916,8 +1916,8 @@ impl App {
         // `tests/conformance/caps.rs`), so setting it there is inert today
         // and each backend adopts it on its own schedule with no
         // vimcode-side change needed. `UnitProfile::cell()` (the `tui`
-        // harness arm) leaves it off, matching `TuiShellApp::
-        // build_shell_config`, which never calls this either.
+        // harness arm) leaves it off, matching the pre-#1434 TUI shell's
+        // `build_shell_config`, which never calls this either.
         if self.units.client_side_titlebar {
             cfg = cfg.with_client_side_titlebar();
         }
@@ -1926,8 +1926,8 @@ impl App {
         // font makes it oblong — `UnitProfile::px()` pins a fixed-pixel
         // width. `UnitProfile::cell()` leaves this `None`, so
         // `ShellConfig::activity_bar_width`'s own default (a 3-line-height
-        // multiple) stays in charge, matching `TuiShellApp::
-        // build_shell_config`'s explicit `3.0`. Assigned to the field
+        // multiple) stays in charge, matching the pre-#1434 TUI shell's
+        // `build_shell_config`'s explicit `3.0`. Assigned to the field
         // directly — `ShellConfig`'s own builder method does the identical
         // one-line `Some(..)` assignment.
         cfg.activity_bar_width_px = self.units.activity_bar_width_px;
@@ -1975,7 +1975,7 @@ impl App {
     /// `gdk::Display::default()` and panics outright with no `DISPLAY`, and
     /// `register_emergency_engine` would leave a dangling `*const Engine` in a
     /// process-global once a short-lived test's `App` is dropped (the same
-    /// soundness trap #635 documented on `TuiShellApp::live`).
+    /// soundness trap #635 documented on the pre-#1434 TUI shell's `live`).
     ///
     /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation;
     /// none of it touches GDK. `backend` is taken as a parameter rather than
@@ -2111,7 +2111,7 @@ impl App {
     }
 
     /// Build an `App` around a caller-supplied, fully in-memory [`Engine`] with
-    /// **no** display-dependent setup — the GTK twin of `TuiShellApp::new` for
+    /// **no** display-dependent setup — the GTK twin of the pre-#1434 TUI shell's `new` for
     /// tests (#646). Feed the result to `crate::gtk::testing::harness`, which
     /// wraps it in `quadraui::gtk::testing::driver_with_shell`.
     ///
@@ -3134,7 +3134,7 @@ impl App {
     /// (`sidebar_visible()`) was already correct, only the paint wasn't.
     fn sync_runner_sidebar_visibility(&self, ctx: &quadraui::ShellContext<'_>) {
         // #1427: moved to `render::sync_runner_sidebar_visibility`, shared
-        // with `TuiShellApp` — see its own doc, including the #1029/#988
+        // with the pre-#1434 TUI shell — see its own doc, including the #1029/#988
         // hamburger guard this method used to lack entirely (harmless on
         // GTK/macOS/Win, which never register the hamburger panel).
         render::sync_runner_sidebar_visibility(&self.engine.borrow(), ctx);
@@ -3154,7 +3154,7 @@ impl App {
     /// from the runner's own `AppShell`, reachable solely through
     /// `ShellContext::shell_mut` (see `handle_key_press`'s doc comment on
     /// `ctx`, and TUI's identical shadow/runner split documented on
-    /// `TuiShellApp::on_shell_event`). Without pushing the change through,
+    /// the pre-#1434 TUI shell's `on_shell_event`). Without pushing the change through,
     /// `should_autohide_sidebar` flips a flag nothing paints from and the
     /// sidebar visually stays open.
     fn run_post_key_epilogue(&mut self, ctx: &quadraui::ShellContext<'_>) {
@@ -3272,7 +3272,7 @@ impl App {
         // #1248: the rest of this function's chores — per-window viewport
         // sync, tab-visibility re-check, window title, yank-highlight clear,
         // idle/SC polling, deferred quit, terminal command, ext-panel focus,
-        // platform-action drain — are shared with `TuiShellApp::tick`. See
+        // platform-action drain — are shared with the pre-#1434 TUI shell's `tick`. See
         // `render::run_shared_tick_chores`'s header comment for the full
         // list and why the pieces left in `GtkTickHost` below differ.
         let engine_rc = self.engine.clone();
@@ -4424,7 +4424,7 @@ impl App {
     /// shared walk by #1251) and recover this frame's `FrameHitMap` from it.
     ///
     /// Walks `render::paint_editor_band_rungs`, the single loop both this
-    /// method and `TuiShellApp::paint_editor_band` now call — see that
+    /// method and the pre-#1434 TUI shell's `paint_editor_band` now call — see that
     /// function's doc and `GtkEditorBandHost`'s for exactly which four rungs
     /// still need a per-backend body and why. Extracted out of
     /// `render_content` (#766) so that function reads as the frame's *order*.
@@ -4636,7 +4636,7 @@ impl App {
                         continue;
                     };
                     // GTK has no persistent `quickfix_scroll_top` to advance
-                    // from key events (unlike TUI's `TuiShellApp`), so the
+                    // from key events (unlike TUI's the pre-#1434 TUI shell), so the
                     // "keep the selection visible" offset is recomputed
                     // statelessly each frame — through the shared
                     // `quickfix_scroll_top`, so the two backends cannot
@@ -6531,7 +6531,7 @@ impl App {
     /// The `TreeController` widget dispatch itself — populate, re-apply the
     /// paint-time metrics, `handle()`, resolve a `ContextMenuRequested` —
     /// is [`render::route_explorer_tree_event`], shared with TUI's
-    /// `TuiShellApp::handle_mouse_event` explorer intercept. What stays here
+    /// the pre-#1434 TUI shell's `handle_mouse_event` explorer intercept. What stays here
     /// is GTK-only plumbing: which events this panel claims at all
     /// (`dominated`), pulling the metrics/backend/theme it needs to make the
     /// call, and its own draw-invalidation bookkeeping.
@@ -8479,7 +8479,7 @@ impl App {
     /// here via `apply_dialog_action`, can also request exit.
     fn tick_dispatch(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
         // ── Terminal chrome the runner doesn't own (#1428) ──────────────
-        // Mirrors `TuiShellApp::tick`'s identical rung verbatim, including
+        // Mirrors the pre-#1434 TUI shell's `tick`'s identical rung verbatim, including
         // the `self.live` gate — see `Self::live`'s own doc for why an
         // unconditional call would corrupt a `TuiBackend`-backed test
         // harness's real stdout. A no-op on GTK/macOS/Win-GUI either way
@@ -8540,7 +8540,7 @@ impl App {
         self.handle_poll_tick(backend);
 
         // #1428: the one-shot nerd-font startup nudge — mirrors
-        // `TuiShellApp::tick`'s identical drain (`pending_startup_msg`),
+        // the pre-#1434 TUI shell's `tick`'s identical drain (`pending_startup_msg`),
         // unconditional on `Self::live`, unlike the caret-shape write
         // above: this only ever writes to `engine.message`, never touches
         // the real terminal, so there is nothing here a test harness needs
@@ -8563,12 +8563,12 @@ impl App {
 impl quadraui::ShellApp for App {
     fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
         // #1428: read the live kitty-keyboard-protocol capability once, at
-        // setup time — mirrors `TuiShellApp::setup`'s identical read
+        // setup time — mirrors the pre-#1434 TUI shell's `setup`'s identical read
         // (`self.keyboard_enhanced = backend.backend_caps().kitty_keyboard`)
         // verbatim, except unconditional rather than gated behind TUI's own
         // `self.live` (that gate exists solely because a *second*,
         // TUI-only, direct crossterm round-trip used to live at this call
-        // site before #1109 — see `TuiShellApp::setup`'s own doc; reading
+        // site before #1109 — see the pre-#1434 TUI shell's `setup`'s own doc; reading
         // `backend_caps()` itself is a plain field access on every backend,
         // never I/O, so there is nothing here for a "don't do this under a
         // test harness" gate to protect against). A GUI backend's
@@ -8577,7 +8577,7 @@ impl quadraui::ShellApp for App {
         // terminal-only ambiguity this flag exists to disambiguate — see
         // `render::engine_key_from_ui`'s own doc), so this is a no-op there;
         // TUI's own capability is unaffected by living on the shared `App`
-        // instead of `TuiShellApp` — `backend.backend_caps()` reads the same
+        // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
         // `TuiBackend` state either way.
         self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
         // Seed cached metrics from runner defaults.
@@ -8664,7 +8664,7 @@ impl quadraui::ShellApp for App {
             // #1427: no OS menu bar to hide behind (`native_menu`) and no
             // window chrome for the drawn row to double as (`window_chrome`)
             // — the `cell` profile (TUI-via-`App`) today. The bar is fully
-            // hideable at runtime (mirrors pre-#1427 `TuiShellApp::setup`,
+            // hideable at runtime (mirrors the pre-#1434 TUI shell's `setup`,
             // `event_loop`'s `mod.rs:797`) and starts however
             // `Engine::new` already resolved `menu_bar_visible` (`true`
             // only in vscode-mode) — left untouched here, unlike the two
@@ -8723,7 +8723,7 @@ impl quadraui::ShellApp for App {
         // `engine.menu_bar_toggleable` (the `cell` profile; always `false`
         // on GTK/macOS/Win). See `render::reclaim_hamburger_sidebar_
         // reservation`'s own doc; mirrors pre-#1427
-        // `TuiShellApp::render_content`'s identical rebind.
+        // the pre-#1434 TUI shell's `render_content`'s identical rebind.
         let corrected_layout = render::reclaim_hamburger_sidebar_reservation(&engine, layout);
         let layout = &corrected_layout;
 
@@ -9300,7 +9300,7 @@ impl quadraui::ShellApp for App {
                 // to port — `draw.rs::draw_find_replace_popup` — but it routed
                 // through `Surface::FindReplace` with a rect the rasteriser
                 // ignores; calling `Backend::draw_find_replace` directly (same
-                // trait method TUI's `TuiShellApp::render_content` calls) is
+                // trait method TUI's the pre-#1434 TUI shell's `render_content` calls) is
                 // simpler and identical in effect. The GTK rasteriser positions
                 // the panel from its own `panel.group_bounds` (already absolute
                 // pixel coordinates — #550, same as TUI's absolute cell
@@ -9352,7 +9352,7 @@ impl quadraui::ShellApp for App {
                 // percent-of-terminal-columns sizing, which wouldn't make sense
                 // in pixel space); content comes from the same shared
                 // `render::tab_switcher_to_quadraui_list_view` adapter TUI's
-                // `TuiShellApp::render_content` uses, through
+                // the pre-#1434 TUI shell's `render_content` uses, through
                 // `Backend::draw_list`.
                 render::FrameOp::TabSwitcher => {
                     if let Some(ref ts) = screen.tab_switcher {
@@ -9590,7 +9590,7 @@ impl quadraui::ShellApp for App {
     /// response to `AppShell::handle`'s own click hit-testing, or this poll
     /// — so it silently kept showing the previous panel's title forever.
     ///
-    /// `TuiShellApp::take_requested_panel` already had this override (see
+    /// the pre-#1434 TUI shell's `take_requested_panel` already had this override (see
     /// its own doc for the shared mechanics, mirrored verbatim here); this
     /// is the same logic against `App`'s fields.
     fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
@@ -9637,7 +9637,7 @@ impl quadraui::ShellApp for App {
                 // #1427: the hamburger panel only exists on the `cell`
                 // profile (`Self::shell_config`) — reveal the menu bar
                 // instead of switching to a nonexistent shadow panel.
-                // Mirrors pre-#1427 `TuiShellApp::on_shell_event`'s own
+                // Mirrors the pre-#1434 TUI shell's `on_shell_event`'s own
                 // hamburger arm, now shared via
                 // `render::route_hamburger_panel_changed`; see its own doc.
                 // A no-op check on GTK/macOS/Win, which never register this
@@ -9684,7 +9684,7 @@ impl quadraui::ShellApp for App {
                 // #1360: a built-in panel's activity-bar icon click must move
                 // keyboard focus into that panel, exactly as TUI's own
                 // `PanelChanged` arm does (`focus_sidebar_panel` +
-                // `sidebar.has_focus = true` in `TuiShellApp::on_shell_event`)
+                // `sidebar.has_focus = true` in the pre-#1434 TUI shell's `on_shell_event`)
                 // — before this, GTK only redrew, so `render::route_focus_key`
                 // (which every keystroke passes through, see
                 // `Self::handle_key_press`'s "Shared focus-owner keyboard
@@ -9749,7 +9749,7 @@ impl quadraui::ShellApp for App {
                 // second click on an already-open bottom item (e.g.
                 // "bottom:settings") re-showed it instead of collapsing the
                 // sidebar like VS Code does for an active-tab click — while
-                // the old, hand-rolled `TuiShellApp::on_shell_event` (same
+                // the old, hand-rolled the pre-#1434 TUI shell's `on_shell_event` (same
                 // arm) already ran the toggle. Route through `switch_panel`,
                 // the same shared `render::apply_activity_panel_switch`
                 // call site `PanelChanged`'s ext-panel arm above already
@@ -9770,7 +9770,7 @@ impl quadraui::ShellApp for App {
         }
     }
 
-    /// #1057: the ctx-aware override TUI's `TuiShellApp` already had (its
+    /// #1057: the ctx-aware override TUI's the pre-#1434 TUI shell already had (its
     /// own title-bar sync, quadraui#617) — `App` only implemented the
     /// deprecated ctx-less [`Self::on_shell_event`] until now, so nothing
     /// here could ever push a shell-state change back into the runner's own
@@ -9812,7 +9812,7 @@ impl quadraui::ShellApp for App {
         // the hamburger apart from a real panel's own second click; the
         // shadow `engine.app_shell` has no hamburger `PanelDefinition` at
         // all (see `render::route_hamburger_panel_changed`'s doc). Mirrors
-        // pre-#1427 `TuiShellApp::on_shell_event_ctx`'s identical check, now
+        // the pre-#1434 TUI shell's `on_shell_event_ctx`'s identical check, now
         // shared via `render::route_hamburger_sidebar_hidden`. A no-op check
         // on GTK/macOS/Win, which never register this panel id.
         if matches!(event, quadraui::AppShellEvent::SidebarHidden)
@@ -9849,7 +9849,7 @@ impl quadraui::ShellApp for App {
         // `SidebarHidden` for a top-row panel itself and returns without
         // ever calling `Self::handle` — the one place `Self::handle`'s own
         // `render::sync_menu_bar_title_row` call can never reach. Mirrors
-        // pre-#1427 `TuiShellApp::on_shell_event_ctx`'s identical tail call
+        // the pre-#1434 TUI shell's `on_shell_event_ctx`'s identical tail call
         // — see that function's own doc for why running this on every path
         // (not just the hamburger arm above) is what makes any *future* arm
         // that flips `menu_bar_visible` get the same same-frame guarantee
@@ -9952,143 +9952,6 @@ mod portable_entry_point_tests {
         );
         assert_eq!(cfg.min_sidebar_width, render::ALT_SIDEBAR_WIDTH_MIN as f32);
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
-    }
-
-    /// #1107: `App::shell_config` (this GTK/macOS/Win-GUI builder) and
-    /// `TuiShellApp::build_shell_config` used to carry two entirely
-    /// independent icon tables for the built-in activity-bar panels — which
-    /// is exactly how the search panel ended up resolving to `SEARCH_COD`
-    /// on GTK and `SEARCH` on TUI for months before #950 noticed by
-    /// inspection and hand-aligned the two literals. Hand-aligning the
-    /// *values* doesn't stop the *tables* from drifting again the next time
-    /// either one gains a panel; this test pins the fact that both
-    /// backends now resolve every shared built-in panel id — not just
-    /// search — through the one `App::resolve_builtin_panel_icon` table
-    /// (#1107), so a future edit to only one of them fails here instead of
-    /// shipping a silent per-backend icon fork again.
-    ///
-    /// Note for reviewers: this does **not** go red against unfixed
-    /// `develop` — #950 already made the two *values* agree by hand. #1107
-    /// is the refactor that deletes the machinery which let them diverge in
-    /// the first place (no user-visible behaviour change), and this test is
-    /// the structural regression guard for it, not a bug-fix repro.
-    #[cfg(feature = "gui")]
-    #[test]
-    fn shell_config_resolves_the_same_icon_on_every_backend_for_every_shared_panel() {
-        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let app = App::new_headless(engine);
-        let gtk_cfg = app.shell_config();
-        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
-
-        let icon_for = |cfg: &quadraui::ShellConfig, id: &str| -> Option<String> {
-            cfg.panels
-                .iter()
-                .chain(cfg.bottom_items.iter())
-                .find(|p| p.id.as_str() == id)
-                .map(|p| p.icon.clone())
-        };
-
-        // Every built-in id both backends' `ShellConfig`s claim to carry —
-        // not just search, so a future panel doesn't get a free pass.
-        let shared_ids: Vec<&str> = gtk_cfg
-            .panels
-            .iter()
-            .chain(gtk_cfg.bottom_items.iter())
-            .map(|p| p.id.as_str())
-            .filter(|id| {
-                tui_cfg
-                    .panels
-                    .iter()
-                    .chain(tui_cfg.bottom_items.iter())
-                    .any(|p| p.id.as_str() == *id)
-            })
-            .collect();
-        assert!(
-            shared_ids.contains(&"panel:search"),
-            "precondition: both backends must claim the search panel for \
-             this test to mean anything"
-        );
-
-        for id in shared_ids {
-            let gtk_icon = icon_for(&gtk_cfg, id).unwrap();
-            let tui_icon = icon_for(&tui_cfg, id).unwrap();
-            assert_eq!(
-                gtk_icon, tui_icon,
-                "panel {id:?} resolved to different icons per backend \
-                 (GTK: {gtk_icon:?}, TUI: {tui_icon:?})"
-            );
-        }
-    }
-
-    /// #1166: `App::shell_config` (GTK/macOS/Win-GUI) derives its panel
-    /// *order* from `self.engine.app_shell.panels()` — the engine's shadow
-    /// `AppShell`, built by `Engine::new_from_state` from
-    /// `sidebar::engine_app_shell_panel_definitions()` — while
-    /// `TuiShellApp::build_shell_config` derives its order by iterating
-    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly. Both now trace back to
-    /// the same constant, but the icon test above only compares icons *per
-    /// id* — it never looks at relative order, so a future edit that
-    /// reintroduces an independent order for one side (e.g. a
-    /// hand-transcribed panel list, or a stray `.sort()`) would still pass
-    /// it while shipping a different activity-bar order per backend, the
-    /// same shape of bug #1107 fixed for icons. This pins order the same
-    /// way that test pins icons.
-    ///
-    /// Note for reviewers: like the icon test above, this does not go red
-    /// against unfixed `develop` — the hand-transcribed literal
-    /// `Engine::new_from_state` used to build `self.app_shell` from
-    /// happened to list the same six ids in the same order as
-    /// `FIXED_ACTIVITY_PANEL_IDS` already, so the *values* never
-    /// disagreed. #1166 is the refactor that deletes the second copy of
-    /// the order (no user-visible behaviour change) so the two can no
-    /// longer independently drift; this test is the structural regression
-    /// guard for that, not a bug-fix repro (verified red by temporarily
-    /// reverting `engine_app_shell_panel_definitions` to a hand-ordered
-    /// literal with two ids swapped: this test caught it, the icon test
-    /// above did not).
-    #[cfg(feature = "gui")]
-    #[test]
-    fn shell_config_resolves_the_same_panel_order_on_every_backend_for_every_shared_panel() {
-        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let app = App::new_headless(engine);
-        let gtk_cfg = app.shell_config();
-        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
-
-        let order_of = |cfg: &quadraui::ShellConfig| -> Vec<String> {
-            cfg.panels
-                .iter()
-                .chain(cfg.bottom_items.iter())
-                .map(|p| p.id.as_str().to_string())
-                .collect()
-        };
-        let gtk_order = order_of(&gtk_cfg);
-        let tui_order = order_of(&tui_cfg);
-
-        // Both orderings restricted to the ids the two backends share, each
-        // kept in that backend's own relative order — panels only one
-        // backend claims (extension panels; there are no built-in-only ids
-        // today) are irrelevant to whether the *shared* panels agree.
-        let shared_gtk_order: Vec<String> = gtk_order
-            .iter()
-            .filter(|id| tui_order.contains(id))
-            .cloned()
-            .collect();
-        let shared_tui_order: Vec<String> = tui_order
-            .iter()
-            .filter(|id| gtk_order.contains(id))
-            .cloned()
-            .collect();
-
-        assert!(
-            shared_gtk_order.iter().any(|id| id == "panel:search"),
-            "precondition: both backends must claim the search panel for \
-             this test to mean anything"
-        );
-        assert_eq!(
-            shared_gtk_order, shared_tui_order,
-            "GTK and TUI resolved the shared activity-bar panels to \
-             different relative orders (GTK: {gtk_order:?}, TUI: {tui_order:?})"
-        );
     }
 
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
@@ -10254,7 +10117,7 @@ mod portable_entry_point_tests {
     /// happened to touch `tab_scroll_offset` (`goto_tab`/`close_tab`/etc.).
     /// TUI already self-corrected within two frames via the identical
     /// `tab_visible_counts` → `post_draw_apply_widths` drain in
-    /// `TuiShellApp::tick`.
+    /// the pre-#1434 TUI shell's `tick`.
     ///
     /// Follows `handle_poll_tick_reloads_settings_changed_on_disk`'s
     /// established pattern of driving `App::handle_poll_tick` directly
@@ -10314,7 +10177,7 @@ mod portable_entry_point_tests {
         );
     }
 
-    /// #1360: the GTK mirror of `TuiShellApp`'s own
+    /// #1360: the GTK mirror of the pre-#1434 TUI shell's own
     /// `take_requested_panel_echo_does_not_steal_focus` (`src/tui_main/
     /// shell_app.rs`) — a *reconciliation* `PanelChanged` (the one
     /// `Self::take_requested_panel` synthesizes to steer the runner's own

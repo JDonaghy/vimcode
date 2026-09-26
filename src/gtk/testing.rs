@@ -146,20 +146,20 @@ pub struct Harness<A: AppLogic> {
     pub tab_switcher_popup_rect: Rc<std::cell::Cell<Option<quadraui::Rect>>>,
     /// The frame rungs the last frame actually composed, in composition order
     /// (#735, folded into one sequence by #766). The GTK half of the
-    /// cross-backend sequence-equality assertion — `TuiShellApp` carries the
+    /// cross-backend sequence-equality assertion — the pre-#1434 TUI shell carries the
     /// identical `composed_frame` and its `frame_sequence_*_via_shell_app`
     /// tests assert against the same expected `Vec<FrameOp>`
     /// (`render::frame_sequence_fixture`) for the same engine state.
     pub composed_frame: Rc<RefCell<Vec<crate::render::FrameOp>>>,
     /// The editor rungs the last frame actually composed, in composition order
     /// (#764). The GTK half of the cross-backend editor-band assertion —
-    /// `TuiShellApp` carries the identical `composed_editor_band` and its
+    /// the pre-#1434 TUI shell carries the identical `composed_editor_band` and its
     /// `editor_band_*_via_shell_app` tests assert against the same expected
     /// `Vec<EditorOp>` for the same engine state.
     pub composed_editor_band: Rc<RefCell<Vec<crate::render::EditorOp>>>,
     /// The bottom rungs the last frame actually composed, in composition order
     /// (#765). The GTK half of the cross-backend bottom-band assertion —
-    /// `TuiShellApp` carries the identical `composed_bottom_band` and its
+    /// the pre-#1434 TUI shell carries the identical `composed_bottom_band` and its
     /// `bottom_band_*_via_shell_app` tests assert against the same expected
     /// `Vec<BottomOp>` for the same engine state.
     pub composed_bottom_band: Rc<RefCell<Vec<crate::render::BottomOp>>>,
@@ -12779,7 +12779,7 @@ mod overlay_band_z_order {
     // (`frame_sequence_*_via_shell_app` / `overlay_band_*_via_shell_app`) and
     // asserts against the **same expected `Vec<FrameOp>`** for the same engine
     // state. A single test cannot drive both backends — the GTK `App` lives in
-    // the `vimcode` bin target, `TuiShellApp` in `vcd` — so "both backends emit
+    // the `vimcode` bin target, the pre-#1434 TUI shell in `vcd` — so "both backends emit
     // the same sequence" is expressed as two tests sharing one expected value.
     // Both call `render::frame_sequence_fixture()` /
     // `render::overlay_band_title_bar_only_fixture()` for that value — a
@@ -17504,7 +17504,7 @@ mod acquire_status_paint_1345 {
 /// `tui_main::shell_app::tests::extension_install_offer_toast_*`.
 ///
 /// Unlike the TUI `TuiDriver` (whose wrapped `ShellAdapter` keeps
-/// `TuiShellApp` crate-private, see that module's own comment on why),
+/// the pre-#1434 TUI shell crate-private, see that module's own comment on why),
 /// `Harness::engine` stays reachable (`Rc<RefCell<Engine>>`) for the whole
 /// test, so setup *and* the click-target lookups below can both read/drive
 /// it directly. Click targets come straight from `engine.toast_layout` —

@@ -35,14 +35,14 @@ impl Engine {
     /// derives it there, once, before anything else can touch it) — a
     /// caller that mutates `self.session` on an already-built `Engine` (as
     /// `Engine::new_for_test`'s own doc warns against) leaves it behind.
-    /// That staleness is not just cosmetic: `TuiShellApp::handle`'s own
+    /// That staleness is not just cosmetic: the pre-#1434 TUI shell's `handle`'s own
     /// runner-vs-shadow resync (`shell_app.rs`, "#634 smoke retry") pushes
     /// *this* shadow's `sidebar_visible()` onto the runner every dispatch,
     /// so a stale shadow doesn't just mis-answer a query — it actively
     /// hides a sidebar the runner had correctly showing (#1117).
     ///
     /// Callers: `Engine::new_from_state` (construction) and
-    /// `TuiShellApp::from_engine` (picks up whatever a caller mutated on
+    /// the pre-#1434 TUI shell's `from_engine` (picks up whatever a caller mutated on
     /// the engine after construction but before the shell app takes
     /// ownership of it — the only path this ever has real work to do on).
     pub fn sync_app_shell_sidebar_visibility(&mut self) {
@@ -73,13 +73,14 @@ pub const PANEL_SETTINGS: &str = "bottom:settings";
 
 /// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
 ///
-/// The TUI registers this as `panels[0]` of its live [`quadraui::AppShell`]
-/// (`tui_main::shell_app::TuiShellApp::live_shell_config`) and
+/// The pre-#1434 TUI shell used to register this as `panels[0]` of its live
+/// [`quadraui::AppShell`] (its own `live_shell_config`), and
 /// `render::build_activity_bar` mints the same id for its hamburger
 /// `ActivityItem`, so it is the one activity-bar id that is *already* shared
-/// across the two id spaces described on [`EXT_PANEL_ID_PREFIX`]. Promoted out
-/// of `tui_main::shell_app` (#536) so [`Engine::activity_bar_item_id`] can name
-/// the slot without the core depending on a backend module.
+/// across the two id spaces described on [`EXT_PANEL_ID_PREFIX`]. Promoted
+/// out of the deleted `tui_main::shell_app` (#536) so
+/// [`Engine::activity_bar_item_id`] can name the slot without the core
+/// depending on a backend module.
 ///
 /// GTK paints no hamburger (`include_hamburger = false`), but the slot still
 /// exists in the keyboard sequence there — `k` from Explorer lands on it and
@@ -115,7 +116,7 @@ pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
 
 /// The single source of truth for the fixed (non-hamburger, non-settings,
 /// non-dynamic-extension) activity-bar panel order. `render::build_activity_bar`'s
-/// `fixed` array and `tui_main::shell_app::TuiShellApp::shell_config`'s
+/// `fixed` array and the pre-#1434 TUI shell's `shell_config`'s
 /// `PanelDefinition` list both iterate this rather than hand-transcribing the
 /// order twice — a reordering here is now a one-line change both call sites
 /// pick up, instead of a silent drift only a snapshot test would catch.
@@ -165,7 +166,7 @@ fn fixed_panel_title_tooltip(id: &str) -> (&'static str, &'static str) {
 /// backends read that shadow shell's order straight through
 /// `App::shell_config` (`self.engine.app_shell.panels()`), so a reorder of
 /// `FIXED_ACTIVITY_PANEL_IDS` moved TUI's activity bar (which iterates the
-/// constant directly in `TuiShellApp::build_shell_config`) without moving
+/// constant directly in the pre-#1434 TUI shell's `build_shell_config`) without moving
 /// GUI's — exactly the icon-table split #1107 fixed, one level up. Building
 /// this list *from* the constant instead of beside it closes that gap:
 /// there is now one order both backends' `ShellConfig`s ultimately trace
@@ -209,8 +210,8 @@ impl Engine {
     /// Activity-bar [`quadraui::PanelDefinition`]s for every plugin-registered
     /// extension panel, sorted by name (#557).
     ///
-    /// Both backends' `ShellConfig` builders — `tui_main::shell_app::
-    /// TuiShellApp::live_shell_config` and `gtk::build_shell_config` — append
+    /// Both backends' `ShellConfig` builders — the pre-#1434 TUI shell's own
+    /// `live_shell_config` and `gtk::build_shell_config` — append
     /// this to their static panel list, and the TUI additionally re-syncs it
     /// into the live `AppShell` after every dispatch so a plugin that
     /// registers a panel *after* startup still gets an icon. Without it the
@@ -417,7 +418,7 @@ impl Engine {
     /// stepping for [`Self::activity_bar_move_down`] / [`Self::activity_bar_move_up`].
     ///
     /// Panel list and bottom-item list mirror the TUI's live `ShellConfig`
-    /// (`tui_main::shell_app::TuiShellApp::live_shell_config`) exactly:
+    /// (the pre-#1434 TUI shell's own `live_shell_config`) exactly:
     /// hamburger, the fixed panels, the dynamic extension panels sorted by
     /// name, then Settings pinned to the bottom. `AppShell`'s cursor spans
     /// `panels` then `bottom_items` as one sequence and saturates at both ends,

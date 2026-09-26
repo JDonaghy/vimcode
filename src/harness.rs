@@ -104,7 +104,7 @@
 //!   only here means the two rasterisers disagree, nothing about the TUI
 //!   binary users actually run.
 //! - `tui_prod` → [`crate::tui_main::testing::conformance_harness_prod`],
-//!   wrapping [`crate::tui_main::testing::TuiShellApp`] — the independently
+//!   wrapping [`crate::tui_main::testing::the pre-#1434 TUI shell`] — the independently
 //!   hand-written shell `tui_main::run` really ships (its own mouse
 //!   routing, its own render path). A scenario green on `gtk`+`tui` but red
 //!   on `tui_prod` is, by construction, the shipped TUI diverging from the
@@ -391,7 +391,7 @@ pub(crate) fn install_folder_picker(app: &App, dir: PathBuf) {
 /// `FolderPickerController::handle` path, and Esc dismisses it — the exact
 /// three things `src/tui_main/shell_app.rs`'s
 /// `folder_picker_paints_and_filters_via_shell_app` protects on the TUI
-/// side. TUI drives a different `ShellApp` impl (`TuiShellApp`, out of
+/// side. TUI drives a different `ShellApp` impl (the pre-#1434 TUI shell, out of
 /// this issue's scope — see `GOALS.md`), so this is new coverage for the
 /// GUI backends, not a duplicate of that test.
 ///
@@ -1040,7 +1040,7 @@ pub fn sidebar_ctrl_w_l_returns_focus_to_the_editor<D: ConformanceDriver + Drive
 /// panel. So Search -> `Ctrl-W h` (arm+toolbar-focus) -> `j` (select the
 /// next toolbar item, Debug) -> `l` (activate it) landing on the Debug
 /// panel's own painted content (case-insensitive `"debug"` — GTK's shared
-/// `App` titles this panel "RUN AND DEBUG", `TuiShellApp`'s own independent
+/// `App` titles this panel "RUN AND DEBUG", the pre-#1434 TUI shell's own independent
 /// `shell_config` titles it "Debug"; `"debug"` is a substring of both)
 /// proves the chord actually moved focus to the toolbar.
 ///
@@ -1513,7 +1513,7 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 // #1117 removed the last live entry here (`::tui_prod`'s chevron-click
 // scenario, filed by #1043 without a follow-up — see that issue and this
 // one for the full history). Root cause was a genuine `tui_main`-only
-// desync: `TuiShellApp::handle_mouse_event`'s `TreeController` intercept
+// desync: the pre-#1434 TUI shell's `handle_mouse_event`'s `TreeController` intercept
 // required `engine.app_shell.sidebar_visible()` — a shadow copy of sidebar
 // visibility tracked independently of what the runner's own `AppShell`
 // actually painted — in addition to `explorer_tree_rect.width > 0.0`, the
@@ -1896,7 +1896,7 @@ where
 /// cross-backend-shared shell, also what `gtk` wraps) on
 /// `quadraui::tui::TuiBackend` — it is the *control* that isolates
 /// "rasteriser difference" from "implementation difference". `tui_prod`
-/// wraps [`crate::tui_main::testing::TuiShellApp`] — the independently
+/// wraps [`crate::tui_main::testing::the pre-#1434 TUI shell`] — the independently
 /// hand-written shell `tui_main::run` actually ships. A scenario green on
 /// `gtk`+`tui` but red on `tui_prod` is, by construction, the shipped TUI
 /// diverging from the shared shell, not a paint-surface artifact — exactly
@@ -2045,7 +2045,7 @@ mod tests {
     // arm here red), confirming this is the same shared scenario body,
     // not a fork of it.
     //
-    // #1043 adds `tui_prod`: `TuiShellApp`'s own explorer click routing
+    // #1043 adds `tui_prod`: the pre-#1434 TUI shell's own explorer click routing
     // (`tui_main::mouse`) is a completely independent implementation of the
     // same #967 hit-band contract, so this is genuine new coverage, not
     // just a third copy of the same assertion.
@@ -2211,7 +2211,7 @@ mod tests {
     // `sc_hint_row_shows_only_while_focused` uses, RED-verified there.
     //
     // `gtk`-only, **not** registered on `tui_prod`: driving either
-    // scenario through `tui_prod` (`TuiShellApp` + `super::mouse::
+    // scenario through `tui_prod` (the pre-#1434 TUI shell + `super::mouse::
     // handle_mouse`) hits a second, entirely different pre-existing bug
     // from the header one above — a genuine `MouseDown` dispatched at
     // *any* point inside the SC panel (reproduced with a bare click on
@@ -2226,7 +2226,7 @@ mod tests {
     // at both this issue's own (800, 480) viewport and a plain (100, 30)
     // one, so it is not a viewport-size artifact either. `tui_prod`'s
     // sibling explorer coverage (`sweep_hit_band_integrity_proof` above)
-    // clicks through the identical `TuiShellApp`/`handle_mouse` pipeline
+    // clicks through the identical the pre-#1434 TUI shell/`handle_mouse` pipeline
     // successfully, so this is specific to the SC panel's own click arm
     // in `tui_main::mouse::handle_mouse`, not a `conformance_harness_prod`
     // limitation in general. This diff's own `tui_main/mouse.rs` change is
@@ -2722,7 +2722,7 @@ mod issue_983_row_click_selects_the_row_below {
     // extra to also run on TUI (`ConformanceDriver + DriverInput` is
     // TUI's own bound, not a GTK-only one — see this module's top doc on
     // "Which trait bound a scenario needs"), nor on `tui_prod` (#1043) —
-    // `TuiShellApp` renders the Settings panel through the same
+    // the pre-#1434 TUI shell renders the Settings panel through the same
     // `render::handle_settings_form_ui_event` shared code `App` does.
     crate::backend_conformance! {
         label: settings_row_sweep_hit_band_integrity,
@@ -2798,7 +2798,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
         // `Engine::sync_app_shell_sidebar_visibility`, which already ran
         // (inside `Engine::new_for_test()`, above) *before* this line set
         // the field — the same "mutate an already-built Engine" gap that
-        // method's own doc describes. `TuiShellApp::from_engine` (the
+        // method's own doc describes. the pre-#1434 TUI shell's `from_engine` (the
         // `tui_prod` arm's constructor) re-runs that sync itself, picking
         // this up; the `tui` arm's `App::new_headless_with_backend` does
         // not, so the shadow's `sidebar_visible()` would otherwise stay
@@ -2880,7 +2880,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     }
 
     // #1043: the `tui_prod` twin — same scenario, driven through the actual
-    // production TUI shell (`TuiShellApp`, its own independently
+    // production TUI shell (the pre-#1434 TUI shell, its own independently
     // hand-written `tui_main::mouse` hit-testing) instead of the shared
     // `App`. Its own `::tui_prod`-suffixed `KNOWN_BUGS` label, per this
     // module's own disambiguation rule (each backend arm needs its own
@@ -2954,7 +2954,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // and this harness's own "tui" conformance arm dispatch mouse events
 // through (see this module's own "Which trait bound a scenario needs" doc:
 // `crate::tui_main::testing::conformance_harness` wraps `App`, not the
-// production `TuiShellApp`/`tui_main::mouse.rs` -- a separate, hand-written
+// production the pre-#1434 TUI shell/`tui_main::mouse.rs` -- a separate, hand-written
 // stack that has its own, independently-written version of this same bug
 // shape, out of this issue's `src/harness.rs` scope) has **no vertical
 // scrollbar hit-test at all** in `handle_mouse_click_msg`: it hit-tests the
@@ -2993,7 +2993,7 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // Per this issue's own "report whether TUI reproduces" acceptance item:
 // **yes**, identically, because both `backend_conformance!` arms below
 // drive the exact same `src/app.rs` dispatch code (`ConformanceHarness`'s
-// "tui" arm wraps `App`, not `TuiShellApp` -- see above). That is good news
+// "tui" arm wraps `App`, not the pre-#1434 TUI shell -- see above). That is good news
 // under the Platform-Neutrality Rule: there is no backend-specific
 // scrollbar hit-test to delete, because neither backend has *any*
 // vertical-scrollbar hit-test in the shared dispatch path the fix would add
@@ -3012,11 +3012,11 @@ mod issue_984_explorer_chevron_needs_a_double_click {
 // for) — `App`'s `cached_screen_layout` is an `Rc<RefCell<Option<ScreenLayout>>>`
 // specifically so `ConformanceHarness::new_with_screen_layout` can keep a
 // live handle to it after `App` is moved into `driver_with_shell`.
-// `TuiShellApp`'s own layout cache (`last_layout`) is a private, non-`Rc`
+// the pre-#1434 TUI shell's own layout cache (`last_layout`) is a private, non-`Rc`
 // `RefCell`, so `crate::tui_main::testing::conformance_harness_prod` has no
 // live handle to hand back (`ConformanceHarness::screen_layout` is `None`
 // there — see that function's own doc). Porting this family needs either a
-// `TuiShellApp`-side `Rc`-wrapped accessor (a `shell_app.rs` change outside
+// the pre-#1434 TUI shell-side `Rc`-wrapped accessor (a `shell_app.rs` change outside
 // this harness-wiring issue's file scope) or a window-rect probe that
 // doesn't depend on it — filed as a follow-up rather than silently
 // skipped.
@@ -3299,7 +3299,7 @@ mod issue_987_group_scrollbar_inert_and_click_resizes {
 /// `develop` — what it proves is that the *architecture* converged. Per the
 /// issue's own "Proving it actually converged" section: `#1043`'s
 /// `tui_prod` arm is the only harness lens that actually drives
-/// `TuiShellApp`/`mouse.rs` — `issue_987_group_scrollbar_inert_and_click_
+/// the pre-#1434 TUI shell/`mouse.rs` — `issue_987_group_scrollbar_inert_and_click_
 /// resizes`'s own `tui` arm (immediately above) wraps the *shared* `App`
 /// instead (see that module's own "no `tui_prod` coverage" note), so it
 /// could never have caught `mouse.rs`'s copy drifting from `app.rs`'s. This
@@ -3453,7 +3453,7 @@ mod issue_1429_shared_mouse_routes {
     // `render_content`'s own `native_dialog_shown` edge-trigger rung
     // (#727), shared code with no backend check at all, so it fires for
     // `gtk` *and* `tui` (both wrap `App`) alike, not just `gtk`. Only
-    // `tui_prod` (`TuiShellApp`, its own independent paint path, never
+    // `tui_prod` (the pre-#1434 TUI shell, its own independent paint path, never
     // touches that rung) actually composes the dialog in-canvas, so only
     // that arm gets `screen_has("Confirm Move")` — `gtk` gets the
     // `native_dialog_shown`/`pending_native_dialog` edge-trigger hand-
@@ -3548,7 +3548,7 @@ mod issue_1429_shared_mouse_routes {
         }
         // Hermetic in-memory clipboard -- mirrors `setup_gtk_clipboard`'s
         // shape without touching the real desktop clipboard.
-        // `tui_prod`'s own `TuiShellApp::from_engine` installs its
+        // `tui_prod`'s own the pre-#1434 TUI shell's `from_engine` installs its
         // equally-hermetic thread-local stand-in over this (see
         // `tui_main::setup_tui_clipboard`'s `#[cfg(test)]` twin) -- either
         // way the write-then-read round trip this scenario drives through
@@ -3643,7 +3643,7 @@ mod issue_1429_shared_mouse_routes {
             );
             // `app-shell:sidebar-content` (the quadraui `AppShell` chrome
             // zone) is only registered by the shared `App` — `tui_prod`'s
-            // `TuiShellApp` doesn't compose through `AppShell` at all (its
+            // the pre-#1434 TUI shell doesn't compose through `AppShell` at all (its
             // own doc: "the independently hand-written shell"), so the
             // empty-space point is instead derived from the last painted
             // row's own bounds, which every arm paints identically: several
@@ -3787,7 +3787,7 @@ mod issue_986_confirm_prompt_never_built {
     //
     // #1043 adds `tui_prod`, still under the same un-suffixed
     // `KNOWN_BUGS` label: `execute.rs`'s `flags.contains('c')` early return
-    // is core code every shell (`App` and `TuiShellApp` alike) calls
+    // is core code every shell (`App` and the pre-#1434 TUI shell alike) calls
     // through the same `Engine::execute_command` path, so this bug (and
     // its eventual fix) is identical on all three arms — see this module's
     // own top doc on why the label is shared rather than per-backend here.
@@ -3913,9 +3913,9 @@ mod issue_986_confirm_prompt_never_built {
 /// (resolving `resolve_activity_bar_click`, including a `MenuToggle` arm)
 /// that #988's own "likely shape" guess pointed at as the bug site, wrongly
 /// -- it was confirmed-unreachable for a genuine single click: `AppShell`
-/// (`TuiShellApp::shell_config` registers every activity-bar item,
+/// (the pre-#1434 TUI shell's `shell_config` registers every activity-bar item,
 /// including the hamburger, as a real `PanelDefinition`) consumes the click
-/// into a semantic `AppShellEvent` upstream of `TuiShellApp::handle` ->
+/// into a semantic `AppShellEvent` upstream of the pre-#1434 TUI shell's `handle` ->
 /// `mouse::handle_mouse` entirely. Deleted.
 ///
 /// `tui_prod`-only (not `backend_conformance!`'s usual `[gtk, tui,
@@ -3930,7 +3930,7 @@ mod issue_986_confirm_prompt_never_built {
 /// of) the more thorough in-crate black-box coverage in
 /// `shell_app.rs`'s `driver_click_on_every_activity_bar_icon_opens_its_
 /// panel_via_shell_app` (all 6 fixed panels, Settings, and the hamburger,
-/// via `TuiShellApp::new_for_test` + real single clicks). This scenario
+/// via the pre-#1434 TUI shell's `new_for_test` + real single clicks). This scenario
 /// samples two of those targets through the independent `conformance_
 /// harness_prod` lens instead of repeating all of them: an ordinary fixed
 /// panel (Search) and the specific arm #988 named (the hamburger).
@@ -4007,7 +4007,7 @@ mod issue_1053_dead_activity_bar_block {
 /// #1057 (GOALS.md's 2026-09-16 audit, #1044, wave 1 item 5): a bottom
 /// activity-bar item (`shell_config`'s only one today, "bottom:settings")
 /// drifted between backends on a second click of the item it had *already*
-/// opened. `TuiShellApp::on_shell_event`'s `BottomItemClicked` arm ran
+/// opened. the pre-#1434 TUI shell's `on_shell_event`'s `BottomItemClicked` arm ran
 /// `Engine::toggle_sidebar_panel`, collapsing the sidebar on a second click
 /// -- `App::on_shell_event`'s own arm just called
 /// `app_shell.show_panel(id)` unconditionally, so a second Settings click
@@ -4023,7 +4023,7 @@ mod issue_1053_dead_activity_bar_block {
 ///
 /// Converged both backends onto `render::apply_activity_panel_switch`, the
 /// same shared toggle-decision function `App::switch_panel` and
-/// `TuiShellApp::activate_ext_panel` already called for the ext-panel case
+/// the pre-#1434 TUI shell's `activate_ext_panel` already called for the ext-panel case
 /// -- see `src/app.rs`'s `BottomItemClicked` arm (now `self.switch_panel
 /// (id.as_str().to_string())`) and `src/tui_main/shell_app.rs`'s, same arm
 /// (now `render::apply_activity_panel_switch(&mut self.engine, ...)`), for
@@ -4155,7 +4155,7 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
 /// This is a structural-convergence scenario, not a bug reproduction --
 /// the closest sibling in this wave is #1059's tab-bar-dispatch rung, whose
 /// own doc makes the same call: both `App::on_shell_event` and
-/// `TuiShellApp::on_shell_event` already produced the *same* observable
+/// the pre-#1434 TUI shell's `on_shell_event` already produced the *same* observable
 /// result for a real (non-hamburger, non-`ext:`) panel's open/close pair
 /// before this issue -- what was duplicated was the sync statements
 /// themselves, not the behaviour they produced. So this is not expected to
@@ -4163,9 +4163,9 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
 /// `tui` **and** `tui_prod`, is that all three arms still agree *after*
 /// being collapsed onto the one shared function -- per the issue's own
 /// "Proving it actually converged" section, the `tui_prod` arm is the only
-/// one that could have caught `TuiShellApp::on_shell_event`'s copy
+/// one that could have caught the pre-#1434 TUI shell's `on_shell_event`'s copy
 /// drifting from `App`'s during the convergence, since it is the only arm
-/// that drives the shipped `TuiShellApp` rather than the shared `App`.
+/// that drives the shipped the pre-#1434 TUI shell rather than the shared `App`.
 ///
 /// Exercises the Search panel's activity-bar icon: one click opens it
 /// (`PanelChanged`), a second click on the now-open icon closes it
@@ -4174,7 +4174,7 @@ mod issue_1057_bottom_item_click_toggles_sidebar {
 /// rendered proxy on TUI to assert on: `render::sync_shell_event_shadow`'s
 /// `SidebarResized` arm now pushes the drag-settled width into the shadow
 /// `engine.app_shell` on TUI too (previously nothing did -- nothing reads
-/// that copy's width back on TUI, `TuiShellApp::sidebar_width` is the
+/// that copy's width back on TUI, the pre-#1434 TUI shell's `sidebar_width` is the
 /// separate field its own column math actually reads), so there is no
 /// painted difference to assert on without asserting on state directly,
 /// which this repo's own testing rule (`CLAUDE.md`, "Rendered output, not
@@ -4260,9 +4260,9 @@ mod issue_1062_shell_event_shadow_sync {
 /// both still open a terminal pane via Terminal &#9656; New Terminal
 /// *after* being collapsed onto the one shared applier -- per #1063's own
 /// "Proving it actually converged" section, `tui_prod` is the only arm
-/// that could have caught `TuiShellApp`'s own `dispatch_post_key_action`
+/// that could have caught the pre-#1434 TUI shell's own `dispatch_post_key_action`
 /// drifting from the shared function during the convergence, since it is
-/// the only arm that drives the shipped `TuiShellApp` rather than the
+/// the only arm that drives the shipped the pre-#1434 TUI shell rather than the
 /// shared `App`; `tui` (wrapping `App`, the same shell `gtk` wraps) is
 /// what could have caught `GtkEngineActionHost` itself double-borrowing
 /// `Engine` or otherwise regressing GTK's menu path (see that struct's own
@@ -4339,7 +4339,7 @@ mod issue_1063_menu_action_engine_action_applier {
     // `explorer_chevron_click_toggles_dir_with_same_arity_as_label_click_tui`/
     // `_tui_prod`, above): `tui` is the control (`App`, the shell `gtk` also
     // wraps -- `GtkEngineActionHost`'s code runs here even though this
-    // arm never touches real GTK), `tui_prod` is the shipped `TuiShellApp`.
+    // arm never touches real GTK), `tui_prod` is the shipped the pre-#1434 TUI shell.
     // Structural-convergence proof, not a bug reproduction -- see this
     // module's own doc above for why it's not expected to go red against
     // pre-#1063 `develop`.
@@ -4376,7 +4376,7 @@ mod issue_1063_menu_action_engine_action_applier {
 /// user-visible bug here to reproduce), so this scenario is not expected to
 /// go red against pre-#1059 `develop`; what it proves is that the
 /// *architecture* actually converged -- the #1043 `tui_prod` arm is the only
-/// one that drives `TuiShellApp`/`mouse.rs` rather than the shared `App`, so
+/// one that drives the pre-#1434 TUI shell/`mouse.rs` rather than the shared `App`, so
 /// it's the only arm that could ever have caught the two deleted copies
 /// drifting apart from each other or from GTK, per the issue's "Proving it
 /// actually converged" section.
@@ -4405,7 +4405,7 @@ mod issue_1063_menu_action_engine_action_applier {
 /// below (`gtk`/`tui` both wrap the shared `App`, which already routed
 /// through `click::dispatch_tab_bar_target` before this issue -- they're the
 /// control, expected green before and after; `tui_prod` wraps the real
-/// `TuiShellApp`/`mouse.rs` this issue's fix touches, so it's the arm that
+/// the pre-#1434 TUI shell/`mouse.rs` this issue's fix touches, so it's the arm that
 /// actually exercises the deleted hand-rolled copies' replacement). The
 /// CloseTab scenario drops the `tui` arm -- see its own doc comment for an
 /// unrelated pre-existing gap that scenario's development surfaced.
@@ -4758,24 +4758,15 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 /// `take_requested_panel` lives on `App` itself with no backend-conditional
 /// code inside it, so both arms exercise the identical new override and
 /// both are expected to flip together. `tui_prod`
-/// (`crate::tui_main::testing::conformance_harness_prod`) is different in
-/// kind: it wraps `TuiShellApp`, the independently hand-written production
-/// TUI shell, which already had its own equivalent
-/// `take_requested_panel`/`last_shell_panel`/`suppress_shell_panel_echo`
-/// override *before* this issue — untouched by this fix — so it was
-/// already green and stays green throughout. Its role here is not to prove
-/// the new code red/green like `gtk`/`tui`; it's the "Proving it actually
-/// converged" check from the issue: showing the newly-added `App` override
-/// reconciles the same contract the shipped TUI shell already enforced,
-/// rather than merely doing *something* plausible on `App` in isolation.
-/// `tui_prod`'s own arm can't reach the trigger the `gtk`/`tui` arms use
-/// below (a direct `engine.focus_sidebar_panel` call through
-/// `ConformanceHarness::engine` — `conformance_harness_prod`'s own doc:
-/// that field is a disconnected placeholder for this arm, since
-/// `TuiShellApp` owns its `Engine` directly, not behind a shared `Rc`), so
-/// it drives the identical reconciliation through the Search-focus panel
-/// accelerator instead — see its own doc below for why that is a
-/// genuinely equivalent trigger, not a weaker substitute.
+/// (`crate::tui_main::testing::conformance_harness_prod`) used to be
+/// different in kind: it wrapped the independently hand-written production
+/// TUI shell #1434 deleted, which already had its own equivalent override
+/// *before* this issue and so stayed green throughout as a "proving it
+/// actually converged" check. #1434 made `conformance_harness_prod` a thin
+/// alias of `conformance_harness` (no second implementation is left to
+/// converge against), so `tui_prod` below is now built identically to
+/// `tui` — kept as a separate named arm only so existing `tui_prod`-
+/// suffixed labels elsewhere in this file keep resolving.
 ///
 /// Verified RED against unfixed `develop`: deleting `App`'s
 /// `take_requested_panel` override (falling back to the trait default
@@ -4783,9 +4774,7 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 /// `gtk()` — turns **both** the `gtk` and `tui` arms red, exactly as
 /// expected from them sharing `App`: the header stays on "EXPLORER"
 /// forever after the direct `focus_sidebar_panel(PANEL_SEARCH)` call
-/// below, in each arm. `tui_prod` stays green throughout, since
-/// `TuiShellApp`'s own override was never touched. Restored after
-/// confirming red.
+/// below, in each arm. Restored after confirming red.
 #[cfg(test)]
 mod issue_1064_take_requested_panel {
     use super::*;
@@ -4836,7 +4825,7 @@ mod issue_1064_take_requested_panel {
         // Poke the runner so `ShellAdapter::handle`/`apply_requested_panel`
         // polls `take_requested_panel` again — the same "direct engine
         // mutation, then a dispatch to force the poll" shape
-        // `TuiShellApp`'s own `take_requested_panel_reconciles_keyboard_
+        // the pre-#1434 TUI shell's own `take_requested_panel_reconciles_keyboard_
         // switch_once` unit test uses (`shell_app.rs`), applied here as a
         // black-box assertion on painted output instead of the
         // `Option<WidgetId>` `take_requested_panel` returns directly.
@@ -4891,68 +4880,23 @@ mod issue_1064_take_requested_panel {
         app_initiated_switch_reconciles_runner_chrome(&mut h.driver, &h.engine);
     }
 
-    /// `conformance_harness_prod` wraps the shipped `TuiShellApp`, which
-    /// owns its `Engine` directly rather than behind a shared `Rc` — its
-    /// `ConformanceHarness::engine` is a disconnected placeholder (see that
-    /// constructor's own doc), so the direct-mutation trigger the `gtk`/
-    /// `tui` arms above use has nothing live to reach on this arm.
-    ///
-    /// Dispatching the Search-focus panel accelerator instead reaches the
-    /// identical code shape: `TuiAccelHost::focus_search`
-    /// (`shell_app.rs`) calls `engine.toggle_sidebar_panel(PANEL_SEARCH)`
-    /// directly on the shadow, synchronously inside this one
-    /// `TuiShellApp::handle` dispatch — no runner click, exactly like the
-    /// direct-mutation trigger above. (GTK's own accelerator host instead
-    /// *defers* the equivalent call to `tick()` via `App::
-    /// toggle_focus_search`'s `DeferredAction` queue — `GtkDriver`'s
-    /// headless harness has no way to pump `tick()` at all, per its own
-    /// module doc's "No main loop" limit, which is why the `gtk` arm above
-    /// needs the direct-engine-mutation shape instead of this one.)
+    /// #1434: `conformance_harness_prod` is now a thin alias of
+    /// `conformance_harness` (the independently hand-written production TUI
+    /// shell this arm used to exercise is gone — see that function's own
+    /// doc) — so this arm is now built identically to `tui` above, live
+    /// `Rc<RefCell<Engine>>` included. Kept as a separate, named arm anyway
+    /// rather than deleted, so the many existing `tui_prod`-suffixed
+    /// scenarios and `KNOWN_BUGS` labels across this file keep resolving.
     #[test]
     fn tui_prod() {
-        let mut h = crate::tui_main::testing::conformance_harness_prod(engine_fixture(), 800, 480);
-        let driver = &mut h.driver;
-
-        // Unlike `App::new_headless_with_backend` (the `gtk`/`tui` arms'
-        // own constructor), `TuiShellApp::from_engine` boots with the
-        // sidebar hidden — Explorer is still the default *active* panel
-        // (index 0), just not visible yet, so one real click reveals it
-        // (`AppShell::handle_activity_click`'s "different panel, or
-        // already-active-but-hidden" branch — see the shared function
-        // above for the mirror-image case, an already-*visible* active
-        // panel, which toggles closed instead).
-        driver.click_text(crate::icons::EXPLORER.s());
-        assert!(
-            driver.screen_has("Explorer"),
-            "precondition: clicking the Explorer icon must open the \
-             sidebar on Explorer via the real runner click path"
-        );
-
-        driver.dispatch(quadraui::UiEvent::Accelerator(
-            quadraui::AcceleratorId::new(crate::render::ACC_FOCUS_SEARCH),
-            quadraui::Modifiers::default(),
+        let mut engine = engine_fixture();
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
         ));
-
-        // Not `screen_has("Search")`: `TuiShellApp::shell_config`'s own
-        // panel titles are title-case ("Explorer"/"Search"), unlike the
-        // shared `App`'s all-caps `PanelDefinition`s — and the Search
-        // panel's own *content* paints a "Search…" input placeholder
-        // (`render.rs`) regardless of whether the runner's chrome caught
-        // up, so a positive `screen_has("Search")` can't tell the two
-        // apart here (it already passed before this issue's fix, since
-        // the content pane was never the broken half). `!screen_has
-        // ("Explorer")` is the half that's actually diagnostic: the
-        // runner's stale chrome is the only remaining place "Explorer"
-        // could still be painted once the shadow has moved to Search.
-        assert!(
-            !driver.screen_has("Explorer"),
-            "#1064: an app-initiated panel switch (the Search-focus \
-             accelerator, which moves only the shadow `engine.app_shell`, \
-             not the runner's own chrome) must still steer the runner's \
-             sidebar-header title off the previous panel — proving \
-             TuiShellApp's own pre-existing `take_requested_panel` still \
-             agrees with App's new one"
-        );
+        engine.session.explorer_visible = true;
+        let mut h = crate::tui_main::testing::conformance_harness_prod(engine, 800, 480);
+        h.driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        app_initiated_switch_reconciles_runner_chrome(&mut h.driver, &h.engine);
     }
 }
 
@@ -4963,7 +4907,7 @@ mod issue_1064_take_requested_panel {
 /// three shells, each panel opened by a real click on its activity-bar
 /// icon, which found:
 ///
-/// | | `gtk` / `tui` (shared `App`) | `tui_prod` (`TuiShellApp`) |
+/// | | `gtk` / `tui` (shared `App`) | `tui_prod` (the pre-#1434 TUI shell) |
 /// |---|---|---|
 /// | Extensions header | " EXTENSIONS " — quadraui `AppShell::render`'s sidebar-header row, titled from `PanelDefinition.title` (`core/engine/sidebar.rs`) | runner header "Extensions" **and** `render_ext_sidebar`'s own " EXTENSIONS" row (doubled) |
 /// | Extensions search row | **none** | "Search extensions (press /)" |
@@ -5021,7 +4965,7 @@ mod issue_1256_sidebar_chrome {
         open_extensions(driver);
         // Case differs by arm, same as `settings_then_explorer_reclaims_
         // header` below: the shared `App`'s `PanelDefinition` titles are
-        // all-caps ("EXTENSIONS"), `TuiShellApp::shell_config`'s own are
+        // all-caps ("EXTENSIONS"), the pre-#1434 TUI shell's `shell_config`'s own are
         // title-case ("Extensions") — both are the shell's *one* header,
         // not a second hand-painted row (#1343 deleted the shipped TUI's
         // duplicate " EXTENSIONS" row that used to paper over this exact
@@ -5051,7 +4995,7 @@ mod issue_1256_sidebar_chrome {
         // Case differs by arm, same as `settings_then_explorer_reclaims_
         // header` below and `extensions_header_is_painted` above: the
         // shared `App`'s `PanelDefinition` titles are all-caps
-        // ("SETTINGS"), `TuiShellApp::shell_config`'s own bottom-item
+        // ("SETTINGS"), the pre-#1434 TUI shell's `shell_config`'s own bottom-item
         // title is title-case ("Settings").
         assert!(
             (driver.screen_has("SETTINGS") || driver.screen_has("Settings"))
@@ -5091,7 +5035,7 @@ mod issue_1256_sidebar_chrome {
         driver.click_text(crate::icons::EXPLORER.s());
 
         // Case differs by arm: the shared `App`'s `PanelDefinition`
-        // titles are all-caps ("EXPLORER"), `TuiShellApp::shell_config`'s
+        // titles are all-caps ("EXPLORER"), the pre-#1434 TUI shell's `shell_config`'s
         // own are title-case ("Explorer") — see this module's doc table.
         assert!(
             driver.screen_has("EXPLORER") || driver.screen_has("Explorer"),
@@ -5130,7 +5074,7 @@ mod issue_1256_sidebar_chrome {
         open_extensions(&mut h.driver);
         let inv = h.driver.inventory();
         // Case differs by arm (see `extensions_header_is_painted`'s doc) —
-        // `TuiShellApp::shell_config`'s title is "Extensions", not
+        // the pre-#1434 TUI shell's `shell_config`'s title is "Extensions", not
         // "EXTENSIONS"; sum both so a regression that reintroduces the
         // all-caps duplicate still trips this either way.
         let count = inv.count("EXTENSIONS") + inv.count("Extensions");
@@ -5259,7 +5203,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// `TAB_ROW_HEIGHT_PX`'s 35 rows) rather than collapsing the whole editor
 /// content band the way the pre-#1426 hardcoded pixel constants did.
 ///
-/// `tui_prod` (`TuiShellApp`) is not run as a second arm here: reaching an
+/// `tui_prod` (the pre-#1434 TUI shell) is not run as a second arm here: reaching an
 /// explorer-collapsed baseline on it needs two activity-bar clicks (its
 /// first click only selects Explorer — the runner's own `AppShell` starts
 /// on the hamburger panel while the engine's shadow copy already defaults
@@ -5270,7 +5214,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// That is a real, pre-existing quirk of `conformance_harness_prod`'s
 /// default reveal state — unrelated to `UnitProfile`, and orthogonal to
 /// what this scenario exists to pin down — so it is not encoded here as a
-/// hardcoded row expectation. `TuiShellApp`'s own row-0-tab-bar and
+/// hardcoded row expectation. the pre-#1434 TUI shell's own row-0-tab-bar and
 /// last-two-rows-status/command-line facts are already established
 /// separately and extensively by `shell_app.rs`'s own test suite (e.g. the
 /// `#[test]` this file's `tab_bar` module mirrors,
@@ -5287,7 +5231,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 /// once, so the sidebar was never actually collapsed, and separately the
 /// assertion assumed no breadcrumb row exists between the tab bar and the
 /// buffer's first line. A same-fixture debug dump of `tui_prod`
-/// (`TuiShellApp`, with the same double-click collapse) painted an
+/// (the pre-#1434 TUI shell, with the same double-click collapse) painted an
 /// *identical* layout — tab bar row 0, one blank breadcrumb row (empty
 /// because `[No Name]` has no path), buffer content row 2 — proving `App`
 /// was never diverging here at all. Fixed and ungated.
@@ -5443,7 +5387,7 @@ mod issue_406_sidebar_ctrl_w_navigates {
 /// `backends: [gtk, tui_prod]` only (no `tui`): `App::dispatch_context_menu_key`
 /// is shared code between the `gtk` arm and the `tui` "control" arm (`App` on
 /// `quadraui::tui::TuiBackend`), so `tui` would just be a second copy of the
-/// same result — `tui_prod` (`TuiShellApp`, the shell `tui_main::run` actually
+/// same result — `tui_prod` (the pre-#1434 TUI shell, the shell `tui_main::run` actually
 /// ships) is the one genuinely independent implementation, same reasoning
 /// `sc_hint_row_shows_only_while_focused` gives above.
 #[cfg(test)]
@@ -5472,6 +5416,20 @@ mod issue_1418_explorer_context_menu {
         engine.cwd = dir.clone();
         engine.explorer_rebuild_rows();
         engine.session.explorer_visible = true;
+        // #1434: `session.explorer_visible` alone leaves the shadow
+        // `engine.app_shell`'s `sidebar_visible()` stale — this scenario
+        // used to run only on `gtk` and the independently hand-written
+        // `tui_prod` shell (deleted by #1434), neither of which needed this
+        // reconciliation the way `App` on a `TuiBackend` does (see
+        // `render::sync_runner_sidebar_visibility`, called unconditionally
+        // on every dispatch, which would otherwise collapse the sidebar the
+        // moment this scenario's own `Enter` confirm below dispatches
+        // anything). `app_on_tui_tests.rs`'s own copy of this fixture
+        // already carries the identical fix (#1427) — this brings the two
+        // back in sync now that `tui_prod` also drives `App`.
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
         engine.open_explorer_context_menu(dir, true, 5, 5);
         engine.context_menu.as_mut().unwrap().selected = selected_idx;
         engine
@@ -5493,21 +5451,28 @@ mod issue_1418_explorer_context_menu {
         engine: engine_with_folder_ctx_menu("new_file", 0),
         size: (800, 480),
         body: |driver| {
-            // "file name..." rather than the full "New file name..." —
-            // TUI's `paint_edit_input` (quadraui `tui/tree.rs`) always
-            // overwrites the placeholder's first painted cell with an
-            // inverted-space cursor block, so the leading "N" never
-            // survives into a painted text run there (GTK draws the caret
-            // as a separate overlay rectangle instead, leaving its own
-            // text run intact) — a backend rasterization difference, not
-            // part of what this scenario is proving.
+            // "file name" rather than the full "New file name..." — TUI's
+            // `paint_edit_input` (quadraui `tui/tree.rs`) always overwrites
+            // the placeholder's first painted cell with an inverted-space
+            // cursor block, so the leading "N" never survives into a
+            // painted text run there (GTK draws the caret as a separate
+            // overlay rectangle instead, leaving its own text run intact)
+            // — a backend rasterization difference, not part of what this
+            // scenario is proving. #1434: also dropping the trailing
+            // "..." — the shared `App`'s fixed-width TUI sidebar, one
+            // level of tree nesting deep, truncates the placeholder's own
+            // ellipsis before the row's right edge (confirmed by hand: the
+            // painted row reads "…ew file name." with the trailing dots
+            // already past the column budget), the same truncation-
+            // tolerance `tui_main::app_on_tui_tests`' own copy of this
+            // scenario already applies for the identical reason.
             assert!(
-                !driver.screen_has("file name..."),
+                !driver.screen_has("file name"),
                 "precondition: nothing is being edited yet"
             );
             driver.press_named(NamedKey::Enter);
             assert!(
-                driver.screen_has("file name..."),
+                driver.screen_has("file name"),
                 "confirming 'New File...' must start the tree's inline-edit \
                  placeholder"
             );
@@ -5694,7 +5659,7 @@ mod issue_1418_explorer_context_menu {
 
 /// #1427: the TUI menu-bar reveal/hide rung (the #318 Alt+<letter> shim,
 /// the #988/#1029 hamburger-corner-click guard, and the hamburger panel's
-/// own reveal/hide) lifted out of `TuiShellApp` into shared `render.rs`
+/// own reveal/hide) lifted out of the pre-#1434 TUI shell into shared `render.rs`
 /// functions (`route_menu_bar_reveal`, `route_hamburger_panel_changed`,
 /// `route_hamburger_sidebar_hidden`, `sync_menu_bar_title_row`,
 /// `reclaim_hamburger_sidebar_reservation`) so `App` — the cross-backend-
@@ -5703,7 +5668,7 @@ mod issue_1418_explorer_context_menu {
 /// `App::setup` rather than reimplemented per backend.
 ///
 /// These are `tui`-arm ports of scenarios that, before #1427, only existed
-/// as `TuiShellApp`-only unit tests in `src/tui_main/shell_app.rs` (still
+/// as the pre-#1434 TUI shell-only unit tests in `src/tui_main/shell_app.rs` (still
 /// present there, unchanged, as the `tui_prod` proof the shipped TUI binary
 /// keeps agreeing with the shared implementation): `alt_letter_reveals_
 /// menu_bar_via_shell_app`, `driver_click_on_settings_toggle_with_menu_bar_
@@ -5711,7 +5676,7 @@ mod issue_1418_explorer_context_menu {
 /// after_reveal_hides_menu_bar`, and `hamburger_stale_click_position_after_
 /// reveal_still_hides_menu_bar`. Driving `App` on `quadraui::tui::TuiBackend`
 /// (via `crate::tui_main::testing::conformance_harness`) rather than
-/// `TuiShellApp` proves the shared implementation, not a second TUI-only
+/// the pre-#1434 TUI shell proves the shared implementation, not a second TUI-only
 /// reimplementation of it — see this module's own header doc, "Why `App`,
 /// not a fresh mock".
 ///
@@ -5763,7 +5728,7 @@ mod issue_1427_menu_bar_reveal_shared {
     /// that helper documents: (1) `Engine::new_for_test()`'s sidebar is
     /// hidden by default (`default_explorer_visible()` — a deterministic
     /// fixture must not depend on ambient `~/.config/vimcode` state, unlike
-    /// a bare `App::new`/`TuiShellApp::new`), which would leave the File
+    /// a bare `App::new`/the pre-#1434 TUI shell's `new`), which would leave the File
     /// dropdown painting flush against the left edge and erasing an
     /// editor-offset-0 marker; and (2), specific to the hamburger tests
     /// below: `App::shell_config`'s `cell`-profile hamburger
