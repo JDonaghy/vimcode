@@ -12089,7 +12089,42 @@ pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 /// *inside* the title bar and command-line rows instead of spanning them, so
 /// the edge grip can win only in that sliver and fall through to the
 /// row/scrollbar/minimap hit-test everywhere else in the row.
+///
+/// Caveat (#1528 acceptance criteria, stated explicitly so a reader of
+/// `window_resize_grip_stays_inside_the_scrollbar_gutter` below doesn't read
+/// it as proving *zero* overlap): the acceptance bar is "a press in the
+/// outermost ~4 px still resizes (E)", i.e. some overlap with the
+/// scrollbar/minimap gutter's own outermost pixels is expected and accepted
+/// — the fix's job is shrinking that overlap from a full row-height band down
+/// to this margin, not eliminating it.
 pub const WINDOW_RESIZE_GRIP_PX: f32 = 4.0;
+
+/// Does an outer-window resize press at `edge` land inside the band the
+/// change-review surface's own first row occupies (#1528 review of #955)?
+///
+/// The change-review surface is genuinely full-viewport, and its first diff
+/// row paints underneath the (visually hidden but still logically live) CSD
+/// title bar — i.e. it only ever overlaps the *top* of the window, never the
+/// bottom/left/right edges or the corners that don't touch North. So a press
+/// in the resize grip should still be allowed to arm a resize everywhere
+/// *except* where it would otherwise be reinterpreted as a click on that
+/// first diff row: `North`, and the two corners that include it
+/// (`NorthEast`/`NorthWest`).
+///
+/// Extracted to a pure function (rather than left as an inline `matches!` at
+/// the one call site in `App::handle`) so the *decision* — which edges a
+/// change-review surface may steal from resize — is unit-testable on its
+/// own, independent of `quadraui::gtk::testing::GtkDriver`'s inability to
+/// arm a real resize headlessly (no `gtk4::Window`, no captured GDK press —
+/// see `src/gtk/testing.rs`'s module doc "No window").
+pub fn resize_edge_overlaps_change_review_band(edge: quadraui::ResizeEdge) -> bool {
+    matches!(
+        edge,
+        quadraui::ResizeEdge::North
+            | quadraui::ResizeEdge::NorthEast
+            | quadraui::ResizeEdge::NorthWest
+    )
+}
 
 /// Build the inline minimize/maximize/close window-control buttons for the
 /// GTK client-side titlebar (#552).
@@ -30237,6 +30272,43 @@ mod tests {
     }
 
     // ── Outer window resize grip (#1528) ─────────────────────────────────
+    //
+    // Black-box coverage note (#1528 review, blocking finding #1/#2): this
+    // section is unit tests, not a `GtkDriver` black-box test, and that is a
+    // deliberate, stated exemption — not an oversight or a substitute chosen
+    // for convenience. `src/gtk/testing.rs`'s own module doc says "No
+    // window": `App::new_headless` never captures a `gtk4::Window`, so the
+    // pinned quadraui rev's `GtkBackend::begin_window_resize`,
+    // `begin_window_drag`, and `set_cursor` all early-return `false`/no-op on
+    // `self.window.is_none()` before touching anything a test could observe.
+    // Worse, `begin_window_resize`/`begin_window_drag` also require a
+    // `self.pending_window_press` captured from a *real* GDK press event
+    // (device/button/x/y/time) — something only `gtk/run.rs`'s live event
+    // controllers populate, never `GtkDriver::dispatch`'s synthesised
+    // `UiEvent`s. So in headless mode the resize-press block in
+    // `App::handle` never actually consumes the event either way (old
+    // full-row-height grip or this PR's thin grip) — both silently no-op
+    // and fall through — which means the specific real-world regression
+    // #1528 describes (a live window's resize arming and swallowing the
+    // press before the scrollbar/minimap/command-line ever sees it) cannot
+    // be reproduced through the existing harness at all, in either
+    // direction. This mirrors commit `4e2bd1e` ("wire GTK window
+    // edge-resize + resize cursor"), which shipped no test for the same
+    // reason ("Needs a real WM to smoke (Xvfb has no compositor)").
+    //
+    // What IS extracted and unit-tested below, because it doesn't need a
+    // window at all: `WINDOW_RESIZE_GRIP_PX`'s value (a regression guard on
+    // the constant, not the dispatch order) and
+    // `resize_edge_overlaps_change_review_band` (the actual decision
+    // function `App::handle` calls for blocking finding #3's fix, tested
+    // directly against its own inputs/outputs — this one *is* production
+    // logic, not just a constant, and the test fails if the logic
+    // regresses).
+    //
+    // Manual smoke test (see this fix's `SMOKE_TESTS` in the commit/PR):
+    // drag from each outer edge and corner of a live GTK window, with and
+    // without a change-review surface open, and confirm the cursor and
+    // resize both behave as the acceptance criteria describe.
 
     /// #1528: the grip must be thin — a handful of pixels, VS Code/Electron
     /// style — not `backend.line_height()` (16-22px). A full row-height grip
@@ -30284,6 +30356,45 @@ mod tests {
                  strip beyond it"
             );
         }
+    }
+
+    /// #1528 review (blocking finding #3): the change-review guard on the
+    /// edge-resize press must cover only the edges that actually overlap the
+    /// change-review surface's own first row — `North`/`NorthEast`/
+    /// `NorthWest` — and must NOT cover `South`/`SouthEast`/`SouthWest`/
+    /// `East`/`West`. A regression that widened the guard back to "every
+    /// edge" (the bug this test pins) would silently make a user unable to
+    /// resize from any edge at all while a change-review surface is open,
+    /// which is exactly the scope-creep the review caught.
+    ///
+    /// RED against the reverted fix: if `resize_edge_overlaps_change_review_
+    /// band` unconditionally returned `true` (i.e. `App::handle` gated ALL
+    /// edges on `change_review_open`, as this PR did before the fix), every
+    /// `assert!(!...)` below would fail. Verified by hand: with the function
+    /// body swapped for a bare `true`, `cargo test --lib resize_edge_overlaps`
+    /// fails at the `!resize_edge_overlaps_change_review_band(ResizeEdge::
+    /// South)` assertion.
+    #[test]
+    fn resize_edge_overlaps_change_review_band_only_covers_the_top() {
+        use quadraui::ResizeEdge;
+
+        assert!(resize_edge_overlaps_change_review_band(ResizeEdge::North));
+        assert!(resize_edge_overlaps_change_review_band(
+            ResizeEdge::NorthEast
+        ));
+        assert!(resize_edge_overlaps_change_review_band(
+            ResizeEdge::NorthWest
+        ));
+
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::South));
+        assert!(!resize_edge_overlaps_change_review_band(
+            ResizeEdge::SouthEast
+        ));
+        assert!(!resize_edge_overlaps_change_review_band(
+            ResizeEdge::SouthWest
+        ));
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::East));
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::West));
     }
 
     #[test]

@@ -7902,8 +7902,22 @@ impl App {
         // as wide as the whole row, and the grip only occupies its outermost
         // sliver, so a point inside the title bar but outside the grip already
         // resolves to `None` on its own. Checked on the SAME predicate the
-        // press path below uses, so the cursor never promises a resize the
-        // press won't honor.
+        // press path below uses when no change-review surface is open — so
+        // the cursor never promises a resize the press won't honor in that
+        // (overwhelmingly common) case.
+        //
+        // Pre-existing quirk, NOT fixed by #1528 (review, non-blocking
+        // finding #2): this `MouseMoved` arm does not check
+        // `change_review_open` at all — it never has — while the press path
+        // below does, for the top edge only
+        // (`render::resize_edge_overlaps_change_review_band`). So while a
+        // change-review surface is open, hovering near the top edge can
+        // still show a resize cursor that a press in the same spot won't
+        // honor (it falls through to the change-review click handling
+        // instead). Narrowing this hint to match would need
+        // `change_review_open` computed above the `MouseMoved` arm instead
+        // of below it — out of scope for this fix; called out here so the
+        // "share one predicate" guarantee above isn't read as unconditional.
         if let UiEvent::MouseMoved { position, .. } = &event {
             let shape = match ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
             {
@@ -7951,18 +7965,17 @@ impl App {
             }
         }
 
-        // #955 (ACP-4, review fix): gates both the edge-resize press below
-        // and the title-bar drag/double-click arms after it on the
-        // change-review surface being closed. That surface is genuinely
-        // full-viewport — its first diff row paints inside `ctx.in_title_
-        // bar`'s band, underneath the (visually hidden but still logically
-        // live) CSD title bar — so without this guard, a click there was
-        // silently reinterpreted as "start dragging the window" instead of
-        // reaching `handle_mouse_click_msg`'s change-review branch further
-        // down. `ctx.in_title_bar` has no such reach today for the folder
-        // picker (its popup is centred, never touching row 0), which is why
-        // this wasn't already latent there in a way any existing test could
-        // see.
+        // #955 (ACP-4, review fix): gates the title-bar drag/double-click
+        // arms below on the change-review surface being closed. That surface
+        // is genuinely full-viewport — its first diff row paints inside
+        // `ctx.in_title_bar`'s band, underneath the (visually hidden but
+        // still logically live) CSD title bar — so without this guard, a
+        // click there was silently reinterpreted as "start dragging the
+        // window" instead of reaching `handle_mouse_click_msg`'s
+        // change-review branch further down. `ctx.in_title_bar` has no such
+        // reach today for the folder picker (its popup is centred, never
+        // touching row 0), which is why this wasn't already latent there in
+        // a way any existing test could see.
         let change_review_open = self.engine.borrow().change_review.is_some();
 
         // ── Outer window border: edge-resize press (quadraui#406) ──────────
@@ -7993,20 +8006,32 @@ impl App {
         // resize; otherwise fall through so a window's own rightmost column
         // (exactly where a vertical scrollbar or minimap gutter can sit) on
         // a backend with no window still reaches the editor's own hit-test.
-        if !change_review_open {
-            if let UiEvent::MouseDown {
-                button: MouseButton::Left,
-                position,
-                ..
-            } = &event
+        //
+        // #1528 review (blocking finding #3): the base commit's guard here
+        // was `!change_review_open` applied to EVERY edge — a regression
+        // this PR introduced and the review caught, since the base-commit
+        // pre-#1528 code had no `change_review_open` guard on edge-resize at
+        // all. The change-review surface only ever overlaps the *top* of the
+        // window (see the doc above), so only `North`/`NorthEast`/
+        // `NorthWest` need to defer to it —
+        // `render::resize_edge_overlaps_change_review_band` is the
+        // (unit-tested) decision. Resizing from the bottom, left, right, or
+        // the two southern corners must keep working while a change-review
+        // surface is open; nothing in that surface ever paints there.
+        if let UiEvent::MouseDown {
+            button: MouseButton::Left,
+            position,
+            ..
+        } = &event
+        {
+            if let Some(edge) =
+                ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
             {
-                if let Some(edge) =
-                    ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
-                {
-                    if backend.begin_window_resize(edge) {
-                        self.draw_needed.set(true);
-                        return quadraui::Reaction::Redraw;
-                    }
+                let blocked_by_change_review =
+                    change_review_open && render::resize_edge_overlaps_change_review_band(edge);
+                if !blocked_by_change_review && backend.begin_window_resize(edge) {
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
                 }
             }
         }
