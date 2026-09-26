@@ -304,26 +304,70 @@ pub mod testing {
     // lands, `seam_657.rs`'s TUI half has nothing left to compile against.
     //
     // [`tui_driver`]/[`tui_driver_with`] are the replacement seam: built
-    // through *exactly* the construction path [`run`] uses —
-    // `App::new_portable` + `App::shell_config` — rather than
+    // through *almost* exactly the construction path [`run`] uses —
+    // `App::new_portable_for_test` (the review-fix twin of `App::
+    // new_portable`, see its own doc) + `App::shell_config` — rather than
     // `conformance_harness`'s `build_app_and_config`, which calls the
     // *headless* `App::new_headless_with_backend` on a caller-supplied
     // fixture `Engine` precisely so a `crate::harness` scenario never
     // touches the machine's real `~/.config/vimcode` (see that function's
     // own doc). This seam is for the opposite case: proving an external
-    // crate can drive the same thing a user actually runs. `App` stays
-    // `pub(crate)` either way — both functions return the opaque
-    // `TuiDriver<impl quadraui::AppLogic>`, exactly like
-    // `conformance_harness`, so nothing about `App`'s shape leaks.
+    // crate can drive the same thing a user actually runs, while still
+    // being a *test* construction — see `App::new_portable_for_test`'s own
+    // doc for why it, not `App::new_portable` itself, is the right
+    // constructor here. `App` stays `pub(crate)` either way — both
+    // functions return the opaque `TuiAppDriver<TuiDriver<impl quadraui::
+    // AppLogic>>`, exactly like `conformance_harness` returns an opaque
+    // `ConformanceHarness<TuiDriver<impl quadraui::AppLogic>>`, so nothing
+    // about `App`'s shape leaks.
+
+    /// Bundles a [`TuiDriver`] built by [`tui_driver`]/[`tui_driver_with`]
+    /// with the two process-wide guards
+    /// ([`crate::test_paint::PaintGuard`], [`crate::test_cwd::CwdReadGuard`])
+    /// every other App/Engine-backed driver constructor in this codebase
+    /// takes before handing back a driver — [`conformance_harness`] and
+    /// [`conformance_harness_prod`] above, and every GTK/macOS/Win
+    /// equivalent (`src/gtk/testing.rs`, `src/macos/mod.rs`,
+    /// `src/win/mod.rs`). See `crate::test_paint`'s and `crate::test_cwd`'s
+    /// own module docs for the concurrent-Pango segfault and CWD-read race
+    /// this protects against; `App::new_portable_for_test`'s real
+    /// `Engine::startup` (explorer root, ambient sidebar restore) is exactly
+    /// the CWD-dependent read `crate::test_cwd`'s doc warns about.
+    ///
+    /// Implements `Deref`/`DerefMut` to the wrapped driver, so a caller
+    /// drives it exactly like a bare `TuiDriver` (`driver.render()`,
+    /// `driver.screen()`, `driver.screen_contains(..)`, …) — this wrapper
+    /// only exists to keep the two guards alive for the driver's whole
+    /// lifetime, the same "held for the harness's whole lifetime" contract
+    /// [`crate::harness::ConformanceHarness`]'s own `_paint`/`_cwd` fields
+    /// document, not to add a new API surface a test would need to learn.
+    pub struct TuiAppDriver<D> {
+        driver: D,
+        _paint: crate::test_paint::PaintGuard,
+        _cwd: crate::test_cwd::CwdReadGuard,
+    }
+
+    impl<D> std::ops::Deref for TuiAppDriver<D> {
+        type Target = D;
+        fn deref(&self) -> &D {
+            &self.driver
+        }
+    }
+
+    impl<D> std::ops::DerefMut for TuiAppDriver<D> {
+        fn deref_mut(&mut self) -> &mut D {
+            &mut self.driver
+        }
+    }
 
     /// Build a TUI driver of the given cell size with no other setup — the
     /// TUI twin of `driver_with_shell(TuiShellApp::new(file_path), ...)`,
     /// but built through the shared `App` construction path
-    /// (`App::new_portable` + `App::shell_config`, the same pair [`run`]
-    /// calls) rather than through `TuiShellApp`.
+    /// (`App::new_portable_for_test` + `App::shell_config`) rather than
+    /// through `TuiShellApp`.
     ///
-    /// Runs the real `Engine::startup` (via `App::new_portable`), so —
-    /// exactly like `TuiShellApp::new` (see `seam_657.rs`'s own doc) —
+    /// Runs the real `Engine::startup` (via `App::new_portable_for_test`),
+    /// so — exactly like `TuiShellApp::new` (see `seam_657.rs`'s own doc) —
     /// sidebar visibility, scroll offsets, and restored session state are
     /// *ambient*, read from the developer's real `~/.config/vimcode`, not
     /// fixed. A caller that needs a known starting buffer/scroll position
@@ -334,7 +378,7 @@ pub mod testing {
         file_path: Option<PathBuf>,
         width: u16,
         height: u16,
-    ) -> TuiDriver<impl quadraui::AppLogic> {
+    ) -> TuiAppDriver<TuiDriver<impl quadraui::AppLogic>> {
         tui_driver_with(file_path, width, height, |_| {})
     }
 
@@ -354,18 +398,33 @@ pub mod testing {
     /// a mutable window onto the same engine [`tui_driver`] would otherwise
     /// hand straight to `driver_with_shell` unseen, without `App` ever
     /// crossing the module boundary.
+    ///
+    /// Acquires [`crate::test_paint::PaintGuard`] and
+    /// [`crate::test_cwd::CwdReadGuard`] *before* constructing the `App` (so
+    /// `Engine::startup`'s own CWD reads are covered, not just the later
+    /// `render()` calls a caller makes on the returned driver) and returns
+    /// them bundled into the driver via [`TuiAppDriver`] — see that type's
+    /// own doc for why they must outlive this function's return, not just
+    /// its body.
     pub fn tui_driver_with(
         file_path: Option<PathBuf>,
         width: u16,
         height: u16,
         setup: impl FnOnce(&mut Engine),
-    ) -> TuiDriver<impl quadraui::AppLogic> {
+    ) -> TuiAppDriver<TuiDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
-        let app = App::new_portable(file_path, backend, UnitProfile::cell());
+        let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
         setup(&mut app.engine.borrow_mut());
         let config = app.shell_config();
-        driver_with_shell(app, config, width, height)
+        let driver = driver_with_shell(app, config, width, height);
+        TuiAppDriver {
+            driver,
+            _paint: paint,
+            _cwd: cwd,
+        }
     }
 }
 
