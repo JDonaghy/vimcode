@@ -675,6 +675,39 @@ fn lexically_normalize(path: &Path) -> std::path::PathBuf {
     out
 }
 
+/// How an already-[`resolve_path_within_roots`]-resolved `path` should be
+/// *shown* to the user: relative to `workspace_cwd` when it lives inside it,
+/// else the full absolute path.
+///
+/// The subtlety this exists for (and the reason it is one shared function
+/// rather than a `strip_prefix` open-coded at each chip site): the path has
+/// been **canonicalized** by [`resolve_path_within_roots`], while
+/// `workspace_cwd` is whatever the user's `cwd`/`--workspace` string was —
+/// *not* canonicalized. Any symlink anywhere in that prefix makes a plain
+/// `resolved.strip_prefix(workspace_cwd)` miss, and the chip then renders a
+/// full absolute path instead of `t.rs:1-2`. That is not hypothetical or
+/// platform-specific trivia: on macOS `std::env::temp_dir()` is
+/// `/var/folders/…`, a symlink to `/private/var/folders/…`, so *every*
+/// workspace under the temp dir hit it — which is precisely how #1452's test
+/// run caught this (green on Linux, red on macOS). A user whose project sits
+/// under any symlinked path (`/tmp/proj`, a symlinked `$HOME`, a symlinked
+/// network mount) saw the same thing.
+///
+/// So: try the literal prefix first (the common, no-symlink case, and no
+/// filesystem access at all), then retry against the canonicalized
+/// `workspace_cwd`, and only then fall back to the absolute display.
+pub fn workspace_relative_display(path: &Path, workspace_cwd: &Path) -> String {
+    if let Ok(relative) = path.strip_prefix(workspace_cwd) {
+        return relative.display().to_string();
+    }
+    if let Ok(canonical_cwd) = workspace_cwd.canonicalize() {
+        if let Ok(relative) = path.strip_prefix(&canonical_cwd) {
+            return relative.display().to_string();
+        }
+    }
+    path.display().to_string()
+}
+
 /// Resolve `path` (absolute, or joined onto `roots[0]` if relative — ACP
 /// paths are supposed to be absolute already, but this is defensive rather
 /// than a panic) and confirm it falls inside one of `roots` (the session
@@ -857,15 +890,12 @@ pub struct AcpRangeAttachment {
 impl AcpRangeAttachment {
     /// The `⧉ <path>:<range>` chip shown in the AI panel while this
     /// attachment is pending (#1450 point 4) — `path` relative to
-    /// `workspace_cwd` when possible, matching
+    /// `workspace_cwd` when possible (see [`workspace_relative_display`] for
+    /// the symlinked-prefix case), matching
     /// `Engine::acp_current_buffer_attachment`'s chip convention. A
     /// single-line range renders as `path:N`, not `path:N-N`.
     pub fn chip(&self, workspace_cwd: &std::path::Path) -> String {
-        let display = self
-            .path
-            .strip_prefix(workspace_cwd)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| self.path.display().to_string());
+        let display = workspace_relative_display(&self.path, workspace_cwd);
         let (start1, end1) = (self.start_line + 1, self.end_line + 1);
         if start1 == end1 {
             format!("\u{29c9} {display}:{start1}")
@@ -2780,6 +2810,64 @@ mod tests {
         assert_eq!(select_text_lines(content, Some(100), None), "");
         assert_eq!(select_text_lines(content, Some(1), Some(100)), "one\ntwo");
         assert_eq!(select_text_lines(content, Some(0), None), "one\ntwo");
+    }
+
+    /// #1452: an attachment chip must stay workspace-relative even when the
+    /// workspace path reaches the project through a symlink. The resolved
+    /// path is canonical (`resolve_path_within_roots` canonicalizes), the
+    /// `workspace_cwd` is whatever the user typed — so the naive
+    /// `resolved.strip_prefix(workspace_cwd)` this replaced missed, and the
+    /// chip showed a full absolute path instead of `t.rs:1-2`.
+    ///
+    /// RED verified: reverting `chip` to the plain `strip_prefix` fails this
+    /// (`/private/…/t.rs:1-2` on macOS, `<canonical dir>/t.rs:1-2` on Linux).
+    ///
+    /// `#[cfg(unix)]` only because creating a symlink on Windows needs
+    /// elevation — the fix itself is platform-neutral, and macOS exercises it
+    /// on *every* temp-dir workspace (`/var/folders` → `/private/var/folders`)
+    /// with no explicit symlink at all.
+    #[cfg(unix)]
+    #[test]
+    fn chip_stays_workspace_relative_through_a_symlinked_workspace_path() {
+        let base = std::env::temp_dir().join(format!("acp-1452-chip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("create real workspace dir");
+        std::fs::write(real.join("t.rs"), "one\ntwo\nthree\n").expect("write test file");
+        let link = base.join("via-link");
+        std::os::unix::fs::symlink(&real, &link).expect("create workspace symlink");
+
+        // What the engine actually hands the chip: the *resolved* (canonical)
+        // path, plus the un-canonicalized workspace cwd the user gave.
+        let resolved = resolve_path_within_roots(&link.join("t.rs"), std::slice::from_ref(&link))
+            .expect("a file inside the symlinked workspace must resolve");
+        let attachment = AcpRangeAttachment {
+            path: resolved,
+            start_line: 0,
+            end_line: 1,
+            text: "one\ntwo\n".to_string(),
+        };
+
+        assert_eq!(attachment.chip(&link), "\u{29c9} t.rs:1-2");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_relative_display_falls_back_to_the_absolute_path_outside_the_workspace() {
+        // No symlink games and nothing on disk — a path that simply isn't
+        // under the workspace must render in full, not get mangled.
+        let outside = std::path::Path::new("/somewhere/else/file.rs");
+        assert_eq!(
+            workspace_relative_display(outside, std::path::Path::new("/project")),
+            "/somewhere/else/file.rs"
+        );
+        assert_eq!(
+            workspace_relative_display(
+                std::path::Path::new("/project/src/main.rs"),
+                std::path::Path::new("/project")
+            ),
+            "src/main.rs"
+        );
     }
 
     #[test]
