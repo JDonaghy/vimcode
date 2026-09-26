@@ -1459,6 +1459,17 @@ pub struct AcpClient {
     /// emitted; drained by [`Self::respond_to_client_request`].
     pending_client_requests: Arc<Mutex<HashMap<i64, String>>>,
     rx: mpsc::Receiver<AcpEvent>,
+    /// Transcript recorder (#1461, ACP contract-test infra) — `Some` only
+    /// when spawned via [`Self::spawn_with_recording`] with a `record_to`
+    /// path. Every raw NDJSON line in *both* directions is appended here,
+    /// one line per message, prefixed `"> "` for client->agent (written in
+    /// [`Self::send_raw`]) or `"< "` for agent->client (written in
+    /// [`reader_thread_main`]) — see that file's own doc for why a plain
+    /// text prefix rather than a wrapping JSON envelope: it keeps each
+    /// recorded line byte-identical to what actually crossed the wire, so
+    /// a replay agent (or a human) can diff a transcript against a fresh
+    /// recording without a serialization round-trip in the way.
+    recorder: Option<Arc<Mutex<std::fs::File>>>,
     // Held only to keep the thread alive; dropped (and thus joined-on-exit
     // implicitly via detach) when AcpClient is dropped.
     _reader_thread: Option<thread::JoinHandle<()>>,
@@ -1480,6 +1491,34 @@ impl AcpClient {
         cwd: &Path,
         extra_env: &[(&str, &str)],
     ) -> Result<Self, String> {
+        Self::spawn_with_recording(argv, cwd, extra_env, None)
+    }
+
+    /// Like [`Self::spawn_with_env`], but when `record_to` is `Some`, tees
+    /// every raw NDJSON line crossing stdio — both directions — into that
+    /// file (#1461: the "record mode" a contract test's corpus is captured
+    /// with). `record_to`'s parent directory must already exist; the file
+    /// itself is created (truncating any previous contents) so re-running a
+    /// recording session always starts clean.
+    ///
+    /// See [`AcpClient::recorder`]'s doc for the on-disk line format
+    /// (`"> "`/`"< "` prefix + the exact raw line, no re-encoding) and
+    /// `docs/ACP_CONTRACT_TESTS.md` for how to record a corpus fixture and
+    /// replay it back with the `acp-replay-agent` binary.
+    pub fn spawn_with_recording(
+        argv: &[String],
+        cwd: &Path,
+        extra_env: &[(&str, &str)],
+        record_to: Option<&Path>,
+    ) -> Result<Self, String> {
+        let recorder = match record_to {
+            Some(path) => {
+                let file = std::fs::File::create(path)
+                    .map_err(|e| format!("failed to create ACP transcript {path:?}: {e}"))?;
+                Some(Arc::new(Mutex::new(file)))
+            }
+            None => None,
+        };
         let (program, args) = argv.split_first().ok_or("empty ACP agent command")?;
 
         let mut cmd = crate::core::git::hidden_command_new_process_group(program);
@@ -1544,6 +1583,7 @@ impl AcpClient {
         let reader_pending = pending_requests.clone();
         let reader_pending_client = pending_client_requests.clone();
         let reader_stdin = stdin.clone();
+        let reader_recorder = recorder.clone();
         let reader_thread = thread::spawn(move || {
             reader_thread_main(
                 stdout,
@@ -1552,6 +1592,7 @@ impl AcpClient {
                 reader_pending_client,
                 reader_stdin,
                 stderr_buf,
+                reader_recorder,
             );
         });
 
@@ -1562,6 +1603,7 @@ impl AcpClient {
             pending_requests,
             pending_client_requests,
             rx,
+            recorder,
             _reader_thread: Some(reader_thread),
         })
     }
@@ -1591,6 +1633,7 @@ impl AcpClient {
 
     fn send_raw(&self, body: &serde_json::Value) {
         let encoded = encode_ndjson_line(body);
+        record_line(&self.recorder, "> ", &encoded);
         if let Ok(mut stdin) = self.stdin.lock() {
             let _ = stdin.write_all(&encoded);
             let _ = stdin.flush();
@@ -1760,6 +1803,23 @@ impl Drop for AcpClient {
 // Reader thread
 // ---------------------------------------------------------------------------
 
+/// Append one raw NDJSON `line` (already `\n`-terminated, exactly as it
+/// crossed the wire) to `recorder`, prefixed with `dir` (`"> "` or `"< "`).
+/// A no-op — including on a write error — when `recorder` is `None`; a
+/// transcript recording is diagnostic infrastructure, never allowed to
+/// disturb the actual ACP session it's observing (matches the stderr-ring
+/// and reader-thread's own "best effort" posture elsewhere in this file).
+fn record_line(recorder: &Option<Arc<Mutex<std::fs::File>>>, dir: &str, line: &[u8]) {
+    let Some(recorder) = recorder else { return };
+    if let Ok(mut file) = recorder.lock() {
+        let _ = file.write_all(dir.as_bytes());
+        let _ = file.write_all(line);
+        if !line.ends_with(b"\n") {
+            let _ = file.write_all(b"\n");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reader_thread_main(
     stdout: impl IoRead + Send + 'static,
@@ -1768,6 +1828,7 @@ fn reader_thread_main(
     pending_client_requests: Arc<Mutex<HashMap<i64, String>>>,
     stdin: Arc<Mutex<Box<dyn IoWrite + Send>>>,
     stderr_buf: Arc<Mutex<String>>,
+    recorder: Option<Arc<Mutex<std::fs::File>>>,
 ) {
     // `stdin` is threaded through only so a future slice can auto-answer
     // agent requests it recognizes inline (the "handler returns
@@ -1787,6 +1848,7 @@ fn reader_thread_main(
             Ok(_) => {}
             Err(_) => break,
         }
+        record_line(&recorder, "< ", line.as_bytes());
 
         match classify_line(&line) {
             ParsedLine::Unusable => continue, // malformed/blank — resync on next line
@@ -3161,6 +3223,101 @@ mod tests {
         match &events[0] {
             AcpEvent::PromptStopped { stop_reason, .. } => assert_eq!(stop_reason, "end_turn"),
             other => panic!("expected PromptStopped, got {other:?}"),
+        }
+    }
+
+    // ---- Transcript recording (#1461: contract-test corpus infra) ----
+
+    /// `AcpClient::spawn_with_recording` tees every raw line, both
+    /// directions, into the recording file, in wire order, unmodified byte
+    /// for byte — the property the `acp-replay-agent` fixture binary and any
+    /// contract test built on it rely on (a recorded transcript must be
+    /// byte-identical to what a fresh session would produce, or replaying it
+    /// proves nothing about the real wire shape). Drives the same
+    /// initialize -> session/new -> session/prompt (`ACP_FAKE_NO_TOOL_
+    /// REQUEST`, so there's no agent->client request to park on) lifecycle
+    /// as `full_session_lifecycle_reaches_end_turn` above, then asserts on
+    /// the file's actual contents rather than just "it exists" — the #587/
+    /// #592 lesson (state populated is not the same as content correct)
+    /// applies to test infrastructure too, not just paint.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_with_recording_captures_both_directions_of_the_wire() {
+        let record_to = std::env::temp_dir().join(format!(
+            "acp-1461-record-{}-{:?}.transcript",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        let argv = vec![
+            "sh".to_string(),
+            fixture_path().to_string_lossy().into_owned(),
+        ];
+        let mut client = AcpClient::spawn_with_recording(
+            &argv,
+            &std::env::temp_dir(),
+            &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+            Some(&record_to),
+        )
+        .expect("fixture agent should spawn with recording enabled");
+
+        client.initialize();
+        poll_until(&mut client, TEST_DEADLINE);
+        client.new_session(&std::env::temp_dir(), vec![]);
+        poll_until(&mut client, TEST_DEADLINE);
+        client.prompt(
+            "sess-1",
+            vec![serde_json::json!({"type": "text", "text": "hi"})],
+        );
+        poll_collecting_until(&mut client, TEST_DEADLINE, |events| {
+            events
+                .iter()
+                .any(|e| matches!(e, AcpEvent::PromptStopped { .. }))
+        });
+        // Drop the client (closes stdin, joins the reader thread's EOF path)
+        // before reading the file back, so every buffered write has landed.
+        drop(client);
+
+        let transcript =
+            std::fs::read_to_string(&record_to).expect("recording file should have been written");
+        let _ = std::fs::remove_file(&record_to);
+
+        let sent: Vec<&str> = transcript
+            .lines()
+            .filter_map(|l| l.strip_prefix("> "))
+            .collect();
+        let received: Vec<&str> = transcript
+            .lines()
+            .filter_map(|l| l.strip_prefix("< "))
+            .collect();
+
+        assert!(
+            sent.iter().any(|l| l.contains(r#""method":"initialize""#)),
+            "outgoing initialize request must be recorded: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|l| l.contains(r#""method":"session/prompt""#)),
+            "outgoing session/prompt request must be recorded: {sent:?}"
+        );
+        assert!(
+            received
+                .iter()
+                .any(|l| l.contains(r#""sessionUpdate":"agent_message_chunk""#)),
+            "incoming session/update notification must be recorded: {received:?}"
+        );
+        assert!(
+            received
+                .iter()
+                .any(|l| l.contains(r#""stopReason":"end_turn""#)),
+            "incoming final response must be recorded: {received:?}"
+        );
+        // Every recorded line is a real, complete JSON-RPC message — proves
+        // the recorder never split or corrupted a line while teeing it.
+        for line in sent.iter().chain(received.iter()) {
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
+            assert_eq!(parsed["jsonrpc"], "2.0");
         }
     }
 
