@@ -9396,14 +9396,13 @@ pub fn paint_editor_band_rungs<'screen>(
 // more than one independently-gated bottom band, which does not exist
 // upstream today.
 //
-// **Per CLAUDE.md's Platform-Neutrality Rule, this gap must be filed on
-// `JDonaghy/quadraui`, not worked around here — that filing is drafted and
-// ready to submit** (see `docs/PENDING_QUADRAUI_ISSUES.md`, "multi-band
-// bottom chrome"), pending a session with `gh` access (this repo's worker
-// sessions are `git`-only; issue filing is a coordinator action). **#820 must
-// stay open behind that filing, not close on this investigation alone** —
-// this is a rejection with a drafted-but-unfiled blocker, not a resolved
-// question.
+// **That upstream gap has since shipped.** quadraui#997 (`d1b1931`) added N
+// independently-gated stacked bottom bands, and vimcode's pinned rev carries
+// it (the "multi-band bottom chrome" draft in
+// `docs/PENDING_QUADRAUI_ISSUES.md` was struck 2026-09-22, #1259). The
+// "does not exist upstream" blocker above is therefore historical: moving this
+// band onto the shipped API is now an adoption question for vimcode, not a
+// missing quadraui capability.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.

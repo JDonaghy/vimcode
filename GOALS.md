@@ -72,6 +72,19 @@ re-confirming.
 
 ### Current sizing (regenerated 2026-09-19 at `30c0077`, `scripts/prod_lines.py`)
 
+> **Read with the 2026-09-26 correction (audit R4, `02319b83`).** Since #1433
+> (`6ece249`) `tui_main::run` builds the shared `App`, so `TuiShellApp`,
+> `mouse.rs`, `panels.rs`, `render_impl.rs` and the `mod.rs` helpers only they
+> call are unreachable from `run()` — yet still compiled, and still counted.
+> `scripts/prod_lines.py src/tui_main` reports **10,813** at `02319b83`; the
+> **live** TUI surface is **≈210** lines. `prod_lines.py` cannot tell the
+> difference (it does not see reachability or `cfg(any(test, feature =
+> "test-support"))`), and neither does `dead_code` (trait impls and
+> never-constructed structs don't warn). The 10,813 falls to the true figure
+> when vimcode#1434 deletes the unreachable modules; until then, quote both
+> numbers. Same run: `src/gtk/` 1,160 · `src/macos/` 150 · `src/win/` 190 ·
+> `src/app.rs` 9,792 · `src/render.rs` 25,661.
+
 | File | Production lines | Δ vs 2026-09-16 |
 |---|---:|---:|
 | `src/gtk/` | **1,149** | +129 |
