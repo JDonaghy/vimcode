@@ -10929,6 +10929,15 @@ pub fn menu_bar_items_end(layout: &quadraui::MenuBarLayout, fallback_x: f32) -> 
         .unwrap_or(fallback_x)
 }
 
+/// The min-gap [`measure_title_bar_bands`] reserves between the Command
+/// Center and the inline window-control buttons (#1530), matching every
+/// quadraui backend that supplies a `controls_bar`'s own `StatusBar::layout`
+/// min-gap (`quadraui::gtk::MIN_GAP_PX`, `quadraui::win::MIN_GAP_DIP` — both
+/// `16.0` at the pinned rev). See that function's doc for why a *second*
+/// copy of this number has to live here rather than importing the `gtk`
+/// one.
+const TITLE_BAR_CONTROLS_MIN_GAP_PX: f32 = 16.0;
+
 /// How the title-bar band divides up to the right of the last menu label.
 ///
 /// Both bands are *measured*, never painted — see [`FrameOp::MenuRow`].
@@ -10989,6 +10998,24 @@ pub fn measure_title_bar_bands(
                 .fold(f32::INFINITY, f32::min)
         })
         .filter(|s| s.is_finite())
+        // #1530: the value above is measured against the *wide* `full` band,
+        // where `StatusBar::layout`'s `bar_width - left_w - min_gap` never
+        // goes negative and all three buttons come back — but `controls`
+        // below is narrowed to exactly that painted width, and it is
+        // *that* narrower rect `paint_title_bar_band` hands to
+        // `Backend::draw_status_bar_interactive` for the actual paint.
+        // `window_controls_status_bar` has no left segments, so re-laying-out
+        // at `bar_width == total_right` makes the identical `min_gap`
+        // subtraction go negative and silently drops the front (lowest-
+        // priority) segment — minimize — even though it fit a moment ago.
+        // Reserving one min-gap's worth of slack here is what keeps the
+        // repaint from re-triggering that drop. Every backend that supplies
+        // a `controls_bar` (GTK, Win-GUI) reserves the same 16px/16dip
+        // min-gap convention (`quadraui::gtk::MIN_GAP_PX`,
+        // `quadraui::win::MIN_GAP_DIP`) — restated here as a plain constant,
+        // not imported, so this stays buildable without the `gui` feature
+        // (`quadraui::gtk` is gated on `quadraui/gtk`, `render.rs` is not).
+        .map(|s| (s - TITLE_BAR_CONTROLS_MIN_GAP_PX).max(0.0))
         .unwrap_or(full.width);
     let controls = quadraui::Rect::new(
         full.x + controls_start,

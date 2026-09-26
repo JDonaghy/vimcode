@@ -1130,6 +1130,27 @@ pub(crate) struct App {
     /// same primitive so the buttons get real hover/press highlighting and
     /// click-on-release semantics instead of firing on press. (#552)
     pub(crate) title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
+    /// The last inline window-control action dispatched (`render::
+    /// WINDOW_MINIMIZE_ACTION` / `_MAXIMIZE_ACTION` / `_CLOSE_ACTION`), or
+    /// `None` before any click. (#1530)
+    ///
+    /// A pure test-observability seam, `Rc`-wrapped like [`Self::
+    /// title_bar_rect`] so the headless test harness can clone a handle —
+    /// minimize/maximize genuinely have no other headlessly-observable
+    /// effect. `WindowControl::minimize`/`Backend::toggle_window_maximize`
+    /// both route through `Backend::window()`, which this crate's own GTK
+    /// test harness deliberately reports `None` from (see `src/gtk/
+    /// testing.rs`'s module doc, "No window" — there is no live
+    /// `gtk4::Window` for a click to actually iconify/zoom), so a black-box
+    /// test asserting "the click dispatched `minimize`" has nothing else to
+    /// read. `window_close`'s equivalent bypass is `show_quit_confirm`'s own
+    /// engine-visible state (`native_dialog_shown`/`exit_requested`); this
+    /// field is the same idea for the two buttons with no engine-visible
+    /// state of their own to piggyback on. Written unconditionally
+    /// (production code, not `cfg(test)`) exactly like every other `Rc<Cell<
+    /// _>>` seam in this struct — cheap enough that it costs nothing outside
+    /// a test.
+    pub(crate) last_window_control_action: Rc<Cell<Option<&'static str>>>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     pub(crate) last_sc_refresh: std::time::Instant,
     /// Link hit rects populated during hover popup draw: (rect, url, is_native).
@@ -2126,6 +2147,7 @@ impl App {
             menu_items_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
+            last_window_control_action: Rc::new(Cell::new(None)),
             last_sc_refresh: std::time::Instant::now(),
             panel_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             panel_hover_popup_rect: Rc::new(Cell::new(None)),
@@ -7437,6 +7459,8 @@ impl App {
     /// silent no-op there; `WindowControl` is backed on every windowed
     /// backend.
     fn window_minimize(&mut self, backend: &mut dyn quadraui::Backend) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_MINIMIZE_ACTION));
         if let Some(w) = backend.window() {
             let _ = w.minimize();
         }
@@ -7452,6 +7476,8 @@ impl App {
     /// one place that operates the real OS window instead of two that have
     /// to agree.
     fn window_toggle_maximize(&mut self, backend: &mut dyn quadraui::Backend) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_MAXIMIZE_ACTION));
         backend.toggle_window_maximize();
     }
 
@@ -7472,6 +7498,8 @@ impl App {
     /// then tears the window down with `destroy()`, which does not re-enter
     /// `close-request`.
     fn window_close(&mut self) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_CLOSE_ACTION));
         self.show_quit_confirm();
     }
 
