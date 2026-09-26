@@ -7891,19 +7891,25 @@ impl App {
 
         // ── Outer window border: edge-resize cursor hint (quadraui#406) ──
         // Pure side effect on hover — hint the resize pointer over the outer
-        // window border, default everywhere else (including the non-resizable
-        // full-width CSD title bar, which owns the top edge). Falls through so
-        // the editor/sidebar hover handling below still runs. Mirrors
+        // window border, default everywhere else. Falls through so the
+        // editor/sidebar hover handling below still runs. Mirrors
         // `full_chrome_demo`'s `MouseMoved` arm. GTK-only; TUI `set_cursor`
         // is a documented no-op.
+        //
+        // #1528: `render::WINDOW_RESIZE_GRIP_PX` (a few px), not
+        // `backend.line_height()` (a full title-bar/command-line row) — see
+        // that constant's doc. With a thin grip there's no need to special-case
+        // `ctx.in_title_bar` here the way this used to: the title bar is only
+        // as wide as the whole row, and the grip only occupies its outermost
+        // sliver, so a point inside the title bar but outside the grip already
+        // resolves to `None` on its own. Checked on the SAME predicate the
+        // press path below uses, so the cursor never promises a resize the
+        // press won't honor.
         if let UiEvent::MouseMoved { position, .. } = &event {
-            let shape = if ctx.in_title_bar(position.x, position.y) {
-                quadraui::PointerShape::Default
-            } else {
-                match ctx.window_edge(position.x, position.y, backend.line_height()) {
-                    Some(edge) => quadraui::PointerShape::Resize(edge),
-                    None => quadraui::PointerShape::Default,
-                }
+            let shape = match ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
+            {
+                Some(edge) => quadraui::PointerShape::Resize(edge),
+                None => quadraui::PointerShape::Default,
             };
             backend.set_cursor(shape);
         }
@@ -7946,30 +7952,76 @@ impl App {
             }
         }
 
-        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
-        // (quadraui#400) + outer window border: edge-resize (quadraui#406).
-        // Runs after the menu-item intercept and the window-control-button
-        // check above, so both take priority — only a press/double-click that
-        // lands in the title bar band but misses every interactive segment
-        // (menu item, min/max/close button) reaches here, matching
-        // `Backend::begin_window_drag`'s documented contract. The title bar
-        // takes priority over the top window edge (a full-width CSD header
-        // owns it), so `in_title_bar` is checked before `window_edge` —
-        // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
-        // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
-        // are all documented no-ops there; this path is GTK-only.
-        //
-        // #955 (ACP-4, review fix): also gated on the change-review surface
-        // being closed. That surface is genuinely full-viewport — its first
-        // diff row paints inside `ctx.in_title_bar`'s band, underneath the
-        // (visually hidden but still logically live) CSD title bar — so
-        // without this guard, a click there was silently reinterpreted as
-        // "start dragging the window" instead of reaching
-        // `handle_mouse_click_msg`'s change-review branch further down.
-        // `ctx.in_title_bar` has no such reach today for the folder picker
-        // (its popup is centred, never touching row 0), which is why this
-        // wasn't already latent there in a way any existing test could see.
+        // #955 (ACP-4, review fix): gates both the edge-resize press below
+        // and the title-bar drag/double-click arms after it on the
+        // change-review surface being closed. That surface is genuinely
+        // full-viewport — its first diff row paints inside `ctx.in_title_
+        // bar`'s band, underneath the (visually hidden but still logically
+        // live) CSD title bar — so without this guard, a click there was
+        // silently reinterpreted as "start dragging the window" instead of
+        // reaching `handle_mouse_click_msg`'s change-review branch further
+        // down. `ctx.in_title_bar` has no such reach today for the folder
+        // picker (its popup is centred, never touching row 0), which is why
+        // this wasn't already latent there in a way any existing test could
+        // see.
         let change_review_open = self.engine.borrow().change_review.is_some();
+
+        // ── Outer window border: edge-resize press (quadraui#406) ──────────
+        // Checked BEFORE the CSD title-bar drag-to-move / double-click-
+        // maximize arms and the #816 command-line click below (#1528, review
+        // of #816/#1026/#987): `render::WINDOW_RESIZE_GRIP_PX` is a thin,
+        // fixed pixel margin (see that constant's doc) — a few px, not a full
+        // `line_height` row — so it sits *inside* the title bar and
+        // command-line rows instead of spanning them. It has to win over
+        // both to ever fire at all: a full-width CSD title bar otherwise owns
+        // every pixel of the top row (dead North/NE/NW), and the command
+        // line likewise owns every pixel of the bottom row (dead South/SE/
+        // SW, the #816 bug this replaces the guard for). Everywhere else in
+        // those rows — the overwhelming majority of both — `window_edge`
+        // returns `None` and this falls through to the drag/click handling
+        // below untouched, same as before #1528. The same thin margin also
+        // keeps the East edge out of the vertical scrollbar's and the
+        // minimap's own hit-test area with a single editor group (see the
+        // constant's doc); no guard is needed for those the way the command
+        // line needed one, because the margin no longer reaches them.
+        //
+        // #1026/#987 review: `begin_window_resize`'s own doc contract is
+        // explicit — it returns `false` "when the backend owns no window
+        // (TUI...)" and callers "should treat `false` as a no-op, not an
+        // error". `ctx.window_edge`'s margin math is generic geometry, not
+        // GTK-gated — it fires for any backend near the outer window bounds
+        // — so only consume the event when the backend actually armed a
+        // resize; otherwise fall through so a window's own rightmost column
+        // (exactly where a vertical scrollbar or minimap gutter can sit) on
+        // a backend with no window still reaches the editor's own hit-test.
+        if !change_review_open {
+            if let UiEvent::MouseDown {
+                button: MouseButton::Left,
+                position,
+                ..
+            } = &event
+            {
+                if let Some(edge) =
+                    ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
+                {
+                    if backend.begin_window_resize(edge) {
+                        self.draw_needed.set(true);
+                        return quadraui::Reaction::Redraw;
+                    }
+                }
+            }
+        }
+
+        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
+        // (quadraui#400). Runs after the menu-item intercept, the
+        // window-control-button check, and the edge-resize press above, so
+        // all three take priority — only a press/double-click that lands in
+        // the title bar band but misses every interactive segment (menu
+        // item, min/max/close button, resize grip) reaches here, matching
+        // `Backend::begin_window_drag`'s documented contract. Mirrors
+        // quadraui's `full_chrome_demo` reference. TUI has no window, so
+        // `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
+        // are all documented no-ops there; this path is GTK-only.
         match &event {
             UiEvent::MouseDown {
                 button: MouseButton::Left,
@@ -7986,53 +8038,6 @@ impl App {
                 backend.toggle_window_maximize();
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
-            }
-            UiEvent::MouseDown {
-                button: MouseButton::Left,
-                position,
-                ..
-            } => {
-                // #816: the command line paints in the window's literal last
-                // `line_height` pixels — exactly the margin `window_edge`
-                // treats as the bottom resize border — so without this guard
-                // a click on it landing here first (before
-                // `handle_mouse_click_msg`'s command-line rung ever ran)
-                // ordered `begin_window_resize` instead of ever reaching the
-                // click. No prior GTK feature lived in that exact band to
-                // expose the conflict; the command line is the first.
-                //
-                // `render::point_over_command_line` checks BOTH axes — see
-                // its doc comment for why a y-only version silently disables
-                // the window's only S/SW/SE resize grab (#816 review).
-                let over_command_line = render::point_over_command_line(
-                    self.engine.borrow().command_line_rect.get(),
-                    *position,
-                );
-                if !over_command_line {
-                    if let Some(edge) =
-                        ctx.window_edge(position.x, position.y, backend.line_height())
-                    {
-                        // #1026/#987 review: `begin_window_resize`'s own doc
-                        // contract is explicit — it returns `false` "when the
-                        // backend owns no window (TUI...)" and callers
-                        // "should treat `false` as a no-op, not an error".
-                        // This call site used to discard that return value
-                        // and swallow the click unconditionally, so on TUI
-                        // (`ctx.window_edge`'s margin math is generic
-                        // geometry, not GTK-gated — it fires for any backend
-                        // near the outer window bounds) a click on a
-                        // window's own rightmost column — exactly where a
-                        // vertical scrollbar column sits when that window is
-                        // flush with the screen's own right edge — never
-                        // reached `handle_mouse_click_msg` at all. Only
-                        // consume the event when the backend actually armed
-                        // a resize.
-                        if backend.begin_window_resize(edge) {
-                            self.draw_needed.set(true);
-                            return quadraui::Reaction::Redraw;
-                        }
-                    }
-                }
             }
             _ => {}
         }
