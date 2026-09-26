@@ -37,7 +37,7 @@
 //! built its rows from the marketplace manifest list regardless of which
 //! plugin id was active (`src/app.rs`, the `id if id.starts_with("ext:")`
 //! arm), while only `crate::tui_main::panels::render_ext_panel` — reached
-//! via `TuiShellApp`, i.e. the `tui_prod` arm — painted a
+//! via the pre-#1434 TUI shell, i.e. the `tui_prod` arm — painted a
 //! `PanelRegistration`'s own sections through `render::ext_panel_to_tree_view`.
 //!
 //! So the scenarios here used to be green on `tui_prod` and red everywhere
@@ -334,7 +334,7 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     engine.ext_panel_has_focus = true;
     engine.ext_panel_scroll_top = fx.scroll_top;
     engine.ext_panel_input_active = fx.search_input_visible;
-    // `ext_panel_focus_pending` is what `TuiShellApp::tick` consumes to put
+    // `ext_panel_focus_pending` is what the pre-#1434 TUI shell's `tick` consumes to put
     // the sidebar onto this panel — the same handoff
     // `Engine::apply_plugin_ctx` performs for a live `panel.reveal`.
     engine.ext_panel_focus_pending = Some(PANEL.to_string());
@@ -351,7 +351,7 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
     // `AppShell` registration — `render::apply_activity_panel_switch`'s own
     // doc), so asking for `ext:<name>` here would leave the explorer active
     // and frame 0 would paint the explorer tree. That matters on the
-    // shipped TUI shell specifically: `TuiShellApp::handle_mouse_event`'s
+    // shipped TUI shell specifically: the pre-#1434 TUI shell's `handle_mouse_event`'s
     // `TreeController` intercept claims any `MouseDown` inside the *cached*
     // `explorer_tree_rect` while `active_panel_is(PANEL_EXPLORER)`, and that
     // rect survives the switch to a plugin panel — so every click in this

@@ -19,12 +19,13 @@ pub mod core;
 pub mod icons;
 
 // #657: promoted out of `src/main.rs` / `src/tui_bin.rs`, which used to
-// declare these as private `mod`s. No lint allows are re-stated here: each of
-// the three already carries the inner attributes it needs at the top of its
-// own file (`render.rs`'s `#![allow(dead_code)]`, `tui_main/mod.rs`'s
-// `#![allow(unused_assignments, ...)]`, `gtk/mod.rs`'s
-// `#![allow(deprecated)]`), and repeating them here trips clippy's
-// `duplicated_attributes`.
+// declare these as private `mod`s. No lint allows are re-stated here: each
+// needs its own inner attributes at the top of its own file only where it
+// still has dead code to silence (`render.rs`'s `#![allow(dead_code)]`,
+// `gtk/mod.rs`'s `#![allow(deprecated)]`) — repeating them here would trip
+// clippy's `duplicated_attributes`. `tui_main/mod.rs` carried its own
+// `#![allow(unused_assignments, dead_code, deprecated, ...)]` here too until
+// #1434 deleted the unreachable code it existed to silence.
 pub mod render;
 pub mod tui_main;
 
