@@ -7,12 +7,13 @@
 //!
 //! **No GTK/Cairo/Pango imports here.** All editor logic comes from `core`.
 //! All rendering data comes from `render`.
-// #937's quadraui pin bump deprecated `Backend::draw_status_bar` (quadraui#819)
-// and `TabBarHits`'s tuple fields (quadraui#823) that this module tree (incl.
-// `panels`, `render_impl`, `shell_app`) still uses; migrating to the
-// `_interactive`/`TabBarLayout` replacements is an unrelated refactor
-// deferred to a follow-up, so it's silenced here rather than left as a stray
-// warning under `-D warnings`.
+// #937's quadraui pin bump deprecated `TabBarHits`'s tuple fields
+// (quadraui#823) that `shell_app` still uses; migrating to the
+// `TabBarLayout` replacement is an unrelated refactor deferred to a
+// follow-up, so it's silenced here rather than left as a stray warning
+// under `-D warnings`. (#1490 migrated this tree's `Backend::draw_status_bar`
+// calls — `panels`, `render_impl` — to `draw_status_bar_interactive`, so
+// this allow no longer covers that API.)
 //
 // `dead_code`: #1433 moved production `tui_main::run()` onto `crate::app::App`
 // — `TuiShellApp` and the rest of this module tree (`panels`, `mouse`,
