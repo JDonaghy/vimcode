@@ -15495,6 +15495,224 @@ mod tests {
         );
     }
 
+    /// #1452: the mouse wheel over the AI panel must scroll its transcript.
+    ///
+    /// Unlike [`ai_panel_scrolls_transcript_via_shell_app`] above (which
+    /// hand-sets `ai_has_focus`/`sidebar.has_focus` and only exercises the
+    /// keyboard `PageUp` path), this drives a real `UiEvent::Scroll` at a
+    /// point inside the painted panel (found the same way a real click
+    /// test would, via [`TuiDriver::find`] on its painted status line) —
+    /// the same event a terminal wheel notch becomes
+    /// (`quadraui::tui::events::synth_mouseevent` / `uievent_to_crossterm`).
+    /// Before this issue's fix, `mouse::handle_mouse`'s wheel arm
+    /// (`MouseEventKind::ScrollUp | ScrollDown`) had entries for every
+    /// other scrollable sidebar panel (explorer/git/search/settings) but
+    /// none for `PANEL_AI`, so the event fell through to the generic
+    /// scroll-surface dispatch (which has no AI entry either) and then the
+    /// editor-scroll fallback — silently doing nothing to the transcript.
+    ///
+    /// **RED verified**: failed against unfixed `develop` — the wheel notches
+    /// left `MSG_MARKER_0` off-screen.
+    #[test]
+    fn ai_panel_wheel_scroll_reveals_earlier_messages_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_messages = (0..60)
+            .map(|i| crate::core::ai::AiMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: format!("MSG_MARKER_{i}"),
+            })
+            .collect();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_59"),
+            "stuck-to-bottom must show the most recent message; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("MSG_MARKER_0"),
+            "a 60-message conversation must not fit an 80x24 screen, so the \
+             very first message must be scrolled out of view; screen:\n{screen}"
+        );
+
+        // Deliberately *not* focused (`ai_has_focus`/`sidebar.has_focus`
+        // stay at their default `false`) — a wheel notch over an unfocused
+        // panel must still scroll it, mirroring every other sidebar panel's
+        // own wheel arm and the "hovering-and-scrolling must not steal
+        // focus" rule `try_route_sidebar_mouse_event`'s GTK twin documents.
+        let point = driver.find("AI ASSISTANT").unwrap_or_else(|| {
+            panic!(
+                "the AI panel's status line must be painted; screen:\n{}",
+                driver.screen()
+            )
+        });
+        for _ in 0..60 {
+            driver.dispatch(quadraui::UiEvent::Scroll {
+                widget: None,
+                delta: quadraui::ScrollDelta::new(0.0, 1.0),
+                position: quadraui::Point::new(point.0, point.1),
+            });
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_0"),
+            "the mouse wheel over the AI panel must reveal earlier messages \
+             (#1452); screen:\n{screen}"
+        );
+    }
+
+    /// #1452: dragging the AI panel's scrollbar thumb to the top of its
+    /// track must scroll the transcript to the first message.
+    ///
+    /// The thumb's geometry is derived from `ChatController::compute_layout`
+    /// (quadraui, private): a 1-row status line, then the transcript+track
+    /// down to a fixed 4-row (+2 border rows) input box at the bottom. Since
+    /// the transcript starts stuck to the tail, the thumb's bottom edge sits
+    /// exactly on the track's last row — so a press there lands on the thumb
+    /// (not the "page jump" outcome a press elsewhere on the track produces)
+    /// and arms `ChatController`'s own `transcript_drag`.
+    ///
+    /// Before this issue's fix, `mouse::handle_mouse` had no `MouseMoved`
+    /// (drag-follow-through) or `MouseUp` arm for `PANEL_AI` at all — the
+    /// `MouseDown` alone (added by #1445) could arm the drag, but the
+    /// following `MouseEventKind::Drag(Left)` never reached
+    /// `render::route_ai_chat_event`, so the thumb never actually moved.
+    ///
+    /// **RED verified**: failed against unfixed `develop` — the drag left
+    /// `MSG_MARKER_0` off-screen (the mouse-down's own click-time page-jump,
+    /// with no follow-through, was not enough to reach the top of a
+    /// 60-message transcript).
+    #[test]
+    fn ai_panel_scrollbar_thumb_drag_reveals_first_message_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_messages = (0..60)
+            .map(|i| crate::core::ai::AiMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: format!("MSG_MARKER_{i}"),
+            })
+            .collect();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_59"),
+            "stuck-to-bottom must show the most recent message; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("MSG_MARKER_0"),
+            "a 60-message conversation must not fit an 80x24 screen, so the \
+             very first message must be scrolled out of view; screen:\n{screen}"
+        );
+
+        let (_, header_y) = driver.find("AI ASSISTANT").unwrap_or_else(|| {
+            panic!(
+                "the AI panel's status line must be painted; screen:\n{}",
+                driver.screen()
+            )
+        });
+        // The input box's top-right corner (`draw_text_input`'s `┐`) sits at
+        // `(rect.x + rect.width - 1, rect.y + rect.height - input_h)` — the
+        // exact same column `ChatController::compute_layout` gives the
+        // scrollbar track (`track_w = line_height = 1.0`, so the track is
+        // this panel's rightmost column), and the exact row one below the
+        // track's own last row. Reading both off this one glyph — not a
+        // hand-computed `ACTIVITY_BAR_WIDTH + SIDEBAR_WIDTH` — is what
+        // catches the mismatch a first draft of this test had: this test's
+        // bare-bones `config()` (unlike `TuiShellApp::build_shell_config`)
+        // leaves `AppShell`'s own sidebar width at its quadraui default,
+        // which is narrower than the `SIDEBAR_WIDTH` constant
+        // `mouse::handle_mouse`'s click-routing math uses — so a column
+        // computed from that constant landed *inside* the click-routing
+        // band but past the real painted panel, where `ChatController`'s
+        // own hit-test (rightly) ignores it.
+        let corner = driver.find_bounds("┐").unwrap_or_else(|| {
+            panic!(
+                "the AI panel's input box must paint a top-right corner; \
+                 screen:\n{}",
+                driver.screen()
+            )
+        });
+        let sb_col = corner.x;
+        // Stuck to the tail, the thumb's bottom edge sits exactly on the
+        // track's last row (one above the input box's top border) — a
+        // press there lands on the thumb (arms `transcript_drag`) rather
+        // than the "page jump" a press elsewhere on the track produces.
+        let thumb_row = corner.y - 1.0;
+        // Just below the 1-row status line — the very top of the track.
+        let top_row = header_y + 1.0;
+
+        driver.mouse_down(sb_col, thumb_row);
+        driver.mouse_move(sb_col, top_row);
+        driver.mouse_up(sb_col, top_row);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_0"),
+            "dragging the scrollbar thumb to the top of its track must \
+             reveal the first message (#1452); screen:\n{screen}"
+        );
+    }
+
+    /// #1452 (paging half): `PageUp` must scroll the AI panel's transcript
+    /// once the panel has keyboard focus *through a real click* — not the
+    /// hand-set `ai_has_focus`/`sidebar.has_focus` flags
+    /// [`ai_panel_scrolls_transcript_via_shell_app`] uses. Exercises the
+    /// same click-to-focus path #1445 fixed
+    /// (`clicking_into_the_ai_panel_body_gives_it_keyboard_focus_via_shell_app`)
+    /// immediately followed by the paging this issue is about, so a
+    /// regression in either the click-focus rung or the `PageUp` rung fails
+    /// this one test.
+    #[test]
+    fn ai_panel_pageup_scrolls_after_real_click_focus_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_messages = (0..60)
+            .map(|i| crate::core::ai::AiMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: format!("MSG_MARKER_{i}"),
+            })
+            .collect();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.dispatch(quadraui::UiEvent::WindowFocused(true));
+        driver.render();
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_59"),
+            "stuck-to-bottom must show the most recent message; screen:\n{screen}"
+        );
+
+        let (body_x, body_y) = driver.find("AI ASSISTANT").unwrap_or_else(|| {
+            panic!(
+                "the AI panel's status line must be painted; screen:\n{}",
+                driver.screen()
+            )
+        });
+        driver.click(body_x, body_y);
+        driver.mouse_up(body_x, body_y);
+        driver.render();
+
+        for _ in 0..60 {
+            driver.press_named(quadraui::NamedKey::PageUp);
+        }
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("MSG_MARKER_0"),
+            "PageUp must scroll the transcript once the panel is focused \
+             through a real click (#1452); screen:\n{screen}"
+        );
+    }
+
     /// #952 (ACP-1): a live ACP agent's `session/update` chunks must reach
     /// the AI panel transcript incrementally through the real
     /// `TuiShellApp`/`TuiDriver` stack — `Ctrl+S` submits, `driver.tick()`
