@@ -527,10 +527,8 @@ impl Engine {
         let path = self.active_buffer_state().file_path.clone()?;
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(&path, &roots).ok()?;
-        let display = resolved
-            .strip_prefix(self.acp_workspace_cwd())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| resolved.display().to_string());
+        let display =
+            crate::core::acp::workspace_relative_display(&resolved, &self.acp_workspace_cwd());
         let name = resolved
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
