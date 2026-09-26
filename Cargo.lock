@@ -2681,7 +2681,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 [[package]]
 name = "quadraui"
 version = "0.0.1"
-source = "git+https://github.com/JDonaghy/quadraui.git?rev=3cfc751c6566baba520f32ad3d776b402a6617d6#3cfc751c6566baba520f32ad3d776b402a6617d6"
+source = "git+https://github.com/JDonaghy/quadraui.git?rev=78a22f2597e07d0238fc651621d79f67846984a8#78a22f2597e07d0238fc651621d79f67846984a8"
 dependencies = [
  "arboard",
  "core-foundation 0.9.4",
@@ -3945,6 +3945,7 @@ dependencies = [
  "gio",
  "gtk4",
  "ignore",
+ "image",
  "insta",
  "libc",
  "lsp-types",

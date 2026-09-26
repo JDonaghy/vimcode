@@ -206,7 +206,7 @@ win = ["quadraui/win"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "3cfc751c6566baba520f32ad3d776b402a6617d6", features = ["tui", "terminal"] }
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "78a22f2597e07d0238fc651621d79f67846984a8", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
@@ -305,6 +305,21 @@ insta = "1.39"
 # protocol synchronously; #27's fuzzing loop can build on it or swap in
 # nvim-rs then without touching anything else.
 rmpv = "1.3"
+# #1531: a portable "did these bytes decode as a real image" check for the
+# macOS/Win-GUI `build_shell_config` app-icon tests — those two backends have
+# no bundled pixel-decoder exposed to test code the way GTK's `gdk_pixbuf` is
+# (see `src/gtk/mod.rs`'s `shell_config_identity_tests`, which reuses that
+# instead). Already resolved transitively at this exact version (`arboard`'s
+# `image-data` feature, pulled in by quadraui's GTK/macOS clipboard support,
+# already depends on it), so this adds no new crate version to `Cargo.lock` —
+# just a direct name for vimcode's own test code to reach it by.
+# `default-features = false` + `features = ["png"]`: the app icon asset this
+# decodes is always PNG, so vimcode's own declared need stays minimal even
+# though `arboard`'s broader feature request is what actually determines the
+# unified build (Cargo unions feature flags across the whole dependency
+# graph) — narrowing here is correct today and free if `arboard` ever
+# narrows its own request first.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [build-dependencies]
 cc = "1.0"

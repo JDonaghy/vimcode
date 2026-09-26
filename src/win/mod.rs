@@ -83,13 +83,13 @@ use crate::app::{App, TextMetricsBackend};
 /// `crate::macos::run`.
 ///
 /// Panic hook + swap flush, choose the backend, construct the shared
-/// [`App`], derive its [`quadraui::ShellConfig`] via the same
-/// `App::shell_config()` the macOS entry point calls (#866 — no
-/// per-backend copy of that logic here, see `crate::gtk::build_shell_config`'s
-/// doc comment), hand both to the runner. Nothing else — no `gtk4::init`
-/// equivalent, because `quadraui::win::run`'s Win32 bootstrap
-/// (`RegisterClassExW`/`CreateWindowExW`/the message loop) does its own
-/// setup inside `run_with_shell`.
+/// [`App`], derive its [`quadraui::ShellConfig`] via [`build_shell_config`]
+/// (#866 — no per-backend copy of the panel/title-bar/sidebar-clamp logic
+/// here, see `crate::gtk::build_shell_config`'s doc comment for why that
+/// lives once, in `App::shell_config`, instead), hand both to the runner.
+/// Nothing else — no `gtk4::init` equivalent, because `quadraui::win::run`'s
+/// Win32 bootstrap (`RegisterClassExW`/`CreateWindowExW`/the message loop)
+/// does its own setup inside `run_with_shell`.
 pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The same panic hook `crate::gtk::run` / `crate::macos::run` install:
     // flush every dirty buffer to its swap file, then write a crash log.
@@ -110,8 +110,63 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
         text_metrics_backend,
         crate::render::UnitProfile::px(),
     );
-    let config = app.shell_config();
+    let config = build_shell_config(&app);
     quadraui::win::shell_runner::run_with_shell(app, config)
+}
+
+/// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine
+/// state — the Win-GUI twin of `crate::gtk::build_shell_config` /
+/// `crate::macos::build_shell_config`.
+///
+/// Adds only [`quadraui::ShellConfig::with_app_icon`] on top of
+/// `app.shell_config()`: #1531/quadraui#1142's titlebar/taskbar icon.
+/// `WM_SETICON` (`ICON_BIG`/`ICON_SMALL`) needs a decodable image handed in
+/// explicitly — Win-GUI has no manifest icon resource here to fall back to.
+/// Split out (rather than inlined in [`run`]) so a headless test can assert
+/// the bytes reach `ShellConfig` without needing a live Win32 message loop.
+pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
+    app.shell_config()
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
+}
+
+/// #1531/quadraui#1142: same reasoning as `crate::gtk`'s
+/// `shell_config_identity_tests` / `crate::macos`'s
+/// `shell_config_identity_tests` — no headless taskbar to render into and
+/// assert on (that's the SMOKE_TESTS item, run on real Windows hardware),
+/// but a headless build *can* assert the bytes reach the `ShellConfig` the
+/// real `run` hands `run_with_shell`, and that they decode as a real image.
+/// Runs on an ordinary Linux host under `cargo test --features win`, per
+/// this module's own "Why `feature = "win"` alone" doc — `build_shell_config`
+/// touches no WinAPI, only `quadraui::ShellConfig`.
+#[cfg(all(test, feature = "win"))]
+mod shell_config_identity_tests {
+    use super::{build_shell_config, App};
+    use crate::app::TextMetricsBackend;
+    use crate::core::Engine;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        assert!(
+            image::load_from_memory(&bytes).is_ok(),
+            "app icon bytes must decode as an image"
+        );
+    }
 }
 
 // ── #969: `TextMetricsBackend` conformance (`WinBackend`) ──────────────────

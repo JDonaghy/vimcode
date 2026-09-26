@@ -130,6 +130,16 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
         // a fresh string literal, so there's exactly one identity string.
         .with_app_id(util::APP_ID)
         .with_icon_name(util::APP_ID)
+        // #1531/quadraui#1142: `with_app_icon` is a no-op on GTK today
+        // (`ShellConfig::app_icon`'s own doc — GTK keeps using
+        // `icon_name`/the desktop-theme icon `util::install_icon_and_desktop`
+        // installs). Set anyway, alongside the other two identity builders
+        // above, so the three GUI backends build their `ShellConfig`
+        // identically and a future GTK consumer of this field needs no new
+        // call site.
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
 }
 
 // #731: the `native_scrollbar_placement_tests` module that used to live
@@ -350,6 +360,33 @@ mod shell_config_identity_tests {
         let config = build_shell_config(&app);
         assert_eq!(config.app_id, util::APP_ID);
         assert_eq!(config.icon_name.as_deref(), Some(util::APP_ID));
+    }
+
+    /// #1531/quadraui#1142: same reasoning as the identity test above —
+    /// GTK ignores `ShellConfig::app_icon` at paint time (there is no
+    /// headless "Dock"/taskbar to render into and assert on; that's the
+    /// SMOKE_TESTS item), but a headless build *can* assert the bytes
+    /// actually reach the `ShellConfig` every GUI backend's runner is
+    /// handed, and that they decode as a real image rather than empty or
+    /// truncated bytes.
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        // PNG decoding needs no `librsvg2-common` loader (unlike the SVG
+        // probe `host_has_svg_loader` above) — core `gdk-pixbuf` decodes PNG
+        // unconditionally, so this assertion runs on every host, CI included.
+        let decoded = gtk4::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes))
+            .expect("app icon bytes must decode as an image");
+        assert!(decoded.width() > 0 && decoded.height() > 0);
     }
 
     #[test]
