@@ -15,9 +15,11 @@ be regenerated instead of trusted:
 and, for a historical column, against a worktree of the revision in question.
 
 Method: walk each `.rs` file; on a `#[cfg(test)]` (or `#[cfg(all(test, ...))]`)
-attribute, skip that attribute, any attributes stacked under it, and the whole
-braced item it guards. Everything else counts, blank lines and comments included
-— the point is comparability across revisions, not a true SLOC figure.
+attribute, skip that attribute, any attributes stacked under it, and the item it
+guards — either the braced body (skip to the matching `}`) or, for a bodiless
+item like `mod x;`, the single line ending in `;`. Everything else counts, blank
+lines and comments included — the point is comparability across revisions, not
+a true SLOC figure.
 """
 
 from __future__ import annotations
@@ -42,11 +44,15 @@ def prod_lines(path: str) -> int:
             depth = 0
             opened = False
             while i < n:
-                depth += lines[i].count("{") - lines[i].count("}")
-                if "{" in lines[i]:
+                line = lines[i]
+                depth += line.count("{") - line.count("}")
+                if "{" in line:
                     opened = True
                 i += 1
                 if opened and depth <= 0:
+                    break
+                if not opened and line.rstrip().endswith(";"):
+                    # Bodiless item (e.g. `mod x;`) — nothing to brace-scan.
                     break
             continue
         counted += 1

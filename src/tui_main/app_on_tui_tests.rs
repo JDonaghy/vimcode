@@ -37,21 +37,19 @@ mod tests {
     //!
     //! # Why this whole module lives inside one `#[cfg(test)] mod tests`
     //!
-    //! `mod.rs`'s own `mod app_on_tui_tests;` declaration is deliberately
-    //! *not* itself `#[cfg(test)]`-gated, even though every item this file
-    //! defines is (this one `mod tests` block wraps literally everything
-    //! below, including its own module doc you're reading right now).
-    //! Gating that bodiless, semicolon-form declaration *in addition to*
-    //! this inner gate trips a latent `scripts/prod_lines.py` blind spot:
-    //! its brace-balance skip loop only knows how to skip a *braced* item,
-    //! so on a `#[cfg(test)] mod x;` line with no body it never finds an
-    //! opening `{` to close on and instead runs off the end of the
-    //! *`mod.rs` file*, silently miscounting everything below it as
-    //! skipped (confirmed by hand — `src/tui_main`'s own reported total
-    //! dropped by hundreds of lines the one time this was tried). Leaving
-    //! `mod.rs`'s declaration ungated sidesteps that bug; the module still
-    //! compiles to empty outside tests either way, since everything here
-    //! is gated at this level instead.
+    //! `mod.rs`'s own `mod app_on_tui_tests;` declaration *is*
+    //! `#[cfg(test)]`-gated, same as every item this file defines (this one
+    //! `mod tests` block wraps literally everything below, including its own
+    //! module doc you're reading right now). Gating that bodiless,
+    //! semicolon-form `mod` declaration used to trip a `scripts/prod_lines.py`
+    //! bug: its brace-balance skip loop only knew how to skip a *braced*
+    //! item, so on a `#[cfg(test)] mod x;` line with no body it never found
+    //! an opening `{` to close on and instead ran off the end of the
+    //! *`mod.rs` file*, silently miscounting everything below it as skipped.
+    //! `prod_lines.py` now also recognises a bodiless item — one that ends in
+    //! `;` before any `{` is seen — as a single skippable line, so the `mod`
+    //! declaration above is gated for real and this file's ~830 lines are
+    //! correctly excluded from `src/tui_main`'s production count (delta: 0).
     //!
     //! # Why `(80, 24)`
     //!
@@ -256,18 +254,32 @@ mod tests {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
+            // #1425 gate: unit — same editor-band collapse as the sibling
+            // key_dispatch tests above (`dd_deletes_the_current_line`,
+            // `undo_restores_after_dd`): the precondition below (the typed
+            // marker text visible before Escape) can't be satisfied at this
+            // viewport, so the real Escape-vs-Insert assertion after it is
+            // unreachable either way. Target: UnitProfile.
             known_bug_gate(
                 "app_on_tui::escape_returns_to_normal_mode_after_insert",
                 || {
                     driver.type_char('i');
-                    driver.type_char('a');
+                    for c in "ZQXWESC".chars() {
+                        driver.type_char(c);
+                    }
+                    assert!(
+                        driver.screen_has("ZQXWESC"),
+                        "precondition: the typed marker text must be painted \
+                 before Escape can be meaningfully tested; screen:\n{}",
+                        driver.screen()
+                    );
                     driver.press_named(quadraui::NamedKey::Escape);
                     // In Normal mode, 'x' deletes the character under the cursor
                     // rather than inserting — if Escape didn't work, this 'x' would
                     // instead insert a literal 'x' into the buffer.
                     driver.type_char('x');
                     assert!(
-                        !driver.screen_has("ax"),
+                        !driver.screen_has("ZQXWESCx"),
                         "'x' after Escape must delete under the cursor (Normal \
                  mode), not insert a literal 'x' (would mean Escape never \
                  left Insert mode); screen:\n{}",
@@ -1013,9 +1025,9 @@ mod tests {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
+            // #1425 gate: unit — the bottom panel band is part of the same collapsed layout.
+            // Target: UnitProfile.
             known_bug_gate(
-                // #1425 gate: unit — the bottom panel band is part of the same collapsed layout.
-                // Target: UnitProfile.
                 "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
                 || {
                     // Baseline count, not `!screen_has("Terminal")` — `App`
@@ -1181,12 +1193,13 @@ mod tests {
             let mut h = harness(engine_with_folder_ctx_menu("delete", 8));
             let driver = &mut h.driver;
 
-            // #1425 gate: unit — neither the explorer context menu popup nor the confirm
-            // dialog it opens paints at this viewport (confirmed alongside
-            // popups::dialog_intercepts_all_keys's identical symptom for a
-            // plain dialog) — the engine-level dispatch still runs
-            // (context_menu_new_file_starts_inline_edit's inline-edit result
-            // proves that half works), only the overlay's own paint is
+            // #1425 gate: unit — the context menu itself paints fine (its sibling tests
+            // `context_menu_escape_dismisses`/`context_menu_new_file_starts_inline_edit`
+            // read it ungated), but the confirm dialog it opens does not paint at this
+            // viewport (confirmed alongside popups::dialog_intercepts_all_keys's
+            // identical symptom for a plain dialog) — the engine-level dispatch still
+            // runs (context_menu_new_file_starts_inline_edit's inline-edit result
+            // proves that half works), only the confirm-dialog overlay's own paint is
             // missing. Target: UnitProfile.
             known_bug_gate(
                 "app_on_tui::context_menu_delete_opens_confirm_dialog",
@@ -1303,7 +1316,18 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
+            // #1425 gate: unit — same collapsed editor content band as
+            // `minimap_paints_braille_when_enabled`: the precondition below
+            // (the buffer's own text painting) can't be satisfied at this
+            // viewport, so there is no signal to distinguish "minimap off"
+            // from "minimap unreachable" either way. Target: UnitProfile.
             known_bug_gate("app_on_tui::no_minimap_braille_when_setting_is_off", || {
+                assert!(
+                    driver.screen_has("line 1"),
+                    "precondition: buffer text must be painted before the \
+                 minimap setting can be meaningfully tested; screen:\n{}",
+                    driver.screen()
+                );
                 assert!(
                     !has_braille(&driver.screen()),
                     "`minimap: false` must reserve no strip, so no braille may \
@@ -1441,9 +1465,9 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
+            // #1425 gate: unit — same collapse as the sibling divider tests above. Target:
+            // UnitProfile.
             known_bug_gate(
-                // #1425 gate: unit — same collapse as the sibling divider tests above. Target:
-                // UnitProfile.
                 "app_on_tui::group_divider_drag_moves_the_painted_divider_via_shell_app",
                 || {
                     driver.mouse_up(1.0, 1.0); // settle the layout, see mirrored test's own doc
@@ -1484,9 +1508,9 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
+            // #1425 gate: unit — the group divider glyph itself never paints once the editor
+            // content band has collapsed to zero rows. Target: UnitProfile.
             known_bug_gate(
-                // #1425 gate: unit — the group divider glyph itself never paints once the editor
-                // content band has collapsed to zero rows. Target: UnitProfile.
                 "app_on_tui::group_divider_click_without_move_leaves_the_divider_put_via_shell_app",
                 || {
                     driver.mouse_up(1.0, 1.0);
@@ -1526,9 +1550,9 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
+            // #1425 gate: unit — same TAB_ROW_HEIGHT_PX-as-rows collapse: the split's second
+            // pane never paints its own tab bar at all. Target: UnitProfile.
             known_bug_gate(
-                // #1425 gate: unit — same TAB_ROW_HEIGHT_PX-as-rows collapse: the split's second
-                // pane never paints its own tab bar at all. Target: UnitProfile.
                 "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
                 || {
                     driver.ctrl_char('w');
