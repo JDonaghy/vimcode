@@ -16353,6 +16353,105 @@ mod tests {
         );
     }
 
+    /// #1459 review blocking finding: resuming a session while the
+    /// current one is still live (no `:AiClear` in between) must replace
+    /// the on-screen transcript, not splice the resumed history onto
+    /// whatever conversation was already displayed. Every other
+    /// `:AiSessions` driver test (including the one just above) calls
+    /// `:AiClear` before resuming, which happens to also empty the
+    /// transcript as a side effect of killing the live client — masking
+    /// this exact state, the one `Engine::acp_resume_session`'s own doc
+    /// names ("a live session already: call `acp_begin_session`
+    /// immediately").
+    ///
+    /// RED verified: with `Engine::acp_reset_transcript_for_resume`'s call
+    /// removed from `acp_resume_session`, this fails — "hello from
+    /// session A" (and its reply) are still on screen alongside the
+    /// resumed session's replayed history.
+    #[cfg(unix)]
+    #[test]
+    fn ai_sessions_picker_resume_replaces_a_still_live_transcript_via_shell_app() {
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        app.engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec![
+                "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                "ACP_FAKE_LOAD_SESSION=1".to_string(),
+            ],
+        }];
+        app.engine.settings.acp_active_agent = "claude".to_string();
+
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+        driver.press_named(quadraui::NamedKey::Escape);
+
+        // The still-live session this resume must not splice onto.
+        driver.type_char(':');
+        for c in "AI hello from session A".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("Hello world") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("hello from session A"),
+            "sanity: the live session's own turn must be on screen before \
+             resuming; screen:\n{screen}"
+        );
+
+        // Deliberately no `:AiClear` here — the live client and its
+        // session stay connected into the resume below.
+        driver.type_char(':');
+        for c in "AiSessions".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AI Sessions"),
+            "the picker must open while a session is still live; \
+             screen:\n{screen}"
+        );
+
+        // Confirm the (only) entry — the currently-live session itself,
+        // resumed via `session/load` on the same still-running agent
+        // process.
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut screen = driver.screen();
+        while !screen.contains("It prints hello.") && Instant::now() < deadline {
+            driver.tick();
+            std::thread::sleep(Duration::from_millis(10));
+            screen = driver.screen();
+        }
+        assert!(
+            screen.contains("It prints hello."),
+            "the resumed session's replayed history must rebuild within \
+             5s; screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("hello from session A"),
+            "the previous live session's transcript must be gone, not \
+             spliced in ahead of the resumed history; screen:\n{screen}"
+        );
+    }
+
     /// #1459's other acceptance half: when the active agent's most
     /// recently learned `agentCapabilities.loadSession` is `false` (the
     /// fixture's default — every pre-#1459 test relies on this), `:AiSessions`

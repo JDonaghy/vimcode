@@ -3099,6 +3099,23 @@ mod tests {
         assert_eq!(absent, AcpPromptCapabilities::default());
     }
 
+    /// Review nit: direct unit coverage for [`parse_load_session_capability`]
+    /// — modeled on `parse_prompt_capabilities`'s sibling test above, which
+    /// this one previously lacked (only exercised indirectly via the
+    /// fixture/engine tests).
+    #[test]
+    fn parse_load_session_capability_reads_the_flag_and_defaults_absent_to_false() {
+        let caps = serde_json::json!({"loadSession": true});
+        assert!(parse_load_session_capability(&caps));
+
+        let caps = serde_json::json!({"loadSession": false});
+        assert!(!parse_load_session_capability(&caps));
+
+        // Every pre-#1459 fixture/agent omits the field entirely.
+        assert!(!parse_load_session_capability(&serde_json::Value::Null));
+        assert!(!parse_load_session_capability(&serde_json::json!({})));
+    }
+
     // ---- Integration: fake NDJSON echo agent subprocess ----
     //
     // `tests/fixtures/fake_acp_agent.sh` is the fixture the whole ACP track
