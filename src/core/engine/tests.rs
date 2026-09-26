@@ -22891,6 +22891,19 @@ fn test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message() {
         "message should explain the API key side is unconfigured: {}",
         e.message
     );
+    // The panel must not swallow the turn the user typed, and the reason
+    // belongs in the transcript too — same shape as the ACP spawn-failure
+    // arm. (Painted-output coverage for both lives in
+    // `ai_panel_submit_without_transport_keeps_turn_and_paints_reason_via_shell_app`.)
+    assert_eq!(e.ai_messages.len(), 2, "{:?}", e.ai_messages);
+    assert_eq!(e.ai_messages[0].role, "user");
+    assert_eq!(e.ai_messages[0].content, "hello");
+    assert_eq!(e.ai_messages[1].role, "assistant-thought");
+    assert!(
+        e.ai_messages[1].content.contains("Cannot send"),
+        "transcript should explain why nothing was sent: {}",
+        e.ai_messages[1].content
+    );
 }
 
 /// Companion to the above: an Ollama provider needs no API key at all, so

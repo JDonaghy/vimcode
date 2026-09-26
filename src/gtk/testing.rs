@@ -5533,6 +5533,49 @@ second line here
         );
     }
 
+    /// #1446, GTK side of the multi-backend rule (the TUI companion is
+    /// `ai_panel_submit_without_transport_keeps_turn_and_paints_reason_via_shell_app`):
+    /// submitting with no ACP agent *and* no resolvable API key must keep
+    /// the typed turn in the painted transcript and paint the reason there
+    /// too, rather than spawning a doomed `curl` whose only feedback was a
+    /// bare "AI error: curl failed:".
+    ///
+    /// RED verified: with `Engine::ai_send_message`'s pre-flight check
+    /// disabled (develop's behaviour), "Cannot send" never paints.
+    #[test]
+    fn ai_panel_submit_without_transport_paints_reason() {
+        let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let engine = h.engine.borrow();
+            assert!(engine.settings.acp_agent_command.trim().is_empty());
+            assert!(engine.settings.acp_agents.is_empty());
+            assert!(engine.settings.ai_api_key.is_empty());
+        }
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+
+        for c in "hello assistant".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        assert!(
+            h.driver.screen_contains("hello assistant"),
+            "the submitted turn must still be painted when no transport is \
+             configured (#1446)"
+        );
+        assert!(
+            h.driver.screen_contains("Cannot send"),
+            "the transcript must paint why nothing was sent (#1446)"
+        );
+    }
+
     /// AI: the transcript must scroll — messages painted while stuck to the
     /// tail must no longer include the earliest message once scrolled up,
     /// and scrolling must reveal it. `ChatController` follows the tail by

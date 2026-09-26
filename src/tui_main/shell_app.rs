@@ -14888,6 +14888,56 @@ mod tests {
         );
     }
 
+    /// #1446, panel surface: submitting from the AI panel itself with no
+    /// transport configured must (a) keep the typed turn in the rendered
+    /// transcript — the panel must never silently swallow what the user
+    /// typed — and (b) paint the explanation *in the transcript*, where a
+    /// chat user is actually looking, not only on the command line that
+    /// `render_content_paints_ai_no_key_error_via_shell_app` covers. This
+    /// mirrors the ACP spawn-failure arm's existing shape.
+    ///
+    /// RED verified against the first cut of this branch (which returned
+    /// early without touching `ai_messages`): the submitted turn vanished,
+    /// which is exactly what broke
+    /// `ai_panel_submit_appends_transcript_turn_via_shell_app` and the two
+    /// #1445 click-focus tests on a machine with no `ANTHROPIC_API_KEY`.
+    #[test]
+    fn ai_panel_submit_without_transport_keeps_turn_and_paints_reason_via_shell_app() {
+        let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let mut app = TuiShellApp::new(None);
+        app.engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_AI));
+        app.engine.ai_has_focus = true;
+        app.sidebar.has_focus = true;
+        assert!(app.engine.settings.acp_agent_command.trim().is_empty());
+        assert!(app.engine.settings.acp_agents.is_empty());
+        assert!(app.engine.settings.ai_api_key.is_empty());
+
+        let mut driver = driver_with_shell(app, config(), 120, 30);
+        for c in "hello assistant".chars() {
+            driver.type_char(c);
+        }
+        driver.ctrl_char('s');
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("hello assistant") && screen.contains("You"),
+            "the submitted turn must still be painted in the transcript even \
+             when no transport is configured (#1446); screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("Cannot send"),
+            "the transcript must explain why nothing was sent (#1446); \
+             screen:\n{screen}"
+        );
+    }
+
     /// Install a mock board provider — an installed extension whose
     /// manifest declares `[board]` (#522's seam). No coordinator (or any
     /// other specific provider) anywhere in this test, per #521's "generic
