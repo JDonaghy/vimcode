@@ -25,9 +25,8 @@ are adding a module, add it to `src/lib.rs`, not to a bin.
 
 The `test-support` feature (off by default) re-exports the two black-box
 harnesses for that external crate: `gtk::testing::{Harness, harness}` (the #646
-headless `GtkDriver` wrapper) and `tui_main::testing::TuiShellApp` (for
-quadraui's `driver_with_shell`). See `tests/acceptance.rs` and
-`tests/acceptance/ms-example/contract.md`.
+headless `GtkDriver` wrapper) and the `tui_main::testing` seam (`tui_driver`,
+`conformance_harness`) over the shared `App`. See `tests/acceptance.rs`.
 
 ### The two backends, and what is left in them
 

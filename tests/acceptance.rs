@@ -59,4 +59,9 @@
 // `ms-NN` (hyphens — not valid Rust module names), which is why these are
 // `include!`s rather than `mod` declarations. Each slice wraps its tests in
 // its own `mod`, so the libtest ids the manifest maps are module-qualified.
-include!("acceptance/ms-example/seam_657.rs");
+//
+// No slices yet. The #657 `ms-example` reachability slice was deleted once
+// #1433 moved the TUI onto the shared `App`: its TUI half is mirrored on the
+// `tui_main::testing::tui_driver` seam in `src/tui_main/app_on_tui_tests.rs`,
+// and it pinned `TuiShellApp`, which #1434 deletes. Add the first real slice
+// as `include!("acceptance/ms-NN/<slice>.rs");`.
