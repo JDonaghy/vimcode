@@ -6223,6 +6223,109 @@ second line here
         );
     }
 
+    /// #1459 acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
+    /// transcript_via_shell_app`: `:AiSessions` lists past sessions for the
+    /// active agent + workspace (vimcode's own local index — ACP has no
+    /// `session/list` method) and resumes one via `session/load` through
+    /// the real `App`/`GtkDriver` stack, rebuilding the transcript from the
+    /// agent's replayed history through the exact same chunk-mapping path
+    /// a live turn uses, not a second renderer.
+    ///
+    /// RED verified the same way as the TUI twin: with
+    /// `Engine::acp_begin_session`'s resume branch deleted (so
+    /// `acp_pending_resume` is silently ignored), this test fails at the
+    /// "It prints hello." wait — no `session/load` request is ever sent.
+    #[cfg(unix)]
+    #[test]
+    fn ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_transcript() {
+        let mut h = panel_harness(PANEL_AI);
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "claude".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_LOAD_SESSION=1".to_string(),
+                ],
+            }];
+            engine.settings.acp_active_agent = "claude".to_string();
+            engine.execute_command("AI remember this please");
+        }
+        h.driver.render();
+
+        // First session: let it complete, so the local index has something
+        // to remember.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "the first session must complete within 5s"
+        );
+
+        // End the session — the local index survives on `Engine::
+        // acp_session_index`, not on the now-dead client.
+        h.engine.borrow_mut().execute_command("AiClear");
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("remember this please"),
+            ":AiClear must wipe the transcript before the resume below can \
+             prove anything"
+        );
+
+        // `:AiSessions` must list the just-recorded session, keyed by its
+        // first prompt.
+        h.engine.borrow_mut().execute_command("AiSessions");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("AI Sessions"),
+            "the picker title must paint"
+        );
+        assert!(
+            h.driver.screen_contains("remember this please"),
+            "the recorded session's first prompt must list as the picker \
+             entry"
+        );
+
+        // Confirm the (only) entry — a real key press through the driver,
+        // resuming via `session/load` on a freshly spawned agent process
+        // (the old one died at `:AiClear`).
+        h.driver.press_named(quadraui::NamedKey::Enter);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("It prints hello.") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("It prints hello."),
+            "the assistant turn replayed via session/load must rebuild in \
+             the transcript within 5s"
+        );
+        assert!(
+            h.driver.screen_contains("what does main.rs do"),
+            "the user turn replayed via session/load must rebuild too -- \
+             history replay covers both roles, not just the assistant side"
+        );
+        assert!(
+            h.driver.screen_contains("Read README.md"),
+            "a replayed tool-call turn must also rebuild, not just message \
+             chunks"
+        );
+    }
+
     /// #1449 acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_shows_attached_current_buffer_chip_via_shell_app`: with
     /// `ai_attach_current_buffer` on (the default) and the active buffer

@@ -68,6 +68,10 @@ impl Engine {
                 self.picker_title = "Open Recent Workspace".to_string();
                 self.picker_populate_recent_workspaces();
             }
+            PickerSource::AcpSessions => {
+                self.picker_title = "AI Sessions".to_string();
+                self.picker_populate_acp_sessions();
+            }
             _ => {
                 self.picker_title = format!("{:?}", source);
             }
@@ -716,6 +720,45 @@ impl Engine {
                     filter_text: display,
                     detail,
                     action: PickerAction::OpenWorkspace(path.clone()),
+                    icon: None,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+    }
+
+    /// Populate the `:AiSessions` picker (#1459) from the local session
+    /// index, scoped to the active agent + workspace, most-recently-used
+    /// first (`AcpSessionIndex::sessions_for` already sorts that way). The
+    /// entry's `display` is the first prompt that started the session
+    /// (falling back to the raw session id for a record predating that
+    /// field, which can't happen post-#1459 but costs nothing to guard),
+    /// since a bare session id means nothing to a human; `detail` is a
+    /// relative "last used" timestamp, reusing `git::epoch_to_relative`'s
+    /// bucketing rather than re-deriving it.
+    fn picker_populate_acp_sessions(&mut self) {
+        let agent_name = self.acp_active_agent_name();
+        let cwd = self.acp_workspace_cwd();
+        self.picker_all_items = self
+            .acp_session_index
+            .sessions_for(&agent_name, &cwd)
+            .into_iter()
+            .map(|record| {
+                let display = if record.first_prompt.is_empty() {
+                    record.session_id.clone()
+                } else {
+                    record.first_prompt.clone()
+                };
+                let detail = crate::core::git::epoch_to_relative(record.updated_at as i64);
+                PickerItem {
+                    display: display.clone(),
+                    filter_text: display,
+                    detail: Some(detail),
+                    action: PickerAction::ResumeAcpSession(record.session_id),
                     icon: None,
                     score: 0,
                     match_positions: Vec::new(),
@@ -1993,6 +2036,16 @@ impl Engine {
                 self.explorer_has_focus = true;
                 self.explorer_reveal_active_file();
                 self.explorer_needs_refresh = true;
+                EngineAction::None
+            }
+            PickerAction::ResumeAcpSession(session_id) => {
+                // #1459: `:AiSessions` picker confirm. Reveal the panel the
+                // same way `:AI <message>` does (`ff739abb`/#1453) so the
+                // replayed transcript is actually visible, then resume —
+                // `Engine::acp_resume_session` handles every client state
+                // (none yet, mid-handshake, or already live) uniformly.
+                self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
+                self.acp_resume_session(session_id);
                 EngineAction::None
             }
             PickerAction::JumpToMark(_mark) => {

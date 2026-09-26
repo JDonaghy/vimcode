@@ -1132,6 +1132,11 @@ pub enum PickerSource {
     /// TUI's old `FolderPickerState::new_recent` (removed, #815) with the
     /// engine-driven picker.
     RecentWorkspaces,
+    /// `:AiSessions` (#1459): past sessions for the active ACP agent and
+    /// workspace, sourced from `crate::core::acp_sessions::AcpSessionIndex`
+    /// (ACP has no `session/list` method — this is vimcode's own record of
+    /// sessions it has itself created).
+    AcpSessions,
     Custom(String),
 }
 
@@ -1197,6 +1202,9 @@ pub enum PickerAction {
     SetLineEnding(bool),
     /// Open a workspace folder (recent-workspaces picker; #274).
     OpenWorkspace(PathBuf),
+    /// Resume a past ACP session by id via `session/load` (`:AiSessions`
+    /// picker; #1459).
+    ResumeAcpSession(String),
     Custom(String),
 }
 
@@ -3703,6 +3711,32 @@ pub struct Engine {
     /// context) can both branch on it. Session-scoped: reset to the
     /// all-`false` default alongside `acp_auth_methods`/`acp_client`.
     pub acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities,
+    /// Local index of past ACP sessions this client has itself created,
+    /// plus the learned `loadSession` capability per agent (#1459). Loaded
+    /// once at startup (`AcpSessionIndex::load`), updated and re-saved
+    /// whenever a new session is created (`SessionCreated`) or an
+    /// `initialize` response is seen (`Initialized`) — see
+    /// `Engine::acp_open_sessions_picker` (the `:AiSessions` entry point)
+    /// and `Engine::acp_begin_session` (the `session/load` resume path)
+    /// for the two consumers.
+    pub acp_session_index: crate::core::acp_sessions::AcpSessionIndex,
+    /// A session id chosen via `:AiSessions`, waiting for the next
+    /// `initialize` handshake to complete so `Engine::acp_begin_session`
+    /// can `session/load` it instead of `session/new`-ing a fresh one
+    /// (#1459). Also set by the `acp_reopen_last_session` setting's
+    /// "resume on first `:AI` after startup" path
+    /// (`Engine::ai_send_message_via_acp`). Consumed (taken) the moment
+    /// `acp_begin_session` runs, however it got there — auth-choice
+    /// skipped, a `type: "agent"` method succeeding, or no auth required at
+    /// all — since all four call sites funnel through that one function.
+    pub acp_pending_resume: Option<String>,
+    /// One-shot guard for the `acp_reopen_last_session` setting (#1459):
+    /// `Engine::ai_send_message_via_acp` only ever attempts the automatic
+    /// "resume the last session for this agent/workspace" on the *first*
+    /// `:AI`/message of the process, never again — a deliberate `:AiClear`
+    /// or `:AiSessions` pick later in the same run must not be silently
+    /// overridden by this on the next message.
+    pub acp_startup_reopen_attempted: bool,
     /// A buffer line-range staged for the *next* prompt (#1450): either the
     /// Visual-mode `<leader>ai` mapping or a `:{range}AI` ex command. `Some`
     /// shows the `⧉`-chip in the panel header
@@ -4976,6 +5010,9 @@ impl Engine {
             acp_auth_methods: Vec::new(),
             acp_authenticated: false,
             acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities::default(),
+            acp_session_index: crate::core::acp_sessions::AcpSessionIndex::load(),
+            acp_pending_resume: None,
+            acp_startup_reopen_attempted: false,
             acp_pending_attachment: None,
             sidebar_focus_requested: false,
             acp_tool_calls: Vec::new(),

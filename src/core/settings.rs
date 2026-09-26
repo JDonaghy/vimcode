@@ -623,6 +623,22 @@ pub struct Settings {
     #[serde(default)]
     pub acp_active_agent: String,
 
+    /// Automatically resume the most recently used ACP session for the
+    /// active agent and workspace (`:AiSessions`' local index,
+    /// `crate::core::acp_sessions::AcpSessionIndex`) on the *first*
+    /// `:AI`/message of the process (#1459), instead of always starting
+    /// empty. Only ever applies once per run
+    /// (`Engine::acp_startup_reopen_attempted`) — a later `:AiClear` or
+    /// manual `:AiSessions` pick is never second-guessed by this. Silently
+    /// falls back to a fresh session (unchanged behaviour) when there is no
+    /// recorded session for this agent/workspace yet, or the agent doesn't
+    /// advertise `loadSession`. **Default off**, same reasoning as
+    /// `board_tick_enabled`: resuming means the agent replays its whole
+    /// prior turn history back at this client, which is not what every
+    /// user wants every time they open the editor.
+    #[serde(default)]
+    pub acp_reopen_last_session: bool,
+
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer (default: false).
     #[serde(default)]
@@ -1567,6 +1583,7 @@ impl Default for Settings {
             acp_agent_command: String::new(),
             acp_agents: Vec::new(),
             acp_active_agent: String::new(),
+            acp_reopen_last_session: false,
             show_hidden_files: false,
             explorer_sort_case_insensitive: true,
             swap_file: default_swap_file(),
@@ -3422,6 +3439,7 @@ impl Settings {
             "ai_completions" => self.ai_completions.to_string(),
             "ai_attach_current_buffer" => self.ai_attach_current_buffer.to_string(),
             "acp_agent_command" => self.acp_agent_command.clone(),
+            "acp_reopen_last_session" => self.acp_reopen_last_session.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -3560,6 +3578,7 @@ impl Settings {
             "ai_completions" => self.ai_completions = value == "true",
             "ai_attach_current_buffer" => self.ai_attach_current_buffer = value == "true",
             "acp_agent_command" => self.acp_agent_command = value.to_string(),
+            "acp_reopen_last_session" => self.acp_reopen_last_session = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4131,6 +4150,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::StringVal,
     },
     SettingDef {
+        key: "acp_reopen_last_session",
+        label: "Reopen Last AI Session",
+        description: "Resume the most recent ACP session for the active agent and workspace on the first :AI message after startup, instead of always starting empty (off by default)",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "indent_guides",
         label: "Indent Guides",
         description: "Show vertical lines at each indentation level",
@@ -4531,6 +4557,24 @@ mod tests {
         assert_eq!(s.get_value_str("board_tick_enabled"), "true");
 
         assert!(SETTING_DEFS.iter().any(|d| d.key == "board_tick_enabled"));
+    }
+
+    /// #1459's opt-in "reopen last AI session on startup" setting: same
+    /// default-off/round-trip/registry contract as `board_tick_enabled`
+    /// above.
+    #[test]
+    fn acp_reopen_last_session_defaults_off_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert!(!s.acp_reopen_last_session);
+        assert_eq!(s.get_value_str("acp_reopen_last_session"), "false");
+
+        s.set_value_str("acp_reopen_last_session", "true").unwrap();
+        assert!(s.acp_reopen_last_session);
+        assert_eq!(s.get_value_str("acp_reopen_last_session"), "true");
+
+        assert!(SETTING_DEFS
+            .iter()
+            .any(|d| d.key == "acp_reopen_last_session"));
     }
 
     #[test]

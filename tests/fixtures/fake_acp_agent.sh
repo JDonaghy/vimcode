@@ -32,6 +32,24 @@
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
 #                           against.
+#   - session/load       -> (#1459) only reachable when $ACP_FAKE_LOAD_SESSION
+#                           also made `initialize` advertise the capability
+#                           (see below), matching the real Claude ACP
+#                           adapter's contract: replays a three-turn history
+#                           (one `user_message_chunk`, one
+#                           `agent_message_chunk`, one completed `tool_call`)
+#                           as `session/update` notifications *before*
+#                           answering the request — so a test can assert the
+#                           transcript rebuilds every turn kind the live
+#                           path renders (user, assistant, tool-call) through
+#                           the exact same chunk-mapping path, not a second
+#                           renderer — then replies with an empty result (no
+#                           `sessionId` echoed back; the caller already knows
+#                           it, see `AcpEvent::SessionLoaded`'s doc). If
+#                           $ACP_FAKE_LOAD_SESSION_ERROR is set, replies with
+#                           a JSON-RPC error instead, for the "resume against
+#                           an agent that doesn't actually support it"
+#                           regression path.
 #   - session/prompt     -> (#1449) if $ACP_FAKE_CAPTURE_PROMPT_TO names a
 #                           file, the raw request line is appended to it
 #                           first, unconditionally — lets a test assert on
@@ -179,6 +197,13 @@
 # (an embedded `resource` block with the exact buffer text vs. a
 # `resource_link` + fenced-text fallback) against the same fixture.
 #
+# #1459: `initialize`'s `agentCapabilities.loadSession` is `false`/absent
+# unless $ACP_FAKE_LOAD_SESSION is set, in which case it's `true` and
+# `session/load` becomes reachable (see that method's entry above) — lets a
+# test drive both the ":AiSessions says so and does nothing else" refusal
+# (capability absent/false) and the actual resume path (capability true)
+# against the same fixture.
+#
 # #957 (ACP-6) interactive terminal-auth login. When this script's own
 # stdin is a real TTY — i.e. it was launched by `Engine::
 # acp_launch_terminal_login`'s `TerminalSession` (a real PTY) rather than
@@ -285,9 +310,25 @@ while IFS= read -r line; do
       # `Engine::acp_prompt_content_blocks`. Unset (every pre-#1450 test)
       # keeps the empty `{}` every prior slice relies on, which parses as
       # all-`false` per `parse_prompt_capabilities`'s doc.
-      agent_caps='{}'
+      # #1459: $ACP_FAKE_LOAD_SESSION set -> agentCapabilities also carries
+      # (or, absent embeddedContext, carries alone) loadSession:true, so a
+      # test can drive `parse_load_session_capability` and the actual
+      # `session/load` path. Built independently of embeddedContext above so
+      # either, both, or neither can be set without the fixture needing a
+      # case for every combination.
+      caps_fields=""
       if [ -n "$ACP_FAKE_EMBEDDED_CONTEXT" ]; then
-        agent_caps='{"promptCapabilities":{"embeddedContext":true}}'
+        caps_fields='"promptCapabilities":{"embeddedContext":true}'
+      fi
+      if [ -n "$ACP_FAKE_LOAD_SESSION" ]; then
+        if [ -n "$caps_fields" ]; then
+          caps_fields="${caps_fields},"
+        fi
+        caps_fields="${caps_fields}\"loadSession\":true"
+      fi
+      agent_caps='{}'
+      if [ -n "$caps_fields" ]; then
+        agent_caps="{${caps_fields}}"
       fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
@@ -302,6 +343,27 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
+      fi
+      ;;
+    *'"method":"session/load"'*)
+      id=$(extract_id "$line")
+      # #1459: only reachable when `initialize` advertised loadSession —
+      # see this file's top-of-file doc for the full contract. Replays a
+      # two-turn history as `session/update` notifications *before*
+      # answering, matching the real Claude ACP adapter's documented
+      # behaviour, then answers with an empty result (no `sessionId` of its
+      # own to echo — the caller already knows it).
+      if [ -n "$ACP_FAKE_LOAD_SESSION_ERROR" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"unknown session"}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"what does main.rs do"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"It prints hello."}}}}\n'
+        # A completed tool call is part of the replayed history too, not
+        # just message chunks — a resumed transcript must rebuild every
+        # turn kind the live path already renders (#1459's acceptance bar
+        # explicitly names "user, assistant and tool-call turns").
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-replayed","title":"Read README.md","kind":"read","status":"completed"}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       fi
       ;;
     *'"method":"session/prompt"'*)

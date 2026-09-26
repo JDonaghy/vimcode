@@ -799,6 +799,15 @@ below) is configured:
   - **Cancelling** — `Ctrl+C` while a turn is streaming aborts just that turn
     (`session/cancel`) without ending the session or losing history; `Ctrl+C` while
     idle clears the conversation (same as `:AiClear`).
+  - **Resuming past sessions** — `:AiSessions` opens a picker of past sessions vimcode
+    itself has started for the active agent and workspace (ACP has no way to list an
+    agent's own sessions, only to resume one by id via `session/load`). Picking one
+    replays the agent's history back into the transcript and continues that same
+    session for the next message. Only works when the active agent advertises
+    `agentCapabilities.loadSession`; otherwise `:AiSessions` says so and does nothing.
+    Set `acp_reopen_last_session: true` to automatically resume the most recent session
+    for the active agent/workspace on the first `:AI`/message after startup, instead of
+    always starting empty (off by default).
 - **Direct provider** (no agent binary required) — leave `acp_agent_command`/`acp_agents`
   empty and configure `ai_provider`/`ai_api_key` for Anthropic Claude, OpenAI, or local
   Ollama (or set `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env vars instead of `ai_api_key`).
@@ -817,7 +826,8 @@ below) is configured:
 - `PageUp`/`PageDown` — scroll the transcript
 - `:AI <message>` — send from command mode; `:AiClear` — clear history; `:AiAgent
   [name]` — list/switch configured agents; `:AiMode [name]` — show/switch the active
-  agent's declared modes
+  agent's declared modes; `:AiSessions` — list/resume past sessions for the active
+  agent + workspace
 - **AI inline completions** — set `ai_completions: true` for ghost-text suggestions in insert mode (`Tab` accepts, `Alt-]`/`Alt-[` cycle alternatives)
 
 **macOS terminal notes:** `Alt+Enter` requires the terminal to send Option as Meta —
@@ -1324,6 +1334,7 @@ All ex commands support Vim-style abbreviations (e.g., `:j` for `:join`, `:y` fo
 | `:AiClear` | Clear the AI conversation history |
 | `:AiAgent [name]` | List configured ACP agents (`acp_agents`) and the active one, or switch to `name` |
 | `:AiMode [name]` | Show the active ACP agent's declared modes, or switch to `name` |
+| `:AiSessions` | List past sessions for the active ACP agent + workspace and resume one via `session/load`; refuses if the agent doesn't advertise `loadSession` |
 | `:MarkdownPreview` / `:MdPreview` | Open side-by-side styled markdown preview (live-updates on edit, scroll sync, scaled headings in GTK) |
 | `:Explore [dir]` / `:Ex [dir]` | Open netrw-style in-buffer directory listing |
 | `:Sexplore [dir]` / `:Sex [dir]` | Horizontal split + netrw directory listing |

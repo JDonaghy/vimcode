@@ -1148,6 +1148,15 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiSessions — open the `:AiSessions` picker of past sessions for
+        // the active agent + workspace, or resume one via `session/load`
+        // (#1459). See `Engine::acp_open_sessions_picker`'s doc for the
+        // "agent doesn't support resume" refusal.
+        if cmd == "AiSessions" {
+            self.acp_open_sessions_picker();
+            return EngineAction::None;
+        }
+
         // Handle :e[dit]! — reload current file from disk (discard changes)
         if cmd == "edit!" {
             let buf_id = self.active_buffer_id();

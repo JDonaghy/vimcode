@@ -2060,7 +2060,10 @@ pub fn blame_line(
 
 /// Convert a Unix timestamp into a human-readable relative string
 /// (e.g. "just now", "3 hours ago", "2 days ago", "1 week ago", "Mar 2026").
-fn epoch_to_relative(ts: i64) -> String {
+/// `pub(crate)` so `engine::picker`'s `:AiSessions` picker (#1459) can reuse
+/// it for each entry's "last used" detail instead of re-deriving the same
+/// bucketing.
+pub(crate) fn epoch_to_relative(ts: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
