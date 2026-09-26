@@ -6517,6 +6517,95 @@ second line here
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1454, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_tool_call_diff_fragment_preserves_surrounding_file_content_via_shell_app`:
+    /// a real ACP adapter's `diff` block is the edited *fragment*, not the
+    /// whole file (`@agentclientprotocol/claude-agent-acp`'s `Edit` tool
+    /// shape) — the fake fixture's fixed "old line\n" -> "new line\n"
+    /// fragment is applied against a target file with real surrounding
+    /// context, and accepting must preserve it rather than truncating the
+    /// file to just the edited region (the exact data-loss repro this issue
+    /// reports).
+    ///
+    /// RED verified: reverting `Engine::acp_open_review_for_diffs` to write
+    /// the raw `diff` block's fragment straight through as a whole-file
+    /// `ProposedChange` (pre-#1454) makes this accept write bare
+    /// `"new line\n"` to disk, discarding `"line1"`/`"line3"`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_tool_call_diff_fragment_preserves_surrounding_file_content_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!("acp1454-gtk-fragment-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "line1\nold line\nline3\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.workspace_root = Some(dir.clone());
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
+            "the change-review surface must paint the fragment"
+        );
+
+        h.driver.type_char('a');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::fs::read_to_string(&target).unwrap_or_default() != "line1\nnew line\nline3\n"
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "line1\nnew line\nline3\n",
+            "accepting a fragment diff must preserve the surrounding file \
+             content, not truncate the file to just the edited region"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #955 (ACP-4) review follow-up, GTK's twin of `tui_main::shell_app::
     /// tests::ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_
     /// via_shell_app`: "clicking a `location` jumps to that file and line"

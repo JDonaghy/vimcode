@@ -331,6 +331,18 @@ impl Engine {
     /// uses for `fs/write_text_file` (#954), reused here rather than
     /// duplicated. Auto-closes the surface once every entry has a
     /// decision.
+    ///
+    /// Safe to write `new_text` as the buffer's entire content precisely
+    /// because it's guaranteed whole-file by construction (#1454): every
+    /// entry in `self.change_review` was built by
+    /// `Engine::acp_open_review_for_diffs` -> `Engine::acp_resolve_diff_block`
+    /// (`acp_ops.rs`), which resolves a possibly-fragment ACP `diff` block
+    /// against the file's actual current content *before* a
+    /// `ProposedChange` (and the `ChangeReviewEntry`/`DiffView` built from
+    /// it) ever exists — an ambiguous or unlocatable fragment is refused
+    /// there and never reaches an entry at all. This function itself does
+    /// no fragment resolution; that would be the bug this issue reports
+    /// (writing an edited-region fragment over the whole file).
     pub(crate) fn change_review_accept_current(&mut self) {
         let Some(review) = &mut self.change_review else {
             return;
