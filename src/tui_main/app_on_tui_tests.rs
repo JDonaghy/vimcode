@@ -64,6 +64,34 @@ mod tests {
     //! the tab bar alone claims more rows than exist and the editor content
     //! band collapses. That is exactly the gap this module exists to inventory
     //! test-by-test rather than leave as a single paragraph in an issue body.
+    //!
+    //! # #1432 tranche 3 is a partial port — see the PR for the running count
+    //!
+    //! #1432's title calls for porting *every* remaining behavioural test in
+    //! `shell_app.rs` (~392 as of this tranche) plus the standalone suites in
+    //! `mouse.rs` (14), `panels.rs` (12) and `mod.rs` (2 +
+    //! `clipboard_hermeticity_tests`) onto this seam. This tranche closes the
+    //! issue's *other* two acceptance bullets in full (the quadraui pin bump
+    //! and driving `crate::harness::KNOWN_BUGS` to `&[]` — see that const's
+    //! own doc), but only ports a first slice of the test-porting bullet
+    //! itself: `panels.rs`'s `sc_panel_tests` (all 7 — see `sidebar_panels`'s
+    //! `sc_panel_*` tests below) and two of `mouse.rs`'s right-click
+    //! scenarios (see `explorer_context_menu`'s `right_click_*` tests below).
+    //! Everything else named above — the remaining ~9 `mouse.rs` behavioural
+    //! tests, `panels.rs`'s 5-test `activity_bar_keyboard_ring_tests` (needs
+    //! a `driver.styled_row`-based colour probe, not just `screen_has`),
+    //! `render_impl.rs`'s 39 tests (10 of which drive the legacy
+    //! `render_tui_buffer_impl`/`with_frame_scope` path named in the issue
+    //! body and are dropped rather than ported once that's confirmed truly
+    //! dead), `mod.rs`'s 4, and the ~392 in `shell_app.rs` — remains
+    //! unported. At the pace #1430/#1431 (each a dedicated tranche session)
+    //! actually ran (10 and 17 tests respectively), the full remaining count
+    //! is a multi-session undertaking on its own, not something a single
+    //! review-fix iteration can close alongside everything else already in
+    //! this PR. Do not read `KNOWN_BUGS` being `&[]` as "the App-on-TUI port
+    //! is complete" — it only means the *known, categorised* gaps this
+    //! module had already inventoried are closed; the bulk of the suite this
+    //! issue asks to port has simply not been visited yet.
 
     use quadraui::testing::ConformanceDriver;
 
@@ -821,6 +849,191 @@ mod tests {
                     driver.screen()
                 );
             });
+        }
+
+        /// Build an engine with a real (empty) git repo as `cwd` and the
+        /// Source Control panel already shown + focused — same fixture
+        /// shape `source_control_panel_paints_header` above uses, factored
+        /// out so `panels.rs::sc_panel_tests`'s remaining scenarios (#1432
+        /// tranche 3) can each layer their own commit/branch/help state on
+        /// top of it. `tag` keeps concurrently-running tests' tmp dirs from
+        /// colliding, same convention as
+        /// `explorer_context_menu::engine_with_folder_ctx_menu`.
+        fn sc_engine(tag: &str) -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1432_sc_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let _ = std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(&dir)
+                .output();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir;
+            engine.git_branch = Some("main".to_string());
+            engine.sc_has_focus = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_GIT,
+            ));
+            engine
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::empty_commit_message_shows_
+        /// placeholder` onto `App`: with no commit message typed yet, the
+        /// commit `TextInput` must paint its placeholder rather than an
+        /// empty box.
+        #[test]
+        fn sc_panel_empty_commit_message_shows_placeholder() {
+            let h = harness(sc_engine("placeholder"));
+            let driver = &h.driver;
+            // Missing the trailing ")": this module's sidebar column budget
+            // (~20 cols, vs. `panels.rs`'s own isolated-panel harness's 40)
+            // truncates the closing paren off the placeholder text — same
+            // truncation-tolerance reasoning `explorer_context_menu`'s
+            // `context_menu_new_file_starts_inline_edit` applies to its own
+            // "file name" (vs. the full "New file name...") assertion.
+            assert!(
+                driver.screen_has("Message (press c"),
+                "expected the commit-input placeholder; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::active_commit_input_renders_
+        /// typed_message_not_placeholder` onto `App`.
+        #[test]
+        fn sc_panel_active_commit_input_renders_typed_message_not_placeholder() {
+            let mut engine = sc_engine("typed");
+            engine.sc_commit_message = "Fix the thing".to_string();
+            engine.sc_commit_cursor = engine.sc_commit_message.len();
+            engine.sc_commit_input_active = true;
+            let h = harness(engine);
+            let driver = &h.driver;
+            assert!(
+                driver.screen_has("Fix the thing"),
+                "expected the typed commit message; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("Message (press c)"),
+                "placeholder should not show while actively editing; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::multiline_commit_message_
+        /// renders_every_line` onto `App`.
+        #[test]
+        fn sc_panel_multiline_commit_message_renders_every_line() {
+            let mut engine = sc_engine("multiline");
+            engine.sc_commit_message = "Summary line\n\nBody line one\nBody line two".to_string();
+            engine.sc_commit_cursor = 0;
+            engine.sc_commit_input_active = true;
+            let h = harness(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(driver.screen_has("Summary line"), "{screen}");
+            assert!(driver.screen_has("Body line one"), "{screen}");
+            assert!(driver.screen_has("Body line two"), "{screen}");
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::branch_picker_list_mode_
+        /// renders_branches_and_marks_current` onto `App`, including the
+        /// #677-audited current-branch-glyph distinction (not just that
+        /// both names paint somewhere).
+        #[test]
+        fn sc_panel_branch_picker_list_mode_renders_branches_and_marks_current() {
+            let mut engine = sc_engine("branch_list");
+            engine.sc_branch_picker_open = true;
+            engine.sc_branch_picker_branches = vec![
+                crate::core::git::BranchEntry {
+                    name: "main".to_string(),
+                    is_current: true,
+                    upstream: None,
+                    ahead_behind: None,
+                },
+                crate::core::git::BranchEntry {
+                    name: "feature/foo".to_string(),
+                    is_current: false,
+                    upstream: None,
+                    ahead_behind: None,
+                },
+            ];
+            let h = harness(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(driver.screen_has("Switch Branch"), "{screen}");
+            assert!(driver.screen_has("main"), "{screen}");
+            assert!(driver.screen_has("feature/foo"), "{screen}");
+            assert!(
+                driver.screen_has("\u{25cf} main"),
+                "the current branch must be marked with the current-branch \
+                 glyph; screen:\n{screen}"
+            );
+            assert!(
+                !driver.screen_has("\u{25cf} feature/foo"),
+                "a non-current branch must not carry the current-branch \
+                 glyph; screen:\n{screen}"
+            );
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::branch_picker_create_mode_
+        /// renders_typed_name` onto `App`.
+        #[test]
+        fn sc_panel_branch_picker_create_mode_renders_typed_name() {
+            let mut engine = sc_engine("branch_create");
+            engine.sc_branch_create_mode = true;
+            engine.sc_branch_create_input = "wip-feature".to_string();
+            let h = harness(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(driver.screen_has("New Branch"), "{screen}");
+            assert!(driver.screen_has("wip-feature"), "{screen}");
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::help_dialog_renders_
+        /// keybindings_table` onto `App`.
+        #[test]
+        fn sc_panel_help_dialog_renders_keybindings_table() {
+            let mut engine = sc_engine("help");
+            engine.sc_help_open = true;
+            let h = harness(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(driver.screen_has("Keybindings"), "{screen}");
+            // "Naviga[te]": the same ~20-column sidebar budget that eats the
+            // placeholder's closing paren above truncates the "Action"
+            // column's text too — "Close" survives intact only because its
+            // own row happens to fit, so it's left unabbreviated below.
+            assert!(driver.screen_has("Naviga"), "{screen}");
+            assert!(driver.screen_has("Close"), "{screen}");
+        }
+
+        /// Ports `panels.rs::sc_panel_tests::renders_without_panicking_at_
+        /// minimum_size` onto `App`: a regression guard that the migrated
+        /// `TextInput`/`Palette`/`Dialog` primitives degrade gracefully
+        /// instead of panicking when the whole shell (not just the SC panel
+        /// in isolation, as the original harness rendered) is squeezed to a
+        /// pathologically tiny terminal. Uses a bespoke tiny-sized harness
+        /// rather than this module's usual `harness()` (which fixes
+        /// `(80, 24)`), same pattern `conformance_harness`'s own callers use
+        /// when a scenario needs a non-standard cell size.
+        #[test]
+        fn sc_panel_renders_without_panicking_at_minimum_size() {
+            let mut engine = sc_engine("tiny_commit");
+            engine.sc_commit_message = "line one\nline two".to_string();
+            engine.sc_commit_input_active = true;
+            let h = crate::tui_main::testing::conformance_harness(engine, 10, 3);
+            let _ = h.driver.screen();
+
+            let mut engine2 = sc_engine("tiny_help");
+            engine2.sc_help_open = true;
+            let h2 = crate::tui_main::testing::conformance_harness(engine2, 10, 3);
+            let _ = h2.driver.screen();
         }
 
         /// A second click on the already-active Search icon must toggle the
@@ -2724,6 +2937,104 @@ mod tests {
                     driver.screen()
                 );
             });
+        }
+
+        /// Ports `mouse.rs::tests::right_click_in_explorer_panel_opens_
+        /// explorer_context_menu` onto `App`: right-clicking a populated,
+        /// visible Explorer row must open its file context menu — the
+        /// "positive" counterpart proving the panel-gate test below isn't
+        /// vacuously true (a right-click that opened nothing anywhere would
+        /// pass that one too).
+        #[test]
+        fn right_click_on_explorer_row_opens_context_menu() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1432_rc_explorer_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rc_marker.txt"), "hello").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir);
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let (x, y) = driver
+                .find("rc_marker.txt")
+                .expect("the populated explorer row must paint its file name");
+            // A *file* row's context menu, not the folder one
+            // (`engine_with_folder_ctx_menu`'s "New File..." above) — "Open
+            // to the Side" is one only a file row offers.
+            assert!(
+                !driver.screen_has("Open to the Side"),
+                "precondition: no context menu is open yet"
+            );
+            driver.right_click(x, y);
+            assert!(
+                driver.screen_has("Open to the Side"),
+                "right-clicking a populated Explorer row must open its file \
+                 context menu; screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        /// Ports `mouse.rs::tests::right_click_in_debug_panel_does_not_
+        /// open_explorer_context_menu` onto `App`: right-clicking inside a
+        /// *different* active sidebar panel must not resurrect a stale
+        /// Explorer context menu just because `explorer_rows` still holds
+        /// rows from an earlier visit (#575 Bug 1's own regression).
+        #[test]
+        fn right_click_in_non_explorer_panel_does_not_open_explorer_context_menu() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1432_rc_debug_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rc_marker.txt"), "hello").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir);
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            // Leave `explorer_rows` populated (stale, per #575 Bug 1's own
+            // diagnosis) but switch the *active* sidebar panel to Debug —
+            // the explorer row content is never painted once Debug is
+            // active, so locate the right-click coordinate via the Debug
+            // icon's own chrome zone instead of a row of explorer text.
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_DEBUG,
+            ));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let debug_zone = driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_DEBUG)
+                .map(|z| z.bounds)
+                .expect("the Debug activity-bar icon must register a chrome zone");
+            // Right-click just to the right of the Debug icon, inside the
+            // sidebar body it now owns.
+            driver.right_click(debug_zone.x + debug_zone.width + 5.0, debug_zone.y + 3.0);
+
+            assert!(
+                !driver.screen_has("Open to the Side"),
+                "right-clicking inside a non-Explorer panel must not open \
+                 the Explorer's file context menu; screen:\n{}",
+                driver.screen()
+            );
         }
     }
 
