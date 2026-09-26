@@ -1551,7 +1551,58 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
 /// `FixLanded` once the fix landed, exactly as designed. Every scenario in
 /// this suite now takes the plain `Pass`/`Regression` arms of
 /// [`GateOutcome`] — there is currently no bug this table needs to track.
-pub(crate) const KNOWN_BUGS: &[&str] = &[];
+///
+/// #1425 (App-on-TUI gap inventory) adds the first entries back: `tui`
+/// arms on the two tab-bar close-button scenarios (diagnosed pre-existing
+/// gaps between `crate::app::App` painted through `quadraui::tui::TuiBackend`
+/// and the shipped TUI), plus the `crate::tui_main::app_on_tui_tests`
+/// driver-test inventory that issue adds. A third scenario,
+/// `activity_bar_click_focuses_search_panel_proof`, was suspected to need a
+/// gated `tui` entry too but turned out to already pass — see that
+/// scenario's own doc for why it was registered plain instead. Each entry's
+/// category (unit/caps/feature/quadraui/product) and target child are
+/// recorded next to it, not just its issue number, per that issue's own
+/// gate-labelling requirement.
+pub(crate) const KNOWN_BUGS: &[&str] = &[
+    // ── #1425: cross-backend `backend_conformance!` scenarios ──────────
+    // category: quadraui (shared ratatui `TabBar` widget's own hit-test
+    // conflates the close glyph with the tab label) — target: quadraui
+    // tab-close rect fix.
+    "tab_bar_click_closes_via_shared_dispatch::tui",
+    "split_tab_bar_click_closes_via_shared_dispatch::tui",
+    // ── #1425: crate::tui_main::app_on_tui_tests driver-test inventory ──
+    // Each entry's category/target-child rationale lives as a `// #1425
+    // gate:` comment directly above its own `known_bug_gate` call in that
+    // module — this list only needs to stay in sync with those labels.
+    //
+    // category: unit (`App::render_content` reserves
+    // `render::TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` as cell-grid
+    // *rows* rather than pixels, collapsing the editor content band — and,
+    // transitively, everything anchored to it — at a realistic terminal
+    // height) — target: UnitProfile.
+    "app_on_tui::key_press_inserts_text_via_shell_app_general_fallback",
+    "app_on_tui::dd_deletes_the_current_line",
+    "app_on_tui::undo_restores_after_dd",
+    "app_on_tui::status_bar_paints_cursor_position",
+    "app_on_tui::two_tabs_paint_both_labels",
+    "app_on_tui::render_content_paints_group_divider_via_shell_app",
+    "app_on_tui::group_divider_drag_moves_the_painted_divider_via_shell_app",
+    "app_on_tui::group_divider_click_without_move_leaves_the_divider_put_via_shell_app",
+    "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
+    "app_on_tui::minimap_paints_braille_when_enabled",
+    "app_on_tui::split_paints_minimap_in_both_panes",
+    "app_on_tui::focused_terminal_swallows_editor_keys_via_shell_app",
+    "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
+    "app_on_tui::dialog_intercepts_all_keys",
+    "app_on_tui::context_menu_delete_opens_confirm_dialog",
+    // category: feature (`App` unconditionally reserves and paints its own
+    // GTK-style menu-bar row on every backend; the shipped TUI shell only
+    // shows that row in vscode-mode or when Alt-revealed, so the tab bar
+    // sits on a different row than the shipped TUI's own fixture expects)
+    // — target: menu-bar caps (conditional menu-bar reveal on `App`).
+    "app_on_tui::render_content_paints_single_group_tab_bar_via_shell_app",
+    "app_on_tui::two_groups_paint_two_tab_bars",
+];
 
 /// A saved `std::panic::set_hook`/`take_hook` closure — named so
 /// `known_bug_gate_outcome`'s suppress/restore `RestoreHook` doesn't need
@@ -1937,15 +1988,20 @@ mod tests {
     // `render::sc_hint_status_bar`, exactly as `render::sc_header_status_bar`
     // already does for the row above it.
     //
-    // `tui` (the `crate::app::App`-wrapped control) is deliberately not in
-    // this scenario's `backends` list: `App`'s `PANEL_GIT` arm is the exact
-    // GTK code path under test (`src/app.rs`'s `paint_sidebar_panel_rung`,
-    // shared by both `crate::gtk::run` and this harness's `gtk` arm) — it
-    // is not a second, independent implementation the way `tui_prod`'s
-    // `tui_main::panels::render_source_control` is, so it adds no
-    // independent signal here, unlike `sweep_hit_band_integrity_proof`
-    // above where isolating "rasteriser" from "implementation" is the
-    // point.
+    // `tui` (the `crate::app::App`-wrapped control) used to be omitted from
+    // this scenario's `backends` list on the grounds that it "adds no
+    // independent signal" — `App`'s `PANEL_GIT` arm is the exact GTK code
+    // path under test (`src/app.rs`'s `paint_sidebar_panel_rung`, shared by
+    // both `crate::gtk::run` and this harness's `gtk` arm), not a second,
+    // independent implementation the way `tui_prod`'s
+    // `tui_main::panels::render_source_control` is, unlike
+    // `sweep_hit_band_integrity_proof` above where isolating "rasteriser"
+    // from "implementation" is the point. #1425's App-on-TUI gap inventory
+    // asked for that reasoning to be checked rather than trusted: it *is*
+    // checked here now — `App` painting through `quadraui::tui::TuiBackend`
+    // does reach the same `PANEL_GIT` bands/`Escape` focus-release path as
+    // `gtk`, so this arm passes ungated, confirming "no independent signal"
+    // was correct rather than merely assumed.
     //
     // RED-verified (#1361): with `App::paint_sidebar_panel_rung`'s
     // `PANEL_GIT` arm's `bands.hint` paint call removed, the `gtk` arm below
@@ -1976,7 +2032,7 @@ mod tests {
 
     crate::backend_conformance! {
         label: sc_hint_row_shows_only_while_focused,
-        backends: [gtk, tui_prod],
+        backends: [gtk, tui, tui_prod],
         engine: engine_with_sc_panel("focused", true),
         size: (800, 480),
         body: |driver| {
@@ -4045,22 +4101,31 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     // (mirroring `click::handle_mouse_click`'s) makes the one
     // `Engine::handle_tab_bar_click` call that decides confirm vs. close.
     //
-    // No `tui` arm here (only `gtk` and `tui_prod`, unlike every other
-    // scenario in this module): while developing this scenario, a click at
-    // the close button's own painted center resolved as a plain tab-select
-    // instead of a close specifically on `tui` -- `App` driven by
-    // `quadraui::tui::TuiBackend`, i.e. quadraui's own generic ratatui
-    // `TabBar` widget rendering, as opposed to `tui_main::render_impl`'s
-    // independent hand-written rasteriser (`tui_prod`) or GTK's pixel-precise
-    // `tab_pixel_hits` cache (`gtk`) -- both of which resolved the same
-    // click correctly. That is a paint/hit-test disagreement inside
-    // quadraui's own TUI backend rendering of a primitive neither of this
-    // issue's two files (`mouse.rs`, `click.rs`) builds or interprets, so
-    // it's out of scope here; `App`+`TuiBackend` is also never what
-    // `tui_main::run` actually ships (`tui_prod` is), so no real user is
-    // affected by it. Left as a call-out rather than silently dropped: worth
-    // its own follow-up investigation before anyone adds a `tui`-arm
-    // scenario that clicks a TUI tab bar's close button specifically.
+    // `tui` here (only `gtk` and `tui_prod` were registered before #1425):
+    // while developing this scenario, a click at the close button's own
+    // painted center resolved as a plain tab-select instead of a close
+    // specifically on `tui` -- `App` driven by `quadraui::tui::TuiBackend`,
+    // i.e. quadraui's own generic ratatui `TabBar` widget rendering, as
+    // opposed to `tui_main::render_impl`'s independent hand-written
+    // rasteriser (`tui_prod`) or GTK's pixel-precise `tab_pixel_hits` cache
+    // (`gtk`) -- both of which resolved the same click correctly. That is a
+    // paint/hit-test disagreement inside quadraui's own TUI backend
+    // rendering of a primitive neither of this issue's two files
+    // (`mouse.rs`, `click.rs`) builds or interprets, so it's out of scope
+    // here; `App`+`TuiBackend` is also never what `tui_main::run` actually
+    // ships (`tui_prod` is), so no real user is affected by it.
+    //
+    // #1425 adds the `tui` arm as a `KNOWN_BUGS`-gated inventory entry
+    // (`tab_bar_click_closes_via_shared_dispatch::tui`, category
+    // **quadraui** -- the shared ratatui `TabBar` widget's own hit-test
+    // conflates the close glyph with the label, a gap in the primitive
+    // itself, not in this crate's dispatch) rather than leaving the gap
+    // silently un-exercised, per that issue's "gap inventory as executable
+    // tests, not a report" mandate. RED-verified: with the `KNOWN_BUGS`
+    // entry removed, this arm fails on the final assertion -- the click
+    // switches to `a1059` instead of closing it (`"a1059"` stays painted,
+    // `"BBBB_1059_CONTENT"` does not reappear), exactly the resolved-as-
+    // tab-select symptom this comment already named by hand.
     crate::backend_conformance! {
         label: tab_bar_click_closes_via_shared_dispatch,
         backends: [gtk, tui_prod],
@@ -4082,6 +4147,26 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                  back to the only remaining tab, b1059.txt, on every backend"
             );
         },
+    }
+
+    #[test]
+    fn tab_bar_click_closes_via_shared_dispatch_tui() {
+        let mut __h = crate::tui_main::testing::conformance_harness(two_tab_fixture(), 800, 480);
+        let driver = &mut __h.driver;
+        crate::harness::known_bug_gate("tab_bar_click_closes_via_shared_dispatch::tui", || {
+            assert!(
+                driver.screen_has("b1059") && driver.screen_has("a1059"),
+                "precondition: both tabs are painted"
+            );
+
+            let (cx, cy) = tab_close_button_center(driver, "a1059");
+            driver.drag(cx, cy, cx, cy);
+            assert!(
+                !driver.screen_has("a1059") && driver.screen_has("BBBB_1059_CONTENT"),
+                "clicking a1059.txt's close button must close it and fall \
+                 back to the only remaining tab, b1059.txt, on every backend"
+            );
+        });
     }
 
     // ── Split-group coverage (review follow-up) ─────────────────────────
@@ -4201,12 +4286,17 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     // the caller; `mouse.rs`'s split-group arm makes the
     // `Engine::handle_tab_bar_click` call that decides confirm vs. close.
     //
-    // No `tui` arm, for the same reason `tab_bar_click_closes_via_shared_dispatch`
-    // above has none: a close-button click resolves as a plain tab-select on
+    // `tui` (only `gtk`/`tui_prod` were registered before #1425): same
+    // reason `tab_bar_click_closes_via_shared_dispatch` above didn't have
+    // one either -- a close-button click resolves as a plain tab-select on
     // `tui` (`App` + `quadraui::tui::TuiBackend`'s own generic `TabBar`
     // widget hit-test), independent of which group the tab bar belongs to.
     // See that scenario's doc comment for the full call-out; the same
-    // quadraui-side gap applies here unchanged.
+    // quadraui-side gap applies here unchanged, so #1425 gates this arm
+    // under the same category (**quadraui**) with its own
+    // `::tui`-suffixed `KNOWN_BUGS` label. RED-verified: with the entry
+    // removed, this arm fails identically to the single-group twin --
+    // `"left_a1059"` stays painted instead of closing.
     crate::backend_conformance! {
         label: split_tab_bar_click_closes_via_shared_dispatch,
         backends: [gtk, tui_prod],
@@ -4235,6 +4325,36 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                  right group's own content"
             );
         },
+    }
+
+    #[test]
+    fn split_tab_bar_click_closes_via_shared_dispatch_tui() {
+        let mut __h =
+            crate::tui_main::testing::conformance_harness(split_two_group_fixture(), 1600, 480);
+        let driver = &mut __h.driver;
+        crate::harness::known_bug_gate(
+            "split_tab_bar_click_closes_via_shared_dispatch::tui",
+            || {
+                assert!(
+                    driver.screen_has("left_a1059") && driver.screen_has("left_b1059"),
+                    "precondition: both left-group tabs are painted"
+                );
+
+                let (cx, cy) = tab_close_button_center(driver, "left_a1059");
+                driver.drag(cx, cy, cx, cy);
+                assert!(
+                    !driver.screen_has("left_a1059") && driver.screen_has("BBBB_LEFT_1059_CONTENT"),
+                    "clicking left_a1059.txt's close button in the split \
+                 (non-active) group's tab bar must close it and fall back to \
+                 the only remaining tab in that group, left_b1059.txt"
+                );
+                assert!(
+                    driver.screen_has("RIGHT_1059_CONTENT"),
+                    "closing a tab in the left group must never disturb the \
+                 right group's own content"
+                );
+            },
+        );
     }
 }
 
@@ -4712,22 +4832,23 @@ mod issue_1256_sidebar_chrome {
 /// [`activity_bar_click_focuses_search_panel`] — see that scenario's own
 /// doc for the repro and the assertions' rationale.
 ///
-/// No `tui` arm (only `gtk` and `tui_prod`, same shape as
-/// `tab_bar_click_closes_via_shared_dispatch`'s own note above): at this
+/// `tui` used to be omitted here (only `gtk` and `tui_prod` were
+/// registered) on the strength of a by-hand observation: "at this
 /// harness's viewport size, `App` driven by `quadraui::tui::TuiBackend`
-/// (the `tui` control arm) never paints the editor's buffer content at
-/// all — no `"line N"` text run, no status-bar `"Ln N, Col N"` segment —
-/// even though the same `engine_fixture()` and the same `App` paint both
-/// correctly under `gtk`. That is a pre-existing gap in this control
-/// fixture unrelated to this issue's `PanelChanged` focus fix (confirmed
-/// by hand: `FrameInventory::zones()` still reports a correctly-sized,
-/// non-empty `app-shell:main-content` zone on that arm, so the zone
-/// geometry itself is not the problem) — left as a call-out for whoever
-/// investigates it next, rather than routed around here.
+/// never paints the editor's buffer content at all". #1425's App-on-TUI
+/// gap inventory re-checked that claim by actually running the `tui` arm
+/// (rather than trusting the comment) and it no longer reproduces — the
+/// precondition (`screen_has("Ln 1,")`) and the rest of
+/// [`activity_bar_click_focuses_search_panel`]'s body all pass cleanly at
+/// this scenario's `(800, 480)` size. Whatever regressed the by-hand
+/// observation has since been fixed elsewhere (most likely #700's move to
+/// fixed-pixel `TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` no longer
+/// scaling with `line_height`, so the huge `lh` a `TuiBackend` used to
+/// report no longer inflates the reserved chrome past the viewport) —
+/// registering the `tui` arm plain (no `KNOWN_BUGS` gate) is itself the
+/// record that this gap has closed.
 #[cfg(test)]
 mod issue_1360_activity_bar_click_focuses_panel {
-    use super::*;
-
     fn engine_fixture() -> crate::core::Engine {
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
@@ -4741,7 +4862,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
 
     crate::backend_conformance! {
         label: activity_bar_click_focuses_search_panel_proof,
-        backends: [gtk, tui_prod],
+        backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
         size: (800, 480),
         body: |driver| {
