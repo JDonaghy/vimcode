@@ -1094,11 +1094,23 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :AI <message> — send a message to the AI assistant
+        // :AI <message> — send a message to the AI assistant. #1453: the
+        // reply streams into the AI panel, so the panel must actually be
+        // revealed (`focus_sidebar_panel`, which expands the sidebar and
+        // switches it to PANEL_AI) rather than just flipping the
+        // `ai_has_focus` flag — that flag alone routes *keyboard* focus but
+        // does nothing to `app_shell`'s active panel, which is what
+        // `render::sidebar_owner` actually paints. Deliberately does not
+        // also raise `sidebar_focus_requested` (contrast
+        // `Engine::ai_attach_range`'s empty-message arm): the user handed
+        // over a complete ex command and should stay where they were, per
+        // the #958 regression this mirrors — pulling the keyboard into the
+        // chat input would turn the next `:` typed after `:AI hi` into chat
+        // text instead of opening the command line.
         if let Some(msg) = cmd.strip_prefix("AI ").map(|s| s.trim()) {
             if !msg.is_empty() {
                 self.ai_send_message(msg.to_string());
-                self.ai_has_focus = true;
+                self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
             }
             return EngineAction::None;
         }

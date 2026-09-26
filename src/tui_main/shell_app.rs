@@ -15279,6 +15279,60 @@ mod tests {
         );
     }
 
+    /// #1453: `:AI <message>` must *reveal* the AI panel, not just send the
+    /// message into it — otherwise the reply streams into a panel the user
+    /// can't see. Starts with the sidebar showing Explorer (`app_with_
+    /// sidebar_open`, the issue's own repro precondition), never touches
+    /// `ai_has_focus`/`app_shell.show_panel(PANEL_AI)` directly the way
+    /// every other AI panel test in this file does, and drives the real ex
+    /// command line instead.
+    ///
+    /// RED verified: with `execute.rs`'s `:AI` arm reverted to a bare
+    /// `self.ai_has_focus = true` (no `focus_sidebar_panel` call), this
+    /// fails — the screen still shows "EXPLORER", never "AI ASSISTANT" or
+    /// the sent message, because `app_shell`'s active panel (what
+    /// `render::sidebar_owner` actually paints) never moved off Explorer.
+    #[test]
+    fn ai_command_reveals_panel_from_collapsed_sidebar_via_shell_app() {
+        let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+        let app = app_with_sidebar_open();
+        let mut driver = driver_with_shell(app, config(), 80, 24);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("Explorer"),
+            "precondition: the sidebar starts showing Explorer, not AI; \
+             screen:\n{screen}"
+        );
+        assert!(
+            !screen.contains("AI ASSISTANT"),
+            "precondition: the AI panel is not yet visible; screen:\n{screen}"
+        );
+
+        driver.type_char(':');
+        for c in "AI hello".chars() {
+            driver.type_char(c);
+        }
+        driver.press_named(quadraui::NamedKey::Enter);
+
+        let screen = driver.screen();
+        assert!(
+            screen.contains("AI ASSISTANT"),
+            ":AI must reveal the AI panel even though it started hidden \
+             behind Explorer (#1453); screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("hello") && screen.contains("You"),
+            "the sent message must be visible in the now-revealed panel's \
+             transcript; screen:\n{screen}"
+        );
+    }
+
     /// #1445: opening the AI panel through the real click UI (an
     /// activity-bar icon click, exactly how a user opens it) must give the
     /// panel keyboard focus, so a subsequent Ctrl+S submits the chat input
