@@ -3703,6 +3703,17 @@ pub struct Engine {
     /// context) can both branch on it. Session-scoped: reset to the
     /// all-`false` default alongside `acp_auth_methods`/`acp_client`.
     pub acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities,
+    /// A buffer line-range staged for the *next* prompt (#1450): either the
+    /// Visual-mode `<leader>ai` mapping or a `:{range}AI` ex command. `Some`
+    /// shows the `⧉`-chip in the panel header
+    /// (`render::populate_ai_chat_controller`) until
+    /// [`Engine::acp_prompt_content_blocks`] consumes it on the next send,
+    /// or the user removes it (Ctrl+R while the panel has focus — see
+    /// [`Engine::dispatch_ai_chat_event`]). Not session-scoped like
+    /// `acp_prompt_capabilities` above — it's composed content, not agent
+    /// state — but `Engine::ai_clear` drops it anyway, matching "clear
+    /// conversation" clearing everything else about to be typed.
+    pub acp_pending_attachment: Option<crate::core::acp::AcpRangeAttachment>,
     /// Tool calls the agent has announced this session (#955, ACP-4),
     /// upserted by `toolCallId` — an addressable collection, not an
     /// append-only log, so a `tool_call_update`'s status transition or
@@ -4950,6 +4961,7 @@ impl Engine {
             acp_auth_methods: Vec::new(),
             acp_authenticated: false,
             acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities::default(),
+            acp_pending_attachment: None,
             acp_tool_calls: Vec::new(),
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),

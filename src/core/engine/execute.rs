@@ -5582,6 +5582,18 @@ impl Engine {
             name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
         };
 
+        // `:[range]AI [message]` (#1450 point 1) — attach `[range]`'s lines
+        // of the current buffer as context, then send `message` (or, given
+        // none, just focus the panel so it can be typed in — see
+        // `Engine::ai_attach_range`'s doc). Case-sensitive `"AI"`, no
+        // abbreviation — matches the existing plain `:AI <message>` in this
+        // function's fallback dispatch further down in `execute_command`.
+        if name == "AI" {
+            let (start, end) = self.range_with_count(range, None, last_line);
+            self.ai_attach_range(start, end, args);
+            return Some(EngineAction::None);
+        }
+
         // `:[range]sor[t][!] [flags] [/pattern/]` — sort just the given range.
         // `sor` is Vim's minimum abbreviation (`so` is `:source`).
         if is("sort", 3) {

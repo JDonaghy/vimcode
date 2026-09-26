@@ -172,6 +172,13 @@
 # that contract (an authMethods array with no `type: "terminal"` entry at
 # all yields no `AcpAuthMethodKind::Terminal` results).
 #
+# #1450: `initialize`'s `agentCapabilities.promptCapabilities.embeddedContext`
+# is `false`/absent (`agentCapabilities: {}`) unless $ACP_FAKE_EMBEDDED_CONTEXT
+# is set, in which case it's `true` — lets a test drive both branches of
+# `Engine::acp_prompt_content_blocks`'s range-attachment content-block choice
+# (an embedded `resource` block with the exact buffer text vs. a
+# `resource_link` + fenced-text fallback) against the same fixture.
+#
 # #957 (ACP-6) interactive terminal-auth login. When this script's own
 # stdin is a real TTY — i.e. it was launched by `Engine::
 # acp_launch_terminal_login`'s `TerminalSession` (a real PTY) rather than
@@ -272,7 +279,17 @@ while IFS= read -r line; do
           auth_methods='[{"id":"api-key","name":"API Key","type":"agent"}]'
         fi
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
+      # #1450: $ACP_FAKE_EMBEDDED_CONTEXT set -> agentCapabilities carries
+      # promptCapabilities.embeddedContext:true, so a test can drive the
+      # "agent understands `resource` content blocks" branch of
+      # `Engine::acp_prompt_content_blocks`. Unset (every pre-#1450 test)
+      # keeps the empty `{}` every prior slice relies on, which parses as
+      # all-`false` per `parse_prompt_capabilities`'s doc.
+      agent_caps='{}'
+      if [ -n "$ACP_FAKE_EMBEDDED_CONTEXT" ]; then
+        agent_caps='{"promptCapabilities":{"embeddedContext":true}}'
+      fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
         exit 7
       fi

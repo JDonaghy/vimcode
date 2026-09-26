@@ -3035,14 +3035,26 @@ impl Engine {
     /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
     /// `AcpClient::poll` — nothing here blocks the tick.
     fn ai_send_message_via_acp(&mut self, text: String) {
-        // #1449: chip line naming what got attached (if anything) goes on
-        // the *displayed* transcript message — the wire content built
+        // #1449/#1450: chip line(s) naming what got attached (if anything)
+        // go on the *displayed* transcript message — the wire content built
         // below (`acp_prompt_content_blocks`) carries the actual
-        // `resource_link` block regardless of whether this chip is shown,
-        // so the two never disagree about what was attached.
-        let displayed_text = match self.acp_current_buffer_attachment() {
-            Some((_, chip)) => format!("{chip}\n{text}"),
-            None => text.clone(),
+        // `resource_link`/`resource` blocks regardless of whether these
+        // chips are shown, so the two never disagree about what was
+        // attached. The range/selection attachment (#1450) is only *read*
+        // here (`.as_ref()`, not `.take()`) — `acp_prompt_content_blocks`
+        // below is what consumes it, since a not-yet-connected session
+        // defers that call to `poll_acp`'s `SessionCreated` handler instead.
+        let mut chip_lines = Vec::new();
+        if let Some((_, chip)) = self.acp_current_buffer_attachment() {
+            chip_lines.push(chip);
+        }
+        if let Some(attachment) = self.acp_pending_attachment.as_ref() {
+            chip_lines.push(attachment.chip(&self.acp_workspace_cwd()));
+        }
+        let displayed_text = if chip_lines.is_empty() {
+            text.clone()
+        } else {
+            format!("{}\n{text}", chip_lines.join("\n"))
         };
         self.ai_messages.push(AiMessage {
             role: "user".to_string(),
@@ -3171,6 +3183,13 @@ impl Engine {
         // #1449: `promptCapabilities` came off the same `initialize`
         // response as `authMethods` — reset alongside it.
         self.acp_prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
+        // #1450: a staged Visual-selection/`:{range}AI` attachment is
+        // composed content the user hasn't sent yet — clearing the
+        // conversation drops it too, same as clearing the typed-but-
+        // unsubmitted input would (the input itself is `ChatController`'s
+        // own state, untouched here, matching this function's existing
+        // scope).
+        self.acp_pending_attachment = None;
         // #955 (ACP-4): tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
@@ -3413,6 +3432,19 @@ impl Engine {
                     self.acp_cancel_turn();
                 } else {
                     self.ai_clear();
+                }
+                true
+            }
+            // #1450 point 4: Ctrl+R drops a staged Visual-selection/
+            // `:{range}AI` attachment (the `⧉`-chip in the panel header)
+            // without sending it — "let the user remove it before sending".
+            // Same escape-hatch shape as Ctrl+C above: `ChatController`
+            // doesn't bind Ctrl+R internally, so it reaches here as a plain
+            // `KeyPressed`. A no-op (still consumes the key) when nothing is
+            // staged.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('r')" => {
+                if self.acp_pending_attachment.take().is_some() {
+                    self.message = "Attachment removed.".to_string();
                 }
                 true
             }
