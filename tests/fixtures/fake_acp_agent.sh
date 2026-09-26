@@ -19,7 +19,14 @@
 #                           is printed to stdout immediately before the real
 #                           response, to prove the reader skips it without
 #                           desyncing. If $ACP_FAKE_DIE_AFTER_INIT is set,
-#                           this process exits right after replying.
+#                           this process exits right after replying. #1462:
+#                           if $ACP_FAKE_MCP_HTTP / $ACP_FAKE_MCP_SSE is
+#                           set, `agentCapabilities.mcpCapabilities.http`/
+#                           `.sse` is `true` (alongside whatever
+#                           `promptCapabilities` above already
+#                           contributed) — absent (every pre-#1462 test)
+#                           parses as all-`false` per
+#                           `parse_mcp_capabilities`'s doc.
 #   - session/new        -> canned sessionId "sess-1". If
 #                           $ACP_FAKE_SESSION_NEW_ERROR is set, replies with a
 #                           JSON-RPC error instead (agent stays alive,
@@ -31,7 +38,13 @@
 #                           result also carries a `modes` field with two
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
-#                           against.
+#                           against. #1462: if $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+#                           names a file, the raw request line is appended
+#                           to it first, unconditionally — lets a test
+#                           assert on the actual `mcpServers` array the
+#                           client sent (`Engine::acp_resolve_mcp_servers` +
+#                           `build_mcp_servers_wire`'s stdio-always/http-sse-
+#                           gated-on-capability shape) via `serde_json`.
 #   - session/prompt     -> (#1449) if $ACP_FAKE_CAPTURE_PROMPT_TO names a
 #                           file, the raw request line is appended to it
 #                           first, unconditionally — lets a test assert on
@@ -285,9 +298,31 @@ while IFS= read -r line; do
       # `Engine::acp_prompt_content_blocks`. Unset (every pre-#1450 test)
       # keeps the empty `{}` every prior slice relies on, which parses as
       # all-`false` per `parse_prompt_capabilities`'s doc.
-      agent_caps='{}'
+      # #1462: $ACP_FAKE_MCP_HTTP / $ACP_FAKE_MCP_SSE, if set, add
+      # `mcpCapabilities.http`/`.sse: true` alongside whatever
+      # `promptCapabilities` above already contributed — a test drives
+      # `Engine::acp_begin_session`'s `build_mcp_servers_wire` drop/keep
+      # branch for the `http`/`sse` MCP transport off this same fixture.
+      caps_parts=""
       if [ -n "$ACP_FAKE_EMBEDDED_CONTEXT" ]; then
-        agent_caps='{"promptCapabilities":{"embeddedContext":true}}'
+        caps_parts='"promptCapabilities":{"embeddedContext":true}'
+      fi
+      if [ -n "$ACP_FAKE_MCP_HTTP" ] || [ -n "$ACP_FAKE_MCP_SSE" ]; then
+        mcp_http=false
+        mcp_sse=false
+        [ -n "$ACP_FAKE_MCP_HTTP" ] && mcp_http=true
+        [ -n "$ACP_FAKE_MCP_SSE" ] && mcp_sse=true
+        mcp_part="\"mcpCapabilities\":{\"http\":$mcp_http,\"sse\":$mcp_sse}"
+        if [ -n "$caps_parts" ]; then
+          caps_parts="$caps_parts,$mcp_part"
+        else
+          caps_parts="$mcp_part"
+        fi
+      fi
+      if [ -n "$caps_parts" ]; then
+        agent_caps="{$caps_parts}"
+      else
+        agent_caps='{}'
       fi
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
@@ -296,6 +331,15 @@ while IFS= read -r line; do
       ;;
     *'"method":"session/new"'*)
       id=$(extract_id "$line")
+      # #1462: when $ACP_FAKE_CAPTURE_SESSION_NEW_TO names a file, the
+      # whole raw `session/new` request line is appended to it — lets a
+      # test assert on the actual `mcpServers` array the client sent
+      # (stdio always present, `http`/`sse` dropped or kept per the
+      # capabilities above) via `serde_json`, same "read the transcript"
+      # shape as `$ACP_FAKE_CAPTURE_PROMPT_TO` uses for `session/prompt`.
+      if [ -n "$ACP_FAKE_CAPTURE_SESSION_NEW_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_NEW_TO"
+      fi
       if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
       elif [ -n "$ACP_FAKE_SESSION_MODES" ]; then

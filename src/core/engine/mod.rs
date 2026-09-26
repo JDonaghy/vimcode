@@ -3703,6 +3703,23 @@ pub struct Engine {
     /// context) can both branch on it. Session-scoped: reset to the
     /// all-`false` default alongside `acp_auth_methods`/`acp_client`.
     pub acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities,
+    /// `agentCapabilities.mcpCapabilities` from the current `acp_client`'s
+    /// `initialize` response (#1462) — which optional MCP server
+    /// transports (`http`/`sse`) the agent accepts, beyond the always-
+    /// eligible `stdio`. Read by `Engine::acp_begin_session` to decide
+    /// which of `settings.acp_mcp_servers`/`AcpAgentProfile::mcp_servers`
+    /// to actually send on `session/new`. Session-scoped, reset alongside
+    /// `acp_prompt_capabilities`.
+    pub acp_mcp_capabilities: crate::core::acp::AcpMcpCapabilities,
+    /// Names of the MCP servers the *live* session actually started with
+    /// — i.e. what `session/new`'s `mcpServers` carried after
+    /// `build_mcp_servers_wire` dropped anything the agent doesn't
+    /// support (#1462). Empty before the first `session/new` of a session,
+    /// or if none were configured/all were dropped. Drives the `:AiAgent`
+    /// status line's `" | MCP: ..."` suffix
+    /// (`acp_agent_registry_status_line`). Session-scoped, reset alongside
+    /// `acp_mcp_capabilities`.
+    pub acp_active_mcp_servers: Vec<String>,
     /// A buffer line-range staged for the *next* prompt (#1450): either the
     /// Visual-mode `<leader>ai` mapping or a `:{range}AI` ex command. `Some`
     /// shows the `⧉`-chip in the panel header
@@ -4976,6 +4993,8 @@ impl Engine {
             acp_auth_methods: Vec::new(),
             acp_authenticated: false,
             acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities::default(),
+            acp_mcp_capabilities: crate::core::acp::AcpMcpCapabilities::default(),
+            acp_active_mcp_servers: Vec::new(),
             acp_pending_attachment: None,
             sidebar_focus_requested: false,
             acp_tool_calls: Vec::new(),

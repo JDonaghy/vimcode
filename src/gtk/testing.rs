@@ -6163,6 +6163,7 @@ second line here
                         "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
                         "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
                     ],
+                    mcp_servers: Vec::new(),
                 },
                 crate::core::acp::AcpAgentProfile {
                     name: "beta".to_string(),
@@ -6172,6 +6173,7 @@ second line here
                         "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
                         "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
                     ],
+                    mcp_servers: Vec::new(),
                 },
             ];
             engine.settings.acp_active_agent = "alpha".to_string();

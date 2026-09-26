@@ -16129,6 +16129,7 @@ mod tests {
                     "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
                     "ACP_FAKE_AGENT_LABEL=AlphaTag958".to_string(),
                 ],
+                mcp_servers: Vec::new(),
             },
             crate::core::acp::AcpAgentProfile {
                 name: "beta".to_string(),
@@ -16138,6 +16139,7 @@ mod tests {
                     "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
                     "ACP_FAKE_AGENT_LABEL=BetaTag958".to_string(),
                 ],
+                mcp_servers: Vec::new(),
             },
         ];
         app.engine.settings.acp_active_agent = "alpha".to_string();
@@ -17790,6 +17792,7 @@ mod tests {
             command: format!("sh \"{fixture_path}\" succeed-slow"),
             cwd: String::new(),
             env: Vec::new(),
+            mcp_servers: Vec::new(),
         }];
         app.engine.settings.acp_active_agent = "claude".to_string();
 

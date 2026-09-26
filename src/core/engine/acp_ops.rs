@@ -80,6 +80,9 @@ impl Engine {
                     self.acp_authenticated = false;
                     self.acp_prompt_capabilities =
                         crate::core::acp::AcpPromptCapabilities::default();
+                    // #1462: session-scoped, same as the rest above.
+                    self.acp_mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
+                    self.acp_active_mcp_servers.clear();
                     // #955 (ACP-4): session-scoped, same as the rest above
                     // — see `Engine::ai_clear`'s matching reset.
                     self.acp_tool_calls.clear();
@@ -99,6 +102,13 @@ impl Engine {
                     // `agent_capabilities` isn't read again after this.
                     self.acp_prompt_capabilities =
                         crate::core::acp::parse_prompt_capabilities(&agent_capabilities);
+                    // #1462: same reasoning — `acp_begin_session` below
+                    // (the straight-to-session branch) and the "acp_auth_
+                    // choice" dialog's skip button (the other call site of
+                    // `acp_begin_session`) both need `mcpCapabilities`
+                    // available before `session/new` is sent.
+                    self.acp_mcp_capabilities =
+                        crate::core::acp::parse_mcp_capabilities(&agent_capabilities);
                     // Handshake step 2. #957 (ACP-6): if the agent offers
                     // any `authMethods` and this client hasn't resolved
                     // auth yet for this session (skipped, a `type: "agent"`
@@ -324,27 +334,72 @@ impl Engine {
         }
     }
 
+    /// Combine `settings.acp_mcp_servers` (global) with the active agent
+    /// profile's own `mcp_servers` override, if any (#1462): a profile
+    /// entry whose `name` matches a global entry replaces it in place; any
+    /// other profile entry is appended. No profile (single-agent `acp_
+    /// agent_command` path) or an empty `profile.mcp_servers` (every
+    /// pre-#1462 profile) yields the global list unchanged — same
+    /// "config fact, no new branch" posture `acp_resolve_agent_launch`
+    /// documents for the registry itself.
+    pub(crate) fn acp_resolve_mcp_servers(&self) -> Vec<crate::core::acp::AcpMcpServerConfig> {
+        let profile_servers = self
+            .acp_active_agent_profile()
+            .map(|p| p.mcp_servers.clone())
+            .unwrap_or_default();
+        if profile_servers.is_empty() {
+            return self.settings.acp_mcp_servers.clone();
+        }
+        let mut merged = self.settings.acp_mcp_servers.clone();
+        for server in profile_servers {
+            if let Some(existing) = merged.iter_mut().find(|s| s.name == server.name) {
+                *existing = server;
+            } else {
+                merged.push(server);
+            }
+        }
+        merged
+    }
+
     /// Human-readable summary of `settings.acp_agents` and which is
     /// active, for `:AiAgent` with no argument — same shape as
-    /// `acp_mode_status_line` above.
+    /// `acp_mode_status_line` above. #1462: also appends which MCP
+    /// servers the *live* session actually started with, if any — see
+    /// `acp_mcp_servers_status_suffix`.
     pub(crate) fn acp_agent_registry_status_line(&self) -> String {
-        if self.settings.acp_agents.is_empty() {
-            return "No ACP agents configured (settings.acp_agents)".to_string();
+        let base = if self.settings.acp_agents.is_empty() {
+            "No ACP agents configured (settings.acp_agents)".to_string()
+        } else {
+            let active = self.acp_active_agent_name();
+            let names: Vec<String> = self
+                .settings
+                .acp_agents
+                .iter()
+                .map(|a| {
+                    if a.name.eq_ignore_ascii_case(&active) {
+                        format!("*{}", a.name)
+                    } else {
+                        a.name.clone()
+                    }
+                })
+                .collect();
+            format!("Agents: {}", names.join(", "))
+        };
+        format!("{base}{}", self.acp_mcp_servers_status_suffix())
+    }
+
+    /// `" | MCP: <names>"` appended to `:AiAgent`'s status line (#1462) —
+    /// the MCP servers the *live* session actually started with
+    /// (`acp_active_mcp_servers`, set by `acp_begin_session` from what
+    /// `build_mcp_servers_wire` didn't drop), not merely configured.
+    /// Empty (no live session yet, or none configured/all dropped) yields
+    /// no suffix at all, so a pre-#1462 status line is unchanged.
+    fn acp_mcp_servers_status_suffix(&self) -> String {
+        if self.acp_active_mcp_servers.is_empty() {
+            String::new()
+        } else {
+            format!(" | MCP: {}", self.acp_active_mcp_servers.join(", "))
         }
-        let active = self.acp_active_agent_name();
-        let names: Vec<String> = self
-            .settings
-            .acp_agents
-            .iter()
-            .map(|a| {
-                if a.name.eq_ignore_ascii_case(&active) {
-                    format!("*{}", a.name)
-                } else {
-                    a.name.clone()
-                }
-            })
-            .collect();
-        format!("Agents: {}", names.join(", "))
     }
 
     /// Switch the active agent to `target` (matched case-insensitively
@@ -390,10 +445,38 @@ impl Engine {
     /// "Continue without auth" / cancel path, which produces no
     /// `AcpEvent`) can call it directly — the other three call sites are
     /// all in this same module.
+    ///
+    /// #1462: also resolves the user-configured MCP server list
+    /// (`settings.acp_mcp_servers`, merged with the active agent profile's
+    /// own override via `acp_resolve_mcp_servers`) into `session/new`'s
+    /// `mcpServers` field, dropping any `http`/`sse` entry `acp_mcp_
+    /// capabilities` (captured off the `Initialized` event just before
+    /// this runs) says the live agent doesn't support — with a status-line
+    /// warning naming what was dropped. `acp_active_mcp_servers` records
+    /// what was actually *sent*, for `:AiAgent`'s status line.
+    ///
+    /// There is no `session/load` in this client (no persisted-session
+    /// support exists anywhere in this codebase yet — see `docs/
+    /// ACP_CONTRACT_TESTS.md`'s "deliberately out of scope" section), so
+    /// this is the only site MCP servers need wiring through.
     pub(crate) fn acp_begin_session(&mut self) {
         let cwd = self.acp_workspace_cwd();
+        let configs = self.acp_resolve_mcp_servers();
+        let (wire, dropped) =
+            crate::core::acp::build_mcp_servers_wire(&configs, self.acp_mcp_capabilities);
+        if !dropped.is_empty() {
+            self.message = format!(
+                "ACP: agent doesn't support dropped MCP server(s): {}",
+                dropped.join(", ")
+            );
+        }
+        self.acp_active_mcp_servers = wire
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .map(str::to_string)
+            .collect();
         if let Some(client) = self.acp_client.as_mut() {
-            client.new_session(&cwd, vec![]);
+            client.new_session(&cwd, wire);
         }
     }
 
@@ -489,6 +572,8 @@ impl Engine {
         self.acp_auth_methods.clear();
         self.acp_authenticated = false;
         self.acp_prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
+        self.acp_mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
+        self.acp_active_mcp_servers.clear();
     }
 
     // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
@@ -2009,6 +2094,240 @@ mod tests {
 
         let _ = std::fs::remove_file(&file_path);
         let _ = std::fs::remove_file(&capture);
+    }
+
+    // ── user-configured MCP servers on `session/new` (#1462) ────────────────
+
+    /// Path the fixture's `ACP_FAKE_CAPTURE_SESSION_NEW_TO` writes each
+    /// captured `session/new` request line to, one per test so parallel
+    /// `cargo test` runs never collide — same shape as `capture_file_path`
+    /// above, distinct temp-file namespace.
+    #[cfg(unix)]
+    fn session_new_capture_file_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vimcode_test_acp1462_session_new_{tag}_{}",
+            std::process::id()
+        ))
+    }
+
+    /// Read back the captured `session/new` request line and return its
+    /// `params.mcpServers` array.
+    #[cfg(unix)]
+    fn captured_session_new_mcp_servers(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("capture file {} should exist: {e}", path.display()));
+        let last_line = content
+            .lines()
+            .next_back()
+            .expect("capture file should have at least one captured line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(last_line).expect("captured line should be valid JSON");
+        parsed["params"]["mcpServers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Acceptance (#1462): a `stdio` entry in `settings.acp_mcp_servers` is
+    /// always sent on `session/new`, and an `http` entry is dropped — with
+    /// a status-line warning naming it — when the agent's `initialize`
+    /// response doesn't advertise `agentCapabilities.mcpCapabilities.http`
+    /// (the fixture's default; see `fake_acp_agent.sh`'s doc).
+    ///
+    /// RED verified: with `Engine::acp_begin_session` reverted to its
+    /// pre-#1462 `client.new_session(&cwd, vec![])`, this fails — the
+    /// captured `session/new` line's `mcpServers` is an empty array, not
+    /// `[{"name": "fs", ...}]`.
+    #[cfg(unix)]
+    #[test]
+    fn session_new_sends_stdio_mcp_server_and_drops_http_without_capability() {
+        let capture = session_new_capture_file_path("drop_http");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_SESSION_NEW_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.acp_mcp_servers = vec![
+            crate::core::acp::AcpMcpServerConfig {
+                name: "fs".to_string(),
+                command: "mcp-fs".to_string(),
+                args: vec!["--root".to_string(), "/tmp".to_string()],
+                ..Default::default()
+            },
+            crate::core::acp::AcpMcpServerConfig {
+                name: "remote".to_string(),
+                transport: "http".to_string(),
+                url: "https://mcp.example.com".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        poll_acp_until(&mut engine, |e| {
+            e.acp_session_id.is_some() || e.acp_client.is_none()
+        });
+        assert!(
+            engine.acp_session_id.is_some(),
+            "session should have started within the deadline"
+        );
+
+        let servers = captured_session_new_mcp_servers(&capture);
+        let names: Vec<&str> = servers.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["fs"],
+            "http server must be dropped without the agent's mcpCapabilities.http: {servers:?}"
+        );
+        assert_eq!(servers[0]["command"], "mcp-fs");
+        assert_eq!(servers[0]["args"], serde_json::json!(["--root", "/tmp"]));
+
+        assert_eq!(
+            engine.acp_active_mcp_servers,
+            vec!["fs".to_string()],
+            "only the server actually sent should be recorded for the status line"
+        );
+        assert!(
+            engine.message.contains("remote"),
+            "status line should warn about the dropped MCP server by name: {}",
+            engine.message
+        );
+        let status = engine.acp_agent_registry_status_line();
+        assert!(
+            !status.contains("MCP: remote"),
+            "the dropped server must not appear in the :AiAgent status line: {status}"
+        );
+
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance (#1462), other half: the same `http` server IS sent when
+    /// the agent's `initialize` response DOES advertise
+    /// `agentCapabilities.mcpCapabilities.http` (`$ACP_FAKE_MCP_HTTP`).
+    ///
+    /// RED verified: with `AcpMcpCapabilities` ignored and
+    /// `build_mcp_servers_wire` always dropping non-stdio entries, this
+    /// fails — the captured `mcpServers` array is empty.
+    #[cfg(unix)]
+    #[test]
+    fn session_new_sends_http_mcp_server_when_agent_advertises_capability() {
+        let capture = session_new_capture_file_path("send_http");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_SESSION_NEW_TO", capture.to_str().unwrap()),
+            ("ACP_FAKE_MCP_HTTP", "1"),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+            name: "remote".to_string(),
+            transport: "http".to_string(),
+            url: "https://mcp.example.com".to_string(),
+            headers: vec!["Authorization=Bearer tok".to_string()],
+            ..Default::default()
+        }];
+
+        poll_acp_until(&mut engine, |e| {
+            e.acp_session_id.is_some() || e.acp_client.is_none()
+        });
+        assert!(
+            engine.acp_session_id.is_some(),
+            "session should have started within the deadline"
+        );
+
+        let servers = captured_session_new_mcp_servers(&capture);
+        assert_eq!(
+            servers.len(),
+            1,
+            "http server should be sent when the agent advertises mcpCapabilities.http: {servers:?}"
+        );
+        assert_eq!(servers[0]["name"], "remote");
+        assert_eq!(servers[0]["type"], "http");
+        assert_eq!(servers[0]["url"], "https://mcp.example.com");
+        assert_eq!(servers[0]["headers"][0]["name"], "Authorization");
+        assert_eq!(servers[0]["headers"][0]["value"], "Bearer tok");
+
+        assert_eq!(engine.acp_active_mcp_servers, vec!["remote".to_string()]);
+        assert!(
+            !engine.message.contains("dropped"),
+            "no server should be reported dropped: {}",
+            engine.message
+        );
+        let status = engine.acp_agent_registry_status_line();
+        assert!(
+            status.contains("MCP: remote"),
+            "the :AiAgent status line should show the server the session started with: {status}"
+        );
+
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance (#1462, per-profile override): an `AcpAgentProfile`'s own
+    /// `mcp_servers` entry with the same `name` as a global `settings.
+    /// acp_mcp_servers` entry replaces it — the profile's `command` reaches
+    /// `session/new`, not the global one.
+    #[cfg(unix)]
+    #[test]
+    fn agent_profile_mcp_servers_override_replaces_global_entry_by_name() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+            name: "fs".to_string(),
+            command: "global-mcp-fs".to_string(),
+            ..Default::default()
+        }];
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: "claude-code-acp".to_string(),
+            cwd: String::new(),
+            env: Vec::new(),
+            mcp_servers: vec![crate::core::acp::AcpMcpServerConfig {
+                name: "fs".to_string(),
+                command: "profile-mcp-fs".to_string(),
+                ..Default::default()
+            }],
+        }];
+        engine.settings.acp_active_agent = "claude".to_string();
+
+        let resolved = engine.acp_resolve_mcp_servers();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "same-named entry must replace, not add: {resolved:?}"
+        );
+        assert_eq!(resolved[0].command, "profile-mcp-fs");
+    }
+
+    /// Acceptance (#1462, per-profile override): an `AcpAgentProfile`
+    /// `mcp_servers` entry with a *different* name is appended alongside
+    /// the global list, not a replacement for it.
+    #[cfg(unix)]
+    #[test]
+    fn agent_profile_mcp_servers_with_new_name_extends_global_list() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+            name: "fs".to_string(),
+            command: "global-mcp-fs".to_string(),
+            ..Default::default()
+        }];
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: "claude-code-acp".to_string(),
+            cwd: String::new(),
+            env: Vec::new(),
+            mcp_servers: vec![crate::core::acp::AcpMcpServerConfig {
+                name: "search".to_string(),
+                command: "profile-mcp-search".to_string(),
+                ..Default::default()
+            }],
+        }];
+        engine.settings.acp_active_agent = "claude".to_string();
+
+        let resolved = engine.acp_resolve_mcp_servers();
+        let names: Vec<&str> = resolved.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["fs", "search"],
+            "unmatched profile entry must be appended, not replace: {resolved:?}"
+        );
     }
 
     /// Acceptance (point 1): `:'<,'>AI` with no message stages the
