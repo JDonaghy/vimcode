@@ -4058,4 +4058,70 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1500: public App-on-TUI test seam
+    //
+    // Mirrors `tests/acceptance/ms-example/seam_657.rs`'s TUI half exactly
+    // — same marker, same two assertions — but built with only the new
+    // `crate::tui_main::testing::tui_driver`/`tui_driver_with` functions,
+    // not `crate::`-private items (`conformance_harness`,
+    // `ConformanceHarness`, `App` itself). That restriction is the point:
+    // it proves an *external* crate could write these same two tests once
+    // `seam_657.rs` is re-pointed at this seam instead of `TuiShellApp`
+    // (which #1434 is about to delete).
+    // ─────────────────────────────────────────────────────────────────────
+    mod app_on_tui_seam {
+        use crate::tui_main::testing::tui_driver_with;
+
+        /// Same marker `seam_657.rs` uses: cannot occur in a restored
+        /// session, a settings file, or any chrome vimcode paints, so
+        /// finding it on screen can only mean the frame rendered the
+        /// buffer seeded via [`tui_driver_with`]'s `setup` hook.
+        const MARKER: &str = "SEAM657MARKER";
+
+        /// `tui_driver(None, 80, 24)` → `render()` → the screen has exactly
+        /// 24 rows and is not blank — the `tui_driver` twin of
+        /// `seam_657.rs`'s `tui_backend_paints_a_full_frame_from_an_
+        /// integration_test`.
+        #[test]
+        fn tui_driver_paints_a_full_frame() {
+            let mut driver = crate::tui_main::testing::tui_driver(None, 80, 24);
+            driver.render();
+            let screen = driver.screen();
+
+            let rows: Vec<&str> = screen.lines().collect();
+            assert_eq!(
+                rows.len(),
+                24,
+                "expected a 24-row frame, got {}:\n{screen}",
+                rows.len()
+            );
+            assert!(
+                screen.chars().any(|c| !c.is_whitespace()),
+                "the frame painted nothing at all:\n{screen}"
+            );
+        }
+
+        /// Seeding `SEAM657MARKER\n` at buffer offset 0 with every window's
+        /// scroll pinned to 0, at 120x24, must reach the painted character
+        /// grid — the `tui_driver_with` twin of `seam_657.rs`'s
+        /// `tui_backend_paints_seeded_buffer_text`.
+        #[test]
+        fn tui_driver_with_paints_seeded_buffer_text() {
+            let mut driver = tui_driver_with(None, 120, 24, |engine| {
+                engine.buffer_mut().insert(0, &format!("{MARKER}\n"));
+                for window in engine.windows.values_mut() {
+                    window.view.scroll_top = 0;
+                }
+            });
+            driver.render();
+
+            assert!(
+                driver.screen_contains(MARKER),
+                "seeded buffer text never reached the character grid:\n{}",
+                driver.screen()
+            );
+        }
+    }
 }

@@ -132,14 +132,16 @@ pub mod testing {
     // scenario can finally tell the two apart instead of only ever seeing
     // the first.
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
 
     use quadraui::tui::testing::{driver_with_shell, TuiDriver};
     use quadraui::tui::TuiBackend;
 
-    use crate::app::TextMetricsBackend;
+    use crate::app::{App, TextMetricsBackend};
     use crate::core::Engine;
     use crate::harness::ConformanceHarness;
+    use crate::render::UnitProfile;
 
     /// The `TuiDriver` instantiation of `crate::harness::ConformanceHarness`
     /// (#982) — mirrors `crate::gtk::testing::conformance_harness`
@@ -287,6 +289,83 @@ pub mod testing {
         let driver = driver_with_shell(app, config, width, height);
         let placeholder_engine = Rc::new(RefCell::new(Engine::new_for_test()));
         ConformanceHarness::new(driver, placeholder_engine, paint, cwd)
+    }
+
+    // ── #1500: public App-on-TUI test seam ──────────────────────────────
+    //
+    // `conformance_harness` above already wraps the shared `crate::app::App`
+    // for TUI, but it's reached through `crate::harness::ConformanceHarness`
+    // / `crate::harness::build_app_and_config` — both `pub(crate)` — so an
+    // *external* test crate (the sealed acceptance suite,
+    // `tests/acceptance/ms-example/seam_657.rs`) cannot reach either.
+    // `seam_657.rs`'s TUI half currently drives [`TuiShellApp`] (re-exported
+    // above) instead; #1434 is about to delete that type now that #1433
+    // moved production `tui_main::run` (above) onto `App` — once #1434
+    // lands, `seam_657.rs`'s TUI half has nothing left to compile against.
+    //
+    // [`tui_driver`]/[`tui_driver_with`] are the replacement seam: built
+    // through *exactly* the construction path [`run`] uses —
+    // `App::new_portable` + `App::shell_config` — rather than
+    // `conformance_harness`'s `build_app_and_config`, which calls the
+    // *headless* `App::new_headless_with_backend` on a caller-supplied
+    // fixture `Engine` precisely so a `crate::harness` scenario never
+    // touches the machine's real `~/.config/vimcode` (see that function's
+    // own doc). This seam is for the opposite case: proving an external
+    // crate can drive the same thing a user actually runs. `App` stays
+    // `pub(crate)` either way — both functions return the opaque
+    // `TuiDriver<impl quadraui::AppLogic>`, exactly like
+    // `conformance_harness`, so nothing about `App`'s shape leaks.
+
+    /// Build a TUI driver of the given cell size with no other setup — the
+    /// TUI twin of `driver_with_shell(TuiShellApp::new(file_path), ...)`,
+    /// but built through the shared `App` construction path
+    /// (`App::new_portable` + `App::shell_config`, the same pair [`run`]
+    /// calls) rather than through `TuiShellApp`.
+    ///
+    /// Runs the real `Engine::startup` (via `App::new_portable`), so —
+    /// exactly like `TuiShellApp::new` (see `seam_657.rs`'s own doc) —
+    /// sidebar visibility, scroll offsets, and restored session state are
+    /// *ambient*, read from the developer's real `~/.config/vimcode`, not
+    /// fixed. A caller that needs a known starting buffer/scroll position
+    /// (so a marker painted at a known location can't drift by whatever the
+    /// machine's own session happens to restore) should use
+    /// [`tui_driver_with`] instead.
+    pub fn tui_driver(
+        file_path: Option<PathBuf>,
+        width: u16,
+        height: u16,
+    ) -> TuiDriver<impl quadraui::AppLogic> {
+        tui_driver_with(file_path, width, height, |_| {})
+    }
+
+    /// [`tui_driver`], plus a `setup` hook that runs against the live
+    /// `Engine` after construction but before the first frame renders —
+    /// e.g. seeding buffer text and pinning every window's
+    /// `view.scroll_top` to `0`, the same two steps `seam_657.rs`'s
+    /// `tui_backend_paints_seeded_buffer_text` performs directly on
+    /// `TuiShellApp::engine` (a bare `Engine` there).
+    ///
+    /// `App` stores its `Engine` behind `Rc<RefCell<Engine>>` (`App::engine`
+    /// in `src/app.rs`) rather than owning it directly the way `TuiShellApp`
+    /// does, and `App` itself is `pub(crate)` — so a public accessor handing
+    /// back the `Rc` would either leak `App`'s crate-private shape through
+    /// the accessor's own return type, or need a wrapper type solely to hide
+    /// it. A `FnOnce(&mut Engine)` callback sidesteps both: the caller gets
+    /// a mutable window onto the same engine [`tui_driver`] would otherwise
+    /// hand straight to `driver_with_shell` unseen, without `App` ever
+    /// crossing the module boundary.
+    pub fn tui_driver_with(
+        file_path: Option<PathBuf>,
+        width: u16,
+        height: u16,
+        setup: impl FnOnce(&mut Engine),
+    ) -> TuiDriver<impl quadraui::AppLogic> {
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(TuiBackend::new())));
+        let app = App::new_portable(file_path, backend, UnitProfile::cell());
+        setup(&mut app.engine.borrow_mut());
+        let config = app.shell_config();
+        driver_with_shell(app, config, width, height)
     }
 }
 
