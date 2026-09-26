@@ -6356,6 +6356,144 @@ second line here
         );
     }
 
+    /// #1487 acceptance, GTK's twin of `tui_main::app_on_tui_tests::
+    /// acp_mcp_servers::ai_agent_status_line_shows_active_mcp_server_via_
+    /// shell_app`: the `:AiAgent` status line's `" | MCP: <names>"` suffix
+    /// must actually paint on screen through the real `App`/`GtkDriver`
+    /// stack, not merely be true of `Engine::acp_agent_registry_status_line`
+    /// in isolation. The fixture agent advertises `mcpCapabilities.http` via
+    /// `$ACP_FAKE_MCP_HTTP`, so the configured `http` server is sent to
+    /// `session/new`, not dropped.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::acp_begin_session` to send `vec![]` unconditionally (so
+    /// `AcpSession::active_mcp_servers` stays empty) makes this fail -- the
+    /// `:AiAgent` screen shows no `MCP:` suffix at all.
+    #[cfg(unix)]
+    #[test]
+    fn ai_agent_status_line_shows_active_mcp_server_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                    "ACP_FAKE_MCP_HTTP=1".to_string(),
+                    "ACP_FAKE_AGENT_LABEL=McpGtk1487".to_string(),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+                name: "remoteMcpGtk1487".to_string(),
+                transport: "http".to_string(),
+                url: "https://mcp.example.com".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello_McpGtk1487") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello_McpGtk1487"),
+            "session must start and reply within 5s"
+        );
+
+        // The real ex-command path, same convention as
+        // `ai_panel_mode_switch_round_trips_via_session_set_mode` above.
+        h.engine.borrow_mut().execute_command("AiAgent");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("MCP: remoteMcpGtk1487"),
+            "`:AiAgent`'s painted status line must name the MCP server the \
+             live session actually started with"
+        );
+    }
+
+    /// #1487 acceptance, GTK's twin of `tui_main::app_on_tui_tests::
+    /// acp_mcp_servers::ai_agent_warns_about_dropped_mcp_server_via_
+    /// shell_app`: when the agent does NOT advertise `mcpCapabilities.http`,
+    /// a configured `http` MCP server is dropped and the warning must reach
+    /// the painted screen, not merely `engine.message` in isolation.
+    ///
+    /// RED verified the same way as the TUI twin: reverting
+    /// `Engine::acp_begin_session` to send `vec![]` unconditionally (so the
+    /// drop warning is never assigned to `self.message`) makes this fail --
+    /// the screen right after sending never shows any `ACP:`/`dropped` text.
+    #[cfg(unix)]
+    #[test]
+    fn ai_agent_warns_about_dropped_mcp_server_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_NO_TOOL_REQUEST=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            engine.settings.acp_mcp_servers = vec![crate::core::acp::AcpMcpServerConfig {
+                name: "droppedMcpGtk1487".to_string(),
+                transport: "http".to_string(),
+                url: "https://mcp.example.com".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("droppedMcpGtk1487") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("droppedMcpGtk1487"),
+            "the painted screen must name the dropped MCP server within 5s \
+             of session start"
+        );
+        assert!(
+            h.driver.screen_contains("ACP:") && h.driver.screen_contains("dropped"),
+            "the painted screen must warn that the server was dropped, not \
+             merely mention its name"
+        );
+    }
+
     /// #1459 acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
     /// transcript_via_shell_app`: `:AiSessions` lists past sessions for the
