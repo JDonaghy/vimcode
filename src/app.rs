@@ -4149,8 +4149,28 @@ impl App {
         // modal stack.
         let completion = screen.completion.as_ref().and_then(|menu| {
             let (cursor_x, cursor_y) = anchor_points.completion?;
-            // Longest candidate + 2 cells of padding/border, floored at
-            // 100px.
+            // Longest candidate + 4 cells of padding/border, floored at 12
+            // cells' worth of raw units (`cw`-scaled, not a bare pixel
+            // constant — #1432: this function runs unmodified for both `gtk`
+            // and TUI-via-`App`, and a flat `100.0` floor is a GTK pixel
+            // width. On TUI `cw` is `1.0` (cell = 1 raw unit), so that same
+            // constant used to demand a 100-*cell*-wide popup — wider than
+            // most terminals — which made `Completions::layout`'s own
+            // right-edge-overflow branch always fire and clamp `x` straight
+            // back to `viewport.x`, discarding the correctly-computed cursor
+            // anchor outright (observed: popup pinned at the window's left
+            // edge regardless of cursor column). Both the `+4`/`.max(12.0)`
+            // now match `tui_main::render_impl`'s independent
+            // completion-width calc exactly (its own comment there names
+            // the same reasoning) — this used to read `+2`, which happened
+            // to never matter while `100.0` always dominated it, but once
+            // scaled down to a real cell-sized floor a too-narrow candidate
+            // term clipped the popup's own last character (observed:
+            // `"ZQXWFOOBAR"` painted as `"ZQXWFOOBA"`, missing the border's
+            // trailing padding cell). Scaling the shared `12.0` floor by
+            // `cw` here keeps GTK's effective minimum close to its old
+            // ~100px (12 * a typical ~8px cell) while giving TUI-via-`App`
+            // the same sane 12-cell floor `render_impl` already ships.
             //
             // #420: `Completions::layout` clamps the popup's *position*
             // into `win_viewport` (`x.max(viewport.x)`) but never clamps
@@ -4163,7 +4183,7 @@ impl App {
             // Tracked as a follow-up pending a quadraui-side fix rather than
             // duplicating a `.min(...)` clamp here and in
             // `tui_main::render_impl`.
-            let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
+            let popup_w = ((menu.max_width + 4) as f64 * cw).max(12.0 * cw);
             let max_popup_h = 10.0 * lh;
             Some((
                 render::PopupAnchor {
@@ -8815,12 +8835,24 @@ impl quadraui::ShellApp for App {
         // drained by `tick()` since the blocking `PlatformServices` call can't
         // run from inside this paint callback, mirroring `PendingFileDialog`
         // #572) and flips the flag; a *closed* dialog re-arms it.
+        //
+        // #1432: `quadraui::native_dialog_options` is a pure content-shape
+        // check (no table/no input) — it says nothing about whether *this*
+        // backend actually has a native alert facility to show it with. Its
+        // own doc says as much: "callers should consult [`BackendCaps::
+        // native_dialogs`] before calling [`Backend::show_message_dialog`],
+        // and fall back to `draw_dialog` when it returns `None`." Gating here
+        // (rather than only inside `Some(opts) =>`) also keeps `presence.dialog`
+        // below correct — an ungated `native_dialog_shown` would still have
+        // suppressed the in-canvas rung on a backend with no native dialog at
+        // all (TUI), leaving the dialog painted nowhere.
         match screen
             .dialog
             .as_ref()
             .map(render::dialog_panel_to_quadraui_dialog)
             .as_ref()
             .and_then(quadraui::native_dialog_options)
+            .filter(|_| backend.backend_caps().native_dialogs)
         {
             Some(opts) => {
                 if !self.native_dialog_shown.get() {

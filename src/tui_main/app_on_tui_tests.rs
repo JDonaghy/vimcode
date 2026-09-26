@@ -411,105 +411,106 @@ mod tests {
             engine.explorer_reveal_path(&marker_file);
             let mut h = harness(engine);
             let driver = &mut h.driver;
+            // #1432: without this, the six back-to-back `driver.click()`
+            // calls below (no simulated time between them) let quadraui's
+            // `TuiBackend::translate_injected` fold any pair landing within
+            // its double-click time/radius window into a `DoubleClick` —
+            // observed by instrumenting `App::try_route_sidebar_mouse_event`
+            // directly: the Search→Source-Control click pair stayed plain
+            // `MouseDown`s, but the very next click (Source Control→
+            // Extensions, on the activity bar's fixed-width column, one row
+            // apart) arrived as `DoubleClick`, and a double-click on a plain
+            // activity-bar icon zone has no "activate panel" handler — it
+            // silently did nothing, exactly the "click lands, panel doesn't
+            // switch" symptom this scenario used to gate as a "product"
+            // dispatch gap. Same root cause and same fix as this module's
+            // own `collapse_sidebar` doc (#1427/#1432).
+            driver.set_double_click_folding(false);
 
-            known_bug_gate(
-                "app_on_tui::driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app",
-                || {
-                    // Unlike the mirrored `shell_app.rs` test, `App`'s shadow
-                    // `engine.app_shell` defaults its *own* active panel to
-                    // Explorer regardless of the runner chrome's separate
-                    // hamburger-active default (this module's own
-                    // `collapse_sidebar` doc) — so the marker is already
-                    // painted here, not hidden. Confirmed by
-                    // `key_dispatch`/`sidebar_panels`' own fixtures, which
-                    // never depend on this precondition either way.
-                    assert!(
-                        driver.screen_has("zqxw1053.txt"),
-                        "precondition: Explorer is the shadow engine's default \
+            // Unlike the mirrored `shell_app.rs` test, `App`'s shadow
+            // `engine.app_shell` defaults its *own* active panel to
+            // Explorer regardless of the runner chrome's separate
+            // hamburger-active default (this module's own
+            // `collapse_sidebar` doc) — so the marker is already
+            // painted here, not hidden. Confirmed by
+            // `key_dispatch`/`sidebar_panels`' own fixtures, which
+            // never depend on this precondition either way.
+            assert!(
+                driver.screen_has("zqxw1053.txt"),
+                "precondition: Explorer is the shadow engine's default \
                          active panel, so its content paints even before any \
                          click; screen:\n{}",
-                        driver.screen()
-                    );
-                    assert!(
-                        !driver.screen_has("File"),
-                        "precondition: menu bar starts hidden; screen:\n{}",
-                        driver.screen()
-                    );
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has("File"),
+                "precondition: menu bar starts hidden; screen:\n{}",
+                driver.screen()
+            );
 
-                    // Located by chrome zone id, not `driver.find`'s glyph
-                    // search: several fallback icons (Nerd Fonts off, same
-                    // as every other fixture in this module) are single
-                    // ASCII characters that also occur in a previously-
-                    // opened panel's own body text — `EXTENSIONS.s()` is
-                    // `"#"`, and the fixed activity-bar rail is not the
-                    // *only* `"#"` `find` can match once a panel with body
-                    // text is showing. A chrome zone's `id` is exact, so
-                    // this can never collide.
-                    let mut click_icon_and_expect = |panel_id: &str, marker: &str, label: &str| {
-                        let bounds = driver
-                            .inventory()
-                            .zones()
-                            .iter()
-                            .find(|z| z.id.as_str() == panel_id)
-                            .map(|z| z.bounds)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "{label} icon must register a chrome zone; \
+            // Located by chrome zone id, not `driver.find`'s glyph
+            // search: several fallback icons (Nerd Fonts off, same
+            // as every other fixture in this module) are single
+            // ASCII characters that also occur in a previously-
+            // opened panel's own body text — `EXTENSIONS.s()` is
+            // `"#"`, and the fixed activity-bar rail is not the
+            // *only* `"#"` `find` can match once a panel with body
+            // text is showing. A chrome zone's `id` is exact, so
+            // this can never collide.
+            let mut click_icon_and_expect = |panel_id: &str, marker: &str, label: &str| {
+                let bounds = driver
+                    .inventory()
+                    .zones()
+                    .iter()
+                    .find(|z| z.id.as_str() == panel_id)
+                    .map(|z| z.bounds)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{label} icon must register a chrome zone; \
                                      screen:\n{}",
-                                    driver.screen()
-                                )
-                            });
-                        driver.click(
-                            bounds.x + bounds.width / 2.0,
-                            bounds.y + bounds.height / 2.0,
-                        );
-                        let screen = driver.screen();
-                        assert!(
-                            screen.contains(marker),
-                            "clicking the {label} icon must open its panel via \
+                            driver.screen()
+                        )
+                    });
+                driver.click(
+                    bounds.x + bounds.width / 2.0,
+                    bounds.y + bounds.height / 2.0,
+                );
+                let screen = driver.screen();
+                assert!(
+                    screen.contains(marker),
+                    "clicking the {label} icon must open its panel via \
                              the real App path (marker {marker:?} missing); \
                              screen:\n{screen}"
-                        );
-                    };
+                );
+            };
 
-                    use crate::core::engine::sidebar::{
-                        PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
-                    };
-                    click_icon_and_expect(PANEL_SEARCH, "Replace…", "Search");
-                    click_icon_and_expect(PANEL_GIT, "SOURCE CONTROL", "Source Control");
-                    // #1430 gate: this specific step — clicking Extensions
-                    // *right after* Source Control — is where the gap lives.
-                    // Confirmed in isolation (Search → Extensions, no SC in
-                    // between) that the Extensions panel itself opens fine
-                    // and paints its own all-caps "EXTENSIONS" header (the
-                    // marker below), so this is not an Extensions-panel bug;
-                    // with SC opened first the click on Extensions' own
-                    // chrome zone lands (verified: same coordinates as the
-                    // isolated case) but the sidebar body never switches —
-                    // the SC panel's own commit-message input most likely
-                    // captures the click before it reaches the activity-bar
-                    // dispatch. category: product (the SC panel's own click
-                    // handling needs to release/ignore clicks outside its
-                    // own bounds) — target: needs its own filed issue.
-                    click_icon_and_expect(PANEL_EXTENSIONS, "EXTENSIONS", "Extensions");
-                    click_icon_and_expect(PANEL_SETTINGS, "Settings", "Settings");
-                    click_icon_and_expect(
-                        crate::core::engine::sidebar::PANEL_EXPLORER,
-                        "zqxw1053.txt",
-                        "Explorer",
-                    );
+            use crate::core::engine::sidebar::{
+                PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+            };
+            click_icon_and_expect(PANEL_SEARCH, "Replace…", "Search");
+            click_icon_and_expect(PANEL_GIT, "SOURCE CONTROL", "Source Control");
+            // Was gated as "#1430: clicking Extensions right after
+            // Source Control never switches the sidebar body" — see
+            // this fn's own `set_double_click_folding(false)` comment
+            // above for the real cause (a folded `DoubleClick`, not
+            // the SC panel's click handling).
+            click_icon_and_expect(PANEL_EXTENSIONS, "EXTENSIONS", "Extensions");
+            click_icon_and_expect(PANEL_SETTINGS, "SETTINGS", "Settings");
+            click_icon_and_expect(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+                "zqxw1053.txt",
+                "Explorer",
+            );
 
-                    let (hx, hy) = driver
-                        .find(crate::icons::HAMBURGER.s())
-                        .expect("hamburger icon must paint on the activity bar");
-                    driver.click(hx, hy);
-                    assert!(
-                        driver.screen_has("File"),
-                        "clicking the hamburger must reveal the menu bar via \
+            let (hx, hy) = driver
+                .find(crate::icons::HAMBURGER.s())
+                .expect("hamburger icon must paint on the activity bar");
+            driver.click(hx, hy);
+            assert!(
+                driver.screen_has("File"),
+                "clicking the hamburger must reveal the menu bar via \
                          the real App path; screen:\n{}",
-                        driver.screen()
-                    );
-                },
+                driver.screen()
             );
 
             let _ = std::fs::remove_dir_all(&dir);
@@ -1197,42 +1198,34 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
-            // wrong: the editor-band collapse #1426 fixed was never this
-            // scenario's blocker — with the band fixed, this still fails on
-            // the same precondition). category: quadraui —
-            // `quadraui::native_dialog_options` reports a `Dialog` with no
-            // table/input as "natively expressible" with no backend
-            // capability gate, so `App::render_content` queues a native
-            // `PlatformServices::show_message_dialog` present instead of
-            // painting the in-canvas `Dialog` rung — on every backend, not
-            // just ones with a real native alert facility. TUI has none.
-            // Same root cause as `explorer_context_menu::
-            // context_menu_delete_opens_confirm_dialog`. Target: quadraui
-            // (a `BackendCaps`-gated native-dialog capability must be
-            // filed).
-            known_bug_gate("app_on_tui::dialog_intercepts_all_keys", || {
-                assert!(
-                    driver.screen_has("ZQXW_1425_DIALOG_MARKER"),
-                    "precondition: the dialog must be painted"
-                );
-                // 'dd' would delete the line under Normal-mode dispatch; with a
-                // dialog open it must be swallowed instead.
-                driver.type_char('d');
-                driver.type_char('d');
-                assert!(
-                    driver.screen_has("ZQXW_DIALOG_LINE"),
-                    "keys must not reach the buffer while a dialog is open; \
+            // #1432 fixed the root cause (re-diagnosed from #1425's "unit"
+            // guess, which was wrong): `App::render_content` now filters
+            // `quadraui::native_dialog_options`'s answer on
+            // `backend.backend_caps().native_dialogs` before queuing a
+            // native present, so TUI (no native alert facility) falls back
+            // to the in-canvas `Dialog` rung instead of never painting it.
+            // Ungated — was the same root cause as `explorer_context_menu::
+            // context_menu_delete_opens_confirm_dialog`.
+            assert!(
+                driver.screen_has("ZQXW_1425_DIALOG_MARKER"),
+                "precondition: the dialog must be painted"
+            );
+            // 'dd' would delete the line under Normal-mode dispatch; with a
+            // dialog open it must be swallowed instead.
+            driver.type_char('d');
+            driver.type_char('d');
+            assert!(
+                driver.screen_has("ZQXW_DIALOG_LINE"),
+                "keys must not reach the buffer while a dialog is open; \
                  screen:\n{}",
-                    driver.screen()
-                );
-                driver.press_named(quadraui::NamedKey::Escape);
-                assert!(
-                    !driver.screen_has("ZQXW_1425_DIALOG_MARKER"),
-                    "Escape must dismiss the dialog; screen:\n{}",
-                    driver.screen()
-                );
-            });
+                driver.screen()
+            );
+            driver.press_named(quadraui::NamedKey::Escape);
+            assert!(
+                !driver.screen_has("ZQXW_1425_DIALOG_MARKER"),
+                "Escape must dismiss the dialog; screen:\n{}",
+                driver.screen()
+            );
         }
 
         /// An open quickfix list with a real item must paint that item's text
@@ -1273,9 +1266,41 @@ mod tests {
         /// completion popup must anchor at the cursor's real *display*
         /// column, not its raw character column — on a tab-indented line the
         /// two disagree. See the mirrored test's own doc for the full
-        /// rationale; ported unmodified here since it only drives
-        /// `TuiDriver`'s public `type_char`/`terminal_cursor_position`/
-        /// `find_bounds` API, none of which is `TuiShellApp`-specific.
+        /// rationale; ported unmodified here (down to the `find_bounds`
+        /// needle bracketing *both* popup borders, restored below) since it
+        /// only drives `TuiDriver`'s public `type_char`/
+        /// `terminal_cursor_position`/`find_bounds` API, none of which is
+        /// `TuiShellApp`-specific.
+        ///
+        /// #1432 re-diagnosed this, in two layers:
+        ///
+        /// 1. It was gated as `render::editor_popup_anchors` omitting the
+        ///    active window's own `rect.x` offset, but instrumenting
+        ///    `App::paint_editor_popups_rung` directly showed the computed
+        ///    anchor was already correct (x=19, matching the real cursor
+        ///    column) on every frame. The actual bug was one line further
+        ///    down: `App`'s completion-popup width floor (`popup_w =
+        ///    (...).max(100.0)`) is a bare GTK pixel constant, but this
+        ///    function runs unmodified for TUI-via-`App` too, where `cw`
+        ///    (raw units per character) is `1.0` — so the same "100"
+        ///    demanded a 100-*cell*-wide popup, wider than the 80-column
+        ///    terminal, which made `quadraui::Completions::layout`'s
+        ///    right-edge-overflow branch always fire and clamp `x` straight
+        ///    back to the window's left edge, discarding the correct
+        ///    anchor. Fixed by scaling the floor by `cw` and matching
+        ///    `tui_main::render_impl`'s own `+4`/`.max(12.0)` completion-
+        ///    width formula exactly (a bare `+2` here had never mattered
+        ///    while `100.0` always dominated it, but once scaled down to a
+        ///    real cell-sized floor it clipped the popup's own trailing
+        ///    padding cell).
+        /// 2. Fixing (1) exposed that this port's own `find_bounds` needle
+        ///    had silently dropped the mirrored test's trailing `" │"` —
+        ///    see the needle's own comment below for why that makes it
+        ///    match the *dictionary line* (which happens to carry the same
+        ///    leading `"│ "` via this fixture's persistent gutter/divider
+        ///    chrome) instead of the popup, on every run, independent of
+        ///    the anchor bug. Restoring the exact mirrored needle was
+        ///    needed before (1)'s fix could be observed to work at all.
         #[test]
         fn completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app() {
             let mut engine = plain_engine();
@@ -1284,41 +1309,51 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            known_bug_gate(
-                "app_on_tui::completion_popup_anchors_at_the_real_cursor_column_on_tab_indented_line_via_shell_app",
-                || {
-                    driver.type_char('G');
-                    driver.type_char('o');
-                    driver.type_char('\t');
-                    driver.type_char('\t');
-                    for c in "ZQXWFOO".chars() {
-                        driver.type_char(c);
-                    }
+            driver.type_char('G');
+            driver.type_char('o');
+            driver.type_char('\t');
+            driver.type_char('\t');
+            for c in "ZQXWFOO".chars() {
+                driver.type_char(c);
+            }
 
-                    let screen = driver.screen();
-                    assert_eq!(
-                        screen.matches("ZQXWFOOBAR").count(),
-                        2,
-                        "precondition: the popup must be showing the \
-                         \"ZQXWFOOBAR\" candidate (once in the dictionary line, \
-                         once in the popup); screen:\n{screen}"
-                    );
+            let screen = driver.screen();
+            assert_eq!(
+                screen.matches("ZQXWFOOBAR").count(),
+                2,
+                "precondition: the popup must be showing the \
+                 \"ZQXWFOOBAR\" candidate (once in the dictionary line, \
+                 once in the popup); screen:\n{screen}"
+            );
 
-                    let (cursor_x, _) = driver
-                        .terminal_cursor_position()
-                        .expect("insert-mode cursor must be visible after typing");
-                    let popup_bounds = driver
-                        .find_bounds("│ ZQXWFOOBAR")
-                        .expect("completion popup must be visible on screen");
+            let (cursor_x, _) = driver
+                .terminal_cursor_position()
+                .expect("insert-mode cursor must be visible after typing");
+            let popup_bounds = driver
+                // #1432: the mirrored `shell_app.rs` test brackets with
+                // *both* the popup's own left and right borders
+                // (`"│ ZQXWFOOBAR │"`) specifically because the candidate
+                // text also appears verbatim as plain buffer content (the
+                // dictionary line above) with its own leading `"│ "` —
+                // this fixture's persistent activity-bar/divider chrome
+                // puts a `"│"` immediately left of *every* row's content,
+                // and that row's 1-cell gutter reservation happens to
+                // reproduce the leading `"│ "` prefix too, so a
+                // left-border-only needle silently matched the dictionary
+                // line first (the topmost row `find_bounds` scans) instead
+                // of the popup — this port had dropped the trailing
+                // `" │"` when copying the needle over, silently comparing
+                // the dictionary line's own x against the cursor instead
+                // of the popup's.
+                .find_bounds("│ ZQXWFOOBAR │")
+                .expect("completion popup must be visible on screen");
 
-                    assert!(
-                        (popup_bounds.x - cursor_x as f32).abs() <= 1.0,
-                        "completion popup (x={}) must anchor at the real \
-                         cursor's display column (x={cursor_x}), not the raw \
-                         character column; screen:\n{screen}",
-                        popup_bounds.x,
-                    );
-                },
+            assert!(
+                (popup_bounds.x - cursor_x as f32).abs() <= 1.0,
+                "completion popup (x={}) must anchor at the real \
+                 cursor's display column (x={cursor_x}), not the raw \
+                 character column; screen:\n{screen}",
+                popup_bounds.x,
             );
         }
 
@@ -2361,42 +2396,45 @@ mod tests {
         /// `render::ACC_OPEN_TERMINAL`) must paint a terminal pane — mirrors
         /// `shell_app.rs`'s
         /// `menu_terminal_activation_opens_terminal_pane_via_shell_app`.
+        ///
+        /// #1432 re-diagnosed this: it was gated as a "product" dispatch gap,
+        /// but `App`'s `UiEvent::Accelerator(OpenTerminal, ..)` arm
+        /// (`GtkAccelHost::open_terminal`) queues a `DeferredAction::
+        /// ToggleTerminal`, drained only inside `App::tick_dispatch` — not by
+        /// `TuiDriver::dispatch`/`render` alone, which never call `app.tick`
+        /// (confirmed against quadraui's own `tui::testing`/`runtime`
+        /// source: `dispatch` → `preprocess_event` → `app.handle`, no `tick`
+        /// anywhere in that path). The gate's own scenario was missing the
+        /// `driver.tick()` every other deferred-queue-consuming scenario in
+        /// this suite already calls after a dispatch. Fixed the test, not
+        /// `App`; confirmed `FixLanded`.
         #[test]
         fn menu_terminal_activation_opens_terminal_pane_via_shell_app() {
             let mut h = harness_no_sidebar(plain_engine());
             let driver = &mut h.driver;
 
-            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
-            // wrong: with the editor-band collapse #1426 fixed, this still
-            // fails). category: product —
-            // `quadraui::UiEvent::Accelerator(ACC_OPEN_TERMINAL, ..)`
-            // dispatched directly at `App` (bypassing the menu click path)
-            // does not open a terminal pane; a dispatch gap unrelated to
-            // geometry units. Target: TBD, needs its own filed issue.
-            known_bug_gate(
-                "app_on_tui::menu_terminal_activation_opens_terminal_pane_via_shell_app",
-                || {
-                    // Baseline count, not `!screen_has("Terminal")` — `App`
-                    // always paints a permanent "Terminal" top-level menu item
-                    // (`File Edit View Go Run Terminal Help`), so a bare
-                    // presence check is true before any terminal ever opens.
-                    // Same gotcha `crate::harness`'s own
-                    // `context_menu_open_terminal_opens_terminal_tab` doc
-                    // names for `gtk`.
-                    let before = driver.inventory().count("Terminal");
-                    driver.dispatch(quadraui::UiEvent::Accelerator(
-                        quadraui::AcceleratorId::new(crate::render::ACC_OPEN_TERMINAL),
-                        quadraui::Modifiers::default(),
-                    ));
-                    let after = driver.inventory().count("Terminal");
-                    assert!(
-                        after > before,
-                        "the open-terminal accelerator must open a terminal \
-                     pane, painting a new \"Terminal\" occurrence (before \
-                     {before}, after {after}); screen:\n{}",
-                        driver.screen()
-                    );
-                },
+            // Baseline count, not `!screen_has("Terminal")` — `App`
+            // always paints a permanent "Terminal" top-level menu item
+            // (`File Edit View Go Run Terminal Help`), so a bare
+            // presence check is true before any terminal ever opens.
+            // Same gotcha `crate::harness`'s own
+            // `context_menu_open_terminal_opens_terminal_tab` doc
+            // names for `gtk`.
+            let before = driver.inventory().count("Terminal");
+            driver.dispatch(quadraui::UiEvent::Accelerator(
+                quadraui::AcceleratorId::new(crate::render::ACC_OPEN_TERMINAL),
+                quadraui::Modifiers::default(),
+            ));
+            // Drains the `DeferredAction::ToggleTerminal` the accelerator
+            // arm queued — see this fn's own doc.
+            driver.tick();
+            let after = driver.inventory().count("Terminal");
+            assert!(
+                after > before,
+                "the open-terminal accelerator must open a terminal \
+                 pane, painting a new \"Terminal\" occurrence (before \
+                 {before}, after {after}); screen:\n{}",
+                driver.screen()
             );
         }
 
@@ -2489,24 +2527,17 @@ mod tests {
             let h = harness_no_sidebar(engine);
             let driver = &h.driver;
 
-            // Same root cause as `popups::dialog_intercepts_all_keys` (moved
-            // here from the pre-#1431 `popups` module — category: quadraui,
-            // `quadraui::native_dialog_options` reports this button-only,
-            // no-input `Dialog` as natively expressible with no
-            // `BackendCaps` gate, so `App::render_content` queues a native
-            // `PlatformServices::show_message_dialog` present instead of
-            // painting the in-canvas `Dialog` rung, on every backend — TUI
-            // has none. Target: quadraui.
-            known_bug_gate(
-                "app_on_tui::render_content_paints_dialog_via_shell_app",
-                || {
-                    assert!(
-                        driver.screen_has("ZQXW605DIALOG"),
-                        "modal dialog should paint via App::render_content; \
-                     screen:\n{}",
-                        driver.screen()
-                    );
-                },
+            // #1432 fixed the shared root cause (same as
+            // `popups::dialog_intercepts_all_keys`): `App::render_content`
+            // now filters `quadraui::native_dialog_options` on
+            // `backend.backend_caps().native_dialogs`, so TUI paints the
+            // in-canvas `Dialog` rung instead of dropping it for a native
+            // present it has no facility for. Ungated.
+            assert!(
+                driver.screen_has("ZQXW605DIALOG"),
+                "modal dialog should paint via App::render_content; \
+                 screen:\n{}",
+                driver.screen()
             );
         }
 
@@ -2524,28 +2555,26 @@ mod tests {
             let h = crate::tui_main::testing::conformance_harness(engine, 100, 30);
             let driver = &h.driver;
 
-            known_bug_gate(
-                "app_on_tui::check_nerd_fonts_dialog_paints_both_variants_via_shell_app",
-                || {
-                    assert!(
-                        driver.screen_contains(crate::icons::FILE_RUST.nerd),
-                        "the painted dialog must show the Nerd Font glyph \
-                         row; screen:\n{}",
-                        driver.screen()
-                    );
-                    assert!(
-                        driver.screen_contains(crate::icons::FILE_RUST.fallback),
-                        "the painted dialog must show the ASCII fallback \
-                         row; screen:\n{}",
-                        driver.screen()
-                    );
-                    assert!(
-                        driver.screen_contains("Check Nerd Fonts"),
-                        "the painted dialog must show its own title; \
-                         screen:\n{}",
-                        driver.screen()
-                    );
-                },
+            // #1432 fixed the shared root cause — see
+            // `dialogs::render_content_paints_dialog_via_shell_app`'s own
+            // comment. Ungated.
+            assert!(
+                driver.screen_contains(crate::icons::FILE_RUST.nerd),
+                "the painted dialog must show the Nerd Font glyph \
+                 row; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains(crate::icons::FILE_RUST.fallback),
+                "the painted dialog must show the ASCII fallback \
+                 row; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                driver.screen_contains("Check Nerd Fonts"),
+                "the painted dialog must show its own title; \
+                 screen:\n{}",
+                driver.screen()
             );
         }
     }
@@ -2637,36 +2666,22 @@ mod tests {
             let mut h = harness(engine_with_folder_ctx_menu("delete", 8));
             let driver = &mut h.driver;
 
-            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
-            // wrong: with the editor-band collapse #1426 fixed, this still
-            // fails). category: quadraui — same root cause as
-            // `popups::dialog_intercepts_all_keys`: the confirm dialog has
-            // no table/input, so `quadraui::native_dialog_options` reports
-            // it "natively expressible" with no backend-capability gate,
-            // and `App::render_content` queues a native present instead of
-            // painting the in-canvas `Dialog` rung. The engine-level
-            // dispatch itself is fine (this context menu's sibling tests
-            // `context_menu_escape_dismisses`/
-            // `context_menu_new_file_starts_inline_edit` read it ungated;
-            // `context_menu_new_file_starts_inline_edit`'s inline-edit
-            // result proves the dispatch half works) — only the paint is
-            // missing. Target: quadraui (see
-            // `popups::dialog_intercepts_all_keys`'s own doc).
-            known_bug_gate(
-                "app_on_tui::context_menu_delete_opens_confirm_dialog",
-                || {
-                    assert!(
-                        !driver.screen_has("Confirm Delete"),
-                        "precondition: no dialog is open yet"
-                    );
-                    driver.press_named(quadraui::NamedKey::Enter);
-                    assert!(
-                        driver.screen_has("Confirm Delete"),
-                        "confirming 'Delete' must open the delete-confirmation \
+            // #1432 fixed the shared root cause (re-diagnosed from #1425's
+            // "unit" guess, which was wrong) — same as
+            // `popups::dialog_intercepts_all_keys`: `App::render_content`
+            // now filters `quadraui::native_dialog_options` on
+            // `backend.backend_caps().native_dialogs`, so TUI paints the
+            // in-canvas `Dialog` rung. Ungated.
+            assert!(
+                !driver.screen_has("Confirm Delete"),
+                "precondition: no dialog is open yet"
+            );
+            driver.press_named(quadraui::NamedKey::Enter);
+            assert!(
+                driver.screen_has("Confirm Delete"),
+                "confirming 'Delete' must open the delete-confirmation \
                  dialog; screen:\n{}",
-                        driver.screen()
-                    );
-                },
+                driver.screen()
             );
         }
 
@@ -2977,6 +2992,21 @@ mod tests {
         /// the `Ctrl-W v` keychord (rather than the `open_editor_group` engine
         /// call every other divider test here uses) so this specifically
         /// exercises the key-dispatch route into the same split.
+        ///
+        /// #1432 re-diagnosed this: it was gated as a "product" dispatch gap
+        /// (`Ctrl-W v` not producing a second window through `App`), but the
+        /// gate's own assertion was checking for the wrong shape. `Ctrl-W v`
+        /// is `Engine::split_window` — a plain vim **window** split, which
+        /// shares its group's one tab bar (unlike the sibling tests above,
+        /// which call `open_editor_group` directly — a VSCode-style
+        /// **editor-group** split, which paints one tab bar *per group*).
+        /// Debug-dumping the painted screen showed the key chord dispatches
+        /// correctly on `App` — two window panes, each showing `"short"` and
+        /// its own status-bar segment, separated by a divider column — just
+        /// under a single tab bar, exactly as real vim semantics say it
+        /// should. Fixed to assert that shape (mirroring the divider-glyph
+        /// checks the sibling group-divider tests above use) instead of the
+        /// two-tab-bars shape only an editor-group split produces. Ungated.
         #[test]
         fn ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app() {
             let mut engine = plain_engine();
@@ -2984,42 +3014,48 @@ mod tests {
             let mut h = harness_no_sidebar(engine);
             let driver = &mut h.driver;
 
-            // #1426 gate (re-diagnosed from #1425's "unit" guess, which was
-            // wrong: with the editor-band collapse #1426 fixed, this still
-            // fails). category: product — the `Ctrl-W v` key chord's
-            // dispatch route into `Engine::open_editor_group`/window-split
-            // creation doesn't produce a second window on `App`, unlike the
-            // sibling divider tests above (which drive the split via a
-            // direct `engine.open_editor_group` call, not the key chord) —
-            // a dispatch gap unrelated to geometry units. Target: TBD,
-            // needs its own filed issue.
-            known_bug_gate(
-                "app_on_tui::ctrl_w_v_reserves_one_column_for_the_divider_via_shell_app",
-                || {
-                    driver.ctrl_char('w');
-                    driver.type_char('v');
-                    driver.mouse_up(1.0, 1.0);
+            driver.ctrl_char('w');
+            driver.type_char('v');
+            driver.mouse_up(1.0, 1.0); // settle the layout, see mirrored test's own doc
 
-                    let screen = driver.screen();
-                    // Whichever row the tab bar actually paints on (not
-                    // assumed to be row 0 — `App` reserves its own permanent
-                    // menu-bar row above it, see
-                    // `tab_bar::render_content_paints_single_group_tab_bar_via_shell_app`'s
-                    // own doc) — this scenario's claim is about the divider
-                    // column reservation, not the row offset.
-                    let tab_row = screen
-                        .lines()
-                        .find(|line| line.contains("[No Name]"))
-                        .unwrap_or("");
-                    let starts: Vec<usize> =
-                        tab_row.match_indices("[No Name]").map(|(i, _)| i).collect();
-                    assert_eq!(
-                        starts.len(),
-                        2,
-                        "'Ctrl-W v' must split into two panes, each with its \
-                     own tab bar; row:\n{tab_row}"
-                    );
-                },
+            let screen = driver.screen();
+            // Exactly one tab bar (a window split shares its group's tab
+            // bar) — proves this is a window split, not an editor-group
+            // split, before checking the divider shape below.
+            let tab_row = screen
+                .lines()
+                .find(|line| line.contains("[No Name]"))
+                .unwrap_or("");
+            let tab_starts: Vec<usize> =
+                tab_row.match_indices("[No Name]").map(|(i, _)| i).collect();
+            assert_eq!(
+                tab_starts.len(),
+                1,
+                "'Ctrl-W v' is a window split and must share its group's \
+                 single tab bar; row:\n{tab_row}"
+            );
+
+            // The content row: both window panes paint the buffer's own
+            // text, exactly once each, with exactly one divider column
+            // between them.
+            let content_row = screen
+                .lines()
+                .find(|line| line.match_indices("short").count() >= 2)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected a row with both window panes' content \
+                         painted; screen:\n{screen}"
+                    )
+                });
+            let first_end = content_row.find("short").unwrap() + "short".len();
+            let second_start = content_row[first_end..].find("short").unwrap() + first_end;
+            let between = &content_row[first_end..second_start];
+            assert_eq!(
+                between.matches('\u{2502}').count(),
+                1,
+                "'Ctrl-W v' must reserve exactly one column for the \
+                 divider between the two panes; between-text: {between:?}; \
+                 row:\n{content_row}"
             );
         }
     }

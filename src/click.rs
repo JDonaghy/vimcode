@@ -80,15 +80,37 @@ const CLOSE_HOVER_PAD: f64 = 2.0;
 /// `quadraui::Backend::tab_bar_layout` — down to the tight × glyph box the
 /// rasteriser actually draws (including its 2px hover halo). Leading
 /// `tab_inner_gap` and trailing `tab_pad + tab_outer_gap` are dead padding that
-/// should select the tab, not close it. Returns `None` if the padded zone is
-/// degenerate (too small to contain a glyph). (#515)
+/// should select the tab, not close it. Returns `None` only if the raw zone
+/// itself is degenerate (`start >= end` — no close button at all).
+///
+/// #1432: falls back to the **raw**, untrimmed zone rather than `None` when
+/// trimming would eat the whole zone. The `CLOSE_TAB_*`/`CLOSE_HOVER_PAD`
+/// constants below are calibrated to GTK's proportional-font tab padding
+/// (~25px of dead space around a tight glyph); a monospace/cell-based
+/// backend's `tab_bar_layout` reports a close zone that already *is* the
+/// tight glyph box (a couple of character cells, no extra padding to trim),
+/// so subtracting GTK's pixel padding from it always underflows past the
+/// zone's own start — before this fix, every such backend's close button
+/// silently had no hit zone at all (`tighten_close_bounds` returning `None`
+/// for every tab), and a click on the × resolved as a plain tab-select
+/// instead (`tab_bar_click_closes_via_shared_dispatch::tui`,
+/// `split_tab_bar_click_closes_via_shared_dispatch::tui`). This function has
+/// no way to ask "is this backend proportional or cell-based" directly (and
+/// per the Platform-Neutrality Rule it must not branch on backend identity
+/// to find out) — but it doesn't need to: trimming should never make a
+/// valid, already-tight zone into an invalid one, so falling back to the
+/// pre-trim zone whenever the trim itself is what produced the degeneracy is
+/// correct for every backend, not just this one.
 fn tighten_close_bounds(start: f64, end: f64) -> Option<(f64, f64)> {
+    if end <= start {
+        return None;
+    }
     let tight_start = start + CLOSE_TAB_INNER_GAP - CLOSE_HOVER_PAD;
     let tight_end = end - CLOSE_TAB_PAD - CLOSE_TAB_OUTER_GAP + CLOSE_HOVER_PAD;
     if tight_end > tight_start {
         Some((tight_start, tight_end))
     } else {
-        None
+        Some((start, end))
     }
 }
 
