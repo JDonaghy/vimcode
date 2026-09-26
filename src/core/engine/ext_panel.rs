@@ -3524,7 +3524,7 @@ impl Engine {
                 if self.acp_pending_attachment.take().is_some() {
                     self.message = "Attachment removed.".to_string();
                 } else if let Some(removed) = self.acp_manual_attachments.pop() {
-                    self.message = format!("Removed {}", removed.chip());
+                    self.message = format!("Removed {}.", removed.chip());
                 }
                 true
             }

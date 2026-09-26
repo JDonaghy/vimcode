@@ -14180,6 +14180,14 @@ mod command_line_selection {
 
         let mut engine = Engine::new_for_test();
         crate::app::setup_gtk_clipboard(&mut engine, backend.clone());
+        // #1464: the image twin of `clipboard_read`/`clipboard_write` above
+        // — must be installed unconditionally too, live clipboard or not,
+        // same contract as its text siblings just above.
+        assert!(
+            engine.clipboard_read_image.is_some(),
+            "setup_gtk_clipboard must always install clipboard_read_image, \
+             live clipboard or not"
+        );
 
         // Probe: does this sandbox have a live OS clipboard at all? Real
         // GTK/desktop machines do; a headless CI box with no display
