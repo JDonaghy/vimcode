@@ -479,3 +479,42 @@ pub(crate) fn v_scrollbar_hit_test(
 /// `register_font_from_memory` override — see that function's doc for how
 /// the in-memory registration now covers every backend, GTK included.
 pub(crate) static ICON_FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
+
+/// The app icon (Dock/app-switcher on macOS, big+small titlebar/taskbar icon
+/// on Win-GUI), rasterised at 512px from `render::APP_ICON_SVG` and embedded
+/// in the binary — quadraui#1142 / vimcode#1531.
+///
+/// A raster PNG rather than the SVG source: `ShellConfig::with_app_icon`
+/// decodes through each backend's *tray*-icon pipeline
+/// (`macos::tray::decode_ns_image` / `win::tray::decode_hicon`), not the
+/// general `Backend::draw_image` path `render::APP_ICON_SVG`'s other call
+/// site uses — `NSImage::initWithData` and WIC's default
+/// `IWICImagingFactory` both decode PNG/JPEG/BMP reliably but have no
+/// guaranteed SVG decoder, so a raster asset is the only format both
+/// backends' tray decoders are guaranteed to accept. quadraui's own
+/// `full_chrome_demo` example makes the same choice for its `with_app_icon`
+/// call, for the same reason.
+///
+/// Backend-neutral home, not `src/gtk/`: `crate::gtk::build_shell_config`
+/// does set it too (for consistency with `crate::macos`/`crate::win`), but
+/// `ShellConfig::app_icon` is a no-op on GTK/TUI per its own doc — this
+/// constant's *only* backend with real behaviour to prove is macOS/Win-GUI.
+/// The byte constant itself carries no GTK dependency and both `src/macos/`
+/// and `src/win/` need to reach it, so it lives beside `ICON_FONT_BYTES`
+/// rather than under a single backend's directory.
+///
+/// `cfg_attr`'d the same way `App::shell_config` is (see that method's own
+/// `#[cfg_attr]`): its only readers are `crate::gtk`/`crate::macos`/
+/// `crate::win`'s `build_shell_config` functions, so a TUI-only
+/// `--no-default-features` build — which compiles none of those three —
+/// would otherwise report this `dead_code`.
+#[cfg_attr(
+    not(any(
+        feature = "gui",
+        feature = "win",
+        all(feature = "macos", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
+pub(crate) static APP_ICON_PNG: &[u8] =
+    include_bytes!("../data/icons/io.github.jdonaghy.VimCode.png");

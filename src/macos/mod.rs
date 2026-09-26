@@ -114,10 +114,10 @@ impl TextMetricsBackend for quadraui::macos::MacBackend {
 /// Entry point for the native macOS GUI, mirroring `crate::gtk::run`.
 ///
 /// Panic hook + swap flush, choose the backend, construct the shared
-/// [`App`], derive its [`quadraui::ShellConfig`], hand both to the runner.
-/// Nothing else — no `gtk4::init` equivalent, because
-/// `quadraui::macos::run` does AppKit's own bootstrap (main-thread check,
-/// `NSApplication`, default font) itself.
+/// [`App`], derive its [`quadraui::ShellConfig`] via [`build_shell_config`],
+/// hand both to the runner. Nothing else — no `gtk4::init` equivalent,
+/// because `quadraui::macos::run` does AppKit's own bootstrap (main-thread
+/// check, `NSApplication`, default font) itself.
 pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The same panic hook `crate::gtk::run` installs: flush every dirty
     // buffer to its swap file, then write a crash log.
@@ -132,8 +132,62 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     );
 
     let app = App::new_portable(file_path, backend, crate::render::UnitProfile::px());
-    let config = app.shell_config();
+    let config = build_shell_config(&app);
     quadraui::macos::shell_runner::run_with_shell(app, config)
+}
+
+/// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine
+/// state — the macOS twin of `crate::gtk::build_shell_config`.
+///
+/// Adds only [`quadraui::ShellConfig::with_app_icon`] on top of
+/// `app.shell_config()`: #1531/quadraui#1142's Dock/Cmd-Tab icon. A bare
+/// unbundled binary has no `Info.plist` `CFBundleIconFile` to supply one, so
+/// it falls back to the generic executable glyph unless something sets one
+/// at runtime — this is that something. Split out (rather than inlined in
+/// [`run`]) so a headless test can assert the bytes reach `ShellConfig`
+/// without needing a live `NSApplication`.
+pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
+    app.shell_config()
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
+}
+
+/// #1531/quadraui#1142: same reasoning as `crate::gtk`'s
+/// `shell_config_identity_tests` — there is no headless Dock to render into
+/// and assert on (that's the SMOKE_TESTS item, run on real hardware), but a
+/// headless build *can* assert the bytes reach the `ShellConfig` the real
+/// `run` hands `run_with_shell`, and that they decode as a real image.
+/// `#[cfg(test)]` only, gated by the whole module's own
+/// `all(feature = "macos", target_os = "macos")` — this never runs off a
+/// Mach-O host, matching every other test in this file.
+#[cfg(test)]
+mod shell_config_identity_tests {
+    use super::{build_shell_config, App, TextMetricsBackend};
+    use crate::core::Engine;
+    use quadraui::macos::MacBackend;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            Rc::new(RefCell::new(Box::new(MacBackend::new())));
+        let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        assert!(
+            image::load_from_memory(&bytes).is_ok(),
+            "app icon bytes must decode as an image"
+        );
+    }
 }
 
 /// The `MacDriver` instantiation of [`crate::harness::ConformanceHarness`]
