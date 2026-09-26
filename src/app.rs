@@ -1259,6 +1259,50 @@ pub(crate) struct App {
     /// (see `render::apply_activity_panel_switch`'s `already_showing`
     /// arm). Mirrors `TuiShellApp::suppress_shell_panel_echo`.
     pub(crate) suppress_shell_panel_echo: bool,
+    /// #1428: cached copy of `quadraui::BackendCaps::kitty_keyboard`, read
+    /// once in `ShellApp::setup` (a live capability probe, not a
+    /// construction-time decision — see `TuiShellApp::keyboard_enhanced`'s
+    /// own doc, ported here verbatim) and threaded into every
+    /// `render::engine_key_from_ui` call this file makes. Defaults `false`
+    /// (every constructor's assembled default, same as `TuiShellApp::new`),
+    /// which resolves the disambiguation the same conservative way a
+    /// terminal without the kitty protocol needs — a hardcoded `true` here
+    /// used to feed `engine_key_from_ui` the wrong answer on any such
+    /// terminal (#826), the same class of bug TUI's own field exists to
+    /// avoid.
+    pub(crate) keyboard_enhanced: bool,
+    /// #1428: a one-shot startup notice queued in [`App::assemble`] and
+    /// drained by the first `tick()`/`handle_poll_tick` — mirrors
+    /// `TuiShellApp::pending_startup_msg` verbatim (see that field's own
+    /// doc for why the nudge exists and why it can only be computed once,
+    /// at construction, rather than every frame). `None` on every
+    /// GUI-backend `App` (`units.is_gui_backend` — GTK/macOS/Win-GUI all
+    /// bundle the icon font, so `nerd_fonts_undiscovered` is never true
+    /// for them); populated only for a `cell`-profile (TUI-via-`App`)
+    /// construction where `settings.use_nerd_fonts` was never explicitly
+    /// set and the backend-derived default resolved to ASCII fallback
+    /// icons.
+    pub(crate) pending_startup_msg: Option<String>,
+    /// #1428: `true` for a real, running application (`App::new`/
+    /// `App::new_portable`), `false` for every test/headless construction
+    /// (`App::new_headless_with_backend`, which every test seam —
+    /// `crate::gtk::testing`, the macOS driver-tier test, and the `tui`
+    /// harness arm — funnels through). Mirrors `TuiShellApp::live`'s own
+    /// doc: gates exactly one call, `tick_dispatch`'s
+    /// `backend.set_caret_shape` write, from running under a test harness.
+    /// `Backend::set_caret_shape`'s only real-writing override
+    /// (`TuiBackend`, quadraui#1015) writes straight to the real process
+    /// `std::io::stdout()` unconditionally — no test-mode guard of its
+    /// own — so calling it during a `conformance_harness`/`app_on_tui_
+    /// tests` driver's `tick()` would emit a raw DECSCUSR escape sequence
+    /// into the test process's real stdout on every tick, exactly the
+    /// corruption `TuiShellApp::live` exists to prevent. GTK/macOS/Win-GUI
+    /// never override the hook (a genuine no-op there), so this gate only
+    /// ever changes behaviour for a `TuiBackend`-backed `App` — today that
+    /// is test-only, since no live TUI-via-`App` entry point exists yet
+    /// (`tui_main::run` still runs `TuiShellApp`, not `App` — see
+    /// `GOALS.md`'s milestone #7).
+    pub(crate) live: bool,
 }
 
 /// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
@@ -1472,6 +1516,7 @@ impl App {
             last_colorscheme,
             backend,
             render::UnitProfile::px(),
+            true,
         )
     }
 
@@ -1599,6 +1644,7 @@ impl App {
             last_colorscheme,
             backend,
             units,
+            true,
         )
     }
 
@@ -1866,7 +1912,29 @@ impl App {
         last_colorscheme: String,
         backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
         units: render::UnitProfile,
+        live: bool,
     ) -> Self {
+        // #1428: computed before `engine` moves into the struct literal
+        // below — see `App::pending_startup_msg`'s own doc for why this
+        // has to be shared across every constructor rather than living
+        // only in `new_portable`.
+        let pending_startup_msg = if !units.is_gui_backend {
+            let e = engine.borrow();
+            let resolved_nerd_fonts = e.settings.use_nerd_fonts();
+            let nerd_fonts_undiscovered =
+                e.settings.use_nerd_fonts.is_none() && !resolved_nerd_fonts;
+            if nerd_fonts_undiscovered {
+                Some(
+                    "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
+                     :CheckNerdFonts to check and enable them."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
@@ -1953,6 +2021,9 @@ impl App {
             // whichever panel is already active, a harmless no-op switch.
             last_shell_panel: None,
             suppress_shell_panel_echo: false,
+            keyboard_enhanced: false,
+            pending_startup_msg,
+            live,
         }
     }
 
@@ -2046,6 +2117,7 @@ impl App {
             last_colorscheme,
             backend,
             units,
+            false,
         )
     }
 }
@@ -2555,7 +2627,12 @@ impl App {
     /// syncs it out at end of dispatch), and `ShellContext::shell_mut` is the
     /// only handle to it. `ui_event` (#815) is the raw event `key_name`/
     /// `unicode`/... were decoded from, needed by the folder-picker rung —
-    /// mirrors TUI's `KeyDispatchState::ui_event`.
+    /// mirrors TUI's `KeyDispatchState::ui_event`. `backend` (#1428) is
+    /// solely for the Ctrl+L rung's `backend.request_full_repaint()` call —
+    /// GTK's `DrawingArea` repaints in full every frame regardless (no
+    /// incremental diff to desync), so this is a no-op there; see
+    /// `render::is_force_redraw_key`'s own doc for why the hook still needs
+    /// calling from every backend rather than being TUI-only code.
     fn handle_key_press(
         &mut self,
         key_name: String,
@@ -2564,6 +2641,7 @@ impl App {
         shift: bool,
         alt: bool,
         ui_event: &quadraui::UiEvent,
+        backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) {
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
@@ -2615,6 +2693,18 @@ impl App {
             engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending
         };
         if render::is_force_redraw_key(&key_name, unicode, ctrl, insert_ctrl_x_pending) {
+            // #1428: was an ordinary redraw only — no rung called
+            // `Backend::request_full_repaint` on GTK at all. Harmless
+            // no-op there today (Cairo's `DrawingArea` repaints in full
+            // every frame, no incremental diff to desync — see
+            // `render::is_force_redraw_key`'s own doc), but load-bearing
+            // the moment `App` backs a real terminal (the `tui` harness
+            // arm today, a future live TUI-via-`App` entry point
+            // eventually): without this, Ctrl+L would only request an
+            // ordinary `Reaction::Redraw`, which a diffing backend's next
+            // paint could resolve as "nothing changed" for any cell
+            // written outside its own diff tracking.
+            backend.request_full_repaint();
             self.draw_needed.set(true);
             return;
         }
@@ -7815,7 +7905,18 @@ impl App {
                         // issue #1422 for the full audit of why every
                         // consumer already accepted this decoder's spelling
                         // directly.
-                        let n = render::engine_key_from_ui(&key, modifiers, true)
+                        // #1428: `self.keyboard_enhanced` (read once in
+                        // `setup()` from the live `BackendCaps::
+                        // kitty_keyboard`) rather than a hardcoded `true` —
+                        // wrong on a TUI-via-`App` construction running on a
+                        // terminal without the kitty protocol (#826);
+                        // unaffected on GTK/macOS/Win-GUI since that
+                        // capability is always `false` there anyway, which
+                        // is exactly what a literal `true` used to paper
+                        // over by disabling the terminal-only fallback arms
+                        // unconditionally rather than because a real
+                        // capability read said so.
+                        let n = render::engine_key_from_ui(&key, modifiers, self.keyboard_enhanced)
                             .map(|(name, _, _)| name)
                             .unwrap_or_default();
                         (n, None)
@@ -7829,6 +7930,7 @@ impl App {
                         modifiers.shift,
                         modifiers.alt,
                         &raw_event,
+                        backend,
                         ctx,
                     );
                 }
@@ -7846,6 +7948,7 @@ impl App {
                     false,
                     false,
                     &UiEvent::CharTyped(c),
+                    backend,
                     ctx,
                 );
             }
@@ -8099,6 +8202,28 @@ impl App {
                 self.line_height_cell.set(self.cached_line_height);
                 self.char_width_cell.set(self.cached_char_width);
                 self.handle_resize();
+                // #1428: forward the resize to any open terminal PTY —
+                // mirrors TUI's identical `WindowResized` rung
+                // (`route_terminal_resize`), a latent gap on GTK (and any
+                // future win-gui/macOS backend hosting a terminal panel)
+                // rather than TUI-only behaviour: nothing resized the PTY
+                // on a window resize before this, so a shell running
+                // inside the terminal panel kept painting at its stale
+                // column/row count (`$COLUMNS`/`$LINES`, and any full-
+                // screen program reading the real ioctl) after the window
+                // — and therefore the panel — changed size.
+                //
+                // `terminal_panel_cols` off `painted_editor_content_width`
+                // (not the just-updated `cached_char_width` against a live
+                // pixel width `WindowResized` doesn't carry) — the same
+                // "no live pixel width in scope" fallback every other
+                // accelerator/menu/tick call site of `terminal_panel_cols`
+                // already uses; the *next* `render_content` repaints the
+                // terminal panel at the corrected geometry regardless of
+                // which frame's width this resize computed against.
+                let cols = self.terminal_panel_cols(self.painted_editor_content_width());
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                render::route_terminal_resize(&mut self.engine.borrow_mut(), cols, rows);
             }
             UiEvent::WindowClose => {
                 self.show_quit_confirm();
@@ -8131,6 +8256,21 @@ impl App {
     /// doc comment (#813). `run_pending_native_dialog`, reachable from
     /// here via `apply_dialog_action`, can also request exit.
     fn tick_dispatch(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
+        // ── Terminal chrome the runner doesn't own (#1428) ──────────────
+        // Mirrors `TuiShellApp::tick`'s identical rung verbatim, including
+        // the `self.live` gate — see `Self::live`'s own doc for why an
+        // unconditional call would corrupt a `TuiBackend`-backed test
+        // harness's real stdout. A no-op on GTK/macOS/Win-GUI either way
+        // (`Backend::set_caret_shape`'s trait default), so gating this
+        // costs nothing there.
+        if self.live {
+            let engine = self.engine.borrow();
+            backend.set_caret_shape(render::caret_shape_for_mode(
+                &engine,
+                engine.sidebar_has_focus(),
+            ));
+        }
+
         // Keep cached metrics up to date.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;
@@ -8177,6 +8317,18 @@ impl App {
         // chore list `render::run_shared_tick_chores` shares with TUI.
         self.handle_poll_tick(backend);
 
+        // #1428: the one-shot nerd-font startup nudge — mirrors
+        // `TuiShellApp::tick`'s identical drain (`pending_startup_msg`),
+        // unconditional on `Self::live`, unlike the caret-shape write
+        // above: this only ever writes to `engine.message`, never touches
+        // the real terminal, so there is nothing here a test harness needs
+        // protecting from. Always `None` on a GUI-backend `App` (see
+        // `Self::pending_startup_msg`'s own doc), so this is a no-op there.
+        if let Some(msg) = self.pending_startup_msg.take() {
+            self.engine.borrow_mut().message = msg;
+            self.draw_needed.set(true);
+        }
+
         if self.draw_needed.get() {
             self.draw_needed.set(false);
             quadraui::Reaction::Redraw
@@ -8188,6 +8340,24 @@ impl App {
 
 impl quadraui::ShellApp for App {
     fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
+        // #1428: read the live kitty-keyboard-protocol capability once, at
+        // setup time — mirrors `TuiShellApp::setup`'s identical read
+        // (`self.keyboard_enhanced = backend.backend_caps().kitty_keyboard`)
+        // verbatim, except unconditional rather than gated behind TUI's own
+        // `self.live` (that gate exists solely because a *second*,
+        // TUI-only, direct crossterm round-trip used to live at this call
+        // site before #1109 — see `TuiShellApp::setup`'s own doc; reading
+        // `backend_caps()` itself is a plain field access on every backend,
+        // never I/O, so there is nothing here for a "don't do this under a
+        // test harness" gate to protect against). A GUI backend's
+        // `BackendCaps::kitty_keyboard` is always `false` (GDK/AppKit/Win32
+        // hand over an already-resolved keysym per physical key, never the
+        // terminal-only ambiguity this flag exists to disambiguate — see
+        // `render::engine_key_from_ui`'s own doc), so this is a no-op there;
+        // TUI's own capability is unaffected by living on the shared `App`
+        // instead of `TuiShellApp` — `backend.backend_caps()` reads the same
+        // `TuiBackend` state either way.
+        self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
         // Seed cached metrics from runner defaults.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;

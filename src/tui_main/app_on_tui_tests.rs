@@ -1618,4 +1618,341 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1428: terminal-shell behaviours keyed on `BackendCaps`
+    // ─────────────────────────────────────────────────────────────────────────
+    //
+    // Five behaviours the shipped TUI (`TuiShellApp`) had that `App` lacked —
+    // see issue #1428's own description for the full audit. Each is a
+    // capability read or a no-op on GUI backends, not a platform fork, so
+    // each got wired into the shared `App`/`render.rs` rather than staying
+    // TUI-only.
+    mod terminal_shell_behaviours {
+        use super::*;
+
+        // ── 1: `keyboard_enhanced` (kitty-keyboard protocol) ────────────
+
+        /// #1428 acceptance: `App::setup` must read `App::keyboard_enhanced`
+        /// from the *live* `Backend::backend_caps().kitty_keyboard` answer,
+        /// not a hardcoded `true` — wrong on a terminal without the kitty
+        /// protocol (#826) — and that value must be exactly what reaches
+        /// `render::engine_key_from_ui` at `App::handle_dispatch`'s named-key
+        /// decode call site.
+        ///
+        /// Deterministic in both directions via `TuiBackend::
+        /// set_kitty_keyboard` (a real test hook quadraui exposes for
+        /// exactly this — `TuiBackend::kitty_keyboard`'s own doc) rather
+        /// than depending on this runner's ambient `TERM`/`KITTY_WINDOW_ID`
+        /// environment. Not a `driver`/`TuiDriver::dispatch` round trip:
+        /// `App::handle_dispatch`'s `Key::Char` arm (unlike its `Key::Named`
+        /// arm — the one this issue's literal-`true` bug lived in) never
+        /// calls `engine_key_from_ui` at all, matching plain GTK/GDK
+        /// behaviour (GDK hands over an already-resolved keysym per
+        /// physical key, so there is no terminal-only ambiguity for that
+        /// arm to resolve — see `engine_key_from_ui`'s own doc) — a
+        /// pre-existing, out-of-scope-for-#1428 GTK/TUI-via-`App`
+        /// divergence this test does not paper over. Calling `setup()`
+        /// directly and asserting on `render::engine_key_from_ui`'s own
+        /// return value is what actually proves the acceptance claim
+        /// ("`engine_key_from_ui` receives `false`/`true`") without
+        /// depending on that unrelated gap.
+        ///
+        /// RED-verified: reverting `App::setup`'s
+        /// `self.keyboard_enhanced = backend.backend_caps().kitty_keyboard`
+        /// to a hardcoded `false` (or `App::handle_dispatch`'s
+        /// `self.keyboard_enhanced` back to a hardcoded `true`) makes the
+        /// `kitty_keyboard(true)` half of this test fail.
+        #[test]
+        fn setup_reads_keyboard_enhanced_from_live_backend_caps() {
+            let engine = std::rc::Rc::new(std::cell::RefCell::new(plain_engine()));
+            let backend_handle: std::rc::Rc<
+                std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>,
+            > = std::rc::Rc::new(std::cell::RefCell::new(Box::new(
+                quadraui::tui::TuiBackend::new(),
+            )));
+            let (mut app, _config) = crate::harness::build_app_and_config(
+                engine,
+                backend_handle,
+                crate::render::UnitProfile::cell(),
+            );
+
+            let ctrl_4 = quadraui::Key::Char('4');
+            let ctrl_mods = quadraui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            };
+
+            let mut backend = quadraui::tui::TuiBackend::new();
+            backend.set_kitty_keyboard(false);
+            quadraui::ShellApp::setup(&mut app, &mut backend);
+            assert!(
+                !app.keyboard_enhanced,
+                "setup() must read kitty_keyboard=false off the live backend"
+            );
+            assert_eq!(
+                crate::render::engine_key_from_ui(&ctrl_4, ctrl_mods, app.keyboard_enhanced),
+                Some(("backslash".to_string(), Some('4'), true)),
+                "without kitty-keyboard support, Ctrl+4 is genuinely \
+                 ambiguous with Ctrl+\\ and must resolve to \"backslash\""
+            );
+
+            backend.set_kitty_keyboard(true);
+            quadraui::ShellApp::setup(&mut app, &mut backend);
+            assert!(
+                app.keyboard_enhanced,
+                "setup() must read kitty_keyboard=true off the live backend"
+            );
+            assert_eq!(
+                crate::render::engine_key_from_ui(&ctrl_4, ctrl_mods, app.keyboard_enhanced),
+                Some(("4".to_string(), Some('4'), true)),
+                "with kitty-keyboard support, Ctrl+4 is unambiguous and must \
+                 resolve to literal \"4\""
+            );
+        }
+
+        // ── 2: caret shape per mode ──────────────────────────────────────
+
+        /// #1428 acceptance: the caret-shape decision `App::tick_dispatch`
+        /// now feeds `Backend::set_caret_shape` is the exact shared
+        /// `render::caret_shape_for_mode` TUI's own
+        /// `caret_shape_for_mode_tracks_engine_mode_and_pending_replace`
+        /// pins (moved there from `TuiShellApp::caret_shape_for_mode`) —
+        /// ported here against `App`'s own `Engine::sidebar_has_focus()`
+        /// wiring (TUI passes `TuiSidebar::has_focus` instead; see each
+        /// caller in `app.rs`/`shell_app.rs`).
+        ///
+        /// Pure-function coverage, not a driver test: the actual
+        /// `backend.set_caret_shape` write is gated behind `App::live` and,
+        /// on a real `TuiBackend`, writes straight to the real process
+        /// `std::io::stdout()` with no test-mode guard of its own (see
+        /// `App::live`'s doc) — the same "the decision is testable, the
+        /// write is a `SMOKE_TESTS` item" split TUI's own test documents.
+        #[test]
+        fn caret_shape_for_mode_tracks_engine_mode_and_sidebar_focus() {
+            let mut engine = plain_engine();
+            assert_eq!(
+                crate::render::caret_shape_for_mode(&engine, engine.sidebar_has_focus()),
+                quadraui::EditorCursorShape::Block,
+                "Normal mode, no sidebar focus, no pending replace -> Block"
+            );
+
+            engine.mode = crate::core::Mode::Insert;
+            assert_eq!(
+                crate::render::caret_shape_for_mode(&engine, engine.sidebar_has_focus()),
+                quadraui::EditorCursorShape::Bar,
+                "Insert mode -> Bar"
+            );
+
+            engine.mode = crate::core::Mode::Normal;
+            engine.pending_key = Some('r');
+            assert_eq!(
+                crate::render::caret_shape_for_mode(&engine, engine.sidebar_has_focus()),
+                quadraui::EditorCursorShape::Underline,
+                "pending replace-char ('r') -> Underline"
+            );
+
+            engine.pending_key = None;
+            engine.mode = crate::core::Mode::Insert;
+            engine.explorer_has_focus = true;
+            assert_eq!(
+                crate::render::caret_shape_for_mode(&engine, engine.sidebar_has_focus()),
+                quadraui::EditorCursorShape::Block,
+                "a focused sidebar panel overrides Insert-mode Bar -> Block"
+            );
+        }
+
+        // ── 3: Ctrl-L full repaint ────────────────────────────────────────
+
+        /// [`quadraui::tui::vt_testing::TuiVtDriver`]-wrapped `App`, the
+        /// vt100-backed observer needed to prove `Backend::
+        /// request_full_repaint` actually cleared a stale cell — mirrors
+        /// [`crate::tui_main::testing::conformance_harness`] exactly, using
+        /// `quadraui::tui::vt_testing::driver_with_shell` in place of
+        /// `quadraui::tui::testing::driver_with_shell` (quadraui#1060, at
+        /// this repo's pinned rev). See `render::is_force_redraw_key`'s own
+        /// doc for why a `TestBackend`-based `TuiDriver` cannot observe this
+        /// at all — `ratatui::Terminal::clear()` is output-identical to an
+        /// ordinary diffed redraw under a `TestBackend`.
+        fn vt_driver(
+            engine: crate::core::Engine,
+        ) -> quadraui::tui::vt_testing::TuiVtDriver<impl quadraui::AppLogic> {
+            let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
+            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(Box::new(
+                    quadraui::tui::TuiBackend::new(),
+                )));
+            let (app, config) = crate::harness::build_app_and_config(
+                engine,
+                backend,
+                crate::render::UnitProfile::cell(),
+            );
+            quadraui::tui::vt_testing::driver_with_shell(app, config, 80, 24)
+        }
+
+        /// The bottom-right cell — never painted by the status bar or any
+        /// popup at 80x24 on either backend (mirrors
+        /// `tui_main::shell_app`'s identical `STALE_CELL_ANSI_MOVE`
+        /// constant and its own doc for why that coordinate is safe).
+        const STALE_CELL_ANSI_MOVE: &[u8] = b"\x1b[24;80H";
+
+        /// #1428 acceptance: Ctrl+L (`render::is_force_redraw_key`'s call
+        /// site in `App::handle_key_press`) must call `Backend::
+        /// request_full_repaint` and force the next paint to wipe a cell an
+        /// incremental diff would otherwise skip — mirrors
+        /// `tui_main::shell_app`'s
+        /// `ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_vt_driver`
+        /// verbatim, against `App` instead of `TuiShellApp`.
+        ///
+        /// RED-verified: removing `App::handle_key_press`'s
+        /// `backend.request_full_repaint()` call makes the final assertion
+        /// fail (the injected glyph survives the Ctrl+L redraw).
+        #[test]
+        fn ctrl_l_repaints_a_stale_cell_an_incremental_diff_would_skip_via_shell_app() {
+            let mut driver = vt_driver(plain_engine());
+
+            driver.inject_raw(STALE_CELL_ANSI_MOVE);
+            driver.inject_raw(b"Z");
+            assert!(
+                driver.screen_contains("Z"),
+                "sanity: the injected stale glyph must be visible before \
+                 either render — screen:\n{}",
+                driver.screen()
+            );
+
+            // Plain redraw, nothing pending: `App` never paints that
+            // corner, so ratatui's diff still believes it's unchanged and
+            // sends nothing for it — the stale glyph survives. Proves this
+            // test can go RED.
+            driver.render();
+            assert!(
+                driver.screen_contains("Z"),
+                "a redraw with no full-repaint request pending must not \
+                 touch cells the diff cache believes are unchanged — \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            let reaction = driver.ctrl_char('l');
+            assert_eq!(
+                reaction,
+                quadraui::Reaction::Redraw,
+                "Ctrl+L must request a redraw"
+            );
+            assert!(
+                !driver.screen_contains("Z"),
+                "Ctrl+L must call Backend::request_full_repaint and force \
+                 the stale glyph to clear — screen:\n{}",
+                driver.screen()
+            );
+        }
+
+        // ── 4: terminal PTY resize on WindowResized ──────────────────────
+
+        /// #1428 acceptance: `App::handle_dispatch`'s `WindowResized` arm
+        /// must forward the resize to any open terminal PTY
+        /// (`render::route_terminal_resize`) — previously a no-op on GTK
+        /// (and, transitively, on this `App`-on-TUI arm), unlike TUI's own
+        /// `TuiShellApp::handle` (#758 / #734 slice 3).
+        ///
+        /// Two `WindowResized` dispatches, not one: `App::
+        /// painted_editor_content_width` (what `terminal_panel_cols` feeds
+        /// `route_terminal_resize`) is the *last-painted* editor bounds —
+        /// there is no live pixel width in scope in `handle_dispatch`
+        /// itself, the same "no live width" fallback every other
+        /// accelerator/menu/tick call site of `terminal_panel_cols` already
+        /// accepts (see that function's own doc). The first dispatch's
+        /// resize computation therefore still reads the *pre*-resize
+        /// painted width; its own `handle_resize()` call sets
+        /// `draw_needed`, and `TuiDriver::dispatch`'s `Reaction::Redraw`
+        /// handling repaints immediately afterward at the real new
+        /// (`driver.resize`-d) backend size, updating the cached bounds —
+        /// which the *second* dispatch's computation then picks up. This
+        /// mirrors how a real live resize settles over consecutive
+        /// `WindowResized` events rather than resolving instantly on the
+        /// first.
+        ///
+        /// RED-verified: removing the `render::route_terminal_resize` call
+        /// from `App::handle_dispatch`'s `WindowResized` arm makes the
+        /// final assertion fail (`cols()` never changes, no matter how many
+        /// resize events fire).
+        #[test]
+        fn window_resized_resizes_the_open_terminal_pty() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(74, 24);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = h.engine.borrow().terminal_panes[0].session.cols();
+
+            driver.resize(40, 24);
+            for _ in 0..2 {
+                driver.dispatch(quadraui::UiEvent::WindowResized {
+                    viewport: quadraui::Viewport::new(40.0, 24.0, 1.0),
+                });
+            }
+
+            let after = h.engine.borrow().terminal_panes[0].session.cols();
+            assert!(
+                after < before,
+                "narrowing the window must shrink the open terminal pane's \
+                 PTY column count (before={before}, after={after})"
+            );
+        }
+
+        // ── 5: nerd-font startup notice ──────────────────────────────────
+
+        /// #1428 acceptance: `App::tick_dispatch` must drain
+        /// `App::pending_startup_msg` into `engine.message` (and request a
+        /// redraw) exactly as `TuiShellApp::tick` does — previously
+        /// unread on `App`, so the one-shot nerd-font nudge never reached
+        /// the user at all on this arm.
+        ///
+        /// The *natural* trigger (`use_nerd_fonts` never explicitly set
+        /// *and* the backend-derived default resolves to ASCII fallback,
+        /// `App::assemble`'s doc) is platform-gated —
+        /// `core::settings::default_use_nerd_fonts` resolves `true` on
+        /// every non-Windows TUI, so it can never fire on this suite's
+        /// Linux/macOS runners regardless of this fix (confirmed by
+        /// `tui_main::shell_app`'s own
+        /// `check_nerd_fonts_disable_stops_painting_glyphs_next_frame_via_shell_app`,
+        /// whose fixture comment notes the same "unset resolves true off
+        /// Windows"). Seeding the field directly — the same "pin what the
+        /// ambient environment can't" pattern this module already uses for
+        /// `use_nerd_fonts` itself — isolates the half #1428 actually
+        /// changed: the *drain*, not the platform-gated resolution.
+        ///
+        /// RED-verified: removing `App::tick_dispatch`'s
+        /// `self.pending_startup_msg.take()` drain makes the final
+        /// assertion fail (the message never reaches `engine.message`, so
+        /// it never paints).
+        #[test]
+        fn tick_drains_the_pending_nerd_font_startup_message_via_shell_app() {
+            let engine = std::rc::Rc::new(std::cell::RefCell::new(plain_engine()));
+            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(Box::new(
+                    quadraui::tui::TuiBackend::new(),
+                )));
+            let (mut app, config) = crate::harness::build_app_and_config(
+                engine,
+                backend,
+                crate::render::UnitProfile::cell(),
+            );
+            app.pending_startup_msg = Some("ASCII fallback icons ZQXW1428".to_string());
+            let mut driver = quadraui::tui::testing::driver_with_shell(app, config, 80, 24);
+
+            let reaction = driver.tick();
+            assert_eq!(
+                reaction,
+                quadraui::Reaction::Redraw,
+                "draining the startup message must request a redraw"
+            );
+            assert!(
+                driver.screen_contains("ASCII fallback icons ZQXW1428"),
+                "the startup nudge must reach engine.message and paint on \
+                 the status/command line; screen:\n{}",
+                driver.screen()
+            );
+        }
+    }
 }

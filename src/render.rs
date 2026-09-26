@@ -6143,6 +6143,34 @@ pub fn run_pending_platform_action(
     }
 }
 
+/// Editor mode → hardware caret shape (#1109, moved here from
+/// `TuiShellApp::caret_shape_for_mode` by #1428 so `App` can share it):
+/// block for Normal/Visual, bar for Insert, underline for a pending
+/// replace-char (`r`) command — the same three-way mapping the old
+/// hand-rolled crossterm cursor-style write used, now feeding
+/// `Backend::set_caret_shape` (quadraui#1015) instead.
+///
+/// `sidebar_has_focus` is the caller's own "is a sidebar panel, not the
+/// editor, holding keyboard focus" answer — `TuiShellApp` passes
+/// `self.sidebar.has_focus`, `App` passes `engine.sidebar_has_focus()` (see
+/// each caller). Pure function, deliberately separate from either caller's
+/// `self.live`/no-op-by-default write gate right after it — see
+/// `Backend::set_caret_shape`'s own doc for why the write itself is
+/// unobservable from a `TestBackend`-driven test (a real terminal write,
+/// no test-mode guard of its own) while this *decision* is.
+pub fn caret_shape_for_mode(
+    engine: &Engine,
+    sidebar_has_focus: bool,
+) -> quadraui::EditorCursorShape {
+    if !sidebar_has_focus && engine.pending_key == Some('r') {
+        quadraui::EditorCursorShape::Underline
+    } else if !sidebar_has_focus && engine.mode == Mode::Insert {
+        quadraui::EditorCursorShape::Bar
+    } else {
+        quadraui::EditorCursorShape::Block
+    }
+}
+
 /// Run the tick-time background chore list both backends share (#1248) —
 /// see the rung's header comment above for the full list and why the
 /// backend-specific bits live behind `host` instead of here. Returns `true`
