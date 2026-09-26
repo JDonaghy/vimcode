@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod app_on_tui_tests;
 mod backend;
 mod events;
 mod mouse;
