@@ -78,6 +78,8 @@ impl Engine {
                     // #957 (ACP-6): session-scoped, same as the rest above.
                     self.acp_auth_methods.clear();
                     self.acp_authenticated = false;
+                    self.acp_prompt_capabilities =
+                        crate::core::acp::AcpPromptCapabilities::default();
                     // #955 (ACP-4): session-scoped, same as the rest above
                     // — see `Engine::ai_clear`'s matching reset.
                     self.acp_tool_calls.clear();
@@ -85,7 +87,18 @@ impl Engine {
                     self.ai_streaming = false;
                     redraw = true;
                 }
-                AcpEvent::Initialized { auth_methods, .. } => {
+                AcpEvent::Initialized {
+                    auth_methods,
+                    agent_capabilities,
+                    ..
+                } => {
+                    // #1449: capture `promptCapabilities` before anything
+                    // else touches this event — both the auth-choice and
+                    // straight-to-session branches below need it available
+                    // for the first `session/prompt` either way, and
+                    // `agent_capabilities` isn't read again after this.
+                    self.acp_prompt_capabilities =
+                        crate::core::acp::parse_prompt_capabilities(&agent_capabilities);
                     // Handshake step 2. #957 (ACP-6): if the agent offers
                     // any `authMethods` and this client hasn't resolved
                     // auth yet for this session (skipped, a `type: "agent"`
@@ -131,11 +144,16 @@ impl Engine {
                         self.acp_current_mode_id = current;
                     }
                     if let Some(text) = self.acp_pending_prompt.take() {
+                        // #1449: rebuilt fresh here (rather than carrying
+                        // pre-built blocks in `acp_pending_prompt` itself)
+                        // so the attachment reflects whatever's the active
+                        // buffer *now*, at the moment the handshake
+                        // actually completes — computed before the
+                        // `acp_client` borrow below, since both need
+                        // `&self`/`&mut self` on the same field.
+                        let content = self.acp_prompt_content_blocks(&text);
                         if let Some(client) = self.acp_client.as_mut() {
-                            client.prompt(
-                                &session_id,
-                                vec![serde_json::json!({"type": "text", "text": text})],
-                            );
+                            client.prompt(&session_id, content);
                         }
                     } else {
                         // No prompt was waiting on this handshake — nothing
@@ -470,6 +488,7 @@ impl Engine {
         self.acp_session_id = None;
         self.acp_auth_methods.clear();
         self.acp_authenticated = false;
+        self.acp_prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
     }
 
     // ── fs/read_text_file, fs/write_text_file (#954, ACP-3) ─────────────────
@@ -484,6 +503,91 @@ impl Engine {
     /// `additionalDirectories` later is a one-line change in one place.
     fn acp_workspace_roots(&self) -> Vec<std::path::PathBuf> {
         vec![self.acp_workspace_cwd()]
+    }
+
+    // ── prompt context: current buffer + `@`-mentions (#1449) ───────────────
+
+    /// The active buffer, resolved into an ACP `resource_link` content
+    /// block plus a short "what got attached" chip line for the
+    /// transcript (`⧉ <path relative to the workspace>`) — `None` when
+    /// `settings.ai_attach_current_buffer` is off, or the active buffer
+    /// has no path (an unnamed/scratch buffer has nothing on disk to
+    /// link), or the path can't be resolved inside the workspace roots
+    /// (same defensive check `fs/read_text_file`/`fs/write_text_file` use,
+    /// via [`crate::core::acp::resolve_path_within_roots`]).
+    ///
+    /// Shared by [`Self::ai_send_message_via_acp`] (the chip, so the
+    /// *displayed* message names what's attached) and
+    /// [`Self::acp_prompt_content_blocks`] (the actual wire content) so
+    /// the two can never disagree about what got attached.
+    pub(crate) fn acp_current_buffer_attachment(&self) -> Option<(serde_json::Value, String)> {
+        if !self.settings.ai_attach_current_buffer {
+            return None;
+        }
+        let path = self.active_buffer_state().file_path.clone()?;
+        let roots = self.acp_workspace_roots();
+        let resolved = crate::core::acp::resolve_path_within_roots(&path, &roots).ok()?;
+        let display = resolved
+            .strip_prefix(self.acp_workspace_cwd())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| resolved.display().to_string());
+        let name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| display.clone());
+        let block = serde_json::json!({
+            "type": "resource_link",
+            "uri": crate::core::lsp::path_to_uri(&resolved),
+            "name": name,
+        });
+        Some((block, format!("\u{29c9} {display}")))
+    }
+
+    /// Resolve one `@`-mention query (the raw text after `@`, as typed —
+    /// relative paths are joined onto the first workspace root, same
+    /// convention `fs/read_text_file` uses) into a `resource_link` content
+    /// block, or `None` if it doesn't resolve to a real path inside the
+    /// workspace. A mention of a file that doesn't exist, or that resolves
+    /// outside the workspace, is silently dropped from the wire content —
+    /// the literal `@path` text the user typed stays in the message either
+    /// way (see [`Self::acp_prompt_content_blocks`]).
+    fn acp_mention_resource_link(&self, mention: &str) -> Option<serde_json::Value> {
+        let roots = self.acp_workspace_roots();
+        let root = roots.first().cloned().unwrap_or_else(|| self.cwd.clone());
+        let candidate = root.join(mention);
+        let resolved = crate::core::acp::resolve_path_within_roots(&candidate, &roots).ok()?;
+        let name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| mention.to_string());
+        Some(serde_json::json!({
+            "type": "resource_link",
+            "uri": crate::core::lsp::path_to_uri(&resolved),
+            "name": name,
+        }))
+    }
+
+    /// Build the ACP `session/prompt` content-block array for `text`
+    /// (#1449): the typed text verbatim as a `{"type": "text"}` block —
+    /// including any literal `@path` mentions, untouched — plus a
+    /// `resource_link` for the active buffer
+    /// ([`Self::acp_current_buffer_attachment`]) and one more for every
+    /// `@`-mention in `text` that resolves to a real workspace path
+    /// ([`Self::acp_mention_resource_link`]). `resource_link` is baseline
+    /// ACP v1 — every agent must accept it, no `promptCapabilities` check
+    /// needed (unlike a future embedded-context/image block, which would
+    /// branch on `self.acp_prompt_capabilities`).
+    pub(crate) fn acp_prompt_content_blocks(&self, text: &str) -> Vec<serde_json::Value> {
+        let mut blocks = vec![serde_json::json!({"type": "text", "text": text})];
+        if let Some((block, _chip)) = self.acp_current_buffer_attachment() {
+            blocks.push(block);
+        }
+        for mention in crate::core::acp::parse_at_mentions(text) {
+            if let Some(block) = self.acp_mention_resource_link(&mention) {
+                blocks.push(block);
+            }
+        }
+        blocks
     }
 
     /// Answer a parked `fs/read_text_file` request. A malformed request
@@ -1240,6 +1344,276 @@ mod tests {
             "the two agent_message_chunk notifications must merge into one \
              streamed turn, not create a turn each"
         );
+    }
+
+    // ── #1449: attach the current buffer + `@`-mentions ──────────────────
+
+    /// Path the fixture's `ACP_FAKE_CAPTURE_PROMPT_TO` writes each captured
+    /// `session/prompt` request line to, one per test so parallel `cargo
+    /// test` runs never collide.
+    #[cfg(unix)]
+    fn capture_file_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "vimcode_test_acp1449_capture_{tag}_{}",
+            std::process::id()
+        ))
+    }
+
+    /// Read back the last captured `session/prompt` request line (the
+    /// fixture appends, so the *last* line is the most recent turn) and
+    /// return its `params.prompt` content-block array.
+    #[cfg(unix)]
+    fn captured_prompt_blocks(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let content = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("capture file {} should exist: {e}", path.display()));
+        let last_line = content
+            .lines()
+            .next_back()
+            .expect("capture file should have at least one captured line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(last_line).expect("captured line should be valid JSON");
+        parsed["params"]["prompt"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Acceptance: `ai_attach_current_buffer` on (the default) plus an
+    /// active buffer with a real path must add exactly one `resource_link`
+    /// content block naming that file, AND show a `⧉`-prefixed chip line
+    /// above the user's text in the displayed transcript — the actual wire
+    /// content and what the user sees must never disagree about what got
+    /// attached (see `Engine::acp_current_buffer_attachment`'s doc).
+    ///
+    /// RED verified: with `Engine::acp_current_buffer_attachment` stubbed
+    /// to always return `None`, this fails on both assertions (no
+    /// `resource_link` block on the wire, no `⧉` chip in the transcript).
+    #[cfg(unix)]
+    #[test]
+    fn ai_send_message_via_acp_attaches_current_buffer_as_resource_link() {
+        let capture = capture_file_path("attach_on");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        assert!(
+            engine.settings.ai_attach_current_buffer,
+            "attach-current-buffer must default to on"
+        );
+
+        let workspace = std::env::temp_dir();
+        engine.workspace_root = Some(workspace.clone());
+        let file_path = workspace.join(format!(
+            "vimcode_test_acp1449_buf_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "fn main() {}\n").expect("write test buffer file");
+        engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+        engine.ai_send_message("hello agent".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        let expected_uri =
+            crate::core::lsp::path_to_uri(&file_path.canonicalize().expect("file exists"));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == "resource_link" && b["uri"] == expected_uri),
+            "expected a resource_link for the attached buffer at {expected_uri}; \
+             captured blocks: {blocks:?}"
+        );
+        assert!(
+            engine.ai_messages[0].content.contains('\u{29c9}'),
+            "displayed user turn should show the attachment chip: {:?}",
+            engine.ai_messages[0]
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance: turning `ai_attach_current_buffer` off must send no
+    /// `resource_link` at all and show no chip, even with an active buffer
+    /// that has a real path.
+    #[cfg(unix)]
+    #[test]
+    fn ai_send_message_via_acp_skips_attachment_when_setting_is_off() {
+        let capture = capture_file_path("attach_off");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.ai_attach_current_buffer = false;
+
+        let workspace = std::env::temp_dir();
+        engine.workspace_root = Some(workspace.clone());
+        let file_path = workspace.join(format!(
+            "vimcode_test_acp1449_buf_off_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&file_path, "fn main() {}\n").expect("write test buffer file");
+        engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+        engine.ai_send_message("hello agent".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "resource_link"),
+            "setting off must send no resource_link at all: {blocks:?}"
+        );
+        assert!(
+            !engine.ai_messages[0].content.contains('\u{29c9}'),
+            "setting off must show no attachment chip: {:?}",
+            engine.ai_messages[0]
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance: an unnamed/scratch buffer (the default buffer every
+    /// fresh `Engine` starts with) has nothing on disk to link — no
+    /// `resource_link`, no chip — even with the setting on.
+    #[cfg(unix)]
+    #[test]
+    fn ai_send_message_via_acp_skips_attachment_for_scratch_buffer() {
+        let capture = capture_file_path("scratch");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        assert!(
+            engine.active_buffer_state().file_path.is_none(),
+            "a fresh engine's default buffer must be an unnamed scratch buffer"
+        );
+
+        engine.ai_send_message("hello agent".to_string());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "resource_link"),
+            "a scratch buffer has nothing to attach: {blocks:?}"
+        );
+        assert!(
+            !engine.ai_messages[0].content.contains('\u{29c9}'),
+            "a scratch buffer must show no attachment chip: {:?}",
+            engine.ai_messages[0]
+        );
+
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// Acceptance: a literal `@path` mention still present in the submitted
+    /// text resolves to its own `resource_link` block, and the text block
+    /// keeps the mention exactly as typed (nothing is stripped out of the
+    /// message the user actually sees on either end).
+    ///
+    /// RED verified: with `Engine::acp_prompt_content_blocks`'s mention
+    /// loop deleted, the wire content has only the text block and no
+    /// `resource_link` for the mentioned file.
+    #[cfg(unix)]
+    #[test]
+    fn ai_send_message_via_acp_mention_resolves_to_resource_link_and_keeps_literal_text() {
+        let capture = capture_file_path("mention");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        // Isolate the mention's own block from the current-buffer one.
+        engine.settings.ai_attach_current_buffer = false;
+
+        let workspace = std::env::temp_dir();
+        engine.workspace_root = Some(workspace.clone());
+        let mentioned = workspace.join(format!(
+            "vimcode_test_acp1449_mention_{}.rs",
+            std::process::id()
+        ));
+        std::fs::write(&mentioned, "// mentioned\n").expect("write mentioned file");
+        let mention_name = mentioned.file_name().unwrap().to_string_lossy().to_string();
+
+        let text = format!("please check @{mention_name} for bugs");
+        engine.ai_send_message(text.clone());
+        poll_acp_until(&mut engine, |e| !e.ai_streaming);
+        assert!(!engine.ai_streaming, "turn should complete within deadline");
+
+        let blocks = captured_prompt_blocks(&capture);
+        let expected_uri =
+            crate::core::lsp::path_to_uri(&mentioned.canonicalize().expect("file exists"));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == "resource_link" && b["uri"] == expected_uri),
+            "expected a resource_link for the mentioned file at {expected_uri}; \
+             captured blocks: {blocks:?}"
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == "text" && b["text"] == text),
+            "the literal @mention text must stay in the text block unchanged: {blocks:?}"
+        );
+
+        let _ = std::fs::remove_file(&mentioned);
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// #1449 acceptance: `@`-mention completions list open buffers before
+    /// workspace files sharing the same prefix, and both sources are
+    /// searched (not just one). No live ACP agent needed — this is pure
+    /// `Engine::ai_mention_completions` state, the same "no subprocess
+    /// needed" tier as the pure parsing tests in `core::acp`.
+    #[test]
+    fn ai_mention_completions_lists_open_buffer_before_workspace_only_file() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_acp1449_mention_ws_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace dir");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+
+        // An open buffer with a path under the workspace...
+        std::fs::write(workspace.join("open_buf.rs"), "").expect("write open buffer file");
+        engine.active_buffer_state_mut().file_path = Some(workspace.join("open_buf.rs"));
+        // ...plus a file on disk sharing the same prefix that is NOT open
+        // in any buffer.
+        std::fs::write(workspace.join("open_buf_extra.rs"), "").expect("write extra file");
+
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @open_buf");
+        let menu = engine
+            .ai_mention_completions()
+            .expect("typing @ with a matching prefix should show mention completions");
+        assert_eq!(
+            menu.candidates[0], "@open_buf.rs",
+            "the open buffer must be listed before the on-disk-only file \
+             sharing the same prefix: {:?}",
+            menu.candidates
+        );
+        assert!(
+            menu.candidates.contains(&"@open_buf_extra.rs".to_string()),
+            "the workspace-only file must still be offered: {:?}",
+            menu.candidates
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// Review regression (#952): a `RequestFailed` for `session/new` — a

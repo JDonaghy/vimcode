@@ -742,6 +742,86 @@ pub fn resolve_path_within_roots(
 }
 
 // ---------------------------------------------------------------------------
+// Prompt context — current buffer + `@`-mentions (#1449)
+// ---------------------------------------------------------------------------
+
+/// `@path` tokens in a `session/prompt` message's raw text (#1449) — every
+/// whitespace-delimited word that starts with `@` and has at least one
+/// character after it. The literal text is left untouched in the prompt's
+/// `text` content block (per the issue: "the literal `@path` stays in the
+/// text block") — this is only used to derive the *extra* `resource_link`
+/// blocks that ride alongside it, so an agent that ignores resource links
+/// entirely still sees exactly what the user typed.
+pub fn parse_at_mentions(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|tok| tok.strip_prefix('@'))
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
+        .collect()
+}
+
+/// The `@mention` token currently being typed at the end of the AI panel
+/// input, if any (#1449): the last whitespace-delimited word, when it
+/// starts with `@`. Returns the byte offset of the `@` itself (so a caller
+/// can splice the input in place to accept a completion) and the query
+/// text after it (possibly empty, right after typing a bare `@`).
+///
+/// Generalizes `ai_command_completions`' "only the word currently under
+/// construction" contract from "must be the *whole* input" (slash
+/// commands, which only ever open a message) to "must be the *trailing*
+/// word" (a mention can follow other typed text) — `ChatController`
+/// exposes `input_text()` but no cursor-position getter, so "trailing
+/// word" is the closest approximation reachable without a wider quadraui
+/// change; typing continues immediately after an accepted mention, which
+/// keeps the common case working.
+pub fn trailing_at_mention_query(input: &str) -> Option<(usize, &str)> {
+    let word_start = input
+        .rfind(|c: char| c.is_whitespace())
+        .map(|i| i + input[i..].chars().next().map(char::len_utf8).unwrap_or(1))
+        .unwrap_or(0);
+    let tail = &input[word_start..];
+    let query = tail.strip_prefix('@')?;
+    Some((word_start, query))
+}
+
+/// Which optional content-block kinds the agent's `initialize` response
+/// declared support for (`agentCapabilities.promptCapabilities`, #1449) —
+/// captured per-session so this issue's follow-up (selection/range
+/// context) can branch on `embedded_context`, and a future image/audio
+/// attachment can branch on the other two. `resource_link` itself (what
+/// this issue actually sends) needs none of these — it is baseline ACP v1,
+/// which every agent must accept regardless of `promptCapabilities`.
+///
+/// An agent that omits `promptCapabilities` entirely (every pre-#1449 test
+/// fixture, and any agent that predates the field) parses as all-`false`,
+/// never an error — the whole struct is optional per the ACP v1 schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpPromptCapabilities {
+    pub embedded_context: bool,
+    pub image: bool,
+    pub audio: bool,
+}
+
+/// Parse `agentCapabilities.promptCapabilities` out of the whole
+/// `agentCapabilities` object (`AcpEvent::Initialized`'s
+/// `agent_capabilities` field, i.e. already one level *into* the
+/// `initialize` result — see that field's construction in
+/// [`AcpClient::poll`]).
+pub fn parse_prompt_capabilities(agent_capabilities: &serde_json::Value) -> AcpPromptCapabilities {
+    let caps = agent_capabilities.get("promptCapabilities");
+    let bool_field = |name: &str| {
+        caps.and_then(|c| c.get(name))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    AcpPromptCapabilities {
+        embedded_context: bool_field("embeddedContext"),
+        image: bool_field("image"),
+        audio: bool_field("audio"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // authMethods — wire-shape parsing (#957, ACP-6)
 // ---------------------------------------------------------------------------
 
@@ -2639,6 +2719,49 @@ mod tests {
             "`..` must not be able to walk out of the only allowed root: {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- prompt context: `@`-mentions + promptCapabilities (#1449) ----
+
+    #[test]
+    fn parse_at_mentions_extracts_every_at_token_and_leaves_bare_words_alone() {
+        let mentions = parse_at_mentions("look at @src/core/acp.rs and also @README.md please");
+        assert_eq!(mentions, vec!["src/core/acp.rs", "README.md"]);
+        assert!(parse_at_mentions("no mentions here").is_empty());
+        // A bare "@" with nothing after it names nothing.
+        assert!(parse_at_mentions("dangling @ here").is_empty());
+    }
+
+    #[test]
+    fn trailing_at_mention_query_matches_only_the_word_under_construction() {
+        // Bare "@" at the very end: query is empty, not absent.
+        let (start, query) = trailing_at_mention_query("hello @").unwrap();
+        assert_eq!(start, 6);
+        assert_eq!(query, "");
+
+        // Mid-word typing: the query grows with the trailing word.
+        let (start, query) = trailing_at_mention_query("look at @src/co").unwrap();
+        assert_eq!(start, 8);
+        assert_eq!(query, "src/co");
+
+        // No trailing "@" word: nothing to complete.
+        assert!(trailing_at_mention_query("hello @foo bar").is_none());
+        assert!(trailing_at_mention_query("no mention").is_none());
+    }
+
+    #[test]
+    fn parse_prompt_capabilities_reads_declared_flags_and_defaults_absent_to_false() {
+        let caps = serde_json::json!({
+            "promptCapabilities": {"embeddedContext": true, "image": true, "audio": false}
+        });
+        let parsed = parse_prompt_capabilities(&caps);
+        assert!(parsed.embedded_context);
+        assert!(parsed.image);
+        assert!(!parsed.audio);
+
+        // Every pre-#1449 fixture/agent omits the field entirely.
+        let absent = parse_prompt_capabilities(&serde_json::Value::Null);
+        assert_eq!(absent, AcpPromptCapabilities::default());
     }
 
     // ---- Integration: fake NDJSON echo agent subprocess ----

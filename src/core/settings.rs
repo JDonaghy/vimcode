@@ -556,6 +556,18 @@ pub struct Settings {
     #[serde(default)]
     pub ai_completions: bool,
 
+    /// Attach the active buffer's path as a `resource_link` content block
+    /// on every ACP `session/prompt` (#1449) — a baseline ACP v1 content
+    /// kind every agent must accept, no `promptCapabilities` check needed.
+    /// Skipped for an unnamed/scratch buffer (nothing on disk to link) and
+    /// only relevant to the ACP transport (`ai_send_message_via_acp`); the
+    /// direct-provider `curl` transport has no content-block concept.
+    /// Default: true — the whole point of #1449 is that the agent already
+    /// knows the workspace and can read files itself (#954), it just
+    /// doesn't know *which* file the user is looking at without this.
+    #[serde(default = "default_true")]
+    pub ai_attach_current_buffer: bool,
+
     /// ACP (Agent Client Protocol) agent command line, e.g.
     /// `"claude-code-acp"` — parsed into argv via
     /// `crate::core::acp::parse_agent_command`. The agent is spawned with
@@ -1551,6 +1563,7 @@ impl Default for Settings {
             ai_model: String::new(),
             ai_base_url: String::new(),
             ai_completions: false,
+            ai_attach_current_buffer: default_true(),
             acp_agent_command: String::new(),
             acp_agents: Vec::new(),
             acp_active_agent: String::new(),
@@ -2567,6 +2580,7 @@ impl Settings {
             "splitbelow" | "sb" => self.splitbelow = enable,
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
+            "ai_attach_current_buffer" => self.ai_attach_current_buffer = enable,
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
@@ -3406,6 +3420,7 @@ impl Settings {
             "ai_model" => self.ai_model.clone(),
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
+            "ai_attach_current_buffer" => self.ai_attach_current_buffer.to_string(),
             "acp_agent_command" => self.acp_agent_command.clone(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
@@ -3543,6 +3558,7 @@ impl Settings {
             "ai_model" => self.ai_model = value.to_string(),
             "ai_base_url" => self.ai_base_url = value.to_string(),
             "ai_completions" => self.ai_completions = value == "true",
+            "ai_attach_current_buffer" => self.ai_attach_current_buffer = value == "true",
             "acp_agent_command" => self.acp_agent_command = value.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
@@ -4097,6 +4113,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "ai_completions",
         label: "Inline Completions",
         description: "Show AI ghost-text completions at the cursor in insert mode (Tab to accept, Alt+]/Alt+[ to cycle alternatives)",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "ai_attach_current_buffer",
+        label: "Attach Current Buffer",
+        description: "Attach the active buffer's path to every ACP prompt so the agent knows which file the user is looking at",
         category: "AI",
         setting_type: SettingType::Bool,
     },

@@ -6180,6 +6180,71 @@ second line here
         );
     }
 
+    /// #1449 acceptance, GTK's twin of `tui_main::shell_app::tests::
+    /// ai_panel_shows_attached_current_buffer_chip_via_shell_app`: with
+    /// `ai_attach_current_buffer` on (the default) and the active buffer
+    /// pointing at a real workspace file, sending a message shows a
+    /// `⧉`-prefixed chip naming that file in the transcript — the visible
+    /// half of "attach the current buffer" shared by both backends via
+    /// `render::populate_ai_chat_controller`/`Engine::
+    /// acp_current_buffer_attachment` (`core::engine::acp_ops::tests::
+    /// ai_send_message_via_acp_attaches_current_buffer_as_resource_link`
+    /// covers the wire-content half neither driver can inspect).
+    ///
+    /// RED verified: same stub as the TUI twin
+    /// (`Engine::acp_current_buffer_attachment` always `None`) makes this
+    /// fail — the screen never shows the chip glyph.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_shows_attached_current_buffer_chip_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+        let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.cwd = cwd.clone();
+            let buf = engine.active_buffer_id();
+            if let Some(state) = engine.buffer_manager.get_mut(buf) {
+                state.file_path = Some(cwd.join("src").join("main.rs"));
+            }
+
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &std::env::temp_dir(),
+                &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "what does this file do?".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("\u{29c9}") && h.driver.screen_contains("main.rs"),
+            "the attached-buffer chip naming main.rs must be visible in the transcript"
+        );
+    }
+
     /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_tool_call_status_transitions_via_shell_app`: a tool call's
     /// transcript summary shows `title` + `kind`, and its status glyph

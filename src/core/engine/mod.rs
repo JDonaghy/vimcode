@@ -3660,6 +3660,11 @@ pub struct Engine {
     /// Reset to 0 whenever `acp_available_commands` changes so a stale
     /// selection never points past a shrunk list's end.
     pub acp_command_completion_idx: usize,
+    /// Selected index into the `@`-mention completions currently matching
+    /// the AI panel's input (#1449, `Engine::ai_mention_completions`) —
+    /// same "clamped by the menu, not reset on every keystroke" contract
+    /// as `acp_command_completion_idx`.
+    pub acp_mention_completion_idx: usize,
     /// The agent's declared modes (`session/new`'s `modes.availableModes`,
     /// #956 ACP-5). The set itself only ever comes from the handshake —
     /// `current_mode_update` changes which one is current, not this list.
@@ -3690,6 +3695,14 @@ pub struct Engine {
     /// `acp_client`/`acp_auth_methods` (new client, new handshake, new
     /// choice) — never persisted across sessions.
     pub acp_authenticated: bool,
+    /// `agentCapabilities.promptCapabilities` from the current `acp_client`'s
+    /// `initialize` response (#1449) — which optional content-block kinds
+    /// besides plain text the agent accepts in `session/prompt`. Captured
+    /// here (not just read once and discarded) so this issue's own
+    /// `resource_link` attachment and its follow-up (selection/range
+    /// context) can both branch on it. Session-scoped: reset to the
+    /// all-`false` default alongside `acp_auth_methods`/`acp_client`.
+    pub acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities,
     /// Tool calls the agent has announced this session (#955, ACP-4),
     /// upserted by `toolCallId` — an addressable collection, not an
     /// append-only log, so a `tool_call_update`'s status transition or
@@ -4930,11 +4943,13 @@ impl Engine {
             acp_plan: Vec::new(),
             acp_available_commands: Vec::new(),
             acp_command_completion_idx: 0,
+            acp_mention_completion_idx: 0,
             acp_modes: Vec::new(),
             acp_current_mode_id: None,
             acp_usage: None,
             acp_auth_methods: Vec::new(),
             acp_authenticated: false,
+            acp_prompt_capabilities: crate::core::acp::AcpPromptCapabilities::default(),
             acp_tool_calls: Vec::new(),
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
