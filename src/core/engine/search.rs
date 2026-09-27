@@ -196,9 +196,12 @@ impl Engine {
     /// `'linebreak'`, which needs the actual characters to find a word
     /// boundary, not just a char count.
     fn wrap_line_text(&self, line: usize) -> String {
-        let mut chars: Vec<char> = self.buffer().content.line(line).chars().collect();
-        chars.pop();
-        chars.into_iter().collect()
+        // Strip only the EOL (the painter wraps the same EOL-stripped text,
+        // see `render.rs`'s `wrap_text_len`) — the buffer's final line has
+        // none, and blindly dropping the last char there would cut a real
+        // one off.
+        let text = self.buffer().content.line(line).to_string();
+        text.trim_end_matches(['\n', '\r']).to_string()
     }
 
     /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
@@ -221,7 +224,21 @@ impl Engine {
     /// has to be counted in *visual* rows instead, since a single wrapped
     /// buffer line can span more than one screen row.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
-        let viewport_cols = self.view().viewport_cols;
+        // Prefer the paint-time column count (exact — the width the painter
+        // actually wrapped each line at) over the resize handler's
+        // approximate `view.viewport_cols`, same as the horizontal branch of
+        // `ensure_cursor_visible` above. Counting visual rows at a width even
+        // one column off the painted one miscounts every line whose wrap
+        // point lands near the edge, drifting the scroll so the cursor's
+        // line can end up below the viewport (#1496).
+        let wid = self.active_window_id();
+        let viewport_cols = self
+            .paint_viewport_cols
+            .borrow()
+            .get(&wid)
+            .copied()
+            .filter(|&c| c > 0)
+            .unwrap_or(self.view().viewport_cols);
         // #185: use effective viewport (accounts for bottom chrome like
         // the quickfix panel that may have opened in the current tick).
         let viewport_lines = self.effective_viewport_lines();

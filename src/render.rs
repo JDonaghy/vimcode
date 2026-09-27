@@ -21126,7 +21126,14 @@ fn build_rendered_window(
         let is_md_preview = engine.md_preview_links.contains_key(&window.buffer_id);
         let wrap_on =
             (engine.settings.wrap || is_md_preview) && render_viewport_cols > 0 && !is_fold_header;
-        let line_char_len = line_str.chars().count();
+        // Wrap on the line's *content* only — without its trailing EOL.
+        // Counting the `\n` as a character made a line whose text exactly
+        // fills its last wrapped row spill the newline into an extra, blank
+        // continuation row that `ensure_cursor_visible_wrap` (which counts
+        // rows on the EOL-stripped text) never accounted for, so `G` could
+        // land the cursor below the viewport (#1496).
+        let wrap_text_len = line_str.trim_end_matches(['\n', '\r']).len();
+        let line_char_len = line_str[..wrap_text_len].chars().count();
         // 'list' (#1190): applied only to the copy handed to the renderer
         // below (`raw_text`/`spans`) — `line_str` above (already consumed
         // by the diagnostics/spell-check UTF-16 offset math) and the word-
@@ -21138,8 +21145,11 @@ fn build_rendered_window(
             // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
             // Build segment boundaries using word-aware splitting.
-            let segment_boundaries =
-                compute_word_wrap_segments(&line_str, vp, engine.settings.linebreak);
+            let segment_boundaries = compute_word_wrap_segments(
+                &line_str[..wrap_text_len],
+                vp,
+                engine.settings.linebreak,
+            );
             let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
                 // Find which segment contains the cursor column.

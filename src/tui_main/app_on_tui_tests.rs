@@ -3992,6 +3992,78 @@ mod tests {
     mod word_wrap {
         use super::*;
 
+        /// The column count the painter wrapped the active window at on the
+        /// last render — `render.rs`'s `render_viewport_cols`, recorded into
+        /// `Engine::paint_viewport_cols`. Fixture measurement only; the
+        /// tests' assertions are on the rendered screen.
+        fn painted_wrap_cols(
+            h: &crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+        ) -> usize {
+            let engine = h.engine.borrow();
+            let wid = engine.active_window_id();
+            let vp = engine
+                .paint_viewport_cols
+                .borrow()
+                .get(&wid)
+                .copied()
+                .unwrap_or(0);
+            assert!(vp > 4, "fixture sanity: implausible painted width {vp}");
+            vp
+        }
+
+        /// A line whose text exactly fills its last wrapped row must not
+        /// paint an extra blank continuation row after it. The painter used
+        /// to wrap the line *including* its trailing `\n`, so the newline
+        /// spilled into a row of its own — a row `ensure_cursor_visible_wrap`
+        /// (which counts rows on the EOL-stripped text) never accounted
+        /// for, drifting `G` off the bottom of the viewport (#1496).
+        ///
+        /// RED verified: reverting `render.rs`'s `wrap_text_len` trim makes
+        /// the next line paint two rows below the wrapped one, not one.
+        #[test]
+        fn exactly_full_wrapped_line_paints_no_trailing_blank_row() {
+            let _settings_guard = crate::core::settings::TestSettingsPathGuard::install(
+                std::env::temp_dir().join(format!(
+                    "vimcode_test_1496_no_settings_{:?}.json",
+                    std::thread::current().id()
+                )),
+            );
+            let mut engine = plain_engine();
+            engine.settings.minimap = false;
+            engine.settings.wrap = true;
+            engine.buffer_mut().insert(0, "x\nZQXW_NEXT_LINE\n");
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+            h.driver.tick();
+            let vp = painted_wrap_cols(&h);
+
+            // Exactly two full rows of 'b', then the marker line.
+            let text = format!("{}\nZQXW_NEXT_LINE\n", "b".repeat(2 * vp));
+            let cur_len = h.engine.borrow().buffer().len_chars();
+            h.engine.borrow_mut().buffer_mut().delete_range(0, cur_len);
+            h.engine.borrow_mut().buffer_mut().insert(0, &text);
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            let rows: Vec<&str> = screen.lines().collect();
+            let last_b_row = rows
+                .iter()
+                .rposition(|r| r.contains("bbbb"))
+                .expect("wrapped line must paint");
+            let marker_row = rows
+                .iter()
+                .position(|r| r.contains("ZQXW_NEXT_LINE"))
+                .expect("next line must paint");
+            assert_eq!(
+                marker_row,
+                last_b_row + 1,
+                "the line after an exactly-full wrapped line must paint on \
+                 the very next row (no blank EOL row); screen:\n{screen}"
+            );
+        }
+
         /// `ensure_cursor_visible_wrap`'s per-line visual-row count used to
         /// be a plain length-based `div_ceil`, blind to `'linebreak'` — see
         /// `core::engine::mod::engine_visual_rows_for_line`'s own doc. With
@@ -4013,14 +4085,11 @@ mod tests {
         /// lines so the total drift is large enough to push the marker
         /// line off *any* plausible viewport height.
         ///
-        /// `vp` here is not `view.viewport_cols` (set at resize time from
-        /// an approximate formula, per `render.rs`'s own comment on
-        /// `render_viewport_cols`) but the column count *empirically*
-        /// measured from a real render of a long unbroken run of the same
-        /// filler char — i.e. exactly what `render_viewport_cols` resolves
-        /// to for this fixture, including whatever this terminal size's
-        /// chrome (activity-bar rail, scrollbar column, gutter) reserves,
-        /// without this test needing to duplicate that arithmetic.
+        /// `vp` here is the width the painter actually wrapped at (see
+        /// [`painted_wrap_cols`]), not a count of visible filler chars on
+        /// screen: the scrollbar overdraws the text area's last column, so
+        /// a screen scan reads one short and the fixture lines end up not
+        /// wrapping the way this doc describes.
         ///
         /// RED verified against unfixed `develop`: reverting
         /// `engine_visual_rows_for_line` to its pre-#1496 `div_ceil`
@@ -4032,6 +4101,20 @@ mod tests {
             const DRIFT_LINES: usize = 30;
             const PROBE_LEN: usize = 500;
 
+            // `tick()` below polls the on-disk settings file and reloads it
+            // if it looks newer — without this guard that's the developer's
+            // real `~/.config/vimcode/settings.json`, which can silently
+            // flip 'wrap'/'linebreak' back off and make this test pass
+            // without exercising anything (it did, on a machine with a
+            // user settings file, while failing on CI's empty `$HOME`).
+            // Point it at a path that doesn't exist instead.
+            let _settings_guard = crate::core::settings::TestSettingsPathGuard::install(
+                std::env::temp_dir().join(format!(
+                    "vimcode_test_1496_no_settings_{:?}.json",
+                    std::thread::current().id()
+                )),
+            );
+
             let mut engine = plain_engine();
             // Minimap off, and 'wrap'+'linebreak' on for the probe render
             // too (a horizontal-scrollbar column reserved only when 'wrap'
@@ -4042,14 +4125,11 @@ mod tests {
             engine.settings.minimap = false;
             engine.settings.wrap = true;
             engine.settings.linebreak = true;
-            // One long unbroken probe line (to measure the real wrap
-            // width), then enough short placeholder lines that the total
-            // line count already matches the real fixture below — keeps
-            // the gutter's digit width identical between the probe and the
-            // real render.
-            let mut probe_text = "a".repeat(PROBE_LEN);
-            probe_text.push('\n');
-            for _ in 0..DRIFT_LINES {
+            // Short placeholder lines so the total line count already
+            // matches the real fixture below — keeps the gutter's digit
+            // width identical between the probe render and the real one.
+            let mut probe_text = String::new();
+            for _ in 0..=DRIFT_LINES {
                 probe_text.push_str("x\n");
             }
             let initial_len = engine.buffer().len_chars();
@@ -4058,30 +4138,8 @@ mod tests {
 
             let mut h = harness_no_sidebar(engine);
             h.driver.render();
-            let screen = h.driver.screen();
-            // `ensure_cursor_visible_wrap` reads `view.viewport_cols`
-            // rather than the paint-exact `paint_viewport_cols` (a
-            // pre-existing, separate gap from what #1496 fixes) — that
-            // field only gets synced to the real painted width by
-            // `run_shared_tick_chores`, which runs on `tick()`, not
-            // `render()`. Tick now (and again below, after the real
-            // fixture's own first render) so the scroll math below sees
-            // the same width this measurement is based on.
             h.driver.tick();
-            let vp = screen
-                .split(|c: char| c != 'a')
-                .map(str::len)
-                .max()
-                .unwrap_or(0);
-            assert!(
-                vp > 4 && vp < PROBE_LEN,
-                "fixture sanity: expected a plausible measured viewport \
-                 width strictly between 4 and {PROBE_LEN} (the probe \
-                 line's own length, which the run must never equal — that \
-                 would mean the probe line never actually wrapped); got \
-                 {vp}. screen:\n{screen}"
-            );
-
+            let vp = painted_wrap_cols(&h);
             // `vp - 2` filler + one space + `vp + 1` filler = exactly
             // `2 * vp` chars total (see this fn's own doc above).
             let drift_line = format!("{}{}{}", "a".repeat(vp - 2), " ", "a".repeat(vp + 1));
