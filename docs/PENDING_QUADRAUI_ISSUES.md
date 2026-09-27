@@ -32,6 +32,201 @@ zero cost instead.
 
 ---
 
+## Win-GUI activity bar hardcodes the ASCII fallback glyph, ignoring the `nerd_fonts_enabled` flag `draw_tree` already reads (blocks vimcode#1558)
+
+**Title:** `win::activity_bar::draw_activity_bar` always paints `Icon::fallback`,
+never `Icon::glyph` — `WinBackend::nerd_fonts_enabled` exists and is wired into
+`draw_tree` (#804) but never reaches this rasteriser
+
+**Body:**
+
+vimcode#1558 reports that on Windows, with **Nerd Font Icons on**, the
+activity bar shows placeholder characters (`⊞ / ! Y # > ▦ *`) instead of real
+glyphs, while the macOS build of the identical commit shows the correct
+icons. Root-caused by inspection (no Windows host in this fleet to run it on,
+but the reported placeholder characters are an exact, unambiguous match —
+see below):
+
+`quadraui/src/win/activity_bar.rs` (pinned rev `a58e5bec`), the paint loop for
+each activity-bar row:
+
+```rust
+// Uses the ASCII `fallback` — this rasteriser doesn't take a
+// per-frame `nerd_fonts_enabled` toggle yet (issue #683 scoped
+// TUI/GTK/macOS only; Win-GUI has no Nerd Font wiring at all,
+// matching `macos::tree`/`macos::form`'s same fallback-only
+// posture until #25's icon-font plumbing lands here too).
+let icon_str = item.icon.fallback.as_str();
+```
+
+That comment is **stale** — it predates #804/#929, which already gave
+`WinBackend` real Nerd-Font wiring: `WinBackend::nerd_fonts_enabled: bool`
+(`win/backend.rs`, set via `Backend::set_nerd_fonts`) is read by
+`draw_tree`'s call site (`win/backend.rs::draw_tree`, `fn draw_tree`),
+which passes `self.nerd_fonts_enabled` straight through to
+`super::tree::draw_tree(..., self.nerd_fonts_enabled)`. `draw_activity_bar`'s
+call site (same file, `fn draw_activity_bar`) never reads
+`self.nerd_fonts_enabled` at all, and `super::activity_bar::draw_activity_bar`'s
+signature has no parameter for it — `item.icon.fallback` is the only branch
+that exists.
+
+vimcode's `src/icons.rs` fallback strings for the exact activity-bar items
+line up character-for-character with the bug report:
+
+```
+EXPLORER   fallback = "\u{229e}"  ⊞
+DEBUG      fallback = "!"
+GIT_BRANCH fallback = "Y"
+EXTENSIONS fallback = "#"
+AI_CHAT    fallback = ">"
+BOARD      fallback = "\u{25a6}"  ▦
+SETTINGS   fallback = "*"
+```
+
+— `⊞ / ! Y # > ▦ *`, in order, is exactly the reported symptom. This is not a
+DirectWrite font-fallback/rendering issue at all for the activity bar
+specifically (contrast the tab-bar entry below, which is): the rasteriser is
+unconditionally painting the ASCII fallback string, the same string a
+`nerd_fonts_enabled == false` GTK/macOS/TUI build would paint. The already-
+shipped `macos::activity_bar` rasteriser is the reference fix shape: it takes
+`nerd_fonts_enabled: bool` as an explicit parameter and branches
+`item.icon.glyph.as_str()` vs `item.icon.fallback.as_str()` on it
+(`quadraui/src/macos/activity_bar.rs`, "`nerd_fonts_enabled` picks which half
+of each item's `crate::Icon` paints" doc comment).
+
+**Ask:** thread `nerd_fonts_enabled: bool` into
+`win::activity_bar::draw_activity_bar`'s signature (mirroring
+`macos::activity_bar`'s existing parameter) and branch the icon string on it,
+the same one-line change `win/backend.rs::draw_tree` already makes for
+`super::tree::draw_tree` — `win/backend.rs::draw_activity_bar` just needs to
+pass `self.nerd_fonts_enabled` through at its call site. Update the stale
+"#25's icon-font plumbing" comment to note #804/#929 already shipped the
+wiring this rasteriser alone never adopted.
+
+**Test:** #1558's acceptance criterion #2 ("a Windows test asserts that an
+activity-bar icon glyph resolves to a real font face, not a fallback or
+tofu") needs new quadraui-side test infrastructure, not just the fix above —
+`crate::testing::TextRun` (`quadraui/src/testing/mod.rs`) currently records
+only `{ text: String, bounds: Rect }` per painted run, with no font-face
+identity captured, so no existing `WinDriver`/`ConformanceHarness` assertion
+can currently distinguish "painted the real Nerd Font glyph" from "painted a
+`.fallback` string" or "painted tofu" — all three currently produce some
+non-empty `text_runs` entry. At minimum, resolving this issue's own
+acceptance bar needs `TextRun` (or a Win-GUI-specific extension of it) to
+also record which `IDWriteFontFace`/family a run's glyphs actually resolved
+against — e.g. via `IDWriteTextLayout::GetGlyphRunAnalysis` or per-run
+`IDWriteFontFace::GetGdiCompatibleGlyphIndices` coverage checks. Absent
+that, the best a driver test can assert today is that
+`nerd_fonts_enabled(true)` + the fixed rasteriser paints `item.icon.glyph`'s
+*text* (not `.fallback`'s) into a `TextRun` — real, but weaker than "resolved
+to a real font face" per the issue's own wording.
+
+**Blocks:** `JDonaghy/vimcode#1558` (activity-bar half). Leave that issue
+open behind this one per `GOALS.md`'s milestone-discipline rule — there is no
+per-backend vimcode-side fix available (`src/win/mod.rs`/`src/win/backend.rs`
+are thin wrappers with no rasterising decisions per the Platform-Neutrality
+Rule; `App::setup` already calls `render::register_nerd_font_fallback`
+identically for every backend, so the vimcode side of this is already
+correct and unchanged).
+
+---
+
+## Win-GUI tab-bar/editor Nerd-Font glyphs may lose to DirectWrite's own system fallback due to `AddMappings`/`AddMapping` call order (suspected, needs Windows verification; blocks vimcode#1558)
+
+**Title:** `win::text::build_nerd_font_fallback` calls
+`builder.AddMappings(&system_fallback)` **before** its own `AddMapping` for
+the registered Nerd Font — if `IDWriteFontFallbackBuilder` mapping priority
+is first-added-wins (as MS documentation describes for overlapping ranges),
+the app's Nerd-Font mapping can never be reached for any codepoint Windows'
+own system fallback table already claims, which very plausibly includes the
+Private-Use-Area block Nerd Font glyphs live in
+
+**Body:**
+
+vimcode#1558 also reports Win-GUI tab-bar file icons rendering as "only a
+plain document glyph" (not a placeholder character, unlike the activity-bar
+half above — see that entry, which is a fully-confirmed, different root
+cause). Unlike the activity bar, the tab-bar paint path is *not* the
+"unconditionally uses fallback" bug: `render::build_tab_bar_icons`
+(vimcode `src/render.rs`) already only constructs `TabIcon` entries when
+`icons::nerd_fonts_enabled()` is true, and `icons::file_icon_for_name` /
+`icons::Icon::s()` already resolve to the real Nerd-Font PUA codepoint
+(`.nerd`, not `.fallback`) in that case — confirmed by reading both
+functions; this part of the pipeline is platform-neutral and identical to
+GTK/macOS/TUI, which all render tab icons correctly per the issue. So
+`quadraui::TabIcon::glyph` genuinely carries the right string by the time it
+reaches `win::backend::draw_tab_bar_icons`, which paints it via `self.dwrite`
+— the same `DWrite` instance `#929` wires up with the registered Nerd Font's
+`IDWriteFontFallback` via `apply_fallback_to_format`/`SetFontFallback`.
+
+The suspected gap is inside `build_nerd_font_fallback`
+(`quadraui/src/win/text.rs`, pinned rev `a58e5bec`):
+
+```rust
+let system_fallback = unsafe { factory.GetSystemFontFallback()? };
+let builder = unsafe { factory.CreateFontFallbackBuilder()? };
+unsafe { builder.AddMappings(&system_fallback)? };   // added FIRST
+
+let ranges = [DWRITE_UNICODE_RANGE { first: 0x0, last: 0x0010_FFFF }];
+// ... AddMapping(&ranges, &[family], ...) added SECOND, for the whole
+// Unicode range, resolving against the app's registered Nerd Font.
+```
+
+The function's own doc comment states the intent explicitly: "`family` is
+only ever *consulted* for a character none of the higher-priority system
+mappings already resolved" — i.e. system fallback is meant to win first, our
+mapping is the last resort. That is backwards for a Private-Use-Area icon
+font: PUA codepoints have no "correct" system glyph to defer to, and if
+Windows' own system fallback table has *any* entry that claims to cover that
+range (a generic symbol/dingbat font, `Segoe UI Symbol`, a CJK/emoji fallback
+font with broad coverage, or the "Last Resort" font DirectWrite consults for
+otherwise-unmapped codepoints), that entry — not the app's registered Nerd
+Font — is what a first-added-wins fallback builder would resolve to. The
+activity-bar placeholder characters in this same bug report are proven (see
+sibling entry above) to be the plain ASCII `.fallback` string, not tofu or a
+substituted glyph — but the tab-bar symptom ("a plain document glyph",
+implying *something* renders, consistently, for every file regardless of
+extension) is consistent with DirectWrite finding one single system-fallback
+font that happens to have a "generic document" glyph mapped somewhere in the
+PUA range and using it for every Nerd Font codepoint in that font, rather
+than ever reaching the app's own registered font.
+
+**This is a hypothesis, not a confirmed root cause** — this fleet has no
+Windows host to run it on, and `IDWriteFontFallbackBuilder`'s actual
+first-vs-last priority for overlapping `AddMapping`/`AddMappings` ranges
+should be verified against Microsoft's documentation (or empirically) before
+committing to a fix. If confirmed, the fix is likely as simple as swapping
+the order — call `builder.AddMapping(...)` for the app's font first, then
+`builder.AddMappings(&system_fallback)` last, so the app's Nerd Font is
+consulted before Windows' own broad-coverage system fallback rather than
+after it — mirroring the *intended* cascade shape GTK's
+`crate::gtk::with_nerd_font_fallback` doc already describes ("later family in
+the list, consulted only for uncovered characters" — for Pango's cascade,
+the *primary UI/editor font* is first and genuinely lacks PUA coverage, so
+falling through to the Nerd Font next in line works; DirectWrite's
+`IDWriteFontFallback` object is a *separate* structure from the primary
+format's own font, consulted only when the primary font's glyph lookup
+already failed — so within *that* structure, the app's font needs to be
+tried before Windows' generic system fallback, not after).
+
+**Ask:** on real Windows hardware, verify whether swapping the
+`AddMapping`/`AddMappings` call order in `build_nerd_font_fallback` makes
+tab-bar (and editor-body, if any Nerd-Font-glyph content appears there) icons
+resolve to the registered Symbols Nerd Font subset instead of a system
+substitute. If confirmed, land the reordering; if the true cause is
+something else in this pipeline (`register_font_from_memory`'s private
+collection, `attach_surface`/`attach_headless` call ordering relative to
+`App::setup`, or a device-lost surface rebuild dropping the fallback), file
+a follow-up with the real cause once it's found.
+
+**Blocks:** `JDonaghy/vimcode#1558` (tab-bar half). Leave that issue open
+behind both entries above per `GOALS.md`'s milestone-discipline rule — there
+is no per-backend vimcode-side fix available here either; the vimcode-side
+data pipeline (`render::build_tab_bar_icons`, `icons::file_icon_for_name`) is
+already correct and platform-neutral.
+
+---
+
 ## ~~TUI test drivers can't observe `Backend::request_full_repaint`'s effect from a downstream `ShellApp` (blocks vimcode#1243's black-box test)~~ — **FILED as quadraui#1060, do not file (struck 2026-09-24)**
 
 > **This draft is retired: it is now a real issue.** Filed 2026-09-24 as
