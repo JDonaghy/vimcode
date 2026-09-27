@@ -93,13 +93,12 @@ pub fn run(file_path: Option<PathBuf>) {
     // The concrete backend is chosen here, at the GTK entry point, and
     // handed to `App::new` rather than `App` constructing one itself
     // (#861) — this is the seam a future non-GTK wrapper (#859) would pass
-    // a different `TextMetricsBackend` impl through.
-    let text_metrics_backend: std::rc::Rc<
-        std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>,
-    > = std::rc::Rc::new(std::cell::RefCell::new(
-        Box::new(backend::GtkBackend::new()),
-    ));
-    let vimcode_app = App::new(file_path, text_metrics_backend);
+    // a different `quadraui::Backend` impl through.
+    let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(
+            Box::new(backend::GtkBackend::new()),
+        ));
+    let vimcode_app = App::new(file_path, concrete_backend);
     let config = build_shell_config(&vimcode_app);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }

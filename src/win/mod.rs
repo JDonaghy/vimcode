@@ -77,7 +77,7 @@ use std::process::ExitCode;
 
 pub(crate) mod backend;
 
-use crate::app::{App, TextMetricsBackend};
+use crate::app::App;
 
 /// Entry point for the native Win-GUI, mirroring `crate::gtk::run` /
 /// `crate::macos::run`.
@@ -98,16 +98,16 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The concrete backend is chosen here, at the entry point, and handed to
     // `App` — the seam #861 opened and `src/gtk/mod.rs::run` names in its
     // own comment as the one "a future non-GTK wrapper (#859) would pass a
-    // different `TextMetricsBackend` impl through". This is that wrapper's
+    // different `quadraui::Backend` impl through". This is that wrapper's
     // Win-GUI sibling.
-    let text_metrics_backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+    let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(
             Box::new(backend::WinBackend::new()),
         ));
 
     let app = App::new_portable(
         file_path,
-        text_metrics_backend,
+        concrete_backend,
         crate::render::UnitProfile::px(),
     );
     let config = build_shell_config(&app);
@@ -143,7 +143,6 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
 #[cfg(all(test, feature = "win"))]
 mod shell_config_identity_tests {
     use super::{build_shell_config, App};
-    use crate::app::TextMetricsBackend;
     use crate::core::Engine;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -151,7 +150,7 @@ mod shell_config_identity_tests {
     #[test]
     fn app_icon_reaches_shell_config_as_a_decodable_image() {
         let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
         let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
         let config = build_shell_config(&app);
@@ -169,21 +168,22 @@ mod shell_config_identity_tests {
     }
 }
 
-// ── #969: `TextMetricsBackend` conformance (`WinBackend`) ──────────────────
+// ── #969: `quadraui::Backend` metric-setter conformance (`WinBackend`) ─────
 //
 // Unlike `win_driver_tests` below, this needs no `WinDriver`/
 // `quadraui::win::testing` at all — only `WinBackend::new()` plus the two
-// `TextMetricsBackend` setters and the `quadraui::Backend` getters they
-// feed, none of which are `target_os`-gated (see this module's own "Why
+// `set_current_line_height`/`set_current_char_width` setters
+// (JDonaghy/quadraui#1086) and the `quadraui::Backend` getters they feed,
+// none of which are `target_os`-gated (see this module's own "Why
 // `feature = "win"` alone" doc above — `current_line_height`/
 // `current_char_width` and their setters/getters are plain fields, not
 // WinAPI calls). So this runs on an ordinary Linux host under `cargo test
 // --features win`, with no Windows target and no cross toolchain — closing
-// the same gap #967 found on macOS (a `TextMetricsBackend` impl whose
-// metric setters silently no-op, disabling the #540/#819 click drift
-// guard) for this backend too, and doing it without needing Windows
-// hardware to run at all. See `crate::harness::assert_text_metrics_backend_applies_metrics`'s
-// doc for the full mechanism.
+// the same gap #967 found on macOS (a metric-setter override that silently
+// no-ops, disabling the #540/#819 click drift guard) for this backend too,
+// and doing it without needing Windows hardware to run at all. See
+// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc for
+// the full mechanism.
 #[cfg(all(test, feature = "win"))]
 mod win_backend_conformance {
     #[test]
@@ -251,7 +251,6 @@ mod win_driver_tests {
 
     use quadraui::win::testing::driver_with_shell;
 
-    use crate::app::TextMetricsBackend;
     use crate::core::Engine;
     use crate::harness::ConformanceHarness;
 
@@ -269,7 +268,7 @@ mod win_driver_tests {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
         let (app, config) = crate::harness::build_app_and_config(
             Rc::clone(&engine),
@@ -289,7 +288,7 @@ mod win_driver_tests {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
         let (app, config) = crate::harness::build_app_and_config(
             Rc::clone(&engine),

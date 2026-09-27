@@ -70,46 +70,17 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::app::{App, TextMetricsBackend};
+use crate::app::App;
 
-/// [`TextMetricsBackend`] for quadraui's `MacBackend`.
-///
-/// - `set_text_measurement_context` stays a no-op, and that is what the
-///   trait's own doc comment predicts for this backend rather than an
-///   omission: "a backend with no persistent-context concept … can
-///   implement this as a no-op"; macOS text measurement
-///   (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
-///   per call instead of storing a context. The only producer of a context
-///   (`click::build_editor_click_context`) is GTK-only and its call site in
-///   `render_content` is `#[cfg(feature = "gui")]`, so nothing ever calls
-///   this here anyway.
-/// - the two metric setters forward to `MacBackend`'s own public
-///   `set_current_line_height`/`set_current_char_width` (`f64`, matching
-///   Pango's unit — quadraui#934, pinned rev `f3b3aed9`), the macOS
-///   counterparts of `GtkBackend`'s methods of the same name and the
-///   `WinBackend` impl below. Before quadraui#934 `MacBackend` had no such
-///   setters and both were stubbed no-ops (#859); #967 found that stub left
-///   `App::explorer_ui_event`'s #540 drift guard — which re-applies the
-///   metrics the tree was *painted* with immediately before hit-testing —
-///   silently doing nothing on macOS, so hit-testing ran against
-///   `MacBackend::new()`'s default `current_line_height` instead of the
-///   real CoreText metric the paint used. `tree_layout`'s row pitch is
-///   `(line_height * 1.4).round()`, so a stale default drifted the hit
-///   bands by a pixel per row, growing with row index until clicks
-///   resolved to the row below.
-impl TextMetricsBackend for quadraui::macos::MacBackend {
-    // `set_text_measurement_context` is deliberately not overridden here —
-    // the trait's default (empty) body is exactly this backend's no-op, per
-    // the reasoning above (#969).
-
-    fn set_current_line_height(&mut self, line_height: f64) {
-        quadraui::macos::MacBackend::set_current_line_height(self, line_height);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        quadraui::macos::MacBackend::set_current_char_width(self, char_width);
-    }
-}
+// #1497: the local `TextMetricsBackend for quadraui::macos::MacBackend`
+// impl that used to live here is gone. It forwarded
+// `set_current_line_height`/`set_current_char_width` onto `MacBackend`'s
+// own inherent setters (quadraui#934, pinned rev `f3b3aed9`) purely because
+// `quadraui::Backend` had no portable equivalent of them; JDonaghy/
+// quadraui#1086 put both directly on `Backend`, with `MacBackend`'s own
+// override doing exactly the forwarding this impl used to do by hand — see
+// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc for
+// the #967 stub-setter bug this conformance-checks against.
 
 /// Entry point for the native macOS GUI, mirroring `crate::gtk::run`.
 ///
@@ -126,8 +97,8 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The concrete backend is chosen here, at the entry point, and handed to
     // `App` — the seam #861 opened and `src/gtk/mod.rs::run` names in its own
     // comment as the one "a future non-GTK wrapper (#859) would pass a
-    // different `TextMetricsBackend` impl through". This is that wrapper.
-    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> = std::rc::Rc::new(
+    // different `quadraui::Backend` impl through". This is that wrapper.
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> = std::rc::Rc::new(
         std::cell::RefCell::new(Box::new(quadraui::macos::MacBackend::new())),
     );
 
@@ -163,7 +134,7 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
 /// Mach-O host, matching every other test in this file.
 #[cfg(test)]
 mod shell_config_identity_tests {
-    use super::{build_shell_config, App, TextMetricsBackend};
+    use super::{build_shell_config, App};
     use crate::core::Engine;
     use quadraui::macos::MacBackend;
     use std::cell::RefCell;
@@ -172,7 +143,7 @@ mod shell_config_identity_tests {
     #[test]
     fn app_icon_reaches_shell_config_as_a_decodable_image() {
         let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
         let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
         let config = build_shell_config(&app);
@@ -214,7 +185,7 @@ pub(crate) fn conformance_harness(
     let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
-    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Box::new(MacBackend::new())));
     let (app, config) = crate::harness::build_app_and_config(
         std::rc::Rc::clone(&engine),
@@ -255,7 +226,7 @@ mod mac_driver_tests {
     use quadraui::macos::testing::driver_with_shell;
     use quadraui::macos::MacBackend;
 
-    use crate::app::{App, TextMetricsBackend};
+    use crate::app::App;
     use crate::core::Engine;
 
     /// Surface size in points — wide enough that the minimap's own column is
@@ -301,7 +272,7 @@ mod mac_driver_tests {
             crate::test_paint::PaintGuard::acquire(),
             crate::test_cwd::CwdReadGuard::acquire(),
         );
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
         let app = App::new_headless_with_backend(
             Rc::new(RefCell::new(engine)),
@@ -332,7 +303,7 @@ mod mac_driver_tests {
             crate::test_cwd::CwdReadGuard::acquire(),
         );
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
         let app = App::new_headless_with_backend(
             Rc::clone(&engine),
@@ -359,7 +330,6 @@ mod mac_driver_tests {
         use quadraui::macos::testing::driver_with_shell;
         use quadraui::macos::MacBackend;
 
-        use crate::app::TextMetricsBackend;
         use crate::core::Engine;
         use crate::harness::ConformanceHarness;
 
@@ -372,7 +342,7 @@ mod mac_driver_tests {
             let paint = crate::test_paint::PaintGuard::acquire();
             let cwd = crate::test_cwd::CwdReadGuard::acquire();
             let engine = Rc::new(RefCell::new(engine));
-            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
             let (app, config) = crate::harness::build_app_and_config(
                 Rc::clone(&engine),
@@ -393,7 +363,7 @@ mod mac_driver_tests {
             let paint = crate::test_paint::PaintGuard::acquire();
             let cwd = crate::test_cwd::CwdReadGuard::acquire();
             let engine = Rc::new(RefCell::new(engine));
-            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
             let (app, config) = crate::harness::build_app_and_config(
                 Rc::clone(&engine),
@@ -1057,13 +1027,14 @@ mod mac_driver_tests {
     /// whole time. Any sweep point that disagrees with the top-of-row
     /// baseline is exactly #967's bug.
     ///
-    /// **RED-verification (#967):** reverting `TextMetricsBackend for
-    /// quadraui::macos::MacBackend`'s two metric setters in this file back
-    /// to their pre-fix no-op bodies takes this test red — the sweep's
-    /// lower sample points mis-hit `core` a row down instead of `src`,
-    /// disagreeing with the top-of-row baseline, and
-    /// `sweep_hit_band_integrity`'s `assert_eq!` fires. Confirmed locally
-    /// with `cargo test --no-default-features --features macos
+    /// **RED-verification (#967):** reverting `MacBackend`'s
+    /// `Backend::set_current_line_height`/`set_current_char_width` overrides
+    /// (quadraui-side since #1497; this file's own wrapper impl before that)
+    /// back to no-op bodies takes this test red — the sweep's lower sample
+    /// points mis-hit `core` a row down instead of `src`, disagreeing with
+    /// the top-of-row baseline, and `sweep_hit_band_integrity`'s
+    /// `assert_eq!` fires. Confirmed locally with `cargo test
+    /// --no-default-features --features macos
     /// explorer_click_hit_band_matches_the_painted_row` before restoring
     /// the fix; see this issue's PR notes.
     #[test]
@@ -1090,8 +1061,8 @@ mod mac_driver_tests {
     /// #969: the direct, driver-free half of the coverage above —
     /// `explorer_click_hit_band_matches_the_painted_row` proves #967's
     /// *symptom* (a mis-hit row) is fixed; this proves the *mechanism* is
-    /// sound by round-tripping a value through `TextMetricsBackend` and
-    /// `quadraui::Backend` directly, no paint or click involved. See
+    /// sound by round-tripping a value through `quadraui::Backend` directly,
+    /// no paint or click involved. See
     /// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
     /// for why a `&mut self`-with-no-return setter needs exactly this kind
     /// of check to catch a silent stub — the class of bug #967 was.

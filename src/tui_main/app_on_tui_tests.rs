@@ -3419,11 +3419,10 @@ mod tests {
         #[test]
         fn setup_reads_keyboard_enhanced_from_live_backend_caps() {
             let engine = std::rc::Rc::new(std::cell::RefCell::new(plain_engine()));
-            let backend_handle: std::rc::Rc<
-                std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>,
-            > = std::rc::Rc::new(std::cell::RefCell::new(Box::new(
-                quadraui::tui::TuiBackend::new(),
-            )));
+            let backend_handle: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(Box::new(
+                    quadraui::tui::TuiBackend::new(),
+                )));
             let (mut app, _config) = crate::harness::build_app_and_config(
                 engine,
                 backend_handle,
@@ -3531,7 +3530,7 @@ mod tests {
             engine: crate::core::Engine,
         ) -> quadraui::tui::vt_testing::TuiVtDriver<impl quadraui::AppLogic> {
             let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
-            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(Box::new(
                     quadraui::tui::TuiBackend::new(),
                 )));
@@ -3682,7 +3681,7 @@ mod tests {
         #[test]
         fn tick_drains_the_pending_nerd_font_startup_message_via_shell_app() {
             let engine = std::rc::Rc::new(std::cell::RefCell::new(plain_engine()));
-            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+            let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
                 std::rc::Rc::new(std::cell::RefCell::new(Box::new(
                     quadraui::tui::TuiBackend::new(),
                 )));

@@ -146,7 +146,7 @@ use std::rc::Rc;
 use quadraui::testing::{ConformanceDriver, DriverInput};
 use quadraui::NamedKey;
 
-use crate::app::{App, TextMetricsBackend};
+use crate::app::App;
 use crate::core::Engine;
 
 /// True if `needle` appears in the painted text of any single screen **row**,
@@ -302,7 +302,7 @@ impl<D> ConformanceHarness<D> {
 /// `crate::tui_main::testing::conformance_harness`.
 pub(crate) fn build_app_and_config(
     engine: Rc<RefCell<Engine>>,
-    backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
     units: crate::render::UnitProfile,
 ) -> (App, quadraui::ShellConfig) {
     let app = App::new_headless_with_backend(engine, backend, units);
@@ -566,7 +566,8 @@ pub fn command_palette_filters_and_escape_dismisses<D: ConformanceDriver>(driver
 ///
 /// #967's bug was exactly this: `App::explorer_ui_event`'s #540 drift guard
 /// re-applies the metrics the tree was *painted* with before hit-testing,
-/// but macOS's `TextMetricsBackend` impl stubbed both setters, so the
+/// but macOS's `set_current_line_height`/`set_current_char_width` impl
+/// stubbed both setters, so the
 /// hit-test silently ran against `MacBackend::new()`'s default line height
 /// instead. `tree_layout`'s row pitch (`(line_height * 1.4).round()`) then
 /// disagreed with the painted pitch by a growing, row-index-dependent
@@ -1466,26 +1467,27 @@ pub fn drag_group_divider_resizes<D: ConformanceDriver + DriverInput>(
     rect_moved(left_before, left_after)
 }
 
-/// #969: conformance assertion for [`TextMetricsBackend`]'s two load-bearing
-/// setters — `set_current_line_height`/`set_current_char_width`. Both are
-/// `&mut self` methods with no return value, so an empty ("stub") body
+/// #969: conformance assertion for [`quadraui::Backend`]'s two load-bearing
+/// setters — `set_current_line_height`/`set_current_char_width`
+/// (JDonaghy/quadraui#1086; #1497 deleted vimcode's own `TextMetricsBackend`
+/// supertrait now that these live directly on `Backend`). Both are `&mut
+/// self` methods with no return value, so an empty ("stub") body
 /// type-checks identically to a correct forwarding one; nothing short of
 /// setting a value through the trait object and reading it back through the
 /// `quadraui::Backend` getter it is supposed to feed
 /// (`Backend::line_height`/`Backend::char_width`) can tell the two apart.
 ///
 /// This is exactly the gap #967 fell into: `quadraui::macos::MacBackend`'s
-/// `TextMetricsBackend` impl stubbed both setters (correct when #859 wrote
-/// it — the inherent setters did not exist yet on that backend), quadraui#934
-/// later added them, and the impl was never updated to forward to them. That
-/// shipped for two days with clicks landing on the wrong explorer row before
-/// #967 found and fixed it (see `src/macos/mod.rs`'s `TextMetricsBackend for
-/// quadraui::macos::MacBackend` doc for the full mechanism). This function is
-/// the seam that would have caught it on the commit that landed
-/// quadraui#934's setters with no matching vimcode-side update: call it once
-/// per concrete backend, in whatever driver-tier (or lighter) lane that
-/// backend already has — see `crate::gtk` / `src/macos/mod.rs` /
-/// `src/win/mod.rs` for the three call sites this issue adds.
+/// setters were stubbed (correct when #859 wrote vimcode's since-deleted
+/// wrapper trait — the inherent setters did not exist yet on that backend),
+/// quadraui#934 later added them, and the impl was never updated to forward
+/// to them. That shipped for two days with clicks landing on the wrong
+/// explorer row before #967 found and fixed it. This function is the seam
+/// that would have caught it on the commit that landed quadraui#934's
+/// setters with no matching update: call it once per concrete backend, in
+/// whatever driver-tier (or lighter) lane that backend already has — see
+/// `crate::gtk` / `src/macos/mod.rs` / `src/win/mod.rs` for the three call
+/// sites this issue adds.
 ///
 /// The two probe values are distinctive and deliberately unlike any
 /// backend's `::new()` default (`WinBackend::new()`'s is `16.0`/`8.0`; GTK's
@@ -1493,24 +1495,24 @@ pub fn drag_group_divider_resizes<D: ConformanceDriver + DriverInput>(
 /// stubbed setter that silently no-ops leaves the getter reporting its own
 /// construction-time default instead of the probe value — which fails the
 /// assertions below exactly the way #967's stub would have.
-pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>(backend: &mut B) {
-    const LINE_HEIGHT: f64 = 971.25;
-    const CHAR_WIDTH: f64 = 483.5;
+pub(crate) fn assert_text_metrics_backend_applies_metrics<B: quadraui::Backend>(backend: &mut B) {
+    const LINE_HEIGHT: f32 = 971.25;
+    const CHAR_WIDTH: f32 = 483.5;
 
-    TextMetricsBackend::set_current_line_height(backend, LINE_HEIGHT);
-    TextMetricsBackend::set_current_char_width(backend, CHAR_WIDTH);
+    quadraui::Backend::set_current_line_height(backend, LINE_HEIGHT);
+    quadraui::Backend::set_current_char_width(backend, CHAR_WIDTH);
 
     assert_eq!(
         backend.line_height(),
-        LINE_HEIGHT as f32,
-        "TextMetricsBackend::set_current_line_height did not reach \
+        LINE_HEIGHT,
+        "Backend::set_current_line_height did not reach \
          Backend::line_height() — a stubbed setter silently disables the \
          #540/#819 click drift guard (#967); see #969"
     );
     assert_eq!(
         backend.char_width(),
-        CHAR_WIDTH as f32,
-        "TextMetricsBackend::set_current_char_width did not reach \
+        CHAR_WIDTH,
+        "Backend::set_current_char_width did not reach \
          Backend::char_width() — a stubbed setter silently disables the \
          #540/#819 click drift guard (#967); see #969"
     );
@@ -2075,14 +2077,14 @@ mod tests {
     // bounded by `ConformanceDriver + DriverInput` (not
     // `PixelClickConformance`), i.e. exactly the one this proof slice needs
     // to demonstrate the macro expands identically on both GTK and TUI.
-    // RED-verification: with `impl TextMetricsBackend for TuiBackend`'s two
-    // setters temporarily changed to write a value the getter never reads
-    // back (impossible to construct meaningfully here, since `TuiBackend`'s
-    // getters are hardcoded — see that impl's own doc) there is no
-    // TUI-side drift to provoke; this proof slice's RED-verification is
-    // therefore the same one `src/macos/mod.rs`'s
+    // RED-verification: `TuiBackend` never overrides
+    // `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+    // (the fixed-cell no-op default is the honest answer there — see
+    // quadraui's own conformance `caps.rs` for the accepted-default entry),
+    // so there is no TUI-side drift to provoke; this proof slice's
+    // RED-verification is therefore the same one `src/macos/mod.rs`'s
     // `explorer_click_hit_band_matches_the_painted_row` already carries
-    // (reverting the GTK/macOS `TextMetricsBackend` fix takes the *gtk*
+    // (reverting the GTK/macOS `Backend` overrides takes the *gtk*
     // arm here red), confirming this is the same shared scenario body,
     // not a fork of it.
     //
@@ -2606,8 +2608,9 @@ mod tests {
 // above its glyph *and* the one below it, deliberately both, so fixing one
 // edge can never quietly move a bug to the other — acts on that row. TUI is
 // excluded, not silently skipped: its row pitch always equals its glyph
-// height by construction (fixed `TextMetricsBackend` no-op,
-// `src/tui_main/mod.rs`), so it has no padding strip to probe and the
+// height by construction (`quadraui::Backend`'s fixed-cell no-op default,
+// which `TuiBackend` never overrides — `src/tui_main/mod.rs`), so it has
+// no padding strip to probe and the
 // helper's own sanity assert fails loudly there rather than reporting a
 // false pass.
 #[cfg(test)]
