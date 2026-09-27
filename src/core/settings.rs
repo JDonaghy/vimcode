@@ -5191,7 +5191,11 @@ mod tests {
         let s = Settings::default();
         let display = s.display_all();
         // #1543: default line numbers are now absolute ("number"), not "nonumber".
-        assert!(display.contains("number"));
+        // `"nonumber".contains("number")` is also true, so assert the exact
+        // "number nornu" phrase (and the absence of "nonumber") to actually
+        // distinguish `LineNumberMode::Absolute` from the other variants.
+        assert!(display.contains("number nornu"));
+        assert!(!display.contains("nonumber"));
         assert!(display.contains("expandtab"));
         assert!(display.contains("ts=4"));
         assert!(display.contains("sw=4"));

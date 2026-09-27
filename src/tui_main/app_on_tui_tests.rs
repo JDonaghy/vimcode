@@ -4210,11 +4210,20 @@ mod tests {
         /// being populated (that field could be right while paint ignores
         /// it, as #587/#592 found for other `ScreenLayout`-adjacent state).
         ///
+        /// Scoped to the gutter column specifically (not an unscoped
+        /// whole-screen substring search): the default-`ruler`-on status
+        /// bar always paints a literal "1" (e.g. "Ln 1, Col 1 (3 lines)"),
+        /// so an unscoped `find_bounds("1").is_some()` can't actually
+        /// distinguish "gutter painted the digit" from "the ruler always
+        /// has a 1 in it". Instead this pins each digit to the same row as
+        /// — and strictly left of — that line's own text, which only the
+        /// gutter satisfies.
+        ///
         /// **Verified RED against unfixed `develop`**: with
         /// `Settings::default`'s `line_numbers` reverted to
         /// `LineNumberMode::None`, this test fails — the gutter paints only
-        /// the fold-indicator column and neither "1" nor "2" appears
-        /// anywhere on screen.
+        /// the fold-indicator column, so `find_bounds("1")` never lands on
+        /// the "aaa" row.
         #[test]
         fn fresh_engine_paints_absolute_line_numbers_by_default() {
             let mut engine = plain_engine();
@@ -4223,11 +4232,36 @@ mod tests {
             h.driver.render();
 
             let screen = h.driver.screen();
+            let aaa = h.driver.find_bounds("aaa").unwrap_or_else(|| {
+                panic!("first line's text should be painted; screen:\n{screen}")
+            });
+            let bbb = h.driver.find_bounds("bbb").unwrap_or_else(|| {
+                panic!("second line's text should be painted; screen:\n{screen}")
+            });
+            let one = h
+                .driver
+                .find_bounds("1")
+                .unwrap_or_else(|| panic!("gutter should paint line number 1; screen:\n{screen}"));
+            let two = h
+                .driver
+                .find_bounds("2")
+                .unwrap_or_else(|| panic!("gutter should paint line number 2; screen:\n{screen}"));
+
+            assert_eq!(
+                one.y, aaa.y,
+                "line number 1 must be on the same row as the first line's text; screen:\n{screen}"
+            );
             assert!(
-                h.driver.find_bounds("1").is_some() && h.driver.find_bounds("2").is_some(),
-                "a fresh buffer's gutter must paint absolute line numbers \
-                 by default, matching VS Code's out-of-the-box gutter; \
-                 screen:\n{screen}"
+                one.x < aaa.x,
+                "line number 1 must sit in the gutter, left of the line text; screen:\n{screen}"
+            );
+            assert_eq!(
+                two.y, bbb.y,
+                "line number 2 must be on the same row as the second line's text; screen:\n{screen}"
+            );
+            assert!(
+                two.x < bbb.x,
+                "line number 2 must sit in the gutter, left of the line text; screen:\n{screen}"
             );
         }
     }
