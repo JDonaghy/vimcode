@@ -5650,12 +5650,41 @@ impl Engine {
     /// Register an accelerator. Re-registration with the same id replaces
     /// the prior entry (for live rebinding).
     ///
-    /// #1495: parsing delegates entirely to
-    /// [`quadraui::accelerator::parse_binding`] — the per-`KeyBinding`-variant
-    /// match table (universal bindings → canonical `<C-x>`-style strings)
-    /// used to be duplicated here; it now lives in exactly one place.
+    /// #1495: parsing delegates to [`quadraui::accelerator::parse_binding`]
+    /// for the universal `KeyBinding` variants (`Save`, `Copy`, ... — fixed,
+    /// vimcode-authored strings with an explicit modifier and no Cmd, so
+    /// quadraui's more permissive grammar can't smuggle anything through
+    /// them) — the per-variant match table used to be duplicated here; it
+    /// now lives in exactly one place.
+    ///
+    /// `KeyBinding::Literal` is different: its string comes straight from
+    /// user config (e.g. `panel_keys.toggle_terminal_maximize`) with no
+    /// other validation at load time, so it is routed through
+    /// [`crate::core::settings::parse_key_binding_named`] instead — the
+    /// same guarded parser `keys.rs`/`render.rs` use — rather than
+    /// quadraui's raw `parse_key_binding`. That guard rejects Cmd
+    /// (`<D-...>`/`<M-...>`) bindings and bindings with no explicit
+    /// modifier (`<t>`, `<F5>`), both of which the pre-#1495 code also
+    /// rejected outright. Without this, a malformed `<D-t>` config value
+    /// would parse successfully (Cmd is simply dropped) and register as an
+    /// accelerator that fires on a bare, unmodified `t` keypress — see the
+    /// #1495 review finding this call site is guarding against.
     pub fn register_accelerator(&mut self, acc: Accelerator) {
-        let parsed = quadraui::accelerator::parse_binding(&acc.binding);
+        let parsed =
+            match &acc.binding {
+                KeyBinding::Literal(s) => crate::core::settings::parse_key_binding_named(s).map(
+                    |(ctrl, shift, alt, key)| quadraui::accelerator::ParsedBinding {
+                        modifiers: quadraui::Modifiers {
+                            ctrl,
+                            shift,
+                            alt,
+                            cmd: false,
+                        },
+                        key,
+                    },
+                ),
+                other => quadraui::accelerator::parse_binding(other),
+            };
         self.accelerators.retain(|r| r.acc.id != acc.id);
         self.accelerators
             .push(RegisteredAccelerator { acc, parsed });
