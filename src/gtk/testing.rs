@@ -4973,8 +4973,8 @@ mod sidebar_panel_clicks {
                     .as_ref()
                     .expect("a live split must have painted a TerminalSplitLayout");
                 (
-                    (sl.divider_x + sl.divider_width / 2.0) as f32,
-                    (sl.left.y + sl.left.height / 2.0) as f32,
+                    sl.divider_x + sl.divider_width / 2.0,
+                    sl.left.y + sl.left.height / 2.0,
                 )
             };
 
@@ -5203,7 +5203,7 @@ mod sidebar_panel_clicks {
 
         let mut h = harness(engine, 1400, 900);
         h.driver.render();
-        let ab_top = (h.menu_row_rect.get().y + h.menu_row_rect.get().height) as f32;
+        let ab_top = h.menu_row_rect.get().y + h.menu_row_rect.get().height;
 
         // Click the plugin panel's activity-bar icon (index 7 — see doc
         // comment above).
@@ -10867,7 +10867,7 @@ mod minimap {
             crate::render::minimap_strip_rect(mm)
         };
 
-        let x = (strip.x + strip.width / 2.0) as f32;
+        let x = strip.x + strip.width / 2.0;
         // Press on the strip's very top row — with the file scrolled to the
         // top, that coincides with the viewport-highlight band's own top
         // edge — then drag to the strip's bottom row.
@@ -14135,8 +14135,13 @@ mod folder_picker {
             h.driver.type_char(c);
         }
         h.driver.render();
+        // `screen_row_has`, not `screen_contains`: a filtered picker row
+        // paints its *matched* substring as its own styled span, so
+        // "File: Open Folder…" reaches the screen as the three runs
+        // "File: " + "Open Folder" + "…" and no single run holds the phrase
+        // (see `crate::harness::screen_row_has`'s doc).
         assert!(
-            h.driver.screen_contains("File: Open Folder"),
+            crate::harness::screen_row_has(&h.driver, "File: Open Folder"),
             "typing must reach the picker's query and keep the matching \
              item visible; painted: {:?}",
             h.driver.painted_texts()
@@ -14145,7 +14150,7 @@ mod folder_picker {
         h.driver.press_named(quadraui::NamedKey::Enter);
         h.driver.render();
         assert!(
-            !h.driver.screen_contains("File: Open Folder"),
+            !crate::harness::screen_row_has(&h.driver, "File: Open Folder"),
             "confirming must close the command palette; painted: {:?}",
             h.driver.painted_texts()
         );
