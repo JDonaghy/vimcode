@@ -22842,10 +22842,13 @@ pub fn build_window_status_line(
             })
         };
 
-        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment.
+        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment. This is
+        // the right-most segment of the bar, so no trailing space here
+        // (quadraui#1155 gives pixel backends their own outer edge inset —
+        // a manual trailing space here would double it; see #1541).
         let cursor_seg = if engine.settings.ruler {
             cursor.map(|c| StatusSegment {
-                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+                text: format!(" Ln {}, Col {}", c.line + 1, c.col + 1),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -22927,8 +22930,10 @@ pub fn build_window_status_line(
 
         let right = if engine.settings.ruler {
             if let Some(c) = cursor {
+                // Right-most segment — no trailing space (see the active-
+                // window cursor_seg comment above; quadraui#1155 / #1541).
                 vec![StatusSegment {
-                    text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
+                    text: format!("Ln {}, Col {}", c.line + 1, c.col + 1),
                     fg: theme.status_inactive_fg,
                     bg: theme.status_inactive_bg,
                     bold: false,
@@ -27129,6 +27134,48 @@ mod tests {
         );
     }
 
+    /// #1541: the ruler segment is the right-most segment of the active
+    /// window's bar, so its own text must not carry a trailing space —
+    /// quadraui#1155 now reserves that outer-edge margin on pixel backends
+    /// (GTK/Win/macOS), and TUI has never had a scrollbar-style gutter to
+    /// hide a trailing blank column in. A stray trailing space here would
+    /// double the gap on the backends that already get one and would be a
+    /// visible dangling blank on TUI, which gets none.
+    ///
+    /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
+    /// trailing space included): `right_text` ends in `" "`, and this
+    /// assertion fails — confirmed by reverting just this segment's format
+    /// string and re-running.
+    #[test]
+    fn test_window_status_line_ruler_segment_has_no_trailing_space() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.settings.ruler = true;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let last = status
+            .right_segments
+            .last()
+            .expect("ruler on: the active window's bar must have a right-most segment");
+        assert!(
+            last.text.contains("Ln 1"),
+            "expected the ruler to be the right-most segment, got '{}'",
+            last.text
+        );
+        assert!(
+            !last.text.ends_with(' '),
+            "the right-most segment must not carry a trailing space \
+             (quadraui#1155 gives pixel backends their own outer edge \
+             inset); got {:?}",
+            last.text
+        );
+    }
+
     #[test]
     fn test_window_status_line_inactive() {
         use crate::core::engine::Engine;
@@ -27150,6 +27197,44 @@ mod tests {
         for seg in &status.left_segments {
             assert_eq!(seg.fg, theme.status_inactive_fg);
         }
+    }
+
+    /// #1541: same claim as
+    /// [`test_window_status_line_ruler_segment_has_no_trailing_space`], for
+    /// the inactive-window bar's own (differently-formatted, no leading
+    /// space) ruler segment.
+    ///
+    /// RED against the pre-#1541 body (`format!("Ln {}, Col {} ", ...)`):
+    /// the segment ends in `" "` and this assertion fails — confirmed by
+    /// reverting just this segment's format string and re-running.
+    #[test]
+    fn test_window_status_line_inactive_ruler_segment_has_no_trailing_space() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.settings.ruler = true;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, false);
+
+        let last = status
+            .right_segments
+            .last()
+            .expect("ruler on: the inactive window's bar must have a right-most segment");
+        assert!(
+            last.text.contains("Ln 1"),
+            "expected the ruler to be the right-most segment, got '{}'",
+            last.text
+        );
+        assert!(
+            !last.text.ends_with(' '),
+            "the right-most segment must not carry a trailing space \
+             (quadraui#1155 gives pixel backends their own outer edge \
+             inset); got {:?}",
+            last.text
+        );
     }
 
     #[test]

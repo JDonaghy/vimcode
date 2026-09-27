@@ -650,6 +650,8 @@ mod mac_driver_tests {
     /// coupling the issue describes.
     #[test]
     fn command_center_paints_on_a_native_menu_backend() {
+        use quadraui::Backend;
+
         let mut engine = plain_engine();
         // A distinctive, non-default `cwd` so the Command Center's "🔍
         // <project>" search label is unmistakable in `painted_texts()` --
@@ -660,6 +662,33 @@ mod mac_driver_tests {
         engine.cwd = std::path::PathBuf::from("omnibar-fixture-939");
 
         let (_guards, driver) = driver(engine);
+
+        // #1541 sanity check: the positive assertion below only proves the
+        // Command Center paints when `titlebar_control_inset()` is the
+        // trait's all-zero default -- the one value `MacDriver` can ever
+        // report, per `control_inset_is_default_because_mac_driver_never_
+        // sets_a_window`'s doc comment just above this test. It says
+        // nothing about a *real* window: quadraui#1154 had
+        // `titlebar_control_inset` return the full window width there,
+        // which (via `render::measure_title_bar_bands`'s otherwise-correct
+        // clamp-to-empty arithmetic, `render.rs`'s
+        // `leading_inset_wider_than_the_row_clamps_to_an_empty_band`)
+        // collapses the Command Center band to zero width -- the exact
+        // "never paints" symptom this test exists to catch, and exactly
+        // what this headless harness cannot reproduce. Pin the assumption
+        // explicitly so this test cannot quietly start "passing" against a
+        // degenerate real-window inset: if this fires, `MacDriver` has
+        // started reporting a real inset, and the positive assertion below
+        // needs re-verifying against it before it can be trusted (real-
+        // window verification is this issue's SMOKE_TESTS item, not
+        // something this harness can do).
+        assert_eq!(
+            driver.backend().titlebar_control_inset(),
+            quadraui::Rect::default(),
+            "MacDriver's backend reported a non-default titlebar control \
+             inset -- the Command Center assertions below no longer prove \
+             what this test's doc comment claims; see that comment"
+        );
 
         assert!(
             !driver.screen_contains("File"),
