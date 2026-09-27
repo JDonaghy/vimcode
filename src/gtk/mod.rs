@@ -197,7 +197,9 @@ mod editor_scrollbar_geometry_tests {
     //! hit-test helper that still applied one would disagree with what's
     //! actually painted: precisely the "hover and paint can disagree by
     //! construction" bug #1128 fixed. These tests pin the replacement
-    //! helpers (`editor_scrollbar_layout`/`h_scrollbar_thumb_geometry`)
+    //! helpers (`editor_scrollbar_layout`/`scrollbar_thumb_geometry`, the
+    //! latter axis-parameterised by #1493, replacing the former per-axis
+    //! `h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` pair)
     //! against that reality instead.
     use super::{editor_scrollbar_layout, scrollbar_thumb_geometry, ScrollbarAxis};
     use crate::core::{Engine, WindowRect};

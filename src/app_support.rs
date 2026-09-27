@@ -298,20 +298,26 @@ pub(crate) fn scrollbar_thumb_geometry(
     let (editor, layout) =
         editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
     let (track, scroll_pos, extent, visible, track_len) = match axis {
-        ScrollbarAxis::Horizontal => (
-            layout.h_scrollbar_bounds?,
-            editor.scroll_left as f32,
-            editor.max_col as f32,
-            layout.visible_cols as f32,
-            layout.h_scrollbar_bounds?.width,
-        ),
-        ScrollbarAxis::Vertical => (
-            layout.v_scrollbar_bounds?,
-            editor.scroll_top as f32,
-            editor.total_lines as f32,
-            layout.visible_lines as f32,
-            layout.v_scrollbar_bounds?.height,
-        ),
+        ScrollbarAxis::Horizontal => {
+            let track = layout.h_scrollbar_bounds?;
+            (
+                track,
+                editor.scroll_left as f32,
+                editor.max_col as f32,
+                layout.visible_cols as f32,
+                track.width,
+            )
+        }
+        ScrollbarAxis::Vertical => {
+            let track = layout.v_scrollbar_bounds?;
+            (
+                track,
+                editor.scroll_top as f32,
+                editor.total_lines as f32,
+                layout.visible_lines as f32,
+                track.height,
+            )
+        }
     };
     let (thumb_start, thumb_len) =
         quadraui::fit_thumb(scroll_pos, extent, visible, track_len, line_height as f32);

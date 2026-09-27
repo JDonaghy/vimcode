@@ -3859,6 +3859,134 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Editor scrollbars (#1493)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod editor_scrollbars {
+        use super::*;
+
+        /// TUI counterpart of `crate::gtk::testing`'s
+        /// `horizontal_scrollbar_thumb_click_scrolls_with_sidebar_open_on_gtk`
+        /// — same scenario (a click on the h-scrollbar's empty track, with the
+        /// explorer sidebar open, must page `scroll_left`), driven through
+        /// `TuiDriver` instead of a Cairo `ImageSurface`. Both tests exist
+        /// because `App::handle_mouse_click_msg`/`App::editor_scrollbar_press`
+        /// (`src/app.rs`) is one shared dispatch for *both* backends now —
+        /// #1433 flipped TUI's `run` onto it and #1434 deleted the
+        /// independently hand-written production TUI shell (this module's own
+        /// top doc) — so CLAUDE.md's "cover both backends" rule for a shared
+        /// dispatch code path applies here, not just on GTK.
+        ///
+        /// Before #1493, `app.rs`'s "H scrollbar hit-test" rung rebuilt window
+        /// rects via `compute_editor_window_rects(&engine, width, height, lh)`,
+        /// which always assumes the editor area starts at column 0 — true only
+        /// with the activity bar/sidebar at zero width. With the explorer
+        /// open, the real editor rect starts to the right of column 0 (this
+        /// test's own `rect.x > 0.0` fixture-sanity check below), so every
+        /// click coordinate this test sends landed *outside* the phantom
+        /// `x = 0` rect and never reached the h-scrollbar hit-test at all —
+        /// #1493's fix reads `painted_editor_bounds()` for both axes through
+        /// the shared `App::editor_scrollbar_press`, so the same click now
+        /// resolves.
+        ///
+        /// **Verified RED against unfixed `develop`**: reverting this test's
+        /// two `app.rs` call sites to call `compute_editor_window_rects(&engine,
+        /// width, height, lh)` directly (the pre-#1493 horizontal rung's own
+        /// rect source) instead of `self.painted_editor_bounds()`, leaving
+        /// everything else (including this test) unmodified, and re-running
+        /// this test — `scroll_left` stayed `0`: the click missed the
+        /// h-scrollbar entirely and landed on ordinary editor text instead
+        /// (cursor moved, scrollbar untouched). Restored before landing.
+        #[test]
+        fn horizontal_scrollbar_thumb_click_scrolls_with_sidebar_open() {
+            let mut engine = plain_engine();
+            // No line numbers: the gutter is then exactly one column wide
+            // (the fold indicator `render::calculate_gutter_cols` always
+            // reserves) — matches the GTK counterpart's fixture.
+            engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
+            // Off (default on): the per-window status line paints in the
+            // same bottom row as the h-scrollbar and would otherwise claim
+            // that row via the chrome rung before this issue's scrollbar
+            // rung ever runs — see the GTK counterpart's identical note.
+            engine.settings.window_status_line = false;
+            // One very long line plus a couple of short ones: needs an
+            // h-scrollbar but never a v-scrollbar, isolating this test to
+            // the one axis #1493 fixes.
+            let long_line = "x".repeat(500);
+            engine
+                .buffer_mut()
+                .insert(0, &format!("{long_line}\nshort\nshort\n"));
+            let win = engine.active_window_id();
+            let buffer_id = engine.windows.get(&win).unwrap().buffer_id;
+            // `max_col` (what the scrollbar geometry reads) is a cache
+            // refreshed by `update_syntax`, not by a raw `Buffer::insert`.
+            engine
+                .buffer_manager
+                .get_mut(buffer_id)
+                .unwrap()
+                .update_syntax();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 24);
+            h.driver.render();
+
+            let rect = h
+                .screen_layout
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.windows.iter().find(|w| w.window_id == win))
+                .map(|w| w.rect)
+                .expect("the editor window must have painted a rect");
+            assert!(
+                rect.x > 0.0,
+                "fixture sanity: with the explorer open the editor must not \
+                 start at column 0 (got x={}) — this offset is exactly what \
+                 the pre-#1493 horizontal rung ignored",
+                rect.x
+            );
+
+            let before = h
+                .engine
+                .borrow()
+                .windows
+                .get(&win)
+                .unwrap()
+                .view
+                .scroll_left;
+            assert_eq!(before, 0, "fixture sanity: must start unscrolled");
+
+            // Click one cell short of the window's right edge, on its bottom
+            // row — where the h-scrollbar's track paints with no per-window
+            // status line to claim that row first — strictly past the thumb
+            // (which starts at the track's own left edge, `scroll_left`
+            // being 0), resolving to a page-jump toward the click.
+            let click_x = (rect.x + rect.width - 1.0) as f32;
+            let click_y = (rect.y + rect.height - 1.0) as f32;
+
+            h.driver.click(click_x, click_y);
+            h.driver.render();
+
+            let after = h
+                .engine
+                .borrow()
+                .windows
+                .get(&win)
+                .unwrap()
+                .view
+                .scroll_left;
+            assert!(
+                after > 0,
+                "a click on the h-scrollbar's empty track must page \
+                 scroll_left forward; got {after} — with the sidebar open, \
+                 this is the exact click the pre-#1493 horizontal rung's \
+                 `x = 0`-assuming window rects missed entirely"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // User-configured MCP servers (#1487, redo of #1462 on the multi-session
     // engine — see that issue's "Tests go on the App-on-TUI seam" redo note)
     // ─────────────────────────────────────────────────────────────────────────

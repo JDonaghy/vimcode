@@ -12576,16 +12576,17 @@ mod scrollbar_paint {
     /// `compute_editor_window_rects` at a hardcoded `(0, 0)` origin, rather
     /// than `App::painted_editor_bounds`'s real, activity-bar/sidebar-offset
     /// one the v-scrollbar rung used (see that rung's own former "Window
-    /// rects come from `self.painted_editor_bounds()`" comment) — a separate,
-    /// pre-existing bug this issue's review flagged as a non-blocking
-    /// follow-up, not fixed here. With the default 48px-wide activity bar
+    /// rects come from `self.painted_editor_bounds()`" comment) — the exact
+    /// x=0 assumption this issue's title calls out. With the default
+    /// 48px-wide activity bar
     /// alone (confirmed empirically: a single un-split window's painted rect
     /// started at `x: 48.0` with the sidebar closed), a real click at the
     /// h-scrollbar's actual on-screen position fell outside that
     /// hardcoded-origin rect and never reached the hit-test at all whenever
-    /// the sidebar/activity bar reserved real width. **#1493 fixed exactly
-    /// that bug** — both axes now share `App::editor_scrollbar_press`, which
-    /// always reads `painted_editor_bounds()` — see
+    /// the sidebar/activity bar reserved real width — **this is exactly the
+    /// bug #1493 exists to fix**: both axes now share
+    /// `App::editor_scrollbar_press`, which always reads
+    /// `painted_editor_bounds()` — see
     /// `horizontal_scrollbar_thumb_click_scrolls_with_sidebar_open_on_gtk`
     /// below for the driver-tier proof, with the sidebar open specifically
     /// (the configuration that made the old bug observable).

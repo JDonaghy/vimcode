@@ -5196,9 +5196,10 @@ impl App {
         y: f64,
         axis: ScrollbarAxis,
     ) -> bool {
-        let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
+        let Some((mut content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
             return false;
         };
+        content_bounds.x = 0.0; // TEMP RED-verification only
         let lh = self.cached_line_height;
         let cw = self.cached_char_width;
         let engine = self.engine.borrow();
@@ -5218,9 +5219,12 @@ impl App {
             return false;
         };
         let max_scroll = scroll_range.round() as usize;
-        // #1061: `resolve_editor_scrollbar_click` below is shared with TUI's
-        // own h/v scrollbar click handlers (`tui_main/mouse.rs`) — see that
-        // function's doc for the full rationale.
+        // #1061: `resolve_editor_scrollbar_click` below is the shared
+        // click-vs-drag resolver used by this (now axis-parameterised, #1493)
+        // press handler — the standalone TUI `tui_main/mouse.rs` module this
+        // comment used to reference was deleted by #1434 once #1433 flipped
+        // TUI's `run` onto this same shared `App` dispatch; see that
+        // function's doc for the full click/drag rationale.
         let (click_pos, track_visible, track_start, track_length) = match axis {
             ScrollbarAxis::Horizontal => (
                 x as f32,
