@@ -86,13 +86,14 @@
 //! than new per-backend code — see `docs/IRREDUCIBLE_SURFACE.md`.
 //!
 //! #1490 migrated this file's `Backend::draw_status_bar` (quadraui#819)
-//! calls to `draw_status_bar_interactive`, so the file-level allow below no
-//! longer covers that. It stays for the unrelated deprecated
-//! `ShellApp::on_shell_event` shim `on_shell_event_ctx` still calls
-//! (`#[allow(deprecated)]`'d at that one call site too, but this test
-//! module also calls it directly) — silenced here rather than left as a
-//! stray warning under `-D warnings`.
-#![allow(deprecated)]
+//! calls to `draw_status_bar_interactive`, so the file-level deprecation
+//! suppression that used to sit here no longer covers that. #1491 removed
+//! the other tenant too — the deprecated `ShellApp::on_shell_event` shim
+//! `on_shell_event_ctx` used to call directly — by pulling the shared body
+//! into a plain [`App::dispatch_shell_event`] both the (now default, no-op)
+//! trait override and `on_shell_event_ctx` can call without dispatching
+//! through the deprecated trait method. This file needs no deprecation
+//! suppression of any kind anymore.
 
 #[cfg(feature = "gui")]
 use gtk4::gdk;
@@ -860,22 +861,18 @@ pub(crate) struct App {
     pub(crate) last_clipboard_content: Option<String>,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
     pub(crate) tab_close_hover: Option<(usize, usize)>,
-    /// Absolute tight close-glyph rects captured in `render_content`. Consumed
-    /// by `tab_close_hit_test` (hover) so it hit-tests against the exact drawn
-    /// geometry — including the activity-bar/sidebar x-offset — instead of
-    /// re-deriving group rects from a `(0,0)` content origin (which ignored the
-    /// offset and made hover never fire in ShellApp mode). (#515)
-    pub(crate) cached_tab_close_abs: Rc<RefCell<TabCloseAbsMap>>,
     /// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`),
     /// captured in `render_content`. Feeds the tab drop-zone computation so a
     /// short drag inside a group's own tab bar resolves to a `TabReorder` (with
     /// an insertion bar) rather than a new-split overlay. (#515)
     pub(crate) cached_tab_slots_abs: Rc<RefCell<TabSlotsAbsMap>>,
-    /// Pixel-accurate per-group tab-bar hit geometry from the ShellApp
-    /// `render_content` pass (via `Backend::tab_bar_layout`). Consumed by the
-    /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which
-    /// don't match GTK's proportional-font tab layout. (#515)
-    pub(crate) cached_tab_pixel_hits: Rc<RefCell<TabPixelHitMap>>,
+    /// Per-group `(Rect, TabBarLayout)` — the exact pixel-accurate geometry
+    /// the ShellApp `render_content` pass just painted (via
+    /// `Backend::draw_tab_bar_icons_layout`). Consumed by the GTK tab-bar
+    /// click hit-test (`GroupTabBarLayoutMap`, #1491) instead of the
+    /// char-cell `hit_regions`, which don't match GTK's proportional-font tab
+    /// layout. (#515)
+    pub(crate) cached_group_tab_bar_layouts: Rc<RefCell<GroupTabBarLayoutMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     pub(crate) status_segment_map: Rc<RefCell<StatusSegmentMap>>,
     /// Painted rect of the separated status line's status bar (#671/#672),
@@ -1206,12 +1203,13 @@ pub(crate) struct App {
     /// where it could neither paint nor *clear its own click-routing cache*
     /// once the sidebar collapsed.
     pub(crate) composed_bottom_band: Rc<RefCell<Vec<render::BottomOp>>>,
-    /// Per-group tab-bar `available_cols`, as this frame's `TabBars` rung
-    /// actually painted them — the GTK twin of the pre-#1434 TUI shell's `tab_visible_counts`
-    /// (#1165). `paint_tab_bars`'s doc used to say "TUI reads
-    /// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
-    /// `hits` for its pixel hit maps" as if that were a deliberate
-    /// backend-specific split — it wasn't: GTK simply never called
+    /// Per-group tab-bar visible-column budget (`click::tab_bar_available_cols`),
+    /// as this frame's `TabBars` rung actually painted them — the GTK twin of
+    /// the pre-#1434 TUI shell's `tab_visible_counts` (#1165). `paint_tab_bars`'s
+    /// doc used to say "TUI reads `hits.available_cols` for
+    /// `set_tab_visible_count`; GTK reads the full `hits` for its pixel hit
+    /// maps" (before #1491 dropped `TabBarHits` entirely) as if that were a
+    /// deliberate backend-specific split — it wasn't: GTK simply never called
     /// `Engine::post_draw_apply_widths` at all, so a tab scrolled out of view
     /// by a resize/sidebar-toggle/new-tab could stay off-screen forever on
     /// this backend, while TUI self-corrected within two frames. Populated by
@@ -2111,9 +2109,8 @@ impl App {
             deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
-            cached_tab_close_abs: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_slots_abs: Rc::new(RefCell::new(HashMap::new())),
-            cached_tab_pixel_hits: Rc::new(RefCell::new(HashMap::new())),
+            cached_group_tab_bar_layouts: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             separated_status_bar_rect: Rc::new(Cell::new(None)),
             global_status_zones: Rc::new(RefCell::new(Vec::new())),
@@ -2456,7 +2453,7 @@ impl App {
                     self.cached_line_height,
                     self.cached_char_width,
                     layout,
-                    &self.cached_tab_pixel_hits.borrow(),
+                    &self.cached_group_tab_bar_layouts.borrow(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
@@ -2534,7 +2531,7 @@ impl App {
                         self.cached_line_height,
                         self.cached_char_width,
                         layout,
-                        &self.cached_tab_pixel_hits.borrow(),
+                        &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                         &mut drag_rc.borrow_mut(),
@@ -3740,7 +3737,7 @@ impl App {
             //
             // #764: this is the layout the *paint* resolved, not a second
             // `status_bar_layout` re-measure of the same bar as it used to be —
-            // same reasoning as `render::PaintedTabBar::hits`.
+            // same reasoning as `render::PaintedTabBar::layout`.
             let sb_layout = backend.draw_status_bar_interactive(
                 sb_rect,
                 &win_bar,
@@ -4554,8 +4551,7 @@ impl App {
         // geometry (#515). Cleared here, before the walk, rather than from an
         // absent-rung branch: `compose_editor_band` returns only the live
         // rungs, so a frame with no tab bars has no arm to clear them from.
-        self.cached_tab_pixel_hits.borrow_mut().clear();
-        self.cached_tab_close_abs.borrow_mut().clear();
+        self.cached_group_tab_bar_layouts.borrow_mut().clear();
         self.cached_tab_slots_abs.borrow_mut().clear();
         // #1165: reset alongside the hit caches above — this frame's
         // `TabBars` rung (if any) repopulates it, and `handle_poll_tick`
@@ -4871,35 +4867,38 @@ impl App {
             self.tab_close_hover
                 .map(|(gid, i)| (core::window::GroupId(gid), i)),
         );
-        let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
-        let mut close_abs = self.cached_tab_close_abs.borrow_mut();
+        let char_width = backend.char_width();
+        let mut group_layouts = self.cached_group_tab_bar_layouts.borrow_mut();
         let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
         let mut visible_counts = self.tab_visible_counts.borrow_mut();
         for bar in painted {
-            // #1165: same `hits.available_cols` TUI reads for
-            // `set_tab_visible_count` — see `Self::tab_visible_counts`'s doc.
-            visible_counts.push((bar.group_id, bar.hits.available_cols));
+            // #1165/#1491: the engine-feedback "how many columns of tab
+            // strip fit" number `Engine::set_tab_visible_count` budgets
+            // against — see `click::tab_bar_available_cols`'s doc for why
+            // this reads the paint's own rect/layout instead of the
+            // deprecated `TabBarHits::available_cols`.
+            visible_counts.push((
+                bar.group_id,
+                tab_bar_available_cols(bar.rect, &bar.layout, char_width),
+            ));
             // Recover the exact pixel geometry the rasteriser just drew and
-            // cache it (relative to the bar's left edge) for hit-testing.
+            // cache it for hit-testing and tab-drop geometry.
             //
-            // #764: `bar.hits` is what the *paint* returned, not the separate
-            // `tab_bar_layout_icons` re-measure this used to make. The icon
-            // reservation widens every decorated tab, so an icon-less or
-            // differently-fonted twin reports slot and close bounds shifted
-            // left of the painted glyphs — i.e. the close × of tab N lands
-            // inside tab N+1's painted slot, and clicking it closes the wrong
-            // tab. Exactly the measure/paint desync of #654; reading the
-            // paint's own answer makes it unreachable rather than merely
-            // fixed (#703).
-            let ph = tab_hits_to_pixel_hits(&bar.hits, bar.bar, bar.rect.x as f64);
-            let bar_top = bar.rect.y as f64;
-            close_abs.insert(
+            // #764: `bar.layout` is what the *paint* returned, not a separate
+            // re-measure this used to make. The icon reservation widens
+            // every decorated tab, so an icon-less or differently-fonted
+            // twin reports slot and close bounds shifted left of the
+            // painted glyphs — i.e. the close × of tab N lands inside tab
+            // N+1's painted slot, and clicking it closes the wrong tab.
+            // Exactly the measure/paint desync of #654; reading the paint's
+            // own answer makes it unreachable rather than merely fixed
+            // (#703).
+            slots_abs.insert(
                 bar.group_id.0,
-                abs_close_record(&ph.close, bar.rect.x as f64, bar_top, bar_top + tab_row_h),
+                abs_slot_positions_from_layout(bar.rect, bar.bar, &bar.layout),
             );
-            slots_abs.insert(bar.group_id.0, abs_slot_positions(&bar.hits));
-            pixel_hits.insert(bar.group_id.0, ph);
             hit_bars.push((bar.group_id, bar.rect, bar.bar));
+            group_layouts.insert(bar.group_id.0, (bar.rect, bar.layout));
         }
     }
 
@@ -4964,7 +4963,7 @@ impl App {
             self.cached_line_height,
             self.cached_char_width,
             layout,
-            &self.cached_tab_pixel_hits.borrow(),
+            &self.cached_group_tab_bar_layouts.borrow(),
             self.cached_frame_hit_map.borrow().as_ref(),
             &self.cached_tab_bar_zones.borrow(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
@@ -5730,7 +5729,7 @@ impl App {
                                 self.cached_line_height,
                                 self.cached_char_width,
                                 layout,
-                                &self.cached_tab_pixel_hits.borrow(),
+                                &self.cached_group_tab_bar_layouts.borrow(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                                 &mut drag,
@@ -6271,7 +6270,7 @@ impl App {
                         self.painted_line_height(),
                         self.painted_char_width(),
                         layout,
-                        &self.cached_tab_pixel_hits.borrow(),
+                        &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                         &mut drag_rc.borrow_mut(),
@@ -8505,7 +8504,7 @@ impl App {
                                         self.cached_line_height,
                                         self.cached_char_width,
                                         layout,
-                                        &self.cached_tab_pixel_hits.borrow(),
+                                        &self.cached_group_tab_bar_layouts.borrow(),
                                         self.cached_frame_hit_map.borrow().as_ref(),
                                         &self.cached_tab_bar_zones.borrow(),
                                     )
@@ -8754,6 +8753,170 @@ impl App {
             quadraui::Reaction::Redraw
         } else {
             quadraui::Reaction::Continue
+        }
+    }
+}
+
+impl App {
+    /// The logic behind [`Self::on_shell_event_ctx`], the real
+    /// (non-deprecated, `ShellContext`-aware) hook the runner calls.
+    ///
+    /// #1491 pulled this out of what used to be `App`'s override of the
+    /// deprecated ctx-less `ShellApp::on_shell_event` (issue #617's
+    /// predecessor) and into this plain inherent method, so
+    /// `on_shell_event_ctx` calls it directly instead of dispatching through
+    /// the deprecated trait method — `App` no longer overrides
+    /// `on_shell_event` at all (the trait's own no-op default applies),
+    /// which was the last deprecation-lint suppression this file needed
+    /// once the tab-bar hit-testing migration cleared the others.
+    fn dispatch_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        use quadraui::AppShellEvent;
+        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
+        // first — see `render::sync_shell_event_shadow`'s rung comment for
+        // why this call has to come before any of the id-specific branching
+        // below rather than be repeated inside each arm. GTK has no id that
+        // needs `ShellShadowSyncHost::panel_absent_from_shadow` to answer
+        // `true` (it has no hamburger panel), so `GtkShellShadowHost` is a
+        // unit struct.
+        {
+            let mut engine = self.engine.borrow_mut();
+            render::sync_shell_event_shadow(event, &mut engine, &GtkShellShadowHost);
+        }
+        match event {
+            AppShellEvent::PanelChanged { panel_id } => {
+                // #1427: the hamburger panel only exists on the `cell`
+                // profile (`Self::shell_config`) — reveal the menu bar
+                // instead of switching to a nonexistent shadow panel.
+                // Mirrors the pre-#1434 TUI shell's `on_shell_event`'s own
+                // hamburger arm, now shared via
+                // `render::route_hamburger_panel_changed`; see its own doc.
+                // A no-op check on GTK/macOS/Win, which never register this
+                // panel id in the first place.
+                if render::route_hamburger_panel_changed(&mut self.engine.borrow_mut(), panel_id) {
+                    self.last_shell_panel = Some(panel_id.clone());
+                    return;
+                }
+                // #1064: record what the runner's own `AppShell` now
+                // believes is active, whether this notification came from
+                // a real click or from `take_requested_panel`'s own echo
+                // below — see `Self::last_shell_panel`'s doc.
+                self.last_shell_panel = Some(panel_id.clone());
+                if std::mem::take(&mut self.suppress_shell_panel_echo) {
+                    // Echo of our own `take_requested_panel` reconciliation:
+                    // the engine already holds this state (an app-initiated
+                    // switch, e.g. a DAP reveal or a panel-focus keyboard
+                    // accelerator) — re-running `switch_panel` below would
+                    // toggle an already-active `ext:` panel back **off**
+                    // (`render::apply_activity_panel_switch`'s
+                    // `already_showing` arm treats a second "click" on the
+                    // active plugin panel as a close).
+                    return;
+                }
+                // #557: plugin-provided panels are now real `PanelDefinition`s
+                // in the runner's `AppShell` (`build_shell_config`), so their
+                // icon clicks arrive here like any built-in panel's. They are
+                // *not* engine-`AppShell` panels though — `render_content`
+                // dispatches on `engine.ext_panel_active`, which
+                // `sync_shell_event_shadow` deliberately leaves untouched for
+                // an `ext:` id (see that function's doc) — so route them
+                // through the existing `switch_panel` handler that owns the
+                // ext-panel focus/toggle bookkeeping.
+                if is_ext_panel_id(panel_id.as_str()) {
+                    // #1427: a real activity-bar click is exactly as much
+                    // "the user moved on" as a keystroke — spend the guard
+                    // (mirrors TUI's identical call in this arm). A no-op
+                    // when never armed (GTK/macOS/Win).
+                    render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                    self.switch_panel(panel_id.as_str().to_string());
+                    return;
+                }
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // #1360: a built-in panel's activity-bar icon click must move
+                // keyboard focus into that panel, exactly as TUI's own
+                // `PanelChanged` arm does (`focus_sidebar_panel` +
+                // `sidebar.has_focus = true` in the pre-#1434 TUI shell's `on_shell_event`)
+                // — before this, GTK only redrew, so `render::route_focus_key`
+                // (which every keystroke passes through, see
+                // `Self::handle_key_press`'s "Shared focus-owner keyboard
+                // rung") kept reading `sidebar_has_focus() == false` and sent
+                // every subsequent key straight to the editor. `sidebar.
+                // has_focus`/`ext_panel_name` have no GTK equivalent to set —
+                // GTK's `route_focus_key` call passes
+                // `engine.sidebar_has_focus()` itself as the "band" (see
+                // that call site's own comment), so the one engine call
+                // below is the whole fix, and it is the same
+                // already-shared `Engine::focus_sidebar_panel` this method's
+                // own `toggle_focus_search`/`toggle_focus_explorer` already
+                // call for the keyboard-accelerator path.
+                self.engine
+                    .borrow_mut()
+                    .focus_sidebar_panel(panel_id.as_str());
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarHidden => {
+                // #1427: a real panel's own second click — the hamburger's
+                // is intercepted by `Self::on_shell_event_ctx` before it
+                // ever reaches this ctx-less method (see that method's own
+                // doc) — so spend the guard here too (mirrors TUI).
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // #557: this is also how a *second* click on an open
+                // extension panel's icon arrives — `sync_shell_event_shadow`
+                // already dropped the plugin panel's claim (its
+                // `SidebarHidden` arm clears the same two fields
+                // unconditionally). Re-opening still works:
+                // `AppShell::handle_activity_click` reports a click on the
+                // active panel as `PanelChanged`, not `SidebarHidden`, once
+                // the sidebar is hidden.
+                //
+                // #1427: `Engine::clear_sidebar_focus()` — a real second
+                // click must clear the sidebar's own keyboard focus the
+                // same way the keyboard-driven `ActivityBarKeyAction::
+                // Collapse` arm above already does (via the wider
+                // `Engine::collapse_sidebar`, which also touches
+                // `session.explorer_visible` — not appropriate here, since
+                // this arm fires for *any* panel's close, not just
+                // Explorer's), or a subsequent keystroke keeps routing to
+                // whichever sidebar panel last held focus instead of the
+                // editor. A pre-existing gap on every backend (this arm
+                // never cleared focus before), invisible until #1427's own
+                // `App`-on-TUI driver tests started clicking a real panel's
+                // icon twice in a row (reveal, then collapse) — the
+                // pre-#1427 "tui" arm never needed a first click at all,
+                // since Explorer was already the runner's default-active
+                // panel.
+                self.engine.borrow_mut().clear_sidebar_focus();
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarResized { .. } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+            }
+            AppShellEvent::BottomItemClicked { id } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // The runner treats bottom activity-bar items as action
+                // buttons (not sidebar panels), so it never toggles or
+                // hides on its own — it only ever reports the click.
+                // #1057: this used to unconditionally `show_panel`, so a
+                // second click on an already-open bottom item (e.g.
+                // "bottom:settings") re-showed it instead of collapsing the
+                // sidebar like VS Code does for an active-tab click — while
+                // the old, hand-rolled the pre-#1434 TUI shell's `on_shell_event` (same
+                // arm) already ran the toggle. Route through `switch_panel`,
+                // the same shared `render::apply_activity_panel_switch`
+                // call site `PanelChanged`'s ext-panel arm above already
+                // uses, so both backends make the identical toggle decision
+                // from one place instead of drifting again. #1433: this is
+                // no longer "two arms that happen to agree" — `App` is what
+                // TUI dispatches through in production now too, so this one
+                // arm *is* both backends' Settings-bottom-item-toggle
+                // behaviour; there was no remaining fork to reconcile when
+                // auditing this for the flip.
+                self.switch_panel(id.as_str().to_string());
+            }
+            // #1427: every remaining `AppShellEvent` variant is likewise a
+            // shell-consumed user interaction — spend the guard and let any
+            // variant quadraui adds later default to the safe direction
+            // (mirrors TUI's identical catch-all).
+            _ => render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut()),
         }
     }
 }
@@ -9822,157 +9985,6 @@ impl quadraui::ShellApp for App {
         Some(current)
     }
 
-    fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
-        use quadraui::AppShellEvent;
-        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
-        // first — see `render::sync_shell_event_shadow`'s rung comment for
-        // why this call has to come before any of the id-specific branching
-        // below rather than be repeated inside each arm. GTK has no id that
-        // needs `ShellShadowSyncHost::panel_absent_from_shadow` to answer
-        // `true` (it has no hamburger panel), so `GtkShellShadowHost` is a
-        // unit struct.
-        {
-            let mut engine = self.engine.borrow_mut();
-            render::sync_shell_event_shadow(event, &mut engine, &GtkShellShadowHost);
-        }
-        match event {
-            AppShellEvent::PanelChanged { panel_id } => {
-                // #1427: the hamburger panel only exists on the `cell`
-                // profile (`Self::shell_config`) — reveal the menu bar
-                // instead of switching to a nonexistent shadow panel.
-                // Mirrors the pre-#1434 TUI shell's `on_shell_event`'s own
-                // hamburger arm, now shared via
-                // `render::route_hamburger_panel_changed`; see its own doc.
-                // A no-op check on GTK/macOS/Win, which never register this
-                // panel id in the first place.
-                if render::route_hamburger_panel_changed(&mut self.engine.borrow_mut(), panel_id) {
-                    self.last_shell_panel = Some(panel_id.clone());
-                    return;
-                }
-                // #1064: record what the runner's own `AppShell` now
-                // believes is active, whether this notification came from
-                // a real click or from `take_requested_panel`'s own echo
-                // below — see `Self::last_shell_panel`'s doc.
-                self.last_shell_panel = Some(panel_id.clone());
-                if std::mem::take(&mut self.suppress_shell_panel_echo) {
-                    // Echo of our own `take_requested_panel` reconciliation:
-                    // the engine already holds this state (an app-initiated
-                    // switch, e.g. a DAP reveal or a panel-focus keyboard
-                    // accelerator) — re-running `switch_panel` below would
-                    // toggle an already-active `ext:` panel back **off**
-                    // (`render::apply_activity_panel_switch`'s
-                    // `already_showing` arm treats a second "click" on the
-                    // active plugin panel as a close).
-                    return;
-                }
-                // #557: plugin-provided panels are now real `PanelDefinition`s
-                // in the runner's `AppShell` (`build_shell_config`), so their
-                // icon clicks arrive here like any built-in panel's. They are
-                // *not* engine-`AppShell` panels though — `render_content`
-                // dispatches on `engine.ext_panel_active`, which
-                // `sync_shell_event_shadow` deliberately leaves untouched for
-                // an `ext:` id (see that function's doc) — so route them
-                // through the existing `switch_panel` handler that owns the
-                // ext-panel focus/toggle bookkeeping.
-                if is_ext_panel_id(panel_id.as_str()) {
-                    // #1427: a real activity-bar click is exactly as much
-                    // "the user moved on" as a keystroke — spend the guard
-                    // (mirrors TUI's identical call in this arm). A no-op
-                    // when never armed (GTK/macOS/Win).
-                    render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
-                    self.switch_panel(panel_id.as_str().to_string());
-                    return;
-                }
-                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
-                // #1360: a built-in panel's activity-bar icon click must move
-                // keyboard focus into that panel, exactly as TUI's own
-                // `PanelChanged` arm does (`focus_sidebar_panel` +
-                // `sidebar.has_focus = true` in the pre-#1434 TUI shell's `on_shell_event`)
-                // — before this, GTK only redrew, so `render::route_focus_key`
-                // (which every keystroke passes through, see
-                // `Self::handle_key_press`'s "Shared focus-owner keyboard
-                // rung") kept reading `sidebar_has_focus() == false` and sent
-                // every subsequent key straight to the editor. `sidebar.
-                // has_focus`/`ext_panel_name` have no GTK equivalent to set —
-                // GTK's `route_focus_key` call passes
-                // `engine.sidebar_has_focus()` itself as the "band" (see
-                // that call site's own comment), so the one engine call
-                // below is the whole fix, and it is the same
-                // already-shared `Engine::focus_sidebar_panel` this method's
-                // own `toggle_focus_search`/`toggle_focus_explorer` already
-                // call for the keyboard-accelerator path.
-                self.engine
-                    .borrow_mut()
-                    .focus_sidebar_panel(panel_id.as_str());
-                self.draw_needed.set(true);
-            }
-            AppShellEvent::SidebarHidden => {
-                // #1427: a real panel's own second click — the hamburger's
-                // is intercepted by `Self::on_shell_event_ctx` before it
-                // ever reaches this ctx-less method (see that method's own
-                // doc) — so spend the guard here too (mirrors TUI).
-                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
-                // #557: this is also how a *second* click on an open
-                // extension panel's icon arrives — `sync_shell_event_shadow`
-                // already dropped the plugin panel's claim (its
-                // `SidebarHidden` arm clears the same two fields
-                // unconditionally). Re-opening still works:
-                // `AppShell::handle_activity_click` reports a click on the
-                // active panel as `PanelChanged`, not `SidebarHidden`, once
-                // the sidebar is hidden.
-                //
-                // #1427: `Engine::clear_sidebar_focus()` — a real second
-                // click must clear the sidebar's own keyboard focus the
-                // same way the keyboard-driven `ActivityBarKeyAction::
-                // Collapse` arm above already does (via the wider
-                // `Engine::collapse_sidebar`, which also touches
-                // `session.explorer_visible` — not appropriate here, since
-                // this arm fires for *any* panel's close, not just
-                // Explorer's), or a subsequent keystroke keeps routing to
-                // whichever sidebar panel last held focus instead of the
-                // editor. A pre-existing gap on every backend (this arm
-                // never cleared focus before), invisible until #1427's own
-                // `App`-on-TUI driver tests started clicking a real panel's
-                // icon twice in a row (reveal, then collapse) — the
-                // pre-#1427 "tui" arm never needed a first click at all,
-                // since Explorer was already the runner's default-active
-                // panel.
-                self.engine.borrow_mut().clear_sidebar_focus();
-                self.draw_needed.set(true);
-            }
-            AppShellEvent::SidebarResized { .. } => {
-                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
-            }
-            AppShellEvent::BottomItemClicked { id } => {
-                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
-                // The runner treats bottom activity-bar items as action
-                // buttons (not sidebar panels), so it never toggles or
-                // hides on its own — it only ever reports the click.
-                // #1057: this used to unconditionally `show_panel`, so a
-                // second click on an already-open bottom item (e.g.
-                // "bottom:settings") re-showed it instead of collapsing the
-                // sidebar like VS Code does for an active-tab click — while
-                // the old, hand-rolled the pre-#1434 TUI shell's `on_shell_event` (same
-                // arm) already ran the toggle. Route through `switch_panel`,
-                // the same shared `render::apply_activity_panel_switch`
-                // call site `PanelChanged`'s ext-panel arm above already
-                // uses, so both backends make the identical toggle decision
-                // from one place instead of drifting again. #1433: this is
-                // no longer "two arms that happen to agree" — `App` is what
-                // TUI dispatches through in production now too, so this one
-                // arm *is* both backends' Settings-bottom-item-toggle
-                // behaviour; there was no remaining fork to reconcile when
-                // auditing this for the flip.
-                self.switch_panel(id.as_str().to_string());
-            }
-            // #1427: every remaining `AppShellEvent` variant is likewise a
-            // shell-consumed user interaction — spend the guard and let any
-            // variant quadraui adds later default to the safe direction
-            // (mirrors TUI's identical catch-all).
-            _ => render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut()),
-        }
-    }
-
     /// #1057: the ctx-aware override TUI's the pre-#1434 TUI shell already had (its
     /// own title-bar sync, quadraui#617) — `App` only implemented the
     /// deprecated ctx-less [`Self::on_shell_event`] until now, so nothing
@@ -10028,8 +10040,7 @@ impl quadraui::ShellApp for App {
             render::route_hamburger_sidebar_hidden(&mut self.engine.borrow_mut(), ctx);
             return;
         }
-        #[allow(deprecated)]
-        self.on_shell_event(event);
+        self.dispatch_shell_event(event);
         // #1356 (quadraui bump for quadraui#1055): a bottom item's click
         // never moves the *real* `AppShell` on its own — the `BottomItemClicked`
         // arm above only toggles the engine-side shadow via `switch_panel`.
@@ -10338,9 +10349,10 @@ mod portable_entry_point_tests {
     /// file, not a vimcode workaround, per `CLAUDE.md`'s Platform-Neutrality
     /// Rule). What this test stands in for a real paint: `tab_visible_counts`
     /// is normally populated by `paint_tab_bars_rung` from
-    /// `bar.hits.available_cols`, the exact geometry
-    /// `render::paint_tab_bars` (shared with TUI, already covered by its own
-    /// driver-tier tests) just painted — here it's pushed by hand to isolate
+    /// `click::tab_bar_available_cols(bar.rect, &bar.layout, ..)`, off the
+    /// exact geometry `render::paint_tab_bars` (shared with TUI, already
+    /// covered by its own driver-tier tests) just painted — here it's pushed
+    /// by hand to isolate
     /// the wiring bug this issue is about from that already-tested paint
     /// step.
     ///
@@ -10414,7 +10426,7 @@ mod portable_entry_point_tests {
 
         let mut app = App::new_headless(Rc::clone(&engine));
         let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
-        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+        app.dispatch_shell_event(&quadraui::AppShellEvent::PanelChanged {
             panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
         });
 

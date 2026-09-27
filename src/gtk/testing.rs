@@ -4693,15 +4693,15 @@ mod sidebar_panel_clicks {
             let hits = hits
                 .as_ref()
                 .expect("the bottom panel must have painted a tab strip");
-            let &(sx, ex) = hits
-                .slot_positions
-                .get(1)
+            let (cx, _cy) = hits
+                .layout
+                .tab_center(1)
                 .expect("Terminal + Debug Output are two painted slots");
             let geom = engine
                 .bottom_panel_geometry
                 .borrow()
                 .expect("the bottom panel must have painted");
-            ((sx + ex) / 2.0, geom.top_y + geom.toolbar_y / 2.0)
+            (hits.origin_x + cx as f64, geom.top_y + geom.toolbar_y / 2.0)
         };
         h.driver.click(slot_x as f32, strip_y as f32);
         h.driver.render();
@@ -4874,14 +4874,14 @@ mod sidebar_panel_clicks {
             let (seg_x, seg_y) = {
                 let engine = h.engine.borrow();
                 let hits = engine.terminal_toolbar_hits.borrow();
-                let crate::core::engine::TerminalToolbarHits::TabStrip(bar_hits) = hits
+                let crate::core::engine::TerminalToolbarHits::TabStrip { layout, origin_x } = hits
                     .as_ref()
                     .expect("the terminal toolbar must have painted a tab strip")
                 else {
                     panic!("expected a tab-strip toolbar before any split exists");
                 };
-                let &(sx, ex) = bar_hits
-                    .right_segment_bounds
+                let seg = layout
+                    .visible_segments
                     .get(1)
                     .expect("AddTab, ToggleSplit, ToggleMaximize, CloseTab must all paint");
                 let geom = engine
@@ -4894,7 +4894,7 @@ mod sidebar_panel_clicks {
                 // what `bottom_panel_tab_strip_click_switches_the_painted_
                 // panel` targets instead.
                 (
-                    (sx + ex) / 2.0,
+                    origin_x + (seg.bounds.x + seg.bounds.width / 2.0) as f64,
                     geom.top_y + (geom.toolbar_y + geom.content_y) / 2.0,
                 )
             };

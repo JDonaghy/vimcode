@@ -4461,10 +4461,22 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     /// tab itself -- neither the title bar (no filename text) nor the
     /// status bar (no `×` to its right) can satisfy both at once.
     fn tab_close_button_center<D: ConformanceDriver>(driver: &D, label_needle: &str) -> (f32, f32) {
+        let close = tab_close_button_bounds(driver, label_needle);
+        (close.x + close.width / 2.0, close.y + close.height / 2.0)
+    }
+
+    /// The full painted bounds of `label_needle`'s tab close (`×`) glyph —
+    /// see [`tab_close_button_center`]'s doc for why both a label run and a
+    /// `×` run to its right, sharing a row, are required to disambiguate it
+    /// from unrelated `×` glyphs (the title-bar close control) or unrelated
+    /// filename runs (the status bar/breadcrumb).
+    fn tab_close_button_bounds<D: ConformanceDriver>(
+        driver: &D,
+        label_needle: &str,
+    ) -> quadraui::Rect {
         let inventory = driver.inventory();
         let runs = inventory.text_runs();
-        let close = runs
-            .iter()
+        runs.iter()
             .filter(|r| r.text.contains(label_needle))
             .find_map(|label| {
                 runs.iter().find(|r| {
@@ -4479,8 +4491,39 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                      painted, on the same row, close button to the right"
                 )
             })
+            .bounds
+    }
+
+    /// Center point of the tab bar's action-menu button (the `⋯` segment
+    /// `build_tab_bar_primitive` always appends last, regardless of overflow
+    /// or which other right segments are showing) — disambiguated from any
+    /// other `⋯` on screen the same way [`tab_close_button_bounds`]
+    /// disambiguates `×`: it must share a row with, and sit to the right of,
+    /// a run containing `label_needle`.
+    fn tab_action_menu_button_center<D: ConformanceDriver>(
+        driver: &D,
+        label_needle: &str,
+    ) -> (f32, f32) {
+        let inventory = driver.inventory();
+        let runs = inventory.text_runs();
+        let btn = runs
+            .iter()
+            .filter(|r| r.text.contains(label_needle))
+            .find_map(|label| {
+                runs.iter().find(|r| {
+                    r.text.contains('\u{22ef}')
+                        && r.bounds.y == label.bounds.y
+                        && r.bounds.x > label.bounds.x
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label_needle:?}'s tab row must paint the action-menu (\u{22ef}) \
+                     button to the label's right"
+                )
+            })
             .bounds;
-        (close.x + close.width / 2.0, close.y + close.height / 2.0)
+        (btn.x + btn.width / 2.0, btn.y + btn.height / 2.0)
     }
 
     // ── Tab arm ──────────────────────────────────────────────────────────
@@ -4562,6 +4605,115 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                  back to the only remaining tab, b1059.txt, on every backend"
             );
         },
+    }
+
+    // ── #1491: click just outside the close glyph selects, doesn't close ──
+    //
+    // Regression coverage for the exact defect `click::tighten_close_bounds`
+    // (deleted by #1491) used to patch by hand: quadraui's pre-#1080
+    // `tab_bar_layout`/`draw_tab_bar` reported a *padded* close-button hit
+    // zone spanning `[label_end, tab_right_edge]` — everything from the end
+    // of the label through the tab's own trailing padding — so a click well
+    // before the × glyph itself closed the tab anyway. quadraui#1080's
+    // `pixel_tab_bar_layout` now reserves only `tab_inner_gap + close_glyph_w`
+    // for the close region on every backend (`TabMeasure::trailing_width`
+    // absorbs the rest), so `TabBarLayout::hit_test` at a point one whole
+    // close-button-width to the left of the tight box's own left edge must
+    // resolve to the tab body, not its close button.
+    crate::backend_conformance! {
+        label: tab_bar_click_just_outside_close_glyph_selects_not_closes,
+        backends: [gtk, tui, tui_prod],
+        engine: two_tab_fixture(),
+        size: (800, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("b1059") && driver.screen_has("a1059"),
+                "precondition: both tabs are painted"
+            );
+
+            let close = tab_close_button_bounds(driver, "a1059");
+            let x = close.x - close.width;
+            let y = close.y + close.height / 2.0;
+            driver.drag(x, y, x, y);
+
+            assert!(
+                driver.screen_has("AAAA_1059_CONTENT") && !driver.screen_has("BBBB_1059_CONTENT"),
+                "a click one close-button-width left of the tight × box must select \
+                 a1059.txt, not miss the tab bar entirely"
+            );
+            assert!(
+                driver.screen_has("a1059") && driver.screen_has("b1059"),
+                "the click must NOT have closed a1059.txt -- both tabs must still be open"
+            );
+        },
+    }
+
+    // ── #1491: overflow + right-segment click ───────────────────────────
+    //
+    // Enough tabs that the strip overflows and scrolls to keep the active
+    // tab visible (`TabBar::fit_active_scroll_offset`, threaded through
+    // quadraui#1080's `pixel_tab_bar_layout` as `corrected_scroll_offset`),
+    // then a click on the always-present action-menu (`⋯`) right segment —
+    // disjoint from the scrolled tab strip, kept together as one
+    // all-or-nothing block per `TabBar::layout`'s overflow policy. Proves
+    // `TabBarLayout::hit_test`'s `visible_segments`/`hit_regions` stay
+    // correct once tabs no longer all fit, not just in the two-tab case
+    // every other scenario in this suite exercises.
+    crate::backend_conformance! {
+        label: tab_bar_overflow_right_segment_click_opens_action_menu,
+        backends: [gtk, tui, tui_prod],
+        engine: overflow_tab_fixture(),
+        size: (500, 480),
+        body: |driver| {
+            assert!(
+                driver.screen_has("OVERFLOW_LAST_CONTENT"),
+                "precondition: the last (active) tab's content is visible"
+            );
+
+            let (cx, cy) = tab_action_menu_button_center(driver, "last1491");
+            driver.drag(cx, cy, cx, cy);
+
+            assert!(
+                driver.screen_has("Close All"),
+                "clicking the tab bar's action-menu button must open the tab \
+                 action menu, even while the strip is scrolled by overflow"
+            );
+        },
+    }
+
+    /// Enough same-editor-group tabs that the strip cannot show them all at
+    /// once (a real, narrow `size: (500, 480)` window rather than a wide one
+    /// makes this reliable on both backends' font metrics). The last tab
+    /// (`last1491`) is opened last, so it's both the active tab AND the one
+    /// `fit_active_scroll_offset` must scroll into view.
+    fn overflow_tab_fixture() -> crate::core::Engine {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1491_tab_bar_overflow_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut engine = crate::core::Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        for i in 0..14 {
+            let path = dir.join(format!("overflow_tab_1491_{i:02}.txt"));
+            std::fs::write(&path, format!("OVERFLOW_{i:02}_CONTENT\n")).unwrap();
+            engine.new_tab(Some(&path));
+        }
+        let last = dir.join("last1491.txt");
+        std::fs::write(&last, "OVERFLOW_LAST_CONTENT\n").unwrap();
+        engine.new_tab(Some(&last));
+        let group = engine.active_group;
+        engine.goto_tab(0); // the seeded scratch tab
+        engine.close_tab();
+        // Closing the (now-active) scratch tab re-picks some neighboring tab
+        // as active -- re-select `last1491.txt` explicitly (mirrors
+        // `two_tab_fixture`'s own `goto_tab` after `close_tab`) rather than
+        // assume which one that re-pick landed on.
+        let last_idx = engine.editor_groups[&group].tabs.len() - 1;
+        engine.goto_tab(last_idx);
+        engine
     }
 
     // ── Split-group coverage (review follow-up) ─────────────────────────

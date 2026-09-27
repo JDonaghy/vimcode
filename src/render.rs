@@ -10,19 +10,19 @@
 // #937's mandatory quadraui pin bump (dbb3023 -> 68f0ef9, needed for
 // `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
 // `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
-// and `TabBarHits`/`SyntaxSpan` (quadraui#822/#823) that this file still uses.
-// #1490 migrated every `draw_status_bar` call site to
-// `draw_status_bar_interactive`; `draw_toolbar`/`draw_sidebar_panel`/
-// `draw_tab_bar`/`SyntaxSpan` are still deprecated and still used here —
-// migrating those to the `_interactive` hover/pressed API and the new
-// `TabBarLayout`/`MinimapSpan` shapes is unrelated, cross-backend follow-up
-// work (the `TabBarHits` follow-up), not part of this file-level allow's
-// removal.
+// and the tab-bar hit struct plus a syntax-highlight span shape (quadraui#822/
+// #823) that this file used. #1490 migrated every `draw_status_bar` call site
+// to `draw_status_bar_interactive`; #1491 migrated every tab-bar paint/measure
+// call site off the now-removed deprecated struct onto `TabBarLayout`.
+// `draw_toolbar`/`draw_sidebar_panel`/the syntax-span shape are still
+// deprecated and still used here — migrating those to the `_interactive`
+// hover/pressed API and its `MinimapSpan`-shaped replacement is unrelated,
+// cross-backend follow-up work, silenced with a narrow `allow` at each
+// remaining call site instead of a file-level one.
 //
 // `dead_code` dropped by #1489: the ~600 lines it was silently covering
 // (two whole dead data pipelines plus five dead helpers) are gone; any new
 // dead code in this file is a real warning again.
-#![allow(deprecated)]
 
 use crate::core::buffer::Buffer;
 use crate::core::engine::sidebar::{
@@ -657,18 +657,25 @@ fn tab_bar_hit_target(hit: quadraui::TabBarHit) -> Option<crate::core::engine::T
     }
 }
 
-/// Resolve a column position (in char cells, relative to the tab bar left
-/// edge) to a `TabBarClickTarget` by hit-testing the `TabBarLayout` paint
-/// already produced — per `feedback_cache_paint_layout`, this reads what
-/// paint produced instead of re-deriving geometry in the click handler.
-/// Row is fixed at `0.0`: every hit region in a `TabBarLayout` spans the
-/// bar's single row (`bar_height = 1.0` at construction), so a column-only
-/// probe lands inside every region's `y` range.
+/// Resolve an x position (relative to the tab bar's left edge, in the
+/// layout's own unit — char cells for the TUI char-cell layout, pixels for a
+/// pixel-accurate GTK paint) to a `TabBarClickTarget` by hit-testing the
+/// `TabBarLayout` paint already produced — per `feedback_cache_paint_layout`,
+/// this reads what paint produced instead of re-deriving geometry in the
+/// click handler. Row is fixed at `0.0`: every hit region in a `TabBarLayout`
+/// spans the bar's single row, so an x-only probe lands inside every
+/// region's `y` range regardless of the layout's `bar_height`.
+///
+/// One function for both the TUI char-cell path (`x` is a whole column,
+/// e.g. `col as f32`) and GTK's pixel-accurate path (#1491 migrated GTK's
+/// own tab-bar click resolution off the deprecated `TabBarHits` onto this
+/// same call, so both backends now share it rather than GTK hand-rolling a
+/// parallel pixel hit-test).
 pub fn resolve_tab_bar_click(
     layout: &quadraui::TabBarLayout,
-    col: u16,
+    x: f32,
 ) -> Option<crate::core::engine::TabBarClickTarget> {
-    tab_bar_hit_target(layout.hit_test(col as f32, 0.0))
+    tab_bar_hit_target(layout.hit_test(x, 0.0))
 }
 
 /// An empty `TabBarLayout` — no tabs, no hit regions — for contexts where no
@@ -9707,12 +9714,17 @@ pub fn paint_bottom_panel_rung(
         engine.terminal_open,
         !screen.bottom_tabs.output_lines.is_empty(),
     );
-    let hits = b.draw_tab_bar(
+    let layout = b.draw_tab_bar_layout(
         quadraui::Rect::new(rect.x, rect.y, rect.width, lh),
         &tab_bar,
         None,
     );
-    engine.bottom_tab_bar_hits.replace(Some(hits));
+    engine.bottom_tab_bar_hits.replace(Some(
+        crate::core::engine::BottomTabStripHits {
+            layout,
+            origin_x: rect.x as f64,
+        },
+    ));
 
     // Rows 2..: the active panel's own toolbar row and body.
     let content_y = rect.y + 2.0 * lh;
@@ -9747,11 +9759,10 @@ pub fn paint_bottom_panel_rung(
                     }
                 }
                 TerminalToolbar::TabStrip(bar) => {
-                    crate::core::engine::TerminalToolbarHits::TabStrip(b.draw_tab_bar(
-                        toolbar_rect,
-                        &bar,
-                        None,
-                    ))
+                    crate::core::engine::TerminalToolbarHits::TabStrip {
+                        layout: b.draw_tab_bar_layout(toolbar_rect, &bar, None),
+                        origin_x: toolbar_rect.x as f64,
+                    }
                 }
             };
             engine.terminal_toolbar_hits.replace(Some(toolbar_hits));
@@ -9909,20 +9920,25 @@ pub fn paint_bottom_panel_rung(
 
 /// One tab bar as [`paint_tab_bars`] left it.
 ///
-/// `hits` is the geometry the rasteriser *actually resolved while painting*,
-/// not a second no-paint measurement of the same bar. That distinction is the
-/// #654/#703 desync in structural form: GTK used to paint with
-/// `draw_tab_bar_icons` and then re-measure with `tab_bar_layout_icons`, two
-/// calls that agree only as long as nobody changes the font, the icon sidecar
-/// or the chrome between them. `Backend::draw_tab_bar_icons` already returns
-/// the same `TabBarHits` type, so the paint's own answer is both cheaper and
-/// impossible to desync.
+/// `layout` is the geometry the rasteriser *actually resolved while
+/// painting*, not a second no-paint measurement of the same bar. That
+/// distinction is the #654/#703 desync in structural form: GTK used to paint
+/// with `draw_tab_bar_icons` and then re-measure with `tab_bar_layout_icons`,
+/// two calls that agree only as long as nobody changes the font, the icon
+/// sidecar or the chrome between them. `Backend::draw_tab_bar_icons_layout`
+/// already returns the same `TabBarLayout` type, so the paint's own answer
+/// is both cheaper and impossible to desync.
+///
+/// `layout`'s own geometry (`visible_tabs`/`visible_segments`/`hit_regions`)
+/// is bar-**relative** (see that type's doc) — callers needing absolute
+/// screen coordinates add `rect`'s own origin back in (#1491; see
+/// `click::GroupTabBarLayoutMap`).
 pub struct PaintedTabBar<'a> {
     pub group_id: GroupId,
     /// The rect the bar was painted into, in the caller's units.
     pub rect: quadraui::Rect,
     pub bar: &'a quadraui::TabBar,
-    pub hits: quadraui::TabBarHits,
+    pub layout: quadraui::TabBarLayout,
 }
 
 /// Paint every editor group's tab bar — the [`EditorOp::TabBars`] rung's whole
@@ -9934,9 +9950,10 @@ pub struct PaintedTabBar<'a> {
 /// is over, so the rasteriser can tint it; TUI passes `None` (it has no
 /// close-glyph hover state).
 ///
-/// Returns one [`PaintedTabBar`] per bar, in paint order. TUI reads
-/// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
-/// `hits` for its pixel hit maps and re-pushes `rect`/`bar` into the separate
+/// Returns one [`PaintedTabBar`] per bar, in paint order. Both backends cache
+/// `rect`/`layout` per group (`click::GroupTabBarLayoutMap`) for hit-testing
+/// and the tab-drop/visible-column engine feedback that used to read
+/// `TabBarHits`; GTK also re-pushes `rect`/`bar` into the separate
 /// `ScreenLayout` it builds a `FrameHitMap` from.
 pub fn paint_tab_bars<'a>(
     backend: &mut dyn quadraui::Backend,
@@ -9950,16 +9967,17 @@ pub fn paint_tab_bars<'a>(
         .into_iter()
         .map(|target| {
             let hover = hovered_close.and_then(|(gid, i)| (gid == target.group_id).then_some(i));
-            // #703: `draw_tab_bar_icons` with an empty sidecar is
-            // byte-identical to `draw_tab_bar` (quadraui's `draw_tab_bar`
-            // literally forwards to it with `&[]`), so the Nerd-Fonts-off
-            // path keeps today's geometry exactly.
-            let hits = backend.draw_tab_bar_icons(target.rect, target.bar, target.icons, hover);
+            // #703: `draw_tab_bar_icons_layout` with an empty sidecar is
+            // byte-identical to `draw_tab_bar_layout` (quadraui's
+            // `draw_tab_bar_layout` literally forwards to it with `&[]`), so
+            // the Nerd-Fonts-off path keeps today's geometry exactly.
+            let layout =
+                backend.draw_tab_bar_icons_layout(target.rect, target.bar, target.icons, hover);
             PaintedTabBar {
                 group_id: target.group_id,
                 rect: target.rect,
                 bar: target.bar,
-                hits,
+                layout,
             }
         })
         .collect()
@@ -12010,6 +12028,10 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     let pressed = engine
         .debug_button_pressed
         .and_then(Engine::debug_button_id);
+    // `draw_toolbar` (quadraui#819) is deprecated in favour of an
+    // `_interactive`-style hover/pressed API this call doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
     engine.debug_toolbar_layout.replace(Some(layout));
 }
@@ -13398,6 +13420,10 @@ pub struct RenderedMinimap {
     /// (rather than one `RenderedMinimap::raw_spans` living beside an
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
+    // `SyntaxSpan` (quadraui#822) is deprecated in favour of a
+    // `MinimapSpan`-shaped replacement this field doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
     /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
     /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
@@ -13766,6 +13792,9 @@ pub fn build_minimap_data(
     if bounds.len() < 2 {
         return None;
     }
+    // `SyntaxSpan` (quadraui#822) is deprecated — unrelated to #1491's
+    // tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for r in 0..bounds.len() - 1 {
         let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
@@ -13825,6 +13854,7 @@ pub fn build_minimap_data(
                     continue;
                 }
                 let c = theme.scope_color(scope);
+                #[allow(deprecated)] // `SyntaxSpan` (quadraui#822); see module doc
                 raw_spans.push(quadraui::SyntaxSpan {
                     line_idx: r,
                     start_col,
@@ -17682,6 +17712,10 @@ pub fn draw_sc_sidebar_panel(
     let panel = sc_sidebar_panel(sc);
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
+    // `draw_sidebar_panel` (quadraui#819) is deprecated in favour of an
+    // `_interactive`-style hover/pressed API this call doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
     engine.sc_panel_layout.replace(Some(layout));
 }

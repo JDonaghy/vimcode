@@ -1,9 +1,7 @@
-// #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
-// module (and its `terminal_ops` child) still reads; migrating to its
-// `TabBarLayout` replacement is an unrelated, cross-backend refactor deferred
-// to a follow-up, so it's silenced here rather than left as a stray warning
-// under `-D warnings`.
-#![allow(deprecated)]
+// #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823), which this
+// module (and its `terminal_ops` child) used to read; #1491 migrated both
+// onto `TabBarLayout::hit_test` instead, so this module needs no
+// deprecation-lint suppression anymore.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -1481,7 +1479,30 @@ pub enum TerminalToolbarHits {
         layout: quadraui::StatusBarLayout,
         origin_x: f64,
     },
-    TabStrip(quadraui::TabBarHits),
+    /// #1491: `layout` is bar-relative (`quadraui::TabBarLayout`'s own
+    /// convention — see that type's doc), unlike the deprecated
+    /// `TabBarHits` this replaced, which was absolute. `origin_x` is the
+    /// toolbar rect's own left edge, so callers shift an absolute click x
+    /// by it before hit-testing (mirrors the `FindBar` arm's `origin_x`
+    /// above).
+    TabStrip {
+        layout: quadraui::TabBarLayout,
+        origin_x: f64,
+    },
+}
+
+/// Cached hit-test data from the last paint of the bottom panel's own
+/// (Terminal / Debug Output) tab strip.
+///
+/// `layout` is bar-relative (see `quadraui::TabBarLayout`'s doc); `origin_x`
+/// is the strip's own absolute left edge (`= rect.x` at paint time), used to
+/// shift an absolute click x into `layout`'s space before hit-testing.
+/// Replaces the deprecated, absolute-coordinate `quadraui::TabBarHits` this
+/// field used to cache (#1491).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BottomTabStripHits {
+    pub layout: quadraui::TabBarLayout,
+    pub origin_x: f64,
 }
 
 /// Cached vertical geometry of the bottom panel (tab bar + toolbar + content),
@@ -3884,7 +3905,7 @@ pub struct Engine {
     pub bottom_panel_kind: BottomPanelKind,
     /// Cached hit regions from the last paint of the bottom panel tab bar.
     /// Written at paint time by both backends; read by click handlers.
-    pub bottom_tab_bar_hits: std::cell::RefCell<Option<quadraui::TabBarHits>>,
+    pub bottom_tab_bar_hits: std::cell::RefCell<Option<BottomTabStripHits>>,
     /// Cached hit data from the last paint of the terminal toolbar (find bar
     /// or tab strip). Written at paint time; read by `resolve_terminal_toolbar_click`.
     pub terminal_toolbar_hits: std::cell::RefCell<Option<TerminalToolbarHits>>,
