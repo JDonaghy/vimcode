@@ -131,8 +131,19 @@ fn hex(s: &str) -> Color {
 /// `quadraui::Color::from_hex`: that upstream function requires the
 /// leading `#` and doesn't accept 3-digit shorthand, both of which
 /// vimcode's settings / custom-theme-file parsing relies on.
+///
+/// #1494: `s.len()` counts bytes, not chars, and the slices below
+/// (`&s[0..2]`, etc.) are byte-index slices — both fine for a genuine hex
+/// string (ASCII-only by definition), but a non-ASCII 6-or-8-byte theme
+/// colour string (e.g. from a corrupt/hostile theme file) used to match
+/// the `6 | 8` arm on byte length alone and then panic slicing mid
+/// UTF-8-char-boundary. Guard on `is_ascii()` first so non-ASCII input
+/// takes the `_ => None` fallback instead.
 fn try_from_hex(s: &str) -> Option<Color> {
     let s = s.trim_start_matches('#');
+    if !s.is_ascii() {
+        return None;
+    }
     let (r, g, b) = match s.len() {
         6 | 8 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -157,6 +168,9 @@ fn try_from_hex(s: &str) -> Option<Color> {
 /// so both share the same `#`-optional / 3-digit-shorthand fallback.
 fn try_from_hex_over(s: &str, bg: Color) -> Option<Color> {
     let s = s.trim_start_matches('#');
+    if !s.is_ascii() {
+        return None;
+    }
     match s.len() {
         8 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -172,56 +186,6 @@ fn try_from_hex_over(s: &str, bg: Color) -> Option<Color> {
         }
         _ => try_from_hex(s),
     }
-}
-
-/// Strip `//` and `/* */` comments from JSON-with-comments (JSONC), as used
-/// by VSCode theme files. Preserves newlines so error positions stay valid.
-fn strip_json_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i] == b'"' {
-            // String literal — copy verbatim until closing quote
-            out.push('"');
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    out.push(bytes[i] as char);
-                    out.push(bytes[i + 1] as char);
-                    i += 2;
-                } else if bytes[i] == b'"' {
-                    out.push('"');
-                    i += 1;
-                    break;
-                } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            // Line comment — skip until newline
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Block comment — skip until */
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                if bytes[i] == b'\n' {
-                    out.push('\n');
-                }
-                i += 1;
-            }
-            i += 2; // skip */
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
 }
 
 // ─── Style / StyledSpan ──────────────────────────────────────────────────────
@@ -1674,35 +1638,6 @@ pub struct PopupAnchor {
     pub viewport: quadraui::Rect,
 }
 
-/// Convert a character-index column to a tab-expanded display column.
-///
-/// Moved here from `tui_main::render_impl` (#1237) so both backends' popup-
-/// anchor math can share it: TUI already expanded tabs before placing the
-/// completion popup, but GTK's equivalent (`App::paint_editor_popups_rung`)
-/// used the raw character column as if it were a display column, which
-/// drifted the popup left of the cursor on tab-indented lines, proportional
-/// to the tab count preceding it. `RenderedWindow::scroll_left` is itself
-/// already in display columns (see `display_col_to_buffer_col`'s doc), so
-/// this must run before any `scroll_left` subtraction, not after.
-pub fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
-    let tabstop = tabstop.max(1);
-    let mut vis = 0usize;
-    for (i, ch) in raw_text.chars().enumerate() {
-        if ch == '\n' || ch == '\r' {
-            break;
-        }
-        if i >= char_col {
-            break;
-        }
-        if ch == '\t' {
-            vis = ((vis / tabstop) + 1) * tabstop;
-        } else {
-            vis += 1;
-        }
-    }
-    vis
-}
-
 /// Resolved `(x, y)` anchor points for each of the five editor-anchored
 /// popups, in the caller's unit scale (`cw`/`lh`: `1.0`/`1.0` for TUI's
 /// cell-native space, the actual pixel char-width/line-height for GTK).
@@ -1737,7 +1672,8 @@ pub struct EditorPopupPoints {
 /// (`App::paint_editor_popups_rung`) as of #1237 — before that each backend
 /// re-derived every one of these five anchor points itself (gutter width,
 /// scroll offset, tab-aware column resolution), and only TUI's completion
-/// anchor happened to call [`char_col_to_visual`] first; the other four
+/// anchor happened to call [`quadraui::text_util::char_col_to_visual`]
+/// first; the other four
 /// anchors on *both* backends, and GTK's completion anchor specifically,
 /// used the raw character column as a display column outright.
 pub fn editor_popup_anchors(
@@ -1763,8 +1699,8 @@ pub fn editor_popup_anchors(
             .get(view_row)
             .map(|l| l.raw_text.as_str())
             .unwrap_or("");
-        let vis_col =
-            char_col_to_visual(raw, char_col, win.tabstop).saturating_sub(scroll_left) as f32;
+        let vis_col = quadraui::text_util::char_col_to_visual(raw, char_col, win.tabstop)
+            .saturating_sub(scroll_left) as f32;
         let x = win_x + win.gutter_char_width as f32 * cw + vis_col * cw;
         let y = win_y + view_row as f32 * lh;
         Some((x, y))
@@ -16152,14 +16088,16 @@ impl Theme {
     /// back onto this struct would silently change which VS Code JSON key
     /// feeds which vimcode field — exactly what "assert rendered chrome
     /// colours match before and after" (#829's acceptance bar) exists to
-    /// catch. `strip_json_comments` and this `colors`-object walk stay
-    /// local for that reason; only the `Color` type itself (this file's
-    /// former `Color` struct, `to_q_color` / `to_quadraui_color`
-    /// conversions) was adopted from quadraui, per #829.
+    /// catch. This `colors`-object walk stays local for that reason;
+    /// only the `Color` type itself (this file's former `Color` struct,
+    /// `to_q_color` / `to_quadraui_color` conversions) was adopted from
+    /// quadraui, per #829. `strip_json_comments` itself has no
+    /// theme-specific semantics — it moved to `quadraui::text_util` in
+    /// #1494.
     pub fn from_vscode_json(path: &std::path::Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
         // VSCode themes often have comments — strip them
-        let data = strip_json_comments(&data);
+        let data = quadraui::text_util::strip_json_comments(&data);
         let val: serde_json::Value = serde_json::from_str(&data).ok()?;
         let colors = val.get("colors");
         let token_colors = val.get("tokenColors");
@@ -20659,15 +20597,6 @@ fn slice_spans_for_segment(
     result
 }
 
-/// Convert a character index within a UTF-8 string to its byte offset.
-/// Returns `s.len()` if `char_idx` is beyond the string length.
-fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_rendered_window(
     engine: &Engine,
@@ -21218,8 +21147,9 @@ fn build_rendered_window(
                 if lines.len() >= visible_lines {
                     break;
                 }
-                let seg_start_byte = char_to_byte_offset(&line_str, seg_start_char);
-                let seg_end_byte = char_to_byte_offset(&line_str, seg_end_char);
+                let seg_start_byte =
+                    quadraui::text_util::char_to_byte_idx(&line_str, seg_start_char);
+                let seg_end_byte = quadraui::text_util::char_to_byte_idx(&line_str, seg_end_char);
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
                 let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
                 let is_cont = seg > 0;
@@ -23904,16 +23834,6 @@ fn command_line_byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
         .unwrap_or_else(|| text.chars().count())
 }
 
-/// The inverse of [`command_line_byte_to_char_idx`] — a character-count
-/// offset converted back to the byte offset `CommandLineLayout::selection_bounds`
-/// expects. Out-of-range indices clamp to `text.len()`.
-fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(text.len())
-}
-
 /// Whether `point` lands inside the painted command-line row, in the same
 /// ABSOLUTE units as `rect` (`Engine::command_line_rect`).
 ///
@@ -24019,8 +23939,8 @@ pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, 
     let lo = sel.0.min(sel.1);
     let hi = sel.0.max(sel.1);
     (
-        command_line_char_to_byte_idx(text, lo),
-        command_line_char_to_byte_idx(text, hi + 1),
+        quadraui::text_util::char_to_byte_idx(text, lo),
+        quadraui::text_util::char_to_byte_idx(text, hi + 1),
     )
 }
 
@@ -26827,13 +26747,24 @@ mod tests {
     }
 
     #[test]
+    fn test_try_from_hex_non_ascii_returns_none_instead_of_panicking() {
+        // #1494: "日本" is 6 *bytes* (two 3-byte UTF-8 chars) but not
+        // ASCII, so it used to match the `6 | 8` byte-length arm and then
+        // panic slicing `&s[0..2]` — byte offset 2 lands inside the first
+        // character, not on a UTF-8 char boundary. Also cover an 8-byte
+        // non-ASCII string, matching `try_from_hex_over`'s `8 =>` arm.
+        assert_eq!(try_from_hex("日本"), None);
+        assert_eq!(try_from_hex_over("日本é", Color::from_rgb(0, 0, 0)), None);
+    }
+
+    #[test]
     fn test_strip_json_comments() {
         let input = r#"{
   // line comment
   "key": "value", /* block */
   "str": "has // no comment"
 }"#;
-        let stripped = strip_json_comments(input);
+        let stripped = quadraui::text_util::strip_json_comments(input);
         let val: serde_json::Value = serde_json::from_str(&stripped).unwrap();
         assert_eq!(val["key"], "value");
         assert_eq!(val["str"], "has // no comment");

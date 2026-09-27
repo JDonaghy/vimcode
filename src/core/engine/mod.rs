@@ -5888,11 +5888,13 @@ fn is_quote_char(ch: char) -> bool {
 
 /// Convert a char index in `s` to a byte offset.
 /// Returns `s.len()` if `char_idx` is at or beyond the end.
+///
+/// #1494: thin wrapper over [`quadraui::text_util::char_to_byte_idx`]
+/// (kept, rather than fully qualifying every call site below, since
+/// `core::engine::keys` pulls this in via `use super::*`) — this used to
+/// be a byte-identical private copy of the upstream helper.
 fn cmd_char_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+    quadraui::text_util::char_to_byte_idx(s, char_idx)
 }
 
 /// occupies when the viewport is `viewport_cols` columns wide.

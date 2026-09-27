@@ -684,6 +684,13 @@ impl DeferredQueue {
 /// `text_metrics_handle()`-style accessor, mirroring `modal_stack_handle()`/
 /// `drag_state_handle()`), tracked as the follow-up this issue's report
 /// files against `JDonaghy/quadraui`.
+/// #1494: quadraui's own `Backend` supertrait gained default
+/// `set_current_line_height`/`set_current_char_width` methods (same names,
+/// `f32` instead of this trait's `f64`) in the rev bumped for that issue,
+/// so every call site through a `dyn TextMetricsBackend` / generic `B:
+/// TextMetricsBackend` is now ambiguous between the two and must be
+/// fully-qualified (`TextMetricsBackend::set_current_line_height(&mut b,
+/// ..)`) rather than called as `b.set_current_line_height(..)`.
 pub(crate) trait TextMetricsBackend: quadraui::Backend {
     fn set_current_line_height(&mut self, line_height: f64);
     fn set_current_char_width(&mut self, char_width: f64);
@@ -3182,8 +3189,8 @@ impl App {
                 let metrics = self.cached_ai_chat_metrics.get();
                 {
                     let mut b = backend_rc.borrow_mut();
-                    b.set_current_line_height(metrics.0);
-                    b.set_current_char_width(metrics.1);
+                    TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
+                    TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
                 }
                 let still_focused = render::route_ai_chat_event(
                     &mut engine,
@@ -6652,8 +6659,8 @@ impl App {
         let metrics = self.cached_explorer_metrics.get();
         let backend_rc = self.backend.clone();
         let mut b = backend_rc.borrow_mut();
-        b.set_current_line_height(metrics.0);
-        b.set_current_char_width(metrics.1);
+        TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
+        TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
             render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
@@ -7233,8 +7240,8 @@ impl App {
         let metrics = self.cached_ai_chat_metrics.get();
         {
             let mut b = backend_rc.borrow_mut();
-            b.set_current_line_height(metrics.0);
-            b.set_current_char_width(metrics.1);
+            TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
+            TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
         }
         render::route_ai_chat_event(
             &mut engine,

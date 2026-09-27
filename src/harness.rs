@@ -1497,8 +1497,8 @@ pub(crate) fn assert_text_metrics_backend_applies_metrics<B: TextMetricsBackend>
     const LINE_HEIGHT: f64 = 971.25;
     const CHAR_WIDTH: f64 = 483.5;
 
-    backend.set_current_line_height(LINE_HEIGHT);
-    backend.set_current_char_width(CHAR_WIDTH);
+    TextMetricsBackend::set_current_line_height(backend, LINE_HEIGHT);
+    TextMetricsBackend::set_current_char_width(backend, CHAR_WIDTH);
 
     assert_eq!(
         backend.line_height(),
