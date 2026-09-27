@@ -18473,7 +18473,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
 /// data. Section 0 is the Form (query/replace/toggles/buttons/status);
 /// Section 1 is the TreeView (results grouped by file). Call once per
 /// frame before `sidebar.render()`.
-pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
+pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, theme: &Theme) {
     use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
     use quadraui::{Badge, Decoration, Form, FormField, StyledSpan, StyledText, TreeRow, WidgetId};
 
@@ -18649,7 +18649,11 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                     spans: vec![
                         StyledSpan {
                             text: line_prefix,
-                            fg: Some(quadraui::Color::rgb(100, 100, 100)),
+                            // #1574: was a hard-coded `rgb(100, 100, 100)`
+                            // literal — unreadable on light colourschemes.
+                            // Use the same muted tone the gutter's own line
+                            // numbers paint with.
+                            fg: Some(theme.line_number_fg),
                             bg: None,
                             bold: false,
                             italic: false,
@@ -23319,6 +23323,27 @@ pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
     to_quadraui_theme_editor(theme, chrome)
 }
 
+/// #1574: this literal is **exhaustive on purpose** — no
+/// `..quadraui::Theme::default()` spread. Every `quadraui::Theme` field
+/// vimcode's rasterisers paint with must come from vimcode's own themed
+/// palette; a spread here would let a newly-added quadraui `Theme` field
+/// silently fall back to quadraui's hardcoded dark default (exactly how
+/// `inactive_selected_bg` shipped unmapped, painting `#333` text on a dark
+/// navy `(35,40,58)` unfocused-selection row under `vscode-light`) instead
+/// of failing the build with `error[E0063]: missing field`. quadraui's own
+/// `theme.rs` uses the identical exhaustive-literal technique for exactly
+/// this reason — that one guards its downstream consumers (e.g. what
+/// caught `tab_active_border_top` for `coord-tui`, #620) rather than a
+/// consumer's own mapping, but the compile-time guarantee is the same one
+/// this literal now gives vimcode. Adding a field to `quadraui::Theme` is
+/// a compile error here until it's mapped (or deliberately assigned a
+/// documented vimcode-side value below) — that is the point.
+///
+/// Some fields below (`editor_active_background` through `ghost_text_fg`)
+/// are immediately re-asserted by [`to_quadraui_theme_editor`]'s own
+/// `..chrome` struct-update — they're set here too, to the same value,
+/// purely so this literal stays exhaustive; there is no drift risk
+/// because both sites read the identical `theme.*` field.
 fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
     quadraui::Theme {
         background: theme.background,
@@ -23333,6 +23358,11 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         surface_bg: theme.fuzzy_bg,
         surface_fg: theme.fuzzy_fg,
         selected_bg: theme.fuzzy_selected_bg,
+        // #1574: was missing entirely (fell through to quadraui's dark
+        // `Theme::default()` navy) — this is the Explorer's
+        // unfocused-selected-row background (`sidebar_sel_bg_inactive`,
+        // e4e6f1 under vscode-light).
+        inactive_selected_bg: theme.sidebar_sel_bg_inactive,
         border_fg: theme.fuzzy_border,
         title_fg: theme.fuzzy_title_fg,
         header_bg: theme.status_bg,
@@ -23355,7 +23385,11 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         completion_border: theme.completion_border,
         completion_selected_bg: theme.completion_selected_bg,
         accent_bg: theme.tab_active_accent,
-        scrollbar_track: theme.separator,
+        // #1574: was `theme.separator` — vimcode has its own dedicated
+        // `scrollbar_track` field (distinct from `separator` in every
+        // colourscheme); using it directly is both more correct and
+        // consistent with `scrollbar_thumb` just below.
+        scrollbar_track: theme.scrollbar_track,
         scrollbar_thumb: theme.scrollbar_thumb,
         // #1185: quadraui's `command_line_{bg,fg}` default to its own
         // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
@@ -23368,7 +23402,68 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         // to read `theme.command_{fg,bg}` by hand).
         command_line_bg: theme.command_bg,
         command_line_fg: theme.command_fg,
-        ..quadraui::Theme::default()
+
+        // ── Editor lift fields — real values set (again) by
+        // `to_quadraui_theme_editor`'s `..chrome` update below. Present
+        // here only so this literal is exhaustive (see doc comment above);
+        // read the doc on each corresponding field in
+        // `to_quadraui_theme_editor` for the actual rationale.
+        editor_active_background: theme.active_background,
+        cursorline_bg: theme.cursorline_bg,
+        dap_stopped_bg: theme.dap_stopped_bg,
+        colorcolumn_bg: theme.colorcolumn_bg,
+        diff_added_bg: theme.diff_added_bg,
+        diff_removed_bg: theme.diff_removed_bg,
+        diff_padding_bg: theme.diff_padding_bg,
+        line_number_fg: theme.line_number_fg,
+        line_number_active_fg: theme.line_number_active_fg,
+        diagnostic_error: theme.diagnostic_error,
+        diagnostic_warning: theme.diagnostic_warning,
+        diagnostic_info: theme.diagnostic_info,
+        diagnostic_hint: theme.diagnostic_hint,
+        git_added: theme.git_added,
+        git_modified: theme.git_modified,
+        git_deleted: theme.git_deleted,
+        lightbulb: theme.lightbulb,
+        spell_error: theme.spell_error,
+        cursor: theme.cursor,
+        cursor_normal_alpha: theme.cursor_normal_alpha as f32,
+        selection: theme.selection,
+        selection_alpha: theme.selection_alpha as f32,
+        yank_highlight_bg: theme.yank_highlight_bg,
+        yank_highlight_alpha: theme.yank_highlight_alpha as f32,
+        bracket_match_bg: theme.bracket_match_bg,
+        indent_guide_fg: theme.indent_guide_fg,
+        indent_guide_active_fg: theme.indent_guide_active_fg,
+        annotation_fg: theme.annotation_fg,
+        ghost_text_fg: theme.ghost_text_fg,
+
+        // ── Board / kanban (#362) — vimcode's `PANEL_BOARD` /
+        // `Backend::draw_board` (#521) were never given their own theme
+        // mapping (#1574 audit); reuse the closest existing semantic
+        // colour rather than leaving them on quadraui's dark default.
+        // Board's selected-card / column-header look like a ListView
+        // selection / a flat header strip respectively, so the same
+        // source fields as `selected_bg`/`header_bg` above apply.
+        board_selected_card_bg: theme.fuzzy_selected_bg,
+        board_col_header_bg: theme.status_bg,
+        // `BadgeStatus` has no vimcode-native equivalent; map onto the
+        // nearest existing semantic colour rather than inventing new
+        // theme fields (one per colourscheme) for a status vocabulary
+        // vimcode doesn't otherwise have:
+        //   running  -> lightbulb (amber "in progress" cue, distinct
+        //               from the warning tone below)
+        //   passed   -> git_added (green)
+        //   warning  -> diagnostic_warning (amber/orange)
+        //   blocked  -> diagnostic_error (red)
+        badge_running: theme.lightbulb,
+        badge_passed: theme.git_added,
+        badge_warning: theme.diagnostic_warning,
+        badge_blocked: theme.diagnostic_error,
+        // `BoardCard::hint` is a callout strip — closest existing
+        // surface is the hover/tooltip popup.
+        card_hint_bg: theme.hover_bg,
+        card_hint_fg: theme.hover_fg,
     }
 }
 
@@ -25709,6 +25804,162 @@ pub fn tab_drop_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── quadraui theme mapping (#1574) ────────────────────────────────────
+    //
+    // `to_quadraui_theme` (and its `_chrome`/`_editor` halves) is the single
+    // place vimcode's rich `render::Theme` is narrowed down to the small
+    // `quadraui::Theme` every rasteriser actually paints with. Before #1574,
+    // three of its fields were wrong or missing entirely and fell through to
+    // quadraui's own hardcoded dark `Theme::default()` — this is the
+    // regression test for that class of bug, not just the two named fields
+    // the issue reported.
+
+    /// The two concrete bugs #1574 reported: `inactive_selected_bg` was
+    /// never set at all (falling through to quadraui's dark
+    /// `Theme::default()`, `rgb(35, 40, 58)`, painted behind `#333` text —
+    /// unreadable), and `scrollbar_track` was mapped to `theme.separator`
+    /// instead of vimcode's own dedicated `theme.scrollbar_track` field.
+    /// Both are asserted against `vscode_light`, whose values for these
+    /// fields are nothing like quadraui's dark defaults, so a regression
+    /// back to either bug fails loudly here instead of only looking wrong
+    /// on screen.
+    #[test]
+    fn to_quadraui_theme_maps_inactive_selected_bg_and_scrollbar_track_from_vimcode_theme() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+        let default = quadraui::Theme::default();
+
+        assert_eq!(q.inactive_selected_bg, theme.sidebar_sel_bg_inactive);
+        assert_ne!(q.inactive_selected_bg, default.inactive_selected_bg);
+
+        assert_eq!(q.scrollbar_track, theme.scrollbar_track);
+        assert_ne!(q.scrollbar_track, default.scrollbar_track);
+    }
+
+    /// The remaining unmapped keys #1574 audited (`badge_*`, `board_*`,
+    /// `card_hint_*`) — every one must trace back to a vimcode theme field
+    /// rather than silently keeping quadraui's dark default, the same way
+    /// `inactive_selected_bg` did before this issue.
+    #[test]
+    fn to_quadraui_theme_maps_badge_board_and_card_hint_keys_from_vimcode_theme() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+        let default = quadraui::Theme::default();
+
+        assert_eq!(q.board_selected_card_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.board_col_header_bg, theme.status_bg);
+        assert_eq!(q.badge_running, theme.lightbulb);
+        assert_eq!(q.badge_passed, theme.git_added);
+        assert_eq!(q.badge_warning, theme.diagnostic_warning);
+        assert_eq!(q.badge_blocked, theme.diagnostic_error);
+        assert_eq!(q.card_hint_bg, theme.hover_bg);
+        assert_eq!(q.card_hint_fg, theme.hover_fg);
+
+        // None of these six keys' `vscode_light` values happen to coincide
+        // with quadraui's own dark default — if they ever silently fell
+        // back to it (e.g. a future field addition landing behind a
+        // reintroduced `..Theme::default()` spread), this would catch it.
+        assert_ne!(q.board_selected_card_bg, default.board_selected_card_bg);
+        assert_ne!(q.board_col_header_bg, default.board_col_header_bg);
+        assert_ne!(q.badge_running, default.badge_running);
+        assert_ne!(q.badge_passed, default.badge_passed);
+        assert_ne!(q.badge_warning, default.badge_warning);
+        assert_ne!(q.badge_blocked, default.badge_blocked);
+        assert_ne!(q.card_hint_bg, default.card_hint_bg);
+        assert_ne!(q.card_hint_fg, default.card_hint_fg);
+    }
+
+    /// Every field on `quadraui::Theme` must be reachable from
+    /// `to_quadraui_theme`'s output via *some* vimcode `Theme` field — this
+    /// is the structural half of #1574: `to_quadraui_theme_chrome`'s struct
+    /// literal has no `..quadraui::Theme::default()` spread any more, so a
+    /// future field added upstream is a compile error here (`E0063`) until
+    /// it's mapped, rather than a silent dark leak discovered by eye later.
+    /// This test pins the full mapping table so a regression on any single
+    /// field (not just the ones called out above) is caught.
+    #[test]
+    fn to_quadraui_theme_maps_every_field_from_vscode_light() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+
+        assert_eq!(q.background, theme.background);
+        assert_eq!(q.foreground, theme.foreground);
+        assert_eq!(q.tab_bar_bg, theme.tab_bar_bg);
+        assert_eq!(q.tab_active_bg, theme.tab_active_bg);
+        assert_eq!(q.tab_active_fg, theme.tab_active_fg);
+        assert_eq!(q.tab_inactive_fg, theme.tab_inactive_fg);
+        assert_eq!(q.tab_preview_active_fg, theme.tab_preview_active_fg);
+        assert_eq!(q.tab_preview_inactive_fg, theme.tab_preview_inactive_fg);
+        assert_eq!(q.separator, theme.separator);
+        assert_eq!(q.surface_bg, theme.fuzzy_bg);
+        assert_eq!(q.surface_fg, theme.fuzzy_fg);
+        assert_eq!(q.selected_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.inactive_selected_bg, theme.sidebar_sel_bg_inactive);
+        assert_eq!(q.border_fg, theme.fuzzy_border);
+        assert_eq!(q.title_fg, theme.fuzzy_title_fg);
+        assert_eq!(q.header_bg, theme.status_bg);
+        assert_eq!(q.header_fg, theme.status_fg);
+        assert_eq!(q.muted_fg, theme.line_number_fg);
+        assert_eq!(q.error_fg, theme.diagnostic_error);
+        assert_eq!(q.warning_fg, theme.diagnostic_warning);
+        assert_eq!(q.query_fg, theme.fuzzy_query_fg);
+        assert_eq!(q.match_fg, theme.fuzzy_match_fg);
+        assert_eq!(q.accent_fg, theme.cursor);
+        assert_eq!(q.hover_bg, theme.hover_bg);
+        assert_eq!(q.hover_fg, theme.hover_fg);
+        assert_eq!(q.hover_border, theme.hover_border);
+        assert_eq!(q.input_bg, theme.completion_bg);
+        assert_eq!(q.inactive_fg, theme.status_inactive_fg);
+        assert_eq!(q.selection_bg, theme.selection);
+        assert_eq!(q.link_fg, theme.md_link);
+        assert_eq!(q.completion_bg, theme.completion_bg);
+        assert_eq!(q.completion_fg, theme.completion_fg);
+        assert_eq!(q.completion_border, theme.completion_border);
+        assert_eq!(q.completion_selected_bg, theme.completion_selected_bg);
+        assert_eq!(q.accent_bg, theme.tab_active_accent);
+        assert_eq!(q.scrollbar_track, theme.scrollbar_track);
+        assert_eq!(q.scrollbar_thumb, theme.scrollbar_thumb);
+        assert_eq!(q.command_line_bg, theme.command_bg);
+        assert_eq!(q.command_line_fg, theme.command_fg);
+        assert_eq!(q.editor_active_background, theme.active_background);
+        assert_eq!(q.cursorline_bg, theme.cursorline_bg);
+        assert_eq!(q.dap_stopped_bg, theme.dap_stopped_bg);
+        assert_eq!(q.colorcolumn_bg, theme.colorcolumn_bg);
+        assert_eq!(q.diff_added_bg, theme.diff_added_bg);
+        assert_eq!(q.diff_removed_bg, theme.diff_removed_bg);
+        assert_eq!(q.diff_padding_bg, theme.diff_padding_bg);
+        assert_eq!(q.line_number_fg, theme.line_number_fg);
+        assert_eq!(q.line_number_active_fg, theme.line_number_active_fg);
+        assert_eq!(q.diagnostic_error, theme.diagnostic_error);
+        assert_eq!(q.diagnostic_warning, theme.diagnostic_warning);
+        assert_eq!(q.diagnostic_info, theme.diagnostic_info);
+        assert_eq!(q.diagnostic_hint, theme.diagnostic_hint);
+        assert_eq!(q.git_added, theme.git_added);
+        assert_eq!(q.git_modified, theme.git_modified);
+        assert_eq!(q.git_deleted, theme.git_deleted);
+        assert_eq!(q.lightbulb, theme.lightbulb);
+        assert_eq!(q.spell_error, theme.spell_error);
+        assert_eq!(q.cursor, theme.cursor);
+        assert_eq!(q.cursor_normal_alpha, theme.cursor_normal_alpha as f32);
+        assert_eq!(q.selection, theme.selection);
+        assert_eq!(q.selection_alpha, theme.selection_alpha as f32);
+        assert_eq!(q.yank_highlight_bg, theme.yank_highlight_bg);
+        assert_eq!(q.yank_highlight_alpha, theme.yank_highlight_alpha as f32);
+        assert_eq!(q.bracket_match_bg, theme.bracket_match_bg);
+        assert_eq!(q.indent_guide_fg, theme.indent_guide_fg);
+        assert_eq!(q.indent_guide_active_fg, theme.indent_guide_active_fg);
+        assert_eq!(q.annotation_fg, theme.annotation_fg);
+        assert_eq!(q.ghost_text_fg, theme.ghost_text_fg);
+        assert_eq!(q.board_selected_card_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.board_col_header_bg, theme.status_bg);
+        assert_eq!(q.badge_running, theme.lightbulb);
+        assert_eq!(q.badge_passed, theme.git_added);
+        assert_eq!(q.badge_warning, theme.diagnostic_warning);
+        assert_eq!(q.badge_blocked, theme.diagnostic_error);
+        assert_eq!(q.card_hint_bg, theme.hover_bg);
+        assert_eq!(q.card_hint_fg, theme.hover_fg);
+    }
 
     // ─── Test-only geometry/key helpers (#812) ────────────────────────────
     //
