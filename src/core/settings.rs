@@ -3490,6 +3490,16 @@ impl Settings {
     /// `defaults` never overrides it again on a later launch even if a
     /// future quadraui release changes this backend's own convention.
     ///
+    /// `font_family` and `font_size` are resolved **independently of each
+    /// other**, each against its own sentinel (`default_font_family()`/
+    /// `default_font_size()`) — never jointly. `zoomin`/`zoomout`
+    /// (`src/core/engine/execute.rs`) mutate only `font_size`, so a joint
+    /// "both still at their sentinel" check would make the very first zoom
+    /// keystroke desync `font_family` back to the raw stored literal on any
+    /// backend whose native family differs from vimcode's compile-time
+    /// `"Monospace"`/`14` (macOS `Menlo`/`12`, Windows `Consolas`/`14`) —
+    /// see #1542's review history for the exact repro.
+    ///
     /// `default_family`/`default_size_pt` are read straight off
     /// `Backend::default_fonts()` — [`quadraui::PlatformFontDefaults`] is
     /// `#[non_exhaustive]` with no public constructor (deliberately: a
@@ -3515,11 +3525,17 @@ impl Settings {
         if default_family.is_empty() || default_size_pt <= 0.0 {
             return (self.font_family.clone(), self.font_size as f32);
         }
-        if self.font_family == default_font_family() && self.font_size == default_font_size() {
-            (default_family.to_string(), default_size_pt)
+        let family = if self.font_family == default_font_family() {
+            default_family.to_string()
         } else {
-            (self.font_family.clone(), self.font_size as f32)
-        }
+            self.font_family.clone()
+        };
+        let size_pt = if self.font_size == default_font_size() {
+            default_size_pt
+        } else {
+            self.font_size as f32
+        };
+        (family, size_pt)
     }
 
     /// Effective UI/chrome font size in points — `ui_font_size`'s twin of
@@ -4530,6 +4546,50 @@ mod tests {
         let (family, size_pt) = settings.effective_editor_font("Menlo", 12.0);
         assert_eq!(family, "JetBrains Mono");
         assert_eq!(size_pt, 16.0);
+    }
+
+    /// #1542 review fix: `font_family` and `font_size` must resolve
+    /// **independently**, not jointly. `zoomin`/`zoomout`
+    /// (`src/core/engine/execute.rs`) mutate only `font_size`, so simulate
+    /// that here — a customized `font_size` alone must not knock a still
+    /// un-customized `font_family` back to the raw stored sentinel
+    /// (`"Monospace"`). Before this fix, the joint `&&` check made this
+    /// return `("Monospace", 15.0)` instead of `("Menlo", 15.0)` — i.e. the
+    /// macOS zoomin bug from the review.
+    ///
+    /// RED-verified against the pre-fix joint check: reverting the
+    /// independent per-field resolution back to `if self.font_family ==
+    /// default_font_family() && self.font_size == default_font_size()`
+    /// makes this assertion fail (`family` comes back `"Monospace"`).
+    #[test]
+    fn effective_editor_font_resolves_family_and_size_independently() {
+        let mut settings = Settings::default();
+        // Only `font_size` diverges from its sentinel, exactly as
+        // `zoomin`/`zoomout` do — `font_family` is left untouched.
+        settings.font_size = 15;
+        let (family, size_pt) = settings.effective_editor_font("Menlo", 12.0);
+        assert_eq!(
+            family, "Menlo",
+            "an untouched font_family must still resolve to the backend default \
+             even when font_size alone has been customized"
+        );
+        assert_eq!(size_pt, 15.0, "the customized font_size must win verbatim");
+
+        // Mirror image: only `font_family` diverges (e.g. `:set guifont`),
+        // `font_size` is left untouched — must still resolve to the
+        // backend's default size.
+        let mut settings = Settings::default();
+        settings.font_family = "Consolas".to_string();
+        let (family, size_pt) = settings.effective_editor_font("Menlo", 12.0);
+        assert_eq!(
+            family, "Consolas",
+            "the customized font_family must win verbatim"
+        );
+        assert_eq!(
+            size_pt, 12.0,
+            "an untouched font_size must still resolve to the backend default \
+             even when font_family alone has been customized"
+        );
     }
 
     /// A fixed-cell backend (TUI) reports [`quadraui::PlatformFontDefaults`]'s
