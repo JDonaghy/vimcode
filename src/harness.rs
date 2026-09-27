@@ -1957,12 +1957,15 @@ where
 ///
 /// `engine`/`size`/`body` are each re-evaluated once per backend arm (not
 /// shared across them) — the intended shape, since every existing fixture
-/// in this repo that touches the filesystem (`scratch_dir`/
-/// `scratch_explorer_dir` helpers) already disambiguates by
-/// `std::thread::current().id()`, and `cargo test` runs each generated
+/// in this repo that touches the filesystem builds its scratch path with
+/// [`scratch_dir`], which disambiguates by `std::thread::current().id()`
+/// *and* `std::process::id()`, and `cargo test` runs each generated
 /// `#[test]` fn on its own thread, so two backends' arms never collide on
 /// the same path even though this macro duplicates the fixture-building
-/// expression textually.
+/// expression textually. The process id matters as much as the thread id —
+/// see [`scratch_dir`]'s own doc for the cross-process collision (two
+/// concurrent `cargo test` runs on one machine) that used to make these
+/// fixtures flaky.
 ///
 /// `#[macro_export]` (rather than a manual `pub(crate) use`) so the `@arm`
 /// recursive expansion below can call itself via `$crate::backend_conformance!`
@@ -2036,9 +2039,75 @@ fn gtk_or_tui_probe_harness(
     crate::tui_main::testing::conformance_harness(engine, 80, 24)
 }
 
+/// Scratch directory for a filesystem-touching test fixture, keyed on
+/// **both** the process id and the calling thread's id.
+///
+/// The thread id alone (what these fixtures used before #1498) only
+/// disambiguates *within* one test binary. `cargo test` hands every
+/// `#[test]` its own thread, so that was enough for two backend arms of the
+/// same `backend_conformance!` scenario — but it is **not** enough when two
+/// `cargo test` runs execute concurrently on one machine (two git
+/// worktrees, a coordinator running several workers, a local run racing CI
+/// on a shared box). Both processes then derive the *same* `/tmp` path, and
+/// each fixture opens with `remove_dir_all` — so one run deletes the
+/// other's fixture out from under it, mid-test.
+///
+/// That is a real, reproduced failure, not a theoretical one: running
+/// `sc_content_row_click_still_opens_it_when_hint_reserved_gtk` in two
+/// processes at once fails ~4% of the time (3 of 80 runs) with "must still
+/// open exactly that file" — the competing process deleted the file between
+/// this one's fixture write and its click — which reads exactly like a
+/// hit-band regression in the code under test. Including
+/// `std::process::id()`, as the newer fixtures in this file already do
+/// ([`make_conflicted_repo`], `engine_with_dnd_explorer_fixture`,
+/// `engine_with_folder_ctx_menu`, `engine_with_scoped_grep_ctx_menu`),
+/// makes the path per-process and the collision impossible.
+#[cfg(test)]
+pub(crate) fn scratch_dir(prefix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards the invariant [`scratch_dir`]'s doc exists for: the path must
+    /// be keyed on the *process* as well as the thread, so two concurrent
+    /// `cargo test` runs on one machine cannot derive the same `/tmp`
+    /// directory and `remove_dir_all` each other's fixture mid-test.
+    ///
+    /// RED against the pre-fix fixtures: they interpolated only
+    /// `std::thread::current().id()`, so the pid assertion below fails.
+    #[test]
+    fn scratch_dir_is_unique_per_process_and_thread() {
+        let mine = scratch_dir("vimcode_scratch_probe");
+        let name = mine.file_name().unwrap().to_string_lossy().into_owned();
+
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "scratch path must carry the pid so two concurrent test \
+             processes get different dirs, got {name}"
+        );
+        assert!(
+            name.contains(&format!("{:?}", std::thread::current().id())),
+            "scratch path must still carry the thread id so two backend \
+             arms in one process get different dirs, got {name}"
+        );
+
+        // A second thread in *this* process must also get its own path —
+        // the property `backend_conformance!`'s per-arm fixtures rely on.
+        let other = std::thread::spawn(|| scratch_dir("vimcode_scratch_probe"))
+            .join()
+            .unwrap();
+        assert_ne!(
+            mine, other,
+            "two threads in one process must not share a scratch dir"
+        );
+    }
 
     /// A minimal engine fixture for the cross-backend proof slice below:
     /// an explorer rooted at a scratch dir, with the root and `src`
@@ -2050,14 +2119,12 @@ mod tests {
     /// module's proof slice doesn't reach into another backend's file.
     ///
     /// `tag` must be distinct per caller (this fn is called once per
-    /// generated backend arm below) — combined with the calling thread's
-    /// id, per `backend_conformance!`'s own doc on why that's enough to
-    /// avoid two backends' arms colliding on the same scratch directory.
+    /// generated backend arm below) — combined with [`scratch_dir`]'s
+    /// process id + thread id, per `backend_conformance!`'s own doc on why
+    /// that's enough to avoid two backends' arms (or two concurrent
+    /// `cargo test` processes) colliding on the same scratch directory.
     fn engine_with_expanded_explorer(tag: &str) -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_982_harness_proof_{tag}_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = scratch_dir(&format!("vimcode_test_982_harness_proof_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src").join("core")).unwrap();
 
@@ -2144,10 +2211,7 @@ mod tests {
     // failed — `screen_has("Press '?' for help")` was false even though
     // `sc.has_focus` was true, reproducing the issue's own "Actual" table.
     fn engine_with_sc_panel(tag: &str, focused: bool) -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1361_sc_hint_{tag}_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = scratch_dir(&format!("vimcode_test_1361_sc_hint_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::process::Command::new("git")
@@ -2295,10 +2359,7 @@ mod tests {
         file_name: &str,
         marker: &str,
     ) -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1361_sc_row_{tag}_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = scratch_dir(&format!("vimcode_test_1361_sc_row_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::process::Command::new("git")
@@ -2819,14 +2880,12 @@ mod issue_984_explorer_chevron_needs_a_double_click {
     /// depending on a name that happens to fit today.
     ///
     /// `tag` must be distinct per caller (each backend's `#[test]` below
-    /// calls this once) -- combined with the calling thread's id, same
-    /// disambiguation rule `backend_conformance!`'s own doc spells out for
-    /// every other filesystem-touching fixture in this module.
+    /// calls this once) -- combined with [`crate::harness::scratch_dir`]'s
+    /// process id + thread id, same disambiguation rule
+    /// `backend_conformance!`'s own doc spells out for every other
+    /// filesystem-touching fixture in this module.
     fn engine_with_collapsed_explorer_dir(tag: &str) -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_984_explorer_chevron_{tag}_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = crate::harness::scratch_dir(&format!("vimcode_test_984_explorer_chevron_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("kkxxqq_dir984")).unwrap();
         std::fs::write(dir.join("kkxxqq_dir984").join("child984mk"), b"").unwrap();
@@ -4468,10 +4527,7 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     /// seeded scratch tab is closed immediately so exactly two tabs remain:
     /// `a1059.txt` at index 0 (inactive), `b1059.txt` at index 1 (active).
     fn two_tab_fixture() -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1059_tab_bar_dispatch_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = crate::harness::scratch_dir("vimcode_test_1059_tab_bar_dispatch");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a1059.txt");
@@ -4817,10 +4873,7 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     /// scenario's "the first tab is off screen" precondition holds on every
     /// arm rather than only the pixel-metric one.
     fn overflow_tab_fixture() -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1491_tab_bar_overflow_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = crate::harness::scratch_dir("vimcode_test_1491_tab_bar_overflow");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -4875,10 +4928,7 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     // *non-active* (left) group's tab bar row is hit-tested and dispatched by
     // the split branch specifically.
     fn split_two_group_fixture() -> crate::core::Engine {
-        let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1059_split_tab_bar_dispatch_{:?}",
-            std::thread::current().id()
-        ));
+        let dir = crate::harness::scratch_dir("vimcode_test_1059_split_tab_bar_dispatch");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let left_a = dir.join("left_a1059.txt");
