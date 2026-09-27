@@ -582,3 +582,114 @@ this same PR, see that file's new §2c).
 > `resize`/`terminal()` accessor. The full draft text lives in that issue
 > now. It blocks no open vimcode issue; it exists so a future resize/TOCTOU
 > regression has a driver-tier repro path.
+
+---
+
+## Win-GUI `draw_editor`'s block cursor paints over the glyph underneath instead of re-painting it, unlike `macos::editor::draw_editor` (blocks vimcode#1559)
+
+**Title:** `win::editor::draw_editor`'s `CursorShape::Block` arm fills an
+opaque `bg.blend(theme.cursor, …)` rectangle *after* text is painted and never
+redraws the covered glyph — `macos::editor::draw_editor` already re-paints it
+in `theme.background` on top of the same fill
+
+**Body:**
+
+vimcode#1559 reports that on Windows, the NORMAL-mode block cursor **hides**
+the character underneath it: a buffer containing `1789518172522` renders as
+`█789518172522` with the cursor on column 1. The macOS build of the identical
+commit keeps the character visible inside the block. Root-caused by reading
+both rasterisers at the pinned rev (`9f8766d3`, `Cargo.toml`'s current pin):
+
+`quadraui/src/win/editor.rs::draw_editor` paints every line's text first
+(the `for (view_idx, line) in editor.lines.iter().enumerate()` loop, lines
+145–199), then paints the cursor afterwards, with no further painting once
+the block rect is filled:
+
+```rust
+// ── Cursor ───────────────────────────────────────────────────────
+if let Some(cursor) = &editor.cursor {
+    ...
+    match cursor.shape {
+        CursorShape::Block => {
+            let color = bg.blend(theme.cursor, theme.cursor_normal_alpha as f64);
+            let _ = fill_rect(target, Rect::new(x, y, cell_width, line_height), color);
+        }
+        ...
+    }
+}
+```
+
+`bg.blend(theme.cursor, theme.cursor_normal_alpha as f64)` pre-blends the
+cursor colour against the editor background *before* painting, producing a
+single opaque colour that is then filled with `fill_rect` — a normal opaque
+Direct2D rectangle fill, not a translucent compositing operation. Because it
+paints strictly after the glyph and never repaints anything on top of itself,
+the glyph is fully overwritten and never seen again — exactly the reported
+symptom.
+
+`quadraui/src/macos/editor.rs::draw_editor`'s `CursorShape::Block` arm is the
+reference fix shape — it fills the same opaque `theme.cursor` rect, then
+explicitly re-paints the single glyph under the cursor on top, in the
+background colour, so it reads against the block fill:
+
+```rust
+CursorShape::Block => {
+    fill_rect(ctx, cur_x, cur_y, char_width, line_height, theme.cursor);
+    // Re-paint the glyph under the cursor in background
+    // colour so it reads against the cursor fill.
+    let ch = line.raw_text[prefix_end..]
+        .chars()
+        .next()
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if !ch.is_empty() {
+        draw_text(ctx, font, &ch, cur_x, cur_y, color_to_cg(theme.background));
+    }
+}
+```
+
+Win-GUI's `draw_editor` has everything this needs already in scope at the
+cursor-painting call site: `dwrite` (a `&DWrite`), `line` is reachable via
+`editor.lines.get(cursor.pos.view_line)` (not currently fetched there — the
+text-painting loop above already borrows `editor.lines` per-line, but the
+cursor block is a separate loop with only `cursor` in scope), and
+`dwrite.draw_text`/`draw_text_styled` are the same primitives
+`paint_line_text` already uses for every other glyph in this file.
+
+**Ask:** in `win::editor::draw_editor`'s `CursorShape::Block` arm, after the
+`fill_rect` call, look up the glyph at `cursor.pos.col` on
+`editor.lines[cursor.pos.view_line]` (mirroring `char_byte_offset` from the
+macOS file, or the equivalent byte-offset lookup `paint_line_text` already
+does via `chars: Vec<(usize, char)>`) and `dwrite.draw_text` it at `(x, y)` in
+`theme.background`, matching `macos::editor::draw_editor`'s comment and
+behaviour exactly. Leave `Bar`/`Underline` untouched — neither obscures the
+glyph, matching macOS's own scoping (macOS only re-paints for `Block`).
+
+**Test:** `quadraui/src/win/editor.rs`'s existing `#[cfg(test)] mod tests`
+already has a `HeadlessSurface`-based `editor`/`plain_line` fixture (used by
+its current panic-only tests) and `crate::win::testing::HeadlessSurface`
+exposes `pixel_at(x, y) -> Color` (`win/testing.rs`) — the Win-GUI twin of
+macOS's `BitmapSurface::pixel` that `block_cursor_paints_theme_cursor_color`
+already probes in `macos/editor.rs`'s test module. Add a
+`block_cursor_repaints_glyph_in_background_colour` test there: paint an
+`Editor` with a `Block` cursor over a known character (e.g. column 0 of
+`"1789518172522"`, matching vimcode#1559's own repro string), then
+`pixel_at` a coordinate inside the glyph's ink (not the cell's empty
+padding) and assert it reads `theme.background`, not `theme.cursor`. Like
+every other test in this module's `HeadlessSurface`-based suite, it only
+*runs* on `target_os = "windows"` (`HeadlessSurface::new` always returns
+`Err` off Windows — no non-Windows Direct2D to build one from) but type-checks
+everywhere; observe it RED against the unfixed `CursorShape::Block` arm
+above, on real Windows hardware (dell64, `cargo xwin test --release --target
+x86_64-pc-windows-msvc --no-default-features --features win --lib --no-run`
+then the printed test `.exe` run directly — see vimcode `src/win/mod.rs`'s
+`win_driver_tests` module doc for the current dell64-local blockers on
+running any `cargo xwin test --lib` binary, which this test inherits until
+those are separately resolved).
+
+**Blocks:** `JDonaghy/vimcode#1559`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available: `src/win/backend.rs` is a 9-line re-export of
+`quadraui::win::WinBackend` (see that file's own doc comment), with zero
+rasterising decisions of its own to change. The bug and its fix are entirely
+inside `quadraui::win::editor::draw_editor`.

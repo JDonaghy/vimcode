@@ -5,5 +5,22 @@
 //! level) so a future `use super::backend::WinBackend` reads exactly like
 //! `src/gtk/backend.rs`'s `use super::backend::GtkBackend`. vimcode does not
 //! own a backend here either — see that file's doc comment.
+//!
+//! # #1559: block cursor hides the glyph underneath it is a quadraui gap,
+//! # not a vimcode-side one
+//!
+//! vimcode#1559 reports the NORMAL-mode block cursor painting over (not
+//! around) the character underneath it on Win-GUI, unlike GTK/macOS which
+//! keep the glyph visible against the block fill. Root-caused entirely
+//! inside `quadraui::win::editor::draw_editor`'s `CursorShape::Block` arm:
+//! it fills the cursor cell *after* text is painted and never redraws the
+//! covered glyph on top, unlike `quadraui::macos::editor::draw_editor`'s
+//! same arm, which explicitly re-paints the glyph in `theme.background` on
+//! top of the block fill. See `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry
+//! for the full analysis, the concrete fix, and the `HeadlessSurface`-based
+//! pixel test this issue's acceptance bar asks for. Nothing in this file
+//! changes: it re-exports `WinBackend` verbatim (see doc above) and has no
+//! rasterising decision of its own to make, per the Platform-Neutrality
+//! Rule. Leave #1559 open until the quadraui issue is filed and lands.
 
 pub use quadraui::win::WinBackend;
