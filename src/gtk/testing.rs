@@ -550,7 +550,7 @@ pub fn conformance_harness(
     let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = Rc::new(RefCell::new(engine));
-    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+    let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
     let (app, config) = crate::harness::build_app_and_config(
         Rc::clone(&engine),
@@ -580,7 +580,7 @@ pub fn conformance_harness_with_folder_picker(
     let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = Rc::new(RefCell::new(engine));
-    let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
+    let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
         Rc::new(RefCell::new(Box::new(super::backend::GtkBackend::new())));
     let (app, config) = crate::harness::build_app_and_config(
         Rc::clone(&engine),
@@ -14799,9 +14799,9 @@ mod command_line_selection {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
 
-        let backend: Rc<RefCell<Box<dyn crate::app::TextMetricsBackend>>> = Rc::new(RefCell::new(
-            Box::new(crate::gtk::backend::GtkBackend::new()),
-        ));
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> = Rc::new(RefCell::new(Box::new(
+            crate::gtk::backend::GtkBackend::new(),
+        )));
 
         let mut engine = Engine::new_for_test();
         crate::app::setup_gtk_clipboard(&mut engine, backend.clone());
@@ -16107,9 +16107,10 @@ mod slice7_closing_rungs {
 
 #[cfg(test)]
 mod issue_813_exit_via_reaction {
-    //! #813: `App::backend` is now typed against the narrow
-    //! [`super::TextMetricsBackend`] trait rather than the concrete GTK
-    //! backend struct, and `save_session_and_exit` was ported off a
+    //! #813: `App::backend` is now typed `Box<dyn quadraui::Backend>`
+    //! (#1497 deleted the narrow local `TextMetricsBackend` supertrait that
+    //! used to sit in between) rather than the concrete GTK backend struct,
+    //! and `save_session_and_exit` was ported off a
     //! `glib::idle_add_local_once(process::exit)` callback onto
     //! `App::exit_requested` + `quadraui::Reaction::Exit` — the same hook
     //! `GtkDriver`'s own `dispatch` already understands (`exited()`/
@@ -17268,9 +17269,10 @@ mod conformance_proof_slice {
     }
 }
 
-/// #969: the GTK leg of the `TextMetricsBackend` conformance assertion —
-/// see `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
-/// for the #967 stub this guards against and why the check has to round-trip
+/// #969: the GTK leg of the `quadraui::Backend::set_current_line_height`/
+/// `set_current_char_width` conformance assertion — see
+/// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc for
+/// the #967 stub this guards against and why the check has to round-trip
 /// through the trait object rather than inspect state. No driver needed
 /// here: `GtkBackend::new()` is a plain struct construction (no display, no
 /// `gtk4::init`), so this runs in the same headless CI lane as every other

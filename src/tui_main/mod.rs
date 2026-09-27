@@ -17,13 +17,12 @@ use std::sync::Mutex;
 mod app_on_tui_tests;
 mod backend;
 
-/// [`crate::app::TextMetricsBackend`] for quadraui's `TuiBackend` (#982),
-/// the TUI sibling of the GTK/Win/Mac impls. Both setters are no-ops: one
-/// ratatui cell is one row/column by construction (#540/#819).
-impl crate::app::TextMetricsBackend for backend::TuiBackend {
-    fn set_current_line_height(&mut self, _line_height: f64) {}
-    fn set_current_char_width(&mut self, _char_width: f64) {}
-}
+// #1497: the local `impl crate::app::TextMetricsBackend for
+// backend::TuiBackend` that used to live here is gone —
+// `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+// (JDonaghy/quadraui#1086) already default to a no-op, which is exactly
+// what this impl's two bodies were: one ratatui cell is one row/column by
+// construction (#540/#819), so `TuiBackend` never needs to override them.
 
 /// Global debug log file handle, set once at startup via `--debug <path>`.
 static DEBUG_LOG: std::sync::OnceLock<Mutex<std::fs::File>> = std::sync::OnceLock::new();
@@ -69,10 +68,9 @@ pub fn run(file_path: Option<PathBuf>, debug_log_path: Option<String>) {
         debug_log!("{}", line);
     });
 
-    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(
-            Box::new(backend::TuiBackend::new()),
-        ));
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> = std::rc::Rc::new(
+        std::cell::RefCell::new(Box::new(backend::TuiBackend::new())),
+    );
 
     let app = crate::app::App::new_portable(file_path, backend, crate::render::UnitProfile::cell());
     // #557: `shell_config()` reads plugin-registered sidebar panels, so it
@@ -122,7 +120,7 @@ pub mod testing {
     use quadraui::tui::testing::{driver_with_shell, TuiDriver};
     use quadraui::tui::TuiBackend;
 
-    use crate::app::{App, TextMetricsBackend};
+    use crate::app::App;
     use crate::core::Engine;
     use crate::harness::ConformanceHarness;
     use crate::render::UnitProfile;
@@ -142,7 +140,7 @@ pub mod testing {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
         let (app, config) = crate::harness::build_app_and_config(
             Rc::clone(&engine),
@@ -167,7 +165,7 @@ pub mod testing {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
         let (app, config) = crate::harness::build_app_and_config(
             Rc::clone(&engine),
@@ -254,7 +252,7 @@ pub mod testing {
     ) -> TuiAppDriver<TuiDriver<impl quadraui::AppLogic>> {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(TuiBackend::new())));
         let app = App::new_portable_for_test(file_path, backend, UnitProfile::cell());
         setup(&mut app.engine.borrow_mut());

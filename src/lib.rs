@@ -65,8 +65,10 @@ pub mod gtk;
 /// `crate::click`/`crate::app_support`/`crate::css` above. What's left
 /// behind `#[cfg(feature = "gui")]` *inside* `src/app.rs` is the handful of
 /// items that are genuinely platform-bound: `App::new`/`App::assemble`'s
-/// display-dependent prologue, the `TextMetricsBackend`/window-handle/
-/// css-provider trait impls for the concrete GTK types, and a few inline
+/// display-dependent prologue, the `PlatformCssProvider` trait impl for the
+/// concrete GTK type (#1497 deleted the `TextMetricsBackend` local trait
+/// that used to sit alongside it, once JDonaghy/quadraui#1086 put its two
+/// methods directly on `quadraui::Backend`), and a few inline
 /// `gtk4::Settings`/window-discovery call sites. See `src/app.rs`'s module
 /// doc for the full inventory.
 pub mod app;

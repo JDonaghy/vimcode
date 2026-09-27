@@ -15,21 +15,21 @@
 //! #813 retired the biggest blocker the #47 re-audit found: `backend` used
 //! to be typed as the concrete GTK backend struct, which is what forced
 //! every one of the ~19 modal-stack/drag-state handle call sites — and by
-//! extension this whole file — to depend on it. It is now typed against
-//! [`TextMetricsBackend`], a narrow local trait for the text-measurement
-//! hooks that still have no portable `quadraui::Backend` equivalent; see
-//! that trait's doc comment for why it survives #1104's click/drag/
-//! modal-stack refactor (which did delete the trait's third method,
-//! `set_text_measurement_context` — a GTK/Pango-context setter #861 had
-//! already type-erased to keep the trait itself toolkit-neutral) and what
-//! quadraui-side work would let the remaining two go too.
+//! extension this whole file — to depend on it. It was then typed against
+//! `TextMetricsBackend`, a narrow local trait for the two text-measurement
+//! setters (`set_current_line_height`/`set_current_char_width`) that had no
+//! portable `quadraui::Backend` equivalent yet; #1497 deleted that trait
+//! once JDonaghy/quadraui#1086 put both methods directly on `Backend`, so
+//! `backend` is typed `Box<dyn quadraui::Backend>` now with no local
+//! supertrait at all.
 //!
 //! #862 closed the three items the previous revision of this doc comment
 //! listed as the remaining blockers to dropping the `gui` gate:
 //!
 //! 1. **The platform-typed fields** (`window`, `css_provider`) are now
 //!    type-erased. `css_provider` goes behind the small local
-//!    [`PlatformCssProvider`] trait (the same shape as [`TextMetricsBackend`]
+//!    [`PlatformCssProvider`] trait (the same shape the now-deleted
+//!    `TextMetricsBackend` used to have, #1497)
 //!    and `Engine::clipboard_read`/`clipboard_write`, #417); `window` had the
 //!    same treatment (`PlatformWindowHandle`) until #1234 deleted it outright
 //!    once `quadraui::Backend::window()` (`WindowControl`, quadraui#950)
@@ -116,10 +116,8 @@ use crate::app_support::*;
 use crate::click::*;
 use crate::core::engine::sidebar::*;
 use crate::css::*;
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", any(test, feature = "test-support")))]
 use crate::gtk::backend;
-#[cfg(feature = "win")]
-use crate::win::backend as win_backend;
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
@@ -630,101 +628,18 @@ impl DeferredQueue {
     }
 }
 
-/// Narrow extension trait for the text-measurement hooks that
-/// `quadraui::Backend` has no portable equivalent for yet (#813): a backend
-/// needs some way to be told the current line height / char width, and (for
-/// backends whose click-time hit-testing wants per-glyph accuracy, like
-/// GTK's Pango) some way to be handed a fresh measurement context each
-/// frame.
-///
-/// `App::backend` used to be typed as the concrete `backend::GtkBackend` —
-/// the sole reason `struct App` couldn't compile without the GTK toolkit
-/// in scope — purely so these calls would resolve. Retyping the field to a
-/// bare `Box<dyn quadraui::Backend>` would drop them; this supertrait lets
-/// `App::backend` hold one trait object that still exposes both the 19
-/// generic `modal_stack_handle`/`drag_state_handle` call sites (via the
-/// `Backend` supertrait bound) *and* these narrow ones, without naming a
-/// concrete backend type anywhere outside its `impl` below.
-///
-/// #861: this trait used to expose `set_pango_context(ctx: pango::Context)`
-/// (a GTK/Pango-typed context setter for the editor-click Pango layout), which
-/// meant *no non-GTK backend could implement this trait at all*. #1104
-/// deleted that method along with its one caller (`App::render_content`'s
-/// per-frame sync onto a second, separately-constructed `GtkBackend` used
-/// only for click-time hit-testing — see the doc comment where that call used
-/// to live) once threading the runner's own live backend through the click/
-/// drag/modal-stack call chain made the second backend, and so the context it
-/// needed, unnecessary. What is left, `set_current_line_height`/
-/// `set_current_char_width`, has no GTK/Pango type in its signature and so
-/// was never the compilation blocker.
-///
-/// #969: `set_current_line_height`/`set_current_char_width` deliberately have
-/// **no default**: both are load-bearing for click correctness
-/// (`App::explorer_ui_event` / `App::route_ai_chat_event` re-apply them,
-/// immediately before hit-testing, to undo the #540/#819 drift guard's
-/// namesake drift), so every impl must write *something* for them rather
-/// than silently inheriting a no-op. That alone does not stop an impl from
-/// writing an empty body anyway — #967 did exactly that on `MacBackend` —
-/// which is what
-/// [`crate::harness::assert_text_metrics_backend_applies_metrics`] is for:
-/// it round-trips a value through the trait object and the
-/// `quadraui::Backend` getter these setters are supposed to feed, so a stub
-/// fails a test instead of shipping silently.
-///
-/// #1104 could not delete this trait outright: `App::explorer_ui_event`,
-/// `App::route_ai_sidebar_event` and the DAP-sidebar key route all call these
-/// setters from deep inside the keyboard/mouse dispatch tree, at call sites
-/// with no live `backend: &mut dyn quadraui::Backend` reference threaded in
-/// (unlike the click/drag chain #1104 *did* convert) — and even if one were
-/// threaded in, `quadraui::Backend` has no `Any`/downcast escape hatch and no
-/// portable equivalent of these two setters, so there is no way to reach a
-/// concrete backend's inherent methods through the trait object without this
-/// local supertrait (or an equivalent) naming the concrete type somewhere.
-/// Closing that gap is quadraui-side work (a portable
-/// `text_metrics_handle()`-style accessor, mirroring `modal_stack_handle()`/
-/// `drag_state_handle()`), tracked as the follow-up this issue's report
-/// files against `JDonaghy/quadraui`.
-/// #1494: quadraui's own `Backend` supertrait gained default
-/// `set_current_line_height`/`set_current_char_width` methods (same names,
-/// `f32` instead of this trait's `f64`) in the rev bumped for that issue,
-/// so every call site through a `dyn TextMetricsBackend` / generic `B:
-/// TextMetricsBackend` is now ambiguous between the two and must be
-/// fully-qualified (`TextMetricsBackend::set_current_line_height(&mut b,
-/// ..)`) rather than called as `b.set_current_line_height(..)`.
-pub(crate) trait TextMetricsBackend: quadraui::Backend {
-    fn set_current_line_height(&mut self, line_height: f64);
-    fn set_current_char_width(&mut self, char_width: f64);
-}
-
-#[cfg(feature = "gui")]
-impl TextMetricsBackend for backend::GtkBackend {
-    fn set_current_line_height(&mut self, line_height: f64) {
-        backend::GtkBackend::set_current_line_height(self, line_height);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        backend::GtkBackend::set_current_char_width(self, char_width);
-    }
-}
-
-/// [`TextMetricsBackend`] for quadraui's `WinBackend` (#866, the Win-GUI
-/// twin of #859's `MacBackend` impl in `src/macos/mod.rs`).
-///
-/// The two metric setters forward to `WinBackend`'s own public
-/// `set_current_line_height`/`set_current_char_width` (`f32`, matching
-/// DirectWrite's unit — GTK's are `f64` Pango units), the Win-GUI
-/// counterparts of `GtkBackend`'s methods of the same name at the pinned
-/// rev `9eede7fd`.
-#[cfg(feature = "win")]
-impl TextMetricsBackend for win_backend::WinBackend {
-    fn set_current_line_height(&mut self, line_height: f64) {
-        win_backend::WinBackend::set_current_line_height(self, line_height as f32);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        win_backend::WinBackend::set_current_char_width(self, char_width as f32);
-    }
-}
+// #1497: `TextMetricsBackend`, the narrow local supertrait that used to
+// live here, is gone. It existed only because `set_current_line_height`/
+// `set_current_char_width` were inherent methods on each pixel backend
+// (`GtkBackend`/`MacBackend`/`WinBackend`) with no portable
+// `quadraui::Backend` equivalent to reach them through `&mut dyn Backend`
+// — closing that gap was JDonaghy/quadraui#1086, filed from this trait's
+// own doc comment. quadraui#1086 landed `Backend::set_current_line_height`/
+// `set_current_char_width` (`f32`, default no-op; GTK/macOS/Win-GUI
+// override to forward onto their existing inherent setters) at the pinned
+// rev, so `App::backend` is typed `Box<dyn quadraui::Backend>` directly now
+// and every former `TextMetricsBackend::set_current_*` call site below
+// calls the `quadraui::Backend` method instead.
 
 // #1234: `PlatformWindowHandle`, the local seam that used to live here, is
 // gone. It existed because quadraui's `WindowControl` had no portable
@@ -966,7 +881,7 @@ pub(crate) struct App {
     /// overwrite for its own metrics; by the time a later mouse/keyboard
     /// event reaches `route_ai_chat_event`, whatever painted *last* this
     /// frame or the previous one may have left a different value there.
-    /// Re-applied via `TextMetricsBackend::set_current_line_height`/
+    /// Re-applied via `quadraui::Backend::set_current_line_height`/
     /// `set_current_char_width` before `ChatController::handle` runs, so its
     /// row-wrap math (`total_rows`/`visible_rows`) matches what `render()`
     /// used rather than silently reading a smaller/larger viewport and
@@ -1281,14 +1196,12 @@ pub(crate) struct App {
     ///   `core::engine` code with no `Backend` parameter of their own at all,
     ///   long after any `handle`/`render` call that held the runner's live
     ///   backend has returned — this handle is what they close over.
-    /// - **`TextMetricsBackend`'s two metric setters** (`explorer_ui_event`,
+    /// - **The click-drift guard's two metric setters** (`explorer_ui_event`,
     ///   `route_ai_sidebar_event`, the DAP-sidebar key route):
-    ///   `set_current_line_height`/`set_current_char_width` are inherent
-    ///   `GtkBackend` methods with no portable `quadraui::Backend` trait
-    ///   equivalent, called from dispatch-tree call sites that #1104 could
-    ///   not thread a live `backend: &dyn quadraui::Backend` reference into
-    ///   without quadraui growing new portable surface — see
-    ///   [`TextMetricsBackend`]'s own doc comment.
+    ///   `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+    ///   (JDonaghy/quadraui#1086) re-apply the metrics the tree/panel was
+    ///   painted with, called from dispatch-tree call sites that #1104 could
+    ///   not thread a live `backend: &dyn quadraui::Backend` reference into.
     ///
     /// #1104 removed the third historical reason this field existed: click/
     /// drag/modal-stack hit-testing (`pixel_to_click_target` and friends)
@@ -1303,10 +1216,12 @@ pub(crate) struct App {
     /// The `init` drain timer holds a clone and pumps `poll_events()` every
     /// 16 ms.
     ///
-    /// Typed against [`TextMetricsBackend`] rather than the concrete
-    /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
-    /// a bare `Box<dyn quadraui::Backend>` isn't quite enough on its own.
-    pub(crate) backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    /// Typed against `Box<dyn quadraui::Backend>` directly, not the
+    /// concrete `backend::GtkBackend` (#813) — the now-deleted
+    /// `TextMetricsBackend` local supertrait used to sit between the two
+    /// (#1497; see the module doc's "Why this module no longer needs
+    /// `#[cfg(feature = "gui")]`" section).
+    pub(crate) backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
     /// #1426: the geometry unit this `App` instance paints in, chosen once at
     /// construction by the caller that already knows its own backend
     /// (GTK/macOS/Win pass [`render::UnitProfile::px`], the `tui` harness arm
@@ -1403,7 +1318,7 @@ pub(crate) struct App {
 /// `PlatformServices` seam, replacing the bespoke `copypasta_ext` stack).
 ///
 /// `backend` is `App`'s own held handle — `Rc<RefCell<Box<dyn
-/// TextMetricsBackend>>>`, distinct from the runner-owned `&mut dyn
+/// quadraui::Backend>>>`, distinct from the runner-owned `&mut dyn
 /// quadraui::Backend` `ShellApp::setup`/`handle`/`tick` receive only
 /// transiently (see [`PendingFileDialog`]'s doc for why that distinction
 /// matters for file dialogs). Cloning the `Rc` into each closure lets
@@ -1421,11 +1336,11 @@ pub(crate) struct App {
 /// clipboard (`arboard` on GTK, matching what TUI's `TuiPlatformServices`
 /// already uses), not to any runner-owned state.
 ///
-/// `TextMetricsBackend: quadraui::Backend` (see that trait's doc), so this
+/// `backend` is typed `Box<dyn quadraui::Backend>` directly (#1497), so this
 /// names no concrete toolkit type and works unchanged for GTK, macOS, and
 /// Win-GUI — every `App::new`/`App::new_portable` caller passes its own
 /// concrete backend through the same `Rc<RefCell<Box<dyn
-/// TextMetricsBackend>>>` seam #861 opened.
+/// quadraui::Backend>>>` seam #861 opened.
 ///
 /// ## #587 follow-up: does `arboard`'s X11 connection contend with GTK's?
 ///
@@ -1448,7 +1363,7 @@ pub(crate) struct App {
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn setup_gtk_clipboard(
     engine: &mut Engine,
-    backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
 ) {
     let read_backend = backend.clone();
     let read_image_backend = backend.clone();
@@ -1548,14 +1463,14 @@ impl App {
     /// (#861): before this, `App::assemble` hardcoded
     /// `Box::new(backend::GtkBackend::new())`, so nothing upstream of this
     /// function — including `App::new` itself — had any seam to hand
-    /// `App` a different `TextMetricsBackend` impl. `src/gtk/mod.rs::run`
+    /// `App` a different `quadraui::Backend` impl. `src/gtk/mod.rs::run`
     /// is the only caller today and it still passes a `GtkBackend`, but
     /// the choice of concrete type now lives at the call site instead of
     /// being baked into `App`.
     #[cfg(feature = "gui")]
     pub(crate) fn new(
         file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
     ) -> Self {
         // Icon search path setup.
         if let Some(home) = std::env::var_os("HOME") {
@@ -1669,15 +1584,15 @@ impl App {
     /// Everything else — engine construction and startup, nerd-font
     /// selection, the clipboard provider (`setup_gtk_clipboard` (#1100)
     /// names no concrete toolkit type — it goes through the generic
-    /// `TextMetricsBackend: quadraui::Backend` seam), the emergency-engine
+    /// `quadraui::Backend` seam), the emergency-engine
     /// registration the panic hook's swap flush needs, and the whole of
     /// [`App::assemble`] — is shared verbatim, so the two constructors
     /// cannot drift on anything that affects behaviour.
     ///
-    /// `backend` is the caller's [`TextMetricsBackend`], the seam #861 opened
-    /// and `src/gtk/mod.rs::run` names in its own comment as "the seam a
-    /// future non-GTK wrapper (#859) would pass a different
-    /// `TextMetricsBackend` impl through".
+    /// `backend` is the caller's `Box<dyn quadraui::Backend>`, the seam #861
+    /// opened and `src/gtk/mod.rs::run` names in its own comment as "the seam
+    /// a future non-GTK wrapper (#859) would pass a different
+    /// `quadraui::Backend` impl through".
     ///
     /// The `allow(dead_code)` is feature-shaped, not a silencer: the callers
     /// are `crate::macos::run` (double-gated on `macos` + `target_os =
@@ -1690,7 +1605,7 @@ impl App {
     )]
     pub(crate) fn new_portable(
         file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
     ) -> Self {
         let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
@@ -1736,7 +1651,7 @@ impl App {
     )]
     fn build_portable_engine(
         file_path: Option<PathBuf>,
-        backend: &Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: &Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
     ) -> (Rc<RefCell<Engine>>, String) {
         let mut engine = {
@@ -1791,7 +1706,7 @@ impl App {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_portable_for_test(
         file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
     ) -> Self {
         let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
@@ -2068,7 +1983,7 @@ impl App {
         deferred: DeferredQueue,
         css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
         live: bool,
     ) -> Self {
@@ -2245,8 +2160,8 @@ impl App {
     /// same `App` a `MacBackend` instead, because the whole point is to paint
     /// through quadraui's macOS rasterisers. Taking the backend as a
     /// parameter keeps **one** headless constructor rather than a second copy
-    /// per backend — the `TextMetricsBackend` trait object is already the
-    /// only place either backend's concrete type appears.
+    /// per backend — the `Box<dyn quadraui::Backend>` trait object is already
+    /// the only place either backend's concrete type appears.
     ///
     /// Ungated on `gui` deliberately: every caller is a test lane, and the
     /// macOS lane (`--no-default-features --features macos`) compiles no GTK
@@ -2254,7 +2169,7 @@ impl App {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_headless_with_backend(
         engine: Rc<RefCell<Engine>>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
     ) -> Self {
         // #999/#1426: this constructor is the shared headless `App` test
@@ -3189,8 +3104,8 @@ impl App {
                 let metrics = self.cached_ai_chat_metrics.get();
                 {
                     let mut b = backend_rc.borrow_mut();
-                    TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
-                    TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
+                    quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+                    quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
                 }
                 let still_focused = render::route_ai_chat_event(
                     &mut engine,
@@ -6659,8 +6574,8 @@ impl App {
         let metrics = self.cached_explorer_metrics.get();
         let backend_rc = self.backend.clone();
         let mut b = backend_rc.borrow_mut();
-        TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
-        TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
+        quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+        quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
             render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
@@ -7240,8 +7155,8 @@ impl App {
         let metrics = self.cached_ai_chat_metrics.get();
         {
             let mut b = backend_rc.borrow_mut();
-            TextMetricsBackend::set_current_line_height(&mut **b, metrics.0);
-            TextMetricsBackend::set_current_char_width(&mut **b, metrics.1);
+            quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+            quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
         }
         render::route_ai_chat_event(
             &mut engine,
@@ -9181,13 +9096,12 @@ impl quadraui::ShellApp for App {
         // `backend` *is* the click backend now.
         //
         // `self.backend` still exists for the handful of callers this refactor
-        // could not reach without quadraui growing new portable surface (see
-        // `TextMetricsBackend`'s doc comment): `explorer_ui_event`,
-        // `route_ai_sidebar_event` and the DAP-sidebar key route all need
-        // `set_current_line_height`/`set_current_char_width`, which are
-        // inherent `GtkBackend` methods with no `quadraui::Backend`-trait
-        // equivalent, called from deep inside the keyboard/mouse dispatch tree
-        // where only `&mut self` (no live `backend` reference) is available.
+        // could not reach: `explorer_ui_event`, `route_ai_sidebar_event` and
+        // the DAP-sidebar key route all call
+        // `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+        // (JDonaghy/quadraui#1086) to undo click drift, from deep inside the
+        // keyboard/mouse dispatch tree where only `&mut self` (no live
+        // `backend` reference) is available.
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════
         // Composed from `render::compose_editor_band`, then the `FrameHitMap`
