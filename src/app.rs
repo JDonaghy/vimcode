@@ -7989,13 +7989,19 @@ impl App {
             ..
         } = &event
         {
+            // `command_center_hit_in_band`, not `CommandCenterLayout::
+            // hit_test` directly (#1494 CI): the cached layout's `SearchBox`
+            // rect overflows the band whenever the band is narrower than the
+            // primitive's 344px content floor, and the overflow lands
+            // squarely on the inline window-control buttons that start where
+            // the Command Center band ends. See that function's doc.
             let cc_hit = self
                 .engine
                 .borrow()
                 .command_center_layout
                 .borrow()
                 .as_ref()
-                .map(|l| l.hit_test(position.x, position.y));
+                .and_then(|l| crate::render::command_center_hit_in_band(l, position.x, position.y));
             // `Bar` (command-center background, not an interactive segment)
             // and `Outside`/`None` fall through so the drag-to-move fallback
             // below still works for genuine empty-band clicks.

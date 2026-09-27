@@ -16425,6 +16425,75 @@ mod issue_1530_titlebar_minimize_button {
         h.driver.mouse_up(x, y)
     }
 
+    /// The same click as `titlebar_minimize_click_dispatches_minimize`, but
+    /// swept across window widths instead of pinned to the one (800px) that
+    /// happened to work.
+    ///
+    /// **Verified RED against this branch without the
+    /// `render::command_center_hit_in_band` clamp:** every width from 700 up
+    /// to ~795 leaves `last_window_control_action` at `None`, because the
+    /// Command Center's cached `SearchBox` hit rect overflows its band (a
+    /// fixed 344px content floor laid out left-aligned inside a narrower
+    /// band) and claims the `MouseDown` that belongs to the painted minimize
+    /// button. With the clamp, all eleven widths dispatch minimize.
+    ///
+    /// This is the font-independent form of the CI-only failure the #1494
+    /// branch hit: the exact width at which the overflow stops reaching the
+    /// minimize glyph depends on the measured width of the menu labels, so
+    /// at 800px it is clear by 2.5px with the Ubuntu UI font a GNOME desktop
+    /// resolves and *not* clear with the DejaVu Sans a bare CI runner falls
+    /// back to. Sweeping widths asserts the invariant ("the painted minimize
+    /// button is always clickable") rather than one font's lucky margin —
+    /// see `render::command_center_hit_in_band`'s doc.
+    #[test]
+    fn titlebar_minimize_click_dispatches_minimize_at_every_window_width() {
+        let needle = format!("  {}  ", crate::icons::WINDOW_MINIMIZE.s());
+        let mut exercised = 0usize;
+
+        for width in [700, 720, 740, 760, 780, 790, 795, 800, 820, 900, 1000] {
+            let engine = Engine::new_for_test();
+            let mut h = harness(engine, width, 600);
+            h.driver.render();
+
+            // A band too narrow to paint minimize at all is a different
+            // (already-covered) concern — skip rather than assert on a
+            // button that isn't there.
+            let Some(bounds) = h.driver.find_bounds(&needle) else {
+                continue;
+            };
+            exercised += 1;
+
+            let x = bounds.x + bounds.width / 2.0;
+            let y = bounds.y + bounds.height / 2.0;
+            h.driver.mouse_down(x, y);
+            h.driver.mouse_up(x, y);
+
+            assert_eq!(
+                h.last_window_control_action.get(),
+                Some(crate::render::WINDOW_MINIMIZE_ACTION),
+                "clicking the painted minimize glyph at window width \
+                 {width} must dispatch App::window_minimize; the glyph \
+                 painted at {bounds:?} and the click landed at ({x}, {y}). \
+                 A `None` here means something in front of the window \
+                 controls swallowed the press — most likely the Command \
+                 Center search box overflowing its band (cc layout: {:?})",
+                h.engine
+                    .borrow()
+                    .command_center_layout
+                    .borrow()
+                    .as_ref()
+                    .map(|l| (l.bounds, l.search_bounds)),
+            );
+        }
+
+        assert!(
+            exercised >= 6,
+            "sanity: the sweep must actually have painted (and clicked) a \
+             minimize button at most widths, else it asserts nothing; \
+             only {exercised} of 11 widths painted one"
+        );
+    }
+
     /// **Verified RED against unfixed `develop`:** before the #1530 fix,
     /// `measure_title_bar_bands` narrows `controls` to exactly the three
     /// buttons' width and `paint_title_bar_band`'s repaint at that width
