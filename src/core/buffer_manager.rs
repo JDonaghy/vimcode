@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
-use super::buffer::{Buffer, BufferId};
+use super::buffer::{read_file_to_string, Buffer, BufferId};
 use super::cursor::Cursor;
 use super::syntax::Syntax;
 
@@ -967,9 +967,15 @@ impl BufferState {
 
     /// Re-read the file from disk, replacing all buffer content.
     /// Resets dirty flag, undo/redo stacks, and updates mtime.
+    ///
+    /// Goes through the same BOM-aware decode as `Buffer::from_file` (#1560):
+    /// this is reachable from `:e[dit]!` and from the idle file-watcher's
+    /// silent-reload path, and a bare `fs::read_to_string` here reproduces
+    /// the exact "stream did not contain valid UTF-8" error for a
+    /// UTF-16/UTF-8-BOM file that the initial open already fixed.
     pub fn reload_from_disk(&mut self) -> Result<(), io::Error> {
         if let Some(path) = self.file_path.clone() {
-            let text = std::fs::read_to_string(&path)?;
+            let text = read_file_to_string(&path)?;
             self.line_ending = LineEnding::detect(&text);
             let char_len = self.buffer.len_chars();
             self.buffer.delete_range(0, char_len);
@@ -1698,4 +1704,34 @@ mod tests {
     // from `Settings::default()`. The gate logic is covered above via
     // `update_syntax_with_limit`; the production sync is a single-line
     // `set_syntax_max_lines(...)` call in `Engine::new` and `set_value_str`.
+
+    /// #1560 (review finding): `reload_from_disk` — the sibling read path
+    /// used by `:e[dit]!` and the idle file-watcher's silent-reload — has
+    /// its own `fs::read_to_string` call that reproduces the exact "stream
+    /// did not contain valid UTF-8" error for a UTF-16LE-BOM file. This
+    /// exercises reload specifically (not `Buffer::from_file`/initial open,
+    /// already covered in `buffer.rs`) to prove the fix reaches both reads:
+    /// open the file as plain UTF-8 first, then externally rewrite it as
+    /// UTF-16LE-with-BOM and reload — the new content must come through
+    /// decoded, not error out.
+    #[test]
+    fn test_reload_from_disk_utf16le_bom() {
+        let path = std::env::temp_dir().join("vimcode_buffer_manager_test_reload_utf16le.txt");
+        std::fs::write(&path, "old content").unwrap();
+
+        let buffer = Buffer::from_file(crate::core::buffer::BufferId(0), &path).unwrap();
+        let mut state = BufferState::with_file(buffer, path.clone());
+        assert_eq!(state.buffer.to_string(), "old content");
+
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for unit in "new content".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        state.reload_from_disk().unwrap();
+        assert_eq!(state.buffer.to_string(), "new content");
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
