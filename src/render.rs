@@ -12136,7 +12136,7 @@ pub const WINDOW_CLOSE_ACTION: &str = "window:close";
 ///
 /// A few pixels — VS Code/Electron frameless windows use a comparable
 /// margin — is still comfortably grabbable with a mouse, is thinner than one
-/// scrollbar/minimap gutter (`app_support::v_scrollbar_thumb_geometry`'s
+/// scrollbar/minimap gutter (`app_support::scrollbar_thumb_geometry`'s
 /// track, `render::minimap`'s gutter offset), and is thin enough to sit
 /// *inside* the title bar and command-line rows instead of spanning them, so
 /// the edge grip can win only in that sliver and fall through to the

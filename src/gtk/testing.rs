@@ -12556,7 +12556,7 @@ mod scrollbar_paint {
     /// thumb-sizing formula `editor_scrollbar_layout`'s `Editor::layout`
     /// call uses, and the same public function this test calls directly —
     /// never this issue's own `editor_scrollbar_layout`/
-    /// `v_scrollbar_thumb_geometry` wrappers) predicts from real painted
+    /// `scrollbar_thumb_geometry` wrappers) predicts from real painted
     /// geometry (`rect`, `line_height`) and the buffer's real line count.
     /// This is the driver-tier proof that the fix is wired up end to end
     /// through a real mouse interaction, not only through the pure-function
@@ -12565,28 +12565,30 @@ mod scrollbar_paint {
     /// **Why the v-scrollbar, when this issue's title names the h-scrollbar:**
     /// both bars' hit-testing now resolve through the identical
     /// `editor_scrollbar_layout` call this issue's diff introduced
-    /// (`h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` are thin
+    /// (`h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` were thin
     /// wrappers reading `h_scrollbar_bounds`/`v_scrollbar_bounds` off the
-    /// same `(Editor, EditorLayout)` pair), and this test targets the exact
-    /// axis (never shrinking the track for a per-window status line) both
-    /// wrappers now share — so a real drag through either rung exercises
-    /// the same fix. The h-scrollbar's own *click* rung (`app.rs`'s "H
-    /// scrollbar hit-test" block) additionally rebuilds window rects via
+    /// same `(Editor, EditorLayout)` pair — since #1493, one
+    /// axis-parameterised `scrollbar_thumb_geometry`), and this test targets
+    /// the exact axis (never shrinking the track for a per-window status
+    /// line) both share — so a real drag through either rung exercises the
+    /// same fix. The h-scrollbar's own *click* rung (`app.rs`'s "H scrollbar
+    /// hit-test" block) additionally rebuilt window rects via
     /// `compute_editor_window_rects` at a hardcoded `(0, 0)` origin, rather
     /// than `App::painted_editor_bounds`'s real, activity-bar/sidebar-offset
-    /// one the v-scrollbar rung uses (see that rung's own "Window rects
-    /// come from `self.painted_editor_bounds()`" comment) — a separate,
+    /// one the v-scrollbar rung used (see that rung's own former "Window
+    /// rects come from `self.painted_editor_bounds()`" comment) — a separate,
     /// pre-existing bug this issue's review flagged as a non-blocking
-    /// follow-up, not introduced or fixed here. With the default 48px-wide
-    /// activity bar alone (confirmed empirically: a single un-split
-    /// window's painted rect starts at `x: 48.0` with the sidebar closed),
-    /// a real click at the h-scrollbar's actual on-screen position —
-    /// anywhere past local column 1352 in a 1400px-wide harness — falls
-    /// outside that hardcoded-origin rect and never reaches
-    /// `h_scrollbar_hit_test` at all. Driving the real *h*-scrollbar click
-    /// end to end would therefore be red for that unrelated reason, not for
-    /// anything this issue changed, so this test exercises the shared fix
-    /// through the rung whose click-dispatch is already correct.
+    /// follow-up, not fixed here. With the default 48px-wide activity bar
+    /// alone (confirmed empirically: a single un-split window's painted rect
+    /// started at `x: 48.0` with the sidebar closed), a real click at the
+    /// h-scrollbar's actual on-screen position fell outside that
+    /// hardcoded-origin rect and never reached the hit-test at all whenever
+    /// the sidebar/activity bar reserved real width. **#1493 fixed exactly
+    /// that bug** — both axes now share `App::editor_scrollbar_press`, which
+    /// always reads `painted_editor_bounds()` — see
+    /// `horizontal_scrollbar_thumb_click_scrolls_with_sidebar_open_on_gtk`
+    /// below for the driver-tier proof, with the sidebar open specifically
+    /// (the configuration that made the old bug observable).
     ///
     /// **What actually distinguishes old from new** (and so what this test
     /// pins): the pre-#1128 `v_scrollbar_geometry` helper (`git show
@@ -12708,6 +12710,170 @@ mod scrollbar_paint {
              `fit_thumb`-based prediction ({expected}); got {after} \
              instead (max_scroll={max_scroll}, visible_lines={visible_lines}, \
              thumb_len={thumb_len})"
+        );
+    }
+
+    /// #1493 black-box regression: a click on the h-scrollbar's empty track
+    /// (past the thumb) must page the window's `scroll_left`, through the
+    /// real `App::handle_mouse_click_msg` dispatch, **with the sidebar
+    /// open** — the exact configuration the pre-fix horizontal rung got
+    /// wrong.
+    ///
+    /// Before #1493, `app.rs`'s "H scrollbar hit-test" rung rebuilt window
+    /// rects via `compute_editor_window_rects(&engine, width, height, lh)`,
+    /// which always assumes the editor area starts at `x = 0` — true only
+    /// with the activity bar/sidebar at zero width. With the explorer open,
+    /// the real editor rect starts well to the right of `x = 0`
+    /// (`painted_sidebar_bounds` below), so every click coordinate this test
+    /// sends landed *outside* the phantom `x = 0` rect and never reached the
+    /// h-scrollbar hit-test at all — the click fell through to ordinary
+    /// editor text handling instead (moving the cursor, not the scrollbar).
+    /// #1493's fix reads `painted_editor_bounds()` for both axes through the
+    /// shared `App::editor_scrollbar_press`, so the same click now resolves.
+    ///
+    /// **Verified RED against unfixed `develop`**: reverted this test's two
+    /// `app.rs` call sites to call `compute_editor_window_rects(&engine,
+    /// width, height, lh)` directly (the pre-#1493 horizontal rung's own
+    /// rect source) instead of `self.painted_editor_bounds()`, leaving
+    /// everything else (including this test) unmodified, and re-ran this
+    /// test — `scroll_left` stayed `0`: the click missed the h-scrollbar
+    /// entirely and landed on ordinary editor text instead (cursor moved,
+    /// scrollbar untouched), exactly the "click aimed at the sidebar-offset
+    /// scrollbar falls through to text handling" failure mode this test
+    /// exists to catch. Restored before landing.
+    #[test]
+    fn horizontal_scrollbar_thumb_click_scrolls_with_sidebar_open_on_gtk() {
+        use crate::core::engine::sidebar::PANEL_EXPLORER;
+
+        let mut engine = Engine::new_for_test();
+        // No line numbers: the gutter is then exactly one column wide (the
+        // fold indicator `render::calculate_gutter_cols` always reserves),
+        // so this test's own independent track-geometry prediction below
+        // doesn't need to duplicate that formula for a wider case.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
+        // Off (default on): the per-window status line paints in the same
+        // bottom row as the h-scrollbar (#1128's paint never shrinks the
+        // track for it) and `render::route_chrome_click`'s "Status bands"
+        // rung claims that whole row via a plain `point_in_rect` fallback —
+        // *before* this issue's scrollbar rung ever runs (`app.rs`'s
+        // "Chrome rung (#752)" precedes "H/V scrollbar hit-test"). With it
+        // on, this test's click would be swallowed by the status line
+        // instead of ever reaching the code under test.
+        engine.settings.window_status_line = false;
+        // One very long line plus a couple of short ones: needs an
+        // h-scrollbar (500 chars overflows any reasonable pane width) but
+        // never a v-scrollbar (3 lines fit any reasonable pane height) —
+        // isolates this test to the one axis #1493 fixes.
+        let long_line = "x".repeat(500);
+        engine
+            .buffer_mut()
+            .insert(0, &format!("{long_line}\nshort\nshort\n"));
+        let win = engine.active_window_id();
+        let buffer_id = engine.windows.get(&win).unwrap().buffer_id;
+        // `max_col` (what the scrollbar geometry reads) is a cache
+        // refreshed by `update_syntax`, not by a raw `Buffer::insert`.
+        engine
+            .buffer_manager
+            .get_mut(buffer_id)
+            .unwrap()
+            .update_syntax();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.session.explorer_visible = true;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let sb = h
+            .painted_sidebar_bounds
+            .get()
+            .expect("the explorer sidebar must have painted");
+
+        let rect = {
+            let layout = h.screen_layout.borrow();
+            layout
+                .as_ref()
+                .expect("render_content must have painted a ScreenLayout")
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active window must have painted")
+                .rect
+        };
+        assert!(
+            rect.x as f32 >= sb.x + sb.width,
+            "fixture sanity: with the explorer open the editor must start \
+             right of the sidebar (sidebar ends at x={}, editor rect starts \
+             at x={}) — this offset is exactly what the pre-#1493 \
+             horizontal rung ignored",
+            sb.x + sb.width,
+            rect.x
+        );
+
+        let char_width = h.painted_char_width() as f32;
+        let line_height =
+            h.painted_line_height()
+                .expect("render_content must publish the painted line height") as f32;
+
+        // Independent geometry prediction — never reusing
+        // `scrollbar_thumb_geometry`/`scrollbar_hit_test` (the code under
+        // test). One fold-indicator gutter column (`LineNumberMode::None`,
+        // no git diff, no breakpoints) and no v-scrollbar in this fixture,
+        // so the track spans the rest of the painted window rect.
+        let track_x = rect.x as f32 + char_width;
+        let track_w = rect.width as f32 - char_width;
+        let max_col = 500.0_f32;
+        let visible_cols = (track_w / char_width).floor();
+        let max_scroll = ((max_col as f64) - (visible_cols as f64)).max(1.0).round() as usize;
+        let (thumb_start0, thumb_len) =
+            quadraui::fit_thumb(0.0, max_col, visible_cols, track_w, line_height);
+        assert!(
+            track_x + thumb_start0 + thumb_len < track_x + track_w,
+            "fixture sanity: the thumb must not fill the whole track, or \
+             there is no empty space left of this test's own click target \
+             (thumb_start0={thumb_start0}, thumb_len={thumb_len}, \
+             track_w={track_w})"
+        );
+
+        // Click on the empty track, one pixel short of its right edge —
+        // strictly past the thumb (which starts at the track's own left
+        // edge, `scroll_left` being 0) — resolving to a page-jump toward
+        // the click, not a thumb-drag.
+        let click_x = track_x + track_w - 1.0;
+        let click_y = rect.y as f32 + rect.height as f32 - line_height / 2.0;
+
+        let before = h
+            .engine
+            .borrow()
+            .windows
+            .get(&win)
+            .unwrap()
+            .view
+            .scroll_left;
+        assert_eq!(before, 0, "fixture sanity: must start unscrolled");
+
+        // A real click (routed through `App::handle_mouse_click_msg`),
+        // exactly as a user's click would dispatch.
+        h.driver.click(click_x, click_y);
+        h.driver.render();
+
+        let after = h
+            .engine
+            .borrow()
+            .windows
+            .get(&win)
+            .unwrap()
+            .view
+            .scroll_left;
+        let expected_min = max_scroll.min(visible_cols.floor() as usize);
+        assert!(
+            after > 0,
+            "a click on the h-scrollbar's empty track must page \
+             scroll_left forward; got {after} (expected roughly \
+             {expected_min}, max_scroll={max_scroll}) — with the sidebar \
+             open, this is the exact click the pre-#1493 horizontal rung's \
+             `x = 0`-assuming window rects missed entirely"
         );
     }
 
