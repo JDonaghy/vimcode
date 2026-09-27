@@ -237,21 +237,23 @@ impl SymbolKind {
 
     pub fn icon(&self) -> &'static str {
         match self {
-            Self::File => "󰈔",
-            Self::Module | Self::Namespace | Self::Package => "󰏗",
+            Self::File => crate::icons::SYM_FILE.nerd,
+            Self::Module | Self::Namespace | Self::Package => crate::icons::SYM_MODULE.nerd,
             Self::Class | Self::Struct => "",
-            Self::Method | Self::Constructor => "󰊕",
-            Self::Function => "󰊕",
+            Self::Method | Self::Constructor => crate::icons::SYM_FUNCTION.nerd,
+            Self::Function => crate::icons::SYM_FUNCTION.nerd,
             Self::Property | Self::Field => "",
             Self::Enum | Self::EnumMember => "",
             Self::Interface => "",
             Self::Variable => "",
             Self::Constant => "",
-            Self::String | Self::Number | Self::Boolean | Self::Null => "󰎠",
-            Self::Array | Self::Object => "󰅪",
+            Self::String | Self::Number | Self::Boolean | Self::Null => {
+                crate::icons::SYM_PRIMITIVE.nerd
+            }
+            Self::Array | Self::Object => crate::icons::SYM_ARRAY.nerd,
             Self::Key => "",
             Self::Event => "",
-            Self::Operator => "󰆕",
+            Self::Operator => crate::icons::SYM_OPERATOR.nerd,
             Self::TypeParameter => "",
             Self::Unknown => "?",
         }
