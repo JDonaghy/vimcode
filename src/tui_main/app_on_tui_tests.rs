@@ -1703,8 +1703,19 @@ mod tests {
                     driver.dispatch(quadraui::UiEvent::WindowFocused(true));
                     driver.render();
 
-                    // Plain editor body, well left of the centred popup.
-                    driver.click(6.0, title.y + 2.0);
+                    // Plain editor body, well left of the centred popup —
+                    // #1543: line numbers now default on, so the gutter is
+                    // wider than the fixed column 6 this used to click;
+                    // resolve a real text pixel instead of a hardcoded one.
+                    let body = driver
+                        .find_bounds("AAA1431 line 0")
+                        .expect("the editor body must paint under the popup");
+                    assert!(
+                        body.x + 1.0 < title.x,
+                        "fixture sanity: the click target must sit left of \
+                         the centred popup, not under it"
+                    );
+                    driver.click(body.x + 1.0, body.y);
                     driver.render();
 
                     let screen = driver.screen();
@@ -4181,6 +4192,42 @@ mod tests {
                 screen.contains("ZQXW1496_LAST_LINE"),
                 "'G' with 'wrap' and 'linebreak' on must scroll the last \
                  line into view; screen:\n{screen}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1543: line numbers default to absolute (VS Code/Neovim hybrid default)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod line_numbers_default {
+        use super::*;
+
+        /// A fresh editor with untouched settings (no `:set number`, no
+        /// `settings.json` override) must paint the absolute line-number
+        /// gutter out of the box — VS Code shows line numbers from the
+        /// first frame, and vimcode is a VS Code/Neovim hybrid. Asserts on
+        /// the painted gutter text itself, not on `settings.line_numbers`
+        /// being populated (that field could be right while paint ignores
+        /// it, as #587/#592 found for other `ScreenLayout`-adjacent state).
+        ///
+        /// **Verified RED against unfixed `develop`**: with
+        /// `Settings::default`'s `line_numbers` reverted to
+        /// `LineNumberMode::None`, this test fails — the gutter paints only
+        /// the fold-indicator column and neither "1" nor "2" appears
+        /// anywhere on screen.
+        #[test]
+        fn fresh_engine_paints_absolute_line_numbers_by_default() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "aaa\nbbb\nccc\n");
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            assert!(
+                h.driver.find_bounds("1").is_some() && h.driver.find_bounds("2").is_some(),
+                "a fresh buffer's gutter must paint absolute line numbers \
+                 by default, matching VS Code's out-of-the-box gutter; \
+                 screen:\n{screen}"
             );
         }
     }

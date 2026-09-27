@@ -487,6 +487,11 @@ mod cross_split_drag_focus_tests {
     #[test]
     fn drag_continuation_does_not_steal_focus_to_neighboring_group() {
         let mut engine = Engine::new();
+        // #1543: line numbers now default on, widening the gutter beyond
+        // one column — pin the pre-#1543 no-gutter geometry this test's
+        // `char_width * 2.0` pixel math assumes, since gutter width isn't
+        // what this test is about.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid_a = engine.active_window_id();
         let group_a = engine.active_group;
@@ -757,6 +762,11 @@ mod frame_hit_map_tests {
         // opposed to the `None` fallback path already covered by
         // `cross_split_drag_focus_tests`.
         let mut engine = Engine::new();
+        // #1543: line numbers now default on, widening the gutter beyond
+        // one column — pin the pre-#1543 no-gutter geometry this test's
+        // `char_width * 2.0` pixel math assumes, since gutter width isn't
+        // what this test is about.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid = engine.active_window_id();
         let theme = Theme::onedark();

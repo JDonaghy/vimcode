@@ -1602,7 +1602,7 @@ fn default_scrolljump() -> usize {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            line_numbers: LineNumberMode::None,
+            line_numbers: LineNumberMode::Absolute,
             font_family: default_font_family(),
             font_size: default_font_size(),
             ui_font_size: default_ui_font_size(),
@@ -4499,7 +4499,10 @@ mod tests {
     #[test]
     fn test_settings_default() {
         let settings = Settings::default();
-        assert_eq!(settings.line_numbers, LineNumberMode::None);
+        // #1543: VS Code/Neovim hybrid default — absolute line numbers on,
+        // matching VS Code's out-of-the-box gutter. Vim users can still
+        // `:set nonumber` / `:set relativenumber`.
+        assert_eq!(settings.line_numbers, LineNumberMode::Absolute);
         // #1129: one value on every platform now that quadraui#1023
         // resolves the `"Monospace"` generic alias per-backend (see
         // `default_font_family`'s doc comment) — no more macOS special case.
@@ -4790,7 +4793,7 @@ mod tests {
     #[test]
     fn test_set_number_enables_absolute() {
         let mut s = Settings::default();
-        assert_eq!(s.line_numbers, LineNumberMode::None);
+        s.line_numbers = LineNumberMode::None;
         let msg = s.parse_set_option("number").unwrap();
         assert_eq!(msg, "number");
         assert_eq!(s.line_numbers, LineNumberMode::Absolute);
@@ -4808,6 +4811,7 @@ mod tests {
     #[test]
     fn test_set_relativenumber() {
         let mut s = Settings::default();
+        s.line_numbers = LineNumberMode::None;
         s.parse_set_option("relativenumber").unwrap();
         assert_eq!(s.line_numbers, LineNumberMode::Relative);
     }
@@ -5186,7 +5190,8 @@ mod tests {
     fn test_display_all() {
         let s = Settings::default();
         let display = s.display_all();
-        assert!(display.contains("nonumber"));
+        // #1543: default line numbers are now absolute ("number"), not "nonumber".
+        assert!(display.contains("number"));
         assert!(display.contains("expandtab"));
         assert!(display.contains("ts=4"));
         assert!(display.contains("sw=4"));
