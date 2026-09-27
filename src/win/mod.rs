@@ -71,6 +71,22 @@
 //! issue's "Machine" section and `Cargo.toml`'s `win` feature comment for
 //! why `mlua`'s vendored Lua C build is the thing that actually requires
 //! the cross C toolchain, not anything in this file.
+//!
+//! # #1558: activity-bar / tab-bar Nerd Font glyphs are a quadraui gap, not
+//! # a vimcode-side one
+//!
+//! vimcode#1558 reports activity-bar icons painting as ASCII placeholder
+//! characters and tab-bar file icons painting as a generic glyph on
+//! Win-GUI, despite Nerd Font Icons being on. Investigated (root cause
+//! confirmed for the activity-bar half, hypothesised for the tab-bar half)
+//! and found to be entirely inside `quadraui::win::activity_bar`/
+//! `quadraui::win::text` — see `docs/PENDING_QUADRAUI_ISSUES.md`'s two new
+//! entries for the full analysis. Nothing in this file or `backend.rs`
+//! changes: `App::setup` already calls `render::register_nerd_font_fallback`
+//! identically for every backend (this module has no special-cased font
+//! registration to add), and per the Platform-Neutrality Rule a Win-GUI-only
+//! icon-selection fix does not belong in a vimcode backend wrapper. Leave
+//! #1558 open until the quadraui issues are filed and land.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
