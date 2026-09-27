@@ -10179,9 +10179,10 @@ mod vscode_dimming {
         const VSCODE_LINE_NUMBER_FG: (u8, u8, u8) = (0x85, 0x85, 0x85);
 
         let mut engine = Engine::new();
-        // Line numbers default to `LineNumberMode::None`, so there is no
-        // gutter to probe unless the test turns them on — this is the
-        // `:set number` configuration the tokens exist for.
+        // #1543: line numbers default to `LineNumberMode::Absolute` now, but
+        // set it explicitly so this test stays correct regardless of the
+        // default — this is the `:set number` configuration the tokens exist
+        // for.
         engine.settings.line_numbers = LineNumberMode::Absolute;
         engine
             .buffer_mut()
@@ -15152,6 +15153,11 @@ mod editor_mouse_rungs {
     #[test]
     fn click_column_tracks_a_runtime_font_size_change_on_gtk() {
         let mut engine = Engine::new_for_test();
+        // #1543: line numbers now default on, widening the gutter — this
+        // test pins click→column tracking a *font* change, not gutter
+        // width, so keep the pre-#1543 no-gutter geometry its computed
+        // pixel math assumes.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine
             .buffer_mut()
             .insert(0, "0123456789".repeat(4).as_str());

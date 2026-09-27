@@ -9678,13 +9678,13 @@ mod portable_entry_point_tests {
             "vimcode_test_949_handle_poll_tick_{:?}.json",
             std::thread::current().id()
         ));
-        std::fs::write(&tmp, r#"{"line_numbers":"Absolute"}"#).expect("write temp settings.json");
+        std::fs::write(&tmp, r#"{"line_numbers":"Relative"}"#).expect("write temp settings.json");
         let _guard = TestSettingsPathGuard::install(tmp.clone());
 
         let engine = Rc::new(RefCell::new(Engine::new_for_test()));
         assert_eq!(
             engine.borrow().settings.line_numbers,
-            LineNumberMode::None,
+            LineNumberMode::Absolute,
             "precondition: the constructor's default must differ from the \
              on-disk value, or a reload would be indistinguishable from a no-op"
         );
@@ -9695,7 +9695,7 @@ mod portable_entry_point_tests {
 
         assert_eq!(
             engine.borrow().settings.line_numbers,
-            LineNumberMode::Absolute,
+            LineNumberMode::Relative,
             "handle_poll_tick did not pick up the externally-edited settings file"
         );
 
