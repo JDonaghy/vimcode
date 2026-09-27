@@ -117,15 +117,6 @@ pub(crate) fn UI_FONT() -> String {
     format!("{} {}", UI_FONT_FAMILY, UI_FONT_SIZE.with(|s| s.get()))
 }
 
-/// Absolute per-group close-glyph hit rects captured during `render_content`.
-/// Keyed by `group_id.0` → `(bar_y_top, bar_y_bottom, per-tab Some((x0, x1)))`.
-/// All coordinates are in **absolute surface pixels** (same space as the raw
-/// mouse position), so hover hit-testing needs no geometry re-derivation. The
-/// x-ranges are the *tight* close-glyph zone (see `crate::click`'s
-/// `tighten_close_bounds`), matching the × highlight the rasteriser draws —
-/// so a hover shows the exact box that a click would close. (#515)
-pub(crate) type TabCloseAbsMap = HashMap<usize, (f64, f64, Vec<Option<(f64, f64)>>)>;
-
 /// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`).
 /// See `ShellApp::cached_tab_slots_abs` for the full doc comment. (#515)
 pub(crate) type TabSlotsAbsMap = HashMap<usize, Vec<(f32, f32)>>;

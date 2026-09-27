@@ -36,7 +36,7 @@ pub(crate) use crate::app::App;
 #[allow(unused_imports)]
 pub(crate) use crate::app_support::*;
 #[allow(unused_imports)]
-pub(crate) use crate::click::{TabBarPixelHits, TabPixelHitMap};
+pub(crate) use crate::click::GroupTabBarLayoutMap;
 
 /// Entry point for GTK mode.
 ///

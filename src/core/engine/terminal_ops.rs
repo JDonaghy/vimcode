@@ -651,8 +651,9 @@ impl Engine {
     }
 
     /// Dispatch a click on the bottom panel tab bar using the cached
-    /// `TabBarHits` from the last paint. Returns `true` if the click
-    /// was consumed (tab switch or panel close).
+    /// [`BottomTabStripHits`] (`TabBarLayout::hit_test`, #1491) from the last
+    /// paint. Returns `true` if the click was consumed (tab switch or panel
+    /// close).
     pub fn handle_bottom_tab_bar_click(&mut self, click_x: f64) -> bool {
         enum Action {
             Close,
@@ -664,26 +665,22 @@ impl Engine {
             let Some(ref hits) = *hits else {
                 return false;
             };
-            if hits
-                .right_segment_bounds
-                .first()
-                .is_some_and(|&(sx, ex)| click_x >= sx && click_x < ex)
-            {
-                Action::Close
-            } else {
-                let mut kinds = Vec::new();
-                if self.terminal_open {
-                    kinds.push(BottomPanelKind::Terminal);
+            let rel_x = click_x - hits.origin_x;
+            match hits.layout.hit_test(rel_x as f32, 0.0) {
+                quadraui::TabBarHit::RightSegment(id) if id.as_str() == "bottom_tab:close" => {
+                    Action::Close
                 }
-                if !self.dap_output_lines.is_empty() {
-                    kinds.push(BottomPanelKind::DebugOutput);
+                quadraui::TabBarHit::Tab(idx) => {
+                    let mut kinds = Vec::new();
+                    if self.terminal_open {
+                        kinds.push(BottomPanelKind::Terminal);
+                    }
+                    if !self.dap_output_lines.is_empty() {
+                        kinds.push(BottomPanelKind::DebugOutput);
+                    }
+                    kinds.get(idx).cloned().map_or(Action::None, Action::Switch)
                 }
-                hits.slot_positions
-                    .iter()
-                    .enumerate()
-                    .find(|(_, &(sx, ex))| click_x >= sx && click_x < ex)
-                    .and_then(|(idx, _)| kinds.get(idx).cloned())
-                    .map_or(Action::None, Action::Switch)
+                _ => Action::None,
             }
         };
         match action {
@@ -702,8 +699,9 @@ impl Engine {
 
     /// Resolve a terminal toolbar click to an action using cached hit data.
     /// Both TUI (cell columns) and GTK (pixel positions) pass screen-absolute
-    /// coordinates; the method accounts for coordinate-system differences
-    /// between `StatusBarLayout` (bar-relative) and `TabBarHits` (absolute).
+    /// coordinates; each arm shifts by its own cached `origin_x` before
+    /// hit-testing its bar-relative `layout` (#1491 — both `StatusBarLayout`
+    /// and `TabBarLayout` share that bar-relative convention now).
     pub fn resolve_terminal_toolbar_click(&self, click_x: f64) -> TerminalToolbarAction {
         let hits = self.terminal_toolbar_hits.borrow();
         let Some(ref hits) = *hits else {
@@ -721,24 +719,19 @@ impl Engine {
                     _ => TerminalToolbarAction::None,
                 }
             }
-            TerminalToolbarHits::TabStrip(hits) => {
-                for (i, &(sx, ex)) in hits.right_segment_bounds.iter().enumerate() {
-                    if click_x >= sx && click_x < ex {
-                        return match i {
-                            0 => TerminalToolbarAction::AddTab,
-                            1 => TerminalToolbarAction::ToggleSplit,
-                            2 => TerminalToolbarAction::ToggleMaximize,
-                            3 => TerminalToolbarAction::CloseTab,
-                            _ => TerminalToolbarAction::None,
-                        };
-                    }
+            TerminalToolbarHits::TabStrip { layout, origin_x } => {
+                let rel_x = click_x - origin_x;
+                match layout.hit_test(rel_x as f32, 0.0) {
+                    quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
+                        "term_toolbar:add" => TerminalToolbarAction::AddTab,
+                        "term_toolbar:split" => TerminalToolbarAction::ToggleSplit,
+                        "term_toolbar:maximize" => TerminalToolbarAction::ToggleMaximize,
+                        "term_toolbar:close" => TerminalToolbarAction::CloseTab,
+                        _ => TerminalToolbarAction::StartResize,
+                    },
+                    quadraui::TabBarHit::Tab(idx) => TerminalToolbarAction::SwitchTab(idx),
+                    _ => TerminalToolbarAction::StartResize,
                 }
-                for (idx, &(sx, ex)) in hits.slot_positions.iter().enumerate() {
-                    if click_x >= sx && click_x < ex && sx < ex {
-                        return TerminalToolbarAction::SwitchTab(idx);
-                    }
-                }
-                TerminalToolbarAction::StartResize
             }
         }
     }
