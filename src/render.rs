@@ -17742,13 +17742,14 @@ pub fn draw_sc_sidebar_panel(
 /// counts when present. Shared by both backends so the header text can't
 /// drift between TUI and GTK renderers (#480).
 pub fn sc_header_text(sc: &SourceControlData) -> String {
+    let branch_icon = crate::icons::GIT_BRANCH.nerd;
     if sc.ahead > 0 || sc.behind > 0 {
         format!(
-            "  \u{e702} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
+            "  {branch_icon} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
             sc.branch, sc.ahead, sc.behind
         )
     } else {
-        format!("  \u{e702} SOURCE CONTROL  {}", sc.branch)
+        format!("  {branch_icon} SOURCE CONTROL  {}", sc.branch)
     }
 }
 
@@ -19971,10 +19972,11 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     chat.set_transcript(turns);
     chat.set_busy(engine.acp().ai_streaming);
     let header_fg = theme.status_fg;
+    let ai_chat_icon = crate::icons::AI_CHAT.nerd;
     let mut header = if engine.acp().ai_streaming {
-        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
+        format!(" {ai_chat_icon} AI ASSISTANT  (thinking\u{2026})")
     } else {
-        " \u{f0e5} AI ASSISTANT".to_string()
+        format!(" {ai_chat_icon} AI ASSISTANT")
     };
     // #1463: the session tab strip. Folded into this same always-repainted
     // header line — exactly like the mode/usage suffix below — rather than
@@ -22693,7 +22695,6 @@ pub fn build_window_status_line(
 
         // Notification — spinner for in-progress, bell for done
         let notification_seg = if !engine.notifications.is_empty() {
-            let nf = crate::icons::nerd_fonts_enabled();
             let has_active = engine.has_active_notifications();
             let has_done = engine.has_done_notifications();
             let (icon, fg_color) = if has_active {
@@ -22709,8 +22710,10 @@ pub fn build_window_status_line(
                 let frame = frames[elapsed % frames.len()];
                 (format!("{frame}"), theme.function)
             } else if has_done {
-                let bell: &str = if nf { "󰂞" } else { "*" };
-                (bell.to_string(), theme.string_lit)
+                (
+                    crate::icons::STATUS_BELL_DONE.s().to_string(),
+                    theme.string_lit,
+                )
             } else {
                 (String::new(), bar_fg)
             };
@@ -22753,11 +22756,9 @@ pub fn build_window_status_line(
                 theme.status_inactive_fg
             }
         };
-        let nf = crate::icons::nerd_fonts_enabled();
-
         let menu_toggle_seg = if engine.menu_bar_toggleable {
             Some(StatusSegment {
-                text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
+                text: format!(" {} ", crate::icons::STATUS_MENU_TOGGLE.s()),
                 fg: toggle_fg(engine.menu_bar_visible),
                 bg: bar_bg,
                 bold: false,
@@ -22768,7 +22769,7 @@ pub fn build_window_status_line(
         };
 
         let panel_toggle_seg = StatusSegment {
-            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            text: format!(" {} ", crate::icons::STATUS_PANEL_TOGGLE.s()),
             fg: toggle_fg(engine.terminal_open || engine.bottom_panel_open),
             bg: bar_bg,
             bold: false,
@@ -22776,7 +22777,7 @@ pub fn build_window_status_line(
         };
 
         let sidebar_toggle_seg = StatusSegment {
-            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
             bg: bar_bg,
             bold: false,
@@ -23127,12 +23128,6 @@ pub fn build_bottom_panel_tab_bar(
 
 // ─── Terminal toolbar adapter (#305) ─────────────────────────────────────────
 
-/// Nerd-font icons for the terminal toolbar segments.
-const NF_TERM_CLOSE: &str = "󰅖";
-const NF_TERM_SPLIT: &str = "󰤼";
-const NF_TERM_MAXIMIZE: &str = "󰊗";
-const NF_TERM_UNMAXIMIZE: &str = "󰊓";
-
 /// The terminal toolbar is either a find bar or a tab strip.
 pub enum TerminalToolbar {
     FindBar(quadraui::StatusBar),
@@ -23170,7 +23165,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 action_id: None,
             }],
             right_segments: vec![quadraui::StatusBarSegment {
-                text: format!(" {} ", NF_TERM_CLOSE),
+                text: format!(" {} ", crate::icons::TERM_CLOSE.s()),
                 fg,
                 bg,
                 bold: false,
@@ -23199,9 +23194,9 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
         }
 
         let maxicon = if panel.maximized {
-            NF_TERM_UNMAXIMIZE
+            crate::icons::TERM_UNMAXIMIZE.s()
         } else {
-            NF_TERM_MAXIMIZE
+            crate::icons::TERM_MAXIMIZE.s()
         };
 
         let right = vec![
@@ -23212,7 +23207,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: false,
             },
             quadraui::TabBarSegment {
-                text: format!("{} ", NF_TERM_SPLIT),
+                text: format!("{} ", crate::icons::TERM_SPLIT.s()),
                 width_cells: 2,
                 id: Some(quadraui::WidgetId::new("term_toolbar:split")),
                 is_active: false,
@@ -23224,7 +23219,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: false,
             },
             quadraui::TabBarSegment {
-                text: format!("{} ", NF_TERM_CLOSE),
+                text: format!("{} ", crate::icons::TERM_CLOSE.s()),
                 width_cells: 2,
                 id: Some(quadraui::WidgetId::new("term_toolbar:close")),
                 is_active: false,
@@ -26632,7 +26627,7 @@ mod tests {
             hint: "h".into(),
             ..Default::default()
         };
-        item_a.icon = "\u{f04b}".into();
+        item_a.icon = crate::icons::DBG_PLAY.nerd.into();
 
         let item_b_child = ExtPanelItem {
             text: "Child".into(),
@@ -27498,6 +27493,132 @@ mod tests {
             "expected 'Spaces: 4', got '{}'",
             indent_seg.text
         );
+    }
+
+    /// #1540: the sidebar/panel/menu-bar status-bar toggles and the
+    /// done-notification bell used to be raw PUA literals embedded directly
+    /// in `build_window_status_line` (and `notification_seg` just above
+    /// it), invisible to `scripts/gen_icon_font.py`/
+    /// `tests/icon_font_coverage.rs` (both scan only `src/icons.rs`), so the
+    /// bundled subset font never picked up their codepoints and they
+    /// painted as tofu wherever the system font's PUA table didn't happen
+    /// to agree with a Nerd Font's. Asserts the *rendered segment text*
+    /// (not some intermediate flag) matches what the tracked
+    /// `crate::icons::STATUS_*` constants resolve to, in both the Nerd Font
+    /// and ASCII fallback cases -- a coupling guard against future drift
+    /// between this function and `icons.rs` (e.g. one side's fallback
+    /// string changing without the other).
+    ///
+    /// This test alone does **not** go red against the pre-#1540 code: the
+    /// old hand-typed literals (`if nf { " <glyph> " } else { " [P] " }`,
+    /// etc.) rendered byte-identical text to today's `STATUS_*` constants, so a
+    /// text-equality assertion here can't distinguish "sourced from
+    /// `icons.rs`" from "hand-typed to look the same". The actual bug --
+    /// the bundled subset font not containing these codepoints, i.e. tofu
+    /// on any system font that doesn't happen to share a Nerd Font's PUA
+    /// assignment -- is what `tests/icon_font_coverage.rs`'s
+    /// `bundled_font_covers_every_icon_codepoint` and (for the raw-literal
+    /// root cause) `no_raw_pua_literals_outside_icons_rs` cover, and both
+    /// were confirmed red against the pre-fix `src/render.rs`/
+    /// `src/core/lsp.rs`/`data/fonts/vimcode-icons.ttf` (13 missing
+    /// codepoints; 20 raw-literal violations) before this fix, green after.
+    #[test]
+    fn test_status_bar_toggle_and_bell_glyphs_come_from_icons_rs_constants() {
+        use crate::core::engine::Engine;
+
+        // ── Nerd Fonts on (default) ──────────────────────────────────────
+        crate::icons::set_nerd_fonts(true);
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.menu_bar_toggleable = true;
+        let notif_id = engine.notify(crate::core::engine::NotificationKind::GitOperation, "done");
+        engine.notify_done(notif_id, None);
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let panel_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::TogglePanel))
+            .expect("expected panel toggle segment");
+        assert_eq!(
+            panel_seg.text,
+            format!(" {} ", crate::icons::STATUS_PANEL_TOGGLE.s()),
+            "panel toggle segment text must come from STATUS_PANEL_TOGGLE"
+        );
+        assert!(
+            panel_seg
+                .text
+                .contains(crate::icons::STATUS_PANEL_TOGGLE.nerd),
+            "expected the tracked STATUS_PANEL_TOGGLE nerd glyph, got '{}'",
+            panel_seg.text
+        );
+
+        let sidebar_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleSidebar))
+            .expect("expected sidebar toggle segment");
+        assert_eq!(
+            sidebar_seg.text,
+            format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
+        );
+
+        let menu_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleMenuBar))
+            .expect("expected menu toggle segment (menu_bar_toggleable = true)");
+        assert_eq!(
+            menu_seg.text,
+            format!(" {} ", crate::icons::STATUS_MENU_TOGGLE.s())
+        );
+
+        let bell_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::DismissNotifications))
+            .expect("expected done-notification bell segment");
+        assert!(
+            bell_seg.text.contains(crate::icons::STATUS_BELL_DONE.nerd),
+            "expected the tracked STATUS_BELL_DONE nerd glyph, got '{}'",
+            bell_seg.text
+        );
+
+        // ── Nerd Fonts off (ASCII fallback) ──────────────────────────────
+        crate::icons::set_nerd_fonts(false);
+        let status_ascii = build_window_status_line(&engine, &theme, wid, true);
+        let panel_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::TogglePanel))
+            .expect("expected panel toggle segment");
+        assert_eq!(panel_seg_ascii.text, " [P] ");
+        let sidebar_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleSidebar))
+            .expect("expected sidebar toggle segment");
+        assert_eq!(sidebar_seg_ascii.text, " [S] ");
+        let menu_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleMenuBar))
+            .expect("expected menu toggle segment");
+        assert_eq!(menu_seg_ascii.text, " [M] ");
+        let bell_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::DismissNotifications))
+            .expect("expected done-notification bell segment");
+        assert!(bell_seg_ascii.text.contains('*'));
+
+        // Restore the default so this test can't leak into others on the
+        // same worker thread (icons.rs's USE_NERD_FONTS is thread-local,
+        // but cargo test can reuse worker threads across tests).
+        crate::icons::set_nerd_fonts(true);
     }
 
     #[test]
