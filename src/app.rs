@@ -1390,10 +1390,19 @@ impl App {
         // already consistent — `sync_per_frame_backend_state`'s per-frame
         // call remains the only thing that matters for a runtime `:set
         // guifont`/`:set font_size=N`/`zoomin`/`zoomout` after that.
-        cfg = cfg.with_editor_font(
-            self.engine.borrow().settings.font_family.clone(),
-            self.engine.borrow().settings.font_size as f32,
-        );
+        //
+        // #1542: resolved through `app_support::resolve_editor_font` rather
+        // than reading `settings.font_family`/`font_size` verbatim, so a
+        // user who has never customized either setting gets *this*
+        // backend's platform-native convention (Menlo 12 on macOS,
+        // Consolas 14 on Win-GUI, ...) instead of one hardcoded literal on
+        // every backend — see that function's doc. `self.backend` is
+        // already the live concrete backend by this point (`App::new_portable`
+        // stores it before `build_shell_config`/`shell_config` ever runs),
+        // so `default_fonts()` answers for real here, not a guess.
+        let (editor_family, editor_size_pt) =
+            resolve_editor_font(&self.engine.borrow().settings, &**self.backend.borrow());
+        cfg = cfg.with_editor_font(editor_family, editor_size_pt);
         // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
         // resolve identically on every backend.
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
@@ -3840,7 +3849,7 @@ impl App {
         // raw-Pango chrome that doesn't go through `Backend::set_ui_font`)
         // read the process-global atomic this writes, so before this port it
         // silently stayed pinned at the default size forever.
-        sync_ui_font_size(&engine.settings);
+        sync_ui_font_size(&engine.settings, backend);
         // #705 item 3 / quadraui#624: push the same UI_FONT() family+size
         // onto the *paint* backend's `ui_font`, which `draw_status_bar`
         // (breadcrumbs, per-window/global status lines), `draw_tree`
@@ -3866,10 +3875,13 @@ impl App {
         // "set_editor_font" src/` returned zero hits before this issue), so
         // the editor painted at whatever default quadraui's `GtkBackend`/
         // `MacBackend` ship with ("Monospace 11") regardless of the setting.
-        backend.set_editor_font(
-            &engine.settings.font_family,
-            engine.settings.font_size as f32,
-        );
+        //
+        // #1542: resolved through `resolve_editor_font` (same function
+        // `shell_config`'s pre-seed above uses) instead of the raw fields,
+        // so an un-customized setting keeps tracking this backend's
+        // platform-native convention every frame, not just at startup.
+        let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
+        backend.set_editor_font(&editor_family, editor_size_pt);
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)

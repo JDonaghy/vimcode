@@ -107,11 +107,52 @@ thread_local! {
     static UI_FONT_SIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(10) };
 }
 
-/// Update this thread's UI font size from `settings`. Called
-/// once per frame at the top of [`App::render_content`] (#672 —
-/// `draw.rs::draw_editor`'s only live caller before the delete).
-pub(crate) fn sync_ui_font_size(settings: &core::settings::Settings) {
-    UI_FONT_SIZE.with(|s| s.set(settings.ui_font_size.max(6)));
+/// Update this thread's UI font size from `settings`, resolving it through
+/// `backend`'s platform-native convention when the user has never
+/// customized `ui_font_size` away from its compile-time default (issue
+/// #1542 — see [`core::settings::Settings::effective_ui_font_size`]'s doc
+/// for the "still at its default means never customized" test this
+/// delegates to). Called once per frame at the top of [`App::render_content`]
+/// (#672 — `draw.rs::draw_editor`'s only live caller before the delete).
+///
+/// `.max(6)` is kept here (on top of `effective_ui_font_size`'s own
+/// `6..=32` clamp) purely for belt-and-suspenders: this is the one call
+/// site every chrome paint call ultimately reads through ([`UI_FONT`]),
+/// so a future caller of `effective_ui_font_size` elsewhere gaining a
+/// bug can never make this thread-local go below a paintable size.
+pub(crate) fn sync_ui_font_size(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) {
+    let size = resolve_ui_font_size(settings, backend);
+    UI_FONT_SIZE.with(|s| s.set(size.max(6)));
+}
+
+/// Resolve this session's editor font `(family, size_pt)` — the user's
+/// explicit `settings.font_family`/`font_size` if they have ever set one,
+/// else `backend`'s own platform-native convention (issue #1156/#1542).
+/// Thin wrapper over [`core::settings::Settings::effective_editor_font`];
+/// exists so every call site (the `ShellConfig`-construction pre-seed in
+/// `App::shell_config` and the per-frame sync in
+/// `App::sync_per_frame_backend_state`) asks `backend` for its defaults
+/// the same way, rather than each inlining its own `backend.default_fonts()`
+/// call.
+pub(crate) fn resolve_editor_font(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) -> (String, f32) {
+    let defaults = backend.default_fonts();
+    settings.effective_editor_font(&defaults.editor_family, defaults.editor_size_pt)
+}
+
+/// Resolve this session's UI/chrome font size in points — [`resolve_editor_font`]'s
+/// twin for `settings.ui_font_size` (#1542). Thin wrapper over
+/// [`core::settings::Settings::effective_ui_font_size`].
+pub(crate) fn resolve_ui_font_size(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) -> u8 {
+    settings.effective_ui_font_size(backend.default_fonts().ui_size_pt)
 }
 
 /// Pango font description string for UI chrome at the currently
