@@ -737,6 +737,104 @@ mod tests {
             );
         }
 
+        /// #1574: the Explorer's selected row, when the tree does **not**
+        /// have keyboard focus, must paint with `theme.sidebar_sel_bg_
+        /// inactive` — not quadraui's own dark `Theme::default()` navy,
+        /// which is what leaked through before `render::
+        /// to_quadraui_theme_chrome` mapped `inactive_selected_bg` at all.
+        /// Reveals a real file so the row selection is genuine (not
+        /// hand-set on the primitive), under `vscode-light` specifically —
+        /// the colourscheme the issue reported — with the tree explicitly
+        /// unfocused, the same "file matching the active editor tab" case
+        /// `sidebar_sel_bg_inactive`'s own doc names.
+        #[test]
+        fn explorer_unfocused_selected_row_paints_sidebar_sel_bg_inactive_via_shell_app() {
+            let dir = std::env::temp_dir()
+                .join(format!("vc1574explinact_{:?}", std::thread::current().id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("zz1574.txt");
+            std::fs::write(&marker, "marker").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.cwd = dir.clone();
+            engine.explorer_reveal_path(&marker);
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.session.explorer_visible = true;
+            engine.explorer_has_focus = false;
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let (x, y) = driver
+                .find("zz1574.txt")
+                .expect("the revealed file must paint in the explorer sidebar");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the revealed row must paint a styled cell");
+
+            let expected_bg = quadraui::tui::ratatui_color(
+                crate::render::Theme::vscode_light().sidebar_sel_bg_inactive,
+            );
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "an unfocused Explorer's selected row must paint with \
+                 `sidebar_sel_bg_inactive`, not quadraui's own dark default; \
+                 screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #1574: the search sidebar's `"  NN: "` line-number prefix must
+        /// paint with `theme.line_number_fg` — before this issue,
+        /// `populate_search_sidebar_system` hard-coded `Color::rgb(100, 100,
+        /// 100)` for that span regardless of colourscheme, which read as an
+        /// odd, unthemed grey specifically under a light colourscheme like
+        /// `vscode-light` (its own `line_number_fg` is a teal, `#237893`,
+        /// nothing like the mid-grey literal). Uses a line number
+        /// (`9999`) picked to be a `find`-unique needle — unlikely to
+        /// collide with any other on-screen text — so the located cell is
+        /// unambiguously the prefix span, not the match text next to it.
+        #[test]
+        fn search_result_line_number_prefix_paints_theme_line_number_fg_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_SEARCH,
+            ));
+            engine.project_search_query = "zz1574".to_string();
+            engine.project_search_results = vec![crate::core::project_search::ProjectMatch {
+                file: std::path::PathBuf::from("zz1574_file.rs"),
+                line: 9998,
+                col: 0,
+                line_text: "zz1574 needle line".to_string(),
+            }];
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            let (x, y) = driver
+                .find("9999:")
+                .expect("the search result's line-number prefix must paint");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the line-number prefix must paint a styled cell");
+
+            let expected_fg =
+                quadraui::tui::ratatui_color(crate::render::Theme::vscode_light().line_number_fg);
+            assert_eq!(
+                style.fg,
+                expected_fg,
+                "the search sidebar's line-number prefix must paint with \
+                 `theme.line_number_fg`, not a hard-coded grey; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// Clicking the Search activity-bar icon must switch the sidebar body
         /// to the search panel (the "Replace…" row is unique to it) — located
         /// via its own chrome zone, not a hardcoded coordinate, same technique

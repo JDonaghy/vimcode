@@ -3237,7 +3237,7 @@ impl App {
                     .search_sidebar_system
                     .borrow_mut()
                     .set_backend_info(search_lh, (self.units.sidebar_system_metrics)(search_lh));
-                render::populate_search_sidebar_system(engine, &engine.cwd);
+                render::populate_search_sidebar_system(engine, &engine.cwd, theme);
                 engine.search_sidebar_body_rect.set(q_sb);
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
             }
@@ -3488,8 +3488,16 @@ impl App {
                 // by this issue) — see `render::search_only_chrome`'s doc.
                 // TUI's `panels::render_settings_panel` builds the identical
                 // chrome through the same helper.
+                //
+                // #1574: `background` is `Some(theme.tab_bar_bg)`, not
+                // `None` — the same sidebar background the `PANEL_EXPLORER`
+                // arm's doc comment above says TUI passes for this composer.
+                // With `None`, nothing fills the strip under the settings
+                // scrollbar's gutter, so the backend's own clear colour
+                // (dark on macOS regardless of the active colourscheme)
+                // showed through there instead of the themed sidebar bg.
                 let panel = render::SidebarPanelBody {
-                    background: None,
+                    background: Some(theme.tab_bar_bg),
                     chrome: render::search_only_chrome(
                         &engine.settings_query,
                         "",
