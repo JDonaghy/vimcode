@@ -1,5 +1,12 @@
 use std::path::PathBuf;
 
+// #1554: the Common-Controls v6 manifest gate lives in its own file so
+// `tests/windows_manifest.rs` can `include!` the same source and assert the
+// whole target/feature matrix on any host. See that file's header for why a
+// build script itself cannot be the unit under test.
+#[path = "build_support/windows_manifest.rs"]
+mod windows_manifest;
+
 fn main() {
     // Compile vendored tree-sitter-latex grammar (v0.3.0, language version 14)
     cc::Build::new()
@@ -50,7 +57,14 @@ fn main() {
 /// TaskDialog sample carries. Both MSVC's `link.exe` (what `windows-latest`
 /// CI uses) and `lld-link` (what `cargo xwin` uses to cross-build from
 /// Linux) implement these two flags natively — neither needs `mt.exe`.
+///
+/// The decision itself (which target/feature combinations get the flags) is
+/// `windows_manifest::comctl_v6_link_args`, kept in `build_support/` so
+/// `tests/windows_manifest.rs` can assert it on a Linux host; this function is
+/// only the cargo-directive plumbing around it.
 fn embed_windows_comctl_v6_manifest() {
+    println!("cargo:rerun-if-changed=build_support/windows_manifest.rs");
+
     // Host-independent gate: read the *target* cfg cargo hands the build
     // script, never `cfg!(…)` (which would describe the build host and so
     // would be wrong for every cross-compile, including the `cargo xwin`
@@ -59,16 +73,8 @@ fn embed_windows_comctl_v6_manifest() {
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let win_feature = std::env::var_os("CARGO_FEATURE_WIN").is_some();
 
-    // `target_env == "msvc"` because these are MSVC linker flags; a
-    // `*-pc-windows-gnu` build links with `ld`, which would reject them. The
-    // `win` feature gate keeps the `vcd.exe` TUI build
-    // (`build-windows-tui`) byte-identical to what it was before this
-    // function existed.
-    if target_os == "windows" && target_env == "msvc" && win_feature {
-        println!("cargo:rustc-link-arg-bin=vimcode=/MANIFEST:EMBED");
-        println!(
-            "cargo:rustc-link-arg-bin=vimcode=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
-        );
+    for arg in windows_manifest::comctl_v6_link_args(&target_os, &target_env, win_feature) {
+        println!("cargo:rustc-link-arg-bin=vimcode={arg}");
     }
 }
 

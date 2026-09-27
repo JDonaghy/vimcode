@@ -19,7 +19,10 @@
     "Adding a CI job? Add its `name:` here too (and bump the job count in",
     "tests/branch_protection.rs::required_contexts_match_ci_job_names), or the",
     "new lane is advisory and gates nothing. #1042 added the native macOS lane",
-    "for exactly that reason: src/macos/ is compiled by no other job.",
+    "for exactly that reason: src/macos/ is compiled by no other job. #1554",
+    "added the Windows GUI lane for the same reason: the Windows TUI lane",
+    "builds vcd.exe with the win backend off, so nothing else links (or",
+    "launches) vimcode.exe for Windows before a release does.",
     "",
     "Apply with:  scripts/apply-branch-protection.sh",
     "Audit with:  scripts/apply-branch-protection.sh --check"
@@ -29,7 +32,8 @@
     "Test (Linux, headless)",
     "Test (Linux, headless, GUI feature on)",
     "Test (macOS native, AppKit)",
-    "Build (Windows TUI, vcd.exe)"
+    "Build (Windows TUI, vcd.exe)",
+    "Build (Windows GUI, vimcode.exe)"
   ],
 
   "branches": {
