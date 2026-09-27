@@ -24,8 +24,9 @@ use util::*;
 pub(crate) use crate::app::App;
 
 // #862: `is_ext_panel_id`, the UI-font helpers, the tab-bar pixel-geometry
-// types/functions, `StatusSegmentMap`, `compute_editor_window_rects` and the
-// h-scrollbar geometry/hit-test functions all moved to the backend-neutral
+// types/functions, `StatusSegmentMap` and the (since #1493, axis-
+// parameterised) scrollbar geometry/hit-test functions all moved to the
+// backend-neutral
 // `crate::app_support` and `crate::click` — none of them named a `gtk4`/
 // `pango`/`gio` type, so nesting them in `crate::gtk` (behind the `gui`
 // feature) only blocked `crate::app` from resolving them without GTK. These
@@ -198,7 +199,7 @@ mod editor_scrollbar_geometry_tests {
     //! construction" bug #1128 fixed. These tests pin the replacement
     //! helpers (`editor_scrollbar_layout`/`h_scrollbar_thumb_geometry`)
     //! against that reality instead.
-    use super::{editor_scrollbar_layout, h_scrollbar_thumb_geometry};
+    use super::{editor_scrollbar_layout, scrollbar_thumb_geometry, ScrollbarAxis};
     use crate::core::{Engine, WindowRect};
 
     /// A window whose longest line overflows a narrow viewport and whose
@@ -275,9 +276,15 @@ mod editor_scrollbar_geometry_tests {
              matching quadraui's paint"
         );
 
-        let (tx, ty, tw, th, ..) =
-            h_scrollbar_thumb_geometry(&e, wid, &rect, char_width, line_height)
-                .expect("thumb geometry must resolve alongside the track");
+        let (tx, ty, tw, th, ..) = scrollbar_thumb_geometry(
+            &e,
+            wid,
+            &rect,
+            char_width,
+            line_height,
+            ScrollbarAxis::Horizontal,
+        )
+        .expect("thumb geometry must resolve alongside the track");
         assert_eq!(tx, h_track.x as f64);
         assert_eq!(ty, h_track.y as f64);
         assert_eq!(tw, h_track.width as f64);

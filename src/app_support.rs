@@ -135,38 +135,6 @@ pub(crate) const SC_COMMIT_BORDER_PX: f32 = 2.0;
 pub(crate) type StatusSegmentMap =
     HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
 
-/// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
-/// so that group rects and divider positions are consistent across draw and click.
-/// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
-///
-/// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh` pixels
-/// (2 chrome rows = bottom-panel tab bar + terminal toolbar). Editor tab bar
-/// stays visible (1 row reserved); breadcrumbs are suppressed elsewhere so
-/// we don't reserve a row for them here. Called every frame from `draw_frame`
-fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
-    render::compute_editor_layout(engine, da_height, line_height, false).editor_bottom
-}
-
-/// Compute editor window rects with the same formula `render_content` uses
-/// (previously shared with the now-deleted `sync_scrollbar`, #731), so event
-/// handlers can do hit-testing without duplicating the layout logic.
-pub(crate) fn compute_editor_window_rects(
-    engine: &Engine,
-    da_width: f64,
-    da_height: f64,
-    line_height: f64,
-) -> Vec<(core::WindowId, core::WindowRect)> {
-    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let editor_bounds = core::WindowRect::new(
-        0.0,
-        0.0,
-        da_width,
-        gtk_editor_bottom(engine, da_width, da_height, line_height),
-    );
-    let (rects, _dividers) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-    rects
-}
-
 /// Build the layout-only [`quadraui::Editor`] needed to call
 /// [`quadraui::Editor::layout`] for scrollbar geometry — the same
 /// primitive GTK's real paint path builds from a full `RenderedWindow`
@@ -281,42 +249,81 @@ pub(crate) fn editor_scrollbar_layout(
     Some((editor, layout))
 }
 
-/// Thumb geometry for one window's h scrollbar, derived from
-/// [`editor_scrollbar_layout`]'s `h_scrollbar_bounds` track and the same
-/// [`quadraui::fit_thumb`] call `quadraui::gtk::editor::draw_editor` paints
-/// the thumb with (`Scrollbar::horizontal`'s `min_thumb_len: line_height`).
+/// Which editor scrollbar a geometry/hit-test call is about (#1493).
+///
+/// Horizontal and vertical scrollbars are laid out by the identical
+/// [`quadraui::Editor::layout`] call and hit-tested by the identical
+/// [`quadraui::EditorLayout::hit_test`] — the only per-axis facts are which
+/// `EditorLayout` bounds field to read, which `Editor`/`window.view` scroll
+/// field drives the thumb, and which `quadraui::DragTarget` variant a thumb
+/// grab arms. [`scrollbar_thumb_geometry`] and [`scrollbar_hit_test`] take
+/// this enum instead of existing twice (`h_scrollbar_thumb_geometry`/
+/// `v_scrollbar_thumb_geometry`, `h_scrollbar_hit_test`/
+/// `v_scrollbar_hit_test`) — the two copies had already drifted once: the
+/// horizontal hit-test used inclusive track bounds (`<=`) while the
+/// vertical one had been fixed to half-open (`<`) to avoid swallowing the
+/// group-divider's own hit zone (#987). Reading both through
+/// `quadraui::EditorLayout::hit_test` below means that half-open convention
+/// can never re-diverge per axis again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbarAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Thumb geometry for one window's scrollbar on `axis`, derived from
+/// [`editor_scrollbar_layout`]'s `h_scrollbar_bounds`/`v_scrollbar_bounds`
+/// track and the same [`quadraui::fit_thumb`] call
+/// `quadraui::gtk::editor::draw_editor` paints the thumb with.
 ///
 /// Replaces the pre-#1128 h-scrollbar geometry helper, whose independently
 /// guessed `8.0`px v-scrollbar reserve (the real reserve is one
 /// `char_width`-wide cell, quadraui#968) and gutter-blind track start meant
-/// hover/drag could resolve against a rect paint never actually drew.
+/// hover/drag could resolve against a rect paint never actually drew, and
+/// the pre-#1493 h/v duplication of this same function.
 ///
-/// Returns `(track_x, track_y, track_w, sb_height, thumb_x, thumb_w,
-/// scroll_range, px_per_col)`. `None` when no h-scrollbar is painted
-/// (content fits).
+/// Returns `(track_x, track_y, track_w, track_h, thumb_pos, thumb_len,
+/// scroll_range, px_per_unit)` — `thumb_pos`/`thumb_len` run along the
+/// track's own axis (x/width for horizontal, y/height for vertical).
+/// `None` when no scrollbar on this axis is painted (content fits).
 #[allow(clippy::type_complexity)]
-pub(crate) fn h_scrollbar_thumb_geometry(
+pub(crate) fn scrollbar_thumb_geometry(
     engine: &Engine,
     window_id: core::WindowId,
     rect: &core::WindowRect,
     char_width: f64,
     line_height: f64,
+    axis: ScrollbarAxis,
 ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
     let (editor, layout) =
         editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
-    let track = layout.h_scrollbar_bounds?;
-    let (thumb_start, thumb_len) = quadraui::fit_thumb(
-        editor.scroll_left as f32,
-        editor.max_col as f32,
-        layout.visible_cols as f32,
-        track.width,
-        line_height as f32,
-    );
-    let scroll_range = (editor.max_col as f64 - layout.visible_cols as f64).max(1.0);
-    let px_per_col = if track.width as f64 > thumb_len as f64 {
-        (track.width - thumb_len) as f64 / scroll_range
+    let (track, scroll_pos, extent, visible, track_len) = match axis {
+        ScrollbarAxis::Horizontal => (
+            layout.h_scrollbar_bounds?,
+            editor.scroll_left as f32,
+            editor.max_col as f32,
+            layout.visible_cols as f32,
+            layout.h_scrollbar_bounds?.width,
+        ),
+        ScrollbarAxis::Vertical => (
+            layout.v_scrollbar_bounds?,
+            editor.scroll_top as f32,
+            editor.total_lines as f32,
+            layout.visible_lines as f32,
+            layout.v_scrollbar_bounds?.height,
+        ),
+    };
+    let (thumb_start, thumb_len) =
+        quadraui::fit_thumb(scroll_pos, extent, visible, track_len, line_height as f32);
+    let scroll_range = (extent as f64 - visible as f64).max(1.0);
+    let px_per_unit = if track_len as f64 > thumb_len as f64 {
+        (track_len - thumb_len) as f64 / scroll_range
     } else {
         0.0
+    };
+    let thumb_pos = match axis {
+        ScrollbarAxis::Horizontal => track.x as f64 + thumb_start as f64,
+        ScrollbarAxis::Vertical => track.y as f64 + thumb_start as f64,
     };
 
     Some((
@@ -324,138 +331,54 @@ pub(crate) fn h_scrollbar_thumb_geometry(
         track.y as f64,
         track.width as f64,
         track.height as f64,
-        track.x as f64 + thumb_start as f64,
+        thumb_pos,
         thumb_len as f64,
         scroll_range,
-        px_per_col,
+        px_per_unit,
     ))
 }
 
-/// Hit-test a point against all h scrollbars. Returns `(window_id,
-/// scroll_left_at_click)` when the point is on any h scrollbar track (not only
-/// the thumb), so the caller can decide between thumb-drag and track-click.
-pub(crate) fn h_scrollbar_hit_test(
-    engine: &Engine,
-    x: f64,
-    y: f64,
-    window_rects: &[(core::WindowId, core::WindowRect)],
-    char_width: f64,
-    line_height: f64,
-) -> Option<(core::WindowId, usize)> {
-    for (window_id, rect) in window_rects {
-        let Some((_, layout)) =
-            editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
-        else {
-            continue;
-        };
-        let Some(track) = layout.h_scrollbar_bounds else {
-            continue;
-        };
-        let (tx, ty, tw, th) = (
-            track.x as f64,
-            track.y as f64,
-            track.width as f64,
-            track.height as f64,
-        );
-        if x >= tx && x <= tx + tw && y >= ty && y <= ty + th {
-            let scroll_left = engine
-                .windows
-                .get(window_id)
-                .map(|w| w.view.scroll_left)
-                .unwrap_or(0);
-            return Some((*window_id, scroll_left));
-        }
-    }
-    None
-}
-
-/// Thumb geometry for one window's v scrollbar — mirrors
-/// [`h_scrollbar_thumb_geometry`], reading `v_scrollbar_bounds` off the
-/// same [`editor_scrollbar_layout`] call instead of `h_scrollbar_bounds`.
+/// Hit-test a point against all windows' scrollbars on `axis`. Returns
+/// `(window_id, scroll_at_click)` — `scroll_at_click` is `scroll_left` for
+/// [`ScrollbarAxis::Horizontal`], `scroll_top` for
+/// [`ScrollbarAxis::Vertical`] — when the point is on that scrollbar's
+/// track (not only the thumb), so the caller can decide between
+/// thumb-drag and track-click.
 ///
-/// Returns `(track_x, track_y, track_w, track_h, thumb_y, thumb_h, scroll_range, px_per_row)`.
-/// Returns `None` when no scrollbar is needed (content fits).
-#[allow(clippy::type_complexity)]
-pub(crate) fn v_scrollbar_thumb_geometry(
-    engine: &Engine,
-    window_id: core::WindowId,
-    rect: &core::WindowRect,
-    char_width: f64,
-    line_height: f64,
-) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
-    let (editor, layout) =
-        editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
-    let track = layout.v_scrollbar_bounds?;
-    let (thumb_start, thumb_len) = quadraui::fit_thumb(
-        editor.scroll_top as f32,
-        editor.total_lines as f32,
-        layout.visible_lines as f32,
-        track.height,
-        line_height as f32,
-    );
-    let scroll_range = (editor.total_lines as f64 - layout.visible_lines as f64).max(1.0);
-    let px_per_row = if track.height as f64 > thumb_len as f64 {
-        (track.height - thumb_len) as f64 / scroll_range
-    } else {
-        0.0
-    };
-
-    Some((
-        track.x as f64,
-        track.y as f64,
-        track.width as f64,
-        track.height as f64,
-        track.y as f64 + thumb_start as f64,
-        thumb_len as f64,
-        scroll_range,
-        px_per_row,
-    ))
-}
-
-/// Hit-test a point against all v scrollbars. Returns `(window_id,
-/// scroll_top_at_click)` when the point is on any v scrollbar track (not
-/// only the thumb), so the caller can decide between thumb-drag and
-/// track-page — mirrors [`h_scrollbar_hit_test`].
-pub(crate) fn v_scrollbar_hit_test(
+/// Delegates to [`quadraui::EditorLayout::hit_test`] rather than
+/// re-deriving inclusive/exclusive track bounds by hand — the pre-#1493
+/// horizontal copy of this function used an inclusive upper bound (`<=`)
+/// on both `x` and `y` where the vertical copy had already been fixed to
+/// half-open (`<`) so a click on a window's right edge lands on the
+/// group-divider's own hit zone instead of being swallowed by the
+/// scrollbar (#987's `drag_group_divider_resizes` regression). Reading
+/// both axes through the same `hit_test` call means they can never
+/// re-diverge on that convention again.
+pub(crate) fn scrollbar_hit_test(
     engine: &Engine,
     x: f64,
     y: f64,
     window_rects: &[(core::WindowId, core::WindowRect)],
     char_width: f64,
     line_height: f64,
+    axis: ScrollbarAxis,
 ) -> Option<(core::WindowId, usize)> {
+    let want = match axis {
+        ScrollbarAxis::Horizontal => quadraui::EditorHit::HScrollbar,
+        ScrollbarAxis::Vertical => quadraui::EditorHit::VScrollbar,
+    };
     for (window_id, rect) in window_rects {
         let Some((_, layout)) =
             editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
         else {
             continue;
         };
-        let Some(track) = layout.v_scrollbar_bounds else {
-            continue;
-        };
-        let (track_x, track_y, track_w, track_h) = (
-            track.x as f64,
-            track.y as f64,
-            track.width as f64,
-            track.height as f64,
-        );
-        // Half-open on the upper `x` bound (unlike `h_scrollbar_hit_test`'s
-        // `<=`) — this column's right edge coincides with the window's own
-        // right edge, which for any window sitting left of a group divider
-        // is also the divider's own hit-test coordinate
-        // (`render::route_divider_grab`'s `position`). An inclusive `<=`
-        // here would let this rung swallow a click aimed at the divider
-        // itself, failing the #987 negative-space case
-        // (`drag_group_divider_resizes`) that pins the divider's own hit
-        // zone must survive this fix. `quadraui::EditorLayout::hit_test`
-        // uses the same half-open convention for its `VScrollbar` arm.
-        if x >= track_x && x < track_x + track_w && y >= track_y && y < track_y + track_h {
-            let scroll_top = engine
-                .windows
-                .get(window_id)
-                .map(|w| w.view.scroll_top)
-                .unwrap_or(0);
-            return Some((*window_id, scroll_top));
+        if layout.hit_test(x as f32, y as f32) == want {
+            let scroll = engine.windows.get(window_id).map(|w| match axis {
+                ScrollbarAxis::Horizontal => w.view.scroll_left,
+                ScrollbarAxis::Vertical => w.view.scroll_top,
+            });
+            return Some((*window_id, scroll.unwrap_or(0)));
         }
     }
     None

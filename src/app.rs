@@ -4581,12 +4581,12 @@ impl App {
         //
         // `app_support::editor_scrollbar_layout` builds the same
         // `Editor`/`EditorLayout` pair (minus the rendered text, which
-        // scrollbar geometry never reads) so `h_scrollbar_thumb_geometry`/
-        // `v_scrollbar_thumb_geometry`/`h_scrollbar_hit_test`/
-        // `v_scrollbar_hit_test` below can never resolve a hover/drag rect
-        // paint didn't actually draw — #1128 deleted the pre-#968 h-scrollbar
-        // geometry helper that independently guessed its own track width and
-        // could disagree with what was actually painted.
+        // scrollbar geometry never reads) so the axis-parameterised
+        // `scrollbar_thumb_geometry`/`scrollbar_hit_test` (#1493, was one
+        // hand-rolled pair per axis) below can never resolve a hover/drag
+        // rect paint didn't actually draw — #1128 deleted the pre-#968
+        // h-scrollbar geometry helper that independently guessed its own
+        // track width and could disagree with what was actually painted.
         let mut host = GtkEditorBandHost {
             app: self,
             lh,
@@ -5171,6 +5171,124 @@ impl App {
         true
     }
 
+    /// Resolve a press against one editor scrollbar axis — thumb-drag vs.
+    /// track page-jump — shared between the horizontal and vertical rungs
+    /// of `handle_mouse_click_msg` (#1493). Returns `true` when the point
+    /// landed on a scrollbar and the click was consumed (either scrolled
+    /// immediately or armed a drag); the caller should `return` without
+    /// falling through to the next rung.
+    ///
+    /// Window rects always come from [`Self::painted_editor_bounds`] — the
+    /// same cached, already-painted geometry the divider rung below reads
+    /// via `painted_divider_geometry` — never a `compute_editor_window_rects`
+    /// recompute from the drawing area's raw `width`/`height`, which always
+    /// assumes the editor area starts at `x = 0`. That only holds with the
+    /// activity bar/sidebar at zero width; with either painted, the real
+    /// left edge is `AppShellLayout::main_content_bounds.x`, so a rect
+    /// rebuilt from `(0, 0, width, height)` lands columns off from what was
+    /// actually drawn (this is what made the pre-#1493 horizontal-only copy
+    /// of this method resolve against a phantom rect once the sidebar/
+    /// activity bar reserved real width).
+    fn editor_scrollbar_press(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+        axis: ScrollbarAxis,
+    ) -> bool {
+        let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
+            return false;
+        };
+        let lh = self.cached_line_height;
+        let cw = self.cached_char_width;
+        let engine = self.engine.borrow();
+        let (rects, _dividers) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+        let Some((win_id, scroll_at_click)) =
+            scrollbar_hit_test(&engine, x, y, &rects, cw, lh, axis)
+        else {
+            return false;
+        };
+        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
+        let geom = win_rect
+            .and_then(|rect| scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh, axis));
+        drop(engine);
+        let Some((track_x, track_y, track_w, track_h, thumb_pos, thumb_len, scroll_range, _)) =
+            geom
+        else {
+            return false;
+        };
+        let max_scroll = scroll_range.round() as usize;
+        // #1061: `resolve_editor_scrollbar_click` below is shared with TUI's
+        // own h/v scrollbar click handlers (`tui_main/mouse.rs`) — see that
+        // function's doc for the full rationale.
+        let (click_pos, track_visible, track_start, track_length) = match axis {
+            ScrollbarAxis::Horizontal => (
+                x as f32,
+                (track_w / cw).floor() as usize,
+                track_x as f32,
+                track_w as f32,
+            ),
+            ScrollbarAxis::Vertical => (
+                y as f32,
+                (track_h / lh.max(1.0)).floor() as usize,
+                track_y as f32,
+                track_h as f32,
+            ),
+        };
+        match render::resolve_editor_scrollbar_click(
+            click_pos,
+            thumb_pos as f32,
+            (thumb_pos + thumb_len) as f32,
+            track_visible,
+            max_scroll,
+            scroll_at_click,
+        ) {
+            render::EditorScrollbarClick::PageTo(new_scroll) => {
+                let mut engine = self.engine.borrow_mut();
+                match axis {
+                    ScrollbarAxis::Horizontal => {
+                        engine.set_scroll_left_for_window(win_id, new_scroll);
+                    }
+                    ScrollbarAxis::Vertical => {
+                        engine.set_scroll_top_for_window(win_id, new_scroll);
+                        engine.sync_scroll_binds();
+                    }
+                }
+            }
+            render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                let drag_rc = backend.drag_state_handle();
+                let widget_prefix = match axis {
+                    ScrollbarAxis::Horizontal => "editor:h_sb",
+                    ScrollbarAxis::Vertical => "editor:v_sb",
+                };
+                let widget = quadraui::WidgetId::new(format!("{widget_prefix}:{}", win_id.0));
+                let target = match axis {
+                    ScrollbarAxis::Horizontal => quadraui::DragTarget::ScrollbarX {
+                        widget,
+                        track_start,
+                        track_length,
+                        thumb_length: thumb_len as f32,
+                        max_scroll,
+                        grab_offset,
+                        inverted: false,
+                    },
+                    ScrollbarAxis::Vertical => quadraui::DragTarget::ScrollbarY {
+                        widget,
+                        track_start,
+                        track_length,
+                        thumb_length: thumb_len as f32,
+                        max_scroll,
+                        grab_offset,
+                        inverted: false,
+                    },
+                };
+                drag_rc.borrow_mut().begin(target);
+            }
+        }
+        self.draw_needed.set(true);
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(
         &mut self,
@@ -5178,7 +5296,6 @@ impl App {
         x: f64,
         y: f64,
         width: f64,
-        height: f64,
         alt: bool,
     ) {
         // ── Folder picker mouse handling (#815) ─────────────────────────
@@ -5510,175 +5627,38 @@ impl App {
                 // widget (which has can_target=true while a menu is open).
                 // If we reach here, no menu is open and we proceed with normal handling.
 
-                // ── H scrollbar hit-test (before editor click) ────────────────
-                // If the click lands on a Cairo h scrollbar:
-                //   - on the thumb → start a DragTarget::ScrollbarX drag.
-                //   - on the empty track → page-jump toward the click.
-                // Either way, consume the click.
-                {
-                    let lh = self.cached_line_height;
-                    let cw = self.cached_char_width;
-                    let engine = self.engine.borrow();
-                    let rects = compute_editor_window_rects(&engine, width, height, lh);
-                    if let Some((win_id, scroll_left)) =
-                        h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
-                    {
-                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect.and_then(|rect| {
-                            h_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
-                        });
-                        drop(engine);
-                        if let Some((
-                            track_x,
-                            _ty,
-                            track_w,
-                            _sb_h,
-                            thumb_x,
-                            thumb_w,
-                            scroll_range,
-                            _,
-                        )) = geom
-                        {
-                            let max_scroll = scroll_range.round() as usize;
-                            let page_cols = (track_w / cw).floor() as usize;
-                            // #1061: shared with TUI's own h/v scrollbar
-                            // click handlers (`tui_main/mouse.rs`) via
-                            // `render::resolve_editor_scrollbar_click` —
-                            // see that function's doc for the full
-                            // rationale.
-                            match render::resolve_editor_scrollbar_click(
-                                x as f32,
-                                thumb_x as f32,
-                                (thumb_x + thumb_w) as f32,
-                                page_cols,
-                                max_scroll,
-                                scroll_left,
-                            ) {
-                                render::EditorScrollbarClick::PageTo(new_left) => {
-                                    let mut engine = self.engine.borrow_mut();
-                                    engine.set_scroll_left_for_window(win_id, new_left);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = backend.drag_state_handle();
-                                    drag_rc
-                                        .borrow_mut()
-                                        .begin(quadraui::DragTarget::ScrollbarX {
-                                            widget: quadraui::WidgetId::new(format!(
-                                                "editor:h_sb:{}",
-                                                win_id.0
-                                            )),
-                                            track_start: track_x as f32,
-                                            track_length: track_w as f32,
-                                            thumb_length: thumb_w as f32,
-                                            max_scroll,
-                                            grab_offset,
-                                            inverted: false,
-                                        });
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── V scrollbar hit-test (before divider) — #1026/#987 ────────
-                // Mirrors the H-scrollbar rung immediately above:
-                //   - on the thumb → start a DragTarget::ScrollbarY drag.
+                // ── H/V scrollbar hit-test (before divider) — #1026/#987/#1493 ──
+                // If the click lands on either editor scrollbar:
+                //   - on the thumb → start a DragTarget::ScrollbarX/Y drag.
                 //   - on the empty track → page-jump toward the click.
                 // Either way, consume the click *before* the divider hit-test
-                // below gets a look. Without this rung, `handle_mouse_click_msg`
-                // had no vertical-scrollbar hit-test at all, so a click on a
-                // window's own scrollbar column (the last `cell_width` before
-                // its edge, painted since quadraui#968) fell straight through
-                // to `route_divider_grab` — inert on any window, and silently
-                // resizing the split for any window whose scrollbar-adjacent
-                // side happened to sit inside the divider's own grab margin.
+                // below gets a look. Without a vertical rung here,
+                // `handle_mouse_click_msg` had no vertical-scrollbar hit-test
+                // at all, so a click on a window's own scrollbar column (the
+                // last `cell_width` before its edge, painted since
+                // quadraui#968) fell straight through to `route_divider_grab`
+                // — inert on any window, and silently resizing the split for
+                // any window whose scrollbar-adjacent side happened to sit
+                // inside the divider's own grab margin.
                 //
-                // Window rects come from `self.painted_editor_bounds()` (the
-                // same cached, already-painted `content_bounds`/`tab_bar_h`
-                // the divider rung below reads via `painted_divider_geometry`)
-                // rather than `compute_editor_window_rects`'s `width`/`height`
-                // recompute: that helper always assumes the editor area starts
-                // at `x = 0`, which only holds with the activity bar/sidebar at
-                // zero width. With either painted, its real left edge is
-                // `AppShellLayout::main_content_bounds.x`, so a rect rebuilt
-                // from `(0, 0, width, height)` lands columns off from what was
-                // actually drawn — verified while building this rung: TUI's
-                // own conformance fixture (activity bar always reserves a
-                // real column, no sidebar needed to see it) reproduced exactly
-                // that drift.
-                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
-                    let lh = self.cached_line_height;
-                    let cw = self.cached_char_width;
-                    let engine = self.engine.borrow();
-                    let (rects, _dividers) =
-                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
-                    if let Some((win_id, scroll_top)) =
-                        v_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
-                    {
-                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect.and_then(|rect| {
-                            v_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
-                        });
-                        drop(engine);
-                        if let Some((
-                            _track_x,
-                            track_y,
-                            _track_w,
-                            track_h,
-                            thumb_y,
-                            thumb_h,
-                            scroll_range,
-                            _,
-                        )) = geom
-                        {
-                            let max_scroll = scroll_range.round() as usize;
-                            let page_rows = (track_h / lh.max(1.0)).floor() as usize;
-                            // #1061: shared with TUI's own h/v scrollbar
-                            // click handlers (`tui_main/mouse.rs`) via
-                            // `render::resolve_editor_scrollbar_click` —
-                            // see that function's doc for the full
-                            // rationale.
-                            match render::resolve_editor_scrollbar_click(
-                                y as f32,
-                                thumb_y as f32,
-                                (thumb_y + thumb_h) as f32,
-                                page_rows,
-                                max_scroll,
-                                scroll_top,
-                            ) {
-                                render::EditorScrollbarClick::PageTo(new_top) => {
-                                    let mut engine = self.engine.borrow_mut();
-                                    engine.set_scroll_top_for_window(win_id, new_top);
-                                    engine.sync_scroll_binds();
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = backend.drag_state_handle();
-                                    drag_rc
-                                        .borrow_mut()
-                                        .begin(quadraui::DragTarget::ScrollbarY {
-                                            widget: quadraui::WidgetId::new(format!(
-                                                "editor:v_sb:{}",
-                                                win_id.0
-                                            )),
-                                            track_start: track_y as f32,
-                                            track_length: track_h as f32,
-                                            thumb_length: thumb_h as f32,
-                                            max_scroll,
-                                            grab_offset,
-                                            inverted: false,
-                                        });
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                // Horizontal tried first (matches the pre-#1493 ordering);
+                // shared axis-parameterised `App::editor_scrollbar_press`
+                // (#1493) — was two hand-rolled ~85-line copies here, one per
+                // axis, which had already drifted: the horizontal copy
+                // rebuilt window rects via `compute_editor_window_rects`'s
+                // `width`/`height` recompute, which always assumes the
+                // editor area starts at `x = 0`, while the vertical copy had
+                // already been fixed (this rung's own prior comment) to read
+                // `self.painted_editor_bounds()` instead — the real left
+                // edge, `AppShellLayout::main_content_bounds.x`, once the
+                // activity bar/sidebar reserves real width. Both axes now go
+                // through the same method, so that offset can never
+                // re-diverge per axis again.
+                if self.editor_scrollbar_press(backend, x, y, ScrollbarAxis::Horizontal) {
+                    return;
+                }
+                if self.editor_scrollbar_press(backend, x, y, ScrollbarAxis::Vertical) {
+                    return;
                 }
 
                 // ── Divider hit-test (#753 shared rung) ───────────────────────
@@ -8442,7 +8422,7 @@ impl App {
                 ..
             } => {
                 let main = ctx.layout.main_content_bounds;
-                let (w, h) = (main.width as f64, main.height as f64);
+                let w = main.width as f64;
                 match button {
                     MouseButton::Left if modifiers.ctrl => {
                         self.handle_ctrl_mouse_click(
@@ -8457,7 +8437,6 @@ impl App {
                             position.x as f64,
                             position.y as f64,
                             w,
-                            h,
                             modifiers.alt,
                         );
                     }
