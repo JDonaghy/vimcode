@@ -729,6 +729,30 @@ pub struct Settings {
     #[serde(default = "default_minimap")]
     pub minimap: bool,
 
+    /// Render VS Code-parity miniature characters in the minimap
+    /// (`editor.minimap.renderCharacters`) instead of density dots/blocks,
+    /// on backends where quadraui's `MinimapRenderMode::Characters` is
+    /// reachable (issue #1532, consuming quadraui#1143's `MinimapScale` +
+    /// glyph atlas). Default on, matching VS Code. TUI's braille rasteriser
+    /// has no font to scale and never overrides
+    /// `Backend::minimap_scale`/`set_minimap_scale`, so this setting is a
+    /// no-op there — see [`Settings::resolved_minimap_scale`] for how the
+    /// shared code tells GUI and TUI apart without a per-backend branch.
+    #[serde(default = "default_minimap_render_characters")]
+    pub minimap_render_characters: bool,
+
+    /// VS Code-parity minimap character-cell scale (`editor.minimap.scale`)
+    /// — `1` resolves to quadraui's pre-#1143 `MinimapScale::One` (a bare
+    /// density dot), `2` (the default, matching VS Code's own
+    /// `minimap.scale`) resolves to `MinimapScale::Two`, the smallest cell
+    /// an atlas-blitted glyph tile reads back as a real shape rather than a
+    /// blob. quadraui does not yet ship a `Three`; a `3` here is accepted
+    /// and clamped to `2` (the largest scale currently available) by
+    /// [`Settings::resolved_minimap_scale`] rather than rejected outright —
+    /// see that method's doc comment.
+    #[serde(default = "default_minimap_scale")]
+    pub minimap_scale: u8,
+
     /// Highlight matching brackets when cursor is on one.
     #[serde(default = "default_match_brackets")]
     pub match_brackets: bool,
@@ -958,6 +982,14 @@ fn default_indent_guides() -> bool {
 
 fn default_minimap() -> bool {
     true
+}
+
+fn default_minimap_render_characters() -> bool {
+    true
+}
+
+fn default_minimap_scale() -> u8 {
+    2
 }
 
 fn default_match_brackets() -> bool {
@@ -1624,6 +1656,8 @@ impl Default for Settings {
             autohide_panels: false,
             indent_guides: default_indent_guides(),
             minimap: default_minimap(),
+            minimap_render_characters: default_minimap_render_characters(),
+            minimap_scale: default_minimap_scale(),
             match_brackets: default_match_brackets(),
             auto_pairs: None, // mode-derived — see Settings::auto_pairs()
             hover_delay: default_hover_delay(),
@@ -2202,6 +2236,30 @@ impl Settings {
             .unwrap_or_else(|| default_use_nerd_fonts(crate::icons::is_gui_backend()))
     }
 
+    /// Resolve `minimap_scale`/`minimap_render_characters` to the quadraui
+    /// [`quadraui::primitives::minimap::MinimapScale`] a backend should
+    /// paint the minimap strip at right now (issue #1532, consuming
+    /// quadraui#1143's `MinimapScale` + glyph atlas). TUI's braille
+    /// rasteriser has no font to scale, so this resolves to
+    /// `MinimapScale::One` — quadraui's own pre-#1143 default, which every
+    /// backend that never calls `Backend::set_minimap_scale` already paints
+    /// at — unconditionally there, via the same GUI-vs-TUI backend-derived
+    /// split [`Self::use_nerd_fonts`] already uses (#999) rather than a
+    /// second stored field. `minimap_scale == 1` or `minimap_render_characters
+    /// == false` also resolve to `One`; any other stored `minimap_scale`
+    /// (`2`, or the accepted-but-clamped `3`) resolves to `MinimapScale::Two`
+    /// — quadraui does not yet ship a `Three` to resolve to instead.
+    pub fn resolved_minimap_scale(&self) -> quadraui::MinimapScale {
+        if crate::icons::is_gui_backend()
+            && self.minimap_render_characters
+            && self.minimap_scale >= 2
+        {
+            quadraui::MinimapScale::Two
+        } else {
+            quadraui::MinimapScale::One
+        }
+    }
+
     /// Does `'virtualedit'` include the "one column past the last character"
     /// effect (`"all"` or `"onemore"`)? The only subset of `'virtualedit'`
     /// vimcode implements — see the field doc comment on
@@ -2642,6 +2700,7 @@ impl Settings {
             "autohidepanels" => self.autohide_panels = enable,
             "indentguides" => self.indent_guides = enable,
             "minimap" => self.minimap = enable,
+            "minimaprendercharacters" => self.minimap_render_characters = enable,
             "matchbrackets" => self.match_brackets = enable,
             "autopairs" => self.auto_pairs = Some(enable),
             "hidden" | "hid" => self.hidden = enable,
@@ -2775,6 +2834,12 @@ impl Settings {
                     .parse()
                     .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
                 self.ui_font_size = n.clamp(6, 32) as u8;
+            }
+            "minimapscale" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid value for {name}: '{value}'"))?;
+                self.minimap_scale = n.clamp(1, 3) as u8;
             }
             "font_family" => {
                 self.font_family = value.to_string();
@@ -2990,6 +3055,7 @@ impl Settings {
             "hover_delay" | "hd" => Some(self.hover_delay as i64),
             "font_size" => Some(self.font_size as i64),
             "ui_font_size" => Some(self.ui_font_size as i64),
+            "minimapscale" => Some(self.minimap_scale as i64),
             "syntax_max_lines" | "syntaxmaxlines" => Some(self.syntax_max_lines as i64),
             "undolevels" | "ul" => Some(self.undolevels as i64),
             "softtabstop" | "sts" => Some(self.softtabstop as i64),
@@ -3207,6 +3273,11 @@ impl Settings {
                 "minimap".to_string()
             } else {
                 "nominimap".to_string()
+            }),
+            "minimaprendercharacters" => Ok(if self.minimap_render_characters {
+                "minimaprendercharacters".to_string()
+            } else {
+                "nominimaprendercharacters".to_string()
             }),
             "matchbrackets" => Ok(if self.match_brackets {
                 "matchbrackets".to_string()
@@ -3482,6 +3553,10 @@ impl Settings {
             "autohide_panels" | "autohidepanels" => self.autohide_panels.to_string(),
             "indent_guides" | "indentguides" => self.indent_guides.to_string(),
             "minimap" => self.minimap.to_string(),
+            "minimap_render_characters" | "minimaprendercharacters" => {
+                self.minimap_render_characters.to_string()
+            }
+            "minimap_scale" | "minimapscale" => self.minimap_scale.to_string(),
             "match_brackets" | "matchbrackets" => self.match_brackets.to_string(),
             "auto_pairs" | "autopairs" => self.auto_pairs().to_string(),
             "hover_delay" => self.hover_delay.to_string(),
@@ -3638,6 +3713,15 @@ impl Settings {
             "autohide_panels" | "autohidepanels" => self.autohide_panels = value == "true",
             "indent_guides" | "indentguides" => self.indent_guides = value == "true",
             "minimap" => self.minimap = value == "true",
+            "minimap_render_characters" | "minimaprendercharacters" => {
+                self.minimap_render_characters = value == "true"
+            }
+            "minimap_scale" | "minimapscale" => {
+                let n: u32 = value
+                    .parse()
+                    .map_err(|_| format!("Invalid minimap_scale: {value}"))?;
+                self.minimap_scale = n.clamp(1, 3) as u8;
+            }
             "match_brackets" | "matchbrackets" => self.match_brackets = value == "true",
             "auto_pairs" | "autopairs" => self.auto_pairs = Some(value == "true"),
             "hover_delay" => {
@@ -4197,6 +4281,20 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "Show the code-overview minimap on the right edge of each editor pane",
         category: "Editor",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "minimap_render_characters",
+        label: "Minimap Render Characters",
+        description: "Render miniature characters in the minimap instead of density dots/blocks (VS Code's `editor.minimap.renderCharacters`); no effect on TUI, which has no font to render glyphs at",
+        category: "Editor",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "minimap_scale",
+        label: "Minimap Scale",
+        description: "Minimap character-cell scale when \"Minimap Render Characters\" is on (VS Code's `editor.minimap.scale`); 2 is VS Code's own default, the smallest cell a glyph reads back as a real shape",
+        category: "Editor",
+        setting_type: SettingType::Integer { min: 1, max: 2 },
     },
     SettingDef {
         key: "match_brackets",
