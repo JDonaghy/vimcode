@@ -3016,13 +3016,12 @@ mod grep_scope_tests {
         let (mut engine, dir) = engine_with_scoped_and_unscoped_files("file_target");
         let file_target = dir.join("in_scope.txt");
 
-        let mut host = NoopHost;
         crate::render::apply_explorer_context_action(
             &mut engine,
             "find_in_folder",
             &file_target,
             false,
-            &mut host,
+            &mut |_engine, _dir| {},
         );
         engine.picker_query = MARKER.to_string();
         engine.picker_filter();
@@ -3039,10 +3038,5 @@ mod grep_scope_tests {
                 .collect::<Vec<_>>()
         );
         assert!(engine.picker_items[0].display.contains("in_scope.txt"));
-    }
-
-    struct NoopHost;
-    impl crate::render::ExplorerContextHost for NoopHost {
-        fn open_terminal_at(&mut self, _engine: &mut Engine, _dir: std::path::PathBuf) {}
     }
 }

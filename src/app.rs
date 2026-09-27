@@ -125,8 +125,8 @@ use crate::gtk::backend;
 // dispatcher itself (`render::dispatch_panel_accelerator`) are shared with
 // TUI (#761 / #734 slice 6) — see the rung's header comment in `render.rs`.
 // What's left here is registration (this backend's own `quadraui::Backend`
-// instance) and [`GtkAccelHost`], the five-hook impl for the actions that
-// need GTK's `DeferredQueue` seam.
+// instance); `render::dispatch_panel_accelerator` queues onto `self.deferred`
+// directly (#1499) for the five actions that need GTK's `DeferredQueue` seam.
 
 // `register_panel_accelerators` (the 14-entry id table + registration loop)
 // moved to `render::register_panel_accelerators` in #823 item 1 — it was
@@ -134,448 +134,14 @@ use crate::gtk::backend;
 // Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
 // startup.
 
-/// [`render::PanelAcceleratorHost`] impl for GTK: each hook just queues the
-/// matching [`DeferredAction`] — GTK's `UiEvent::Accelerator` arm has no
-/// engine-mutation seam of its own for these five actions (see the rung's
-/// header comment in `render.rs`), so the real work happens in `tick()`
-/// (which does have `&mut App`) on the next frame, same as every other
-/// App-only GTK callback.
-struct GtkAccelHost<'a> {
-    deferred: &'a DeferredQueue,
-}
-
-impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
-    fn toggle_sidebar(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleSidebar);
-    }
-    fn focus_explorer(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleFocusExplorer);
-    }
-    fn focus_search(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleFocusSearch);
-    }
-    fn open_terminal(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleTerminal);
-    }
-    fn terminal_toggle_max(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleTerminalMaximize);
-    }
-}
-
-/// [`render::ShellShadowSyncHost`] impl for `App` (#1062, widened #1427):
-/// the shadow `engine.app_shell` has no `PanelDefinition` for the hamburger
-/// (`Self::shell_config` only registers it on the `cell` profile, and even
-/// there it's runner-only, never mirrored into the shadow — see
-/// `render::reclaim_hamburger_sidebar_reservation`'s doc), so a
-/// `PanelChanged` for it must skip the generic shadow sync. On GTK/macOS/Win
-/// (the `px` profile) the hamburger panel is never registered in the first
-/// place, so this arm is unreachable there and the impl is exactly as inert
-/// as the old GTK-only unit struct it replaces — same name kept
-/// (`GtkShellShadowHost`) since `App::on_shell_event` is the one call site,
-/// on every backend.
-struct GtkShellShadowHost;
-
-impl render::ShellShadowSyncHost for GtkShellShadowHost {
-    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool {
-        panel_id.as_str() == crate::core::engine::sidebar::HAMBURGER_PANEL_ID
-    }
-}
-
-/// [`render::EngineActionHost`] impl for GTK (#1063) — see the rung's header
-/// comment in `render.rs`. Unlike [`GtkAccelHost`] above, these hooks run
-/// with full `&mut App` in hand (`App::dispatch_engine_action`, the sole
-/// caller, has no engine borrow outstanding when it builds this), so there's
-/// no need to defer to `tick()` via `DeferredQueue` — except most method
-/// bodies below read/mutate the `engine: &mut Engine` parameter
-/// `apply_engine_action` hands them directly, rather than going through
-/// `self.engine.borrow()/borrow_mut()` the way the pre-#1063 `App` methods
-/// they replace did. That's not stylistic: `apply_engine_action`'s own
-/// `engine` parameter is already a live `RefMut` borrow of that same
-/// `Rc<RefCell<Engine>>` — reaching for a second, independent
-/// `self.app.engine.borrow_mut()` from in here would double-borrow the same
-/// `RefCell` and panic at runtime. `open_terminal`/`open_workspace_dialog`
-/// below used to be `App::new_terminal_tab`/`App::open_workspace_dialog`
-/// verbatim, until this rewrite left both with no other caller (menu, key
-/// and macro dispatch all go through here now) and #1063 deleted them
-/// rather than ship dead code.
-struct GtkEngineActionHost<'a> {
-    app: &'a mut App,
-}
-
-impl GtkEngineActionHost<'_> {
-    /// Shared by [`Self::quit`] and [`Self::quit_with_unsaved`]'s
-    /// no-unsaved-changes branch — inlines `App::save_session_and_exit`
-    /// against the already-borrowed `engine` instead of calling it (see this
-    /// struct's own doc for why).
-    fn save_session_and_exit(app: &App, engine: &mut Engine) {
-        // See `App::cached_window_geometry`'s own doc for why this reads
-        // cached cells rather than querying a live `backend` handle — this
-        // call chain (`EngineActionHost`) carries none (#1234, #1529).
-        engine.session.window = app.cached_window_geometry();
-        engine.save_session_state();
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        app.exit_requested.set(true);
-    }
-}
-
-impl render::EngineActionHost for GtkEngineActionHost<'_> {
-    /// Was `App::new_terminal_tab`; see this struct's own doc.
-    fn open_terminal(&mut self, engine: &mut Engine) {
-        let cols = self
-            .app
-            .terminal_panel_cols(self.app.painted_editor_content_width());
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab(cols, rows);
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::toggle_terminal_maximize`.
-    fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
-        let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: self
-                .app
-                .terminal_panel_cols(self.app.painted_editor_content_width()),
-            terminal_max_rows: self.app.terminal_maximize_target_rows(&*engine),
-        };
-        engine.handle_ui_event(
-            crate::core::engine::UiEvent::Accelerator(
-                crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
-                quadraui::Modifiers::default(),
-            ),
-            ctx,
-        );
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::run_command_in_terminal`.
-    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self
-            .app
-            .terminal_panel_cols(self.app.painted_editor_content_width());
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(&cmd, cols, rows);
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::open_folder_dialog`.
-    fn open_folder_dialog(&mut self, engine: &mut Engine) {
-        let controller = quadraui::FolderPickerController::new(
-            engine.cwd.clone(),
-            vec![".vimcode-workspace".to_string()],
-            engine.settings.show_hidden_files,
-        );
-        *self.app.folder_picker.borrow_mut() = Some(controller);
-        self.app.draw_needed.set(true);
-    }
-    /// Was `App::open_workspace_dialog` (see this struct's own doc), inlining
-    /// the `refresh_file_tree` / `refresh_explorer` / `reveal_path_in_explorer`
-    /// chain it called — `queue_explorer_draw` (that chain's last step) is a
-    /// documented no-op under the `ShellApp` runner, so dropping it changes
-    /// nothing.
-    fn open_workspace_dialog(&mut self, engine: &mut Engine) {
-        engine.explorer_rebuild_rows();
-        if let Some(path) = engine.file_path().cloned() {
-            engine.explorer_reveal_path(&path);
-        }
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::save_workspace_as_dialog` — touches no engine state, so
-    /// this one calls straight through.
-    fn save_workspace_as_dialog(&mut self, _engine: &mut Engine) {
-        self.app.save_workspace_as_dialog();
-    }
-    /// Inlines `App::open_recent_dialog`.
-    fn open_recent_dialog(&mut self, engine: &mut Engine) {
-        if engine.session.recent_workspaces.is_empty() {
-            engine.message = "No recent workspaces".to_string();
-        } else {
-            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
-        }
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
-    /// the `ShellApp` runner (see that method's own doc comment).
-    fn sidebar_toggled(&mut self, _engine: &mut Engine) {
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::show_quit_confirm`.
-    fn quit_with_unsaved(&mut self, engine: &mut Engine) {
-        if !engine.has_any_unsaved() {
-            Self::save_session_and_exit(self.app, engine);
-            return;
-        }
-        engine.show_quit_confirm();
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::quit_confirmed` (itself just `save_session_and_exit`).
-    fn quit(&mut self, engine: &mut Engine) {
-        Self::save_session_and_exit(self.app, engine);
-    }
-    /// Matches the former inline `EngineAction::QuitWithError` arm in
-    /// `dispatch_engine_action` exactly — no `save_session_state` (unlike
-    /// `quit` above). This asymmetry is GTK-specific, not something
-    /// `tui_main::handle_action` itself does: TUI's `Quit`/`SaveQuit` and
-    /// `QuitWithError` arms both call `save_session` (`tui_main/mod.rs`),
-    /// i.e. TUI treats the two variants *symmetrically*. The divergence is
-    /// cross-backend (GTK skips the save on `QuitWithError`, TUI doesn't),
-    /// preserved here exactly as it behaved pre-#1063 rather than changed
-    /// as a side effect of this convergence.
-    fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        std::process::exit(1);
-    }
-}
-
-/// [`render::ExplorerContextHost`] impl for GTK (#1418) — see the rung's
-/// header comment above [`render::apply_explorer_context_action`]. Same
-/// `app: &'a mut App` / `self.engine.clone()`-before-borrowing shape as
-/// [`GtkEngineActionHost`] above, for the same reason: the caller
-/// (`App::dispatch_context_menu_key`) already holds the confirmed action
-/// string, which was read out from a now-dropped `engine.borrow_mut()`, so
-/// building this host doesn't double-borrow the engine `RefCell`.
-struct GtkExplorerCtxHost<'a> {
-    app: &'a mut App,
-}
-
-impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
-    /// Was the `"open_terminal"` arm of the deleted
-    /// `App::dispatch_explorer_ctx_action`, which called `App::open_terminal_at`
-    /// — inlined here (rather than calling it) because that method reaches
-    /// for its own `self.engine.borrow_mut()`, and the caller
-    /// (`App::dispatch_context_menu_key`) already holds this same `Engine`
-    /// borrowed mutably as the `engine` parameter below; a second borrow
-    /// would panic (`RefCell` already mutably borrowed).
-    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf) {
-        let cols = self
-            .app
-            .terminal_panel_cols(self.app.painted_editor_content_width());
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab_at(cols, rows, Some(&dir));
-        self.app.draw_needed.set(true);
-    }
-}
-
-/// [`render::TickHost`] impl for GTK — the tick-time background chores
-/// `App::handle_poll_tick` shares with the pre-#1434 TUI shell's `tick` (#1248).
-/// Holds `app: &mut App` and `backend` as plain borrows, same shape as
-/// [`GtkEngineActionHost`]/[`GtkAccelHost`] above.
-///
-/// Every method that needs `Engine` mutation takes it via the `engine`
-/// parameter [`render::run_shared_tick_chores`] passes through — **never**
-/// via `self.app.engine.borrow_mut()`. The caller already holds that
-/// `RefCell` borrowed for the whole call (see `App::handle_poll_tick`), so a
-/// method reaching for `self.app`'s own `engine`-touching helpers (e.g.
-/// `App::quit_confirmed`, `App::run_command_in_terminal`) would panic with
-/// `BorrowMutError` — this struct inlines those helpers' bodies against the
-/// passed-in `engine` instead.
-struct GtkTickHost<'a> {
-    app: &'a mut App,
-    backend: &'a mut dyn quadraui::Backend,
-}
-
-impl render::TickHost for GtkTickHost<'_> {
-    fn with_last_layout(&self, f: &mut dyn FnMut(&render::ScreenLayout)) {
-        if let Some(layout) = self.app.cached_screen_layout.borrow().as_ref() {
-            f(layout);
-        }
-    }
-
-    fn tab_visible_counts(&self) -> Vec<(core::window::GroupId, usize)> {
-        self.app.tab_visible_counts.borrow().clone()
-    }
-
-    fn yank_highlight_deadline(&self) -> Option<std::time::Instant> {
-        self.app.yank_hl_deadline.get()
-    }
-
-    /// Inlines `App::clear_yank_highlight`'s body against `engine` directly
-    /// — see this struct's own doc for why it can't call that method.
-    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine) {
-        engine.clear_yank_highlight();
-        self.app.yank_hl_deadline.set(None);
-    }
-
-    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
-    /// the `ShellApp` runner (see that method's own doc comment).
-    fn on_idle_dirty(&mut self, _engine: &mut Engine) {
-        self.app.draw_needed.set(true);
-    }
-
-    fn sidebar_refresh_due(&mut self) -> bool {
-        if self.app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2) {
-            self.app.last_sc_refresh = std::time::Instant::now();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Inlines `App::run_command_in_terminal`'s body against `engine`
-    /// directly — see this struct's own doc for why it can't call that
-    /// method.
-    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self
-            .app
-            .terminal_panel_cols(self.app.painted_editor_content_width());
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(&cmd, cols, rows);
-    }
-
-    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String) {
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine.ext_panel_has_focus = true;
-        engine.ext_panel_active = Some(panel_name);
-        self.app.sync_sidebar_widgets();
-    }
-
-    /// Inlines `App::save_session_and_exit`'s body against `engine` directly
-    /// — see this struct's own doc for why it can't call that method.
-    fn quit_after_format_save(&mut self, engine: &mut Engine) {
-        engine.session.window = self.app.cached_window_geometry();
-        engine.save_session_state();
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        self.app.exit_requested.set(true);
-    }
-
-    fn run_platform_action(
-        &mut self,
-        engine: &mut Engine,
-        action: crate::core::engine::PendingPlatformAction,
-    ) {
-        render::run_pending_platform_action(engine, action, self.backend);
-    }
-
-    /// Sync the OS window title with the active buffer name (taskbar/
-    /// pager). Routed through `Backend::window()` (quadraui#950, #1124)
-    /// rather than the old GTK-only `self.window`/`PlatformWindowHandle`
-    /// title setter (deleted #1234) — that seam was `None` on
-    /// macOS/Win-GUI, so this used to be a silent no-op there;
-    /// `WindowControl` is backed on every windowed backend.
-    fn sync_window_title(&mut self, engine: &Engine) {
-        let win_title = render::window_title(engine);
-        if let Some(w) = self.backend.window() {
-            let _ = w.set_title(&win_title);
-            // Refresh the session-restore maximized cache (#1529)
-            // unconditionally — unlike size/position below, this is exactly
-            // the one moment those freeze, so it must always be current.
-            let maximized = w.is_maximized();
-            if let Ok(m) = maximized {
-                self.app.cached_window_maximized.set(m);
-            }
-            // Refresh the session-restore size/position cache (#1234,
-            // extended #1529 for position) — see `cached_window_width`'s
-            // doc for why this is cached here rather than read live from
-            // `save_session_and_exit`, and why it's gated on
-            // `!is_maximized()`.
-            if matches!(maximized, Ok(false)) {
-                if let Ok(bounds) = w.bounds() {
-                    self.app
-                        .cached_window_width
-                        .set(bounds.width.round() as i32);
-                    self.app
-                        .cached_window_height
-                        .set(bounds.height.round() as i32);
-                    // `WindowControl::bounds`'s own doc: GTK/Wayland always
-                    // reports `x: 0.0, y: 0.0` here, meaning "unknown", not
-                    // "at the screen origin" — skip caching that sentinel
-                    // rather than saving a fake position a `set_bounds`-
-                    // capable backend could later misapply; see
-                    // `cached_window_x`/`y`'s own doc for the #1529 review
-                    // finding this closes.
-                    if bounds.x != 0.0 || bounds.y != 0.0 {
-                        self.app.cached_window_x.set(Some(bounds.x.round() as i32));
-                        self.app.cached_window_y.set(Some(bounds.y.round() as i32));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// [`render::EditorBandHost`] impl for GTK (#1251) — the four [`render::
-/// EditorOp`] rungs `App::compose_editor_band_rungs`'s shared walk still
-/// hands back per-backend. See that trait's own doc for why each of these
-/// four, specifically, can't be inlined into the walk.
-///
-/// `window_editors`/`hit_bars` accumulate across the `Windows`/`TabBars`
-/// calls the same way the pre-#1251 local variables did — they used to live
-/// on the stack inside `compose_editor_band_rungs`'s loop; now they live here
-/// so the host can be threaded through `render::paint_editor_band_rungs`
-/// without a callback per rung. `compose_editor_band_rungs` destructures them
-/// back out once the walk returns, to build this frame's `FrameHitMap`.
-struct GtkEditorBandHost<'a> {
-    app: &'a App,
-    lh: f64,
-    tab_row_h: f64,
-    tab_bar_h: f64,
-    window_editors: Vec<quadraui::Editor>,
-    hit_bars: Vec<(core::window::GroupId, quadraui::Rect, &'a quadraui::TabBar)>,
-}
-
-impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
-    fn paint_windows(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        _engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app
-            .paint_editor_windows_rung(backend, screen, self.lh, &mut self.window_editors);
-    }
-
-    fn paint_tab_bars(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app.paint_tab_bars_rung(
-            backend,
-            engine,
-            screen,
-            self.tab_row_h,
-            self.tab_bar_h,
-            &mut self.hit_bars,
-        );
-    }
-
-    fn paint_group_dividers(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        render::draw_dividers_as_splits(backend, &screen.group_dividers, |div| {
-            quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
-        });
-    }
-
-    fn paint_tab_drag_overlay(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app
-            .cache_tab_drop_geometry(screen, engine, self.tab_bar_h);
-        let ctx = self.app.cached_drop_ctx.borrow();
-        let (mx, my) = self.app.mouse_pos_cell.get();
-        render::paint_tab_drop_overlay(backend, &ctx, (mx as f32, my as f32), 2.0, self.lh as f32);
-    }
-}
-
 /// Work that a GTK callback with no `&mut App` in hand must hand back to the
 /// next frame.
 ///
 /// #732 tranche 3: the six deferrals below are all that is left of the
 /// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
 /// originates somewhere that cannot call an `&mut self` method at all:
-/// [`GtkAccelHost`], which holds only a clone of the queue. (The 200 ms
+/// `render::dispatch_panel_accelerator`'s `UiEvent::Accelerator` arm, which
+/// only ever holds a clone of the queue. (The 200 ms
 /// yank-highlight one-shot used to be a seventh, scheduled via a one-shot
 /// toolkit timer; #813 ported it to the portable `yank_hl_deadline`
 /// poll-in-`tick` pattern TUI already used — see [`App::yank_hl_deadline`] —
@@ -590,7 +156,7 @@ impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
 /// the queued payload is necessarily app-specific, so the queue stays here
 /// rather than becoming a quadraui gap to file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredAction {
+pub(crate) enum DeferredAction {
     /// Redraw after an accelerator mutated engine state directly.
     Resize,
     /// Toggle focus between the explorer and the editor.
@@ -617,7 +183,7 @@ impl DeferredQueue {
     }
 
     /// Enqueue an action for processing in the next `tick()` call.
-    fn send(&self, action: DeferredAction) {
+    pub(crate) fn send(&self, action: DeferredAction) {
         self.0.borrow_mut().push_back(action);
     }
 
@@ -916,7 +482,7 @@ pub(crate) struct App {
     pub(crate) csd_applied: Cell<bool>,
     /// Cached window width/height (#1234), refreshed every tick
     /// (`handle_poll_tick`) from `WindowControl::bounds()` rather than read
-    /// live at quit time: quit runs through `EngineActionHost`/
+    /// live at quit time: quit runs through `render::apply_engine_action`/
     /// `handle_menu_action`/dialog-button call chains with no live
     /// `backend: &mut dyn quadraui::Backend` in scope (only `tick`/`setup`/
     /// paint entry points have one) — the same "no backend in scope"
@@ -2501,14 +2067,14 @@ impl App {
     ///
     /// Reads the `cached_window_*` cells rather than a live `backend`
     /// handle: every call site that needs to save on quit
-    /// (`GtkEngineActionHost::save_session_and_exit`, `GtkTickHost::
-    /// quit_after_format_save`, and `Self::save_session_and_exit` below)
-    /// runs through `EngineActionHost`/menu/dialog call chains with no live
-    /// `backend: &mut dyn quadraui::Backend` in scope — only `tick`/`setup`/
-    /// paint entry points have one — the same "no backend in scope" problem
-    /// `cached_line_height`/`cached_char_width` solve for text metrics,
-    /// solved the same way here. A free function (shared by all three sites)
-    /// rather than three duplicated field-copies keeps the five-field list
+    /// ([`Self::quit_and_save_session`] and, through it,
+    /// [`Self::save_session_and_exit`] below) runs through
+    /// `apply_engine_action`/`run_shared_tick_chores`/menu/dialog call chains
+    /// with no live `backend: &mut dyn quadraui::Backend` in scope — only
+    /// `tick`/`setup`/paint entry points have one — the same "no backend in
+    /// scope" problem `cached_line_height`/`cached_char_width` solve for text
+    /// metrics, solved the same way here. A free function (shared by both
+    /// sites) rather than duplicated field-copies keeps the five-field list
     /// in one place.
     fn cached_window_geometry(&self) -> core::session::WindowGeometry {
         core::session::WindowGeometry {
@@ -2520,15 +2086,25 @@ impl App {
         }
     }
 
-    /// Save the current session state and request a clean shutdown.
+    /// Save session state and request a clean shutdown, given an already
+    /// mutably-borrowed `engine`.
     ///
     /// Sets [`App::exit_requested`] rather than calling `process::exit`
     /// itself (#813) — `ShellApp::handle`/`tick` check the flag once they
     /// return and surface [`quadraui::Reaction::Exit`] to the runner, which
     /// tears the window down via `ReactionSink::request_exit`
     /// (`gtk/run.rs`), the same mechanism every other quadraui backend uses.
-    fn save_session_and_exit(&self) {
-        let mut engine = self.engine.borrow_mut();
+    ///
+    /// Takes `engine` as a parameter rather than borrowing `self.engine`
+    /// itself (unlike [`Self::save_session_and_exit`] below) because its
+    /// callers — `render::apply_engine_action`'s `Quit`/`SaveQuit`/
+    /// `QuitWithUnsaved` arms and `render::run_shared_tick_chores`'s
+    /// format-on-save-then-quit chore — already hold `engine: &mut Engine`
+    /// borrowed from this same `Rc<RefCell<Engine>>` for the whole call; a
+    /// second, independent `self.engine.borrow_mut()` from in here would
+    /// double-borrow and panic at runtime (#1063, #1248, folded here by
+    /// #1499).
+    pub(crate) fn quit_and_save_session(&self, engine: &mut Engine) {
         // Capture the cached window geometry into session state *before*
         // `save_session_state` persists it — `Engine` has no window handle
         // of its own to read this from (#823 item 5). See
@@ -2538,8 +2114,17 @@ impl App {
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
-        drop(engine);
         self.exit_requested.set(true);
+    }
+
+    /// Save the current session state and request a clean shutdown.
+    ///
+    /// Thin wrapper around [`Self::quit_and_save_session`] for call sites
+    /// that don't already hold `engine` borrowed — see that method's own
+    /// doc for why the two can't simply be one.
+    fn save_session_and_exit(&self) {
+        let mut engine = self.engine.borrow_mut();
+        self.quit_and_save_session(&mut engine);
     }
 
     /// Dispatch an `EngineAction` produced by `handle_key`, macro playback,
@@ -2569,8 +2154,7 @@ impl App {
             }
         }
         let engine_rc = self.engine.clone();
-        let mut host = GtkEngineActionHost { app: self };
-        render::apply_engine_action(action, &mut engine_rc.borrow_mut(), &mut host);
+        render::apply_engine_action(action, &mut engine_rc.borrow_mut(), self);
     }
 
     /// Return focus to the main editor drawing area when a sidebar loses
@@ -3159,14 +2743,13 @@ impl App {
         // #1248: the rest of this function's chores — per-window viewport
         // sync, tab-visibility re-check, window title, yank-highlight clear,
         // idle/SC polling, deferred quit, terminal command, ext-panel focus,
-        // platform-action drain — are shared with the pre-#1434 TUI shell's `tick`. See
-        // `render::run_shared_tick_chores`'s header comment for the full
-        // list and why the pieces left in `GtkTickHost` below differ.
+        // platform-action drain — are shared with the pre-#1434 TUI shell's
+        // `tick`. See `render::run_shared_tick_chores`'s header comment for
+        // the full list.
         let engine_rc = self.engine.clone();
         let needs_redraw = {
             let mut engine = engine_rc.borrow_mut();
-            let mut host = GtkTickHost { app: self, backend };
-            render::run_shared_tick_chores(&mut engine, &mut host)
+            render::run_shared_tick_chores(&mut engine, self, backend)
         };
         if needs_redraw {
             self.draw_needed.set(true);
@@ -3477,7 +3060,7 @@ impl App {
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
     /// within-group separators (`render_separators`) from the same rung.
-    fn paint_editor_windows_rung(
+    pub(crate) fn paint_editor_windows_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
         screen: &render::ScreenLayout,
@@ -4311,10 +3894,10 @@ impl App {
     /// shared walk by #1251) and recover this frame's `FrameHitMap` from it.
     ///
     /// Walks `render::paint_editor_band_rungs`, the single loop both this
-    /// method and the pre-#1434 TUI shell's `paint_editor_band` now call — see that
-    /// function's doc and `GtkEditorBandHost`'s for exactly which four rungs
-    /// still need a per-backend body and why. Extracted out of
-    /// `render_content` (#766) so that function reads as the frame's *order*.
+    /// method and the pre-#1434 TUI shell's `paint_editor_band` now call —
+    /// see that function's own doc for exactly which rungs need `self` and
+    /// why. Extracted out of `render_content` (#766) so that function reads
+    /// as the frame's *order*.
     ///
     /// `band` carries the editor column's origin and width (its height is not
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
@@ -4350,8 +3933,8 @@ impl App {
         // `window_editors`/`hit_bars` stash what the `Windows`/`TabBars`
         // rungs painted, past the walk (#449), so the `FrameHitMap` built
         // below references the SAME objects just painted rather than a
-        // second copy that could drift — see `GtkEditorBandHost`'s doc for
-        // why this bookkeeping can't move into the shared walk itself.
+        // second copy that could drift — see `render::paint_editor_band_rungs`'s
+        // doc for why this bookkeeping can't move into the shared walk itself.
         //
         // #1128 (was #731): both scrollbars ARE painted for the editor on
         // GTK today. quadraui#968 taught `gtk::editor::draw_editor` (the
@@ -4375,14 +3958,8 @@ impl App {
         // rect paint didn't actually draw — #1128 deleted the pre-#968
         // h-scrollbar geometry helper that independently guessed its own
         // track width and could disagree with what was actually painted.
-        let mut host = GtkEditorBandHost {
-            app: self,
-            lh,
-            tab_row_h,
-            tab_bar_h,
-            window_editors: Vec::with_capacity(screen.windows.len()),
-            hit_bars: Vec::new(),
-        };
+        let mut window_editors = Vec::with_capacity(screen.windows.len());
+        let mut hit_bars = Vec::new();
         let units = render::EditorBandUnits::px(lh, cw, tab_row_h);
         let composed_editor = render::paint_editor_band_rungs(
             backend,
@@ -4391,14 +3968,12 @@ impl App {
             theme,
             band,
             units,
+            tab_bar_h,
             self.tab_drag.is_dragging(),
-            &mut host,
+            self,
+            &mut window_editors,
+            &mut hit_bars,
         );
-        let GtkEditorBandHost {
-            window_editors,
-            hit_bars,
-            ..
-        } = host;
         *self.composed_editor_band.borrow_mut() = composed_editor;
         // Same contract as the chrome/overlay bands: read back through the
         // field rather than the local, so the *stored* observable is what gets
@@ -4637,7 +4212,7 @@ impl App {
         }
     }
 
-    fn paint_tab_bars_rung<'a>(
+    pub(crate) fn paint_tab_bars_rung<'a>(
         &self,
         backend: &mut dyn quadraui::Backend,
         engine: &Engine,
@@ -4709,7 +4284,7 @@ impl App {
     /// of `screen_to_drop_group_bounds` derived its rect from a caller-supplied
     /// origin/size instead; `group_tab_bars` now covers one group too, so both
     /// the branch and the parameters it fed are gone (#551).
-    fn cache_tab_drop_geometry(
+    pub(crate) fn cache_tab_drop_geometry(
         &self,
         screen: &render::ScreenLayout,
         engine: &Engine,
@@ -6331,7 +5906,7 @@ impl App {
     /// sync — `render_content` repaints the whole sidebar from
     /// `engine.app_shell` every frame — so this is now just the redraw
     /// trigger (#731).
-    fn sync_sidebar_widgets(&mut self) {
+    pub(crate) fn sync_sidebar_widgets(&mut self) {
         self.draw_needed.set(true);
     }
 
@@ -7199,13 +6774,24 @@ impl App {
         };
         if let (Some(ref act), Some((ref path, is_dir))) = (action, target) {
             let engine_rc = self.engine.clone();
-            let mut host = GtkExplorerCtxHost { app: self };
+            // Was the `"open_terminal"` arm of the deleted
+            // `App::dispatch_explorer_ctx_action`, which called the deleted
+            // `App::open_terminal_at` — inlined here (rather than calling a
+            // method) because that method reached for its own
+            // `self.engine.borrow_mut()`, and this closure runs while
+            // `engine_rc` is already borrowed mutably below; a second borrow
+            // would panic (`RefCell` already mutably borrowed).
             render::apply_explorer_context_action(
                 &mut engine_rc.borrow_mut(),
                 act,
                 path,
                 is_dir,
-                &mut host,
+                &mut |engine: &mut Engine, dir: std::path::PathBuf| {
+                    let cols = self.terminal_panel_cols(self.painted_editor_content_width());
+                    let rows = engine.session.terminal_panel_rows;
+                    engine.terminal_new_tab_at(cols, rows, Some(&dir));
+                    self.draw_needed.set(true);
+                },
             );
         }
         let needs_refresh = {
@@ -7442,7 +7028,7 @@ impl App {
     }
 
     /// Show a native "Save Workspace As" dialog.
-    fn save_workspace_as_dialog(&mut self) {
+    pub(crate) fn save_workspace_as_dialog(&mut self) {
         // Deferred to tick() — see PendingFileDialog (#572).
         self.pending_file_dialog
             .set(Some(PendingFileDialog::SaveWorkspaceAs));
@@ -7490,7 +7076,7 @@ impl App {
     /// painted (`cached_editor_bounds` is still `None`).
     ///
     /// #1421: replaces the old hardcoded `terminal_cols() -> 80`.
-    fn painted_editor_content_width(&self) -> f64 {
+    pub(crate) fn painted_editor_content_width(&self) -> f64 {
         self.cached_editor_bounds
             .get()
             .map(|(r, _)| r.width)
@@ -7513,7 +7099,7 @@ impl App {
     /// `App::new` and only ever grows from a real paint, so clamping it to a
     /// `1.0` floor (rather than branching on a `<= 0.0` fallback) is enough
     /// to avoid a divide-by-zero without a second hardcoded column count.
-    fn terminal_panel_cols(&self, width: f64) -> u16 {
+    pub(crate) fn terminal_panel_cols(&self, width: f64) -> u16 {
         let cw = self.cached_char_width.max(1.0);
         ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / cw) as u16
     }
@@ -7530,7 +7116,7 @@ impl App {
     /// #1421: replaces the old hardcoded `terminal_target_maximize_rows() ->
     /// 10`. Mirrors the TUI equivalent,
     /// `tui_main::terminal_target_maximize_rows_tui`.
-    fn terminal_maximize_target_rows(&self, engine: &Engine) -> u16 {
+    pub(crate) fn terminal_maximize_target_rows(&self, engine: &Engine) -> u16 {
         let h = self.cached_main_content_height.get();
         let lh = self.cached_line_height.max(1.0);
         render::compute_editor_layout(engine, h, lh, false).terminal_max_target_rows
@@ -8144,18 +7730,15 @@ impl App {
                 );
             }
             UiEvent::Accelerator(id, _mods) => {
-                let mut host = GtkAccelHost {
-                    deferred: &self.deferred,
-                };
                 if let Some(action) = render::dispatch_panel_accelerator(
                     id.as_str(),
                     &mut self.engine.borrow_mut(),
-                    &mut host,
+                    self,
                 ) {
                     // `dispatch_panel_accelerator` already mutated `engine`
-                    // directly for these five (no `GtkAccelHost` hook — see
-                    // `render.rs`), but they still need geometry recomputed
-                    // before the next paint — matches the pre-#761 per-arm
+                    // directly for the nine pure-`Engine` actions, but every
+                    // action still needs geometry recomputed before the next
+                    // paint — matches the pre-#761 per-arm
                     // `deferred.send(DeferredAction::Resize)`.
                     use render::PanelAccelerator::*;
                     if matches!(
@@ -8550,13 +8133,10 @@ impl App {
         // #1062: the shadow-`engine.app_shell` sync, unconditionally and
         // first — see `render::sync_shell_event_shadow`'s rung comment for
         // why this call has to come before any of the id-specific branching
-        // below rather than be repeated inside each arm. GTK has no id that
-        // needs `ShellShadowSyncHost::panel_absent_from_shadow` to answer
-        // `true` (it has no hamburger panel), so `GtkShellShadowHost` is a
-        // unit struct.
+        // below rather than be repeated inside each arm.
         {
             let mut engine = self.engine.borrow_mut();
-            render::sync_shell_event_shadow(event, &mut engine, &GtkShellShadowHost);
+            render::sync_shell_event_shadow(event, &mut engine);
         }
         match event {
             AppShellEvent::PanelChanged { panel_id } => {
@@ -10258,8 +9838,8 @@ mod portable_entry_point_tests {
     }
 
     /// #1529: `App::cached_window_geometry` is the save-side snapshot
-    /// `GtkEngineActionHost::save_session_and_exit`/`GtkTickHost::
-    /// quit_after_format_save`/`App::save_session_and_exit` all funnel
+    /// `App::quit_and_save_session`/`App::save_session_and_exit` (folded
+    /// from three separate near-duplicate sites into one by #1499) funnel
     /// through before `Engine::save_session_state` persists it. Before
     /// this fix each of those three sites wrote only `width`/`height`
     /// into `engine.session.window` — `x`/`y`/`maximized` were never
