@@ -18,6 +18,58 @@ fn main() {
     // it into the binary here for `vimcode --version` / `vcd --version`
     // (`src/quadraui_pin.rs::version_line`).
     export_quadraui_rev();
+
+    // ── Windows Common-Controls v6 manifest (#1554) ────────────────────────
+    embed_windows_comctl_v6_manifest();
+}
+
+/// Embed a Common-Controls v6 side-by-side manifest dependency in the
+/// binary's linker output (#1554).
+///
+/// # Why this is needed
+///
+/// quadraui's `win` backend calls `TaskDialogIndirect`
+/// (`quadraui/src/win/services.rs`, quadraui#744), which the `windows` crate
+/// imports **statically** from `comctl32.dll`. That export exists only in
+/// the Common-Controls **v6** side-by-side assembly —
+/// `%SystemRoot%\System32\comctl32.dll` is still the legacy 5.82 build. A
+/// Win32 binary only gets the v6 assembly if its own application manifest
+/// declares a dependency on it; without that, the Windows loader resolves
+/// `comctl32.dll` to 5.82, fails to find `TaskDialogIndirect` in its export
+/// table, and kills the process **before `main` runs** — no output, no
+/// panic, just `STATUS_ENTRYPOINT_NOT_FOUND` (`0xC0000139`).
+///
+/// quadraui's own `build.rs` embeds this manifest for *its* bins/tests/
+/// examples, but link args from a build script do **not** propagate to a
+/// downstream crate (quadraui's `build.rs` "Downstream note" says so
+/// explicitly) — vimcode links the `win` backend and must embed an
+/// equivalent manifest of its own, which is what this function does.
+///
+/// `/MANIFEST:EMBED` + `/MANIFESTDEPENDENCY:` is the linker spelling of the
+/// classic `#pragma comment(linker, "/manifestdependency:…")` every C++
+/// TaskDialog sample carries. Both MSVC's `link.exe` (what `windows-latest`
+/// CI uses) and `lld-link` (what `cargo xwin` uses to cross-build from
+/// Linux) implement these two flags natively — neither needs `mt.exe`.
+fn embed_windows_comctl_v6_manifest() {
+    // Host-independent gate: read the *target* cfg cargo hands the build
+    // script, never `cfg!(…)` (which would describe the build host and so
+    // would be wrong for every cross-compile, including the `cargo xwin`
+    // route documented in CLAUDE.md).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let win_feature = std::env::var_os("CARGO_FEATURE_WIN").is_some();
+
+    // `target_env == "msvc"` because these are MSVC linker flags; a
+    // `*-pc-windows-gnu` build links with `ld`, which would reject them. The
+    // `win` feature gate keeps the `vcd.exe` TUI build
+    // (`build-windows-tui`) byte-identical to what it was before this
+    // function existed.
+    if target_os == "windows" && target_env == "msvc" && win_feature {
+        println!("cargo:rustc-link-arg-bin=vimcode=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-bin=vimcode=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    }
 }
 
 /// Resolve the quadraui git rev this build is locked to, and export it as
