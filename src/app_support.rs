@@ -1,14 +1,18 @@
 //! Backend-neutral shell support functions used by `crate::app::App` (#862).
 //!
-//! Moved out of `src/gtk/mod.rs` (`gui`-gated) and `src/gtk/{css,util}.rs`:
-//! every item here is pure computation over `Engine`/`quadraui` geometry and
+//! Moved out of `src/gtk/mod.rs` (`gui`-gated) and `src/gtk/util.rs`: every
+//! item here is pure computation over `Engine`/`quadraui` geometry and
 //! string data — none of it names a `gtk4`/`pango`/`gio` type — so nesting it
 //! inside `crate::gtk` only meant `crate::app` (and any future backend reusing
-//! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs`,
-//! `src/gtk/css.rs` and `src/gtk/util.rs` re-export everything below so the
-//! rest of `crate::gtk` keeps resolving these names unchanged. The genuinely
-//! GTK-only siblings (`css::load_css`, `util::install_icon_and_desktop`, ...)
-//! stayed behind.
+//! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs` and
+//! `src/gtk/util.rs` re-export everything below so the rest of `crate::gtk`
+//! keeps resolving these names unchanged. The genuinely GTK-only siblings
+//! (`util::install_icon_and_desktop`, `util::add_icon_theme_search_path`,
+//! ...) stayed behind. `src/css.rs`/`src/gtk/css.rs` — this module's own
+//! former sibling for `make_theme_css`/`STATIC_CSS`/`load_css` — is gone
+//! entirely as of #1498, once JDonaghy/quadraui#1091 gave
+//! `GtkPlatformServices` its own equivalent stylesheet for the native file
+//! dialog's fallback widgets.
 use crate::core;
 use crate::core::Engine;
 use crate::render;

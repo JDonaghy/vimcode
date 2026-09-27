@@ -227,6 +227,37 @@ pub(super) fn install_icon_and_desktop_at(data_dir: &std::path::Path) {
     }
 }
 
+/// Seed the process's `gtk4::IconTheme` (the one attached to the default
+/// `gdk::Display`) with `~/.local/share/icons` as an extra search path, so a
+/// non-flatpak build picks up the SVG/PNGs [`install_icon_and_desktop`] just
+/// wrote there even on a desktop session that hasn't refreshed its icon
+/// theme index yet (`gtk-update-icon-cache` targets the *cache*, not the
+/// theme's search path list).
+///
+/// #1498 moved this out of `App::new`, which used to run it right next to
+/// `crate::gtk::css::load_css` (`App::new`'s other, now-deleted GTK-only
+/// step — JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
+/// equivalent stylesheet, so vimcode stopped needing one at all). With that
+/// step gone, `App::new` and `App::new_portable` no longer differed by
+/// anything but this one GDK-only call, so folding them left this as the
+/// single remaining piece [`crate::gtk::run`] still has to do itself before
+/// handing off to the shared, backend-neutral constructor — quadraui has no
+/// portable icon-theme search-path surface for any backend to reach through
+/// `quadraui::Backend`.
+///
+/// A no-op with `$HOME` unset or no default `gdk::Display` yet (mirrors the
+/// two guards `App::new`'s inline version used to have).
+pub(super) fn add_icon_theme_search_path() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let icon_theme = gtk4::IconTheme::for_display(&display);
+        icon_theme.add_search_path(&icon_dir);
+    }
+}
+
 /// Contents of the runtime-installed `.desktop` file. Factored out from
 /// [`install_icon_and_desktop`] so the identity fields are unit-testable
 /// without touching the filesystem (#716).

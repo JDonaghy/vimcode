@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 pub(crate) mod backend;
 pub(crate) mod click;
-pub(crate) mod css;
 mod events;
 mod explorer;
 mod services;
@@ -80,25 +79,35 @@ pub fn run(file_path: Option<PathBuf>) {
     unsafe {
         gtk4::glib::ffi::g_log_set_writer_func(Some(gtk_log_writer), std::ptr::null_mut(), None);
     }
-    // Initialize GTK before App::new() so that CssProvider, Display,
-    // and Settings calls inside App::new() find an initialized toolkit.
+    // Initialize GTK before add_icon_theme_search_path()/App::new_portable()
+    // so the Display/IconTheme calls below find an initialized toolkit.
     // Under the old Relm4 path this happened inside RelmApp::create_and_run();
     // with the ShellApp runner it happens inside gapp.run() which is called
-    // by run_with_shell() — too late for App::new().
+    // by run_with_shell() — too late for either of those.
     gtk4::init().expect("Failed to initialize GTK");
+    // #1498: the one GTK-only step `App::new` (now folded into the shared
+    // `App::new_portable` every other GUI backend already used — see that
+    // constructor's doc) can't do itself — quadraui has no portable
+    // icon-theme search-path surface. Must run after `gtk4::init()`, same as
+    // `App::new`'s old inline version needed.
+    util::add_icon_theme_search_path();
     // Create the App and run via the quadraui ShellApp runner.
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
     //
     // The concrete backend is chosen here, at the GTK entry point, and
-    // handed to `App::new` rather than `App` constructing one itself
-    // (#861) — this is the seam a future non-GTK wrapper (#859) would pass
-    // a different `quadraui::Backend` impl through.
+    // handed to `App::new_portable` rather than `App` constructing one
+    // itself (#861) — this is the seam a future non-GTK wrapper (#859) would
+    // pass a different `quadraui::Backend` impl through.
     let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(
             Box::new(backend::GtkBackend::new()),
         ));
-    let vimcode_app = App::new(file_path, concrete_backend);
+    let vimcode_app = App::new_portable(
+        file_path,
+        concrete_backend,
+        crate::render::UnitProfile::px(),
+    );
     let config = build_shell_config(&vimcode_app);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }

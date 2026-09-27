@@ -206,7 +206,13 @@ win = ["quadraui/win"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "a58e5bec4a1ad53d48446f9c072d6aa3d86f0710", features = ["tui", "terminal"] }
+#
+# #1498 bumped this to pick up quadraui#1091 (`GtkPlatformServices` themes
+# `gtk4::FileDialog`'s fallback widgets — sidebar/scrollbar/popover — from
+# `Theme` on every `Backend::set_theme` call), which lets this crate delete
+# its own `css.rs`/`gtk/css.rs` copy of the same stylesheet instead of
+# maintaining a duplicate.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "9f8766d37912a58d28714a346ee8158a60efabf3", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
