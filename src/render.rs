@@ -10892,6 +10892,38 @@ pub fn menu_bar_items_end(layout: &quadraui::MenuBarLayout, fallback_x: f32) -> 
 /// one.
 const TITLE_BAR_CONTROLS_MIN_GAP_PX: f32 = 16.0;
 
+/// Total slack [`measure_title_bar_bands`] reserves to the *left* of the
+/// window-control buttons' measured leading edge, so that repainting them
+/// inside the narrowed `controls` rect doesn't re-trigger
+/// `StatusBar::layout_padded`'s priority-drop and silently lose minimize
+/// (#1530).
+///
+/// Derivation — with `E` = [`quadraui::primitives::status_bar::PIXEL_EDGE_INSET`],
+/// `G` = [`TITLE_BAR_CONTROLS_MIN_GAP_PX`] and `T` the buttons' total
+/// padded width:
+///
+/// * The wide-band measurement puts the leftmost button at `W - E - T`, i.e.
+///   it accounts for exactly **one** trailing edge inset.
+/// * The repaint at `bar_width = B` keeps every button only while
+///   `B - left_w - G - E >= T`. `window_controls_status_bar` has no left
+///   segments, but `layout_padded` still starts its left cursor at `E` and
+///   reports `left_w = E` — so the repaint needs `B >= T + 2E + G`, i.e.
+///   `E + G` more than the measurement reserved.
+/// * One further `E` on top of that minimum keeps the comparison off the
+///   knife edge: `B` is derived by subtracting from the band's absolute
+///   `W` (hundreds of px), where f32 has ~1e-4 resolution, and an exact-fit
+///   `B` can round a hair *under* `T + 2E + G` and drop minimize anyway.
+///   The cost is 10px of Command Center width; the benefit is that the fit
+///   no longer depends on `W`'s rounding.
+///
+/// `PIXEL_EDGE_INSET` lives in `quadraui::primitives`, which is not feature
+/// gated, so unlike `quadraui::gtk::MIN_GAP_PX` it can be imported here
+/// rather than restated (quadraui#1155 added it; before that rev pixel
+/// backends called plain `StatusBar::layout`, i.e. `E == 0`, and `G` alone
+/// was enough).
+const TITLE_BAR_CONTROLS_SLACK_PX: f32 =
+    TITLE_BAR_CONTROLS_MIN_GAP_PX + 2.0 * quadraui::primitives::status_bar::PIXEL_EDGE_INSET;
+
 /// How the title-bar band divides up to the right of the last menu label.
 ///
 /// Both bands are *measured*, never painted — see [`FrameOp::MenuRow`].
@@ -10953,23 +10985,23 @@ pub fn measure_title_bar_bands(
         })
         .filter(|s| s.is_finite())
         // #1530: the value above is measured against the *wide* `full` band,
-        // where `StatusBar::layout`'s `bar_width - left_w - min_gap` never
-        // goes negative and all three buttons come back — but `controls`
-        // below is narrowed to exactly that painted width, and it is
-        // *that* narrower rect `paint_title_bar_band` hands to
+        // where `StatusBar::layout_padded`'s `bar_width - left_w - min_gap
+        // - edge_inset` never goes negative and all three buttons come back
+        // — but `controls` below is narrowed to (nearly) that painted width,
+        // and it is *that* narrower rect `paint_title_bar_band` hands to
         // `Backend::draw_status_bar_interactive` for the actual paint.
         // `window_controls_status_bar` has no left segments, so re-laying-out
-        // at `bar_width == total_right` makes the identical `min_gap`
+        // at a `bar_width` that only covers the buttons makes the identical
         // subtraction go negative and silently drops the front (lowest-
         // priority) segment — minimize — even though it fit a moment ago.
-        // Reserving one min-gap's worth of slack here is what keeps the
-        // repaint from re-triggering that drop. Every backend that supplies
-        // a `controls_bar` (GTK, Win-GUI) reserves the same 16px/16dip
-        // min-gap convention (`quadraui::gtk::MIN_GAP_PX`,
-        // `quadraui::win::MIN_GAP_DIP`) — restated here as a plain constant,
-        // not imported, so this stays buildable without the `gui` feature
+        // [`TITLE_BAR_CONTROLS_SLACK_PX`] is the slack that keeps the repaint
+        // from re-triggering that drop; its doc derives the number. Every
+        // backend that supplies a `controls_bar` (GTK, Win-GUI) reserves the
+        // same 16px/16dip min-gap convention (`quadraui::gtk::MIN_GAP_PX`,
+        // `quadraui::win::MIN_GAP_DIP`) — restated as a plain constant, not
+        // imported, so this stays buildable without the `gui` feature
         // (`quadraui::gtk` is gated on `quadraui/gtk`, `render.rs` is not).
-        .map(|s| (s - TITLE_BAR_CONTROLS_MIN_GAP_PX).max(0.0))
+        .map(|s| (s - TITLE_BAR_CONTROLS_SLACK_PX).max(0.0))
         .unwrap_or(full.width);
     let controls = quadraui::Rect::new(
         full.x + controls_start,
