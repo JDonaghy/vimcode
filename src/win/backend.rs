@@ -22,5 +22,16 @@
 //! changes: it re-exports `WinBackend` verbatim (see doc above) and has no
 //! rasterising decision of its own to make, per the Platform-Neutrality
 //! Rule. Leave #1559 open until the quadraui issue is filed and lands.
+//!
+//! # #1561: left-edge desktop strip — investigated, no fix here
+//!
+//! vimcode#1561's reported left-edge desktop strip was investigated against
+//! `WinBackend::attach_surface`/`resize_surface` (the only two places a
+//! render target's pixel size is derived) and, separately, against a real
+//! `vimcode.exe` on dell64. See `src/win/mod.rs`'s `#1561` doc section for
+//! the full write-up — nothing changes here: this file re-exports
+//! `WinBackend` verbatim (see this file's own doc above) and, per the
+//! sizing arithmetic already inspected, has no decision of its own that
+//! could produce a left-specific gap even in principle.
 
 pub use quadraui::win::WinBackend;

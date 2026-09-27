@@ -147,6 +147,94 @@
 //! font face" criterion remains genuinely blocked on dell64 by the two
 //! dell64-local issues above (test-binary loader crash; locked interactive
 //! session blocking screen capture), not by absence of a Windows host.
+//!
+//! # #1561: left-edge desktop strip — no quadraui source-level defect found;
+//! # live pixel verification stayed blocked, and a new dell64-local wrinkle
+//! # surfaced along the way
+//!
+//! vimcode#1561 reports a thin (~6px) strip along the window's left edge
+//! showing the desktop through it. The two hypotheses the issue text names
+//! ("non-client insets subtracted twice, or physical vs. logical pixels")
+//! were checked directly against `quadraui::win::backend::WinBackend`
+//! (pinned rev `9f8766d3`), `attach_surface` and `resize_surface`
+//! specifically:
+//!
+//! ```text
+//! let mut rect = RECT::default();
+//! GetClientRect(hwnd, &mut rect)?;
+//! let width = (rect.right - rect.left).max(1) as u32;
+//! let height = (rect.bottom - rect.top).max(1) as u32;
+//! // ... single D2D_SIZE_U { width, height } fed straight to
+//! // CreateHwndRenderTarget; resize_surface's WM_SIZE-driven `Resize`
+//! // call is the same single width/height pair, no per-edge split.
+//! ```
+//!
+//! Both call sites derive the render target's pixel size from one
+//! un-split `GetClientRect`/`WM_SIZE` pair — there is no separate
+//! left/right/top/bottom computation anywhere in `win::backend`/`win::run`
+//! for either to double-subtract, and no DIP↔physical conversion happens
+//! on the render-target size itself (`dpi_scale` only scales
+//! `Viewport`/hit-testing, never the `D2D_SIZE_U` passed to
+//! `CreateHwndRenderTarget`/`Resize`). So neither hypothesised bug shape
+//! exists in the source as pinned.
+//!
+//! **Real-hardware verification was attempted on dell64** (this fleet's
+//! real Windows 11 host) per this issue's own "Verify on real Windows"
+//! section, going one step further than #1558/#1559's attempts:
+//! 1. `cargo xwin build --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --bin vimcode` succeeded, and
+//!    the resulting `vimcode.exe` was launched **directly** (WSL2 interop,
+//!    not wine) against a real `HWND` on dell64's desktop, confirmed via
+//!    `Get-Process -PassThru`'s real `MainWindowHandle`.
+//! 2. dell64's interactive session was, again, independently confirmed
+//!    locked (`Get-Process -Name logonui` running in the same session
+//!    `query session` reports as the active console session;
+//!    `GetForegroundWindow()` returns `NULL`) — the same blocker
+//!    #1558/#1559 hit, not "no Windows host in this fleet".
+//!    `Graphics.CopyFromScreen` against the live window rect came back
+//!    solid black, exactly as those two issues' docs already record.
+//! 3. **New this session:** `PrintWindow` with `PW_RENDERFULLCONTENT`
+//!    (the workaround #1558 tried and found returned only DWM chrome) was
+//!    retried and this time *did* return real client-area pixels — but
+//!    cross-checking `GetWindowRect`/`GetClientRect`/
+//!    `DWMWA_EXTENDED_FRAME_BOUNDS` against the captured bitmap showed:
+//!    - The gap between `GetWindowRect` and the first painted (non-black)
+//!      column/row was **identical (8 physical px) on the left, right,
+//!      and bottom edges** of a freshly-launched, untouched window — i.e.
+//!      symmetric, not left-specific — and matches Windows' own
+//!      documented invisible `WS_THICKFRAME` resize-border hit-test
+//!      margin present on every classic-style top-level window, which
+//!      `DWMWA_EXTENDED_FRAME_BOUNDS` (the actually-visible, DWM-composited
+//!      frame) already excludes: the painted content's on-screen position
+//!      lined up with `DWMWA_EXTENDED_FRAME_BOUNDS`'s edges to within 1px
+//!      on every side. Nothing about that measurement points at a
+//!      left-specific defect, in the source or on the glass.
+//!    - Repeating the capture after `SW_MAXIMIZE`, then again after an
+//!      external `SetWindowPos` to a new size (`GetClientRect` itself
+//!      *did* update both times, proving Windows genuinely resized the
+//!      window), and again after an explicit `InvalidateRect` +
+//!      `UpdateWindow`, kept returning the **same painted content pinned
+//!      at its original launch size** in the corner of the new, larger
+//!      capture, never stretching to fill it. That is inconsistent with
+//!      live re-rendering and far more consistent with a locked/secure-
+//!      desktop session suspending real composition for a fully-occluded
+//!      window — `PrintWindow(PW_RENDERFULLCONTENT)` reads from DWM's own
+//!      redirection surface, and Microsoft does not document that surface
+//!      as guaranteed-fresh for an occluded window. In other words: this
+//!      workaround's pixel data cannot be trusted as "what a user would
+//!      actually see" while dell64's session stays locked, so it can
+//!      neither confirm nor rule out #1561's reported strip.
+//!
+//! **Net:** no left-specific defect exists in `win::backend`'s sizing
+//! arithmetic as pinned, and no quadraui-side fix is proposed here — filing
+//! a `docs/PENDING_QUADRAUI_ISSUES.md` entry needs a concrete ask, and
+//! "the render-target sizing already looks correct" isn't one. What #1561
+//! actually needs next is a **live, unlocked** dell64 session (or another
+//! Windows host) at both 100% and 150% scaling, so a real DWM-composited
+//! screenshot — not `PrintWindow`'s possibly-stale redirection-surface
+//! read — can confirm whether the strip is real, and if so, isolate which
+//! of `win::run`'s window-class/style choices (not sizing arithmetic, which
+//! this session already cleared) produces it. Leave #1561 open.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
