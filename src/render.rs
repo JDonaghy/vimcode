@@ -6568,6 +6568,60 @@ pub fn apply_status_action(
     }
 }
 
+/// Resolve a Command Center click, ignoring any part of the cached layout
+/// that falls **outside the band the Command Center was painted into**.
+///
+/// `quadraui::CommandCenter::layout` centres its content in `bounds` via
+/// `bounds.x + (bounds.width - content_width).max(0.0) / 2.0` — that
+/// `.max(0.0)` clamps the *centring offset*, not the content, so when the
+/// band is narrower than the content's minimum width the whole group is
+/// left-aligned at `bounds.x` and simply **overflows the right edge**. On
+/// every pixel backend that minimum is fixed at
+/// `2 * ARROW_WIDTH_PX + 2 * GAP_PX + SEARCH_MIN_WIDTH_PX` = 344px
+/// (`quadraui::CommandCenterMeasure`), so any title-bar band narrower than
+/// that overflows — and the overflowing `SearchBox` rect is still recorded
+/// as a hit region.
+///
+/// Whatever sits to the Command Center's right therefore loses its clicks
+/// to the search box. On GTK that is the inline minimize/maximize/close
+/// buttons (`measure_title_bar_bands`' `controls` band, which starts exactly
+/// where `command_center` ends): the button paints, the press lands on the
+/// search box instead, and `StatusBarInteraction` never arms — so the
+/// release is a no-op and the window never minimizes.
+///
+/// How far the overflow reaches depends on `menu_end`, i.e. on the
+/// *measured* width of the menu labels, i.e. on which UI font resolved from
+/// `UI_FONT_FAMILY` — which is why this reproduces at 800x600 on a bare CI
+/// runner (no Cantarell/Ubuntu installed, so the wider DejaVu Sans fallback
+/// wins) and not on a GNOME desktop, and why the `#1530` titlebar tests were
+/// green locally and red in CI. The underlying overlap is font-independent
+/// though: it bites at *every* window width below roughly 815px on either
+/// font.
+///
+/// A widget must not be clickable outside the region it was allotted, so
+/// this clamps to `layout.bounds` before consulting `hit_test`. Shared here
+/// rather than in a backend so every backend that routes a Command Center
+/// click gets the same arbitration (Platform-Neutrality Rule).
+///
+/// Note this fixes the *click* half only. The paint still overflows — the
+/// search box's rounded border draws over the window-control glyphs on a
+/// narrow band, because `CommandCenter::layout` hands the backend
+/// out-of-bounds rects and neither `gtk::draw_command_center` nor its
+/// mac/win twins clip to `bounds`. That is a quadraui-side gap (the
+/// primitive should shrink the search box to fit, or clip), not something
+/// vimcode can fix without per-backend code.
+pub fn command_center_hit_in_band(
+    layout: &quadraui::CommandCenterLayout,
+    x: f32,
+    y: f32,
+) -> Option<quadraui::CommandCenterHit> {
+    let b = layout.bounds;
+    if x < b.x || x >= b.x + b.width || y < b.y || y >= b.y + b.height {
+        return None;
+    }
+    Some(layout.hit_test(x, y))
+}
+
 /// Apply a resolved [`quadraui::CommandCenterHit`]. Returns `true` when the
 /// hit was an interactive control (so the caller consumes and redraws).
 pub fn apply_command_center_hit(engine: &mut Engine, hit: quadraui::CommandCenterHit) -> bool {
@@ -26787,6 +26841,76 @@ mod tests {
         // non-ASCII string, matching `try_from_hex_over`'s `8 =>` arm.
         assert_eq!(try_from_hex("日本"), None);
         assert_eq!(try_from_hex_over("日本é", Color::from_rgb(0, 0, 0)), None);
+    }
+
+    /// #1494 CI: the band-clamp that stops the Command Center's
+    /// overflowing search box from eating the window-control buttons'
+    /// clicks. Built from the real primitive (`CommandCenter::layout`)
+    /// rather than a hand-written `CommandCenterLayout` literal, so the
+    /// overflow this guards against is the one quadraui actually produces.
+    #[test]
+    fn command_center_hit_in_band_ignores_the_overflowing_search_box() {
+        let cc = build_command_center_view(true, true, "vimcode");
+        // 272px band — the width `measure_title_bar_bands` hands the
+        // Command Center on an 800px window with a wide UI font. The
+        // primitive's content floor is 2*24 arrows + 2*8 gaps + a 280px
+        // search box = 344px, so 72px of it overflows to the right.
+        let band = quadraui::Rect::new(367.0, 0.0, 272.0, 46.0);
+        let measure =
+            quadraui::CommandCenterMeasure::from_char_width(cc.search_label.as_str(), 8.0, 46.0);
+        let layout = cc.layout(band, measure);
+
+        let search = layout
+            .search_bounds
+            .expect("the search box must be laid out for this to test anything");
+        assert!(
+            search.x + search.width > band.x + band.width,
+            "precondition: this band must be narrow enough that the search \
+             box overflows it; search={search:?} band={band:?}"
+        );
+
+        // Inside the band, on the search box — still a SearchBox hit.
+        let inside_x = band.x + band.width - 1.0;
+        assert_eq!(
+            command_center_hit_in_band(&layout, inside_x, 10.0),
+            Some(quadraui::CommandCenterHit::SearchBox),
+            "a click inside the band must still resolve normally"
+        );
+        assert_eq!(
+            command_center_hit_in_band(&layout, band.x + 4.0, 10.0),
+            Some(quadraui::CommandCenterHit::Back),
+            "the nav arrows must keep working"
+        );
+
+        // Past the band's right edge — where the window-control buttons
+        // live — the overflowing search box must NOT claim the click.
+        // `hit_test` alone does, which is the bug.
+        let overflow_x = band.x + band.width + 1.0;
+        assert!(
+            overflow_x < search.x + search.width,
+            "precondition: this probe must land on the overflowing part of \
+             the search box"
+        );
+        assert_eq!(
+            layout.hit_test(overflow_x, 10.0),
+            quadraui::CommandCenterHit::SearchBox,
+            "precondition: the unclamped primitive really does claim this \
+             out-of-band point — if this ever stops being true the clamp \
+             is obsolete, not the test"
+        );
+        assert_eq!(
+            command_center_hit_in_band(&layout, overflow_x, 10.0),
+            None,
+            "a point outside the painted band must resolve to nothing, so \
+             the caller falls through to whatever owns that pixel"
+        );
+
+        // Outside vertically, too.
+        assert_eq!(
+            command_center_hit_in_band(&layout, band.x + 4.0, band.y + band.height + 1.0),
+            None,
+            "below the band is outside the band"
+        );
     }
 
     #[test]
