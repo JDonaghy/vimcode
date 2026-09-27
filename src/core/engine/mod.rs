@@ -161,13 +161,16 @@ pub enum EngineAction {
 #[derive(Debug)]
 pub struct RegisteredAccelerator {
     pub acc: Accelerator,
-    /// Cached parse of `acc.binding` in vimcode's native form
-    /// (`(ctrl, shift, alt, key_name)`). `None` if the binding string is
-    /// unparseable; the registration is still kept so `unregister_accelerator`
-    /// can find it by id.
+    /// Cached parse of `acc.binding`, via
+    /// [`quadraui::accelerator::parse_binding`] (#1495 — vimcode used to
+    /// carry its own copy of this match-every-`KeyBinding`-variant table;
+    /// deleted in favour of quadraui's, which vimcode's universal bindings
+    /// already resolve to the same canonical strings). `None` if the
+    /// binding string is unparseable; the registration is still kept so
+    /// `unregister_accelerator` can find it by id.
     /// Dead in ShellApp mode until GTK accelerator lookup is re-wired.
     #[allow(dead_code)]
-    pub parsed: Option<(bool, bool, bool, String)>,
+    pub parsed: Option<quadraui::accelerator::ParsedBinding>,
 }
 
 /// Per-call backend context that [`Engine::handle_ui_event`] needs to act on
@@ -5646,27 +5649,13 @@ impl Engine {
 
     /// Register an accelerator. Re-registration with the same id replaces
     /// the prior entry (for live rebinding).
+    ///
+    /// #1495: parsing delegates entirely to
+    /// [`quadraui::accelerator::parse_binding`] — the per-`KeyBinding`-variant
+    /// match table (universal bindings → canonical `<C-x>`-style strings)
+    /// used to be duplicated here; it now lives in exactly one place.
     pub fn register_accelerator(&mut self, acc: Accelerator) {
-        let parsed = match &acc.binding {
-            KeyBinding::Literal(s) => crate::core::settings::parse_key_binding_named(s),
-            // Universal bindings render platform-appropriately; for vimcode
-            // (Linux/Windows; macOS not yet a backend) Ctrl+letter is the
-            // canonical form. parse_key_binding_named handles the vim-style
-            // strings.
-            KeyBinding::Save => crate::core::settings::parse_key_binding_named("<C-s>"),
-            KeyBinding::Open => crate::core::settings::parse_key_binding_named("<C-o>"),
-            KeyBinding::New => crate::core::settings::parse_key_binding_named("<C-n>"),
-            KeyBinding::Close => crate::core::settings::parse_key_binding_named("<C-w>"),
-            KeyBinding::Copy => crate::core::settings::parse_key_binding_named("<C-c>"),
-            KeyBinding::Cut => crate::core::settings::parse_key_binding_named("<C-x>"),
-            KeyBinding::Paste => crate::core::settings::parse_key_binding_named("<C-v>"),
-            KeyBinding::Undo => crate::core::settings::parse_key_binding_named("<C-z>"),
-            KeyBinding::Redo => crate::core::settings::parse_key_binding_named("<C-S-z>"),
-            KeyBinding::SelectAll => crate::core::settings::parse_key_binding_named("<C-a>"),
-            KeyBinding::Find => crate::core::settings::parse_key_binding_named("<C-f>"),
-            KeyBinding::Replace => crate::core::settings::parse_key_binding_named("<C-h>"),
-            KeyBinding::Quit => crate::core::settings::parse_key_binding_named("<C-q>"),
-        };
+        let parsed = quadraui::accelerator::parse_binding(&acc.binding);
         self.accelerators.retain(|r| r.acc.id != acc.id);
         self.accelerators
             .push(RegisteredAccelerator { acc, parsed });
@@ -5708,10 +5697,14 @@ impl Engine {
             if !matches!(reg.acc.scope, AcceleratorScope::Global) {
                 continue;
             }
-            let Some((want_ctrl, want_shift, want_alt, ref key_name)) = reg.parsed else {
+            let Some(ref parsed) = reg.parsed else {
                 continue;
             };
-            if want_ctrl != ctrl || want_shift != shift || want_alt != alt {
+            let key_name = &parsed.key;
+            if parsed.modifiers.ctrl != ctrl
+                || parsed.modifiers.shift != shift
+                || parsed.modifiers.alt != alt
+            {
                 continue;
             }
             let matches = match key_name.as_str() {

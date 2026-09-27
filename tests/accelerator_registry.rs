@@ -180,6 +180,58 @@ fn unregister_accelerator_removes_match() {
         .is_none());
 }
 
+/// #1495: the engine's accelerator registry used to carry its own copy of
+/// the `KeyBinding` → canonical-string parsing table; it now delegates
+/// entirely to `quadraui::accelerator::parse_binding`. Round-trip a
+/// user-configured binding string through `register_accelerator` /
+/// `match_accelerator` and confirm the match decision agrees with what
+/// quadraui's own parser says the binding means — proving the engine isn't
+/// running a second, possibly-diverging parser under the hood.
+#[test]
+fn user_configured_binding_round_trips_through_quadraui_parser() {
+    let mut e = engine_with("");
+    let user_binding = "<C-A-S-k>";
+
+    e.register_accelerator(Accelerator {
+        id: AcceleratorId::new("test.user_configured"),
+        binding: KeyBinding::Literal(user_binding.into()),
+        scope: AcceleratorScope::Global,
+        label: None,
+    });
+
+    let parsed = vimcode_core::quadraui::accelerator::parse_key_binding(user_binding)
+        .expect("quadraui should parse this vim-style binding");
+
+    // The engine's match decision must agree with quadraui's own parse of
+    // the same string — same modifiers, same key.
+    let hit = e.match_accelerator(
+        parsed.modifiers.ctrl,
+        parsed.modifiers.shift,
+        parsed.modifiers.alt,
+        parsed.key.chars().next(),
+        false,
+        false,
+        false,
+    );
+    assert_eq!(
+        hit.as_ref().map(|i| i.as_str()),
+        Some("test.user_configured")
+    );
+
+    // A press missing one of the modifiers quadraui parsed must NOT match.
+    assert!(e
+        .match_accelerator(
+            parsed.modifiers.ctrl,
+            false, // drop shift
+            parsed.modifiers.alt,
+            parsed.key.chars().next(),
+            false,
+            false,
+            false,
+        )
+        .is_none());
+}
+
 #[test]
 fn match_accelerator_skips_non_global_scopes() {
     let mut e = engine_with("");

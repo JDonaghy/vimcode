@@ -1485,29 +1485,41 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
 
 /// Extended key binding parser that returns the key name as a string.
 /// Supports named keys like `Tab`, `Space`, `Escape`, etc.
+///
+/// #1495: delegates the actual `<...>` grammar to
+/// [`quadraui::accelerator::parse_key_binding`] rather than re-implementing
+/// vim-style parsing here — that was the shadow copy this function used to
+/// carry. Two vimcode-specific rules are layered on top, kept because
+/// deleting them would be a behaviour change (this is a pure consolidation,
+/// not a parser upgrade):
+///
+/// - **An explicit modifier is required.** vimcode's config format has
+///   never accepted a bare vim-style binding like `<t>` or `<F5>` (config
+///   authors write unmodified keys as plain `t` elsewhere); quadraui's
+///   parser is more permissive and accepts those. Rejected before
+///   delegating by requiring a `-` inside the brackets.
+/// - **No Cmd modifier.** quadraui's `D`/`M` modifier letters map to
+///   `Modifiers::cmd`, a concept vimcode's Linux/Windows backends have no
+///   equivalent for; `<D-s>`-style bindings are rejected here same as
+///   before, where `D` was simply an unrecognised modifier letter.
+///
+/// Both are genuine divergences between the two parsers, not just
+/// implementation detail — see #1495.
 pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
-    let s = s.trim();
-    if !s.starts_with('<') || !s.ends_with('>') {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('<') || !trimmed.contains('-') {
         return None;
     }
-    let inner = &s[1..s.len() - 1];
-    let parts: Vec<&str> = inner.split('-').collect();
-    if parts.len() < 2 {
+    let parsed = quadraui::accelerator::parse_key_binding(trimmed)?;
+    if parsed.modifiers.cmd {
         return None;
     }
-    let mut ctrl = false;
-    let mut shift = false;
-    let mut alt = false;
-    for part in &parts[..parts.len() - 1] {
-        match *part {
-            "C" => ctrl = true,
-            "S" => shift = true,
-            "A" => alt = true,
-            _ => return None,
-        }
-    }
-    let key_str = parts[parts.len() - 1].to_string();
-    Some((ctrl, shift, alt, key_str))
+    Some((
+        parsed.modifiers.ctrl,
+        parsed.modifiers.shift,
+        parsed.modifiers.alt,
+        parsed.key,
+    ))
 }
 
 /// #1069 branched this on `target_os == "macos"` via `cfg!` ("Menlo" on
