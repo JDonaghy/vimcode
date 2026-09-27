@@ -5196,10 +5196,9 @@ impl App {
         y: f64,
         axis: ScrollbarAxis,
     ) -> bool {
-        let Some((mut content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
+        let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
             return false;
         };
-        content_bounds.x = 0.0; // TEMP RED-verification only
         let lh = self.cached_line_height;
         let cw = self.cached_char_width;
         let engine = self.engine.borrow();
