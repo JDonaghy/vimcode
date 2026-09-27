@@ -43,9 +43,19 @@ never `Icon::glyph` — `WinBackend::nerd_fonts_enabled` exists and is wired int
 vimcode#1558 reports that on Windows, with **Nerd Font Icons on**, the
 activity bar shows placeholder characters (`⊞ / ! Y # > ▦ *`) instead of real
 glyphs, while the macOS build of the identical commit shows the correct
-icons. Root-caused by inspection (no Windows host in this fleet to run it on,
-but the reported placeholder characters are an exact, unambiguous match —
-see below):
+icons. Root-caused primarily by inspection — the reported placeholder
+characters are an exact, unambiguous match, see below — and corroborated on
+dell64 (this fleet's real Windows 11 host, reachable via WSL2 interop; see
+#1558's "Verify on real Windows" section) by successfully cross-building
+`vimcode.exe` with `cargo xwin build --release --target
+x86_64-pc-windows-msvc --no-default-features --features win --bin vimcode`
+and launching it **directly** (not wine) against a real `HWND` on dell64's
+desktop. Pixel-level confirmation of the glyph fix itself (this entry's own
+ask below, not yet landed) couldn't be captured in that same session: dell64's
+interactive console session was independently locked at the OS level
+(`logonui.exe` running), which blocks GDI-based screen/window-content capture
+regardless of what quadraui paints underneath — see `src/win/mod.rs`'s
+`#1558` doc section in vimcode for the full repro chain:
 
 `quadraui/src/win/activity_bar.rs` (pinned rev `a58e5bec`), the paint loop for
 each activity-bar row:
@@ -191,12 +201,23 @@ font that happens to have a "generic document" glyph mapped somewhere in the
 PUA range and using it for every Nerd Font codepoint in that font, rather
 than ever reaching the app's own registered font.
 
-**This is a hypothesis, not a confirmed root cause** — this fleet has no
-Windows host to run it on, and `IDWriteFontFallbackBuilder`'s actual
-first-vs-last priority for overlapping `AddMapping`/`AddMappings` ranges
-should be verified against Microsoft's documentation (or empirically) before
-committing to a fix. If confirmed, the fix is likely as simple as swapping
-the order — call `builder.AddMapping(...)` for the app's font first, then
+**This is a hypothesis, not a confirmed root cause** — dell64 (this fleet's
+real Windows 11 host, see #1558's "Verify on real Windows" section) is
+reachable and `cargo xwin build`/direct-exe-launch both work on it, but
+empirically exercising DirectWrite's actual `IDWriteFontFallbackBuilder`
+priority needs either a live GUI visual check or a new automated test, and
+both avenues hit dell64-local blockers during this investigation (the
+interactive session was locked, blocking screen capture; the `cargo xwin
+test --lib` binary crashes at Windows DLL-load time with
+`STATUS_ENTRYPOINT_NOT_FOUND` before any `#[test]` runs — see `src/win/mod.rs`'s
+`#1558` doc section in vimcode for the full repro of both). So this hypothesis
+is still unconfirmed, but for those two concrete, named reasons — not for
+lack of a host. `IDWriteFontFallbackBuilder`'s actual first-vs-last priority
+for overlapping `AddMapping`/`AddMappings` ranges should be verified against
+Microsoft's documentation (or empirically, once the blockers above are
+cleared) before committing to a fix. If confirmed, the fix is likely as
+simple as swapping the order — call `builder.AddMapping(...)` for the app's
+font first, then
 `builder.AddMappings(&system_fallback)` last, so the app's Nerd Font is
 consulted before Windows' own broad-coverage system fallback rather than
 after it — mirroring the *intended* cascade shape GTK's
