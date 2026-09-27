@@ -1507,6 +1507,11 @@ pub fn parse_key_binding(s: &str) -> Option<(bool, bool, bool, char)> {
 /// implementation detail — see #1495.
 pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
     let trimmed = s.trim();
+    // Note: this checks for a `-` anywhere in `trimmed`, not strictly
+    // between the brackets, which is slightly looser than the old
+    // `inner.split('-').len() >= 2` check it replaces. Equivalent today
+    // because no vimcode key name contains a literal `-`; revisit this
+    // check if that ever changes.
     if !trimmed.starts_with('<') || !trimmed.contains('-') {
         return None;
     }
@@ -5226,6 +5231,27 @@ mod tests {
         assert_eq!(parse_key_binding("<C>"), None); // no key char
         assert_eq!(parse_key_binding("<X-b>"), None); // unknown modifier
         assert_eq!(parse_key_binding(""), None);
+    }
+
+    /// #1495 review finding: `parse_key_binding_named`'s doc comment claims
+    /// two genuine divergences from quadraui's more permissive
+    /// `parse_key_binding` — rejecting Cmd (`<D-...>`/`<M-...>`) and
+    /// rejecting bracket bindings with no explicit modifier (`<t>`,
+    /// `<F5>`). Neither was exercised by a test before this; lock both in
+    /// so the invariant doesn't rest on doc comments alone, and so a
+    /// future quadraui pin bump that changes that grammar fails loudly
+    /// here instead of surfacing as a silent behaviour change at a call
+    /// site like `Engine::register_accelerator`.
+    #[test]
+    fn test_parse_key_binding_named_rejects_cmd_modifier() {
+        assert_eq!(parse_key_binding_named("<D-s>"), None);
+        assert_eq!(parse_key_binding_named("<M-s>"), None);
+    }
+
+    #[test]
+    fn test_parse_key_binding_named_rejects_no_explicit_modifier() {
+        assert_eq!(parse_key_binding_named("<t>"), None);
+        assert_eq!(parse_key_binding_named("<F5>"), None);
     }
 
     // ── PanelKeys tests ──────────────────────────────────────────────────────
