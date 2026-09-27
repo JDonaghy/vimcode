@@ -26,23 +26,25 @@
 //! #862 closed the three items the previous revision of this doc comment
 //! listed as the remaining blockers to dropping the `gui` gate:
 //!
-//! 1. **The platform-typed fields** (`window`, `css_provider`) are now
-//!    type-erased. `css_provider` goes behind the small local
-//!    [`PlatformCssProvider`] trait (the same shape the now-deleted
-//!    `TextMetricsBackend` used to have, #1497)
-//!    and `Engine::clipboard_read`/`clipboard_write`, #417); `window` had the
-//!    same treatment (`PlatformWindowHandle`) until #1234 deleted it outright
-//!    once `quadraui::Backend::window()` (`WindowControl`, quadraui#950)
-//!    became a full replacement — see that issue's note further down for why
-//!    the field itself, not just its type erasure, is gone. A third field
-//!    used to live in this list, `settings_monitor`,
-//!    holding a GTK-only `gio::FileMonitor` behind a `Box<dyn Any>`
-//!    drop-guard; #949 deleted it outright rather than type-erasing it —
-//!    `Engine::check_settings_reload`'s portable mtime poll (already the
-//!    sole reload mechanism on TUI, and already called from GTK's own
-//!    `handle_poll_tick` every tick) made it redundant, and deleting it
-//!    closed the settings-hot-reload gap on macOS/Win-GUI that this file's
-//!    `new_portable` doc table used to list as deliberately skipped.
+//! 1. **The platform-typed fields.** `window` was type-erased
+//!    (`PlatformWindowHandle`) until #1234 deleted it outright once
+//!    `quadraui::Backend::window()` (`WindowControl`, quadraui#950) became a
+//!    full replacement — see that issue's note further down for why the
+//!    field itself, not just its type erasure, is gone. A second field used
+//!    to live in this list, `settings_monitor`, holding a GTK-only
+//!    `gio::FileMonitor` behind a `Box<dyn Any>` drop-guard; #949 deleted it
+//!    outright rather than type-erasing it — `Engine::check_settings_reload`'s
+//!    portable mtime poll (already the sole reload mechanism on TUI, and
+//!    already called from GTK's own `handle_poll_tick` every tick) made it
+//!    redundant, and deleting it closed the settings-hot-reload gap on
+//!    macOS/Win-GUI that this file's `new_portable` doc table used to list
+//!    as deliberately skipped. A third field, `css_provider` (a
+//!    `PlatformCssProvider`-erased `gtk4::CssProvider` theming the native
+//!    file dialog's fallback widgets, the same shape the now-deleted
+//!    `TextMetricsBackend` used to have, #1497), was deleted outright by
+//!    #1498 once JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
+//!    equivalent stylesheet, reloaded every frame by
+//!    `sync_per_frame_backend_state`'s `Backend::set_theme` call.
 //! 2. **The platform hook call sites** (colorscheme reload, OS window title /
 //!    size / maximized-check / decoration / minimize) now go through
 //!    `quadraui::Backend::window()` (`WindowControl`, quadraui#950) and
@@ -55,29 +57,32 @@
 //!    internally, so `app.rs` never had a genuine discovery gap, only a
 //!    missing *portable accessor* to reach a window quadraui's own backend
 //!    already had a handle to. Only the `gdk::Display`/`gtk4::IconTheme`
-//!    icon-search-path setup inside `App::new` stays behind inline
-//!    `#[cfg(feature = "gui")]` — quadraui has no portable icon-theme
+//!    icon-search-path setup — [`crate::gtk::util::add_icon_theme_search_path`]
+//!    since #1498 folded `App::new` into [`App::new_portable`] — stays
+//!    genuinely GTK-only, called directly by `crate::gtk::run` instead of
+//!    from inside this file; quadraui has no portable icon-theme
 //!    search-path surface. A `gtk4::Settings` dark/light-variant push used
-//!    to live here too (`App::new` and `handle_poll_tick` both);
+//!    to live here too (the old `App::new` and `handle_poll_tick` both);
 //!    quadraui#1016 moved it into `Backend::set_theme`, so both call sites
 //!    were deleted rather than kept behind the gate.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
 //!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
-//!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url` —
-//!    moved to the backend-neutral
-//!    `crate::click`/`crate::css`/`crate::app_support`, which `src/gtk/{click,
-//!    css,mod,util}.rs` now re-export so nothing else in `crate::gtk` had to
-//!    change. The genuinely GTK-only remainder — `css::load_css` and
-//!    `util`'s icon-install/log helpers — stayed in `crate::gtk` and is
-//!    reached from here through explicit `#[cfg(feature = "gui")]` call
-//!    sites in `App::new`. (`click::build_editor_click_context`, the
-//!    Pango/Cairo text-measurement context builder this list used to name
-//!    here too, is `#[cfg(test)]`-only since #1104 — see its doc comment.)
-//!    `app_icon_image_for_paint` used to be a
-//!    third such site — GTK got a pre-rasterised PNG, every other backend the
-//!    raw SVG — until quadraui#1014 added a decode cache to
-//!    `Backend::draw_image` itself (#1102), so it now hands every backend the
-//!    same [`crate::render::app_icon_image`] with no fork at all.
+//!    pixel-geometry functions, `open_url` — moved to the backend-neutral
+//!    `crate::click`/`crate::app_support`, which `src/gtk/{click,mod,util}.rs`
+//!    now re-export so nothing else in `crate::gtk` had to change. `css.rs`
+//!    (`make_theme_css`/`STATIC_CSS`/`load_css`) is gone entirely as of
+//!    #1498 — see item 1 above. The genuinely GTK-only remainder —
+//!    `util`'s icon-install/log helpers plus the icon-theme search path —
+//!    stayed in `crate::gtk` and is reached from here (or, for the
+//!    icon-theme path, from `crate::gtk::run` directly) through explicit
+//!    `#[cfg(feature = "gui")]` call sites. (`click::build_editor_click_context`,
+//!    the Pango/Cairo text-measurement context builder this list used to
+//!    name here too, is `#[cfg(test)]`-only since #1104 — see its doc
+//!    comment.) `app_icon_image_for_paint` used to be a third such site —
+//!    GTK got a pre-rasterised PNG, every other backend the raw SVG — until
+//!    quadraui#1014 added a decode cache to `Backend::draw_image` itself
+//!    (#1102), so it now hands every backend the same
+//!    [`crate::render::app_icon_image`] with no fork at all.
 //!
 //! None of this was a "route around it" job: per `CLAUDE.md`'s
 //! Platform-Neutrality Rule, the parts that stayed behind the `gui` feature
@@ -95,8 +100,6 @@
 //! through the deprecated trait method. This file needs no deprecation
 //! suppression of any kind anymore.
 
-#[cfg(feature = "gui")]
-use gtk4::gdk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -104,8 +107,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::core;
-#[cfg(feature = "gui")]
-use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
@@ -115,7 +116,6 @@ use render::Theme;
 use crate::app_support::*;
 use crate::click::*;
 use crate::core::engine::sidebar::*;
-use crate::css::*;
 #[cfg(all(feature = "gui", any(test, feature = "test-support")))]
 use crate::gtk::backend;
 
@@ -656,19 +656,13 @@ impl DeferredQueue {
 // none of this needs a `#[cfg(feature = "gui")]` gate or a per-backend impl
 // the way the deleted trait's sole `gtk4::Window` impl did.
 
-/// Narrow seam over the platform stylesheet provider (#862). `App::css_provider`
-/// stores one of these type-erased so the colorscheme-reload/`setup` methods can reload it
-/// without naming `gtk4::CssProvider`.
-pub(crate) trait PlatformCssProvider {
-    fn load_css_data(&self, css: &str);
-}
-
-#[cfg(feature = "gui")]
-impl PlatformCssProvider for gtk4::CssProvider {
-    fn load_css_data(&self, css: &str) {
-        self.load_from_data(css);
-    }
-}
+// #1498: `PlatformCssProvider`, the local seam that used to live here, is
+// gone. It existed to reload a `gtk4::CssProvider` theming the native file
+// dialog's fallback widgets (sidebar/scrollbar/popover) on every colorscheme
+// change; JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
+// equivalent stylesheet, rebuilt from `Theme` on every `Backend::set_theme`
+// call (which `sync_per_frame_backend_state` already makes every frame), so
+// there is nothing left for `App` itself to own or reload.
 
 pub(crate) struct App {
     pub(crate) engine: Rc<RefCell<Engine>>,
@@ -1176,14 +1170,13 @@ pub(crate) struct App {
     /// `draw_editor_hover_popup`; consumed by click + drag handlers
     /// in this file.
     pub(crate) editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>>,
-    /// CSS provider registered with the GTK display — updated when colorscheme changes.
-    ///
-    /// `None` only under the headless test harness ([`App::new_headless`], #646):
-    /// `gtk4::CssProvider::new()` asserts `gtk::init` has run, which it cannot
-    /// with no display, and a provider that is attached to no `GdkDisplay`
-    /// styles nothing anyway. Always `Some` in a live run.
-    pub(crate) css_provider: Option<Box<dyn PlatformCssProvider>>,
-    /// Colorscheme name at the time the CSS was last applied.
+    /// Colorscheme name as of the last `handle_poll_tick` check — lets that
+    /// method detect a runtime `:colorscheme` change and schedule a redraw.
+    /// Used to also gate reloading a GTK-only CSS provider theming the
+    /// native file dialog; #1498 deleted that provider (JDonaghy/
+    /// quadraui#1091 moved the equivalent stylesheet into
+    /// `GtkPlatformServices` itself), leaving only the change-detection use
+    /// below.
     pub(crate) last_colorscheme: String,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
     /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
@@ -1456,167 +1449,53 @@ fn app_icon_image_for_paint() -> quadraui::Image {
 
 /// Create a new `App` instance.
 ///
-/// All widget-dependent setup (window handle, CSS) is deferred to
+/// All widget-dependent setup (window handle) is deferred to
 /// `ShellApp::setup()`, called by the runner once the window exists.
 impl App {
+    /// The single `App` constructor every GUI/TUI entry point calls (#1498
+    /// folded the once-GTK-only `App::new` into this — see this file's
+    /// module doc for the history: by the time #1498 landed, the two
+    /// constructors differed by exactly one GDK-only step,
+    /// [`crate::gtk::util::add_icon_theme_search_path`], which
+    /// [`crate::gtk::run`] now calls directly before this constructor
+    /// instead of `App::new` calling it inline).
+    ///
     /// `backend` is supplied by the caller rather than constructed here
     /// (#861): before this, `App::assemble` hardcoded
     /// `Box::new(backend::GtkBackend::new())`, so nothing upstream of this
-    /// function — including `App::new` itself — had any seam to hand
-    /// `App` a different `quadraui::Backend` impl. `src/gtk/mod.rs::run`
-    /// is the only caller today and it still passes a `GtkBackend`, but
-    /// the choice of concrete type now lives at the call site instead of
-    /// being baked into `App`.
-    #[cfg(feature = "gui")]
-    pub(crate) fn new(
-        file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
-    ) -> Self {
-        // Icon search path setup.
-        if let Some(home) = std::env::var_os("HOME") {
-            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
-            if let Some(display) = gdk::Display::default() {
-                let icon_theme = gtk4::IconTheme::for_display(&display);
-                icon_theme.add_search_path(&icon_dir);
-            }
-        }
-        let mut engine = {
-            let mut e = Engine::new();
-            // #999: record this as a GUI backend *before* resolving
-            // `use_nerd_fonts()` — GUI bundles the icon font, so an unset
-            // setting inherits `true` regardless of OS.
-            icons::set_gui_backend(true);
-            icons::set_nerd_fonts(e.settings.use_nerd_fonts());
-            e.startup(file_path.as_deref());
-            e
-        };
-        setup_gtk_clipboard(&mut engine, backend.clone());
-
-        let initial_theme = Theme::from_name(&engine.settings.colorscheme);
-        let css_provider: Option<Box<dyn PlatformCssProvider>> =
-            Some(Box::new(crate::gtk::css::load_css(&initial_theme)));
-        let last_colorscheme = engine.settings.colorscheme.clone();
-
-        let engine = Rc::new(RefCell::new(engine));
-        unsafe {
-            crate::core::swap::register_emergency_engine(
-                engine.as_ptr() as *const crate::core::Engine
-            );
-        }
-
-        let deferred = DeferredQueue::new();
-
-        // #949: settings.json hot-reload used to need a GTK-only
-        // `gio::FileMonitor` constructed here. It's gone — `handle_poll_tick`
-        // now calls `Engine::check_settings_reload`'s portable mtime poll on
-        // every tick, the same mechanism TUI has always used, so there is
-        // nothing left for this constructor to set up.
-        Self::assemble(
-            engine,
-            deferred,
-            css_provider,
-            last_colorscheme,
-            backend,
-            render::UnitProfile::px(),
-            true,
-        )
-    }
-
-    /// Backend-neutral twin of [`App::new`] (#859) — what a wrapper over a
-    /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
-    /// the same `impl ShellApp`, the GTK entry point runs.
+    /// function had any seam to hand `App` a different `quadraui::Backend`
+    /// impl. `src/gtk/mod.rs::run`, `src/tui_main/mod.rs::run`,
+    /// `src/macos/mod.rs::run` and `src/win/mod.rs::run` are today's
+    /// callers, each passing its own concrete backend.
     ///
-    /// This is [`App::new`] minus exactly two steps in its prologue that
-    /// need a live GTK display, each of which is a platform *resource*
-    /// rather than a decision:
-    ///
-    /// | skipped | why | what replaces it |
-    /// |---|---|---|
-    /// | `gdk::Display` icon-theme search path | GDK-only; no portable icon-theme concept exists off GTK | nothing — no other backend has an icon theme to seed |
-    /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
-    ///
-    /// A third row used to live in this table: the GTK-only
-    /// `gtk4::Settings` dark/light-variant push, run once from `App::new`'s
-    /// prologue and again from `handle_poll_tick` on every colorscheme
-    /// change. quadraui#1016 moved that push into
-    /// `Backend::set_theme` itself, which `sync_per_frame_backend_state`
-    /// already calls every frame on both constructors' `App`s — so both
-    /// call sites were deleted outright rather than needing a row here.
-    ///
-    /// A fourth row used to live in this table: the GTK-only
-    /// `gio::FileMonitor` on `settings.json`, replaced here by
-    /// `settings_monitor: None` — a known hot-reload gap off GTK. #949
-    /// deleted the monitor from [`App::new`] entirely rather than adding a
-    /// portable equivalent here, since `Engine::check_settings_reload`'s
-    /// mtime poll (already the sole mechanism on TUI) now runs from the
-    /// shared `handle_poll_tick`, which both constructors' `App`s reach via
-    /// `ShellApp::tick`. That closes this gap **for macOS** for free —
-    /// nothing needed adding here at all — because quadraui's
-    /// `macos::run` keeps the same `IDLE_POLL_CEILING` (250ms) idle-tick
-    /// fallback GTK does (quadraui#940's `idlePollTick:` timer).
-    ///
-    /// **Win-GUI is only half-fixed, per the very doc this claim leans
-    /// on** (quadraui#832/#940's `AppLogic::tick` table, `runner.rs`):
-    /// Windows gets *no* idle-poll fallback at all — `tick` there only
-    /// runs after a batch of native events or an explicit
-    /// `RedrawAfter`/`request_frame_in` ask, neither of which this diff
-    /// arranges. So a future Win-GUI backend picks up an
-    /// externally-edited `settings.json` while the user is actively
-    /// generating native events (typing, moving the mouse), but not while
-    /// the app sits idle — the exact "edit settings.json externally, come
-    /// back to it" scenario hot-reload exists for. Whoever builds the
-    /// Win-GUI backend (quadraui#19–#31) needs an explicit periodic
-    /// `RedrawAfter`/`request_frame_in` nudge for this to work there the
-    /// way it does on GTK/macOS/TUI; there is no such backend in this
-    /// repo yet, so this is not a live regression today, only a caveat
-    /// for that future work.
-    ///
-    /// A fifth row used to live in this table: `install_bundled_icon_font()`
-    /// (#920's fontconfig filesystem install + font-cache-refresh shell-out).
-    /// #1130
-    /// deleted that function outright now that quadraui#1013 gives
-    /// `GtkBackend` a real `register_font_from_memory` override — every
-    /// backend, GTK included, now registers the bundled Nerd Font subset
-    /// in-process via `ShellApp::setup`'s `render::register_nerd_font_
-    /// fallback(backend)` call instead, so there is nothing left for either
-    /// constructor to call here.
-    ///
-    /// Everything else — engine construction and startup, nerd-font
-    /// selection, the clipboard provider (`setup_gtk_clipboard` (#1100)
-    /// names no concrete toolkit type — it goes through the generic
-    /// `quadraui::Backend` seam), the emergency-engine
-    /// registration the panic hook's swap flush needs, and the whole of
-    /// [`App::assemble`] — is shared verbatim, so the two constructors
-    /// cannot drift on anything that affects behaviour.
-    ///
-    /// `backend` is the caller's `Box<dyn quadraui::Backend>`, the seam #861
-    /// opened and `src/gtk/mod.rs::run` names in its own comment as "the seam
-    /// a future non-GTK wrapper (#859) would pass a different
-    /// `quadraui::Backend` impl through".
-    ///
-    /// The `allow(dead_code)` is feature-shaped, not a silencer: the callers
-    /// are `crate::macos::run` (double-gated on `macos` + `target_os =
-    /// "macos"`) and, since #866, `crate::win::run` (`win`, un-target-gated
-    /// — see that module's doc comment for why). Keeping the function itself
-    /// **un**gated means every lane still type-checks it.
-    #[cfg_attr(
-        not(any(feature = "win", all(feature = "macos", target_os = "macos"))),
-        allow(dead_code)
-    )]
+    /// Nothing here needs a live GTK display: the two steps that used to
+    /// ([`crate::gtk::util::add_icon_theme_search_path`] and the deleted
+    /// `css::load_css`, GDK-only and gone respectively — the latter since
+    /// JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own equivalent
+    /// stylesheet, reloaded every frame by `sync_per_frame_backend_state`'s
+    /// `Backend::set_theme` call) both moved or vanished. `settings_monitor`
+    /// (a GTK-only `gio::FileMonitor`) was deleted outright by #949 rather
+    /// than replaced — `Engine::check_settings_reload`'s portable mtime
+    /// poll, already the sole reload mechanism on TUI, made it redundant on
+    /// every backend via the shared `handle_poll_tick`. A GTK-only
+    /// `gtk4::Settings` dark/light-variant push used to live here too;
+    /// quadraui#1016 moved that into `Backend::set_theme` itself, so it
+    /// needed no portable replacement either.
     pub(crate) fn new_portable(
         file_path: Option<PathBuf>,
         backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
     ) -> Self {
         let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
-        // SAFETY: identical contract to `App::new`'s own call — the `Rc` is
-        // moved into the returned `App`, which the caller hands straight to
-        // a `run_with_shell` that owns it for the rest of the process, so
-        // the pointer never dangles. `crate::macos::run` is the only caller
-        // and does exactly that. [`Self::new_portable_for_test`] below is a
-        // second caller of [`Self::build_portable_engine`], but deliberately
-        // **not** of `register_emergency_engine` — see its own doc for why a
-        // second, test-scoped caller of that unsafe fn would be unsound.
+        // SAFETY: the `Rc` is moved into the returned `App`, which the
+        // caller hands straight to a `run_with_shell` that owns it for the
+        // rest of the process, so the pointer never dangles.
+        // `crate::gtk::run`/`crate::tui_main::run`/`crate::macos::run`/
+        // `crate::win::run` are today's callers and each does exactly that.
+        // [`Self::new_portable_for_test`] below is a second caller of
+        // [`Self::build_portable_engine`], but deliberately **not** of
+        // `register_emergency_engine` — see its own doc for why a second,
+        // test-scoped caller of that unsafe fn would be unsound.
         unsafe {
             crate::core::swap::register_emergency_engine(
                 engine.as_ptr() as *const crate::core::Engine
@@ -1626,7 +1505,6 @@ impl App {
         Self::assemble(
             engine,
             DeferredQueue::new(),
-            None,
             last_colorscheme,
             backend,
             units,
@@ -1713,7 +1591,6 @@ impl App {
         Self::assemble(
             engine,
             DeferredQueue::new(),
-            None,
             last_colorscheme,
             backend,
             units,
@@ -1971,17 +1848,15 @@ impl App {
     ///
     /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation;
     /// none of it touches GDK. `backend` is taken as a parameter rather than
-    /// constructed here (#861) — see [`App::new`]'s doc comment.
+    /// constructed here (#861) — see [`App::new_portable`]'s doc comment.
     ///
     /// Named no toolkit type in its own signature even before #862 (#861
     /// already erased `backend`'s concrete type), so it stays un-gated
-    /// itself; only `App::new`/`App::new_headless` — its sole callers today,
-    /// both `gui`-gated — construct the arguments this needs.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    /// itself; called from every constructor above/below (`new_portable`,
+    /// `new_portable_for_test`, `new_headless_with_backend`).
     fn assemble(
         engine: Rc<RefCell<Engine>>,
         deferred: DeferredQueue,
-        css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
         backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
         units: render::UnitProfile,
@@ -2085,7 +1960,6 @@ impl App {
             painted_char_width: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
-            css_provider,
             last_colorscheme,
             backend,
             units,
@@ -2111,13 +1985,11 @@ impl App {
     /// tests (#646). Feed the result to `crate::gtk::testing::harness`, which
     /// wraps it in `quadraui::gtk::testing::driver_with_shell`.
     ///
-    /// Deliberately skips, relative to [`App::new`]:
+    /// Deliberately skips, relative to [`App::new_portable`]:
     ///
-    /// - `gdk::Display::default()` icon-theme search paths.
-    /// - `load_css`, which `unwrap()`s `gdk::Display::default()` and therefore
-    ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
-    ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
-    ///   attached to no display styles nothing.
+    /// - `crate::gtk::util::add_icon_theme_search_path`'s
+    ///   `gdk::Display::default()` icon-theme search path — GDK-only, and
+    ///   `crate::gtk::run` (its sole caller) is skipped entirely here.
     /// - `setup_gtk_clipboard` (#1100), which would install
     ///   `backend.services().clipboard()` callbacks. Every other test in
     ///   `src/gtk/testing.rs` that needs `engine.clipboard_read`/
@@ -2192,7 +2064,6 @@ impl App {
         Self::assemble(
             engine,
             DeferredQueue::new(),
-            None,
             last_colorscheme,
             backend,
             units,
@@ -3234,21 +3105,16 @@ impl App {
     }
 
     fn handle_poll_tick(&mut self, backend: &mut dyn quadraui::Backend) {
-        // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
+        // Schedule a redraw if the colorscheme changed (e.g. via
+        // `:colorscheme`). #1498: this used to also reload a GTK-only CSS
+        // provider theming the native file dialog here; that provider is
+        // gone (JDonaghy/quadraui#1091 moved the equivalent stylesheet into
+        // `GtkPlatformServices`, reloaded every frame by
+        // `sync_per_frame_backend_state`'s `Backend::set_theme` call), so
+        // this block's only remaining job is the redraw schedule.
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
             if current != self.last_colorscheme {
-                let theme = Theme::from_name(&current);
-                let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-                if let Some(p) = &self.css_provider {
-                    p.load_css_data(&combined);
-                }
-                // GTK dark/light preference for native widgets & menus
-                // (the file dialog) is no longer pushed here: quadraui#1016
-                // made `Backend::set_theme` do it, and
-                // `sync_per_frame_backend_state` calls that every frame —
-                // this block's `draw_needed.set(true)` below is what
-                // schedules the next one.
                 self.last_colorscheme = current;
                 self.draw_needed.set(true);
             }
@@ -8954,13 +8820,13 @@ impl quadraui::ShellApp for App {
             .borrow_mut()
             .set_menus(menu_defs);
 
-        // Apply initial CSS (no-op under the headless test harness, which has
-        // no display to attach a provider to — see the field's doc, #646).
-        if let Some(p) = &self.css_provider {
-            let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-            let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-            p.load_css_data(&combined);
-        }
+        // #1498: initial CSS used to be applied here by hand (a GTK-only
+        // `css_provider` theming the native file dialog). That provider is
+        // gone — `GtkPlatformServices::set_theme` (JDonaghy/quadraui#1091)
+        // now owns the equivalent stylesheet, and `render_content`'s first
+        // frame already calls `sync_per_frame_backend_state`, which calls
+        // `Backend::set_theme` unconditionally before anything paints — so
+        // there is nothing left for `setup` to do here.
 
         // Register the panel-keys accelerator set (toggle sidebar, fuzzy
         // finder, live grep, command palette, ...) on the runner's backend.
