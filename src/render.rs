@@ -5010,7 +5010,7 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 // the nine actions that are pure `Engine` mutations once too.
 //
 // The other five (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
-// `OpenTerminal`, `TerminalToggleMax`) go through [`PanelAcceleratorHost`]
+// `OpenTerminal`, `TerminalToggleMax`) queue onto `App`'s `DeferredQueue`
 // instead of being inlined here, because their effect genuinely depends on
 // state this module has no business owning:
 //
@@ -5032,20 +5032,22 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 //   state — collapsing them into one body would be papering over a real
 //   platform difference, not deleting duplication.
 //
-// A `host: &mut impl PanelAcceleratorHost` argument is the shared function's
-// seam for that residue — each backend supplies a thumbnail struct (`GtkAccelHost`
-// / `TuiAccelHost`, defined next to their call sites) implementing the five
-// hook methods, so the dispatcher itself never needs to know which backend is
-// calling it.
+// #1499: this used to take a `host: &mut impl PanelAcceleratorHost` argument
+// — each backend supplied a thumbnail struct (`GtkAccelHost` / `TuiAccelHost`,
+// defined next to their call sites) implementing the five hook methods, so
+// the dispatcher itself never needed to know which backend was calling it.
+// With the TUI backend gone, `App` is the only implementation left, so
+// [`dispatch_panel_accelerator`] takes `app: &App` directly and queues onto
+// its `DeferredQueue` inline instead of through a trait object.
 //
 // #823 item 1: the *registration* half (the 14-entry `(id, binding)` table
 // and the loop that (un)registers each one) was, until now, a byte-identical
 // 44-line function pasted into `app.rs` and `tui_main/mod.rs`. It has no
 // backend-specific step at all — every call goes through the trait object
-// `&mut dyn quadraui::Backend` — so unlike the five [`PanelAcceleratorHost`]
-// actions above, it needed no host seam to collapse: [`register_panel_accelerators`]
-// below is the whole function, called verbatim from both `App::setup` and
-// `tui_main`'s startup path.
+// `&mut dyn quadraui::Backend` — so unlike the five deferred-queue actions
+// above, it needed no per-backend seam to collapse:
+// [`register_panel_accelerators`] below is the whole function, called
+// verbatim from both `App::setup` and `tui_main`'s startup path.
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
@@ -5151,34 +5153,35 @@ impl PanelAccelerator {
     }
 }
 
-/// Backend hook for the five panel-accelerator actions whose effect needs
-/// state `Engine` doesn't own — see the rung's header comment above for why
-/// GTK and TUI each need their own five-method impl rather than one shared
-/// body.
-pub trait PanelAcceleratorHost {
-    fn toggle_sidebar(&mut self, engine: &mut Engine);
-    fn focus_explorer(&mut self, engine: &mut Engine);
-    fn focus_search(&mut self, engine: &mut Engine);
-    fn open_terminal(&mut self, engine: &mut Engine);
-    fn terminal_toggle_max(&mut self, engine: &mut Engine);
-}
-
 /// Resolve `id` and apply the corresponding panel-accelerator action.
 /// Returns the resolved [`PanelAccelerator`] (so callers can layer their own
 /// residual bookkeeping — e.g. GTK's per-action `DeferredAction::Resize`) or
 /// `None` if `id` isn't a registered panel accelerator.
-pub fn dispatch_panel_accelerator(
+///
+/// Five actions (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
+/// `OpenTerminal`, `TerminalToggleMax`) queue onto `app`'s `DeferredQueue`
+/// instead of mutating `engine` directly — `App`'s own `UiEvent::Accelerator`
+/// arm has no engine-mutation seam of its own for these
+/// (`toggle_sidebar_panel`/`toggle_focus_explorer`/`toggle_focus_search`/
+/// `toggle_terminal`/`toggle_terminal_maximize` are `&mut App` methods that
+/// also re-sync GTK widgets), so `tick()` (which does have `&mut App`) runs
+/// the real method next frame instead — see [`crate::app::DeferredQueue`]'s
+/// own doc comment.
+pub(crate) fn dispatch_panel_accelerator(
     id: &str,
     engine: &mut Engine,
-    host: &mut impl PanelAcceleratorHost,
+    app: &crate::app::App,
 ) -> Option<PanelAccelerator> {
+    use crate::app::DeferredAction;
     let action = PanelAccelerator::from_id(id)?;
     match action {
-        PanelAccelerator::ToggleSidebar => host.toggle_sidebar(engine),
-        PanelAccelerator::FocusExplorer => host.focus_explorer(engine),
-        PanelAccelerator::FocusSearch => host.focus_search(engine),
-        PanelAccelerator::OpenTerminal => host.open_terminal(engine),
-        PanelAccelerator::TerminalToggleMax => host.terminal_toggle_max(engine),
+        PanelAccelerator::ToggleSidebar => app.deferred.send(DeferredAction::ToggleSidebar),
+        PanelAccelerator::FocusExplorer => app.deferred.send(DeferredAction::ToggleFocusExplorer),
+        PanelAccelerator::FocusSearch => app.deferred.send(DeferredAction::ToggleFocusSearch),
+        PanelAccelerator::OpenTerminal => app.deferred.send(DeferredAction::ToggleTerminal),
+        PanelAccelerator::TerminalToggleMax => {
+            app.deferred.send(DeferredAction::ToggleTerminalMaximize)
+        }
         PanelAccelerator::FuzzyFinder => {
             engine.open_picker(crate::core::engine::PickerSource::Files)
         }
@@ -5222,60 +5225,65 @@ pub fn dispatch_panel_accelerator(
 // function from GTK's, so the two could still drift independently even
 // though neither, on its own, had a reachability gap today.
 //
-// [`apply_engine_action`] is the one function both now call: an exhaustive
-// match (no `_ =>` arm — a new `EngineAction` variant fails to compile here
-// until every caller decides what it means), with a `host: &mut impl
-// EngineActionHost` seam for the effects each backend must supply itself —
-// follows [`dispatch_panel_accelerator`]'s shape above, not a new one.
-pub trait EngineActionHost {
-    /// Open a new terminal tab (needs the live pane's column/row count).
-    fn open_terminal(&mut self, engine: &mut Engine);
-    /// Toggle terminal-panel maximize (needs the live viewport's row count).
-    fn toggle_terminal_maximize(&mut self, engine: &mut Engine);
-    /// Run `cmd` in a new terminal tab (extension-install flow).
-    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String);
-    /// Show the "Open Folder" dialog/picker.
-    fn open_folder_dialog(&mut self, engine: &mut Engine);
-    /// Finish an "Open Workspace" action already run inside the engine.
-    fn open_workspace_dialog(&mut self, engine: &mut Engine);
-    /// Show the "Save Workspace As" dialog.
-    fn save_workspace_as_dialog(&mut self, engine: &mut Engine);
-    /// Show the "Open Recent" workspace picker.
-    fn open_recent_dialog(&mut self, engine: &mut Engine);
-    /// Re-sync/redraw after the engine toggled sidebar visibility internally.
-    fn sidebar_toggled(&mut self, engine: &mut Engine);
-    /// Show the "unsaved changes" quit-confirmation UI.
-    fn quit_with_unsaved(&mut self, engine: &mut Engine);
-    /// Save session state and request a clean shutdown.
-    fn quit(&mut self, engine: &mut Engine);
-    /// Save session state and exit the process with a non-zero code
-    /// (`:cquit`). Never returns.
-    fn quit_with_error(&mut self, engine: &mut Engine) -> !;
-}
+// #1499: [`apply_engine_action`] used to take a `host: &mut impl
+// EngineActionHost` seam — a per-backend struct implementing eleven hook
+// methods — for the dozen or so effects `Engine` cannot finish alone. With
+// the TUI backend gone, `App` is the only implementation left, so those
+// eleven hooks are inlined directly into the match arms below, reading/
+// mutating `engine` and `app`'s fields exactly as `GtkEngineActionHost` (the
+// old per-backend host struct) used to. `open_terminal`/`open_workspace_dialog`
+// used to be `App::new_terminal_tab`/`App::open_workspace_dialog` verbatim,
+// until #1063 left both with no other caller (menu, key and macro dispatch
+// all go through here now) and deleted them rather than ship dead code —
+// this fold does not resurrect them.
 
 /// Apply the [`crate::core::engine::EngineAction`] produced by
 /// `Engine::dispatch_menu_action` (a fired `MenuEvent::Activated`). Returns
 /// `true` when the action means the caller should exit — `Quit`/`SaveQuit`;
 /// `QuitWithError` never returns at all.
 ///
-/// `OpenFile`/`OpenUrl`/`None`/`Error` need no backend help — `Engine`
-/// already did (or need do) everything for those — so they're handled
-/// inline rather than through `host`.
-pub fn apply_engine_action(
+/// `OpenFile`/`OpenUrl`/`None`/`Error` need no `app` help — `Engine` already
+/// did (or need do) everything for those — so they're handled inline without
+/// touching `app` at all.
+///
+/// Most arms below read/mutate the `engine: &mut Engine` parameter directly
+/// rather than going through `app.engine.borrow()/borrow_mut()`: `engine` is
+/// already a live `RefMut` borrow of that same `Rc<RefCell<Engine>>` at every
+/// call site, so a second, independent `app.engine.borrow_mut()` from in here
+/// would double-borrow the same `RefCell` and panic at runtime.
+pub(crate) fn apply_engine_action(
     action: crate::core::engine::EngineAction,
     engine: &mut Engine,
-    host: &mut impl EngineActionHost,
+    app: &mut crate::app::App,
 ) -> bool {
     use crate::core::engine::{EngineAction, PendingPlatformAction};
     match action {
         EngineAction::None | EngineAction::Error => false,
         EngineAction::Quit | EngineAction::SaveQuit => {
-            host.quit(engine);
+            app.quit_and_save_session(engine);
             true
         }
-        EngineAction::QuitWithError => host.quit_with_error(engine),
+        // Matches the former inline `EngineAction::QuitWithError` arm in
+        // `App::dispatch_engine_action` exactly — no `save_session_state`
+        // (unlike `Quit`/`SaveQuit` above). This asymmetry is GTK-specific,
+        // not something `tui_main::handle_action` itself used to do: the
+        // pre-#1434 TUI shell's `Quit`/`SaveQuit` and `QuitWithError` arms
+        // both called `save_session`, i.e. TUI treated the two variants
+        // *symmetrically*. The divergence was cross-backend (GTK skipped the
+        // save on `QuitWithError`, TUI didn't); preserved here exactly as it
+        // behaved pre-#1063 rather than changed as a side effect of this fold.
+        EngineAction::QuitWithError => {
+            engine.cleanup_all_swaps();
+            engine.lsp_shutdown();
+            std::process::exit(1);
+        }
         EngineAction::QuitWithUnsaved => {
-            host.quit_with_unsaved(engine);
+            if !engine.has_any_unsaved() {
+                app.quit_and_save_session(engine);
+            } else {
+                engine.show_quit_confirm();
+                app.draw_needed.set(true);
+            }
             false
         }
         EngineAction::OpenFile(path) => {
@@ -5285,41 +5293,82 @@ pub fn apply_engine_action(
             false
         }
         EngineAction::OpenTerminal => {
-            host.open_terminal(engine);
+            let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_new_tab(cols, rows);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::ToggleTerminalMaximize => {
-            host.toggle_terminal_maximize(engine);
+            let ctx = crate::core::engine::UiEventContext {
+                terminal_cols: app.terminal_panel_cols(app.painted_editor_content_width()),
+                terminal_max_rows: app.terminal_maximize_target_rows(engine),
+            };
+            engine.handle_ui_event(
+                crate::core::engine::UiEvent::Accelerator(
+                    crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                    quadraui::Modifiers::default(),
+                ),
+                ctx,
+            );
+            app.draw_needed.set(true);
             false
         }
         EngineAction::RunInTerminal(cmd) => {
-            host.run_in_terminal(engine, cmd);
+            let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_run_command(&cmd, cols, rows);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::OpenFolderDialog => {
-            host.open_folder_dialog(engine);
+            let controller = quadraui::FolderPickerController::new(
+                engine.cwd.clone(),
+                vec![".vimcode-workspace".to_string()],
+                engine.settings.show_hidden_files,
+            );
+            *app.folder_picker.borrow_mut() = Some(controller);
+            app.draw_needed.set(true);
             false
         }
+        // Inlines the `refresh_file_tree` / `refresh_explorer` /
+        // `reveal_path_in_explorer` chain the deleted `App::open_workspace_dialog`
+        // called — `queue_explorer_draw` (that chain's last step) is a
+        // documented no-op under the `ShellApp` runner, so dropping it
+        // changes nothing.
         EngineAction::OpenWorkspaceDialog => {
-            host.open_workspace_dialog(engine);
+            engine.explorer_rebuild_rows();
+            if let Some(path) = engine.file_path().cloned() {
+                engine.explorer_reveal_path(&path);
+            }
+            app.draw_needed.set(true);
             false
         }
+        // Touches no engine state, so this calls `App::save_workspace_as_dialog`
+        // straight through rather than inlining it.
         EngineAction::SaveWorkspaceAsDialog => {
-            host.save_workspace_as_dialog(engine);
+            app.save_workspace_as_dialog();
             false
         }
         EngineAction::OpenRecentDialog => {
-            host.open_recent_dialog(engine);
+            if engine.session.recent_workspaces.is_empty() {
+                engine.message = "No recent workspaces".to_string();
+            } else {
+                engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+            }
+            app.draw_needed.set(true);
             false
         }
+        // A redraw trigger only under the `ShellApp` runner (see
+        // `App::sync_sidebar_from_engine`'s own doc comment, the method this
+        // arm used to call).
         EngineAction::ToggleSidebar => {
-            host.sidebar_toggled(engine);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::OpenUrl(url) => {
             // #1134: queue rather than shell out here — `apply_engine_action`
-            // is shared by both backends via `EngineActionHost` and has no
-            // `backend` handle of its own. `App::tick_dispatch` (GTK) /
+            // has no `backend` handle of its own. `App::tick_dispatch` (GTK) /
             // the pre-#1434 TUI shell's `tick` (TUI) drain `pending_platform_actions`
             // through `PlatformServices` (`is_safe_url` was already applied
             // by whichever engine path produced this `EngineAction`).
@@ -5362,20 +5411,23 @@ pub fn apply_engine_action(
 // agreed on that subset before this issue, so it is not a divergence this
 // rung needs to resolve, only preserve.
 //
-// `host: &mut impl ExplorerContextHost` covers the one action that
-// genuinely needs backend-specific plumbing: `"open_terminal"` needs the
-// live terminal pane's column count, which only each backend's own runner
-// has in scope. Every other action is a plain `Engine` call with no
-// backend seam — including the caller's own post-action redraw/refresh
-// bookkeeping (`explorer_needs_refresh`, `draw_needed`), which stays at
-// each call site exactly as before since it is generic "something changed"
-// plumbing already shared across far more than context-menu actions, not
-// specific to this rung.
-pub trait ExplorerContextHost {
-    /// Open a new terminal tab rooted at `dir` (needs the live pane's
-    /// column count, which only the backend's own runner has in scope).
-    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf);
-}
+// `open_terminal_at` covers the one action that genuinely needs
+// backend-specific plumbing: `"open_terminal"` needs the live terminal
+// pane's column count, which only each backend's own runner has in scope.
+// Every other action is a plain `Engine` call with no backend seam —
+// including the caller's own post-action redraw/refresh bookkeeping
+// (`explorer_needs_refresh`, `draw_needed`), which stays at each call site
+// exactly as before since it is generic "something changed" plumbing
+// already shared across far more than context-menu actions, not specific to
+// this rung.
+//
+// #1499: this used to be a `host: &mut impl ExplorerContextHost` one-method
+// trait, so a second backend (the pre-#1434 TUI shell) could supply its own
+// terminal-opening plumbing. With that backend gone, `open_terminal_at`
+// (a plain `FnMut`) is enough: `App` passes a closure over its own `&mut
+// self`; the test-only caller in `core::engine::picker` passes a no-op —
+// no trait, no per-backend struct, and no dependency from `core`'s test code
+// onto `crate::app::App`.
 
 /// Resolve the "open_terminal"/"find_in_folder" target directory: `target`
 /// itself when it is already a directory, its parent otherwise (falling
@@ -5401,12 +5453,16 @@ fn explorer_ctx_action_dir(
 /// `select_for_diff`/`diff_with_selected` are engine-owned — already fully
 /// handled inside `context_menu_confirm` itself — so they (and any other
 /// unrecognised action) are a deliberate no-op here.
+///
+/// `open_terminal_at` opens a new terminal tab rooted at the given directory
+/// — needs the live pane's column count, which only the caller's own runner
+/// has in scope, so it's the caller's job, not this function's.
 pub fn apply_explorer_context_action(
     engine: &mut Engine,
     action: &str,
     target: &std::path::Path,
     is_dir: bool,
-    host: &mut impl ExplorerContextHost,
+    open_terminal_at: &mut dyn FnMut(&mut Engine, std::path::PathBuf),
 ) {
     match action {
         "new_file" | "new_folder" | "rename" => {
@@ -5423,7 +5479,7 @@ pub fn apply_explorer_context_action(
         }
         "open_terminal" => {
             let dir = explorer_ctx_action_dir(engine, target, is_dir);
-            host.open_terminal_at(engine, dir);
+            open_terminal_at(engine, dir);
         }
         "find_in_folder" => {
             let dir = explorer_ctx_action_dir(engine, target, is_dir);
@@ -5512,51 +5568,31 @@ pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadr
 // `PanelChanged { hamburger }` returned early, before any shadow-sync
 // statement ran, because the sync was spelled out fresh at each call site
 // instead of owned by one function every call site is required to reach.
-// [`sync_shell_event_shadow`] is that one function. Both `App::on_shell_event`
-// (GTK) and the pre-#1434 TUI shell's `on_shell_event` (TUI) now call it unconditionally,
-// as the first thing they do, before any of their own id-specific branching —
-// so the shadow mutation itself can no longer be skipped by an early
-// `return` reached before it. The only door left for a backend to exclude an
-// id from the shadow sync is [`ShellShadowSyncHost::panel_absent_from_shadow`],
-// a declarative predicate with no side effects of its own, answered inside
-// this function rather than around it.
-
-/// Host hook for [`sync_shell_event_shadow`] — same shape as
-/// [`PanelAcceleratorHost`] and for the same reason: the sync itself is one
-/// shared body, but *which* panel ids even have a shadow `PanelDefinition`
-/// to sync differs per backend.
-pub trait ShellShadowSyncHost {
-    /// True when `panel_id` has no matching `PanelDefinition` in the shadow
-    /// `engine.app_shell`, so a `PanelChanged` for it must skip the generic
-    /// sync below rather than call `show_panel` on an id the shadow doesn't
-    /// know (a silent no-op) or clobber state a different subsystem owns.
-    ///
-    /// `ext:`-prefixed plugin panels qualify on *both* backends —
-    /// `render::apply_activity_panel_switch`'s `ext:` branch already handles
-    /// them through `engine.ext_panel_active`, not a shadow
-    /// `PanelDefinition` — so [`sync_shell_event_shadow`] checks that case
-    /// itself rather than asking the host. TUI's hamburger id is the one
-    /// case that genuinely needs a host answer: the shadow `AppShell`
-    /// (built in `Engine::new` from only the real content panels) has no
-    /// hamburger `PanelDefinition` at all, for reasons specific enough to
-    /// TUI that GTK's impl is simply `false`.
-    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool;
-}
+// [`sync_shell_event_shadow`] is that one function. `App::on_shell_event`
+// calls it unconditionally, as the first thing it does, before any of its
+// own id-specific branching — so the shadow mutation itself can no longer be
+// skipped by an early `return` reached before it.
+//
+// #1499: this used to take a `host: &impl ShellShadowSyncHost` with one
+// hook, `panel_absent_from_shadow`, so a second backend (the pre-#1434 TUI
+// shell) could answer it differently. With that backend gone, `App`'s own
+// answer is the only one left, so the predicate is inlined below instead of
+// asked through a trait: the shadow `engine.app_shell` never gets a
+// `PanelDefinition` for the hamburger panel (`App::shell_config` only
+// registers it in the runner's own `AppShell`, on the `cell` profile, and
+// even there it's runner-only — see
+// [`reclaim_hamburger_sidebar_reservation`]'s doc), so a `PanelChanged` for
+// it must always skip the generic sync below.
 
 /// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
-/// `engine.app_shell` (#1062). Shared by `App::on_shell_event` (GTK) and
-/// the pre-#1434 TUI shell's `on_shell_event` (TUI) — call this first, unconditionally,
-/// before any of the event's other id-specific handling; see the rung's
-/// header comment above for why the call must come first.
-pub fn sync_shell_event_shadow(
-    event: &quadraui::AppShellEvent,
-    engine: &mut Engine,
-    host: &impl ShellShadowSyncHost,
-) {
+/// `engine.app_shell` (#1062). Called by `App::on_shell_event` first,
+/// unconditionally, before any of the event's other id-specific handling —
+/// see the rung's header comment above for why the call must come first.
+pub fn sync_shell_event_shadow(event: &quadraui::AppShellEvent, engine: &mut Engine) {
     match event {
         quadraui::AppShellEvent::PanelChanged { panel_id } => {
             if crate::app_support::is_ext_panel_id(panel_id.as_str())
-                || host.panel_absent_from_shadow(panel_id)
+                || panel_id.as_str() == crate::core::engine::sidebar::HAMBURGER_PANEL_ID
             {
                 return;
             }
@@ -5788,7 +5824,7 @@ pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine
 /// `panel_id` names the hamburger, in which case the caller must skip its
 /// own generic `PanelChanged` handling for this event (there is no shadow
 /// `PanelDefinition` for the hamburger to switch to — see
-/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc).
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm).
 pub fn route_hamburger_panel_changed(engine: &mut Engine, panel_id: &quadraui::WidgetId) -> bool {
     if panel_id.as_str() != HAMBURGER_PANEL_ID {
         return false;
@@ -5823,7 +5859,7 @@ pub fn route_hamburger_sidebar_hidden(engine: &mut Engine, ctx: &quadraui::Shell
 /// `PanelDefinition` in the *runner's* `AppShell` (so a click on it produces
 /// a real `PanelChanged`/hit-testable activity-bar icon) but has no matching
 /// entry in the shadow `engine.app_shell` (see
-/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc) — so while the
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm) — so while the
 /// hamburger is the runner's active panel, `AppShellLayout` still reserves a
 /// sidebar column for it even though nothing real is behind it. Left alone,
 /// `render_content` would paint that reservation as an empty sidebar band
@@ -5882,7 +5918,7 @@ pub fn reclaim_hamburger_sidebar_reservation(
 /// #1029 (defect 2 of #988, widened #1427): the hamburger is special-cased
 /// out of this sync entirely while it's the reveal actually in effect. The
 /// shadow has no hamburger `PanelDefinition` at all (see
-/// [`ShellShadowSyncHost::panel_absent_from_shadow`]'s doc), so
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm), so
 /// `shadow_visible` can never reflect a hamburger reveal — it's always
 /// whatever the last *real* panel click left behind. Without the
 /// `runner_shows_hamburger` guard, the very next dispatch after a hamburger
@@ -5968,100 +6004,25 @@ pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellCont
 // field names), how quitting actually ends the process (GTK sets a
 // `Cell<bool>` the runner polls next frame; TUI returns `Reaction::Exit`
 // directly), whether a terminal command needs a live `backend` handle for
-// sizing — live behind [`TickHost`], following [`PanelAcceleratorHost`] /
-// [`EngineActionHost`]'s established shape (a small per-backend host struct
-// holding `&mut App`/its own fields plus `backend`, constructed fresh at each
-// call site) rather than a new one. [`TickHost::tab_switcher_gate`] is the
-// one TUI-only hook with a default: TUI skips the rest of the chore list
-// entirely while the tab-switcher popup is mid-cycle (`event_loop`'s legacy
-// behavior, preserved as-is); GTK has no such popup, so the default no-op
-// (`None`) applies.
-
-/// Host hook for [`run_shared_tick_chores`] — see the rung's header comment
-/// above for why these, and only these, differ per backend.
-pub trait TickHost {
-    /// Run `f` against the `ScreenLayout` the last paint produced, if any.
-    fn with_last_layout(&self, f: &mut dyn FnMut(&ScreenLayout));
-
-    /// The per-group tab-bar widths this frame's `TabBars` rung painted
-    /// (#1165) — a clone, since both backends clear the real field at the
-    /// *start* of the next paint, not here.
-    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)>;
-
-    /// The yank-highlight clear deadline armed by `run_post_key_epilogue`
-    /// (#813).
-    fn yank_highlight_deadline(&self) -> Option<std::time::Instant>;
-
-    /// Clear the armed yank highlight — both the engine-side highlight state
-    /// and this host's own deadline field.
-    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine);
-
-    /// TUI-only: while the tab-switcher popup is mid-cycle, run *only* its
-    /// own 500ms auto-confirm timer and skip every other chore below this
-    /// point in the list — `Some(needs_redraw)` short-circuits
-    /// [`run_shared_tick_chores`] with that verdict. `None` (GTK's default,
-    /// and TUI's own answer whenever the popup isn't open) means "no gate,
-    /// keep going."
-    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
-        let _ = engine;
-        None
-    }
-
-    /// Extra work when `Engine::poll_idle` reports dirty state (LSP/DAP/
-    /// search finished something this tick) — GTK re-syncs sidebar widgets
-    /// from `engine.app_shell`; TUI needs nothing extra here (its sidebar
-    /// repaints from engine state every frame regardless).
-    fn on_idle_dirty(&mut self, engine: &mut Engine) {
-        let _ = engine;
-    }
-
-    /// True once >= 2s has elapsed since the last periodic sidebar/SC
-    /// refresh, resetting the timer as a side effect when it has. Each
-    /// backend owns its own `Instant`/`Cell<Instant>` field (different
-    /// storage shapes), so the elapsed check can't live in `Engine` itself.
-    fn sidebar_refresh_due(&mut self) -> bool;
-
-    /// TUI-only: rebuild the explorer row cache on the same 2s tick,
-    /// regardless of which panel is active (mirrors the legacy `event_loop`
-    /// behavior). No-op on GTK, which refreshes the file tree from
-    /// `Engine::explorer_needs_refresh` instead.
-    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
-        let _ = engine;
-    }
-
-    /// Run a queued terminal command in a freshly-sized pane — needs a live
-    /// column/row count only available per-backend.
-    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String);
-
-    /// Give a just-revealed extension panel focus, in whatever backend-local
-    /// sidebar-focus state each backend tracks.
-    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String);
-
-    /// Finish the format-on-save-then-quit flow (`:wq`/`:x` deferred
-    /// quit) — each backend's own session-save + shutdown/exit sequence.
-    fn quit_after_format_save(&mut self, engine: &mut Engine);
-
-    /// Carry out one queued platform action (open URL / reveal in file
-    /// manager) via this host's own `backend` handle.
-    fn run_platform_action(
-        &mut self,
-        engine: &mut Engine,
-        action: crate::core::engine::PendingPlatformAction,
-    );
-
-    /// Sync the OS window title/chrome from `engine`'s state — [`window_title`]
-    /// supplies the shared string both backends format identically; each
-    /// decides when/whether to apply it (TUI gates on its own `live` field —
-    /// no real terminal under the test driver — and GTK additionally caches
-    /// the window bounds for session-restore).
-    fn sync_window_title(&mut self, engine: &Engine);
-}
+// sizing — used to live behind a `host: &mut impl TickHost` seam, following
+// [`PanelAcceleratorHost`]/[`EngineActionHost`]'s established shape (#1499: a
+// small per-backend host struct holding `&mut App`/its own fields plus
+// `backend`, constructed fresh at each call site). With the TUI backend
+// gone, `App` is the only implementation left, so [`run_shared_tick_chores`]
+// takes `app: &mut App` and `backend: &mut dyn quadraui::Backend` directly
+// and inlines what used to be `GtkTickHost`'s method bodies. The two
+// TUI-only hooks the old trait gave a no-op default for on GTK —
+// `tab_switcher_gate` (skip the rest of the chore list while TUI's
+// tab-switcher popup is mid-cycle) and `on_sidebar_refresh_tick` (rebuild
+// TUI's explorer row cache on the periodic sidebar tick) — are simply gone
+// below rather than inlined as always-no-op calls: `App` never overrode
+// either, so dropping them changes nothing observable.
 
 /// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
 /// <buffer name>"`, or the bare app name with none open. Used to be
 /// formatted identically, and independently, in `App::handle_poll_tick` and
-/// the pre-#1434 TUI shell's `tick`; now the one string both [`TickHost::sync_window_title`]
-/// impls format (#1248).
+/// the pre-#1434 TUI shell's `tick`; now the one string
+/// [`run_shared_tick_chores`]'s window-title chore formats (#1248).
 pub fn window_title(engine: &Engine) -> String {
     engine
         .active_buffer_name()
@@ -6121,17 +6082,21 @@ pub fn caret_shape_for_mode(
     }
 }
 
-/// Run the tick-time background chore list both backends share (#1248) —
-/// see the rung's header comment above for the full list and why the
-/// backend-specific bits live behind `host` instead of here. Returns `true`
-/// when anything changed this tick that warrants a redraw.
-pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> bool {
+/// Run the tick-time background chore list `App::handle_poll_tick` shares
+/// with the pre-#1434 TUI shell's `tick` (#1248) — see the rung's header
+/// comment above for the full list. Returns `true` when anything changed
+/// this tick that warrants a redraw.
+pub(crate) fn run_shared_tick_chores(
+    engine: &mut Engine,
+    app: &mut crate::app::App,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
     let mut needs_redraw = false;
 
     // Exact per-window viewport dimensions from the last paint, so
     // `ensure_cursor_visible` uses real geometry rather than a whole-screen
     // approximation that can't see splits.
-    host.with_last_layout(&mut |layout| {
+    if let Some(layout) = app.cached_screen_layout.borrow().as_ref() {
         for rw in &layout.windows {
             engine.set_viewport_for_window(
                 rw.window_id,
@@ -6139,36 +6104,71 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
                 rw.text_viewport_cols.max(1),
             );
         }
-    });
+    }
 
     // Re-check every group's active tab is still on-screen against the
     // widths this frame's `TabBars` rung actually painted (#1165).
-    let counts = host.tab_visible_counts();
+    let counts = app.tab_visible_counts.borrow().clone();
     if !counts.is_empty() && engine.post_draw_apply_widths(&counts) {
         needs_redraw = true;
     }
 
     // Sync the OS window title before any chore below could plausibly change
-    // the active buffer name (mirrors the legacy TUI ordering).
-    host.sync_window_title(engine);
-
-    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
-    if let Some(deadline) = host.yank_highlight_deadline() {
-        if std::time::Instant::now() >= deadline {
-            host.clear_yank_highlight_deadline(engine);
-            needs_redraw = true;
+    // the active buffer name (mirrors the legacy TUI ordering). Routed
+    // through `Backend::window()` (quadraui#950, #1124) rather than the old
+    // GTK-only `self.window`/`PlatformWindowHandle` title setter (deleted
+    // #1234) — that seam was `None` on macOS/Win-GUI, so this used to be a
+    // silent no-op there; `WindowControl` is backed on every windowed
+    // backend.
+    let win_title = window_title(engine);
+    if let Some(w) = backend.window() {
+        let _ = w.set_title(&win_title);
+        // Refresh the session-restore maximized cache (#1529) unconditionally
+        // — unlike size/position below, this is exactly the one moment those
+        // freeze, so it must always be current.
+        let maximized = w.is_maximized();
+        if let Ok(m) = maximized {
+            app.cached_window_maximized.set(m);
+        }
+        // Refresh the session-restore size/position cache (#1234, extended
+        // #1529 for position) — see `App::cached_window_width`'s doc for why
+        // this is cached here rather than read live from
+        // `App::save_session_and_exit`, and why it's gated on
+        // `!is_maximized()`.
+        if matches!(maximized, Ok(false)) {
+            if let Ok(bounds) = w.bounds() {
+                app.cached_window_width.set(bounds.width.round() as i32);
+                app.cached_window_height.set(bounds.height.round() as i32);
+                // `WindowControl::bounds`'s own doc: GTK/Wayland always
+                // reports `x: 0.0, y: 0.0` here, meaning "unknown", not "at
+                // the screen origin" — skip caching that sentinel rather than
+                // saving a fake position a `set_bounds`-capable backend
+                // could later misapply; see `App::cached_window_x`/`y`'s own
+                // doc for the #1529 review finding this closes.
+                if bounds.x != 0.0 || bounds.y != 0.0 {
+                    app.cached_window_x.set(Some(bounds.x.round() as i32));
+                    app.cached_window_y.set(Some(bounds.y.round() as i32));
+                }
+            }
         }
     }
 
-    // TUI-only early exit — see `TickHost::tab_switcher_gate`'s doc.
-    if let Some(redraw) = host.tab_switcher_gate(engine) {
-        return needs_redraw || redraw;
+    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
+    if let Some(deadline) = app.yank_hl_deadline.get() {
+        if std::time::Instant::now() >= deadline {
+            engine.clear_yank_highlight();
+            app.yank_hl_deadline.set(None);
+            needs_redraw = true;
+        }
     }
 
     // Periodic background work: LSP, DAP, git, search, etc.
     if engine.poll_idle() {
         needs_redraw = true;
-        host.on_idle_dirty(engine);
+        // A redraw trigger only under the `ShellApp` runner (see
+        // `App::sync_sidebar_from_engine`'s own doc comment, the method this
+        // used to call).
+        app.draw_needed.set(true);
     }
 
     // Auto-refresh source control periodically, gated on sidebar visibility
@@ -6177,8 +6177,17 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     // extension panel shown over Git/Explorer doesn't spuriously re-trigger
     // this (mirrors the legacy GTK gate exactly; TUI's own prior gate missed
     // the ext-panel-priority case `sidebar_owner` already handles).
-    if engine.app_shell.sidebar_visible() && host.sidebar_refresh_due() {
-        host.on_sidebar_refresh_tick(engine);
+    //
+    // The elapsed check only resets `last_sc_refresh` while the sidebar is
+    // actually visible — matching the old `host.sidebar_refresh_due()`
+    // hook's short-circuited-`&&` evaluation exactly: while the sidebar is
+    // hidden, the 2s timer is never reset, so it fires once (and resets)
+    // the first tick after the sidebar is shown again, no matter how long
+    // it was hidden for.
+    if engine.app_shell.sidebar_visible()
+        && app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
+    {
+        app.last_sc_refresh = std::time::Instant::now();
         if matches!(
             sidebar_owner(engine),
             SidebarOwner::Git | SidebarOwner::Explorer
@@ -6194,18 +6203,25 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     // Format-on-save + :wq/:x deferred quit.
     if engine.format_save_quit_ready {
         engine.format_save_quit_ready = false;
-        host.quit_after_format_save(engine);
+        app.quit_and_save_session(engine);
     }
 
     // Run a pending terminal command (needs a live column/row count).
     if let Some(cmd) = engine.pending_terminal_command.take() {
-        host.run_terminal_command(engine, cmd);
+        let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, cols, rows);
         needs_redraw = true;
     }
 
     // Focus a panel revealed by plugin logic this frame.
     if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
-        host.ext_panel_focus(engine, panel_name);
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine.ext_panel_has_focus = true;
+        engine.ext_panel_active = Some(panel_name);
+        app.sync_sidebar_widgets();
         needs_redraw = true;
     }
 
@@ -6215,7 +6231,7 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     let actions = std::mem::take(&mut engine.pending_platform_actions);
     if !actions.is_empty() {
         for action in actions {
-            host.run_platform_action(engine, action);
+            run_pending_platform_action(engine, action, backend);
         }
         needs_redraw = true;
     }
@@ -9178,130 +9194,105 @@ impl EditorBandUnits {
     }
 }
 
-/// Host hook for [`paint_editor_band_rungs`] — the four [`EditorOp`] rungs
-/// whose paint body still differs enough per backend that the shared walk
-/// cannot inline them directly. `Minimap`, `Breadcrumbs` and `TabTooltip`
-/// need no hook at all: their bodies are already byte-identical between GTK
-/// and TUI (see [`paint_editor_band_rungs`]'s match arms), which is exactly
-/// what made them safe to inline into the shared walk instead of leaving
-/// them here as a fifth/sixth/seventh trivial forwarding method.
-///
-/// `'screen` ties every method's `screen` parameter to the *same*
-/// `ScreenLayout` borrow for the whole walk, so a host (GTK's) that needs to
-/// carry a `&'screen quadraui::TabBar` past the `TabBars` call — for the
-/// `FrameHitMap` it builds after the walk returns — can store it in its own
-/// fields without a lifetime mismatch.
-pub trait EditorBandHost<'screen> {
-    /// [`EditorOp::Windows`]: every editor window's text, gutter, per-window
-    /// status line and the `:split`/`:vsplit` divider lines within each
-    /// group.
-    ///
-    /// Genuinely per-backend: GTK accumulates each window's owned
-    /// `quadraui::Editor` into its own `FrameHitMap` (#449) so later click
-    /// routing hit-tests the exact objects just painted, never a second copy
-    /// that could drift; TUI carries no such map (its hit-testing recomputes
-    /// geometry from `ScreenLayout` directly) but instead wants an optional
-    /// raw `ratatui::Frame` for cursor placement that this trait's `&mut dyn
-    /// Backend`-only signature has no room for (see `render_window`'s own
-    /// doc comment for why `frame: Option<&mut Frame>` exists there).
-    fn paint_windows(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::TabBars`]: one tab bar per editor group.
-    ///
-    /// Genuinely per-backend: GTK recovers the rasteriser's exact *pixel* hit
-    /// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
-    /// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution
-    /// (#515, #703, #764); TUI's hit-testing works in whole cells and needs
-    /// none of that bookkeeping.
-    fn paint_tab_bars(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::GroupDividers`]: the between-*group* `Ctrl+W v`/`Ctrl+W s`
-    /// boundary lines.
-    ///
-    /// Genuinely per-backend: GTK rasterises through quadraui's `Split`
-    /// primitive ([`draw_dividers_as_splits`]); TUI rasterises cell-by-cell
-    /// instead, because it alone carries the #481 guard that suppresses a
-    /// divider column immediately beside a neighbouring window's scrollbar —
-    /// a coalescence problem that exists only in a character grid. See
-    /// [`draw_dividers_as_splits`]'s own doc comment for the full story.
-    fn paint_group_dividers(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::TabDragOverlay`]: the tab-drag drop-zone highlight,
-    /// insertion bar and dragged-tab ghost.
-    ///
-    /// Genuinely per-backend: GTK's drop geometry is cached every frame
-    /// (`cache_tab_drop_geometry`) so the drag hit-test has it whether or not
-    /// this rung ran that frame; TUI recomputes it inline and additionally
-    /// paints the dragged buffer's name at the ghost position — the decision
-    /// [`paint_tab_drop_overlay`]'s own doc comment already records GTK
-    /// leaves to quadraui's rasteriser instead.
-    fn paint_tab_drag_overlay(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-}
+// #1499: [`paint_editor_band_rungs`]'s four "genuinely per-backend" rungs —
+// `Windows`, `TabBars`, `GroupDividers`, `TabDragOverlay` — used to live
+// behind a `host: &mut impl EditorBandHost<'screen>` trait, implemented once
+// per backend (`GtkEditorBandHost` in `app.rs`, a TUI twin before #1434).
+// With only `App` left, the function takes `app: &App` plus the
+// `window_editors`/`hit_bars` accumulators directly instead — see its own
+// doc below.
+//
+// `Minimap`, `Breadcrumbs` and `TabTooltip` need no `app` at all: their
+// bodies were already byte-identical between GTK and TUI, which is exactly
+// what made them safe to inline into the shared walk directly rather than
+// leaving them as a fifth/sixth/seventh trivial forwarding method.
+//
+// [`EditorOp::Windows`] (every editor window's text, gutter, per-window
+// status line and the `:split`/`:vsplit` divider lines within each group)
+// accumulates each window's owned `quadraui::Editor` into `window_editors` so
+// `App`'s own `FrameHitMap` (#449) hit-tests the exact objects just painted,
+// never a second copy that could drift. [`EditorOp::TabBars`] (one tab bar
+// per editor group) similarly recovers the rasteriser's exact *pixel* hit
+// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
+// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution (#515,
+// #703, #764) into `hit_bars`. [`EditorOp::GroupDividers`] (the
+// between-*group* `Ctrl+W v`/`Ctrl+W s` boundary lines) and
+// [`EditorOp::TabDragOverlay`] (the tab-drag drop-zone highlight, insertion
+// bar and dragged-tab ghost) need no accumulator at all.
 
 /// The shared **editor band** walk (#1251): the single ordered loop both
 /// the pre-#1434 TUI shell's `paint_editor_band` and `App::compose_editor_band_rungs` run
 /// over [`compose_editor_band`], replacing what used to be two hand-written
 /// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
 /// `TabTooltip` paint identically on both backends (modulo `units`) and are
-/// inlined here directly; the four rungs that still need a per-backend body
-/// go through `host` — see [`EditorBandHost`]'s own doc for exactly which
-/// parts of each and why.
+/// inlined here directly.
 ///
 /// `band` is the editor column's bounds in the caller's units (only `x`, `y`
 /// and `width` are read, by the `TabTooltip` rung); `units` carries the
-/// metrics and tab-row height the same rung needs. Returns the rungs actually
-/// composed, in order, for the caller to stash and validate with
+/// metrics and tab-row height the same rung needs, and `tab_bar_h` (not part
+/// of `units` — only the `TabBars`/`TabDragOverlay` rungs need it) is the
+/// tab strip's own painted row height. `window_editors`/`hit_bars` accumulate
+/// across the `Windows`/`TabBars` calls — the caller destructures them back
+/// out once this returns, to build its `FrameHitMap`. Returns the rungs
+/// actually composed, in order, for the caller to stash and validate with
 /// [`check_editor_band_order`] — callers do that themselves (rather than this
 /// function doing it) so the assertion message keeps each backend's own
 /// "TUI "/"GTK " prefix, unchanged from before this convergence.
 #[allow(clippy::too_many_arguments)]
-pub fn paint_editor_band_rungs<'screen>(
+pub(crate) fn paint_editor_band_rungs<'screen>(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,
     screen: &'screen ScreenLayout,
     theme: &Theme,
     band: quadraui::Rect,
     units: EditorBandUnits,
+    tab_bar_h: f64,
     drag_active: bool,
-    host: &mut impl EditorBandHost<'screen>,
+    app: &crate::app::App,
+    window_editors: &mut Vec<quadraui::Editor>,
+    hit_bars: &mut Vec<(GroupId, quadraui::Rect, &'screen quadraui::TabBar)>,
 ) -> Vec<EditorOp> {
     let mut composed = Vec::new();
     for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
         match op {
-            EditorOp::Windows => host.paint_windows(backend, engine, screen, theme),
+            EditorOp::Windows => app.paint_editor_windows_rung(
+                backend,
+                screen,
+                units.metrics.line_height as f64,
+                window_editors,
+            ),
             // #35/#722: minimap strips on every window's right edge (one
             // entry per `WindowId` in `screen.minimap`, not just the active
             // window's) — one call, the rasteriser is quadraui's.
             EditorOp::Minimap => draw_minimap_strip(backend, screen),
-            EditorOp::TabBars => host.paint_tab_bars(backend, engine, screen, theme),
+            EditorOp::TabBars => app.paint_tab_bars_rung(
+                backend,
+                engine,
+                screen,
+                units.tab_row_h as f64,
+                tab_bar_h,
+                hit_bars,
+            ),
             EditorOp::Breadcrumbs => {
                 paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
             }
-            EditorOp::GroupDividers => host.paint_group_dividers(backend, screen, theme),
-            EditorOp::TabDragOverlay => host.paint_tab_drag_overlay(backend, engine, screen, theme),
+            EditorOp::GroupDividers => {
+                draw_dividers_as_splits(backend, &screen.group_dividers, |div| {
+                    quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
+                })
+            }
+            EditorOp::TabDragOverlay => {
+                app.cache_tab_drop_geometry(screen, engine, tab_bar_h);
+                let ctx = app.cached_drop_ctx.borrow();
+                let (mx, my) = app.mouse_pos_cell.get();
+                paint_tab_drop_overlay(
+                    backend,
+                    &ctx,
+                    (mx as f32, my as f32),
+                    2.0,
+                    units.metrics.line_height,
+                );
+            }
             // Positioned one *tab row* below the top of the editor column —
             // `units.tab_row_h`, not `units.metrics.line_height` — mirroring
             // GTK's `tab_row_h` / TUI's always-one-cell tab strip; see
