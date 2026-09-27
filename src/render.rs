@@ -9719,12 +9719,12 @@ pub fn paint_bottom_panel_rung(
         &tab_bar,
         None,
     );
-    engine.bottom_tab_bar_hits.replace(Some(
-        crate::core::engine::BottomTabStripHits {
+    engine
+        .bottom_tab_bar_hits
+        .replace(Some(crate::core::engine::BottomTabStripHits {
             layout,
             origin_x: rect.x as f64,
-        },
-    ));
+        }));
 
     // Rows 2..: the active panel's own toolbar row and body.
     let content_y = rect.y + 2.0 * lh;

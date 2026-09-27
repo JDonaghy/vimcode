@@ -105,7 +105,6 @@ pub(crate) fn tab_bar_available_cols(
     (effective / char_width.max(1.0)).floor().max(0.0) as usize
 }
 
-
 /// Convert pixel (x, y) to a click target using the cached ScreenLayout from
 /// the last paint pass (#344). Zone detection delegates to the shared
 /// `screen_zone_hit_test` / `window_zone_hit_test` / `resolve_gutter_action`

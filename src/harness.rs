@@ -149,6 +149,41 @@ use quadraui::NamedKey;
 use crate::app::{App, TextMetricsBackend};
 use crate::core::Engine;
 
+/// True if `needle` appears in the painted text of any single screen **row**,
+/// that row's runs joined left-to-right first.
+///
+/// The row-aware twin of [`ConformanceDriver::screen_has`], which matches
+/// within *one painted run*. A run is one Pango run / one styled span, not
+/// one logical row — quadraui's own `GtkDriver::painted_texts` doc spells
+/// this out ("for multi-span content … one entry *per span*") — so a phrase
+/// that straddles a style change is invisible to `screen_has` even though
+/// it is plainly on screen. That is not hypothetical: the fuzzy pickers
+/// paint each row's *matched* substring as its own span, so the moment a
+/// scenario types a filter, `"View: Toggle Sidebar"` becomes the two runs
+/// `"View: Toggle "` + `"Sidebar"` and `"File: Open Folder…"` becomes
+/// `"File: "` + `"Open Folder"` + `"…"`.
+///
+/// Still an assertion on *rendered output*, not on state (the CLAUDE.md
+/// rule #587/#592 taught) — it reads the same painted runs `screen_has`
+/// does, only grouped the way the user sees them. Rows are keyed on exact
+/// painted `y`, the same equality the tab-bar row locators in this file use.
+pub fn screen_row_has<D: ConformanceDriver>(driver: &D, needle: &str) -> bool {
+    let inventory = driver.inventory();
+    let mut rows: std::collections::HashMap<u32, Vec<(f32, String)>> = Default::default();
+    for run in inventory.text_runs() {
+        rows.entry(run.bounds.y.to_bits())
+            .or_default()
+            .push((run.bounds.x, run.text.clone()));
+    }
+    rows.values_mut().any(|row| {
+        row.sort_by(|a, b| a.0.total_cmp(&b.0));
+        row.iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<String>()
+            .contains(needle)
+    })
+}
+
 /// A backend-neutral [`ConformanceDriver`] plus the `Rc` handle to the
 /// [`Engine`] it drives, and the two process-wide guards every headless
 /// paint-time harness in this repo needs (mirrors
@@ -449,9 +484,15 @@ pub fn folder_picker_filters_and_escape_dismisses<D: ConformanceDriver>(
 /// `render.rs`, the same source `PickerSource::Commands` and the drawn
 /// menu system both read) — present regardless of engine settings, unlike
 /// a keybinding-derived entry.
+/// Asserted with [`screen_row_has`] rather than
+/// [`ConformanceDriver::screen_has`] from the filter step on: once a query
+/// narrows the list, the picker paints each row's *matched* substring as its
+/// own styled span, so `"View: Toggle Sidebar"` reaches the screen as the two
+/// runs `"View: Toggle "` + `"Sidebar"` and a single-run substring match can
+/// no longer see the phrase. See `screen_row_has`'s own doc.
 pub fn command_palette_filters_and_escape_dismisses<D: ConformanceDriver>(driver: &mut D) {
     assert!(
-        !driver.screen_has("Toggle Sidebar"),
+        !screen_row_has(driver, "Toggle Sidebar"),
         "precondition: the palette starts closed"
     );
 
@@ -460,7 +501,7 @@ pub fn command_palette_filters_and_escape_dismisses<D: ConformanceDriver>(driver
     driver.press_named(NamedKey::Enter);
 
     assert!(
-        driver.screen_has("Toggle Sidebar") && driver.screen_has("Toggle Terminal"),
+        screen_row_has(driver, "Toggle Sidebar") && screen_row_has(driver, "Toggle Terminal"),
         "':CommandPalette<CR>' must open the palette and list the app's \
          commands"
     );
@@ -468,18 +509,18 @@ pub fn command_palette_filters_and_escape_dismisses<D: ConformanceDriver>(driver
     driver.type_text("Sidebar");
 
     assert!(
-        driver.screen_has("Toggle Sidebar"),
+        screen_row_has(driver, "Toggle Sidebar"),
         "typing 'Sidebar' must keep the matching entry visible"
     );
     assert!(
-        !driver.screen_has("Toggle Terminal"),
+        !screen_row_has(driver, "Toggle Terminal"),
         "typing 'Sidebar' must filter out entries that don't match"
     );
 
     driver.press_named(NamedKey::Escape);
 
     assert!(
-        !driver.screen_has("Toggle Sidebar"),
+        !screen_row_has(driver, "Toggle Sidebar"),
         "Esc must dismiss the command palette"
     );
 }
@@ -4474,16 +4515,30 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
         driver: &D,
         label_needle: &str,
     ) -> quadraui::Rect {
+        tab_label_and_close_bounds(driver, label_needle).1
+    }
+
+    /// `(label_bounds, close_bounds)` for `label_needle`'s tab — the two
+    /// painted runs [`tab_close_button_bounds`] pairs up, both returned so a
+    /// scenario can probe the *dead gap between them* (the `tab_inner_gap`
+    /// quadraui#1080's `TabMeasure` folds into the reserved close region)
+    /// without re-deriving either run's geometry itself.
+    fn tab_label_and_close_bounds<D: ConformanceDriver>(
+        driver: &D,
+        label_needle: &str,
+    ) -> (quadraui::Rect, quadraui::Rect) {
         let inventory = driver.inventory();
         let runs = inventory.text_runs();
         runs.iter()
             .filter(|r| r.text.contains(label_needle))
             .find_map(|label| {
-                runs.iter().find(|r| {
-                    r.text.contains('\u{00d7}')
-                        && r.bounds.y == label.bounds.y
-                        && r.bounds.x > label.bounds.x
-                })
+                runs.iter()
+                    .find(|r| {
+                        r.text.contains('\u{00d7}')
+                            && r.bounds.y == label.bounds.y
+                            && r.bounds.x > label.bounds.x
+                    })
+                    .map(|close| (label.bounds, close.bounds))
             })
             .unwrap_or_else(|| {
                 panic!(
@@ -4491,7 +4546,6 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                      painted, on the same row, close button to the right"
                 )
             })
-            .bounds
     }
 
     /// Center point of the tab bar's action-menu button (the `⋯` segment
@@ -4607,22 +4661,45 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
         },
     }
 
-    // ── #1491: click just outside the close glyph selects, doesn't close ──
+    // ── #1491: the close region is the *whole* reserved close gutter ──────
     //
-    // Regression coverage for the exact defect `click::tighten_close_bounds`
-    // (deleted by #1491) used to patch by hand: quadraui's pre-#1080
-    // `tab_bar_layout`/`draw_tab_bar` reported a *padded* close-button hit
-    // zone spanning `[label_end, tab_right_edge]` — everything from the end
-    // of the label through the tab's own trailing padding — so a click well
-    // before the × glyph itself closed the tab anyway. quadraui#1080's
-    // `pixel_tab_bar_layout` now reserves only `tab_inner_gap + close_glyph_w`
-    // for the close region on every backend (`TabMeasure::trailing_width`
-    // absorbs the rest), so `TabBarLayout::hit_test` at a point one whole
-    // close-button-width to the left of the tight box's own left edge must
-    // resolve to the tab body, not its close button.
+    // On the pixel-accurate layout the close button's hit zone is not the
+    // painted × glyph box — it is the band quadraui#1080's
+    // `pixel_tab_bar_layout` reserves for it, namely
+    // `tab_inner_gap + close_glyph_w` (`TabMeasure::trailing_width` absorbs
+    // the tab's own trailing padding, which is *not* part of it). So a click
+    // in the dead gap immediately left of the painted ×, between the end of
+    // the label and the glyph, must still close the tab — the clickable box
+    // equals the box the rasteriser highlights on hover, which is the whole
+    // point of reading the paint's own `TabBarLayout` back instead of
+    // re-deriving geometry click-side.
+    //
+    // **RED against unfixed `develop`**: pre-#1491,
+    // `click::tighten_close_bounds` hand-trimmed exactly this gap off every
+    // close zone (`start + CLOSE_TAB_INNER_GAP - CLOSE_HOVER_PAD`, GTK's
+    // proportional-font padding constants), so this probe resolved to `Tab`
+    // and *selected* a1059.txt instead of closing it — i.e. hover
+    // highlighted a box that a click a pixel inside would not act on.
+    // Verified by restoring `tighten_close_bounds` and re-running: this test
+    // fails on the "must close" assertion below.
+    //
+    // **`gtk`-only, deliberately** — unlike every other scenario in this
+    // suite, which all run on all three arms. The property under test is a
+    // *proportional-layout* geometry fact, and quadraui's two layouts
+    // genuinely disagree about who owns the inter-glyph gap:
+    // `pixel_tab_bar_layout` folds `tab_inner_gap` into the close region,
+    // while the cell layout's one-column gap stays with the tab body (probed
+    // empirically — the `tui`/`tui_prod` arms of this same scenario resolve
+    // the gap column to `Tab`, not `TabClose`). That divergence is upstream's
+    // to reconcile, not something vimcode may paper over per the
+    // Platform-Neutrality Rule, so this asserts the pixel layout's contract
+    // where it holds instead of encoding a fork. The cross-backend halves of
+    // the same surface — × glyph closes, label selects — are covered on all
+    // three arms by `tab_bar_click_closes_via_shared_dispatch` and
+    // `tab_bar_click_switches_via_shared_dispatch` above.
     crate::backend_conformance! {
-        label: tab_bar_click_just_outside_close_glyph_selects_not_closes,
-        backends: [gtk, tui, tui_prod],
+        label: tab_bar_click_in_close_gutter_closes_not_selects,
+        backends: [gtk],
         engine: two_tab_fixture(),
         size: (800, 480),
         body: |driver| {
@@ -4631,19 +4708,30 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
                 "precondition: both tabs are painted"
             );
 
-            let close = tab_close_button_bounds(driver, "a1059");
-            let x = close.x - close.width;
+            let (label, close) = tab_label_and_close_bounds(driver, "a1059");
+            let label_end = label.x + label.width;
+            assert!(
+                close.x > label_end,
+                "precondition: the rasteriser leaves a dead `tab_inner_gap` \
+                 between a tab's label and its × glyph (label ends at \
+                 {label_end}, × starts at {})",
+                close.x
+            );
+            // Midpoint of that gap: outside the painted glyph, inside the
+            // reserved close region.
+            let x = (label_end + close.x) / 2.0;
             let y = close.y + close.height / 2.0;
             driver.drag(x, y, x, y);
 
             assert!(
-                driver.screen_has("AAAA_1059_CONTENT") && !driver.screen_has("BBBB_1059_CONTENT"),
-                "a click one close-button-width left of the tight × box must select \
-                 a1059.txt, not miss the tab bar entirely"
+                !driver.screen_has("a1059"),
+                "a click in the reserved close gutter (between the label and the \
+                 painted ×) must close a1059.txt, not select it"
             );
             assert!(
-                driver.screen_has("a1059") && driver.screen_has("b1059"),
-                "the click must NOT have closed a1059.txt -- both tabs must still be open"
+                driver.screen_has("BBBB_1059_CONTENT"),
+                "closing a1059.txt must fall back to the only remaining tab, \
+                 b1059.txt, on every backend"
             );
         },
     }
@@ -4659,15 +4747,33 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     // `TabBarLayout::hit_test`'s `visible_segments`/`hit_regions` stay
     // correct once tabs no longer all fit, not just in the two-tab case
     // every other scenario in this suite exercises.
+    //
+    // Sized `(800, 480)`, not the narrower `(500, 480)` this scenario was
+    // first written against: on `gtk` those units are real pixels, and a
+    // 500px-wide window leaves the editor group ~200px after the activity
+    // bar and sidebar — less than one ~175px-wide tab once the right
+    // segments have taken their ~50px, so `TabBar::layout` dropped the whole
+    // strip and painted *no* tab label at all. The scenario then failed in
+    // its own locator (`tab_action_menu_button_center` needs a `last1491`
+    // run sharing the tab row with the `⋯`), not on the behaviour it means
+    // to assert. The overflow itself comes from `overflow_tab_fixture`'s
+    // primed scroll state (see its doc — narrowing the *window* cannot
+    // produce it on frame 1), and the `overflow_tab_1491_00` precondition
+    // below *proves* the strip really scrolled rather than assuming it.
     crate::backend_conformance! {
         label: tab_bar_overflow_right_segment_click_opens_action_menu,
         backends: [gtk, tui, tui_prod],
         engine: overflow_tab_fixture(),
-        size: (500, 480),
+        size: (800, 480),
         body: |driver| {
             assert!(
                 driver.screen_has("OVERFLOW_LAST_CONTENT"),
                 "precondition: the last (active) tab's content is visible"
+            );
+            assert!(
+                !driver.screen_has("overflow_tab_1491_00"),
+                "precondition: the strip really has overflowed -- the first tab \
+                 must have scrolled out of view to keep the active last tab visible"
             );
 
             let (cx, cy) = tab_action_menu_button_center(driver, "last1491");
@@ -4682,10 +4788,31 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
     }
 
     /// Enough same-editor-group tabs that the strip cannot show them all at
-    /// once (a real, narrow `size: (500, 480)` window rather than a wide one
-    /// makes this reliable on both backends' font metrics). The last tab
-    /// (`last1491`) is opened last, so it's both the active tab AND the one
-    /// `fit_active_scroll_offset` must scroll into view.
+    /// once, *already scrolled* so the active last tab (`last1491`, opened
+    /// last) is the only one on screen.
+    ///
+    /// The scroll is primed here, in the fixture, rather than left to the
+    /// first paint: `EditorGroup::tab_bar_width` starts at `usize::MAX`
+    /// ("before the first render, assume all tabs fit"), so frame 1 always
+    /// paints an *unscrolled* strip no matter how many tabs exist or how
+    /// narrow the window is — the paint→`post_draw_apply_widths`→scroll
+    /// feedback loop only converges from frame 2 on. Sizing the window down
+    /// instead is what this scenario first tried, and it cannot work: it
+    /// starved `gtk`'s strip of room for even one tab (so nothing painted a
+    /// tab label at all) while never overflowing the `tui` arms, whose units
+    /// are columns rather than pixels. `set_tab_visible_count` +
+    /// `ensure_all_groups_tabs_visible` is exactly the pair
+    /// `post_draw_apply_widths` itself runs, so this is the post-first-frame
+    /// state reproduced faithfully, in one backend-agnostic unit (columns),
+    /// rather than a hand-poked `tab_scroll_offset`.
+    ///
+    /// The tab *count* is sized for the other end of that same loop: once the
+    /// real paint reports its own width back, a `tui` arm at the scenario's
+    /// 800 **columns** re-widens `tab_bar_width` to ~766 and would scroll
+    /// back to offset 0 if the strip fit — 40 tabs of ~26 columns each
+    /// (~1070 total) keeps it overflowed after convergence too, so the
+    /// scenario's "the first tab is off screen" precondition holds on every
+    /// arm rather than only the pixel-metric one.
     fn overflow_tab_fixture() -> crate::core::Engine {
         let dir = std::env::temp_dir().join(format!(
             "vimcode_test_1491_tab_bar_overflow_{:?}",
@@ -4696,7 +4823,7 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
 
         let mut engine = crate::core::Engine::new_for_test();
         engine.settings.use_nerd_fonts = Some(false);
-        for i in 0..14 {
+        for i in 0..40 {
             let path = dir.join(format!("overflow_tab_1491_{i:02}.txt"));
             std::fs::write(&path, format!("OVERFLOW_{i:02}_CONTENT\n")).unwrap();
             engine.new_tab(Some(&path));
@@ -4713,6 +4840,13 @@ mod issue_1059_tab_bar_dispatch_routes_through_shared_click_fn {
         // assume which one that re-pick landed on.
         let last_idx = engine.editor_groups[&group].tabs.len() - 1;
         engine.goto_tab(last_idx);
+        // 30 columns is narrower than two `overflow_tab_1491_NN.txt` tabs
+        // (~26 columns each) but wide enough for one, so
+        // `TabBar::fit_active_scroll_offset` lands on "the active tab only" —
+        // the strip is unambiguously overflowed *and* the tab the scenario
+        // has to locate is unambiguously painted, on either backend.
+        engine.set_tab_visible_count(group, 30);
+        engine.ensure_all_groups_tabs_visible();
         engine
     }
 
