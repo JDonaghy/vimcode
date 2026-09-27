@@ -4453,4 +4453,86 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1560 review fix: black-box coverage for the BOM decode fix
+    //
+    // CLAUDE.md's "Testing (CRITICAL)" section requires a driver test
+    // asserting on rendered output for any user-visible behaviour change —
+    // the unit tests added to `src/core/buffer.rs` cover the decode logic
+    // in isolation, but not that a UTF-16/UTF-8-BOM file opened through the
+    // real production path (`Engine::open` → `App` → `TuiDriver`) actually
+    // paints its decoded content instead of the "stream did not contain
+    // valid UTF-8" error (and the stuck-looking `[No Name]` buffer) the
+    // issue reported.
+    // ─────────────────────────────────────────────────────────────────────
+    mod file_encoding {
+        use super::*;
+
+        use crate::core::Engine;
+
+        /// #1560: opening a UTF-16LE-with-BOM file (Notepad's/PowerShell's
+        /// "Unicode" default on Windows) through `Engine::open` — the exact
+        /// fixed read path (`Buffer::from_file` → `decode_file_bytes`) —
+        /// must paint the decoded text on screen, with no trace of the raw
+        /// decode error.
+        #[test]
+        fn opening_utf16le_bom_file_shows_decoded_content_via_shell_app() {
+            let path = std::env::temp_dir().join(format!(
+                "vimcode_test_1560_utf16le_{:?}.txt",
+                std::thread::current().id()
+            ));
+            let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+            for unit in "UTF16MARKER98431".encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            std::fs::write(&path, &bytes).unwrap();
+
+            let engine = Engine::open(&path);
+            let h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+
+            assert!(
+                !h.driver.screen_has("stream did not contain valid UTF-8"),
+                "must not surface the raw decode error on screen:\n{}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_has("UTF16MARKER98431"),
+                "the decoded UTF-16LE-BOM file content must reach the \
+                 painted character grid; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// #1560: mirror of the above for a UTF-8-with-BOM file.
+        #[test]
+        fn opening_utf8_bom_file_shows_decoded_content_via_shell_app() {
+            let path = std::env::temp_dir().join(format!(
+                "vimcode_test_1560_utf8bom_{:?}.txt",
+                std::thread::current().id()
+            ));
+            let mut bytes: Vec<u8> = vec![0xEF, 0xBB, 0xBF]; // UTF-8 BOM
+            bytes.extend_from_slice(b"UTF8BOMMARKER24601");
+            std::fs::write(&path, &bytes).unwrap();
+
+            let engine = Engine::open(&path);
+            let h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+
+            assert!(
+                !h.driver.screen_has("stream did not contain valid UTF-8"),
+                "must not surface the raw decode error on screen:\n{}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_has("UTF8BOMMARKER24601"),
+                "the decoded UTF-8-BOM file content must reach the painted \
+                 character grid; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
