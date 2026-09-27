@@ -10230,6 +10230,80 @@ mod vscode_dimming {
         );
     }
 
+    /// #1543: a fresh engine with **untouched settings** — no `:set number`,
+    /// no `settings.json` override, `Engine::new_for_test()`'s
+    /// `Settings::default()` as-is — must paint the absolute line-number
+    /// gutter out of the box (VS Code shows line numbers from the first
+    /// frame, and vimcode is a VS Code/Neovim hybrid). This is the GTK twin
+    /// of `line_numbers_default::fresh_engine_paints_absolute_line_numbers_by_default`
+    /// in `src/tui_main/app_on_tui_tests.rs` — same behaviour, both backends.
+    ///
+    /// Asserts on what the render path actually painted, not on
+    /// `settings.line_numbers` being populated: `pane_geometry`'s
+    /// `gutter_cells > 1` sanity check reads `ScreenLayout.gutter_char_width`,
+    /// the same field `editor_text_layout`/paint consult to place the gutter
+    /// and body text (`render.rs`'s `win_x + win.gutter_char_width as f32 *
+    /// cw` offset) — it is real painted geometry, not an echo of the
+    /// setting. On top of that, the two gutter-colour probes below reuse
+    /// this module's `inactive_line_numbers_dim_while_the_cursor_line_stays_bright`
+    /// machinery to confirm actual digit glyphs are drawn (dimmed inactive
+    /// colour on row 3, the brighter active colour on row 0) rather than a
+    /// merely-widened but blank gutter.
+    ///
+    /// **Verified RED against unfixed `develop`**: with `Settings::default`'s
+    /// `line_numbers` reverted to `LineNumberMode::None`, `pane_geometry`'s
+    /// own sanity assertion fails first — `calculate_gutter_cols` reserves
+    /// exactly one fold-indicator column, so `gutter_cells` is `1`, not `>
+    /// 1` — before either colour probe even runs.
+    #[test]
+    fn fresh_engine_paints_absolute_line_numbers_by_default_on_gtk() {
+        const VSCODE_LINE_NUMBER_FG: (u8, u8, u8) = (0x85, 0x85, 0x85);
+
+        // Deliberately NOT setting `engine.settings.line_numbers` — this
+        // test is exactly about what a fresh, untouched-settings engine
+        // paints.
+        let mut engine = Engine::new_for_test();
+        engine
+            .buffer_mut()
+            .insert(0, "aaa\nbbb\nccc\nddd\neee\nfff\n");
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+        assert_eq!(
+            h.engine.borrow().cursor().line,
+            0,
+            "test setup sanity: the cursor must sit on row 0 so row 0 is the \
+             active gutter row and row 3 is an inactive one"
+        );
+
+        // Painted-geometry check: a bare fold-indicator gutter is exactly
+        // one column wide, so this fails immediately if the default ever
+        // reverts to `LineNumberMode::None`.
+        let (_, gutter_px, _) = pane_geometry(&h);
+        assert!(
+            gutter_px > h.painted_char_width(),
+            "a fresh, untouched-settings engine must paint a line-number \
+             gutter wider than the bare one-column fold indicator"
+        );
+
+        let inactive = gutter_probe(&mut h, 3);
+        assert!(
+            near(inactive, VSCODE_LINE_NUMBER_FG),
+            "an inactive row's gutter must paint a dimmed line-number digit \
+             by default (VS Code's editorLineNumber.foreground \
+             {VSCODE_LINE_NUMBER_FG:?}); the gutter's brightest pixel on \
+             row 3 was {inactive:?}"
+        );
+
+        let active = gutter_probe(&mut h, 0);
+        let active_token = crate::render::Theme::onedark().line_number_active_fg;
+        assert!(
+            near(active, (active_token.r, active_token.g, active_token.b)),
+            "the cursor line's number must paint at line_number_active_fg \
+             ({active_token:?}) by default; got {active:?}"
+        );
+    }
+
     /// A non-trailing breadcrumb segment must paint measurably dimmer than
     /// the editor's body text **in the same frame**, so the path recedes
     /// instead of competing with the code (#701).
@@ -15153,10 +15227,13 @@ mod editor_mouse_rungs {
     #[test]
     fn click_column_tracks_a_runtime_font_size_change_on_gtk() {
         let mut engine = Engine::new_for_test();
-        // #1543: line numbers now default on, widening the gutter — this
-        // test pins click→column tracking a *font* change, not gutter
-        // width, so keep the pre-#1543 no-gutter geometry its computed
-        // pixel math assumes.
+        // #1543: line numbers now default on. Not required for correctness
+        // here — `click_at` below resolves its target pixel from THIS
+        // frame's own painted `editor_text_layout(..).text_bounds.x`, which
+        // already accounts for whatever gutter width is currently painted —
+        // but pinned to `None` anyway to keep this test scoped to exactly
+        // what it pins (click→column tracking a *font* change) and stable
+        // against any future gutter-width change.
         engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine
             .buffer_mut()
