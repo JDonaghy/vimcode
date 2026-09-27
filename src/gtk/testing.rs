@@ -10716,7 +10716,20 @@ mod minimap {
     /// confirmed by hand before restoring the fix.
     #[test]
     fn minimap_click_at_the_middle_scrolls_to_half_the_file() {
-        let mut h = harness(engine_with_shaped_buffer(), 1400, 900);
+        let mut engine = engine_with_shaped_buffer();
+        // #1532: `minimap_render_characters` now defaults on, which halves
+        // the strip's row capacity (`MinimapScale::Two`'s 4px row pitch vs
+        // the pre-#1143 2px one) — this fixture's 400 lines no longer fit
+        // inside one uncompressed window at the new, smaller capacity, so
+        // "click the middle" would land at the middle of a *partial*
+        // window, not the middle of the file. This test is about the
+        // click-to-scroll-fraction invariant, not about character
+        // rendering (that's `minimap_row_paints_a_glyph_shape_not_a_
+        // uniform_block_when_render_characters_is_on`, below) — disable it
+        // here to keep testing the same "whole file fits in the window"
+        // case this test has always exercised.
+        engine.settings.minimap_render_characters = false;
+        let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
 
@@ -11807,6 +11820,20 @@ mod minimap {
     /// doc above for why the two representations are pixel-equivalent
     /// under `ColumnBlocks`); it is an equivalence/regression guard for
     /// the lift, not a bug-fix acceptance test.
+    ///
+    /// #1532 update: `ColumnBlocks`' *pixels* stopped being solid,
+    /// uniform `fg`-coloured rectangles the moment the quadraui pin moved
+    /// to `b5cd52e` (quadraui#1143) — that commit also fixed a real bug in
+    /// `render_char_sample_sheet` that made GTK's own #1035 glyph atlas
+    /// unreachable in practice, so `GtkBackend::draw_minimap` now blits a
+    /// density-weighted glyph tile at *every* row pitch, including
+    /// `MinimapScale::One`'s pre-#1143 default, not just at the taller
+    /// `MinimapScale::Two` pitch #1532 introduces. The per-column identity
+    /// claim this test exists to pin (real text, not a masked `'x'`) still
+    /// holds — a masked `'x'` and a line's real character now paint
+    /// *different* glyph shapes, not just different colours — so the
+    /// assertion below only needed to loosen from "solid `fg`" to "clearly
+    /// not `bg`", not to change what it proves.
     #[test]
     fn minimap_single_line_block_paints_the_real_columns_via_gtk_driver() {
         const N_LINES: usize = 200;
@@ -11829,6 +11856,14 @@ mod minimap {
             text.push('\n');
         }
         engine.buffer_mut().insert(0, &text);
+        // #1532: this test hardcodes `ROW_PITCH_PX` (below) to position
+        // `row_y` and is explicitly about `MinimapRenderMode::ColumnBlocks`'s
+        // single-line fast path — `minimap_render_characters` now defaults
+        // on, which paints at `MinimapScale::Two`'s 4px row pitch instead,
+        // desyncing `row_y` from where the row actually lands. Disable it
+        // here to keep testing the block-mode path this test's own name and
+        // doc comment describe.
+        engine.settings.minimap_render_characters = false;
 
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
@@ -11898,11 +11933,28 @@ mod minimap {
             let x = (strip.x + col as f64).round() as i32;
             let pixel = h.driver.pixel(x, row_y);
             if non_blank_cols.contains(&col) {
-                assert_eq!(
-                    pixel, fg,
+                // quadraui#1143 (`b5cd52e`) fixed a real bug that made
+                // GTK's own #1035 glyph atlas unreachable in practice
+                // (`render_char_sample_sheet`'s `ImageSurface::data()`
+                // call always errored while its own live `cairo::Context`
+                // still held a reference, silently falling back to a
+                // solid-filled atlas) — every GTK minimap paint now blits
+                // a real, density-weighted glyph tile even at
+                // `MinimapScale::One`'s pre-#1143 pitch, rather than the
+                // solid `fg`-coloured block this test asserted before
+                // that pin bump. The column is no longer solid, but it
+                // must still read as clearly painted (noticeably
+                // different from `bg`, not just antialiasing fringe) —
+                // that's this fixture's own `#1532` acceptance case, just
+                // reached one pin bump early rather than in the dedicated
+                // test below.
+                assert!(
+                    pixel.0.abs_diff(bg.0) > 40,
                     "column {col} of the distinctive line ({ROW_TEXT:?}) is \
-                     non-whitespace and must paint the theme's foreground \
-                     colour at (x={x}, y={row_y}); strip={strip:?}"
+                     non-whitespace and must paint noticeably different \
+                     from the theme's background colour (not just \
+                     antialiasing fringe) at (x={x}, y={row_y}); \
+                     pixel={pixel:?} bg={bg:?} strip={strip:?}"
                 );
             } else {
                 assert_eq!(
@@ -11913,6 +11965,124 @@ mod minimap {
                 );
             }
         }
+    }
+
+    /// Acceptance (#1532, consuming quadraui#1143): with
+    /// `minimap_render_characters` on — the default, so this fixture never
+    /// touches it — a minimap row over a real, glyph-varied source line
+    /// paints a genuinely non-uniform per-column alpha (a real character
+    /// shape), distinct from what a row of the same length made only of
+    /// repeated `'x'` characters paints (uniform, since every column
+    /// blits the exact same atlas tile).
+    ///
+    /// RED-first: confirmed by hand against the pre-#1532 quadraui pin
+    /// (`78a22f2`, i.e. before quadraui#1143's `MinimapScale` + glyph-atlas
+    /// fix landed) — `GtkBackend::draw_minimap`'s atlas build always
+    /// failed on that pin (`render_char_sample_sheet`'s `ImageSurface::
+    /// data()` call errored while its own live `cairo::Context` still held
+    /// a reference) and silently fell back to `MinimapCharAtlas::filled()`,
+    /// a solid, fully-opaque tile blitted identically for every non-blank
+    /// character regardless of its real shape — so `shape_vals` came back
+    /// exactly as uniform as `dither_vals` (both a flat run of the theme's
+    /// foreground colour), and the `shape_vals` non-uniformity assertion
+    /// below failed.
+    #[test]
+    fn minimap_row_paints_a_glyph_shape_not_a_uniform_block_when_render_characters_is_on() {
+        const N_LINES: usize = 100;
+        // Well outside the harness's own editor viewport (~40 rows at
+        // 1400x900), so the translucent viewport-highlight band never
+        // reaches either row (mirrors the sibling block-mode test above).
+        const SHAPE_LINE: usize = 50;
+        const DITHER_LINE: usize = 60;
+        // A deliberately glyph-varied mix — wide (`W`), narrow (`i`, `|`,
+        // `.`), and a low, thin stroke (`_`) — so a real downsampled atlas
+        // tile has visibly different ink coverage column to column, unlike
+        // a line of one repeated character.
+        const SHAPE_TEXT: &str = "Wi.:|_";
+
+        let mut engine = Engine::new_for_test();
+        let dither_text: String = "x".repeat(SHAPE_TEXT.chars().count());
+        let mut text = String::new();
+        for i in 0..N_LINES {
+            if i == SHAPE_LINE {
+                text.push_str(SHAPE_TEXT);
+            } else if i == DITHER_LINE {
+                text.push_str(&dither_text);
+            }
+            text.push('\n');
+        }
+        engine.buffer_mut().insert(0, &text);
+        assert!(
+            engine.settings.minimap_render_characters,
+            "test setup sanity: `minimap_render_characters` must default \
+             on, or this test isn't exercising the default at all"
+        );
+
+        let mut h = harness(engine, 1400, 900);
+        let win = h.engine.borrow().active_window_id();
+        h.window_center(win).expect("editor pane must paint");
+
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let mm = layout
+                .as_ref()
+                .unwrap()
+                .minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("minimap must be present for the active pane");
+            assert_eq!(
+                mm.minimap_scale,
+                quadraui::MinimapScale::Two,
+                "test setup sanity: the default settings must resolve to \
+                 MinimapScale::Two on a GUI backend, or this fixture isn't \
+                 exercising #1532's character-render path at all"
+            );
+            mm.rect
+        };
+        let scale = quadraui::MinimapScale::Two;
+        let row_px = scale.row_pitch_px();
+        let cell_w = scale.cell_w_px();
+
+        let mut row_vals = |line_idx: usize| -> Vec<u8> {
+            let row_y = (strip.y + line_idx as f64 * row_px + 1.0).round() as i32;
+            (0..SHAPE_TEXT.chars().count())
+                .map(|col| {
+                    let x = (strip.x + col as f64 * cell_w).round() as i32;
+                    h.driver.pixel(x, row_y).0
+                })
+                .collect()
+        };
+        let shape_vals = row_vals(SHAPE_LINE);
+        let dither_vals = row_vals(DITHER_LINE);
+
+        let shape_min = *shape_vals.iter().min().unwrap();
+        let shape_max = *shape_vals.iter().max().unwrap();
+        assert!(
+            shape_max - shape_min > 30,
+            "a real, glyph-varied source line ({SHAPE_TEXT:?}) must paint \
+             a non-uniform per-column alpha (a real character shape) — got \
+             {shape_vals:?} (min={shape_min}, max={shape_max}), which reads \
+             as a flat, uniform block"
+        );
+
+        let dither_min = *dither_vals.iter().min().unwrap();
+        let dither_max = *dither_vals.iter().max().unwrap();
+        assert!(
+            dither_max - dither_min <= 5,
+            "fixture sanity: a row of repeated `'x'` characters ({dither_text:?}) \
+             must paint a uniform per-column alpha (the same glyph tile \
+             blitted every column) — got {dither_vals:?} — or this test \
+             has no uniform baseline to contrast the real line against"
+        );
+
+        assert_ne!(
+            shape_vals, dither_vals,
+            "a real, glyph-varied source line's painted row must differ \
+             from a row of the same length made only of repeated `'x'` \
+             characters — got the exact same per-column values \
+             {shape_vals:?} for both"
+        );
     }
 
     #[test]

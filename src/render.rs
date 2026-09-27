@@ -13417,6 +13417,14 @@ pub struct RenderedMinimap {
     /// paint can only ever cost the recompute this issue exists to skip —
     /// never a dropped or misrouted click.
     pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
+    /// The [`quadraui::MinimapScale`] this strip's `lines`/`window_len`
+    /// were sized against (`Settings::resolved_minimap_scale`, issue
+    /// #1532) — [`draw_minimap_strip`] pushes this onto the live backend
+    /// via `Backend::set_minimap_scale` immediately before painting, so
+    /// the row pitch quadraui actually rasterises at can never drift from
+    /// the one this strip's own sampling math (`build_minimap_data`'s
+    /// `effective_row_pitch_px`) assumed.
+    pub minimap_scale: quadraui::MinimapScale,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
@@ -13564,8 +13572,17 @@ pub fn build_minimap_data(
     // since `MINIMAP_LINES_PER_ROW` (4) is larger than `1.0 /
     // ROW_PITCH_PX` (0.5) — so this candidate can only ever win on GTK's
     // own numbers, never accidentally overriding TUI's.
-    let gtk_row_capacity =
-        (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+    //
+    // #1532: `resolved_minimap_scale` (quadraui#1143) resolves to
+    // `MinimapScale::One` — whose `row_pitch_px()` is exactly the old
+    // hardcoded `ROW_PITCH_PX` constant this replaced — everywhere except
+    // a pixel (GUI) backend that has both `minimap_render_characters` on
+    // and a `minimap_scale >= 2`; TUI always takes the `One` branch (see
+    // that method's own doc comment), so every claim this comment block
+    // makes about "GTK's real requirement" below is unaffected there.
+    let minimap_scale = engine.settings.resolved_minimap_scale();
+    let effective_row_pitch_px = minimap_scale.row_pitch_px();
+    let gtk_row_capacity = (rect.height / effective_row_pitch_px).floor() as usize;
     let target_lines = display_rows
         .saturating_mul(MINIMAP_LINES_PER_ROW)
         .max(gtk_row_capacity)
@@ -13615,9 +13632,30 @@ pub fn build_minimap_data(
     let desired_window_lines = editor_visible_rows
         .max(1)
         .saturating_mul(MINIMAP_VIEWPORT_MULTIPLE);
-    let k = desired_window_lines
-        .div_ceil(target_lines.max(1))
-        .clamp(1, MINIMAP_MAX_COMPRESSION);
+    // #1532: in character-render mode (`minimap_scale` resolved to
+    // `MinimapScale::Two`, above) every block must stay exactly one real
+    // buffer line wide — a `k > 1` block would hand `sample_blocks` more
+    // than one line to aggregate, and it has no font to render a
+    // multi-line aggregate as real glyphs with, so it falls back to a
+    // dither-text placeholder (`'x'`-filled) that paints as a uniform
+    // block under the glyph atlas exactly like the density-dot path this
+    // issue exists to move away from. Forcing `k == 1` here — instead of
+    // letting the `div_ceil` below pick whatever compression the strip's
+    // geometry would otherwise ask for — makes `window_len ==
+    // target_lines` (below), so `block_bounds` always takes its
+    // "never upscales" branch and every sampled row is a real, single
+    // buffer line's own text. `target_lines` itself already shrank to
+    // match (`effective_row_pitch_px` above), so the window still slides
+    // (`window_start_line` below) — it just now covers however many
+    // viewports the strip's real height affords at the taller
+    // VS-Code-parity row pitch, rather than a fixed 9.
+    let k = if minimap_scale != quadraui::MinimapScale::One {
+        1
+    } else {
+        desired_window_lines
+            .div_ceil(target_lines.max(1))
+            .clamp(1, MINIMAP_MAX_COMPRESSION)
+    };
     // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
     // above) stays host-side — it depends on this strip's own geometry
     // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
@@ -13872,6 +13910,7 @@ pub fn build_minimap_data(
         },
         raw_syntax_spans,
         resolved_layout: std::cell::RefCell::new(None),
+        minimap_scale,
     })
 }
 
@@ -13931,6 +13970,14 @@ pub fn build_minimap_data(
 /// [`minimap_reserved_width`] — the same call that reserved it here.
 pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
     for mm in &screen.minimap {
+        // #1532: keep the live backend's `MinimapScale` in sync with the
+        // one `build_minimap_data` already sized this strip's `lines`/
+        // `window_len` against (`mm.minimap_scale`) — a backend that never
+        // overrides `Backend::minimap_scale`/`set_minimap_scale` (TUI) no-ops
+        // here, per that trait method's own doc comment, so this stays
+        // exactly as safe to call unconditionally as every other
+        // `Backend::draw_*` call in this file.
+        backend.set_minimap_scale(mm.minimap_scale);
         let rect = minimap_strip_rect(mm);
         // No-paint probe: `mm.minimap.syntax_spans` is still empty
         // here, which is fine — `minimap_layout` (both backends' own
