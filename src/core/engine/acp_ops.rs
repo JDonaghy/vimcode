@@ -4674,6 +4674,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn poll_until_auth_choice_dialog(engine: &mut Engine) {
         poll_acp_until(engine, |e| {
             e.dialog

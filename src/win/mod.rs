@@ -87,6 +87,66 @@
 //! registration to add), and per the Platform-Neutrality Rule a Win-GUI-only
 //! icon-selection fix does not belong in a vimcode backend wrapper. Leave
 //! #1558 open until the quadraui issues are filed and land.
+//!
+//! **Real-hardware verification was attempted on dell64** per #1558's own
+//! "Verify on real Windows" section (which correctly notes a Windows host
+//! *does* exist in this fleet). What was actually run, in order:
+//! 1. `cargo xwin build --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --bin vimcode` — succeeded, real
+//!    PE32+ exe.
+//! 2. The resulting `vimcode.exe` launched **directly** via WSL interop
+//!    (`"$EXE" --version`, not wine) — succeeded, printed the real version
+//!    banner including the quadraui rev, and (launched with a file argument)
+//!    created a real `HWND` on dell64's actual Windows desktop (confirmed
+//!    via `Get-Process | Select MainWindowHandle` from PowerShell and a
+//!    `PrintWindow` capture that shows the real DWM-drawn titlebar chrome
+//!    with the app's own taskbar icon rendering correctly).
+//! 3. `cargo xwin test --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --lib --no-run`, then the printed
+//!    `vimcode_core-*.exe` run directly (the recipe #1558 gives for the
+//!    `win_driver_tests` module below) — this is where verification stalled,
+//!    for two independent, dell64-specific reasons, neither of which is "no
+//!    Windows host":
+//!    - The lib test binary as built on this branch didn't even compile at
+//!      first: `poll_until_auth_choice_dialog` in
+//!      `src/core/engine/acp_ops.rs` was missing the `#[cfg(unix)]` its sole
+//!      callers and its own `poll_acp_until` helper already carry — a
+//!      pre-existing bug unrelated to #1558, fixed alongside this commit.
+//!    - Once compiling, the resulting `vimcode_core-*.exe` — unlike
+//!      `vimcode.exe` above — exits immediately on dell64 with
+//!      `STATUS_ENTRYPOINT_NOT_FOUND` (confirmed via
+//!      `Start-Process -PassThru`'s real `ExitCode`, `-1073741511` /
+//!      `0xC0000139`) before printing anything, even `--version`/`--help`.
+//!      A from-scratch minimal `cargo xwin test --no-run` crate (a single
+//!      `#[test] fn it_works()`) runs fine directly via the same WSL interop
+//!      path on the same host, so this is not a generic
+//!      "WSL can't run cross-built test binaries" limitation — it is
+//!      specific to vimcode's own `--lib` test binary (44 MB, statically
+//!      links `mlua`'s vendored Lua C build, tree-sitter grammars, and
+//!      every `#[cfg(test)]` module in the crate) and needs its own
+//!      follow-up investigation on real hardware, separate from #1558.
+//!    - Pixel-level confirmation via screenshot was also attempted directly
+//!      against the running `vimcode.exe` GUI window (both `BitBlt`-based
+//!      `Graphics.CopyFromScreen` and `PrintWindow` with
+//!      `PW_RENDERFULLCONTENT`), but dell64's interactive console session
+//!      (session 1, confirmed active and holding a real `\\.\DISPLAY1`) was
+//!      locked at the OS level during this session (`Get-Process -Name
+//!      logonui` returned a running process, the definitive signal) —
+//!      Windows blocks GDI screen/window-content capture on a locked
+//!      session regardless of what's actually painted underneath, which is
+//!      why `CopyFromScreen` came back solid black and `PrintWindow` only
+//!      returned the DWM-drawn titlebar chrome, not the Direct2D-painted
+//!      client area. This is an OS security restriction independent of
+//!      vimcode/quadraui rendering correctness, not evidence either way for
+//!      the reported bug.
+//!
+//! Net: the activity-bar root cause above is confirmed by source inspection
+//! (cross-referenced against the exact pinned quadraui rev) and independently
+//! corroborated by dell64 successfully building and directly launching the
+//! real `vimcode.exe`; the acceptance bar's "Windows test asserts a real
+//! font face" criterion remains genuinely blocked on dell64 by the two
+//! dell64-local issues above (test-binary loader crash; locked interactive
+//! session blocking screen capture), not by absence of a Windows host.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -252,12 +312,23 @@ mod win_backend_conformance {
 // exactly, `MacDriver`/`MacBackend` swapped for `WinDriver`/`WinBackend` — see
 // that module for the scenarios' own doc comments (RED-verification notes,
 // why scenario 3 clicks outside the popup rather than a specific row, …).
-// RED-verification itself could not be run against `WinDriver` for the same
-// reason actually *running* these needs real Windows: there is no Windows
-// host in this fleet. GTK and macOS were both RED-verified on real hardware
-// (a Linux lane and an `aarch64-apple-darwin` Mac mini respectively) against
-// the identical vimcode-side mutation — see `src/macos/mod.rs`'s copy of
-// this scenario for that note.
+// RED-verification itself could not be run against `WinDriver`, but **not**
+// for "no Windows host in this fleet" (dell64 runs a real Windows 11 desktop
+// under WSL2 interop and is this repo's designated Windows machine — see
+// #1558's "Verify on real Windows" section, which named and corrected this
+// exact stale claim). `cargo xwin build --bin vimcode` and direct (non-wine)
+// execution of the result both work fine on dell64 today. The blocker is
+// narrower: as of #1558's investigation, the `cargo xwin test --lib --no-run`
+// product crashes at Windows DLL-load time on dell64
+// (`STATUS_ENTRYPOINT_NOT_FOUND`, reproduced and isolated to vimcode's own
+// test binary — see `src/win/mod.rs`'s top-of-file `#1558` doc section for
+// the full repro) before any `#[test]` in this module gets to run, and
+// dell64's interactive session was independently locked (blocking pixel-level
+// GUI capture) during that same investigation. GTK and macOS were both
+// RED-verified on real hardware (a Linux lane and an `aarch64-apple-darwin`
+// Mac mini respectively) against the identical vimcode-side mutation — see
+// `src/macos/mod.rs`'s copy of this scenario for that note. Win-GUI needs the
+// test-binary crash above fixed first.
 #[cfg(all(test, feature = "win"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {
