@@ -187,17 +187,18 @@ impl Engine {
         }
     }
 
-    /// Buffer line `line`'s length in chars, excluding its trailing
-    /// newline — the input `engine_visual_rows_for_line` expects. Small
-    /// private helper factoring out a `.len_chars().saturating_sub(1)` that
-    /// was duplicated across `ensure_cursor_visible_wrap`'s margin/top/
-    /// bottom walks (#1293 review nit).
-    fn wrap_line_len(&self, line: usize) -> usize {
-        self.buffer()
-            .content
-            .line(line)
-            .len_chars()
-            .saturating_sub(1)
+    /// Buffer line `line`'s text with its trailing newline stripped — the
+    /// input `engine_visual_rows_for_line` expects. Small private helper
+    /// factoring out a `.chars().collect()` + drop-last-char that was
+    /// duplicated across `ensure_cursor_visible_wrap`'s margin/top/bottom
+    /// walks (#1293 review nit). Kept as text rather than just a length
+    /// (as it was pre-#1496) so `engine_visual_rows_for_line` can honour
+    /// `'linebreak'`, which needs the actual characters to find a word
+    /// boundary, not just a char count.
+    fn wrap_line_text(&self, line: usize) -> String {
+        let mut chars: Vec<char> = self.buffer().content.line(line).chars().collect();
+        chars.pop();
+        chars.into_iter().collect()
     }
 
     /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
@@ -207,8 +208,9 @@ impl Engine {
         if start >= end {
             return 0;
         }
+        let linebreak = self.settings.linebreak;
         (start..end)
-            .map(|r| engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols))
+            .map(|r| engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak))
             .sum()
     }
 
@@ -240,8 +242,12 @@ impl Engine {
             cursor_seg + self.visual_rows_for_range(0, cursor_line, viewport_cols);
         let top_margin = scrolloff.min(rows_above_cursor);
 
-        let cursor_line_segs =
-            engine_visual_rows_for_line(self.wrap_line_len(cursor_line), viewport_cols);
+        let linebreak = self.settings.linebreak;
+        let cursor_line_segs = engine_visual_rows_for_line(
+            &self.wrap_line_text(cursor_line),
+            viewport_cols,
+            linebreak,
+        );
         let rows_below_cursor = cursor_line_segs.saturating_sub(cursor_seg + 1)
             + self.visual_rows_for_range(cursor_line + 1, total_lines, viewport_cols);
         let bottom_margin = scrolloff.min(rows_below_cursor);
@@ -267,7 +273,11 @@ impl Engine {
                     if rows_used >= top_margin {
                         break;
                     }
-                    rows_used += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                    rows_used += engine_visual_rows_for_line(
+                        &self.wrap_line_text(r),
+                        viewport_cols,
+                        linebreak,
+                    );
                     new_scroll_top = r;
                 }
             }
@@ -284,7 +294,8 @@ impl Engine {
         let mut visual_rows: usize = 0;
         for r in scroll_top..=cursor_line {
             if r < cursor_line {
-                visual_rows += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                visual_rows +=
+                    engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak);
             } else {
                 // Partial count: only up to the cursor's visual segment.
                 visual_rows += cursor_seg + 1;
@@ -305,7 +316,8 @@ impl Engine {
         let mut new_scroll_top = cursor_line;
         if rows_used < target_rows && cursor_line > 0 {
             for r in (0..cursor_line).rev() {
-                let vrows = engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                let vrows =
+                    engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak);
                 if rows_used + vrows > target_rows {
                     break;
                 }
