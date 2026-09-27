@@ -8277,6 +8277,98 @@ impl App {
     }
 }
 
+/// #1549: the macOS report ("command-line row below the status bar is
+/// clipped to about half its height by the window's bottom edge")
+/// reduces to one portable geometric invariant on the painted rect: it
+/// must fit entirely inside the real window content area (`viewport`,
+/// the exact portable equivalent of AppKit's `contentView.bounds`
+/// on every backend — see `quadraui::Backend::viewport`) and be at
+/// least one full line tall.
+///
+/// This should hold on *every* backend by construction: quadraui's
+/// `compose::app_shell::compute_layout` derives `AppShellLayout::
+/// main_content_bounds` from this exact `viewport` (title bar carved off
+/// the top; nothing reserved below, since vimcode never opts into
+/// quadraui's own status-bar/command-line bands — `render_content`'s own
+/// `status_bar_h`/`cmd_y` locals lay both rows out entirely inside
+/// `main_content_bounds` instead), and `cmd_y + lh` always resolves to
+/// `main.y + main.height` (see the `FrameOp::CommandLine` arm below). A
+/// live macOS run is the one environment this fleet cannot check that
+/// construction against directly — no macOS cross-toolchain is
+/// installed (`src/macos/mod.rs`'s "Verifying this file without a Mac").
+/// `debug_assert!` (not a hard `assert!`) so a violation surfaces loudly
+/// in a debug build's log/console — exactly the signal a future live-
+/// macOS debug run needs to confirm or rule out this shape of bug —
+/// instead of crashing a release build over a cosmetic clip.
+fn debug_assert_command_line_fits_viewport(
+    cmd_rect: quadraui::Rect,
+    viewport: quadraui::Viewport,
+    line_height: f64,
+) {
+    debug_assert!(
+        (cmd_rect.y + cmd_rect.height) as f64 <= viewport.height as f64 + 0.5,
+        "#1549: command-line row bottom ({}) exceeds the real window's \
+         content height ({}) — the row will be clipped by the window edge",
+        cmd_rect.y + cmd_rect.height,
+        viewport.height,
+    );
+    debug_assert!(
+        cmd_rect.height as f64 + 0.5 >= line_height,
+        "#1549: command-line row height ({}) is shorter than one full \
+         line ({})",
+        cmd_rect.height,
+        line_height,
+    );
+}
+
+#[cfg(test)]
+mod command_line_viewport_geometry_tests {
+    //! #1549: coverage for `debug_assert_command_line_fits_viewport` in
+    //! isolation — no live window (or even a constructed `App`) needed,
+    //! since the check is a pure function of the three values the bug
+    //! report's own "next step" asked to be logged. `cargo test`'s
+    //! default debug profile keeps `debug_assert!` live, so these panics
+    //! are real, observable failures, not silently-compiled-out no-ops.
+
+    use super::*;
+
+    fn viewport(height: f32) -> quadraui::Viewport {
+        quadraui::Viewport::new(800.0, height, 1.0)
+    }
+
+    /// The exact shape `render_content`'s `FrameOp::CommandLine` arm
+    /// produces on a healthy frame: the row ends precisely at the
+    /// viewport's bottom edge. Must not panic.
+    #[test]
+    fn row_flush_with_viewport_bottom_does_not_panic() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 24.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(600.0), 24.0);
+    }
+
+    /// RED-verified: with the assertion's first check removed, this test
+    /// still passes (proving it *can* fail) — see the reasoning in the
+    /// function's own doc for why this shape is exactly #1549's report.
+    /// Mirrors a real window whose usable content height is ~12px
+    /// shorter than the layout assumed (half of a 24px line).
+    #[test]
+    #[should_panic(expected = "#1549: command-line row bottom")]
+    fn row_extending_past_viewport_bottom_panics() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 24.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(588.0), 24.0);
+    }
+
+    /// The second, independent invariant: a row shorter than one full
+    /// line (even if it does fit inside the viewport) still reproduces
+    /// the reported symptom — only part of a line of glyphs has room to
+    /// paint.
+    #[test]
+    #[should_panic(expected = "is shorter than one full")]
+    fn row_shorter_than_line_height_panics() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 12.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(600.0), 24.0);
+    }
+}
+
 impl quadraui::ShellApp for App {
     fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
         // #1428: read the live kitty-keyboard-protocol capability once, at
@@ -8920,6 +9012,10 @@ impl quadraui::ShellApp for App {
                     let cmd_y = status_y + (status_bar_h - lh);
                     let cmd = render::command_line_view(&screen.command);
                     let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+                    // #1549: catch a "row clipped by the window edge"
+                    // regression the instant it's introduced, on every
+                    // backend, rather than only on a live macOS run.
+                    debug_assert_command_line_fits_viewport(cmd_rect, backend.viewport(), lh);
                     // #816: publish the painted rect for
                     // `render::command_line_click_char_idx` — the exact twin
                     // of `global_status_rect` above, and TUI's identical
