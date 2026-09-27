@@ -16699,12 +16699,34 @@ fn test_dap_eval_result_field_default() {
 
 #[test]
 fn test_visual_rows_for_line() {
-    assert_eq!(engine_visual_rows_for_line(0, 80), 1); // empty line = 1 row
-    assert_eq!(engine_visual_rows_for_line(80, 80), 1); // exactly one row
-    assert_eq!(engine_visual_rows_for_line(81, 80), 2); // one char overflow
-    assert_eq!(engine_visual_rows_for_line(160, 80), 2); // exactly two rows
-    assert_eq!(engine_visual_rows_for_line(161, 80), 3);
-    assert_eq!(engine_visual_rows_for_line(10, 0), 1); // zero cols = 1 row
+    let line = |n: usize| "a".repeat(n);
+    assert_eq!(engine_visual_rows_for_line(&line(0), 80, false), 1); // empty line = 1 row
+    assert_eq!(engine_visual_rows_for_line(&line(80), 80, false), 1); // exactly one row
+    assert_eq!(engine_visual_rows_for_line(&line(81), 80, false), 2); // one char overflow
+    assert_eq!(engine_visual_rows_for_line(&line(160), 80, false), 2); // exactly two rows
+    assert_eq!(engine_visual_rows_for_line(&line(161), 80, false), 3);
+    assert_eq!(engine_visual_rows_for_line(&line(10), 0, false), 1); // zero cols = 1 row
+}
+
+#[test]
+fn test_visual_rows_for_line_honours_linebreak() {
+    // A single 81-char word (no boundary anywhere) wraps to 2 rows either
+    // way: 'linebreak' only backs a break up to a word boundary, and there
+    // is none here, so it falls back to the same hard cut.
+    let word = "a".repeat(81);
+    assert_eq!(engine_visual_rows_for_line(&word, 80, false), 2);
+    assert_eq!(engine_visual_rows_for_line(&word, 80, true), 2);
+
+    // 8 'a's + space + 11 'a's = 20 chars, viewport 10. A hard cut (`false`)
+    // needs exactly 2 rows (10 + 10). With 'linebreak' on, the first break
+    // backs up to the space (row of 8 instead of 10), leaving 12 chars for
+    // the rest — one more row than the hard cut needed (#1496: before this
+    // fix, this function only ever saw a char *count*, never the text, so
+    // it could not see the boundary and always returned the linebreak-off
+    // answer here too — the bug that drifted `:set linebreak` scrolling).
+    let line = format!("{} {}", "a".repeat(8), "a".repeat(11));
+    assert_eq!(engine_visual_rows_for_line(&line, 10, false), 2);
+    assert_eq!(engine_visual_rows_for_line(&line, 10, true), 3);
 }
 
 #[test]

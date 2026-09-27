@@ -29,7 +29,10 @@ use crate::core::engine::sidebar::{
     HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
     PANEL_SEARCH, PANEL_SETTINGS,
 };
-use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
+use crate::core::engine::{
+    compute_word_wrap_segments, AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc,
+    SearchDirection,
+};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::project_search::QuickfixList;
@@ -18291,6 +18294,25 @@ pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetric
     }
 }
 
+/// A plain leaf `TreeRow`: no icon, no badge, not expandable, no inline
+/// edit overlay, `Decoration::Normal` — just a `path`, `indent`, and
+/// rendered `text`. Shared shape for the many sidebar-panel builders below
+/// that previously each wrote out the full `TreeRow { … }` literal with
+/// these same five fields fixed and only `path`/`indent`/`text` varying
+/// (#1496).
+fn plain_tree_row(path: Vec<u16>, indent: u16, text: quadraui::StyledText) -> quadraui::TreeRow {
+    quadraui::TreeRow {
+        path,
+        indent,
+        icon: None,
+        text,
+        badge: None,
+        is_expanded: None,
+        decoration: quadraui::Decoration::Normal,
+        edit: None,
+    }
+}
+
 /// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
 /// row data for all 5 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
@@ -18335,21 +18357,16 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             '!' => del_fg,
             _ => mod_fg,
         };
-        TreeRow {
-            path: vec![i as u16],
-            indent: 0,
-            icon: None,
-            text: StyledText {
+        plain_tree_row(
+            vec![i as u16],
+            0,
+            StyledText {
                 spans: vec![
                     StyledSpan::with_fg(ch.to_string(), color),
                     StyledSpan::plain(format!(" {}", f.path)),
                 ],
             },
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        }
+        )
     };
 
     let merge_rows: Vec<TreeRow> = merge
@@ -18379,16 +18396,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             let branch = wt.branch.as_deref().unwrap_or("HEAD");
             let main_marker = if wt.is_main { " [main]" } else { "" };
             let text = format!("{}{} {}{}", check, branch, wt.path.display(), main_marker);
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(text),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(vec![i as u16], 0, StyledText::plain(text))
         })
         .collect();
 
@@ -18616,11 +18624,10 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
         let expanded = !collapsed.contains(&file_idx);
         if expanded {
             let line_prefix = format!("{:>4}: ", m.line + 1);
-            tree_rows.push(TreeRow {
-                path: vec![file_idx as u16, match_within_file as u16],
-                indent: 1,
-                icon: None,
-                text: StyledText {
+            tree_rows.push(plain_tree_row(
+                vec![file_idx as u16, match_within_file as u16],
+                1,
+                StyledText {
                     spans: vec![
                         StyledSpan {
                             text: line_prefix,
@@ -18633,11 +18640,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                         StyledSpan::plain(m.line_text.trim().to_string()),
                     ],
                 },
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            ));
         }
         match_within_file += 1;
         file_match_count += 1;
@@ -18781,7 +18784,7 @@ fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
 }
 
 fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::{StyledText, TreeRow};
 
     let mut rows: Vec<TreeRow> = Vec::new();
     let mut flat_idx: u16 = 0;
@@ -18809,16 +18812,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
             } else {
                 format!("{}{} = {}", prefix, v.name, v.value)
             };
-            rows.push(TreeRow {
-                path: vec![*flat_idx],
-                indent: depth,
-                icon: None,
-                text: StyledText::plain(text),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            rows.push(plain_tree_row(
+                vec![*flat_idx],
+                depth,
+                StyledText::plain(text),
+            ));
             *flat_idx += 1;
             if v.var_ref > 0 && expanded.contains(&v.var_ref) {
                 if let Some(child_vars) = children_map.get(&v.var_ref) {
@@ -18844,16 +18842,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
         } else {
             icons::COLLAPSE_RIGHT.nerd
         };
-        rows.push(TreeRow {
-            path: vec![flat_idx],
-            indent: 0,
-            icon: None,
-            text: StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        });
+        rows.push(plain_tree_row(
+            vec![flat_idx],
+            0,
+            StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
+        ));
         flat_idx += 1;
         if expanded {
             push_var_tree(
@@ -18883,16 +18876,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
         } else {
             icons::COLLAPSE_RIGHT.nerd
         };
-        rows.push(TreeRow {
-            path: vec![flat_idx],
-            indent: 0,
-            icon: None,
-            text: StyledText::plain(format!("{prefix}{scope_name}")),
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        });
+        rows.push(plain_tree_row(
+            vec![flat_idx],
+            0,
+            StyledText::plain(format!("{prefix}{scope_name}")),
+        ));
         flat_idx += 1;
         if expanded {
             if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
@@ -18916,7 +18904,7 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
 }
 
 fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     if engine.dap_watch_expressions.is_empty() {
         return vec![empty_placeholder_row(session_active)];
@@ -18933,22 +18921,17 @@ fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
             } else {
                 "(not running)"
             });
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{expr} = {val_str}")),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(
+                vec![i as u16],
+                0,
+                StyledText::plain(format!("{expr} = {val_str}")),
+            )
         })
         .collect()
 }
 
 fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     if engine.dap_stack_frames.is_empty() {
         return vec![empty_placeholder_row(session_active)];
@@ -18970,22 +18953,17 @@ fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
             } else {
                 "  "
             };
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(
+                vec![i as u16],
+                0,
+                StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
+            )
         })
         .collect()
 }
 
 fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
     sorted_bp.sort_by_key(|(path, _)| path.as_str());
@@ -19012,16 +18990,11 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
             } else {
                 icons::DBG_BREAKPOINTS.nerd
             };
-            rows.push(TreeRow {
-                path: vec![flat_idx],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            rows.push(plain_tree_row(
+                vec![flat_idx],
+                0,
+                StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
+            ));
             flat_idx += 1;
         }
     }
@@ -20408,56 +20381,6 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
         Some(gid) => build_tab_bar_for_group_by_id(engine, gid),
         None => vec![],
     }
-}
-
-/// Compute wrap segment boundaries for a line, when `'wrap'` soft-wraps it.
-/// Returns a list of `(start_char, end_char)` pairs.
-///
-/// `linebreak` selects which of Vim's two wrap behaviours to use (`:h
-/// 'linebreak'`, #1207):
-/// - `false` (Vim's own default, and this fn's behaviour before #1207):
-///   hard-break exactly at `viewport_cols`, splitting a word mid-way if
-///   that's where the column falls.
-/// - `true`: break at a word boundary (space, hyphen, or `/`) at or before
-///   the column, so words are never split — falling back to a hard break
-///   only when no boundary exists in the segment.
-///
-/// Purely a display-time choice: never mutates or reflows what's actually
-/// stored in the buffer.
-pub fn compute_word_wrap_segments(
-    line: &str,
-    viewport_cols: usize,
-    linebreak: bool,
-) -> Vec<(usize, usize)> {
-    let chars: Vec<char> = line.chars().collect();
-    let total = chars.len();
-    if viewport_cols == 0 || total <= viewport_cols {
-        return vec![(0, total)];
-    }
-    let mut segments = Vec::new();
-    let mut pos = 0;
-    while pos < total {
-        let remaining = total - pos;
-        if remaining <= viewport_cols {
-            segments.push((pos, total));
-            break;
-        }
-        let end = pos + viewport_cols;
-        let mut break_at = end;
-        if linebreak {
-            // Scan backwards from the break point to find a word boundary (space or after punctuation).
-            for i in (pos + 1..=end).rev() {
-                if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
-                    break_at = i;
-                    break;
-                }
-            }
-        }
-        segments.push((pos, break_at));
-        // Safety: guarantee forward progress to prevent infinite loops.
-        pos = break_at.max(pos + 1);
-    }
-    segments
 }
 
 /// Offset table produced by expanding `'list'` glyphs (`\t`, plus any

@@ -3987,6 +3987,148 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // `:set wrap linebreak` scroll drift (#1496)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod word_wrap {
+        use super::*;
+
+        /// `ensure_cursor_visible_wrap`'s per-line visual-row count used to
+        /// be a plain length-based `div_ceil`, blind to `'linebreak'` — see
+        /// `core::engine::mod::engine_visual_rows_for_line`'s own doc. With
+        /// `'linebreak'` on, a word-boundary break can back up off the
+        /// viewport edge, needing *more* wrapped rows for a line than the
+        /// length-only count predicted; the scroll-to-cursor walk in
+        /// `ensure_cursor_visible_wrap` then thinks more buffer lines fit
+        /// above the cursor than the viewport actually has room for once
+        /// they're really wrapped, landing the cursor's own line below the
+        /// bottom of the viewport.
+        ///
+        /// Builds a buffer of lines each engineered so that a hard wrap
+        /// needs exactly 2 rows but a `'linebreak'`-aware wrap needs 3:
+        /// `vp - 2` filler chars, a single space, then `vp + 1` more filler
+        /// chars — `2 * vp` chars total, so the hard cut lands exactly on a
+        /// row boundary (2 rows, no remainder) while `'linebreak'` backs
+        /// the first break up to the space, leaving one char too many to
+        /// fit the remainder in a single second row. Repeated across many
+        /// lines so the total drift is large enough to push the marker
+        /// line off *any* plausible viewport height.
+        ///
+        /// `vp` here is not `view.viewport_cols` (set at resize time from
+        /// an approximate formula, per `render.rs`'s own comment on
+        /// `render_viewport_cols`) but the column count *empirically*
+        /// measured from a real render of a long unbroken run of the same
+        /// filler char — i.e. exactly what `render_viewport_cols` resolves
+        /// to for this fixture, including whatever this terminal size's
+        /// chrome (activity-bar rail, scrollbar column, gutter) reserves,
+        /// without this test needing to duplicate that arithmetic.
+        ///
+        /// RED verified against unfixed `develop`: reverting
+        /// `engine_visual_rows_for_line` to its pre-#1496 `div_ceil`
+        /// (linebreak-blind) form makes this fail — `G` lands the cursor
+        /// below the bottom of the viewport and the marker line never
+        /// appears on screen.
+        #[test]
+        fn linebreak_scroll_to_last_line_shows_it() {
+            const DRIFT_LINES: usize = 30;
+            const PROBE_LEN: usize = 500;
+
+            let mut engine = plain_engine();
+            // Minimap off, and 'wrap'+'linebreak' on for the probe render
+            // too (a horizontal-scrollbar column reserved only when 'wrap'
+            // is off would otherwise make the probe measurement disagree
+            // with the real run below) — both irrelevant to what this test
+            // is about, so set directly rather than through more `:set`
+            // round trips.
+            engine.settings.minimap = false;
+            engine.settings.wrap = true;
+            engine.settings.linebreak = true;
+            // One long unbroken probe line (to measure the real wrap
+            // width), then enough short placeholder lines that the total
+            // line count already matches the real fixture below — keeps
+            // the gutter's digit width identical between the probe and the
+            // real render.
+            let mut probe_text = "a".repeat(PROBE_LEN);
+            probe_text.push('\n');
+            for _ in 0..DRIFT_LINES {
+                probe_text.push_str("x\n");
+            }
+            let initial_len = engine.buffer().len_chars();
+            engine.buffer_mut().delete_range(0, initial_len);
+            engine.buffer_mut().insert(0, &probe_text);
+
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+            let screen = h.driver.screen();
+            // `ensure_cursor_visible_wrap` reads `view.viewport_cols`
+            // rather than the paint-exact `paint_viewport_cols` (a
+            // pre-existing, separate gap from what #1496 fixes) — that
+            // field only gets synced to the real painted width by
+            // `run_shared_tick_chores`, which runs on `tick()`, not
+            // `render()`. Tick now (and again below, after the real
+            // fixture's own first render) so the scroll math below sees
+            // the same width this measurement is based on.
+            h.driver.tick();
+            let vp = screen
+                .split(|c: char| c != 'a')
+                .map(str::len)
+                .max()
+                .unwrap_or(0);
+            assert!(
+                vp > 4 && vp < PROBE_LEN,
+                "fixture sanity: expected a plausible measured viewport \
+                 width strictly between 4 and {PROBE_LEN} (the probe \
+                 line's own length, which the run must never equal — that \
+                 would mean the probe line never actually wrapped); got \
+                 {vp}. screen:\n{screen}"
+            );
+
+            // `vp - 2` filler + one space + `vp + 1` filler = exactly
+            // `2 * vp` chars total (see this fn's own doc above).
+            let drift_line = format!("{}{}{}", "a".repeat(vp - 2), " ", "a".repeat(vp + 1));
+            let mut text = String::new();
+            for _ in 0..DRIFT_LINES {
+                text.push_str(&drift_line);
+                text.push('\n');
+            }
+            text.push_str("ZQXW1496_LAST_LINE");
+            let cur_len = h.engine.borrow().buffer().len_chars();
+            h.engine.borrow_mut().buffer_mut().delete_range(0, cur_len);
+            h.engine.borrow_mut().buffer_mut().insert(0, &text);
+            {
+                let mut engine = h.engine.borrow_mut();
+                let win = engine.active_window_id();
+                let view = &mut engine.windows.get_mut(&win).unwrap().view;
+                view.cursor.line = 0;
+                view.cursor.col = 0;
+                view.scroll_top = 0;
+            }
+            h.driver.render();
+            h.driver.tick();
+
+            let driver = &mut h.driver;
+            // Real, black-box `:set` round trip (already true from the
+            // probe setup above, so this is a confirmatory no-op on the
+            // fields — but it's the actual user gesture the acceptance
+            // scenario names, and exercises the ex-command parse path too).
+            driver.type_char(':');
+            for c in "set wrap linebreak".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            driver.type_char('G');
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQXW1496_LAST_LINE"),
+                "'G' with 'wrap' and 'linebreak' on must scroll the last \
+                 line into view; screen:\n{screen}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // User-configured MCP servers (#1487, redo of #1462 on the multi-session
     // engine — see that issue's "Tests go on the App-on-TUI seam" redo note)
     // ─────────────────────────────────────────────────────────────────────────

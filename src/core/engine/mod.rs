@@ -5919,14 +5919,74 @@ fn cmd_char_to_byte(s: &str, char_idx: usize) -> usize {
     quadraui::text_util::char_to_byte_idx(s, char_idx)
 }
 
+/// Compute wrap segment boundaries for a line, when `'wrap'` soft-wraps it.
+/// Returns a list of `(start_char, end_char)` pairs.
+///
+/// `linebreak` selects which of Vim's two wrap behaviours to use (`:h
+/// 'linebreak'`, #1207):
+/// - `false` (Vim's own default): hard-break exactly at `viewport_cols`,
+///   splitting a word mid-way if that's where the column falls.
+/// - `true`: break at a word boundary (space, hyphen, or `/`) at or before
+///   the column, so words are never split — falling back to a hard break
+///   only when no boundary exists in the segment.
+///
+/// Purely a display-time choice: never mutates or reflows what's actually
+/// stored in the buffer. Lives in `core/` (not `render.rs`, which imports
+/// it from here) so `engine_visual_rows_for_line` below can share the exact
+/// same wrap-point logic the painter uses — the two used to be separate
+/// implementations, and the core-side one silently ignored `linebreak`,
+/// which drifted the scroll-to-cursor math out of sync with what actually
+/// painted whenever `'linebreak'` was on (#1496).
+pub fn compute_word_wrap_segments(
+    line: &str,
+    viewport_cols: usize,
+    linebreak: bool,
+) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = line.chars().collect();
+    let total = chars.len();
+    if viewport_cols == 0 || total <= viewport_cols {
+        return vec![(0, total)];
+    }
+    let mut segments = Vec::new();
+    let mut pos = 0;
+    while pos < total {
+        let remaining = total - pos;
+        if remaining <= viewport_cols {
+            segments.push((pos, total));
+            break;
+        }
+        let end = pos + viewport_cols;
+        let mut break_at = end;
+        if linebreak {
+            // Scan backwards from the break point to find a word boundary (space or after punctuation).
+            for i in (pos + 1..=end).rev() {
+                if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
+                    break_at = i;
+                    break;
+                }
+            }
+        }
+        segments.push((pos, break_at));
+        // Safety: guarantee forward progress to prevent infinite loops.
+        pos = break_at.max(pos + 1);
+    }
+    segments
+}
+
 /// occupies when the viewport is `viewport_cols` columns wide.
 /// Always returns at least 1 (even for empty lines).
-/// Duplicated from render.rs so core/ stays GTK/render-free.
-fn engine_visual_rows_for_line(line_char_len: usize, viewport_cols: usize) -> usize {
+///
+/// Honours `'linebreak'` (#1496) by delegating to
+/// [`compute_word_wrap_segments`] — the same wrap-point logic the painter
+/// uses — rather than a plain `div_ceil` on the line's char length, which
+/// undercounts visual rows whenever `'linebreak'` backs a break up off the
+/// viewport edge, drifting `ensure_cursor_visible_wrap`'s scroll math out of
+/// sync with what's actually rendered.
+fn engine_visual_rows_for_line(line_text: &str, viewport_cols: usize, linebreak: bool) -> usize {
     if viewport_cols == 0 {
         return 1;
     }
-    line_char_len.div_ceil(viewport_cols).max(1)
+    compute_word_wrap_segments(line_text, viewport_cols, linebreak).len()
 }
 // =============================================================================
 // DAP helpers
