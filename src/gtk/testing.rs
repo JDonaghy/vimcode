@@ -2962,6 +2962,70 @@ mod tests {
         );
     }
 
+    /// #1542: an un-customized `settings.ui_font_size` must resolve through
+    /// `GtkBackend::default_fonts()`'s 13pt UI-chrome convention (matching
+    /// VS Code), not the bare `default_ui_font_size()` literal (10pt) that
+    /// used to reach `App::render_content`'s `sync_ui_font_size` call
+    /// unconditionally, on every backend, regardless of what that backend's
+    /// own chrome-font convention actually is.
+    ///
+    /// Proven the same way the sibling
+    /// `breadcrumb_text_width_tracks_ui_font_size_not_editor_font_size` test
+    /// above does — painted breadcrumb glyph *width* scales with point size
+    /// — by comparing `Settings::default()`'s painted width against an
+    /// *explicit* `ui_font_size = 13` (which `Settings::effective_ui_font_size`
+    /// must return verbatim, since 13 != the 10pt sentinel): the two must
+    /// paint at (almost) the same width if the default is really resolving
+    /// to 13pt. A second explicit baseline at 18pt proves this harness can
+    /// actually tell point sizes apart, so the first assertion isn't
+    /// vacuously true from `find_bounds` reporting a fixed row-slot size.
+    ///
+    /// RED-verified against unfixed `develop`: reverting
+    /// `Settings::effective_ui_font_size` to return `self.ui_font_size`
+    /// unconditionally (the pre-#1542 shape — no backend resolution at
+    /// all) makes `Settings::default()` paint the breadcrumb at the bare
+    /// 10pt literal, which measures visibly narrower than the
+    /// `ui_font_size = 13` baseline, failing the first assertion below.
+    #[test]
+    fn ui_font_size_default_resolves_to_gtk_backend_convention_not_hardcoded_10pt() {
+        let engine_default = engine_with_breadcrumb_path();
+        let default_run = harness(engine_default, 1400, 900);
+        let default_bounds = default_run
+            .driver
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at Settings::default()");
+
+        let mut engine_explicit_13 = engine_with_breadcrumb_path();
+        engine_explicit_13.settings.ui_font_size = 13;
+        let explicit_13_run = harness(engine_explicit_13, 1400, 900);
+        let explicit_13_bounds = explicit_13_run
+            .driver
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at ui_font_size=13");
+
+        let mut engine_explicit_18 = engine_with_breadcrumb_path();
+        engine_explicit_18.settings.ui_font_size = 18;
+        let explicit_18_run = harness(engine_explicit_18, 1400, 900);
+        let explicit_18_bounds = explicit_18_run
+            .driver
+            .find_bounds("src")
+            .expect("breadcrumb 'src' segment must paint at ui_font_size=18");
+
+        assert!(
+            (default_bounds.width - explicit_13_bounds.width).abs() < 0.5,
+            "Settings::default()'s un-customized ui_font_size must resolve \
+             to GtkBackend::default_fonts()'s 13pt convention: got \
+             default={default_bounds:?} explicit_13={explicit_13_bounds:?}"
+        );
+        assert!(
+            (default_bounds.width - explicit_18_bounds.width).abs() > 3.0,
+            "sanity: an explicit ui_font_size=18 must paint visibly wider \
+             than the resolved default, or this test can't tell point \
+             sizes apart: got default={default_bounds:?} \
+             explicit_18={explicit_18_bounds:?}"
+        );
+    }
+
     /// #704 item 1 / quadraui#624: tab labels must also honour
     /// `Backend::set_ui_font` — the other non-dialog surface #704's
     /// acceptance criterion names ("a tab label or status-bar segment";

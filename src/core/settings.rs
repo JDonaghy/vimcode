@@ -1544,6 +1544,19 @@ pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
 /// now resolves a real face on every backend and the `cfg!` branch is
 /// no longer needed (Platform-Neutrality Rule; matches the `UI_FONT_FAMILY`
 /// fix in `src/app_support.rs`).
+///
+/// #1542: this literal (and [`default_font_size`]'s) now serves a second
+/// purpose besides "the value a bare `Settings::default()` gets and the
+/// value `serde`'s `#[serde(default = ...)]` fills in for a legacy config
+/// missing the key" — it is also the **sentinel** [`Self::effective_editor_font`]
+/// compares against to decide whether the user has ever customized their
+/// font at all. `font_family`/`font_size` stay plain `String`/`i32` rather
+/// than growing an `Option`/enum "auto" wrapper specifically so this stays
+/// the *only* place that fact is encoded — every other reader
+/// (`get_value_str`, `set_value_str`, `zoomin`/`zoomout` in
+/// `core::engine::execute`) keeps working against a concrete value
+/// unchanged; only `effective_editor_font`'s callers see backend-resolved
+/// per-platform behaviour.
 fn default_font_family() -> String {
     "Monospace".to_string()
 }
@@ -1552,6 +1565,8 @@ fn default_font_size() -> i32 {
     14
 }
 
+/// #1542: see [`default_font_family`]'s doc — this literal is
+/// [`Settings::effective_ui_font_size`]'s "never customized" sentinel too.
 fn default_ui_font_size() -> u8 {
     10
 }
@@ -3456,6 +3471,87 @@ impl Settings {
         Ok(())
     }
 
+    /// Effective editor font family + size in points (issue #1542).
+    ///
+    /// `font_family`/`font_size` still store plain `String`/`i32` — see
+    /// `default_font_family`/`default_font_size`'s own doc — so there is no
+    /// separate "auto" sentinel type to plumb through `get_value_str`/
+    /// `set_value_str`/`Settings::save` (which always serialises the whole
+    /// struct, so an untouched field round-trips through disk as its
+    /// compile-time default, indistinguishable at the type level from a
+    /// user explicitly choosing that same literal string). This method
+    /// resolves that ambiguity the same way `quadraui::PlatformFontDefaults`'s
+    /// own doc recommends: **still exactly equal to the compile-time
+    /// default** means "never customized" — resolve to `defaults` (this
+    /// backend's platform-native convention, e.g. `Menlo 12` on macOS,
+    /// `Consolas 14` on Win-GUI); anything else means the user (via `:set
+    /// guifont`/`:set font_size=N`, or `zoomin`/`zoomout`) chose it on
+    /// purpose, and that literal value always wins, verbatim, forever —
+    /// `defaults` never overrides it again on a later launch even if a
+    /// future quadraui release changes this backend's own convention.
+    ///
+    /// `default_family`/`default_size_pt` are read straight off
+    /// `Backend::default_fonts()` — [`quadraui::PlatformFontDefaults`] is
+    /// `#[non_exhaustive]` with no public constructor (deliberately: a
+    /// consumer is meant to obtain one only from a real backend), so this
+    /// method takes the two plain fields it needs rather than the whole
+    /// struct — that also keeps this module free of any `quadraui::gtk`/
+    /// `quadraui::macos` backend type, and lets its own unit tests below
+    /// exercise the resolution logic with plain literals instead of
+    /// constructing a fake backend just to get a `PlatformFontDefaults`
+    /// value.
+    ///
+    /// `default_family` empty or `default_size_pt <= 0.0` is TUI's (or any
+    /// future fixed-cell backend's) all-sentinel answer — a terminal cell
+    /// grid has no font concept at all — in which case this returns the
+    /// stored fields unresolved (harmless: TUI's `Backend::set_editor_font`
+    /// is already a no-op, so nothing reads the unresolved literal string
+    /// as an actual paint parameter).
+    pub fn effective_editor_font(
+        &self,
+        default_family: &str,
+        default_size_pt: f32,
+    ) -> (String, f32) {
+        if default_family.is_empty() || default_size_pt <= 0.0 {
+            return (self.font_family.clone(), self.font_size as f32);
+        }
+        if self.font_family == default_font_family() && self.font_size == default_font_size() {
+            (default_family.to_string(), default_size_pt)
+        } else {
+            (self.font_family.clone(), self.font_size as f32)
+        }
+    }
+
+    /// Effective UI/chrome font size in points — `ui_font_size`'s twin of
+    /// [`Self::effective_editor_font`] above, same "still at its compile-time
+    /// default means never customized" test and the same TUI all-sentinel
+    /// bypass (`default_size_pt <= 0.0`) (issue #1542). Editor/UI chrome
+    /// font *family* is deliberately **not** resolved through a backend's
+    /// `ui_family` here — `src/app_support.rs`'s `UI_FONT_FAMILY` is already
+    /// a hand-tuned per-backend candidate list (#704) that already beats a
+    /// bare backend-native family name (GTK's own convention is literally
+    /// the fontconfig alias `"Sans"`, which `UI_FONT_FAMILY`'s
+    /// Cantarell/Ubuntu-first ordering was built specifically to avoid
+    /// falling back to) — only the *size* gap (10pt hardcoded everywhere
+    /// vs. VS Code's 13pt UI-chrome convention) is this issue's actual
+    /// target.
+    ///
+    /// Clamped to the same `6..=32` range `set_value_str`'s `"ui_font_size"`
+    /// arm enforces for an explicit `:set` — `default_size_pt` is a trusted
+    /// backend literal today, but clamping here too means a future caller
+    /// that skips `app_support::sync_ui_font_size`'s own `.max(6)` can
+    /// never see an out-of-range value from this method.
+    pub fn effective_ui_font_size(&self, default_size_pt: f32) -> u8 {
+        if default_size_pt <= 0.0 {
+            return self.ui_font_size;
+        }
+        if self.ui_font_size == default_ui_font_size() {
+            default_size_pt.round().clamp(6.0, 32.0) as u8
+        } else {
+            self.ui_font_size
+        }
+    }
+
     /// Where `settings.json` lives — `~/.config/vimcode/settings.json`
     /// (or the platform equivalent, see [`super::paths::vimcode_config_dir`]).
     ///
@@ -4401,6 +4497,72 @@ mod tests {
             settings.indent_guides,
             "indent guides must default on, matching VS Code"
         );
+    }
+
+    /// #1542: an un-customized `font_family`/`font_size` (still exactly the
+    /// compile-time sentinel `default_font_family()`/`default_font_size()`)
+    /// must resolve to the backend's own convention (e.g. macOS's `Menlo
+    /// 12`), not the sentinel itself.
+    ///
+    /// RED-verified against unfixed `develop`: before this issue,
+    /// `Settings` had no `effective_editor_font` method at all — every
+    /// reader used `settings.font_family`/`font_size` directly, so this
+    /// exact scenario (an un-customized setting resolving to a distinct
+    /// per-backend value) had no code path to reach and no test could
+    /// observe.
+    #[test]
+    fn effective_editor_font_resolves_backend_default_when_uncustomized() {
+        let settings = Settings::default();
+        let (family, size_pt) = settings.effective_editor_font("Menlo", 12.0);
+        assert_eq!(family, "Menlo");
+        assert_eq!(size_pt, 12.0);
+    }
+
+    /// An explicit `:set guifont`/`:set font_size=N` (anything other than
+    /// the compile-time sentinel) must win verbatim, even when a backend's
+    /// own convention is available — #1542's core "explicit user values
+    /// still win" contract.
+    #[test]
+    fn effective_editor_font_keeps_explicit_user_value() {
+        let mut settings = Settings::default();
+        settings.font_family = "JetBrains Mono".to_string();
+        settings.font_size = 16;
+        let (family, size_pt) = settings.effective_editor_font("Menlo", 12.0);
+        assert_eq!(family, "JetBrains Mono");
+        assert_eq!(size_pt, 16.0);
+    }
+
+    /// A fixed-cell backend (TUI) reports [`quadraui::PlatformFontDefaults`]'s
+    /// all-sentinel answer (empty family, `0.0` sizes) — resolving through
+    /// it must be a no-op, not e.g. an empty family string or a `0pt` size
+    /// reaching a caller.
+    #[test]
+    fn effective_editor_font_ignores_tui_all_sentinel_defaults() {
+        let settings = Settings::default();
+        let (family, size_pt) = settings.effective_editor_font("", 0.0);
+        assert_eq!(family, settings.font_family);
+        assert_eq!(size_pt, settings.font_size as f32);
+    }
+
+    /// `ui_font_size`'s twin of the three `effective_editor_font` cases
+    /// above.
+    #[test]
+    fn effective_ui_font_size_resolves_backend_default_when_uncustomized() {
+        let settings = Settings::default();
+        assert_eq!(settings.effective_ui_font_size(13.0), 13);
+    }
+
+    #[test]
+    fn effective_ui_font_size_keeps_explicit_user_value() {
+        let mut settings = Settings::default();
+        settings.ui_font_size = 20;
+        assert_eq!(settings.effective_ui_font_size(13.0), 20);
+    }
+
+    #[test]
+    fn effective_ui_font_size_ignores_tui_all_sentinel_defaults() {
+        let settings = Settings::default();
+        assert_eq!(settings.effective_ui_font_size(0.0), settings.ui_font_size);
     }
 
     // ── `minimap` option (#35) ───────────────────────────────────────────
