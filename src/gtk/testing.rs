@@ -14256,6 +14256,153 @@ mod editor_band_order {
         );
     }
 
+    /// #1586's GUI/macOS-driver-tier acceptance bullet: a **stacked**
+    /// (`Ctrl+W s`) group boundary must not paint any divider-fill pixel
+    /// inside the *bottom* group's own tab-row band — that row is exactly
+    /// where `GroupLayout::calculate_group_rects`/`dividers` place the
+    /// stacked divider's `position` (see `render::painted_group_dividers`'s
+    /// doc), so painting a real line there — any thickness GTK's own
+    /// `Split::layout` picks — necessarily overwrites part of the row.
+    ///
+    /// Mirrors `group_divider_paints_between_the_two_groups_via_gtk_driver`
+    /// immediately above (same pixel-probe pattern over
+    /// `h.driver.pixel(x, y)`), transposed to a horizontal band and with the
+    /// assertion inverted: that test proves a side-by-side divider *is*
+    /// painted; this one proves a stacked divider is *not*.
+    ///
+    /// **RED against unfixed `develop`**: before #1586,
+    /// `EditorOp::GroupDividers` painted every entry in
+    /// `screen.group_dividers` unconditionally, including the stacked one —
+    /// `draw_split` fills `theme.separator` across the whole divider rect
+    /// (`quadraui::primitives::split::native_surface_paint::paint`), which
+    /// sits astride the bottom group's tab-row band, so the scan below finds
+    /// a divider-coloured pixel differing from the row's own background.
+    /// Reverting `painted_group_dividers` to the identity filter and running
+    /// this test reproduces that failure — confirmed by hand before
+    /// restoring the fix.
+    #[test]
+    fn stacked_group_divider_paints_nothing_inside_the_bottom_tab_row_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1586_gtk_stacked_tabs_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let top = dir.join("zqxwGTKTOP1586.txt");
+        let bottom = dir.join("zqxwGTKBOTTOM1586.txt");
+        std::fs::write(&top, "top\n").unwrap();
+        std::fs::write(&bottom, "bottom\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+        engine.new_tab(Some(&top));
+        // `open_editor_group`'s new group is always the *second* child
+        // (`split_at(..., new_first: false)`) — for `Horizontal` that is the
+        // bottom pane, and it becomes the active group (same assumption the
+        // TUI twin `stacked_groups_bottom_tab_row_shows_its_label_1586`
+        // documents and relies on).
+        engine.open_editor_group(SplitDirection::Horizontal);
+        engine.new_tab(Some(&bottom));
+        let bottom_group = engine.active_group;
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        // Locate the raw (unfiltered) stacked divider and the bottom
+        // group's own tab-row band from the geometry the frame actually
+        // painted — never from hardcoded coordinates (`CLAUDE.md` rule 1).
+        let char_w = h.painted_char_width();
+        let (probe_x, row_top, row_bottom) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have been painted");
+            let raw = layout
+                .group_dividers
+                .iter()
+                .find(|d| d.direction == SplitDirection::Horizontal)
+                .expect("fixture must produce exactly one stacked (Horizontal) divider");
+            let tab_bar = layout
+                .group_tab_bars
+                .iter()
+                .find(|gtb| gtb.group_id == bottom_group)
+                .expect("the bottom group must have its own tab bar entry");
+            let row_bottom = tab_bar.bounds.y;
+            // The raw divider's own geometry proves the collision is real —
+            // it must fall inside the tab-row band, otherwise there'd be
+            // nothing here for `painted_group_dividers` to have filtered
+            // (twin of the render.rs unit test's part (1)).
+            assert!(
+                raw.position < row_bottom,
+                "raw divider at y={} must sit above the bottom group's tab-row \
+                 bottom (y={row_bottom}) — otherwise this test isn't exercising \
+                 the #1586 collision at all",
+                raw.position
+            );
+            // Past the right edge of every real tab (icon+label+close box),
+            // derived from the tab bar's own painted hit-regions rather than
+            // guessed from `bounds.width` — `new_for_test()` opens with a
+            // scratch tab already present, so this group can hold more than
+            // just the one file this test adds (`open_editor_group` also
+            // copies the active tab into the new group before the fixture
+            // adds its own), and any of those tabs' glyphs would otherwise
+            // poison a background sample taken from a hardcoded offset
+            // (confirmed by hand: `width - 20` landed inside a tab's own
+            // icon/text on the first draft).
+            //
+            // `GroupTabBar::hit_regions` is **cell-unit**, not pixel — its
+            // own doc says so ("char-cell units relative to the tab bar's
+            // left edge") and this backend confirms it empirically: bounds
+            // came back `width ~= 23/26, height == 1.0` regardless of the
+            // 1400px-wide GTK surface. Scale by the frame's own painted
+            // char width (`h.painted_char_width()`) before adding to
+            // `bounds.x` (itself real pixels).
+            let tabs_right_edge_cells = tab_bar
+                .hit_regions
+                .visible_tabs
+                .iter()
+                .map(|vt| vt.bounds.x + vt.bounds.width)
+                .fold(0.0_f32, f32::max);
+            let probe_x = tab_bar.bounds.x + tabs_right_edge_cells as f64 * char_w + 15.0;
+            assert!(
+                probe_x < tab_bar.bounds.x + tab_bar.bounds.width,
+                "probe_x={probe_x} must still be inside the tab bar (bounds={:?}) \
+                 — the fixture's tabs left no blank margin to sample",
+                tab_bar.bounds
+            );
+            (probe_x as i32, raw.position as i32, row_bottom as i32)
+        };
+
+        // The row's own background: sampled well clear of the divider's own
+        // y (a few px below the top of the band) and well clear of any tab
+        // glyph (x past every real tab, computed above).
+        let row_bg = h.driver.pixel(probe_x, row_bottom - 2);
+        // Scan the whole band a real divider line could have landed in — the
+        // raw (unfiltered) divider's own y down to the bottom of the tab
+        // row — for any pixel that isn't the row's own background. A small
+        // tolerance (`pixel_near`, same threshold as this file's other
+        // colour-diff tests) absorbs ordinary Cairo anti-aliasing at a rect
+        // edge; a real divider-fill line reads as a large, sustained jump
+        // (`theme.separator` vs. the tab-row background), never a 1-2 unit
+        // wobble.
+        let pixel_near = |(r, g, b): (u8, u8, u8), target: (u8, u8, u8)| {
+            let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+            near(r, target.0) && near(g, target.1) && near(b, target.2)
+        };
+        let painted_line = (row_top..row_bottom)
+            .map(|y| (y, h.driver.pixel(probe_x, y)))
+            .find(|(_, p)| !pixel_near(*p, row_bg));
+        assert!(
+            painted_line.is_none(),
+            "a divider-fill pixel {painted_line:?} was painted inside the bottom \
+             group's own tab-row band (y in [{row_top}, {row_bottom})) at \
+             x={probe_x} — the stacked group divider must never paint over the \
+             lower group's tab row (#1586); row background sampled at \
+             y={}: {row_bg:?}",
+            row_bottom - 2
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A **live** tab drag composes the ghost rung *inside* the editor band.
     ///
     /// **RED against unfixed `develop`**: GTK painted its drop overlay ~900
