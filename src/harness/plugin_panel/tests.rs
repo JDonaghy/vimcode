@@ -88,22 +88,41 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
              were {painted:?}"
         );
     }
-    // #1434: `ROW_BRANCH` gets its own, looser check — this fixture's
-    // `App`-driven TUI sidebar (shared with `gtk`/`tui` since the
-    // independently hand-written production TUI shell this arm used to
-    // wrap was deleted) reserves less label width for a badge+hint row
-    // than the bespoke shell used to, so even `ROW_BRANCH`'s already-
-    // shortened form (see its own doc — chosen once already to dodge this
-    // exact column-budget trap) now truncates further, to "ma" + a
-    // separately-painted "[HEAD]" run. `screen_has(ROW_BRANCH)` can't
-    // match that; checking for its own two-character prefix plus the
-    // "[HEAD]" badge it's always painted beside is what's actually still
-    // provably on screen.
+    // `ROW_BRANCH` gets its own, *stricter* check: it is the only row in
+    // the fixture that carries a badge and a hint, which
+    // `ext_panel_to_tree_view` composes into one right-aligned `Badge`
+    // (`ROW_BRANCH_BADGE`) competing with the label for the same ~20-column
+    // sidebar row. Asserting the whole label AND the whole badge run AND
+    // that they share a line with no `…` on it is what proves the two
+    // coexist rather than one eating the other — the failure mode that
+    // #1434 papered over with a two-character-prefix check (against a
+    // label the badge was overwriting) and that quadraui#1183 turned into
+    // a bare `…` (see `ROW_BRANCH_BADGE`'s doc for the full history).
+    let branch_line = h
+        .driver
+        .screen()
+        .lines()
+        .find(|line| line.contains(ROW_BRANCH))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!(
+                "the plugin-panel fixture must paint the branch row's whole \
+                 label {ROW_BRANCH:?} (not a badge-clamped fragment of it); \
+                 painted runs were {painted:?}\nscreen:\n{}",
+                h.driver.screen()
+            )
+        });
     assert!(
-        h.driver.screen_has(&ROW_BRANCH[..2]) && h.driver.screen_has("[HEAD]"),
-        "the plugin-panel fixture must paint the branch row (seen as {:?} \
-         + \"[HEAD]\" at this sidebar width); painted runs were {painted:?}",
-        &ROW_BRANCH[..2]
+        branch_line.contains(ROW_BRANCH_BADGE),
+        "the branch row must paint its badge+hint run {ROW_BRANCH_BADGE:?} on \
+         the same line as its label; that line was {branch_line:?}"
+    );
+    assert!(
+        !branch_line.contains('\u{2026}'),
+        "the branch row's label and badge must both fit the sidebar's column \
+         budget — an ellipsis on that line means the tree clamped the label \
+         (quadraui#1183), so nothing below is measuring the row it names; \
+         that line was {branch_line:?}"
     );
 }
 

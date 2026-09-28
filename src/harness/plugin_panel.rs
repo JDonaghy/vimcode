@@ -106,12 +106,33 @@ pub const SEC_EMPTY: &str = "EmptZQXW1090";
 /// Section 0's first row: carries a badge *and* a hint, the richest row
 /// shape `ext_panel_to_tree_view` can emit.
 ///
-/// Shorter than the other needles on purpose: the badge and hint are
-/// right-aligned into the *same* narrow sidebar row, and at 12 characters
-/// the label was painted truncated (`mainZQXW109[HEAD]`), which
-/// `screen_has` cannot match — the column-budget trap this module's own
-/// header comment describes, hit for real during #1090's development.
-pub const ROW_BRANCH: &str = "mainZ1090";
+/// Shorter than the other needles on purpose: `ext_panel_to_tree_view`
+/// concatenates the badges and the hint into ONE right-aligned
+/// `quadraui::Badge` ([`ROW_BRANCH_BADGE`]), which quadraui's TUI tree
+/// reserves room for at the right-hand edge of the same ~20-column sidebar
+/// row the label paints into. The budget is exact: the label gets
+/// `sidebar_width - badge_width - indent - 1` columns (the `-1` is the
+/// mandatory blank gap column), and anything longer is clamped with a `…`
+/// that `screen_has` cannot match — the column-budget trap this module's
+/// own header comment describes, hit for real during #1090's development
+/// and again during #1576's pin bump (see [`ROW_BRANCH_BADGE`]).
+pub const ROW_BRANCH: &str = "mnZ1090";
+/// What `ext_panel_to_tree_view` composes from [`ROW_BRANCH`]'s one badge
+/// (`[HD]`) plus its hint (`a2`) — a single space-joined `Badge` string,
+/// right-aligned into the row by the tree primitive.
+///
+/// Both halves are as terse as "a badge and a hint are both present" allows
+/// because the two compete with the label for the *same* row. Before
+/// quadraui#1183 (picked up by #1576's pin bump) the tree painted the label
+/// at full row width and then drew the badge **on top of it**, so an
+/// over-budget row silently lost its label's tail with no gap and no `…`
+/// — the fixture's old `"mainZ1090"` + `"[HEAD] ahead 2"` (24 columns of
+/// content in a 20-column sidebar) showed up as a bare `"ma"` next to the
+/// badge, and the precondition test below asserted that overlap artifact as
+/// if it were the row. #1183 clamps and ellipsises instead, which turned
+/// the same row into a bare `"…"`; sizing the content to actually fit is
+/// what lets the assertion name the whole label again.
+pub const ROW_BRANCH_BADGE: &str = "[HD] a2";
 /// Section 1's first commit — expandable, expanded by default.
 pub const ROW_COMMIT_A: &str = "c0ffZQXW1090";
 /// `ROW_COMMIT_A`'s one file child — the painted signal that says whether
@@ -257,9 +278,12 @@ pub fn engine_with_plugin_panel(fx: &PluginPanelFixture) -> Engine {
         ExtPanelItem {
             text: ROW_BRANCH.to_string(),
             id: "branch".to_string(),
-            hint: "ahead 2".to_string(),
+            // `ROW_BRANCH_BADGE` is the `"[HD] a2"` these two compose into —
+            // keep the three in sync, the row's whole column budget depends
+            // on it (see that constant's doc).
+            hint: "a2".to_string(),
             badges: vec![ExtPanelBadge {
-                text: "HEAD".to_string(),
+                text: "HD".to_string(),
                 color: "green".to_string(),
             }],
             ..Default::default()
