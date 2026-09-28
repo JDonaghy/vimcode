@@ -855,7 +855,11 @@ impl Engine {
     // =========================================================================
 
     /// Build a directory listing string for netrw.
-    pub(crate) fn netrw_build_listing(dir: &Path, show_hidden: bool) -> String {
+    ///
+    /// `exclude` is `Settings::explorer_exclude` — entries hidden regardless
+    /// of `show_hidden` (#1545), so the netrw listing doesn't start with a
+    /// `.git/` row now that `show_hidden_files` defaults on.
+    pub(crate) fn netrw_build_listing(dir: &Path, show_hidden: bool, exclude: &[String]) -> String {
         let mut lines = Vec::new();
         lines.push(format!("\" {}/", dir.display()));
         lines.push("../".to_string());
@@ -874,6 +878,9 @@ impl Engine {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if super::explorer_ops::explorer_is_excluded(&name, exclude) {
                 continue;
             }
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -929,7 +936,11 @@ impl Engine {
         }
 
         // Create netrw buffer
-        let listing = Self::netrw_build_listing(&dir, self.settings.show_hidden_files);
+        let listing = Self::netrw_build_listing(
+            &dir,
+            self.settings.show_hidden_files,
+            &self.settings.explorer_exclude,
+        );
         let buf_id = self.buffer_manager.create();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
             state.buffer.content = ropey::Rope::from_str(&listing);
@@ -973,7 +984,11 @@ impl Engine {
 
         if path.is_dir() {
             // Navigate into directory — reuse current buffer
-            let listing = Self::netrw_build_listing(&path, self.settings.show_hidden_files);
+            let listing = Self::netrw_build_listing(
+                &path,
+                self.settings.show_hidden_files,
+                &self.settings.explorer_exclude,
+            );
             let buf_id = self.active_buffer_id();
             if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                 state.read_only = false; // temporarily allow write
@@ -1020,7 +1035,11 @@ impl Engine {
             Some(p) => p.to_path_buf(),
             None => return EngineAction::None, // already at root
         };
-        let listing = Self::netrw_build_listing(&parent, self.settings.show_hidden_files);
+        let listing = Self::netrw_build_listing(
+            &parent,
+            self.settings.show_hidden_files,
+            &self.settings.explorer_exclude,
+        );
         let buf_id = self.active_buffer_id();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
             state.read_only = false;

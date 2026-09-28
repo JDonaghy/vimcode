@@ -3404,11 +3404,19 @@ impl Engine {
         let mut file_matches: Vec<String> = Vec::new();
         if buffer_matches.len() < MAX_CANDIDATES {
             let show_hidden = self.settings.show_hidden_files;
+            // #1545: same `explorer_exclude` pruning `picker_populate_files`
+            // applies — with dotfiles shown by default the walk would burn
+            // its `MAX_SCANNED` budget inside `.git/` and surface object
+            // files as `@file` completions.
+            let exclude = self.settings.explorer_exclude.clone();
             let walker = ignore::WalkBuilder::new(&self.cwd)
                 .hidden(!show_hidden)
                 .git_ignore(true)
                 .git_global(true)
                 .git_exclude(true)
+                .filter_entry(move |entry| {
+                    !super::explorer_ops::walk_entry_is_excluded(entry, &exclude)
+                })
                 .build();
             for (scanned, entry) in walker.enumerate() {
                 if file_matches.len() + buffer_matches.len() >= MAX_CANDIDATES

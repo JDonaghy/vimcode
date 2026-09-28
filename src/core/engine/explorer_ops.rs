@@ -603,7 +603,15 @@ pub fn build_explorer_rows(
 /// only this form is supported. `name` may itself contain `*`/`?` wildcards
 /// (e.g. `**/*.pyc`), matched case-sensitively via
 /// [`explorer_glob_matches`].
-fn explorer_is_excluded(entry_name: &str, exclude: &[String]) -> bool {
+///
+/// Shared by every file-listing surface, not just the explorer tree: the
+/// quick-open file picker ([`Engine::picker_populate_files`]), the ext-panel
+/// `@file` completion walk and the netrw directory listing all filter through
+/// this, so flipping `show_hidden_files` on by default (#1545) can't leak
+/// `.git/` internals into any of them.
+///
+/// [`Engine::picker_populate_files`]: super::Engine
+pub(crate) fn explorer_is_excluded(entry_name: &str, exclude: &[String]) -> bool {
     exclude.iter().any(|pattern| {
         let pattern = pattern.strip_prefix("**/").unwrap_or(pattern.as_str());
         // A pattern with further internal `/` isn't a bare name and can
@@ -614,6 +622,20 @@ fn explorer_is_excluded(entry_name: &str, exclude: &[String]) -> bool {
         }
         explorer_glob_matches(pattern, entry_name)
     })
+}
+
+/// [`explorer_is_excluded`] adapted for an `ignore::WalkBuilder` walk, for use
+/// as a `filter_entry` predicate: excluded *directories* are pruned instead of
+/// descended into and discarded.
+///
+/// The walk root (`depth() == 0`) is never excluded — otherwise opening a
+/// project directory that happens to be named `.git` would yield an entirely
+/// empty file list.
+pub(crate) fn walk_entry_is_excluded(entry: &ignore::DirEntry, exclude: &[String]) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    explorer_is_excluded(&entry.file_name().to_string_lossy(), exclude)
 }
 
 /// Anchored `*`/`?` glob match, e.g. `explorer_glob_matches("*.pyc", "a.pyc")`.

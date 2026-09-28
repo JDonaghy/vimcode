@@ -2062,6 +2062,53 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// #1545: flipping `show_hidden_files` on by default must not leak
+        /// `.git/` internals into quick-open. The `explorer_exclude` list is
+        /// the single source of truth for that noise, and
+        /// `picker_populate_files` prunes it from the `ignore` walk — so the
+        /// *painted* picker list shows an ordinary dotfile but no `.git`
+        /// entry.
+        ///
+        /// Confirmed RED against the branch without the
+        /// `picker_populate_files` `filter_entry` prune (which is the state
+        /// unfixed `develop` + the default flip produces): the picker paints
+        /// `.git/HEAD1545` and the second assertion fails. The same
+        /// regression is what made `test_picker_files_populates_preview`
+        /// fail with `"ref: refs/heads/main"` instead of the real file's
+        /// first line.
+        #[test]
+        fn quick_open_hides_git_internals_but_shows_dotfiles_via_shell_app() {
+            let dir =
+                std::env::temp_dir().join(format!("vc1545qo_{:?}", std::thread::current().id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join(".git").join("HEAD1545"), b"ref: refs/heads/main\n").unwrap();
+            std::fs::write(dir.join(".dotrc1545"), b"kept\n").unwrap();
+
+            // Default settings only — the shipped `show_hidden_files` /
+            // `explorer_exclude` defaults are the thing under test.
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.open_picker(crate::core::engine::PickerSource::Files);
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_contains(".dotrc1545"),
+                "quick-open must list dotfiles now that `show_hidden_files` \
+                 defaults on (#1545); screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_contains("HEAD1545"),
+                "quick-open must not list `.git/` internals — `explorer_exclude` \
+                 prunes them from the walk (#1545); screen:\n{}",
+                driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

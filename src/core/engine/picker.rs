@@ -324,11 +324,20 @@ impl Engine {
     fn picker_populate_files(&mut self) {
         let cwd = self.cwd.clone();
         let show_hidden = self.settings.show_hidden_files;
+        // #1545: `show_hidden_files` now defaults on, so the walk would
+        // otherwise descend into `.git/` and fill quick-open with
+        // `HEAD`/`config`/object files. `explorer_exclude` is the single
+        // source of truth for that noise; applied as a `filter_entry` so an
+        // excluded *directory* is pruned rather than walked and discarded.
+        let exclude = self.settings.explorer_exclude.clone();
         let walker = ignore::WalkBuilder::new(&cwd)
             .hidden(!show_hidden)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true)
+            .filter_entry(move |entry| {
+                !super::explorer_ops::walk_entry_is_excluded(entry, &exclude)
+            })
             .build();
 
         let mut items: Vec<PickerItem> = Vec::new();
