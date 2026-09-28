@@ -4961,6 +4961,26 @@ mod tests {
     // (keeping this test) turns every iteration's `Reaction::Continue`
     // assertion into an observed `Reaction::Redraw` — confirmed by hand
     // before writing this comment.
+    //
+    // Scope note (review, iteration 1): this test independently confirms
+    // (see the failure-collecting loop below, which checks all three
+    // signals every tick rather than short-circuiting on the first
+    // mismatch) that the unfixed handlers force a wasted repaint on every
+    // identical `$/progress` repeat — the redraw-storm / "app feels slow"
+    // mechanism is real and closed. It does **not** independently
+    // demonstrate that this specific redraw storm is what produces the
+    // *reported* comment fg colour alternating white/grey: reverting the
+    // fix and re-running this test (done by hand for this note) shows
+    // `Reaction::Redraw` every tick but `screen()`/`style_at()` unchanged
+    // frame-to-frame in this synthetic scenario — i.e. the backend
+    // faithfully repaints the *same* colours it already had, it just does
+    // so wastefully. The colour-divergence mechanism the issue describes
+    // (a frame painting plain `fg` before the comment scope colour comes
+    // back, or two highlight sources disagreeing) is therefore still
+    // unconfirmed by any test in this repo; only the wasted-redraw/
+    // performance half of the bug report is verified fixed here. Treat
+    // "comment text flashes" as reproduced-but-not-yet-root-caused if it
+    // resurfaces after this fix ships.
     mod idle_stability_1583 {
         use super::*;
         use crate::core::lsp::LspEvent;
@@ -5079,6 +5099,19 @@ mod tests {
             // syntax-debounce (150ms) and idle-file-check (2s) windows —
             // the "several ticks, enough to cross every periodic timer"
             // the idle-stability contract asks for.
+            //
+            // Review fix (#1583 iter 1): capture all three signals
+            // (reaction, screen, cell style) *independently* every tick
+            // rather than `assert_eq!`-ing them one after another, so a
+            // pre-fix run's reaction failure can't short-circuit the loop
+            // before the colour check for that same tick ever runs. Without
+            // this, "confirmed RED" only ever demonstrated the wasted
+            // repaint (`Reaction::Redraw`), not the reported symptom itself
+            // (the comment fg actually alternating colour) — the two are
+            // logically distinct claims and this loop now checks both on
+            // every iteration, panicking with the full picture at the end
+            // rather than on the first mismatch.
+            let mut failures: Vec<String> = Vec::new();
             for n in 0..8 {
                 engine_rc
                     .borrow()
@@ -5093,25 +5126,33 @@ mod tests {
                     });
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 let reaction = driver.tick();
+                let screen_n = driver.screen();
+                let style_n = driver.style_at(cx, cy);
 
-                assert_eq!(
-                    reaction,
-                    Reaction::Continue,
-                    "tick {n}: an unchanged $/progress repeat must not force a repaint \
-                     (this is the #1583 root cause: WorkProgress* handlers used to set \
-                     redraw=true unconditionally)"
-                );
-                assert_eq!(
-                    driver.screen(),
-                    screen0,
-                    "tick {n}: rendered text must not change with no input"
-                );
-                assert_eq!(
-                    driver.style_at(cx, cy),
-                    style0,
-                    "tick {n}: comment cell fg/bg must not flash between frames"
-                );
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "tick {n}: an unchanged $/progress repeat must not force a repaint \
+                         (this is the #1583 root cause: WorkProgress* handlers used to set \
+                         redraw=true unconditionally) — got {reaction:?}"
+                    ));
+                }
+                if screen_n != screen0 {
+                    failures.push(format!(
+                        "tick {n}: rendered text must not change with no input"
+                    ));
+                }
+                if style_n != style0 {
+                    failures.push(format!(
+                        "tick {n}: comment cell fg/bg must not flash between frames \
+                         (settle style {style0:?}, this tick {style_n:?})"
+                    ));
+                }
             }
+            assert!(
+                failures.is_empty(),
+                "idle-stability violated:\n{}",
+                failures.join("\n")
+            );
 
             let _ = std::fs::remove_file(&path);
         }

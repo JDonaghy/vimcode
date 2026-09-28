@@ -18786,4 +18786,202 @@ mod issue_1460_acp_turn_review_and_checkpoints {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1583: GTK twin of `tui_main::app_on_tui_tests::tests::
+    // idle_stability_1583::
+    // idle_ticks_with_repeated_lsp_progress_do_not_repaint_or_change_colors`
+    // — see that test's doc comment for the full root-cause writeup.
+    //
+    // The redraw decision under test (`LspManager::work_progress_begin`/
+    // `report`/`end`'s dedup, consumed by `Engine::poll_lsp`) is not TUI
+    // code: it lives in `src/core/engine/panels.rs` and is reached by
+    // *both* backends through the identical shared chain —
+    // `App::handle_poll_tick` → `render::run_shared_tick_chores` →
+    // `Engine::poll_idle` → `Engine::poll_lsp` on GTK, the pre-#1434 TUI
+    // shell's `tick` → the same `run_shared_tick_chores` → `poll_idle` on
+    // TUI (see `run_shared_tick_chores`'s own doc for the shared-rung
+    // history). This test drives that shared chain's entry point directly.
+    //
+    // This harness has no main loop (`tick()` is never pumped — see this
+    // module's header doc's "No main loop" bullet), so `Engine::poll_idle`
+    // is called directly, then followed by an explicit `h.driver.render()`
+    // to repaint — the same "poll state, force a repaint, sample the
+    // screen" shape `ai_panel_streams_acp_thought_and_message_chunks`
+    // above already uses for `Engine::poll_acp` (another `poll_idle`
+    // sub-chore with no GTK timer of its own under this harness).
+    //
+    // Two independent per-tick signals, exactly mirroring the TUI twin's
+    // (and, per that test's own review fix, captured without short-
+    // circuiting so a failure in one can't hide a failure in the other):
+    // `Engine::poll_idle()`'s bool return (the redraw *decision*, backend-
+    // neutral) and the actual painted pixel colour at the comment glyph
+    // plus the whole raw ARGB32 frame buffer (the *symptom* — did anything
+    // actually get repainted differently, GTK's `screen()` being a strictly
+    // stronger check than TUI's char-grid `screen()` since it also catches
+    // sub-glyph antialiasing drift).
+    //
+    // RED verified the same way as the TUI twin: reverting
+    // `LspManager::work_progress_begin`/`report`/`end`'s bool-return dedup
+    // (keeping this test) makes `poll_idle()` return `true` on every
+    // iteration below instead of `false`.
+    //
+    // Scope note (review, iteration 1 — see the TUI twin's own matching
+    // note for the full writeup): confirmed by hand that reverting the fix
+    // makes `poll_idle()` return `true` every tick, but `screen()`/
+    // `pixel()` at the comment glyph stay byte-identical across those same
+    // ticks — this GTK run independently reproduces the same gap the TUI
+    // twin found: the wasted-repaint mechanism is real and closed, but
+    // this synthetic repro does not (yet) demonstrate the specific
+    // colour-divergence-on-repaint mechanism the issue reports on real
+    // Windows hardware.
+    mod idle_stability_1583 {
+        use super::*;
+        use crate::core::lsp::LspEvent;
+        use crate::core::lsp_manager::LspManager;
+
+        /// Open a comment-heavy buffer with LSP auto-start disabled (no
+        /// real language server binary needed) — the GTK twin of
+        /// `tui_main::app_on_tui_tests::tests::idle_stability_1583::
+        /// open_comment_heavy_buffer`. Unlike that helper, no
+        /// `TestHomeGuard`/`PaintGuard`/`CwdReadGuard` juggling here:
+        /// `conformance_harness` (called by the `#[test]` below) already
+        /// acquires the paint/cwd guards, and this path never touches
+        /// `$HOME` (`Settings::default()`, no session/plugin disk read
+        /// reachable from the steps below).
+        fn open_comment_heavy_buffer() -> (std::path::PathBuf, Engine) {
+            let path = std::env::temp_dir().join(format!(
+                "vimcode_test_1583_gtk_{:?}.rs",
+                std::thread::current().id()
+            ));
+            let mut text = String::new();
+            for i in 0..20 {
+                text.push_str(&format!("// this is a documentation comment line {i}\n"));
+            }
+            text.push_str("fn main() {}\n");
+            std::fs::write(&path, &text).unwrap();
+
+            let mut engine = Engine::new_for_test();
+            engine.settings.lsp_enabled = false;
+            let old_id = engine.active_buffer_id();
+            let _ = engine.buffer_manager.delete(old_id, true);
+            let buffer_id = engine.buffer_manager.open_file(&path).unwrap();
+            engine
+                .buffer_manager
+                .apply_language_map(buffer_id, &engine.settings.language_map);
+            if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                window.buffer_id = buffer_id;
+            }
+            let view = engine.restore_file_position(buffer_id);
+            if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                window.view = view;
+            }
+            engine.plugin_init();
+
+            (path, engine)
+        }
+
+        #[test]
+        fn idle_ticks_with_repeated_lsp_progress_do_not_repaint_or_change_colors_via_gtk_driver() {
+            let (path, mut engine) = open_comment_heavy_buffer();
+            // Install a manager the way `Engine::ensure_lsp_manager` would,
+            // without spawning any real server — driven directly via
+            // `LspManager::test_send_event`.
+            engine.lsp_manager = Some(LspManager::new(std::env::temp_dir(), &[]));
+
+            // `GtkDriver::new` (inside `conformance_harness`) already paints
+            // the first frame against this fully-set-up engine, so the
+            // comment text is on screen before any progress event fires.
+            let mut h = conformance_harness(engine, 1000, 700);
+
+            let (fx, fy) = h
+                .driver
+                .find("documentation comment line 0")
+                .expect("comment text must be on screen");
+            let (px, py) = (fx.round() as i32, fy.round() as i32);
+
+            // A genuine first progress notification IS a real change (a
+            // brand-new token) — settle past it before asserting stability,
+            // per this test class's "every frame after the first settle"
+            // contract.
+            h.engine
+                .borrow()
+                .lsp_manager
+                .as_ref()
+                .expect("manager installed above")
+                .test_send_event(LspEvent::WorkProgressBegin {
+                    server_id: 0,
+                    token: "indexing".to_string(),
+                    title: Some("Indexing".to_string()),
+                    message: Some("1/10".to_string()),
+                    percentage: Some(10),
+                });
+            h.engine.borrow_mut().poll_idle();
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("documentation comment line 0"),
+                "settle frame must still show the comment text; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            let screen0 = h.driver.screen();
+            let colour0 = h.driver.pixel(px, py);
+
+            // Now repeat the *exact same* progress payload — a chatty (or
+            // workspace-confused) server re-sending an unchanged
+            // `$/progress` report, the shape that forced a redraw every
+            // idle tick before this fix. Interleave real sleeps so this
+            // also crosses the syntax-debounce (150ms) and idle-file-check
+            // (2s) windows, matching the TUI twin.
+            //
+            // Signals are captured independently (no `assert_eq!` inside
+            // the loop) so a mismatch in one can't hide a mismatch in the
+            // other — see this module's header comment above.
+            let mut failures: Vec<String> = Vec::new();
+            for n in 0..8 {
+                h.engine
+                    .borrow()
+                    .lsp_manager
+                    .as_ref()
+                    .expect("manager installed above")
+                    .test_send_event(LspEvent::WorkProgressReport {
+                        server_id: 0,
+                        token: "indexing".to_string(),
+                        message: Some("1/10".to_string()),
+                        percentage: Some(10),
+                    });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let needs_redraw = h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                let screen_n = h.driver.screen();
+                let colour_n = h.driver.pixel(px, py);
+
+                if needs_redraw {
+                    failures.push(format!(
+                        "tick {n}: an unchanged $/progress repeat must not force a redraw \
+                         (this is the #1583 root cause: WorkProgress* handlers used to set \
+                         redraw=true unconditionally) -- Engine::poll_idle() returned true"
+                    ));
+                }
+                if screen_n != screen0 {
+                    failures.push(format!(
+                        "tick {n}: the rendered pixel buffer must not change with no input"
+                    ));
+                }
+                if colour_n != colour0 {
+                    failures.push(format!(
+                        "tick {n}: the comment glyph's painted colour must not flash between \
+                         frames (settle colour {colour0:?}, this tick {colour_n:?})"
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-stability violated:\n{}",
+                failures.join("\n")
+            );
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
