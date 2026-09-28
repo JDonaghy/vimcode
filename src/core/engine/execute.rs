@@ -5619,6 +5619,11 @@ impl Engine {
             StatusAction::DismissNotifications => {
                 self.dismiss_done_notifications();
             }
+            StatusAction::ShowDiagnostics => {
+                let items = self.diagnostics_as_quickfix_items();
+                self.qf_set_list(None, items);
+                let _ = self.qf_open(None);
+            }
         }
         None
     }

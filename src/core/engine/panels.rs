@@ -2389,6 +2389,41 @@ impl Engine {
             .count();
         (errors, warnings)
     }
+
+    /// Flatten every diagnostic currently known across *all* buffers into
+    /// quickfix items, for the status bar's "Problems" counter (#1548) —
+    /// clicking it opens this workspace-wide list, matching VS Code's
+    /// Problems panel (which is workspace-wide even though the status bar
+    /// counter itself, [`Self::diagnostic_counts`], stays scoped to the
+    /// active buffer). Sorted by severity (errors first) and then by file
+    /// and line, so the most actionable entries land at the top regardless
+    /// of which file each buffer happened to report diagnostics for first.
+    pub fn diagnostics_as_quickfix_items(&self) -> Vec<ProjectMatch> {
+        let mut items: Vec<(DiagnosticSeverity, ProjectMatch)> = self
+            .lsp_diagnostics
+            .iter()
+            .flat_map(|(path, diags)| {
+                diags.iter().map(move |d| {
+                    (
+                        d.severity,
+                        ProjectMatch {
+                            file: path.clone(),
+                            line: d.range.start.line as usize,
+                            col: d.range.start.character as usize,
+                            line_text: format!("{}: {}", d.severity.symbol(), d.message),
+                        },
+                    )
+                })
+            })
+            .collect();
+        items.sort_by(|(sev_a, a), (sev_b, b)| {
+            sev_a
+                .cmp(sev_b)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        items.into_iter().map(|(_, m)| m).collect()
+    }
 }
 
 #[cfg(test)]

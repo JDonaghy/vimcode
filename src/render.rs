@@ -22728,6 +22728,67 @@ fn extract_xy_prefix(msg: &str) -> Option<&str> {
     Some(&msg[..j])
 }
 
+/// Map an internal LSP language id (`crate::core::lsp::language_id_from_path`'s
+/// return value, e.g. `"rust"`, `"typescriptreact"`) to the display name a
+/// user actually recognizes (`"Rust"`, `"TypeScript React"`) — VS Code's
+/// status bar language segment shows the latter, never the raw id (#1548).
+///
+/// Every id in [`crate::core::lsp::all_known_language_ids`] has an explicit
+/// entry below; anything else (a future id this list hasn't caught up with
+/// yet) falls back to capitalizing the first character rather than showing
+/// nothing, so an unrecognized id degrades gracefully instead of going
+/// blank.
+pub fn language_display_name(id: &str) -> String {
+    let name = match id {
+        "rust" => "Rust",
+        "python" => "Python",
+        "javascript" => "JavaScript",
+        "javascriptreact" => "JavaScript React",
+        "typescript" => "TypeScript",
+        "typescriptreact" => "TypeScript React",
+        "go" => "Go",
+        "c" => "C",
+        "cpp" => "C++",
+        "java" => "Java",
+        "csharp" => "C#",
+        "ruby" => "Ruby",
+        "lua" => "Lua",
+        "shellscript" => "Shell Script",
+        "json" => "JSON",
+        "toml" => "TOML",
+        "yaml" => "YAML",
+        "html" => "HTML",
+        "css" => "CSS",
+        "markdown" => "Markdown",
+        "zig" => "Zig",
+        "elixir" => "Elixir",
+        "kotlin" => "Kotlin",
+        "php" => "PHP",
+        "haskell" => "Haskell",
+        "ocaml" => "OCaml",
+        "nix" => "Nix",
+        "terraform" => "Terraform",
+        "terraform-vars" => "Terraform Variables",
+        "bicep" => "Bicep",
+        "scala" => "Scala",
+        "graphql" => "GraphQL",
+        "sql" => "SQL",
+        "solidity" => "Solidity",
+        "swift" => "Swift",
+        "latex" => "LaTeX",
+        "bibtex" => "BibTeX",
+        "dockerfile" => "Dockerfile",
+        _ => {
+            let mut chars = id.chars();
+            return match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+        }
+    };
+    name.to_string()
+}
+
 /// Build a per-window status line for a given window.
 /// Active windows get a rich, colorful bar; inactive windows get dimmed minimal info.
 pub fn build_window_status_line(
@@ -22842,8 +22903,14 @@ pub fn build_window_status_line(
                 }
                 branch_text = format!("{} {}", branch_text, parts.join(" "));
             }
+            // #1548: prefix with the branch glyph via the shared `Icon`
+            // constant (`.s()` picks nerd vs ASCII fallback per
+            // `nerd_fonts_enabled()`) rather than a raw literal — a raw PUA
+            // literal here would bypass `tests/icon_font_coverage.rs`'s
+            // bundled-subset-font check entirely, the exact failure mode
+            // that shipped tofu for the status-bar toggles before #1540.
             left.push(StatusSegment {
-                text: format!("  {}", branch_text),
+                text: format!("  {} {}", crate::icons::GIT_BRANCH.s(), branch_text),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -22868,7 +22935,15 @@ pub fn build_window_status_line(
         //
         // Drop order (least → most important):
         //   notification · menu toggle · panel toggle · sidebar toggle ·
-        //   utf-8 · line ending · indent · filetype · LSP · cursor pos
+        //   problems · utf-8 · line ending · indent · language · LSP ·
+        //   cursor pos
+        //
+        // #1548: the problems counter sits above the encoding/line-ending/
+        // indent trio — diagnostics are more consequential to a narrow bar
+        // dropping segments than "how is this file encoded", but it's still
+        // below the toggles (those are single always-present icon buttons,
+        // not counters) and below language/LSP/cursor (higher-signal, more
+        // frequently glanced at).
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -22965,8 +23040,38 @@ pub fn build_window_status_line(
             action: Some(StatusAction::ToggleSidebar),
         };
 
+        // Problems counter (#1548): always visible, even at zero, matching
+        // VS Code's convention — a `0`/`0` count is itself useful signal
+        // ("no problems", not "we don't know"), and hiding the segment at
+        // zero is what the previous (non-window) status line did. Two
+        // segments sharing one action so a click anywhere in the counter
+        // opens the workspace Problems (quickfix) list.
+        let (diag_errors, diag_warnings) = engine.diagnostic_counts();
+        let errors_seg = StatusSegment {
+            text: format!(" {} {}", crate::icons::STATUS_ERROR.s(), diag_errors),
+            fg: if diag_errors > 0 {
+                theme.diagnostic_error
+            } else {
+                bar_fg
+            },
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ShowDiagnostics),
+        };
+        let warnings_seg = StatusSegment {
+            text: format!(" {} {} ", crate::icons::STATUS_WARNING.s(), diag_warnings),
+            fg: if diag_warnings > 0 {
+                theme.diagnostic_warning
+            } else {
+                bar_fg
+            },
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ShowDiagnostics),
+        };
+
         let encoding_seg = StatusSegment {
-            text: "utf-8 ".to_string(),
+            text: "UTF-8 ".to_string(),
             fg: bar_fg,
             bg: bar_bg,
             bold: false,
@@ -22991,7 +23096,7 @@ pub fn build_window_status_line(
 
         let filetype_seg = if !filetype.is_empty() {
             Some(StatusSegment {
-                text: format!("{} ", filetype),
+                text: format!("{} ", language_display_name(&filetype)),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -23069,6 +23174,8 @@ pub fn build_window_status_line(
         }
         right.push(panel_toggle_seg);
         right.push(sidebar_toggle_seg);
+        right.push(errors_seg);
+        right.push(warnings_seg);
         right.push(encoding_seg);
         right.push(line_ending_seg);
         right.push(indent_seg);
@@ -23878,6 +23985,7 @@ pub fn status_action_id(action: &StatusAction) -> &'static str {
         StatusAction::TogglePanel => "status:toggle_panel",
         StatusAction::ToggleMenuBar => "status:toggle_menu_bar",
         StatusAction::DismissNotifications => "status:dismiss_notifications",
+        StatusAction::ShowDiagnostics => "status:show_diagnostics",
     }
 }
 
@@ -23896,6 +24004,7 @@ pub fn status_action_from_id(id: &str) -> Option<StatusAction> {
         "status:toggle_panel" => Some(StatusAction::TogglePanel),
         "status:toggle_menu_bar" => Some(StatusAction::ToggleMenuBar),
         "status:dismiss_notifications" => Some(StatusAction::DismissNotifications),
+        "status:show_diagnostics" => Some(StatusAction::ShowDiagnostics),
         _ => None,
     }
 }
@@ -28068,6 +28177,227 @@ mod tests {
         {
             assert_eq!(seg.action, None, "inactive segments should have no actions");
         }
+    }
+
+    /// #1548: the problems counter must always paint, even with zero
+    /// diagnostics — VS Code shows `0`/`0`, not nothing, and the previous
+    /// per-window bar had no counter segment at all (only the older,
+    /// non-window `build_status_line`/`build_global_status_bar` had a
+    /// diagnostics blob, and it hid entirely at zero). RED against the
+    /// pre-fix body (no errors/warnings segments in `right`): this search
+    /// for a `ShowDiagnostics`-actioned segment found nothing and the
+    /// assertion failed — confirmed by reverting the `errors_seg`/
+    /// `warnings_seg` push and re-running.
+    #[test]
+    fn test_window_status_line_problems_counter_always_shown_at_zero() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let diag_segs: Vec<&StatusSegment> = status
+            .right_segments
+            .iter()
+            .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
+            .collect();
+        assert_eq!(
+            diag_segs.len(),
+            2,
+            "expected an error segment and a warning segment, both clickable"
+        );
+        let combined: String = diag_segs.iter().map(|s| s.text.clone()).collect();
+        assert!(
+            combined.contains(crate::icons::STATUS_ERROR.s()),
+            "expected the error icon even at zero, got '{combined}'"
+        );
+        assert!(
+            combined.contains(crate::icons::STATUS_WARNING.s()),
+            "expected the warning icon even at zero, got '{combined}'"
+        );
+        assert!(
+            combined.contains('0'),
+            "expected a zero count painted, got '{combined}'"
+        );
+    }
+
+    /// #1548: once diagnostics exist, the painted counts must reflect them
+    /// (not just prove the segment exists at zero, above).
+    #[test]
+    fn test_window_status_line_problems_counter_reflects_diagnostic_counts() {
+        use crate::core::engine::Engine;
+        use crate::core::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+        use std::path::PathBuf;
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/test_1548.rs"));
+        engine.lsp_diagnostics.insert(
+            PathBuf::from("/tmp/test_1548.rs"),
+            vec![
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "e1".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "e2".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Warning,
+                    message: "w1".to_string(),
+                    source: None,
+                    code: None,
+                },
+            ],
+        );
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+        let combined: String = status
+            .right_segments
+            .iter()
+            .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
+            .map(|s| s.text.clone())
+            .collect();
+        assert!(
+            combined.contains(&format!("{} 2", crate::icons::STATUS_ERROR.s())),
+            "expected 2 errors painted, got '{combined}'"
+        );
+        assert!(
+            combined.contains(&format!("{} 1", crate::icons::STATUS_WARNING.s())),
+            "expected 1 warning painted, got '{combined}'"
+        );
+    }
+
+    /// #1548: clicking the problems counter opens the workspace-wide
+    /// Problems (quickfix) list. RED against the pre-fix `StatusAction`
+    /// enum (no `ShowDiagnostics` variant existed, so this action id could
+    /// not resolve at all) — confirmed by reverting the enum + dispatch
+    /// addition and re-running.
+    #[test]
+    fn test_status_action_show_diagnostics_opens_quickfix() {
+        use crate::core::engine::Engine;
+        use crate::core::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+        use std::path::PathBuf;
+
+        let mut engine = Engine::new();
+        engine.lsp_diagnostics.insert(
+            PathBuf::from("/tmp/test_1548_qf.rs"),
+            vec![Diagnostic {
+                range: LspRange::default(),
+                severity: DiagnosticSeverity::Error,
+                message: "boom".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        engine.handle_status_action(&StatusAction::ShowDiagnostics);
+
+        assert!(engine.quickfix.open, "expected the quickfix list to open");
+        assert_eq!(engine.quickfix.items.len(), 1);
+        assert!(engine.quickfix.items[0].line_text.contains("boom"));
+    }
+
+    /// #1548: the encoding segment must read `UTF-8`, matching VS Code's
+    /// casing — not the lowercase `utf-8` the bar used to paint. RED
+    /// against the pre-fix `"utf-8 "` literal.
+    #[test]
+    fn test_window_status_line_encoding_label_is_uppercase() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let enc = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeEncoding))
+            .expect("expected a ChangeEncoding segment");
+        assert_eq!(enc.text, "UTF-8 ");
+    }
+
+    /// #1548: the language segment must show the display name ("Rust"),
+    /// not the internal LSP id ("rust") the bar used to paint verbatim.
+    /// RED against the pre-fix `format!("{} ", filetype)` body.
+    #[test]
+    fn test_window_status_line_language_segment_uses_display_name() {
+        use crate::core::engine::Engine;
+
+        let rs_path = std::env::temp_dir().join("vimcode_status_bar_1548.rs");
+        std::fs::write(&rs_path, "fn main() {}\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        let _ = engine.open_file_with_mode(&rs_path, crate::core::engine::OpenMode::Permanent);
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let lang = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeLanguage))
+            .expect("expected a ChangeLanguage segment");
+        assert_eq!(lang.text, "Rust ");
+        assert!(
+            !lang.text.contains("rust"),
+            "must not leak the internal lowercase id"
+        );
+
+        let _ = std::fs::remove_file(&rs_path);
+    }
+
+    #[test]
+    fn language_display_name_maps_known_ids_and_falls_back_gracefully() {
+        assert_eq!(language_display_name("rust"), "Rust");
+        assert_eq!(language_display_name("typescriptreact"), "TypeScript React");
+        assert_eq!(language_display_name("csharp"), "C#");
+        // Unknown id: soft fallback, not a blank string.
+        assert_eq!(language_display_name("brainfuck"), "Brainfuck");
+    }
+
+    /// #1548: the branch segment must be prefixed with the branch icon via
+    /// the shared `Icon` constant, not painted as bare text. RED against
+    /// the pre-fix body (`format!("  {}", branch_text)`, no icon at all).
+    #[test]
+    fn test_window_status_line_branch_segment_has_icon_prefix() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.git_branch = Some("main".to_string());
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let branch = status
+            .left_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::SwitchBranch))
+            .expect("expected a SwitchBranch segment");
+        assert!(
+            branch.text.contains(crate::icons::GIT_BRANCH.s()),
+            "expected the branch icon in '{}'",
+            branch.text
+        );
+        assert!(branch.text.contains("main"));
     }
 
     #[test]

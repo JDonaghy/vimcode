@@ -290,6 +290,16 @@ pub const STATUS_SIDEBAR_TOGGLE: Icon = Icon::new("\u{f0616}", "[S]");
 /// notification completes.
 pub const STATUS_BELL_DONE: Icon = Icon::new("\u{f009e}", "*");
 
+/// Problems-counter icons (#1548): error/warning glyphs prefixing the
+/// always-on diagnostic-count segments. Ordinary BMP Unicode below the
+/// nerd-font PUA range — same reasoning as the "Window Controls" section
+/// below: these read fine as plain monospace glyphs on any system font, on
+/// both GTK and TUI, so `nerd`/fallback are deliberately identical and
+/// there's no bundled subset-font codepoint to maintain for them (see
+/// `tests/icon_font_coverage.rs`'s `NERD_RANGE_START` gate).
+pub const STATUS_ERROR: Icon = Icon::new("\u{2297}", "\u{2297}"); // ⊗
+pub const STATUS_WARNING: Icon = Icon::new("\u{26a0}", "\u{26a0}"); // ⚠
+
 // ─── Terminal Panel Toolbar (#1540) ─────────────────────────────────────────
 //
 // Same story as the status-bar toggles above: these were raw PUA literals
