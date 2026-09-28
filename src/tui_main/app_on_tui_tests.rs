@@ -835,6 +835,53 @@ mod tests {
             );
         }
 
+        /// #1545: dotfiles show in the explorer by default (VS Code-style)
+        /// but the small `explorer_exclude` list (`.git`, `.svn`, `.hg`,
+        /// `.DS_Store`, `Thumbs.db`) stays hidden regardless — driven end to
+        /// end through the real tree build (`Engine::explorer_rebuild_rows`
+        /// → `build_explorer_rows`/`collect_explorer_rows`), not just
+        /// asserted against the `Settings` struct. Confirmed red against
+        /// unfixed `develop`: with `show_hidden_files` defaulting to
+        /// `false` there, `.dotmk1545` never reaches
+        /// `collect_explorer_rows`'s output at all, so the first assertion
+        /// below fails.
+        #[test]
+        fn render_content_shows_dotfiles_but_hides_git_by_default_via_shell_app() {
+            let dir =
+                std::env::temp_dir().join(format!("vc1545dot_{:?}", std::thread::current().id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(".dotmk1545"), b"").unwrap();
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join(".git").join("HEAD"), b"").unwrap();
+
+            // Default settings only — no explicit `show_hidden_files` or
+            // `explorer_exclude` override, so this exercises the real
+            // shipped defaults end to end.
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir);
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            let h = harness(engine);
+            let driver = &h.driver;
+
+            assert!(
+                driver.screen_has(".dotmk1545"),
+                "dotfiles must show in the explorer by default (#1545); screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                !driver.screen_has(".git"),
+                "'.git' must stay hidden via the default explorer_exclude list \
+                 even though dotfiles now show by default (#1545); screen:\n{}",
+                driver.screen()
+            );
+        }
+
         // #1574: no TUI driver test covers the `PANEL_SETTINGS` arm's
         // `background: Some(theme.tab_bar_bg)` fix — confirmed empirically
         // while writing this issue's fix that it can't: on this module's TUI
