@@ -18,6 +18,7 @@ impl Engine {
             &self.explorer_expanded,
             self.settings.show_hidden_files,
             self.settings.explorer_sort_case_insensitive,
+            &self.settings.explorer_exclude,
         );
         if let Some((ref parent_dir, _is_folder)) = self.explorer_new_entry_pending {
             let insert_at = self
@@ -568,6 +569,7 @@ pub fn build_explorer_rows(
     expanded: &HashSet<PathBuf>,
     show_hidden: bool,
     case_insensitive: bool,
+    exclude: &[String],
 ) -> Vec<ExplorerRow> {
     let mut out = Vec::new();
     let root_name = root
@@ -583,9 +585,56 @@ pub fn build_explorer_rows(
         is_expanded: root_expanded,
     });
     if root_expanded {
-        collect_explorer_rows(root, 1, expanded, show_hidden, case_insensitive, &mut out);
+        collect_explorer_rows(
+            root,
+            1,
+            expanded,
+            show_hidden,
+            case_insensitive,
+            exclude,
+            &mut out,
+        );
     }
     out
+}
+
+/// A single `**/name` (or bare `name`) glob from `Settings::explorer_exclude`
+/// matched against an entry's bare file name — see that field's doc for why
+/// only this form is supported. `name` may itself contain `*`/`?` wildcards
+/// (e.g. `**/*.pyc`), matched case-sensitively via
+/// [`explorer_glob_matches`].
+fn explorer_is_excluded(entry_name: &str, exclude: &[String]) -> bool {
+    exclude.iter().any(|pattern| {
+        let pattern = pattern.strip_prefix("**/").unwrap_or(pattern.as_str());
+        // A pattern with further internal `/` isn't a bare name and can
+        // never match here (see the doc above) — skip it rather than
+        // matching against a path segment it wasn't written for.
+        if pattern.contains('/') {
+            return false;
+        }
+        explorer_glob_matches(pattern, entry_name)
+    })
+}
+
+/// Anchored `*`/`?` glob match, e.g. `explorer_glob_matches("*.pyc", "a.pyc")`.
+/// `*` matches any run of characters (including none), `?` matches exactly
+/// one. No other glob syntax (character classes, brace expansion, `**`) is
+/// recognized — deliberately minimal, since every default
+/// `explorer_exclude` entry is a plain literal name.
+fn explorer_glob_matches(pattern: &str, name: &str) -> bool {
+    fn matches(pattern: &[char], name: &[char]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some('*') => {
+                matches(&pattern[1..], name) || (!name.is_empty() && matches(pattern, &name[1..]))
+            }
+            Some('?') => !name.is_empty() && matches(&pattern[1..], &name[1..]),
+            Some(c) => name.first() == Some(c) && matches(&pattern[1..], &name[1..]),
+        }
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    matches(&pattern, &name)
 }
 
 /// Ordering used to sort explorer entries: directories before files, then by
@@ -621,6 +670,7 @@ fn collect_explorer_rows(
     expanded: &HashSet<PathBuf>,
     show_hidden: bool,
     case_insensitive: bool,
+    exclude: &[String],
     out: &mut Vec<ExplorerRow>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -653,6 +703,9 @@ fn collect_explorer_rows(
         if name.starts_with('.') && !show_hidden {
             continue;
         }
+        if explorer_is_excluded(&name, exclude) {
+            continue;
+        }
         let is_expanded = is_dir && expanded.contains(&path);
         out.push(ExplorerRow {
             depth,
@@ -668,6 +721,7 @@ fn collect_explorer_rows(
                 expanded,
                 show_hidden,
                 case_insensitive,
+                exclude,
                 out,
             );
         }
@@ -843,5 +897,78 @@ mod explorer_sort_tests {
             first_pass,
             vec!["another", "subdir", "alpha.txt", "beta.rs"]
         );
+    }
+}
+
+#[cfg(test)]
+mod explorer_exclude_tests {
+    use super::{build_explorer_rows, explorer_glob_matches, explorer_is_excluded};
+    use std::collections::HashSet;
+
+    #[test]
+    fn glob_matches_literal_name() {
+        assert!(explorer_glob_matches(".git", ".git"));
+        assert!(!explorer_glob_matches(".git", ".gitignore"));
+    }
+
+    #[test]
+    fn glob_matches_star_and_question_wildcards() {
+        assert!(explorer_glob_matches("*.pyc", "foo.pyc"));
+        assert!(explorer_glob_matches("*.pyc", ".pyc"));
+        assert!(!explorer_glob_matches("*.pyc", "foo.pyx"));
+        assert!(explorer_glob_matches("a?c", "abc"));
+        assert!(!explorer_glob_matches("a?c", "ac"));
+    }
+
+    #[test]
+    fn is_excluded_strips_the_leading_doublestar_slash() {
+        let patterns = vec!["**/.git".to_string(), "**/Thumbs.db".to_string()];
+        assert!(explorer_is_excluded(".git", &patterns));
+        assert!(explorer_is_excluded("Thumbs.db", &patterns));
+        assert!(!explorer_is_excluded(".gitignore", &patterns));
+    }
+
+    #[test]
+    fn is_excluded_never_matches_a_pattern_with_further_internal_slashes() {
+        // Documented limitation (see `explorer_is_excluded`'s doc): a
+        // pattern that isn't a bare `**/name` never matches, rather than
+        // matching against a path segment it wasn't written for.
+        let patterns = vec!["**/sub/dir".to_string()];
+        assert!(!explorer_is_excluded("dir", &patterns));
+    }
+
+    #[test]
+    fn build_explorer_rows_shows_dotfiles_but_hides_excluded_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_explorer_ops_unit_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let mut expanded = HashSet::new();
+        expanded.insert(dir.clone());
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let rows = build_explorer_rows(&dir, &expanded, true, true, &exclude);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(
+            names.contains(&".dotfile"),
+            "dotfiles must show when show_hidden is true; got {names:?}"
+        );
+        assert!(
+            names.contains(&"plain.txt"),
+            "ordinary files must always show; got {names:?}"
+        );
+        assert!(
+            !names.contains(&".git"),
+            "'.git' must stay hidden via explorer_exclude even with show_hidden true; \
+             got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

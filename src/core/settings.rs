@@ -694,12 +694,32 @@ pub struct Settings {
     pub acp_mcp_servers: Vec<crate::core::acp::AcpMcpServerConfig>,
 
     // ── Explorer ──────────────────────────────────────────────────────────────
-    /// Show hidden files (dotfiles) in the file explorer (default: false).
-    #[serde(default)]
+    /// Show hidden files (dotfiles) in the file explorer. Default **true**
+    /// (#1545), matching VS Code — dotfiles like `.vscode`, `.github` and
+    /// `.cargo` are legitimate project files most users want to see; only
+    /// the noise VS Code's own `files.exclude` hides by default
+    /// (`explorer_exclude`, below) stays hidden. A pre-#1545 `settings.json`
+    /// with this explicitly written out (including an explicit `false`) is
+    /// untouched — `#[serde(default = ...)]` only ever supplies the value
+    /// for a *missing* key.
+    #[serde(default = "default_true")]
     pub show_hidden_files: bool,
     /// Sort explorer entries case-insensitively (default: true).
     #[serde(default = "default_true")]
     pub explorer_sort_case_insensitive: bool,
+    /// Glob patterns for entries the file explorer always hides, regardless
+    /// of `show_hidden_files` — VS Code's `files.exclude` (#1545). Default
+    /// `["**/.git", "**/.svn", "**/.hg", "**/.DS_Store", "**/Thumbs.db"]`,
+    /// VS Code's own default list.
+    ///
+    /// Only the `**/name` form is matched, against each entry's bare file
+    /// name at any depth — the tree is built one directory at a time
+    /// (`collect_explorer_rows`), so there's no accumulated relative path to
+    /// test a pattern with further internal `/` against; such a pattern
+    /// silently never matches rather than erroring. `name` itself may use
+    /// `*`/`?` glob wildcards (e.g. `**/*.pyc`).
+    #[serde(default = "default_explorer_exclude")]
+    pub explorer_exclude: Vec<String>,
 
     // ── Swap files ────────────────────────────────────────────────────────────
     /// Enable swap file crash recovery (default: true).
@@ -1177,6 +1197,16 @@ fn default_smarttab() -> bool {
 
 fn default_nrformats() -> Vec<String> {
     vec!["bin".to_string(), "hex".to_string()]
+}
+
+fn default_explorer_exclude() -> Vec<String> {
+    vec![
+        "**/.git".to_string(),
+        "**/.svn".to_string(),
+        "**/.hg".to_string(),
+        "**/.DS_Store".to_string(),
+        "**/Thumbs.db".to_string(),
+    ]
 }
 
 fn default_foldmethod() -> String {
@@ -1704,8 +1734,9 @@ impl Default for Settings {
             acp_active_agent: String::new(),
             acp_reopen_last_session: false,
             acp_mcp_servers: Vec::new(),
-            show_hidden_files: false,
+            show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
+            explorer_exclude: default_explorer_exclude(),
             swap_file: default_swap_file(),
             updatetime: default_updatetime(),
             undolevels: default_undolevels(),
@@ -2877,6 +2908,13 @@ impl Settings {
                     .filter(|s| !s.is_empty())
                     .collect();
             }
+            "explorerexclude" | "explorer_exclude" => {
+                self.explorer_exclude = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "hover_delay" | "hd" => {
                 let n: u32 = value
                     .parse()
@@ -3151,6 +3189,7 @@ impl Settings {
             // nrformats=octal` (replacing, not appending), which is a worse
             // outcome than #1191's old "Unknown option: nrformats+" error.
             "nrformats" | "nf" => Some(self.nrformats.join(",")),
+            "explorerexclude" | "explorer_exclude" => Some(self.explorer_exclude.join(",")),
             "colorcolumn" | "cc" => Some(self.colorcolumn.clone()),
             "virtualedit" | "ve" => Some(self.virtualedit.clone()),
             // 'backspace' also accepts a legacy *numeric* shorthand
@@ -3261,6 +3300,10 @@ impl Settings {
                 "nosmarttab".to_string()
             }),
             "nrformats" | "nf" => Ok(format!("nrformats={}", self.nrformats.join(","))),
+            "explorerexclude" | "explorer_exclude" => Ok(format!(
+                "explorer_exclude={}",
+                self.explorer_exclude.join(",")
+            )),
             "cursorline" | "cul" => Ok(if self.cursorline {
                 "cursorline".to_string()
             } else {
@@ -3668,6 +3711,7 @@ impl Settings {
             "scrolljump" | "sj" => self.scrolljump.to_string(),
             "smarttab" | "sta" => self.smarttab.to_string(),
             "nrformats" | "nf" => self.nrformats.join(","),
+            "explorerexclude" | "explorer_exclude" => self.explorer_exclude.join(","),
             "iskeyword" | "isk" => self.iskeyword.clone(),
             "colorcolumn" => self.colorcolumn.clone(),
             "textwidth" => self.textwidth.to_string(),
@@ -3793,6 +3837,13 @@ impl Settings {
             "smarttab" | "sta" => self.smarttab = value == "true",
             "nrformats" | "nf" => {
                 self.nrformats = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "explorerexclude" | "explorer_exclude" => {
+                self.explorer_exclude = value
                     .split(',')
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -4332,9 +4383,16 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     SettingDef {
         key: "show_hidden_files",
         label: "Show Hidden Files",
-        description: "Display dotfiles and hidden directories in the file explorer",
+        description: "Display dotfiles and hidden directories in the file explorer (default: on, VS Code-style)",
         category: "Workspace",
         setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "explorer_exclude",
+        label: "Explorer Exclude",
+        description: "Entries the file explorer always hides regardless of Show Hidden Files, as \"**/name\" globs (comma-separated; default: **/.git, **/.svn, **/.hg, **/.DS_Store, **/Thumbs.db)",
+        category: "Workspace",
+        setting_type: SettingType::StringVal,
     },
     SettingDef {
         key: "board_tick_enabled",
@@ -4564,6 +4622,52 @@ mod tests {
             settings.indent_guides,
             "indent guides must default on, matching VS Code"
         );
+        // #1545: dotfiles show by default (VS Code-style), with only a
+        // small exclude list — VS Code's own `files.exclude` — staying
+        // hidden regardless.
+        assert!(
+            settings.show_hidden_files,
+            "show_hidden_files must default on, matching VS Code"
+        );
+        assert_eq!(
+            settings.explorer_exclude,
+            vec![
+                "**/.git".to_string(),
+                "**/.svn".to_string(),
+                "**/.hg".to_string(),
+                "**/.DS_Store".to_string(),
+                "**/Thumbs.db".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_set_explorer_exclude_default_and_round_trip() {
+        let mut s = Settings::default();
+        assert_eq!(
+            s.explorer_exclude,
+            vec![
+                "**/.git".to_string(),
+                "**/.svn".to_string(),
+                "**/.hg".to_string(),
+                "**/.DS_Store".to_string(),
+                "**/Thumbs.db".to_string(),
+            ]
+        );
+        let msg = s
+            .parse_set_option("explorer_exclude=**/.git,**/node_modules")
+            .unwrap();
+        assert_eq!(msg, "explorer_exclude=**/.git,**/node_modules");
+        assert_eq!(
+            s.explorer_exclude,
+            vec!["**/.git".to_string(), "**/node_modules".to_string()]
+        );
+        let query = s.parse_set_option("explorer_exclude?").unwrap();
+        assert_eq!(query, "explorer_exclude=**/.git,**/node_modules");
+
+        // Also round-trips through the settings-UI string accessors.
+        s.set_value_str("explorer_exclude", "**/.hg").unwrap();
+        assert_eq!(s.get_value_str("explorer_exclude"), "**/.hg");
     }
 
     /// #1542: an un-customized `font_family`/`font_size` (still exactly the
