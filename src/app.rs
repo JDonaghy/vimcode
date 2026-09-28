@@ -3654,7 +3654,7 @@ impl App {
                 // `draw_ai_sidebar_panel`. `ai_chat_rect` is cached on
                 // `Engine` (not here) so `route_ai_chat_event` re-derives
                 // the identical layout `render()` painted (#544/#582/#646).
-                render::populate_ai_chat_controller(engine, theme);
+                render::populate_ai_chat_controller(engine, theme, backend);
                 engine.ai_chat_rect.set(q_sb);
                 engine.ai_chat.borrow().render(backend, q_sb);
                 // #956 (ACP-5): slash-command completions, painted on top —

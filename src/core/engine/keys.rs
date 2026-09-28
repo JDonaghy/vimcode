@@ -5294,6 +5294,17 @@ impl Engine {
                 // Outside Visual mode there's no selection to attach, so
                 // this just focuses the panel — the same fallback the
                 // palette's plain `chat_open` action already has.
+                //
+                // #1507: this arm only ever runs to *enter* the panel — once
+                // `ai_has_focus` is true, every keystroke (including this
+                // same leader sequence typed again) routes straight to
+                // `render::route_ai_chat_event` instead of reaching
+                // `Engine::handle_key`'s dispatch ladder at all (see
+                // `render::route_focus_key`'s doc), so there is no second
+                // pass through here to toggle. The toggle-back-to-editor
+                // half of `<leader>ai` lives in
+                // `Engine::ai_leader_toggle_key`, called from
+                // `render::route_ai_chat_event` itself.
                 if matches!(
                     self.mode,
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock

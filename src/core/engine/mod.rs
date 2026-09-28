@@ -4389,6 +4389,13 @@ pub struct Engine {
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
     pub ai_has_focus: bool,
+    /// In-progress match state for the `<leader>ai` focus-toggle gesture
+    /// (#1507) — see [`Engine::ai_leader_toggle_key`]'s doc for why this
+    /// exists as a small buffer rather than reusing the Normal-mode
+    /// [`Engine::leader_partial`] machinery, and for the invariant
+    /// (`ai_chat`'s input buffer is empty) that keeps it from ever eating
+    /// characters out of a message the user is actually composing.
+    pub ai_leader_toggle_pending: String,
     /// Channel for receiving the AI response from the background thread.
     pub ai_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// quadraui ChatController — owns the AI sidebar's transcript scroll,
@@ -5188,6 +5195,7 @@ impl Engine {
             ai_completion_rx: None,
             ai_completion_prefix_tail: String::new(),
             ai_has_focus: false,
+            ai_leader_toggle_pending: String::new(),
             ai_rx: None,
             ai_chat: std::rc::Rc::new(std::cell::RefCell::new(quadraui::ChatController::new(
                 "vimcode:ai",

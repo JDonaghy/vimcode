@@ -8239,6 +8239,119 @@ second line here
              exited and was reaped, not left behind as a stale paint"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1507: AI panel persistent send/stop/leave hint + `<leader>ai` focus
+    // toggle — GTK twin of `tui_main::app_on_tui_tests::tests::
+    // ai_panel_hint_and_focus_toggle`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod ai_panel_hint_and_focus_toggle {
+        use super::*;
+
+        /// #1507 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::ai_panel_hint_and_focus_toggle::hint_reaches_screen_and_
+        /// survives_typing_via_shell_app`: the send/stop/leave hint
+        /// `render::populate_ai_chat_controller` pins to `ChatController::
+        /// set_hint` must reach the painted surface once the panel has
+        /// focus, and stay there once the user starts typing — unlike the
+        /// `TextInput` placeholder above it, which the panel already
+        /// painted before #1507 and which vanishes the moment the input
+        /// buffer is non-empty.
+        ///
+        /// RED verified: with the `chat.set_hint(...)` call this issue adds
+        /// to `populate_ai_chat_controller` removed, this fails — the
+        /// painted surface after `<leader>ai` shows none of
+        /// "send"/"stop"/"editor" (confirmed by hand, mirroring the TUI
+        /// twin's RED verification — both call the same shared
+        /// `render::populate_ai_chat_controller`).
+        #[test]
+        fn hint_reaches_screen_and_survives_typing_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+            assert!(
+                h.driver.screen_contains("send")
+                    && h.driver.screen_contains("stop")
+                    && h.driver.screen_contains("editor"),
+                "the persistent hint must paint the send/stop/leave keys \
+                 once the panel has focus; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            assert!(
+                h.driver.screen_contains("send")
+                    && h.driver.screen_contains("stop")
+                    && h.driver.screen_contains("editor"),
+                "the persistent hint must stay on screen while typing (the \
+                 whole point of #1507 vs the old placeholder); painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// #1507 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::ai_panel_hint_and_focus_toggle::leader_ai_toggles_focus_
+        /// back_to_editor_via_shell_app`: pressing `<leader>ai` again while
+        /// the panel already has focus and its input is empty toggles focus
+        /// back to the editor (`Engine::ai_leader_toggle_key`, intercepted
+        /// by `render::route_ai_chat_event`).
+        ///
+        /// Proves focus genuinely returned to the editor (rendered output,
+        /// not state in isolation): a follow-up `i` must enter the editor's
+        /// own Insert mode, painted in the window status line — if focus
+        /// were still on the chat panel, that `i` would instead be typed as
+        /// a literal character into the (still-empty) message box.
+        ///
+        /// RED verified: with `render::route_ai_chat_event`'s
+        /// `ai_leader_toggle_key` intercept removed, `ai_has_focus` stays
+        /// `true`, the chat input reads back `"i"` instead of empty, and
+        /// the surface never shows "INSERT" — same failure shape as the TUI
+        /// twin (both share `render::route_ai_chat_event`).
+        #[test]
+        fn leader_ai_toggles_focus_back_to_editor_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+
+            assert!(
+                !h.engine.borrow().ai_has_focus,
+                "<leader>ai pressed again (panel focused, input empty) must \
+                 hand focus back to the editor"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "",
+                "the toggle-back gesture must not leave stray text in the \
+                 chat input"
+            );
+
+            h.driver.type_char('i');
+            assert!(
+                h.driver.screen_contains("INSERT"),
+                "pressing 'i' after the toggle must enter the editor's \
+                 Insert mode, proving focus is really back on the editor; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

@@ -8917,7 +8917,26 @@ pub fn route_ai_chat_event(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return engine.ai_has_focus;
     }
-    populate_ai_chat_controller(engine, theme);
+    populate_ai_chat_controller(engine, theme, backend);
+
+    // #1507: the `<leader>ai` focus-toggle gesture (see
+    // `Engine::ai_leader_toggle_key`'s doc for why this has to be
+    // intercepted here, ahead of the ordinary `ChatController::handle`
+    // call, rather than reusing `Engine::handle_leader_key`). Checked before
+    // the completion-popup intercepts below: `ai_leader_toggle_key` only
+    // ever engages while the input is empty, which is also the one state a
+    // completion popup can never be open in, so the two can't race.
+    if let quadraui::UiEvent::KeyPressed {
+        key: quadraui::Key::Char(ch),
+        modifiers,
+        ..
+    } = event
+    {
+        let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
+        if no_modifiers && engine.ai_leader_toggle_key(*ch) {
+            return engine.ai_has_focus;
+        }
+    }
 
     // #956 (ACP-5): while the slash-command completion popup is showing,
     // steal Tab (cycle selection) and Enter (accept) before handing the
@@ -20074,7 +20093,11 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 /// controller's own `Vec<ChatTurn>` mirror from it on every call, matching
 /// [`quadraui::ChatController::set_transcript`]'s "replace, don't
 /// accumulate" contract so streamed/cleared history never double-renders.
-pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
+pub fn populate_ai_chat_controller(
+    engine: &Engine,
+    theme: &Theme,
+    backend: &dyn quadraui::Backend,
+) {
     let user_fg = theme.keyword;
     let asst_fg = theme.string_lit;
     // ACP-1 (#952): agent "thought" chunks (`session/update`'s
@@ -20223,6 +20246,54 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
         header.push_str(&format!("  \u{b7} {}", attachment.chip()));
     }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
+    chat.set_hint(Some(quadraui::StyledText::colored(
+        ai_chat_hint_line(backend),
+        theme.comment,
+    )));
+}
+
+/// The persistent one-line hint `populate_ai_chat_controller` pins to
+/// [`quadraui::ChatController::set_hint`] (#1507) — unlike the built-in
+/// `TextInput` placeholder it replaces, this stays visible once the user
+/// starts typing (`ChatController`'s own *Persistent hint line* doc), which
+/// is the whole point: the send/stop/leave keys were previously only
+/// discoverable in the empty-input state.
+///
+/// The send-key list is adapted to what actually works on the live
+/// backend rather than a single hardcoded string:
+///
+/// - GTK (`backend_caps().generic_font_families` — true only for a real
+///   font-resolving GUI backend, `false` on every terminal backend per
+///   that field's own doc) reliably delivers a distinct `Ctrl+Enter`, so
+///   that's the one binding shown.
+/// - TUI always has `Alt+Enter` and `Ctrl+S` (`ChatController::handle`'s
+///   module doc: `Ctrl+S` "works on all terminals in both submit_on_enter
+///   modes"). `Ctrl+Enter` is only added when `backend_caps().
+///   kitty_keyboard` is actually active — that field's own doc says
+///   exactly this: "check this before relying on a gesture that needs the
+///   protocol (e.g. Ctrl+Enter distinct from Enter) and fall back to an
+///   always-available binding (Alt+Enter) when it's false" — so a hint
+///   promising a chord the detected terminal can't deliver never ships.
+///
+/// `Esc` and `<leader>ai` both return focus to the editor — the latter
+/// toggles when the panel already has focus and its input is empty (see
+/// [`Engine::ai_leader_toggle_key`], called from this same
+/// `route_ai_chat_event`) — so both are named rather than just `Esc` alone,
+/// closing the discoverability gap #1507 reports for the focus toggle too.
+fn ai_chat_hint_line(backend: &dyn quadraui::Backend) -> String {
+    let caps = backend.backend_caps();
+    let send_keys = if caps.generic_font_families {
+        "Ctrl+Enter".to_string()
+    } else if caps.kitty_keyboard {
+        "\u{2325}\u{23ce}/^S/Ctrl+Enter".to_string()
+    } else {
+        "\u{2325}\u{23ce}/^S".to_string()
+    };
+    // `<leader>ai` is shown verbatim regardless of `Settings::leader`'s
+    // actual character — the same convention every other leader-sequence
+    // hint in this codebase uses (e.g. `mod.rs`'s command-palette
+    // `shortcut: "<leader>sw"` fields), not a literal re-expansion.
+    format!("\u{23ce} newline \u{b7} {send_keys} send \u{b7} ^C stop \u{b7} Esc/<leader>ai editor")
 }
 
 /// Paint the slash-command or `@`-mention completion popup above the AI
