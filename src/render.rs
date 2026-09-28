@@ -21640,6 +21640,97 @@ fn build_rendered_window(
         vec![]
     };
 
+    // ── Sticky scroll (#1546) ────────────────────────────────────────────
+    // Pin the header lines of `scroll_top`'s enclosing scopes at the top of
+    // the viewport by splicing them directly over `lines[0..k]` — reusing
+    // the exact same per-row paint + click-to-jump machinery every other
+    // row already goes through (`RenderedLine::line_idx` is what click
+    // hit-testing resolves screen row -> buffer line with). No backend-
+    // specific overlay code, no new quadraui primitive: the covered rows
+    // *are* the pinned band. See `sticky_scroll::enclosing_scope_headers`'s
+    // doc for the scope-source scoping (indent-hierarchy fallback only;
+    // LSP `documentSymbol` as the primary source is a deferred follow-up).
+    //
+    // Applied after indent guides / colorcolumns / bracket-match above, so
+    // spliced header rows don't carry those (cosmetic-only gap — they still
+    // get full syntax highlighting via `build_spans` below). Never covers
+    // the cursor's own row: if the cursor is already at (or above) a row a
+    // header would occupy, this is a no-op for that frame rather than
+    // hiding the cursor.
+    if engine.settings.sticky_scroll && scroll_top > 0 && !lines.is_empty() {
+        let headers = crate::core::engine::sticky_scroll::enclosing_scope_headers(
+            buffer,
+            scroll_top,
+            engine.settings.shift_width as usize,
+        );
+        let k = headers.len().min(lines.len());
+        if k > 0 && !lines[..k].iter().any(|l| l.is_current_line) {
+            let is_markdown = buffer_state
+                .file_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .and_then(crate::core::syntax::SyntaxLanguage::from_path)
+                == Some(crate::core::syntax::SyntaxLanguage::Markdown);
+            for (row, &header_line) in headers.iter().take(k).enumerate() {
+                let header_rope_line = buffer.content.line(header_line);
+                let header_line_str = header_rope_line.to_string().replace('\0', "");
+                let header_start_byte = buffer.content.line_to_byte(header_line);
+                let header_end_byte = header_start_byte + header_rope_line.len_bytes();
+                let spans = build_spans(
+                    engine,
+                    theme,
+                    &buffer_state.highlights,
+                    &buffer_state.semantic_tokens,
+                    buffer,
+                    header_line,
+                    &header_line_str,
+                    header_start_byte,
+                    header_end_byte,
+                    is_markdown,
+                    &buf_search_matches,
+                    Some(window.buffer_id) == active_buf_id,
+                );
+                let marker_cols = (if has_bp { 1 } else { 0 }) + (if has_git { 1 } else { 0 });
+                let base_gutter = format_gutter_with_fold(
+                    line_number_mode,
+                    header_line,
+                    cursor_line,
+                    gutter_char_width.saturating_sub(marker_cols),
+                    ' ',
+                );
+                let gutter_text = format!(
+                    "{}{}{}",
+                    if has_bp { " " } else { "" },
+                    if has_git { " " } else { "" },
+                    base_gutter
+                );
+                lines[row] = RenderedLine {
+                    raw_text: header_line_str.trim_end_matches(['\n', '\r']).to_string(),
+                    gutter_text,
+                    is_current_line: false,
+                    spans,
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    line_idx: header_line,
+                    git_diff: None,
+                    diagnostics: Vec::new(),
+                    spell_errors: Vec::new(),
+                    diff_status: None,
+                    is_breakpoint: false,
+                    is_conditional_bp: false,
+                    is_dap_current: false,
+                    is_wrap_continuation: false,
+                    segment_col_offset: 0,
+                    annotation: None,
+                    ghost_suffix: None,
+                    is_ghost_continuation: false,
+                    indent_guides: Vec::new(),
+                    colorcolumns: Vec::new(),
+                };
+            }
+        }
+    }
+
     RenderedWindow {
         window_id,
         rect: *rect,

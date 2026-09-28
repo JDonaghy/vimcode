@@ -4676,6 +4676,174 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Sticky scroll (#1546): pin enclosing-scope header lines at the top of
+    // the editor pane while scrolling.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod sticky_scroll {
+        use super::*;
+
+        /// Builds `fn STICKYOUTER1546() {` / `    fn STICKYINNER1546() {`
+        /// followed by 40 body lines and closing braces, scrolled so both
+        /// headers are far above the viewport (`scroll_top = 20`, cursor at
+        /// line 25 — safely below the pinned band so the "never hide the
+        /// cursor" guard doesn't suppress it).
+        fn nested_scopes_engine() -> crate::core::Engine {
+            let mut engine = plain_engine();
+            let mut text = String::from("fn STICKYOUTER1546() {\n    fn STICKYINNER1546() {\n");
+            for i in 0..40 {
+                text.push_str(&format!("        body line {i}\n"));
+            }
+            text.push_str("    }\n}\n");
+            engine.buffer_mut().insert(0, &text);
+            engine.view_mut().scroll_top = 20;
+            engine.view_mut().cursor.line = 25;
+            engine.view_mut().cursor.col = 0;
+            engine
+        }
+
+        /// Scrolling past a nested scope's opener lines must pin them at the
+        /// top of the viewport instead of letting them scroll away — VS
+        /// Code's `editor.stickyScroll.enabled`. Reads the actual painted
+        /// `RenderedWindow` for the row → buffer-line mapping (never a
+        /// hardcoded coordinate, #555) and cross-checks the character grid
+        /// itself (#587/#592's lesson: assert on paint, not engine state).
+        ///
+        /// **Verified RED against unfixed `develop`**: with `render::
+        /// build_rendered_window`'s sticky-scroll splice block deleted
+        /// entirely, rows 0/1 show `body line 18`/`body line 19` (buffer
+        /// lines 20/21 — `scroll_top`'s own real top-of-viewport content,
+        /// since the two header lines shift every body line's buffer index
+        /// up by 2 from its `{i}` suffix) instead of the two headers, and
+        /// the `line_idx`/`screen_contains` assertions below fail. Restored
+        /// before committing.
+        #[test]
+        fn scrolling_past_enclosing_scopes_pins_their_headers_via_shell_app() {
+            let mut h = harness_no_sidebar(nested_scopes_engine());
+            h.driver.render();
+
+            let (row0_idx, row1_idx, row2_idx, row0_text, row1_text) = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have painted");
+                let rw = &layout.windows[0];
+                (
+                    rw.lines[0].line_idx,
+                    rw.lines[1].line_idx,
+                    rw.lines[2].line_idx,
+                    rw.lines[0].raw_text.clone(),
+                    rw.lines[1].raw_text.clone(),
+                )
+            };
+
+            assert_eq!(
+                row0_idx, 0,
+                "row 0 must be pinned to the outer scope's header line (buffer line 0)"
+            );
+            assert!(
+                row0_text.contains("STICKYOUTER1546"),
+                "row 0's pinned text: {row0_text:?}"
+            );
+            assert_eq!(
+                row1_idx, 1,
+                "row 1 must be pinned to the inner scope's header line (buffer line 1)"
+            );
+            assert!(
+                row1_text.contains("STICKYINNER1546"),
+                "row 1's pinned text: {row1_text:?}"
+            );
+            // Rows past the pinned band are untouched — row 2 is still the
+            // *third* row of the original `scroll_top`-anchored viewport
+            // (buffer line 22), not shifted down to compensate for the
+            // splice. The two rows the headers displaced (buffer lines
+            // 20/21) are simply covered, not moved elsewhere.
+            assert_eq!(
+                row2_idx, 22,
+                "row 2 (untouched by the splice) must still be the third \
+                 row of the scroll_top-anchored viewport (buffer line 22)"
+            );
+
+            assert!(
+                h.driver.screen_contains("STICKYOUTER1546"),
+                "the pinned outer header must reach the painted character grid:\n{}",
+                h.driver.screen()
+            );
+            assert!(
+                h.driver.screen_contains("STICKYINNER1546"),
+                "the pinned inner header must reach the painted character grid:\n{}",
+                h.driver.screen()
+            );
+            // `scroll_top`'s own line (buffer line 20 = body index 18,
+            // since the two header lines shift every body line's buffer
+            // index up by 2) must no longer occupy row 0/1 — it was pushed
+            // down behind the pinned band, not lost.
+            assert!(
+                !h.driver.screen_contains("body line 18"),
+                "the real top-of-viewport content (`body line 18`, buffer \
+                 line 20 = scroll_top) must be covered by the pinned \
+                 headers, not painted alongside them:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        /// `sticky_scroll = false` must turn the whole feature off: the
+        /// scrolled-to body line paints at the true top of the viewport
+        /// again, with neither header pinned. Exists so the test above
+        /// can't pass merely because `STICKYOUTER1546`/`STICKYINNER1546`
+        /// happen to appear somewhere else on screen (they don't, but this
+        /// closes that loophole directly) and to prove the setting itself
+        /// is load-bearing, not just plumbed through `Settings` with no
+        /// paint-side effect.
+        #[test]
+        fn sticky_scroll_false_disables_the_pinned_band_via_shell_app() {
+            let mut engine = nested_scopes_engine();
+            engine.settings.sticky_scroll = false;
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let row0_idx = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have painted");
+                layout.windows[0].lines[0].line_idx
+            };
+            assert_eq!(
+                row0_idx, 20,
+                "with sticky_scroll off, row 0 must show the real scrolled-to \
+                 top line (buffer line 20, `scroll_top`), not a pinned header"
+            );
+            assert!(
+                !h.driver.screen_contains("STICKYOUTER1546"),
+                "no header should be pinned when sticky_scroll is off:\n{}",
+                h.driver.screen()
+            );
+        }
+
+        /// Clicking a pinned sticky-scroll header must jump the cursor to
+        /// that line — reuses the exact same `RenderedLine::line_idx` click
+        /// hit-test every other row goes through
+        /// (`render::window_zone_hit_test`), proved end-to-end through a
+        /// real click rather than asserting on the hit-test function in
+        /// isolation.
+        #[test]
+        fn clicking_a_pinned_sticky_header_jumps_the_cursor_to_it_via_shell_app() {
+            let mut h = harness_no_sidebar(nested_scopes_engine());
+            h.driver.render();
+
+            let (x, y) = h
+                .driver
+                .find("STICKYINNER1546")
+                .expect("the pinned inner header must paint somewhere on screen");
+            h.driver.click(x, y);
+
+            assert_eq!(
+                h.engine.borrow().view().cursor.line,
+                1,
+                "clicking the pinned inner-scope header must move the cursor \
+                 to its real buffer line (1), not wherever it visually sits \
+                 in the scrolled viewport"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // User-configured MCP servers (#1487, redo of #1462 on the multi-session
     // engine — see that issue's "Tests go on the App-on-TUI seam" redo note)
     // ─────────────────────────────────────────────────────────────────────────
