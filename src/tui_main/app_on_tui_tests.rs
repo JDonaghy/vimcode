@@ -6617,4 +6617,199 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1507: AI panel persistent send/stop/leave hint + `<leader>ai` focus
+    // toggle
+    // ─────────────────────────────────────────────────────────────────────
+    mod ai_panel_hint_and_focus_toggle {
+        use super::*;
+
+        /// Build a fixture with the AI panel already the active sidebar
+        /// panel, widened well past the default 20-cell content rect via
+        /// the real `Alt+Right` "resize sidebar" gesture
+        /// (`render::alt_resized_sidebar_width`) so the persistent hint's
+        /// full text has room to paint instead of being clipped mid-word —
+        /// the same clipping the built-in `TextInput` placeholder already
+        /// suffers at the narrower default (confirmed by hand while writing
+        /// this test: at the default width the placeholder itself reads
+        /// "Type a m" before running out of room). 40 presses of the
+        /// production `alt_resized_sidebar_width` (`current + 1`, clamped
+        /// at `ALT_SIDEBAR_WIDTH_MAX = 150`) takes the 20-cell default to
+        /// 60, comfortably past this hint's ~57-character width.
+        fn ai_panel_harness_widened() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// #1507 acceptance: the send/stop/leave hint
+        /// `render::populate_ai_chat_controller` pins to
+        /// `ChatController::set_hint` must (a) actually reach the painted
+        /// screen once the panel has keyboard focus and (b) stay on screen
+        /// once the user starts typing a message — unlike the `TextInput`
+        /// placeholder it sits above, which the panel already painted
+        /// before #1507 and which vanishes the moment the input buffer is
+        /// non-empty (`ChatController`'s own *Persistent hint line* doc).
+        /// Focus is driven in through the real `<leader>ai` key sequence
+        /// (default leader: Space), not `engine.ai_has_focus = true`
+        /// directly, so the test exercises the same production key-dispatch
+        /// path a user's keystrokes take.
+        ///
+        /// RED verified: with the `chat.set_hint(...)` call this issue adds
+        /// to `populate_ai_chat_controller` removed, this fails — the
+        /// screen after `<leader>ai` shows none of "send"/"stop"/"editor",
+        /// and typing "hi" doesn't change that (there was never anything to
+        /// lose).
+        #[test]
+        fn hint_reaches_screen_and_survives_typing_via_shell_app() {
+            let mut h = ai_panel_harness_widened();
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("send") && screen.contains("stop") && screen.contains("editor"),
+                "the persistent hint must paint the send/stop/leave keys \
+                 once the panel has focus; screen:\n{screen}"
+            );
+
+            // Unlike the pre-#1507 empty-input placeholder, the hint must
+            // not vanish once the user starts composing a message.
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("send") && screen.contains("stop") && screen.contains("editor"),
+                "the persistent hint must stay on screen while typing (the \
+                 whole point of #1507 vs the old placeholder); screen:\n{screen}"
+            );
+        }
+
+        /// #1507 acceptance: pressing `<leader>ai` again while the AI panel
+        /// already has keyboard focus and its input is empty toggles focus
+        /// back to the editor — `Engine::ai_leader_toggle_key`, intercepted
+        /// by `render::route_ai_chat_event` ahead of `ChatController::
+        /// handle`'s ordinary text-insertion path.
+        ///
+        /// Proves focus genuinely returned to the editor, not merely that
+        /// `ai_has_focus` flipped in isolation (CLAUDE.md's "rendered
+        /// output, not state" rule): a subsequent `i` keystroke must enter
+        /// the editor's own Insert mode (painted in the window status
+        /// line's mode segment, `Engine::mode_str`) — if focus were still on
+        /// the chat panel, that same `i` would instead be typed as a
+        /// literal character into the now-empty message box, and Insert
+        /// mode would never show.
+        ///
+        /// RED verified: with `render::route_ai_chat_event`'s
+        /// `ai_leader_toggle_key` intercept removed (so `<leader>ai`'s three
+        /// characters fall through to `ChatController::handle`'s plain
+        /// text-insertion path instead), this fails two ways: `ai_has_focus`
+        /// stays `true`, and the follow-up `i` reads back as literal text
+        /// (`ChatController::input_text() == "i"`), never as an editor mode
+        /// change — the screen never shows "INSERT" at all.
+        #[test]
+        fn leader_ai_toggles_focus_back_to_editor_via_shell_app() {
+            let mut h = ai_panel_harness_widened();
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            // Pressed again while the input is empty and the panel already
+            // has focus: toggle back to the editor instead of typing
+            // " ai" into the chat message.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+
+            assert!(
+                !h.engine.borrow().ai_has_focus,
+                "<leader>ai pressed again (panel focused, input empty) must \
+                 hand focus back to the editor"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "",
+                "the toggle-back gesture must not leave stray text in the \
+                 chat input"
+            );
+
+            h.driver.type_char('i');
+            h.driver.render();
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("INSERT"),
+                "pressing 'i' after the toggle must enter the editor's \
+                 Insert mode, proving focus is really back on the editor \
+                 and not still consuming keys into the chat input; \
+                 screen:\n{screen}"
+            );
+        }
+
+        /// #1507: typing the literal characters ` ai` into an in-progress
+        /// message must never be swallowed as the focus-toggle gesture —
+        /// `Engine::ai_leader_toggle_key` only engages while the input is
+        /// empty, precisely so a real message containing those characters
+        /// is never at risk.
+        #[test]
+        fn leader_ai_sequence_is_literal_text_once_input_is_non_empty_via_shell_app() {
+            let mut h = ai_panel_harness_widened();
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: panel must be focused"
+            );
+
+            for c in "say ai please".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "typing a message that happens to contain \" ai\" must not \
+                 toggle focus away from the panel"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "say ai please",
+                "every character of the message, including \" ai\", must \
+                 land in the chat input verbatim"
+            );
+        }
+    }
 }

@@ -3495,6 +3495,68 @@ impl Engine {
         true
     }
 
+    /// Intercept a plain, unmodified character key that might be starting,
+    /// continuing, or completing the `<leader>ai` focus-toggle gesture
+    /// (#1507) — checked by `render::route_ai_chat_event` *before* the key
+    /// reaches `ChatController::handle`'s ordinary text-insertion path,
+    /// exactly like that function's existing slash-command/`@`-mention Tab
+    /// and Enter intercepts above it.
+    ///
+    /// Only engages while `self.ai_chat`'s input buffer is empty — the same
+    /// convention Vim's own `<leader>` sequences follow by only ever being
+    /// read from Normal mode's "nothing pending" state — chosen specifically
+    /// so this gesture can never eat characters out of a message the user is
+    /// actually composing: the moment the buffer holds anything, this
+    /// returns `false` unconditionally and every key goes back to being
+    /// ordinary typed text.
+    ///
+    /// A separate small buffer ([`Engine::ai_leader_toggle_pending`]) tracks
+    /// the match rather than reusing the Normal-mode leader machinery
+    /// (`Engine::leader_partial`/`Engine::handle_leader_key`): that machinery
+    /// runs from `Engine::handle_key`'s own dispatch ladder, which
+    /// `render::route_focus_key` never reaches while `ai_has_focus` is set —
+    /// every keystroke goes straight to this panel instead (see
+    /// `render::route_focus_key`'s doc). There is no path left for the
+    /// existing "ai" arm in `Engine::handle_leader_key` to fire a *second*
+    /// time once the panel already has focus, which is exactly the gap
+    /// #1507 reports.
+    ///
+    /// Returns `true` when the key was consumed as part of the gesture
+    /// (still matching, or matched in full — either way the caller must not
+    /// also feed it to `ChatController::handle`). Returns `false` when the
+    /// key breaks a match: any previously-buffered prefix is first replayed
+    /// into the input verbatim (via `ChatController::input_insert_str`) so
+    /// nothing typed is silently dropped, then the caller is free to run the
+    /// *current* key through the normal path itself.
+    pub fn ai_leader_toggle_key(&mut self, ch: char) -> bool {
+        if !self.ai_chat.borrow().input_text().is_empty() {
+            self.ai_leader_toggle_pending.clear();
+            return false;
+        }
+        let pending = std::mem::take(&mut self.ai_leader_toggle_pending);
+        let expected = match pending.chars().count() {
+            0 => self.settings.leader,
+            1 => 'a',
+            _ => 'i',
+        };
+        if ch != expected {
+            if !pending.is_empty() {
+                self.ai_chat.borrow_mut().input_insert_str(&pending);
+            }
+            return false;
+        }
+        let mut matched = pending;
+        matched.push(ch);
+        if matched.chars().count() >= 3 {
+            // Full `<leader>ai` match: toggle focus back to the editor,
+            // mirroring `dispatch_ai_chat_event`'s `Cancelled` (Escape) arm.
+            self.ai_has_focus = false;
+        } else {
+            self.ai_leader_toggle_pending = matched;
+        }
+        true
+    }
+
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
     /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
     /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
@@ -4029,5 +4091,74 @@ mod ai_mention_completions_exclude_tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+}
+
+#[cfg(test)]
+mod ai_leader_toggle_key_tests {
+    use crate::core::Engine;
+
+    /// A full `<leader>ai` match (default leader: Space) while the chat
+    /// input is empty toggles `ai_has_focus` off and leaves the pending
+    /// buffer clean — the unit-level twin of the driver tests in
+    /// `tui_main::app_on_tui_tests`/`gtk::testing` (#1507).
+    #[test]
+    fn full_match_toggles_focus_off() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '), "1st key must be consumed");
+        assert!(engine.ai_has_focus, "still armed after 1 of 3 keys");
+        assert!(engine.ai_leader_toggle_key('a'), "2nd key must be consumed");
+        assert!(engine.ai_has_focus, "still armed after 2 of 3 keys");
+        assert!(engine.ai_leader_toggle_key('i'), "3rd key must be consumed");
+        assert!(
+            !engine.ai_has_focus,
+            "the full <leader>ai sequence must toggle focus off"
+        );
+        assert_eq!(engine.ai_leader_toggle_pending, "");
+    }
+
+    /// A key that breaks the match replays the buffered prefix into the
+    /// chat input verbatim and reports "not consumed", so the caller feeds
+    /// the breaking key through the ordinary text-insertion path itself —
+    /// nothing typed is silently dropped.
+    ///
+    /// RED verified: with the `if !pending.is_empty() { ...
+    /// input_insert_str(&pending) }` replay removed from
+    /// `ai_leader_toggle_key`, this fails — the input stays empty instead
+    /// of holding the replayed `" a"` prefix.
+    #[test]
+    fn mismatch_replays_buffered_prefix_into_input() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        // 'x' breaks the "<leader>ai" match at the third key.
+        assert!(!engine.ai_leader_toggle_key('x'));
+        assert!(engine.ai_has_focus, "a broken match must not toggle focus");
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            " a",
+            "the buffered ' a' prefix must be replayed into the input \
+             verbatim rather than silently dropped"
+        );
+        assert_eq!(engine.ai_leader_toggle_pending, "");
+    }
+
+    /// Once the input already holds text, every key is ordinary typed text
+    /// — the gesture never engages, so a message containing " ai" is never
+    /// at risk of being swallowed as the toggle.
+    #[test]
+    fn never_engages_once_input_is_non_empty() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        engine.ai_chat.borrow_mut().input_insert_str("hello");
+        assert!(!engine.ai_leader_toggle_key(' '));
+        assert!(!engine.ai_leader_toggle_key('a'));
+        assert!(!engine.ai_leader_toggle_key('i'));
+        assert!(
+            engine.ai_has_focus,
+            "typing ' ai' into a non-empty input must never toggle focus"
+        );
     }
 }
