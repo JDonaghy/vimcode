@@ -33,5 +33,23 @@
 //! `WinBackend` verbatim (see this file's own doc above) and, per the
 //! sizing arithmetic already inspected, has no decision of its own that
 //! could produce a left-specific gap even in principle.
+//!
+//! # #1562: chrome parity with macOS — font and status segments already
+//! # fine, title bar/command centre is a real quadraui gap
+//!
+//! vimcode#1562 asked for UI-font resolution, title-bar/command-centre
+//! parity, and status-line segment parity with macOS. The font and
+//! status-segment items turned out to already be backend-neutral/already
+//! fixed upstream (`quadraui::win::backend::parse_ui_font_desc`'s
+//! `GenericFamily` resolution; the shared `primitives::status_bar::
+//! native_surface_paint::paint` rasteriser both backends call) — nothing
+//! for this file to change. The title-bar/command-centre item is real:
+//! `WinBackend::backend_caps()` declares neither `native_menu` nor
+//! `window_chrome`, and `win::run` creates a plain `WS_OVERLAPPEDWINDOW`
+//! with no custom-caption `WM_NCCALCSIZE`/`WM_NCHITTEST` handling. See
+//! `src/win/mod.rs`'s `#1562` doc section for the full write-up and
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the drafted ask —
+//! both are quadraui-side (`WinBackend`/`win::run`), so nothing changes in
+//! this 1-line re-export.
 
 pub use quadraui::win::WinBackend;
