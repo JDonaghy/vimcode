@@ -743,12 +743,13 @@ impl Engine {
     /// Populate the `:AiSessions` picker (#1459) from the local session
     /// index, scoped to the active agent + workspace, most-recently-used
     /// first (`AcpSessionIndex::sessions_for` already sorts that way). The
-    /// entry's `display` is the first prompt that started the session
-    /// (falling back to the raw session id for a record predating that
-    /// field, which can't happen post-#1459 but costs nothing to guard),
-    /// since a bare session id means nothing to a human; `detail` is a
-    /// relative "last used" timestamp, reusing `git::epoch_to_relative`'s
-    /// bucketing rather than re-deriving it.
+    /// entry's `display` prefers the agent-assigned `title` (#1519,
+    /// `session_info_update`) when one has been learned, else falls back
+    /// to the first prompt that started the session, else the raw session
+    /// id (a record predating either field, which can't happen post-#1459
+    /// but costs nothing to guard) — since a bare session id means nothing
+    /// to a human; `detail` is a relative "last used" timestamp, reusing
+    /// `git::epoch_to_relative`'s bucketing rather than re-deriving it.
     fn picker_populate_acp_sessions(&mut self) {
         let agent_name = self.acp_active_agent_name();
         let cwd = self.acp_workspace_cwd();
@@ -757,10 +758,10 @@ impl Engine {
             .sessions_for(&agent_name, &cwd)
             .into_iter()
             .map(|record| {
-                let display = if record.first_prompt.is_empty() {
-                    record.session_id.clone()
-                } else {
-                    record.first_prompt.clone()
+                let display = match record.title.as_deref() {
+                    Some(title) if !title.is_empty() => title.to_string(),
+                    _ if !record.first_prompt.is_empty() => record.first_prompt.clone(),
+                    _ => record.session_id.clone(),
                 };
                 let detail = crate::core::git::epoch_to_relative(record.updated_at as i64);
                 PickerItem {

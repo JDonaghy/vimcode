@@ -6911,6 +6911,64 @@ second line here
         );
     }
 
+    /// #1519 acceptance, GTK's twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// unknown_agent_request_is_answered_not_left_parked_via_shell_app`: an
+    /// agent -> client request whose method this client has no handler for
+    /// must be answered immediately with JSON-RPC `-32601`, never left
+    /// parked forever. The fixture's `$ACP_FAKE_UNKNOWN_REQUEST` sends one
+    /// mid-turn and BLOCKS reading the reply before it can send the
+    /// post-reply chunk or `stopReason: end_turn` — pre-#1519, the client's
+    /// `_ => {}` no-op left that request unanswered, hanging the fixture
+    /// (and the whole turn) forever.
+    ///
+    /// RED verified the same way as the TUI twin: reverting the `_` arm in
+    /// `Engine::acp_dispatch_events`'s `ClientRequest` match to `_ => {}`
+    /// makes this fail — the screen never shows `"ANSWERED1519"` within the
+    /// deadline below.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_agent_request_is_answered_not_left_parked_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_UNKNOWN_REQUEST=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("ANSWERED1519") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("ANSWERED1519"),
+            "the fixture's post-reply chunk (only sent once the client has \
+             actually answered the unknown-method request) must paint \
+             within 5s -- it must be answered immediately, not left parked"
+        );
+    }
+
     /// #1459 acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
     /// transcript_via_shell_app`: `:AiSessions` lists past sessions for the

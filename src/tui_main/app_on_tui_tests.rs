@@ -5339,6 +5339,77 @@ mod tests {
         }
     }
 
+    mod issue_1519_acp_conformance {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// #1519 acceptance: an agent -> client request whose method this
+        /// client has no handler for must be answered immediately with
+        /// JSON-RPC `-32601`, never left parked forever. The fixture's
+        /// `$ACP_FAKE_UNKNOWN_REQUEST` sends one mid-turn and BLOCKS reading
+        /// the reply before it can send `stopReason: end_turn` — pre-#1519,
+        /// the client's `_ => {}` no-op left that request unanswered, so the
+        /// fixture (and the whole turn) hung forever and the reply text
+        /// never painted. Drives a real turn through `:AI hi`, the same
+        /// entry point `acp_mcp_servers`'s tests above use, and reads the
+        /// painted transcript.
+        ///
+        /// RED verified: reverting the `_` arm in `Engine::
+        /// acp_dispatch_events`'s `ClientRequest` match to `_ => {}` makes
+        /// this fail — the screen never shows "Hello world" within the
+        /// deadline below (in fact it hangs for the fixture's remaining
+        /// lifetime, since the unanswered request blocks its own `read`).
+        #[cfg(unix)]
+        #[test]
+        fn unknown_agent_request_is_answered_not_left_parked_via_shell_app() {
+            let mut engine = plain_engine();
+            // See `acp_mcp_servers`'s sibling tests for why this must run
+            // before the fixture agent is configured.
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_UNKNOWN_REQUEST=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("ANSWERED1519") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("ANSWERED1519"),
+                "the fixture's post-reply chunk (only sent once the client \
+                 has actually answered the unknown-method request) must \
+                 paint within 5s -- it must be answered immediately, not \
+                 left parked; screen:\n{screen}"
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // #1500: public App-on-TUI test seam
     //
