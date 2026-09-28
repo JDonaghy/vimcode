@@ -4267,6 +4267,83 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Fold gutter controls (#1544, VS Code's `editor.showFoldingControls`)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod fold_controls {
+        use super::*;
+
+        /// The default `fold_controls = "mouseover"` paints the open-fold
+        /// `-` gutter marker only while the pointer is over that window's
+        /// gutter. Both backends route through the same shared
+        /// `App::handle_dispatch` `MouseMoved` arm (`render::
+        /// route_gutter_hover`), which sets `Engine::gutter_hover_window` —
+        /// read back by `render::build_rendered_window` on the very next
+        /// paint — so no per-backend hover geometry exists for this at all.
+        ///
+        /// Reads the exact gutter cell the fold indicator paints into (the
+        /// leftmost column of the block-opener line's own row, resolved
+        /// from the just-painted `RenderedWindow`, never a hardcoded
+        /// coordinate, #555) — not `gutter_hover_window` being `Some`
+        /// (#587/#592's lesson: state can be right while paint ignores it).
+        ///
+        /// **Verified RED against unfixed `develop`**: reverting `render::
+        /// fold_indicator_char` to always show `-` for a genuine block
+        /// opener (dropping the `open_markers_visible` gate this issue
+        /// adds) makes the "before hover" assertion below fail — the
+        /// marker paints immediately, with no hover required.
+        #[test]
+        fn open_fold_marker_paints_only_while_the_gutter_is_hovered_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "fn foo() {\n    body\n}\n");
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let (row, col) = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have painted");
+                let rw = &layout.windows[0];
+                let view_row = rw
+                    .lines
+                    .iter()
+                    .position(|rl| rl.line_idx == 0)
+                    .expect("the block-opener line must be in the painted viewport");
+                (rw.rect.y as usize + view_row, rw.rect.x as usize)
+            };
+
+            let screen_before = h.driver.screen();
+            let before = screen_before
+                .lines()
+                .nth(row)
+                .and_then(|l| l.chars().nth(col))
+                .unwrap_or(' ');
+            assert_ne!(
+                before,
+                '-',
+                "no pointer has moved onto the gutter yet, so the open-fold \
+                 marker must not be painted under the default \
+                 `fold_controls = mouseover`; row {row}: {:?}",
+                screen_before.lines().nth(row)
+            );
+
+            h.driver.mouse_move(col as f32, row as f32);
+
+            let screen_after = h.driver.screen();
+            let after = screen_after
+                .lines()
+                .nth(row)
+                .and_then(|l| l.chars().nth(col))
+                .unwrap_or(' ');
+            assert_eq!(
+                after,
+                '-',
+                "hovering this window's gutter must paint the `-` open-fold \
+                 marker on its block-opener line; row {row}: {:?}",
+                screen_after.lines().nth(row)
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // User-configured MCP servers (#1487, redo of #1462 on the multi-session
     // engine — see that issue's "Tests go on the App-on-TUI seam" redo note)
     // ─────────────────────────────────────────────────────────────────────────

@@ -4518,6 +4518,15 @@ pub struct Engine {
     pub editor_hover_content: HashMap<usize, String>,
     /// Tab hover tooltip: shortened file path shown when hovering a tab.
     pub tab_hover_tooltip: Option<String>,
+    /// Which editor window's gutter the pointer is currently over, or
+    /// `None` — updated by `render::route_gutter_hover` from the shared
+    /// `MouseMoved` path on both backends (`App::handle_dispatch`), read by
+    /// `render::build_rendered_window` to gate the `fold_controls =
+    /// "mouseover"` open-fold gutter markers (#1544). Not dwell-tracked like
+    /// `editor_hover_dwell`/`panel_hover_dwell` above — no popup delay is
+    /// wanted here, the marker should track the pointer immediately, the
+    /// same as VS Code.
+    pub gutter_hover_window: Option<WindowId>,
     /// Performance profiling log for the last slow keystroke (> 5ms).
     pub perf_log: Option<String>,
 
@@ -5184,6 +5193,7 @@ impl Engine {
             editor_hover_has_focus: false,
             editor_hover_content: HashMap::new(),
             tab_hover_tooltip: None,
+            gutter_hover_window: None,
             perf_log: None,
             panel_hover: None,
             panel_hover_dwell: None,
