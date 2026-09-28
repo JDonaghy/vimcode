@@ -10705,35 +10705,106 @@ pub fn paint_picker_rung(
     rect
 }
 
-/// Should [`paint_context_menu_rung`] hand the context menu off to
-/// [`quadraui::Backend::show_context_menu`] (a native OS popup) instead of
-/// painting `ContextMenuPanel` in-window (#902)?
-///
-/// `style` is the user's `menu_style` setting
-/// ([`crate::core::settings::MenuStyle`]); `caps` is the backend's own
-/// advertised capabilities. `Native`/`Inherit` are only honoured when the
-/// backend actually declares `native_menu` — a backend that can't show one
-/// (GTK, TUI: `native_menu: false`) must still fall back to the in-window
-/// path rather than silently drawing nothing, matching #901's identical
-/// capability gate for the menu bar. `Custom` always draws in-window,
-/// regardless of capability.
-///
-/// `Inherit` (the default, matching VS Code's `window.menuStyle`) has no
-/// `titleBarStyle` counterpart in vimcode yet, so until one exists it
-/// resolves the same as `Native` — see [`crate::core::settings::MenuStyle`]'s
-/// doc comment.
-pub fn context_menu_should_be_native(
-    style: crate::core::settings::MenuStyle,
-    caps: quadraui::BackendCaps,
-) -> bool {
+/// Map vimcode's own [`crate::core::settings::MenuStyle`] onto
+/// [`quadraui::MenuStyle`] (quadraui#1187, #1580). The two enums are
+/// deliberately defined with the same three variants (`Auto`/`Native`/
+/// `Custom`) so this is a straight 1:1 translation with no capability
+/// logic of its own — [`quadraui::Backend::effective_menu_style`] (built
+/// from [`quadraui::MenuStyle::resolve`] against
+/// [`quadraui::BackendCaps::native_menu`]) does that, and is what callers
+/// should consult instead of re-deriving a native/custom decision here.
+pub fn to_quadraui_menu_style(style: crate::core::settings::MenuStyle) -> quadraui::MenuStyle {
     use crate::core::settings::MenuStyle;
     match style {
-        MenuStyle::Native | MenuStyle::Inherit => caps.native_menu,
-        MenuStyle::Custom => false,
+        MenuStyle::Auto => quadraui::MenuStyle::Auto,
+        MenuStyle::Native => quadraui::MenuStyle::Native,
+        MenuStyle::Custom => quadraui::MenuStyle::Custom,
     }
 }
 
-/// The [`FrameOp::ContextMenu`] rung's whole body on both backends.
+/// Build the render-side [`ContextMenuPanel`] from the engine's own
+/// [`crate::core::engine::ContextMenuState`] — the same conversion the
+/// `ScreenLayout` builder uses every frame, factored out so
+/// [`show_context_menu_now`]'s event-handler-time caller can build the
+/// identical value without waiting for a render pass (#1580).
+pub fn context_menu_state_to_panel(cm: &crate::core::engine::ContextMenuState) -> ContextMenuPanel {
+    ContextMenuPanel {
+        items: cm
+            .items
+            .iter()
+            .map(|item| ContextMenuRenderItem {
+                label: item.label.clone(),
+                shortcut: item.shortcut.clone(),
+                separator_after: item.separator_after,
+                enabled: item.enabled,
+            })
+            .collect(),
+        selected_idx: cm.selected,
+        screen_col: cm.screen_x,
+        screen_row: cm.screen_y,
+        trigger_height: cm.trigger_height,
+    }
+}
+
+/// Show `panel` as a native OS context-menu popup right now (#1580).
+///
+/// This is the event-handler-time half of what used to be
+/// `paint_context_menu_rung`'s `native` branch (#902) — moved out of the
+/// render rung entirely. Callers **must** invoke this from event-handling
+/// code (typically right after `Engine::open_*_context_menu`), never from
+/// `render_content`'s paint rung: `MacBackend::show_context_menu`
+/// (quadraui's only `native_menu: true` backend) blocks on AppKit's modal
+/// popup loop, and running that from inside a paint closure re-enters
+/// painting while the closure still holds borrows it needs to finish its
+/// own frame — the exact bug this fixes (a queued
+/// `UiEvent::ContextMenuItemActivated` that only got handled on the
+/// *next* repaint, when it was handled at all; see `App::handle`'s
+/// context-menu right-click arm for the call site).
+///
+/// Uses the same `ContextMenu`/`WidgetId`s [`paint_context_menu_rung`]'s
+/// in-window path does, so `UiEvent::ContextMenuItemActivated` resolves
+/// through the exact same `context_menu_hit_to_idx` conversion either
+/// path takes.
+///
+/// `catch_unwind`-guarded defensively, mirroring `Backend::
+/// install_menu_bar`'s call site (#901): quadraui#930 changed
+/// `MacBackend::show_context_menu` from `.expect()`-ing the AppKit
+/// `MainThreadMarker` (which panicked off the main thread) to a graceful
+/// no-op instead — every real invocation is on the main thread
+/// (`quadraui::macos::shell_runner`'s only entry point) anyway, and
+/// `quadraui::macos::testing::driver_with_shell` calling `App::handle`
+/// from a spawned `#[test]` thread (same as every other Rust test) now
+/// just silently skips showing the popup rather than panicking. The
+/// `catch_unwind` is kept as a belt-and-braces guard against a future
+/// backend that doesn't offer the same off-main-thread degradation, so a
+/// headless dispatch pass still can't take the whole test process down
+/// over a call this function doesn't otherwise depend on.
+pub fn show_context_menu_now(
+    b: &mut dyn quadraui::Backend,
+    panel: &ContextMenuPanel,
+    char_width: f64,
+    line_height: f64,
+) {
+    let menu = context_menu_panel_to_quadraui_context_menu(panel);
+    let anchor = context_menu_anchor_point(panel, char_width, line_height);
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        b.show_context_menu(&menu, anchor);
+    }))
+    .is_err()
+    {
+        eprintln!(
+            "vimcode: Backend::show_context_menu panicked (quadraui \
+             main-thread assertion, see vimcode#1580) -- the native \
+             context menu may be missing"
+        );
+    }
+}
+
+/// The [`FrameOp::ContextMenu`] rung's whole body on both backends —
+/// the in-window (`Custom`-resolved) painted path only (#1580). Callers
+/// must check `backend.effective_menu_style()` themselves and skip this
+/// entirely when it resolves `Native` — see [`show_context_menu_now`] for
+/// that half, which runs at event-handler time instead.
 ///
 /// `viewport`/`char_width`/`line_height`/`border_chrome_inset` are exactly
 /// [`context_menu_generic_layout`]'s parameters — see its doc comment for why
@@ -10741,17 +10812,6 @@ pub fn context_menu_should_be_native(
 /// `layout.bounds`, GTK's inside it). TUI's `+1`-inset viewport and panel
 /// (to make room for that border) is genuinely per-backend geometry prep and
 /// stays at the call site, not here.
-///
-/// `native`, resolved by the caller via [`context_menu_should_be_native`],
-/// picks the rung's whole body: `true` calls
-/// [`quadraui::Backend::show_context_menu`] with the same `ContextMenu`
-/// [`context_menu_panel_to_quadraui_context_menu`] would otherwise hand
-/// `draw_context_menu` — same `WidgetId`s, so
-/// `UiEvent::ContextMenuItemActivated` resolves through the exact
-/// `context_menu_hit_to_idx` conversion the in-window hit-test already uses
-/// (#902) — and returns `None`: nothing was painted in-window, so the
-/// caller must not cache a layout or record the rung as painted. `false`
-/// is the pre-#902 body unchanged.
 pub fn paint_context_menu_rung(
     b: &mut dyn quadraui::Backend,
     panel: &ContextMenuPanel,
@@ -10759,36 +10819,7 @@ pub fn paint_context_menu_rung(
     char_width: f64,
     line_height: f64,
     border_chrome_inset: f64,
-    native: bool,
-) -> Option<quadraui::ContextMenuLayout> {
-    if native {
-        let menu = context_menu_panel_to_quadraui_context_menu(panel);
-        let anchor = context_menu_anchor_point(panel, char_width, line_height);
-        // `MacBackend::show_context_menu` (quadraui's only in-tree
-        // implementation) asserts it is called on the real AppKit main
-        // thread and panics otherwise — the same documented quadraui
-        // limitation #901's `install_menu_bar` call hits, and the same
-        // `catch_unwind` treatment: every real invocation of this rung is
-        // on the main thread (`quadraui::macos::shell_runner`'s only entry
-        // point), so this never fires outside a test harness — but
-        // `quadraui::macos::testing::driver_with_shell` necessarily calls
-        // `render_content` from a spawned `#[test]` thread, same as every
-        // other Rust test. Catching it here keeps a headless paint pass
-        // from taking the whole test process down over a call this rung
-        // doesn't otherwise depend on.
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            b.show_context_menu(&menu, anchor);
-        }))
-        .is_err()
-        {
-            eprintln!(
-                "vimcode: Backend::show_context_menu panicked (quadraui \
-                 main-thread assertion, see vimcode#902) -- the native \
-                 context menu may be missing"
-            );
-        }
-        return None;
-    }
+) -> quadraui::ContextMenuLayout {
     let (menu, layout) = context_menu_generic_layout(
         panel,
         viewport,
@@ -10797,7 +10828,7 @@ pub fn paint_context_menu_rung(
         border_chrome_inset,
     );
     let _ = b.draw_context_menu(&menu, &layout);
-    Some(layout)
+    layout
 }
 
 /// The [`FrameOp::Dialog`] rung's whole body on both backends.
@@ -17589,22 +17620,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
             }),
             vertical_buttons: d.tag == "code_actions",
         }),
-        context_menu: engine.context_menu.as_ref().map(|cm| ContextMenuPanel {
-            items: cm
-                .items
-                .iter()
-                .map(|item| ContextMenuRenderItem {
-                    label: item.label.clone(),
-                    shortcut: item.shortcut.clone(),
-                    separator_after: item.separator_after,
-                    enabled: item.enabled,
-                })
-                .collect(),
-            selected_idx: cm.selected,
-            screen_col: cm.screen_x,
-            screen_row: cm.screen_y,
-            trigger_height: cm.trigger_height,
-        }),
+        context_menu: engine
+            .context_menu
+            .as_ref()
+            .map(context_menu_state_to_panel),
         find_replace: if engine.find_replace_open {
             let match_info = if engine.search_matches.is_empty() {
                 if engine.find_replace_query.is_empty() {
@@ -35094,7 +35113,7 @@ mod slice7_router_tests {
         );
     }
 
-    // ── #902: menu_style → native-vs-in-window resolution ────────────────
+    // ── #1580: menu_style → quadraui::MenuStyle, native-vs-in-window ─────
 
     fn caps_with_native_menu(native_menu: bool) -> quadraui::BackendCaps {
         quadraui::BackendCaps {
@@ -35103,20 +35122,48 @@ mod slice7_router_tests {
         }
     }
 
-    /// `Native` and `Inherit` both defer to the backend's own capability —
-    /// they never force a native popup onto a backend that can't paint one
-    /// (GTK, TUI), matching #901's identical gate for the menu bar.
+    /// `to_quadraui_menu_style` is a straight 1:1 translation — no
+    /// capability logic lives here any more (that's
+    /// `quadraui::MenuStyle::resolve`, exercised below against a real
+    /// `BackendCaps`).
     #[test]
-    fn context_menu_should_be_native_follows_capability_for_native_and_inherit() {
+    fn to_quadraui_menu_style_maps_every_variant() {
         use crate::core::settings::MenuStyle;
 
-        for style in [MenuStyle::Native, MenuStyle::Inherit] {
-            assert!(
-                context_menu_should_be_native(style, caps_with_native_menu(true)),
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Auto),
+            quadraui::MenuStyle::Auto
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Native),
+            quadraui::MenuStyle::Native
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom),
+            quadraui::MenuStyle::Custom
+        );
+    }
+
+    /// `Auto` and `Native` both defer to the backend's own capability via
+    /// `quadraui::MenuStyle::resolve` — they never force a native popup
+    /// onto a backend that can't paint one (GTK, TUI), matching #901's
+    /// identical gate for the menu bar. This is quadraui's own contract
+    /// (covered by its own unit tests), pinned here so a future
+    /// `to_quadraui_menu_style` regression that mis-maps a variant would
+    /// still be caught end-to-end.
+    #[test]
+    fn menu_style_resolves_native_only_with_capability() {
+        use crate::core::settings::MenuStyle;
+
+        for style in [MenuStyle::Auto, MenuStyle::Native] {
+            assert_eq!(
+                to_quadraui_menu_style(style).resolve(&caps_with_native_menu(true)),
+                quadraui::ResolvedMenuStyle::Native,
                 "{style:?} must resolve to native when the backend has one"
             );
-            assert!(
-                !context_menu_should_be_native(style, caps_with_native_menu(false)),
+            assert_eq!(
+                to_quadraui_menu_style(style).resolve(&caps_with_native_menu(false)),
+                quadraui::ResolvedMenuStyle::Custom,
                 "{style:?} must fall back to in-window when the backend has \
                  no native context menu"
             );
@@ -35127,35 +35174,27 @@ mod slice7_router_tests {
     /// a native popup — the escape hatch VS Code's `window.menuStyle:
     /// custom` provides.
     #[test]
-    fn context_menu_should_be_native_custom_never_resolves_native() {
+    fn menu_style_custom_never_resolves_native() {
         use crate::core::settings::MenuStyle;
 
-        assert!(!context_menu_should_be_native(
-            MenuStyle::Custom,
-            caps_with_native_menu(true)
-        ));
-        assert!(!context_menu_should_be_native(
-            MenuStyle::Custom,
-            caps_with_native_menu(false)
-        ));
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom).resolve(&caps_with_native_menu(true)),
+            quadraui::ResolvedMenuStyle::Custom
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom).resolve(&caps_with_native_menu(false)),
+            quadraui::ResolvedMenuStyle::Custom
+        );
     }
 
-    /// `paint_context_menu_rung`'s native branch must skip
-    /// `Backend::draw_context_menu` entirely and return `None` — there is
-    /// no in-window layout to cache when nothing was painted in-window.
-    /// The `false` branch is the pre-#902 behaviour: it must still call
-    /// `draw_context_menu` and return `Some`.
-    ///
-    /// Uses `quadraui::testing::RecordingBackend` (a fully-implemented
-    /// `Backend` mock built for exactly this — `Backend` is a sealed
-    /// trait, so a bespoke local stub can't implement it directly).
-    /// `RecordingBackend::show_context_menu` is the trait's own no-op
-    /// default and isn't recorded, so this test can't observe *that* call
-    /// directly; what it can and does prove is the half that matters for
-    /// #902's "no in-window paint" acceptance criterion:
-    /// `draw_context_menu` is never reached.
+    /// `paint_context_menu_rung` always paints in-window now (#1580) — the
+    /// native path moved to `show_context_menu_now`, called at
+    /// event-handler time instead of from this render rung. This is the
+    /// RED-able regression pin for that split: it proves the rung this
+    /// file owns still calls `draw_context_menu` and returns the painted
+    /// layout.
     #[test]
-    fn paint_context_menu_rung_native_skips_the_in_window_draw() {
+    fn paint_context_menu_rung_paints_in_window() {
         let panel = ContextMenuPanel {
             items: vec![ContextMenuRenderItem {
                 label: "Copy".to_string(),
@@ -35170,37 +35209,12 @@ mod slice7_router_tests {
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 800.0, 600.0);
 
-        let mut native_backend = quadraui::testing::RecordingBackend::new();
-        let native_layout =
-            paint_context_menu_rung(&mut native_backend, &panel, viewport, 8.0, 16.0, 0.0, true);
+        let mut backend = quadraui::testing::RecordingBackend::new();
+        let _layout = paint_context_menu_rung(&mut backend, &panel, viewport, 8.0, 16.0, 0.0);
         assert!(
-            native_layout.is_none(),
-            "native branch must not return a layout"
-        );
-        assert!(
-            !native_backend.calls.contains(&"draw_context_menu"),
-            "native branch must not call draw_context_menu; calls were {:?}",
-            native_backend.calls
-        );
-
-        let mut in_window_backend = quadraui::testing::RecordingBackend::new();
-        let in_window_layout = paint_context_menu_rung(
-            &mut in_window_backend,
-            &panel,
-            viewport,
-            8.0,
-            16.0,
-            0.0,
-            false,
-        );
-        assert!(
-            in_window_layout.is_some(),
-            "non-native branch must return the painted layout"
-        );
-        assert!(
-            in_window_backend.calls.contains(&"draw_context_menu"),
-            "non-native branch must still call draw_context_menu; calls were {:?}",
-            in_window_backend.calls
+            backend.calls.contains(&"draw_context_menu"),
+            "paint_context_menu_rung must call draw_context_menu; calls were {:?}",
+            backend.calls
         );
     }
 

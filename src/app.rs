@@ -1787,6 +1787,45 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// After `handle_dispatch` may have opened a context menu
+    /// (`Engine::open_*_context_menu`, from any surface — editor, tab,
+    /// Explorer, Board, ...), show it immediately if the backend resolves
+    /// `MenuStyle` to `Native` (#1580, and the root-cause fix for the
+    /// macOS right-click bug it also closes).
+    ///
+    /// Called once from `Self::handle`'s single choke point, gated on the
+    /// `context_menu` open *transition* (`None` -> `Some`) rather than
+    /// from each individual `open_*_context_menu` call site — every
+    /// right-click/keyboard path that opens a menu funnels through
+    /// `handle_dispatch` before returning to `handle`, so one check there
+    /// covers all of them without per-surface backend threading. See
+    /// `render::show_context_menu_now`'s doc for why this must run from
+    /// event-handling code and never from `render_content`'s paint rung
+    /// (`FrameOp::ContextMenu`): `MacBackend::show_context_menu` blocks on
+    /// AppKit's modal popup loop, and running that from inside a paint
+    /// closure re-enters painting while the closure still holds the
+    /// borrows it needs to finish its own frame.
+    fn open_context_menu_now_if_native(&mut self, backend: &mut dyn quadraui::Backend) {
+        if backend.effective_menu_style() != quadraui::ResolvedMenuStyle::Native {
+            return;
+        }
+        let panel = self
+            .engine
+            .borrow()
+            .context_menu
+            .as_ref()
+            .map(render::context_menu_state_to_panel);
+        let Some(panel) = panel else {
+            return;
+        };
+        if panel.items.is_empty() {
+            return;
+        }
+        let cw = self.cached_char_width.max(1.0);
+        let lh = self.cached_line_height.max(1.0);
+        render::show_context_menu_now(backend, &panel, cw, lh);
+    }
+
     /// Handle a window/viewport resize.
     fn handle_resize(&mut self) {
         // #731: both branches here were gated on `self.overlay` /
@@ -3866,6 +3905,13 @@ impl App {
         theme: &Theme,
     ) {
         backend.set_theme(render::to_quadraui_theme(theme));
+        // #1580: re-synced every frame, same reasoning as the theme sync
+        // right above — a runtime `:set menu_style=...` (or its Settings-
+        // sidebar equivalent) reaches quadraui's own `MenuStyle` on the
+        // very next paint. `set_menu_style` only persists a value on the
+        // backend struct (no popup, no blocking call), so calling it
+        // every frame is as cheap as the theme/font syncs it sits next to.
+        backend.set_menu_style(render::to_quadraui_menu_style(engine.settings.menu_style));
         // (#547) Re-synced every frame so runtime toggles (`:set
         // nonerdfonts`) take effect immediately, matching TUI.
         render::sync_nerd_fonts(backend, engine);
@@ -7834,16 +7880,20 @@ impl App {
                 return quadraui::Reaction::Redraw;
             }
             UiEvent::ContextMenuItemActivated(id) => {
-                // #902: fired by a *native* right-click popup (macOS
-                // `NSMenu` via `Backend::show_context_menu`, only reachable
-                // when `render::context_menu_should_be_native` resolved
-                // `true`). `id` is one of `context_menu_panel_to_quadraui_
+                // #902/#1580: fired by a *native* right-click popup (macOS
+                // `NSMenu` via `Backend::show_context_menu`, opened by
+                // `Self::open_context_menu_now_if_native` when
+                // `Backend::effective_menu_style()` resolved `Native`).
+                // `id` is one of `context_menu_panel_to_quadraui_
                 // context_menu`'s synthesised `"context:N"` ids — the exact
                 // same ids `route_modal_overlay_click`'s in-window hit-test
                 // (`ContextMenuHit::Item` → `context_menu_hit_to_idx`)
                 // resolves, so routing the activation through
                 // `apply_context_menu_route` reuses that one conversion
-                // instead of duplicating it.
+                // instead of duplicating it. Reached from `handle_dispatch`
+                // itself, i.e. event-handler time — same as every other
+                // `UiEvent` arm here, and (per #1580's root-cause fix)
+                // never queued from inside a paint closure any more.
                 let idx = crate::core::engine::context_menu_hit_to_idx(
                     &quadraui::ContextMenuHit::Item(id),
                 );
@@ -9260,7 +9310,7 @@ impl quadraui::ShellApp for App {
                     }
                 }
 
-                // ── Context menu (#546) ──────────────────────────────────────
+                // ── Context menu (#546, #1580) ────────────────────────────────
                 // The ShellApp render path never painted `screen.context_menu`
                 // at all — its draw + click-geometry cache was populated only by
                 // the dead legacy `draw_editor` Cairo path (src/gtk/draw.rs),
@@ -9272,29 +9322,29 @@ impl quadraui::ShellApp for App {
                     if let Some(panel) =
                         screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
                     {
-                        // #902: a native popup (`Backend::show_context_menu`)
-                        // paints nothing in-window — no layout to cache, and
-                        // no in-window rung to record as painted. Gated on
-                        // the same `BackendCaps::native_menu` capability
-                        // #901 uses for the menu bar, via the `menu_style`
-                        // setting.
-                        let native = render::context_menu_should_be_native(
-                            engine.settings.menu_style,
-                            backend.backend_caps(),
-                        );
-                        let mlayout = render::paint_context_menu_rung(
-                            backend,
-                            panel,
-                            popup_viewport,
-                            cw,
-                            lh,
-                            0.0,
-                            native,
-                        );
-                        let painted = mlayout.is_some();
-                        *self.context_menu_layout.borrow_mut() = mlayout;
-                        if painted {
+                        // #1580: a native popup (`Backend::show_context_menu`)
+                        // was already shown from the event handler that opened
+                        // it (`App::handle`'s `open_context_menu_now_if_native`
+                        // choke point) — never from here. This rung paints
+                        // nothing in-window when the backend resolves `Native`
+                        // (no layout to cache, no rung to record as painted),
+                        // and must not call `show_context_menu` itself: doing
+                        // so from inside `render_content` re-enters AppKit's
+                        // modal popup loop from a paint closure that still
+                        // holds the borrows it needs to finish its own frame.
+                        if backend.effective_menu_style() == quadraui::ResolvedMenuStyle::Custom {
+                            let layout = render::paint_context_menu_rung(
+                                backend,
+                                panel,
+                                popup_viewport,
+                                cw,
+                                lh,
+                                0.0,
+                            );
+                            *self.context_menu_layout.borrow_mut() = Some(layout);
                             composed.push(render::FrameOp::ContextMenu);
+                        } else {
+                            *self.context_menu_layout.borrow_mut() = None;
                         }
                     }
                 }
@@ -9385,7 +9435,19 @@ impl quadraui::ShellApp for App {
         backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
+        let had_context_menu_before = self.engine.borrow().context_menu.is_some();
         let reaction = self.handle_dispatch(event, backend, ctx);
+        // #1580: open the native context-menu popup exactly once, from
+        // this event-handler choke point — never from `render_content`'s
+        // paint rung. Gated on the open *transition* (`None` -> `Some`),
+        // not just `is_some()`, so a native menu that's still open (the
+        // real runner blocks on AppKit's own modal loop for the whole
+        // `show_context_menu` call, so this can't actually re-enter, but a
+        // headless test driver that calls `handle` again while nothing
+        // closed the menu must not re-show it either).
+        if !had_context_menu_before {
+            self.open_context_menu_now_if_native(backend);
+        }
         // #1427: keep the runner's `AppShell` title-bar reservation in sync
         // with `engine.menu_bar_visible` — that flag can flip from any one
         // of several places inside `handle_dispatch` (the #1427 reveal/hide

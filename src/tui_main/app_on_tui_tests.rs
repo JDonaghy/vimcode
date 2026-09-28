@@ -3383,6 +3383,113 @@ mod tests {
             );
         }
 
+        /// #1580 acceptance: right-clicking in the Explorer opens the
+        /// painted menu, clicking an item runs its command, and Escape
+        /// dismisses it — driven entirely through mouse/keyboard events
+        /// (`driver.right_click`/`driver.click`/`driver.press_named`), not
+        /// `Engine::open_explorer_context_menu` called directly the way
+        /// `engine_with_folder_ctx_menu`'s fixture above does.
+        ///
+        /// Parametrized over every `MenuStyle` value: `quadraui::TuiBackend`
+        /// always declares `BackendCaps::native_menu: false`, so
+        /// `quadraui::MenuStyle::resolve` (via `Backend::
+        /// effective_menu_style`) resolves `Custom` here regardless of the
+        /// setting — this loop is the black-box proof that holds for every
+        /// value, not just the default.
+        ///
+        /// "Copy Path" is the item under test: unlike `new_file`/
+        /// `open_terminal`/`rename`/`delete` (UI-backend-plumbed, only via
+        /// the *keyboard* confirm path — see `dispatch_context_menu_key`'s
+        /// doc), `copy_path` runs entirely inside `Engine::
+        /// context_menu_confirm` itself, so it exercises exactly the mouse-
+        /// click route (`apply_context_menu_route`) this test drives
+        /// through, with an effect (`engine.message`, painted in the status
+        /// bar) that is unmistakably observable and impossible to confuse
+        /// with "the click was silently swallowed".
+        ///
+        /// RED against a body that regressed the paint/click/dismiss round
+        /// trip for any one `MenuStyle` value (e.g. a hypothetical bug that
+        /// special-cased `Native`/`Auto` and skipped in-window painting even
+        /// on a `native_menu: false` backend): the loop runs the full
+        /// scenario fresh per variant, so a regression scoped to one value
+        /// still fails this test.
+        #[test]
+        fn explorer_context_menu_right_click_click_and_escape_round_trip_under_every_menu_style() {
+            for style in [
+                crate::core::settings::MenuStyle::Auto,
+                crate::core::settings::MenuStyle::Native,
+                crate::core::settings::MenuStyle::Custom,
+            ] {
+                let dir = std::env::temp_dir().join(format!(
+                    "vimcode_test_1580_ctxmenu_roundtrip_{style:?}_{}_{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("rc_marker.txt"), "hello").unwrap();
+
+                let mut engine = plain_engine();
+                engine.settings.menu_style = style;
+                engine.cwd = dir.clone();
+                engine.explorer_expanded.insert(dir);
+                engine.explorer_rebuild_rows();
+                engine.session.explorer_visible = true;
+                engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                    crate::core::engine::sidebar::PANEL_EXPLORER,
+                ));
+                let mut h = harness(engine);
+                let driver = &mut h.driver;
+
+                let (fx, fy) = driver.find("rc_marker.txt").unwrap_or_else(|| {
+                    panic!("{style:?}: the populated explorer row must paint its file name")
+                });
+
+                // Right-click opens the painted menu.
+                assert!(
+                    !driver.screen_has("Copy Path"),
+                    "{style:?}: precondition -- no context menu open yet"
+                );
+                driver.right_click(fx, fy);
+                let (ix, iy) = driver.find("Copy Path").unwrap_or_else(|| {
+                    panic!(
+                        "{style:?}: right-click must paint the file context menu; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+
+                // Clicking an item runs its command (`copy_path` sets
+                // `engine.message`, painted in the status bar) and closes
+                // the menu.
+                driver.click(ix, iy);
+                assert!(
+                    !driver.screen_has("Copy Path"),
+                    "{style:?}: clicking an item must close the menu; screen:\n{}",
+                    driver.screen()
+                );
+                assert!(
+                    driver.screen_has("Copied:"),
+                    "{style:?}: clicking 'Copy Path' must run its command; screen:\n{}",
+                    driver.screen()
+                );
+
+                // Escape dismisses a freshly re-opened menu, leaving no trace.
+                driver.right_click(fx, fy);
+                assert!(
+                    driver.screen_has("Copy Path"),
+                    "{style:?}: right-click must re-open the menu for the \
+                     Escape half of this test; screen:\n{}",
+                    driver.screen()
+                );
+                driver.press_named(quadraui::NamedKey::Escape);
+                assert!(
+                    !driver.screen_has("Copy Path"),
+                    "{style:?}: Escape must dismiss the context menu; screen:\n{}",
+                    driver.screen()
+                );
+            }
+        }
+
         /// Ports `mouse.rs::tests::right_click_in_debug_panel_does_not_
         /// open_explorer_context_menu` onto `App`: right-clicking inside a
         /// *different* active sidebar panel must not resurrect a stale
