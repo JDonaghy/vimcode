@@ -4930,4 +4930,190 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1583: idle-stability — comment text must not flash, and an idle
+    // frame must not repaint at all when nothing render-relevant changed.
+    //
+    // Root cause: `Engine::poll_lsp`'s `WorkProgressBegin`/`WorkProgressReport`/
+    // `WorkProgressEnd` arms (`src/core/engine/panels.rs`) unconditionally set
+    // `redraw = true` on *any* `$/progress` notification, even a server's
+    // byte-identical repeat of a payload it already reported. A server that
+    // is confused about its workspace root (rust-analyzer, pointed at a
+    // buffer with no enclosing Cargo project — exactly what surfaced this
+    // during investigation) can emit such repeats indefinitely, at roughly
+    // the ~1Hz cadence LSP servers commonly throttle `$/progress` to —
+    // forcing a full repaint every tick forever, not just during genuine
+    // indexing. `LspManager::work_progress_begin/report/end` now return
+    // `bool` ("did the stored snapshot actually change") and
+    // `Engine::poll_lsp` only requests a redraw when one of them does.
+    //
+    // This test drives the exact production path a real server's messages
+    // take (`LspManager::poll_events` → `Engine::poll_lsp`'s event match)
+    // via `LspManager::test_send_event` (a `#[cfg(test)]`-only seam that
+    // pushes an `LspEvent` through the same channel a spawned server
+    // writes to) rather than calling `work_progress_report` etc. directly,
+    // which would bypass `poll_lsp`'s redraw decision entirely and prove
+    // nothing about the user-visible symptom (repaint / flashing).
+    //
+    // RED against unfixed develop: reverting just the
+    // `work_progress_begin`/`report`/`end` return-value + call-site change
+    // (keeping this test) turns every iteration's `Reaction::Continue`
+    // assertion into an observed `Reaction::Redraw` — confirmed by hand
+    // before writing this comment.
+    mod idle_stability_1583 {
+        use super::*;
+        use crate::core::lsp::LspEvent;
+        use crate::core::lsp_manager::LspManager;
+        use crate::core::Engine;
+        use quadraui::Reaction;
+
+        /// Open a comment-heavy buffer with LSP auto-start disabled (so the
+        /// test never depends on a real language server binary existing on
+        /// the machine), in an isolated `$HOME` (so a real
+        /// `~/.config/vimcode/settings.json` on a shared dev machine can't
+        /// leak in mid-test — see `core::paths::set_test_home`'s own doc for
+        /// why a thread-local override, not `std::env::set_var`, is
+        /// required here).
+        fn open_comment_heavy_buffer() -> (
+            crate::test_paint::PaintGuard,
+            crate::test_cwd::CwdReadGuard,
+            crate::core::paths::TestHomeGuard,
+            std::path::PathBuf,
+            Engine,
+        ) {
+            let paint = crate::test_paint::PaintGuard::acquire();
+            let cwd = crate::test_cwd::CwdReadGuard::acquire();
+            let home = std::env::temp_dir().join(format!(
+                "vimcode_test_1583_home_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&home);
+            std::fs::create_dir_all(&home).unwrap();
+            let home_guard = crate::core::paths::set_test_home(&home);
+
+            let path = std::env::temp_dir().join(format!(
+                "vimcode_test_1583_{:?}.rs",
+                std::thread::current().id()
+            ));
+            let mut text = String::new();
+            for i in 0..20 {
+                text.push_str(&format!("// this is a documentation comment line {i}\n"));
+            }
+            text.push_str("fn main() {}\n");
+            std::fs::write(&path, &text).unwrap();
+
+            let mut engine = Engine::new_for_test();
+            engine.settings.lsp_enabled = false;
+            let old_id = engine.active_buffer_id();
+            let _ = engine.buffer_manager.delete(old_id, true);
+            let buffer_id = engine.buffer_manager.open_file(&path).unwrap();
+            engine
+                .buffer_manager
+                .apply_language_map(buffer_id, &engine.settings.language_map);
+            if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                window.buffer_id = buffer_id;
+            }
+            let view = engine.restore_file_position(buffer_id);
+            if let Some(window) = engine.windows.get_mut(&engine.active_window_id()) {
+                window.view = view;
+            }
+            engine.plugin_init();
+
+            (paint, cwd, home_guard, path, engine)
+        }
+
+        #[test]
+        fn idle_ticks_with_repeated_lsp_progress_do_not_repaint_or_change_colors() {
+            let (_paint, _cwd, _home, path, mut engine) = open_comment_heavy_buffer();
+
+            // Install a manager the way `Engine::ensure_lsp_manager` would,
+            // without spawning any real server — this test drives its event
+            // channel directly via `LspManager::test_send_event`.
+            engine.lsp_manager = Some(LspManager::new(std::env::temp_dir(), &[]));
+
+            let h = crate::tui_main::testing::conformance_harness(engine, 80, 24);
+            // `ConformanceHarness::engine` is the same `Rc<RefCell<Engine>>`
+            // the driver's `App` holds (`conformance_harness`'s own body
+            // clones it into both before moving one half into the driver),
+            // so sending an event on `engine_rc.borrow().lsp_manager` here
+            // is visible to the exact `Engine::poll_lsp` call
+            // `driver.tick()` below drives.
+            let engine_rc = h.engine.clone();
+            let mut driver = h.driver;
+
+            let (cx, cy) = driver
+                .find("documentation comment line 0")
+                .expect("comment text must be on screen");
+            let (cx, cy) = (cx.round() as u16, cy.round() as u16);
+
+            // A genuine first progress notification IS a real change (a
+            // brand-new token) — settle past it before asserting stability,
+            // per this test class's "every frame after the first settle"
+            // contract.
+            engine_rc
+                .borrow()
+                .lsp_manager
+                .as_ref()
+                .expect("manager installed above")
+                .test_send_event(LspEvent::WorkProgressBegin {
+                    server_id: 0,
+                    token: "indexing".to_string(),
+                    title: Some("Indexing".to_string()),
+                    message: Some("1/10".to_string()),
+                    percentage: Some(10),
+                });
+            driver.tick();
+
+            let screen0 = driver.screen();
+            let style0 = driver.style_at(cx, cy);
+            assert!(
+                screen0.contains("documentation comment line 0"),
+                "settle frame must still show the comment text:\n{screen0}"
+            );
+
+            // Now repeat the *exact same* progress payload — a chatty (or
+            // workspace-confused) server re-sending an unchanged `$/progress`
+            // report, the shape that forced a redraw every idle tick before
+            // this fix. Interleave real sleeps so this also crosses the
+            // syntax-debounce (150ms) and idle-file-check (2s) windows —
+            // the "several ticks, enough to cross every periodic timer"
+            // the idle-stability contract asks for.
+            for n in 0..8 {
+                engine_rc
+                    .borrow()
+                    .lsp_manager
+                    .as_ref()
+                    .expect("manager installed above")
+                    .test_send_event(LspEvent::WorkProgressReport {
+                        server_id: 0,
+                        token: "indexing".to_string(),
+                        message: Some("1/10".to_string()),
+                        percentage: Some(10),
+                    });
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let reaction = driver.tick();
+
+                assert_eq!(
+                    reaction,
+                    Reaction::Continue,
+                    "tick {n}: an unchanged $/progress repeat must not force a repaint \
+                     (this is the #1583 root cause: WorkProgress* handlers used to set \
+                     redraw=true unconditionally)"
+                );
+                assert_eq!(
+                    driver.screen(),
+                    screen0,
+                    "tick {n}: rendered text must not change with no input"
+                );
+                assert_eq!(
+                    driver.style_at(cx, cy),
+                    style0,
+                    "tick {n}: comment cell fg/bg must not flash between frames"
+                );
+            }
+
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }

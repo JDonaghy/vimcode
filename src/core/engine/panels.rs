@@ -1689,12 +1689,17 @@ impl Engine {
                     message,
                     percentage,
                 } => {
+                    // #1583: only request a redraw if the snapshot this
+                    // feeds (the status-bar segment) actually changed — a
+                    // server that repeats an identical begin payload for a
+                    // token it already reported must not force a full
+                    // repaint every time it does. See
+                    // `LspManager::work_progress_begin`'s own doc.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_begin(server_id, token, title, message, percentage);
+                        if mgr.work_progress_begin(server_id, token, title, message, percentage) {
+                            redraw = true;
+                        }
                     }
-                    // Status indicator may change (Running → Initializing
-                    // while indexing) — request a redraw (#450).
-                    redraw = true;
                 }
                 LspEvent::WorkProgressReport {
                     server_id,
@@ -1702,19 +1707,22 @@ impl Engine {
                     message,
                     percentage,
                 } => {
+                    // #1583: ditto — only the message/percentage actually
+                    // changing warrants a redraw of the status segment.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_report(server_id, &token, message, percentage);
+                        if mgr.work_progress_report(server_id, &token, message, percentage) {
+                            redraw = true;
+                        }
                     }
-                    // Message/percentage changed → segment text changed (#221).
-                    redraw = true;
                 }
                 LspEvent::WorkProgressEnd { server_id, token } => {
+                    // #1583: ditto — a stray `end` for a token already gone
+                    // (or already ended) changes nothing on screen.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_end(server_id, &token);
+                        if mgr.work_progress_end(server_id, &token) {
+                            redraw = true;
+                        }
                     }
-                    // Status indicator may change (Initializing → Running
-                    // once indexing completes) — request a redraw (#450).
-                    redraw = true;
                 }
             }
         }
