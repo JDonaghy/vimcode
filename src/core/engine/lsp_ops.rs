@@ -29,6 +29,45 @@ pub(crate) struct ToolAcquireOutcome {
     pub notification_id: u64,
 }
 
+/// What `ext_install_from_registry` should do with a manifest's
+/// `[lsp.acquire]`/`[dap.acquire]` table (#1346): kick off a native
+/// background acquisition, or — for one of the five package-manager kinds
+/// whose runtime isn't on PATH — fall through to the visible-terminal tier
+/// instead of failing silently.
+///
+/// Pulled out as a pure function of an explicit `runtime_present` predicate
+/// (mirrors `extensions::LspConfig::install_cmd_with`'s `rustup_available:
+/// bool` seam) rather than probing PATH inline, so the fallback decision —
+/// and, via `ext_install_from_registry_with_runtime_check`, the whole
+/// engine-level branch it drives — is unit-testable without depending on
+/// which of npm/python3/go/cargo/dotnet happen to be installed on the
+/// machine running the test suite.
+pub(crate) enum AcquireAction {
+    /// Kick off a native acquisition: every archive-download kind, or a
+    /// package-manager kind whose runtime is present.
+    Native,
+    /// Package-manager kind, runtime missing — fall through to the
+    /// terminal tier. Carries the runtime's name and a ready-to-show
+    /// install hint (from `extensions::prereq_install_cmd`, falling back to
+    /// a generic phrasing for a runtime outside that table).
+    NeedsRuntime { runtime: &'static str, hint: String },
+}
+
+pub(crate) fn resolve_acquire_action(
+    acquire: &crate::core::tool_acquire::AcquireConfig,
+    runtime_present: impl Fn(&str) -> bool,
+) -> AcquireAction {
+    match crate::core::tool_acquire::package_manager_runtime(acquire.kind) {
+        Some(runtime) if !runtime_present(runtime) => {
+            let hint = crate::core::extensions::prereq_install_cmd(runtime)
+                .map(|cmd| format!("{runtime}: {cmd}"))
+                .unwrap_or_else(|| format!("install {runtime} and try again"));
+            AcquireAction::NeedsRuntime { runtime, hint }
+        }
+        _ => AcquireAction::Native,
+    }
+}
+
 /// Per-extension aggregation state for the native acquisitions one
 /// `:ExtInstall` kicked off (#1345 review follow-up).
 ///
@@ -297,6 +336,21 @@ impl Engine {
 
     /// Install an extension by name: download scripts, run LSP/DAP install, mark installed.
     pub fn ext_install_from_registry(&mut self, name: &str) {
+        self.ext_install_from_registry_with_runtime_check(name, binary_on_path)
+    }
+
+    /// The real body of `ext_install_from_registry`, parameterised over the
+    /// "is this package-manager kind's runtime on PATH?" predicate (#1346).
+    /// `ext_install_from_registry` calls this with the real `binary_on_path`
+    /// — split out so a test can call this directly with a stub predicate
+    /// and deterministically exercise the "runtime missing → terminal
+    /// fallback" branch without depending on what's actually installed on
+    /// the machine running the suite.
+    fn ext_install_from_registry_with_runtime_check(
+        &mut self,
+        name: &str,
+        runtime_present: impl Fn(&str) -> bool,
+    ) {
         let manifest = self
             .ext_available_manifests()
             .into_iter()
@@ -355,25 +409,42 @@ impl Engine {
             if let Some(bin) = found_bin {
                 status_parts.push(format!("LSP: {bin} ✓"));
             } else if let Some(acquire) = manifest.lsp.acquire.clone() {
-                let lsp_key = format!("ext:{ext_name}:lsp");
-                self.lsp_installing.insert(lsp_key.clone());
-                let notification_id = self.notify(
-                    NotificationKind::LspInstall,
-                    &format!("Acquiring {}…", manifest.lsp.binary),
-                );
-                self.spawn_tool_acquire(
-                    ext_name.clone(),
-                    lsp_key,
-                    ToolAcquireLeg::Lsp {
-                        lang_ids: manifest.language_ids.clone(),
-                        args: manifest.lsp.args.clone(),
-                    },
-                    manifest.lsp.binary.clone(),
-                    acquire,
-                    notification_id,
-                );
-                has_native_acquire = true;
-                status_parts.push(format!("LSP: acquiring {}…", manifest.lsp.binary));
+                match resolve_acquire_action(&acquire, &runtime_present) {
+                    AcquireAction::Native => {
+                        let lsp_key = format!("ext:{ext_name}:lsp");
+                        self.lsp_installing.insert(lsp_key.clone());
+                        let notification_id = self.notify(
+                            NotificationKind::LspInstall,
+                            &format!("Acquiring {}…", manifest.lsp.binary),
+                        );
+                        self.spawn_tool_acquire(
+                            ext_name.clone(),
+                            lsp_key,
+                            ToolAcquireLeg::Lsp {
+                                lang_ids: manifest.language_ids.clone(),
+                                args: manifest.lsp.args.clone(),
+                            },
+                            manifest.lsp.binary.clone(),
+                            acquire,
+                            notification_id,
+                        );
+                        has_native_acquire = true;
+                        status_parts.push(format!("LSP: acquiring {}…", manifest.lsp.binary));
+                    }
+                    AcquireAction::NeedsRuntime { runtime, hint } => {
+                        let lsp_key = format!("ext:{ext_name}:lsp");
+                        self.lsp_installing.insert(lsp_key.clone());
+                        install_commands.push(format!(
+                            "echo 'Cannot acquire {} — {runtime} not found on PATH. {hint}'",
+                            manifest.lsp.binary
+                        ));
+                        self.pending_install_context = Some(InstallContext {
+                            ext_name: ext_name.clone(),
+                            install_key: lsp_key,
+                        });
+                        status_parts.push(format!("LSP: needs {runtime} — {hint}"));
+                    }
+                }
             } else if !manifest.lsp.install_cmd_for_platform().is_empty() {
                 let lsp_key = format!("ext:{ext_name}:lsp");
                 self.lsp_installing.insert(lsp_key.clone());
@@ -409,22 +480,41 @@ impl Engine {
             if already_on_path {
                 status_parts.push(format!("DAP: {dap_binary} ✓"));
             } else if let Some(acquire) = manifest.dap.acquire.clone() {
-                let dap_key = format!("dap:{}", manifest.dap.adapter);
-                self.lsp_installing.insert(dap_key.clone());
-                let notification_id = self.notify(
-                    NotificationKind::LspInstall,
-                    &format!("Acquiring {}…", manifest.dap.adapter),
-                );
-                self.spawn_tool_acquire(
-                    ext_name.clone(),
-                    dap_key,
-                    ToolAcquireLeg::Dap,
-                    manifest.dap.binary.clone(),
-                    acquire,
-                    notification_id,
-                );
-                has_native_acquire = true;
-                status_parts.push(format!("DAP: acquiring {}…", manifest.dap.adapter));
+                match resolve_acquire_action(&acquire, &runtime_present) {
+                    AcquireAction::Native => {
+                        let dap_key = format!("dap:{}", manifest.dap.adapter);
+                        self.lsp_installing.insert(dap_key.clone());
+                        let notification_id = self.notify(
+                            NotificationKind::LspInstall,
+                            &format!("Acquiring {}…", manifest.dap.adapter),
+                        );
+                        self.spawn_tool_acquire(
+                            ext_name.clone(),
+                            dap_key,
+                            ToolAcquireLeg::Dap,
+                            manifest.dap.binary.clone(),
+                            acquire,
+                            notification_id,
+                        );
+                        has_native_acquire = true;
+                        status_parts.push(format!("DAP: acquiring {}…", manifest.dap.adapter));
+                    }
+                    AcquireAction::NeedsRuntime { runtime, hint } => {
+                        let dap_key = format!("dap:{}", manifest.dap.adapter);
+                        self.lsp_installing.insert(dap_key.clone());
+                        install_commands.push(format!(
+                            "echo 'Cannot acquire {} — {runtime} not found on PATH. {hint}'",
+                            manifest.dap.adapter
+                        ));
+                        if self.pending_install_context.is_none() {
+                            self.pending_install_context = Some(InstallContext {
+                                ext_name: ext_name.clone(),
+                                install_key: dap_key,
+                            });
+                        }
+                        status_parts.push(format!("DAP: needs {runtime} — {hint}"));
+                    }
+                }
             } else {
                 let adapter_install = crate::core::dap_manager::install_cmd_for_adapter(
                     manifest.dap.adapter.as_str(),
@@ -1263,6 +1353,144 @@ mod tests {
             result,
             notification_id: 0,
         }
+    }
+
+    // ── #1346: package-manager runtime dependency → terminal fallback ────
+
+    /// Pure decision-table test for `resolve_acquire_action` — the seam
+    /// `ext_install_from_registry_with_runtime_check` drives for every
+    /// `[lsp.acquire]`/`[dap.acquire]` table. No PATH probing, no process
+    /// spawn: `runtime_present` is passed in explicitly, so this exercises
+    /// every kind × presence combination deterministically regardless of
+    /// what's actually installed on the machine running the suite.
+    #[test]
+    fn resolve_acquire_action_decision_table() {
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        // Archive-download kinds: always `Native`, whatever the predicate
+        // says — `package_manager_runtime` returns `None` for these, so the
+        // predicate is never even consulted.
+        for kind in [
+            AcquireKind::HashicorpRelease,
+            AcquireKind::GithubRelease,
+            AcquireKind::UrlTemplate,
+        ] {
+            let cfg = AcquireConfig {
+                kind,
+                ..Default::default()
+            };
+            assert!(matches!(
+                resolve_acquire_action(&cfg, |_| false),
+                AcquireAction::Native
+            ));
+            assert!(matches!(
+                resolve_acquire_action(&cfg, |_| true),
+                AcquireAction::Native
+            ));
+        }
+
+        // Package-manager kinds: `Native` when the runtime is present,
+        // `NeedsRuntime` (naming that exact runtime) when it isn't.
+        for (kind, runtime) in [
+            (AcquireKind::Npm, "npm"),
+            (AcquireKind::Pip, "python3"),
+            (AcquireKind::Go, "go"),
+            (AcquireKind::Cargo, "cargo"),
+            (AcquireKind::DotnetTool, "dotnet"),
+        ] {
+            let cfg = AcquireConfig {
+                kind,
+                package: "irrelevant".to_string(),
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    resolve_acquire_action(&cfg, |_| true),
+                    AcquireAction::Native
+                ),
+                "{kind:?} with its runtime present should be Native"
+            );
+            match resolve_acquire_action(&cfg, |_| false) {
+                AcquireAction::NeedsRuntime {
+                    runtime: got_runtime,
+                    hint,
+                } => {
+                    assert_eq!(got_runtime, runtime);
+                    assert!(
+                        !hint.is_empty(),
+                        "{kind:?}'s missing-runtime hint must not be empty"
+                    );
+                }
+                AcquireAction::Native => {
+                    panic!("{kind:?} with its runtime absent should be NeedsRuntime")
+                }
+            }
+        }
+    }
+
+    /// #1346 acceptance criterion: a manifest whose `[lsp.acquire]` names a
+    /// package-manager kind whose runtime isn't on PATH must fall through
+    /// to the visible-terminal tier with a dependency hint — never spawn a
+    /// native acquisition (which would just fail silently, or worse, spawn
+    /// a process that doesn't exist) and never leave the user with no
+    /// feedback at all.
+    ///
+    /// `runtime_present` is stubbed to always return `false` — deterministic
+    /// regardless of whether the machine running this suite happens to have
+    /// npm on PATH — so this drives the real engine method
+    /// (`ext_install_from_registry_with_runtime_check`, the seam
+    /// `ext_install_from_registry` itself calls with the real
+    /// `binary_on_path`), not just the pure decision function above.
+    ///
+    /// Verified RED against a version of `ext_install_from_registry` that
+    /// unconditionally spawns `spawn_tool_acquire` for any `[lsp.acquire]`
+    /// table (the pre-#1346 behaviour, still correct for the three
+    /// archive-download kinds): `tool_acquire_groups` gains an entry and
+    /// `pending_terminal_command` stays `None`.
+    #[test]
+    fn missing_package_manager_runtime_falls_through_to_terminal_tier() {
+        use crate::core::extensions::{ExtensionManifest, LspConfig};
+        use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+        let mut e = Engine::new();
+        let ext_name = "vc-unit-pkgmgr-fallback-1346";
+        e.ext_registry = Some(vec![ExtensionManifest {
+            name: ext_name.to_string(),
+            display_name: "Package-manager fallback test (#1346)".to_string(),
+            language_ids: vec!["vc-unit-pkgmgr-1346-lang".to_string()],
+            lsp: LspConfig {
+                binary: "vc-unit-pkgmgr-1346-lsp".to_string(),
+                acquire: Some(AcquireConfig {
+                    kind: AcquireKind::Npm,
+                    package: "vc-unit-pkgmgr-1346-pkg".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+
+        e.ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+
+        assert!(
+            e.tool_acquire_groups.is_empty(),
+            "a missing runtime must never spawn a native acquisition"
+        );
+        let cmd = e.pending_terminal_command.clone().unwrap_or_default();
+        assert!(
+            cmd.contains("npm"),
+            "terminal fallback must name the missing runtime; got: {cmd}"
+        );
+        assert!(
+            cmd.to_lowercase().contains("node"),
+            "terminal fallback must carry npm's install hint (not just fail \
+             silently); got: {cmd}"
+        );
+        assert!(
+            e.message.contains("needs npm"),
+            "status line must explain why native acquisition was skipped; got: {}",
+            e.message
+        );
     }
 
     /// #1345 review follow-up, deterministic half: two legs of the same
