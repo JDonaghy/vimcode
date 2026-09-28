@@ -126,8 +126,9 @@ pub const ROW_BRANCH: &str = "mnZ1090";
 /// quadraui#1183 (picked up by #1576's pin bump) the tree painted the label
 /// at full row width and then drew the badge **on top of it**, so an
 /// over-budget row silently lost its label's tail with no gap and no `…`
-/// — the fixture's old `"mainZ1090"` + `"[HEAD] ahead 2"` (24 columns of
-/// content in a 20-column sidebar) showed up as a bare `"ma"` next to the
+/// — the fixture's old `"mainZ1090"` + `"[HEAD] ahead 2"` (4 indent + 9
+/// label + 1 gap + 14 badge = 28 columns of content, 8 over the
+/// 20-column sidebar's budget) showed up as a bare `"ma"` next to the
 /// badge, and the precondition test below asserted that overlap artifact as
 /// if it were the row. #1183 clamps and ellipsises instead, which turned
 /// the same row into a bare `"…"`; sizing the content to actually fit is
