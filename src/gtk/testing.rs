@@ -11206,6 +11206,20 @@ mod minimap {
         // here to keep testing the same "whole file fits in the window"
         // case this test has always exercised.
         engine.settings.minimap_render_characters = false;
+        // #1546: sticky scroll defaults on, and this fixture is *built* to
+        // trip it — lines 100..300 are indented three levels deep, so the
+        // moment the click lands anywhere inside that band, line 99 (the
+        // nearest column-0 line above it) is pinned over row 0 and the
+        // viewport's own first line is covered by it. That makes
+        // "the painted top line is `fn item_<scroll_top>`" the wrong
+        // invariant for a sticky-on frame: the assertion below would have to
+        // encode the pinned band's height, which is a property of #1546's
+        // scope detector, not of minimap click routing. Sticky scroll has
+        // its own paint coverage (`gtk::testing::sticky_scroll` and
+        // `tui_main::app_on_tui_tests::tests::sticky_scroll`); turn it off
+        // here so this test keeps asserting exactly the one thing it is
+        // about — that a minimap click's new `scroll_top` reaches the paint.
+        engine.settings.sticky_scroll = false;
         let mut h = harness(engine, 1400, 900);
         let win = h.engine.borrow().active_window_id();
         h.window_center(win).expect("editor pane must paint");
