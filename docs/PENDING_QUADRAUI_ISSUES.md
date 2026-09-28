@@ -32,6 +32,31 @@ zero cost instead.
 
 ---
 
+## `MacDriver` has no `set_double_click_folding(false)`, unlike `TuiDriver`/`GtkDriver` (workaround in vimcode#1576)
+
+Since quadraui#486, `MacBackend::fold_double_click` runs every injected
+`MouseDown` through a `DoubleClickDetector` (400 ms window,
+`MAC_DOUBLE_CLICK_RADIUS` = 4 pt). `quadraui::tui::testing::TuiDriver` and
+`quadraui::gtk::testing::GtkDriver` both expose
+`set_double_click_folding(enabled: bool)` so a test doing back-to-back
+independent clicks can opt out; `quadraui::macos::testing::MacDriver` does
+not, and `MacBackend`'s own `set_double_click_folding` doesn't exist either
+(the GTK/TUI backends have a `pub(crate)` one each).
+
+Observed impact: vimcode's `macos::mac_driver_tests::
+picker_row_click_hit_band_matches_the_painted_row` sweeps five single clicks
+~3 pt apart across one picker row; after the pin bump to `286eb6c` sample 1
+arrived as a `UiEvent::DoubleClick`, confirming the wrong picker entry. The
+vimcode test now sleeps 450 ms between samples to let the window lapse —
+correct but slow, and it hardcodes a private quadraui constant.
+
+**Ask:** add `MacDriver::set_double_click_folding(&mut self, enabled: bool)`
+(plus the backing `MacBackend` switch), mirroring the TUI/GTK drivers, so
+cross-backend harness helpers can disable folding uniformly. Do the same for
+`WinDriver` if it has the same gap.
+
+---
+
 ## Win-GUI activity bar hardcodes the ASCII fallback glyph, ignoring the `nerd_fonts_enabled` flag `draw_tree` already reads (blocks vimcode#1558)
 
 **Title:** `win::activity_bar::draw_activity_bar` always paints `Icon::fallback`,
