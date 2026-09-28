@@ -1532,6 +1532,19 @@ mod mac_driver_tests {
             "zqxw971_pickb.txt",
             5,
             |d| {
+                // #1576: the quadraui pin bump brought in macOS
+                // double-click folding (quadraui#486 — `MacBackend`'s
+                // `DoubleClickDetector`, 400 ms window, 4 pt radius). The
+                // sweep's samples are ~3 pt apart and back-to-back, so
+                // sample 1 arrived as a `UiEvent::DoubleClick` — which
+                // confirms the still-selected file `a` instead of
+                // row-clicking `b`, a false "#971 hit-band drift". Unlike
+                // `TuiDriver`/`GtkDriver`, `MacDriver` has no
+                // `set_double_click_folding(false)` (see
+                // docs/PENDING_QUADRAUI_ISSUES.md), so let the fold window
+                // lapse instead: every sample is meant to be an
+                // independent single click on a freshly re-opened picker.
+                std::thread::sleep(std::time::Duration::from_millis(450));
                 engine.borrow_mut().close_picker();
                 engine.borrow_mut().open_picker(PickerSource::Files);
                 d.render();
