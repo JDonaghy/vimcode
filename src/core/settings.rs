@@ -1626,6 +1626,17 @@ pub fn parse_key_binding_named(s: &str) -> Option<(bool, bool, bool, String)> {
 /// `core::engine::execute`) keeps working against a concrete value
 /// unchanged; only `effective_editor_font`'s callers see backend-resolved
 /// per-platform behaviour.
+///
+/// #1562 re-checked this literal against Win-GUI specifically (that issue
+/// reported Windows chrome painting in the monospace editor font instead
+/// of a real UI face) and confirmed `quadraui::win::backend::
+/// parse_ui_font_desc`/`WinBackend::set_editor_font`/`set_ui_font` already
+/// resolve this exact `"Monospace"` alias (and the `"Sans"`/`"system-ui"`
+/// chrome tokens `UI_FONT_FAMILY` in `src/app_support.rs` leads with) to
+/// real DirectWrite faces (`"Consolas"`/`"Segoe UI"`) via `GenericFamily`,
+/// same mechanism as the #1129 macOS fix this doc already describes — no
+/// further change needed here for Windows. See `src/win/mod.rs`'s `#1562`
+/// doc section for the full investigation.
 fn default_font_family() -> String {
     "Monospace".to_string()
 }

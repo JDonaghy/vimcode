@@ -693,3 +693,115 @@ vimcode-side fix available: `src/win/backend.rs` is a 9-line re-export of
 `quadraui::win::WinBackend` (see that file's own doc comment), with zero
 rasterising decisions of its own to change. The bug and its fix are entirely
 inside `quadraui::win::editor::draw_editor`.
+
+---
+
+## `WinBackend` never declares `native_menu`/`window_chrome`, and `win::run` has no custom-caption window style — Win-GUI's title bar can never reach GTK/macOS parity (blocks vimcode#1562)
+
+**Title:** `win::backend::WinBackend::backend_caps()`'s struct literal sets
+neither `native_menu` nor `window_chrome`, so vimcode's drawn title-bar
+band/command-centre falls into its most degraded ("fully toggleable, TUI
+`cell`-profile") posture on Windows; separately, `win::run`'s `CreateWindowExW`
+call uses plain `WS_OVERLAPPEDWINDOW` with no `WM_NCCALCSIZE`/`WM_NCHITTEST`
+client-area-extension, so even fixing the cap would stack a second,
+vimcode-drawn row underneath the real native caption rather than replacing it
+
+**Body:**
+
+vimcode#1562 asks for Win-GUI chrome parity with macOS: a custom title bar
+with back/forward buttons and the command-centre search box, instead of only
+the plain native Win32 caption. vimcode's own title-bar band and command
+centre are already fully backend-neutral (`App::render_content`'s
+`FrameOp::CommandCenter` rung, `render::build_command_center_view`/
+`paint_command_center_rung`, `RenderPresence::command_center` in `render.rs`
+gated only on the reserved band existing, not on which backend is running) —
+see vimcode `src/win/mod.rs`'s `#1562` doc section for the full read-through.
+Two things stop that shared code from ever painting a GTK/macOS-equivalent
+Windows title bar, both entirely inside quadraui at the pinned rev
+(`9f8766d3`, unchanged since the `a58e5bec` pin vimcode#1562's own real-
+hardware observation named):
+
+1. `App::render_content` (vimcode `src/app.rs`) decides the drawn title-bar
+   row's visibility with a three-way branch on `backend.backend_caps()`:
+
+   ```rust
+   if backend.backend_caps().native_menu {
+       // real OS menu bar (macOS) — drawn row suppressed, menu_bar_visible = false
+   } else if backend.backend_caps().window_chrome {
+       // GTK's (and any future Win-GUI's) drawn menu bar doubles as the
+       // client-side titlebar — pinned visible always
+       self.engine.borrow_mut().menu_bar_visible = true;
+   } else {
+       // no OS menu bar to hide behind and no window chrome for the drawn
+       // row to double as — the `cell` profile (TUI-via-`App`) today.
+       self.engine.borrow_mut().menu_bar_toggleable = true;
+   }
+   ```
+
+   The comment on the middle arm — "GTK's (and any future Win-GUI's) drawn
+   menu bar doubles as the client-side titlebar" — already anticipates
+   Win-GUI declaring `window_chrome`. It never does:
+   `quadraui/src/win/backend.rs::backend_caps`'s struct literal (confirmed
+   at both `a58e5bec` and `9f8766d3`) sets `file_dialogs`, `folder_dialogs`,
+   `native_dialogs`, `notifications`, `pointer_cursor`, `mouse`, `scroll`,
+   `drag`, `text_selection`, `app_font_registration`, `generic_font_
+   families`, `window_control`, and `tray` — never `native_menu` or
+   `window_chrome`. So Win-GUI silently takes the third, TUI-shaped arm:
+   the whole band (menu row *and* the command centre painted into it)
+   starts hidden/toggleable rather than pinned visible, unlike GTK.
+
+2. Even with `window_chrome: true` added, `quadraui/src/win/run.rs`'s window
+   creation (`win32::run_inner`, `CreateWindowExW(..., WS_OVERLAPPEDWINDOW,
+   ...)`) still produces a window with the real Win32 caption — title text,
+   native min/max/close, and the standard resize border — and nothing in
+   that file handles `WM_NCCALCSIZE` (to extend the client area up into the
+   caption) or `WM_NCHITTEST` (to make the drawn band's non-button area
+   report `HTCAPTION` for dragging, the way every "modern chrome" Windows
+   app — Windows Terminal, VS Code's own win32 shell — does). Without that,
+   Windows would end up with a real native caption *and*, stacked directly
+   underneath it, vimcode's own drawn band — a double title bar, not the
+   single "custom-drawn caption with native min/max/close" #1562 asks for.
+
+**Ask:** two-part, either of which can land independently but both are
+needed for full parity:
+
+- Add `window_chrome: true` to `WinBackend::backend_caps()`'s struct
+  literal (mirroring `GtkBackend::backend_caps()`'s existing declaration),
+  once part 2 below makes that honest — declaring it before the window
+  style changes would just turn today's "hidden band" into an always-drawn
+  *second* row under the native caption, trading one bad look for another.
+- Give `win::run` a custom-caption window: on `WM_NCCALCSIZE` return a
+  client rect that keeps the window's outer bounds but zeroes the caption
+  height (leaving the resize-border handling alone), and on `WM_NCHITTEST`
+  classify a hit inside vimcode's drawn title-bar band as `HTCAPTION`
+  unless it lands on the band's own inline min/max/close buttons (already
+  painted by `App::paint_title_bar_band`/`StatusBarInteraction`, per
+  vimcode `src/app.rs`) or the command-centre search box, in which case
+  fall through to the client area so those widgets keep receiving normal
+  mouse events. `WinBackend::backend_caps()`'s existing `window_control:
+  true` (issue #950, `impl WindowControl for WinBackend`) already backs
+  real `SetWindowPos`/`ShowWindow`/`SetWindowTextW` calls — the inline
+  min/max/close buttons vimcode already draws into the band can call
+  through that same trait instead of needing new plumbing.
+
+**Test:** a `WinDriver`-based scenario mirroring `crate::testing`'s existing
+`ConformanceHarness` shape (see quadraui's `macos/mod.rs::mac_driver_tests`
+for the sibling pattern vimcode's own `win_driver_tests` module already
+copies): resize a headless-surfaced window, assert `WM_NCHITTEST` at a point
+inside the drawn band's empty area reports `HTCAPTION` and a point on an
+inline window-control button reports `HTCLIENT`; a second, `BackendCaps`-only
+test asserting `WinBackend::backend_caps().window_chrome` is `true` once
+declared (mirrors `tests/conformance/caps.rs`'s `BackendSource::declared`
+parsing this project already runs, per this file's own top-of-file note on
+`ACCEPTED_DEFAULTS`).
+
+**Blocks:** `JDonaghy/vimcode#1562` (title-bar/command-centre item only —
+that issue's font and status-segment items were investigated and found
+already correct on both backends; see vimcode `src/win/mod.rs`'s `#1562` doc
+section). Leave #1562 open behind this one per `GOALS.md`'s milestone-
+discipline rule — there is no per-backend vimcode-side fix available:
+`src/win/mod.rs`/`src/win/backend.rs` are thin wrappers with no window-style
+or capability decisions of their own (Platform-Neutrality Rule), and
+vimcode's title-bar/command-centre paint code is already fully backend-
+neutral and would light up on Windows unchanged once these two quadraui
+gaps close.

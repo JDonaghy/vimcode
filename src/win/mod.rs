@@ -235,6 +235,97 @@
 //! read — can confirm whether the strip is real, and if so, isolate which
 //! of `win::run`'s window-class/style choices (not sizing arithmetic, which
 //! this session already cleared) produces it. Leave #1561 open.
+//!
+//! # #1562: Win-GUI chrome parity with macOS (font / title bar / status
+//! # segments) — two of three items already resolved, the third is a real,
+//! # substantial quadraui gap
+//!
+//! vimcode#1562 asks for three separate things. Investigated each against
+//! the pinned quadraui rev (`9f8766d3`, unchanged from the `a58e5bec` pin
+//! the issue's own real-hardware observation names — `a58e5bec` is 12
+//! commits *behind* `9f8766d3` in quadraui's history, so nothing relevant
+//! moved between the observation and this pin).
+//!
+//! **Item 1 (UI font resolves to a real Windows face, not literal
+//! `"Monospace"`) — already fixed upstream, nothing to do here.**
+//! `quadraui::win::backend::parse_ui_font_desc` and `WinBackend::
+//! set_editor_font`/`set_ui_font` already resolve the fontconfig/Pango
+//! generic alias via `GenericFamily::parse`: `Monospace` →
+//! `DEFAULT_EDITOR_FONT_FAMILY` (`"Consolas"`), `SansSerif`/`SystemUi` →
+//! `DEFAULT_UI_FONT_FAMILY` (`"Segoe UI"`) — confirmed present verbatim at
+//! *both* `a58e5bec` and the current `9f8766d3` pin, so this was already
+//! true at the moment the issue's Windows/macOS comparison was made, not
+//! something this session's pin bump fixed. `App::sync_per_frame_backend_
+//! state` (`src/app.rs`) calls `backend.set_ui_font(&UI_FONT())` and
+//! `backend.set_editor_font(...)` unconditionally for every GUI backend —
+//! no per-backend vimcode wiring gap either. The Settings sidebar showing
+//! **Font Family: `Monospace`** is the intended, platform-neutral sentinel
+//! value (`core::settings::default_font_family`'s own #1129/#1542 doc): it
+//! displays the *raw stored setting*, not the backend-resolved face, and
+//! macOS shows the identical literal string for the identical reason (its
+//! own `font_family` default is the same shared `"Monospace"`) — this is
+//! not Windows-specific behaviour and not a defect.
+//!
+//! **Item 3 (status-line segments: branch, encoding, line endings,
+//! indentation, language, LSP) — already shared code, no per-backend
+//! drop found.** `WinBackend::draw_status_bar_interactive` and
+//! `MacBackend`'s equivalent both route through the *identical*
+//! `quadraui::primitives::status_bar::native_surface_paint::paint`
+//! rasteriser (the "NativeSurface Phase 4" migration folded status-bar
+//! painting into one shared function for every `px()` backend), and
+//! vimcode's own segment list (`render.rs`'s `StatusSegment` construction)
+//! is already fully backend-neutral, with the same width-based
+//! priority-drop (#164) on every backend. No source-level defect found
+//! that would drop segments on Windows specifically; the narrower set
+//! observed during the 2026-09-27 side-by-side is more likely a
+//! window-width/DPI difference between the two compared windows than a
+//! code path. Needs a real-hardware re-comparison at matched window widths
+//! to confirm one way or the other, not a code change — left open pending
+//! that, not closed.
+//!
+//! **Item 2 (custom title bar + command centre) — a real, confirmed
+//! quadraui-side gap.** vimcode's own title-bar band and command centre
+//! (`App::render_content`'s `FrameOp::CommandCenter` rung, `render::
+//! build_command_center_view`/`paint_command_center_rung`) are fully
+//! backend-neutral and gated only on the reserved band existing
+//! (`RenderPresence::command_center`, `render.rs`) — not on which backend
+//! is running — so the search box and its back/forward buttons *would*
+//! already paint on Windows once the band is reliably live. What actually
+//! blocks that:
+//!
+//! - `App::render_content`'s menu-bar-visibility decision is a three-way
+//!   branch on `backend.backend_caps()`: `native_menu` (real OS menu bar,
+//!   macOS) / `window_chrome` (drawn row pinned always-visible, doubling
+//!   as the client-side titlebar — GTK today) / neither (fully toggleable,
+//!   the TUI `cell`-profile posture, starting hidden outside vscode-mode).
+//!   `quadraui::win::backend::WinBackend::backend_caps()` declares neither
+//!   flag — confirmed by reading its struct literal at the pinned rev — so
+//!   Win-GUI silently falls into the third, TUI-shaped arm, even though
+//!   `App::render_content`'s own comment already names this gap ("GTK's
+//!   (and any future Win-GUI's) drawn menu bar doubles as the client-side
+//!   titlebar"). The practical effect: the band (and everything painted
+//!   into it, menu row and command centre alike) starts hidden/toggleable
+//!   rather than pinned visible, unlike GTK.
+//! - `quadraui::win::run` (`win/run.rs`) creates its top-level window with
+//!   plain `WS_OVERLAPPEDWINDOW` — the real Win32 caption, native
+//!   min/max/close and resize border — with no `WM_NCCALCSIZE`/
+//!   `WM_NCHITTEST` client-area extension the way a modern custom-caption
+//!   Windows app needs to fold its own drawn band into that caption
+//!   instead of stacking a second row underneath it. So even once the cap
+//!   above is fixed, today's Windows chrome would still be a real native
+//!   caption *plus* a separate drawn band underneath it, not the single
+//!   "custom-drawn caption with native min/max/close" #1562 asks for.
+//!
+//! Both halves are quadraui infrastructure (`WinBackend::backend_caps`,
+//! `win::run`'s window style/message handling), not a `src/win/` wrapper
+//! decision — per the Platform-Neutrality Rule this is not a fix to
+//! attempt here. Drafted as a pending quadraui issue in
+//! `docs/PENDING_QUADRAUI_ISSUES.md` (new entry) rather than built in this
+//! crate. Leave #1562 open behind it — two of its three items are already
+//! resolved/no-defect-found, the title-bar/command-centre item is real and
+//! substantial, and the status-segment item needs a real-hardware
+//! re-check, none of which this repo's `git`-only worker access can close
+//! out further this session.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
