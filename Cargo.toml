@@ -212,7 +212,30 @@ win = ["quadraui/win"]
 # `Theme` on every `Backend::set_theme` call), which lets this crate delete
 # its own `css.rs`/`gtk/css.rs` copy of the same stylesheet instead of
 # maintaining a duplicate.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "9f8766d37912a58d28714a346ee8158a60efabf3", features = ["tui", "terminal"] }
+#
+# #1576 bumped this to pick up three light-theme fixes: quadraui#1179 (the
+# macOS clear colour comes from the theme instead of a hard-coded #1F1F24,
+# and the GTK/macOS status bar fills its whole `rect.height` instead of
+# stopping at `current_line_height` — fixes the dark band behind the
+# traffic lights, the dark gap under the breadcrumbs and the dark Settings
+# scrollbar gutter), quadraui#1180 (`AppShell::render` sources the sidebar
+# header and resize divider from `Backend::theme()` — a new trait method
+# that reads back whatever the host last passed to `set_theme` — instead
+# of hard-coded VS-Code-dark literals, and `Form`'s focused row pairs
+# `header_fg` with `selected_bg` for guaranteed contrast instead of
+# `foreground`, which under `vscode-light` was near-black on near-black),
+# and quadraui#1184 (`Theme::default()` stays dark on purpose, but a new
+# `Theme::light_default()` gives light-theme builders a palette to spread
+# `..` over instead of leaking dark defaults into unmapped fields, and the
+# GTK terminal background now comes from the theme). No `quadraui::Theme`
+# field was added by any of the three — `to_quadraui_theme_chrome` below
+# already mapped `header_bg`/`header_fg`/`separator` before this bump, and
+# vimcode's exhaustive literal (not a `..Theme::default()` spread) means
+# `light_default()` doesn't apply here either; nothing to change on the
+# mapping side. Also carries whatever else had landed on quadraui
+# `develop` by then: #1177 (macOS full-screen/traffic-light fix) and
+# #1181–#1183 (TUI minimap slider, Toast layout, TUI Tree badge overlap).
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "286eb6c9e3f0a47e22967a625ba1e56018da0068", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole

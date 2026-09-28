@@ -790,6 +790,93 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// #1576: the sidebar header row (the `" EXPLORER "` strip above the
+        /// tree, painted by quadraui's `AppShell::render`) must come from
+        /// vimcode's own theme, not quadraui's hard-coded VS-Code-dark
+        /// literal `Color::rgb(37, 37, 38)` (`#252526`) paired with
+        /// `Color::rgb(220, 220, 220)` foreground. `to_quadraui_theme_chrome`
+        /// (`src/render.rs`) has mapped `header_bg`/`header_fg` from
+        /// `theme.status_bg`/`theme.status_fg` since #1574, but until
+        /// quadraui#1180 (picked up by this issue's pin bump) `AppShell::
+        /// render` never read those fields at all — it painted the literal
+        /// directly, so the mapping had no effect on what actually reached
+        /// the screen. Confirmed red against the pre-#1576 pin: with the
+        /// old rev, this assertion fails because the painted header bg/fg
+        /// are quadraui's literal, not `vscode_light`'s `#007acc`/`#ffffff`.
+        #[test]
+        fn sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.colorscheme = "vscode-light".to_string();
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            // The shadow `engine.app_shell` already defaults its active
+            // panel to Explorer (so the tree content paints from the very
+            // first frame — see this module's `driver_click_on_every_
+            // activity_bar_icon_opens_its_panel_via_shell_app` for the same
+            // precondition), but the *runner's own*, separate `AppShell`
+            // (what `quadraui::AppShell::render` actually paints the header
+            // chrome from) starts on the hamburger panel until a real click
+            // lands — `App::take_requested_panel`'s own doc explains the
+            // shadow/runner split. Click the Explorer activity-bar icon
+            // (located by chrome zone id, not glyph — the Nerd-Fonts-off
+            // fallback icons are ambiguous single ASCII chars) to drive a
+            // real dispatch and pick up the runner's header.
+            let bounds = driver
+                .inventory()
+                .zones()
+                .iter()
+                .find(|z| z.id.as_str() == crate::core::engine::sidebar::PANEL_EXPLORER)
+                .map(|z| z.bounds)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Explorer icon must register a chrome zone; screen:\n{}",
+                        driver.screen()
+                    )
+                });
+            driver.click(
+                bounds.x + bounds.width / 2.0,
+                bounds.y + bounds.height / 2.0,
+            );
+
+            let (x, y) = driver
+                .find("EXPLORER")
+                .expect("the sidebar header must paint its panel title");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the header title must paint a styled cell");
+
+            let theme = crate::render::Theme::vscode_light();
+            let expected_bg = quadraui::tui::ratatui_color(theme.status_bg);
+            let expected_fg = quadraui::tui::ratatui_color(theme.status_fg);
+            // quadraui's old hard-coded header literal, `#252526` /
+            // `Color::rgb(220, 220, 220)` — must NOT show up here.
+            let old_literal_bg = quadraui::tui::ratatui_color(quadraui::Color::rgb(37, 37, 38));
+
+            assert_eq!(
+                style.bg,
+                expected_bg,
+                "sidebar header bg must come from theme.status_bg (vimcode's \
+                 theme, via `to_quadraui_theme_chrome`'s header_bg mapping), \
+                 not quadraui's hard-coded dark literal; screen:\n{}",
+                driver.screen()
+            );
+            assert_ne!(
+                style.bg,
+                old_literal_bg,
+                "sidebar header bg must not be quadraui's old #252526 literal \
+                 under a light theme; screen:\n{}",
+                driver.screen()
+            );
+            assert_eq!(
+                style.fg,
+                expected_fg,
+                "sidebar header fg must come from theme.status_fg, not \
+                 quadraui's hard-coded dark literal; screen:\n{}",
+                driver.screen()
+            );
+        }
+
         /// #1574: the search sidebar's `"  NN: "` line-number prefix must
         /// paint with `theme.line_number_fg` — before this issue,
         /// `populate_search_sidebar_system` hard-coded `Color::rgb(100, 100,
