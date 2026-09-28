@@ -15161,6 +15161,10 @@ pub struct Theme {
     // Activity bar
     /// Foreground for activity bar icons.
     pub activity_bar_fg: Color,
+    /// Colour of the 2px left-edge accent line on the active activity-bar
+    /// item (`quadraui::ActivityBar::active_accent`, #658). Mirrors VS
+    /// Code's `activityBar.activeBorder`.
+    pub activity_active_accent: Color,
 }
 
 impl Theme {
@@ -15354,6 +15358,7 @@ impl Theme {
             scrollbar_track: hex("#1a1a1a"),
             terminal_bg: hex("#1e1e1e"),
             activity_bar_fg: hex("#c8c8d2"),
+            activity_active_accent: hex("#c8c8d2"),
         }
     }
 
@@ -15504,6 +15509,7 @@ impl Theme {
             scrollbar_track: hex("#282828"),
             terminal_bg: hex("#282828"),
             activity_bar_fg: hex("#bdae93"),
+            activity_active_accent: hex("#bdae93"),
         }
     }
 
@@ -15654,6 +15660,7 @@ impl Theme {
             scrollbar_track: hex("#1a1b26"),
             terminal_bg: hex("#1a1b26"),
             activity_bar_fg: hex("#a9b1d6"),
+            activity_active_accent: hex("#a9b1d6"),
         }
     }
 
@@ -15804,6 +15811,7 @@ impl Theme {
             scrollbar_track: hex("#002b36"),
             terminal_bg: hex("#002b36"),
             activity_bar_fg: hex("#93a1a1"),
+            activity_active_accent: hex("#93a1a1"),
         }
     }
 
@@ -15954,6 +15962,7 @@ impl Theme {
             scrollbar_track: hex("#1e1e1e"),
             terminal_bg: hex("#1e1e1e"),
             activity_bar_fg: hex("#c8c8d2"),
+            activity_active_accent: hex("#c8c8d2"),
         }
     }
 
@@ -16103,6 +16112,7 @@ impl Theme {
             scrollbar_track: hex("#f3f3f3"),
             terminal_bg: hex("#ffffff"),
             activity_bar_fg: hex("#646e6e"),
+            activity_active_accent: hex("#646e6e"),
         }
     }
 
@@ -16344,6 +16354,15 @@ impl Theme {
         }
         if let Some(c) = color("activityBar.foreground") {
             theme.activity_bar_fg = c;
+        }
+        // VS Code's own default for `activityBar.activeBorder` is
+        // `activityBar.foreground` (see `ACTIVITY_BAR_ACTIVE_BORDER` in
+        // VS Code's `colorRegistry`) — only fall back when the imported
+        // theme doesn't override it explicitly.
+        if let Some(c) =
+            color("activityBar.activeBorder").or_else(|| color("activityBar.foreground"))
+        {
+            theme.activity_active_accent = c;
         }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────
@@ -19166,9 +19185,9 @@ pub fn build_activity_bar(
         top_items: top,
         bottom_items: bottom,
         active_accent: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
+            theme.activity_active_accent.r,
+            theme.activity_active_accent.g,
+            theme.activity_active_accent.b,
         )),
         selection_bg: Some(quadraui::Color::rgb(
             theme.cursor.r,
@@ -27318,6 +27337,112 @@ mod tests {
         assert_eq!(theme.status_bg, try_from_hex("#181825").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: `activityBar.activeBorder` is VS Code's own colour key for
+    /// the active-item accent line (`activity_active_accent`'s doc). When
+    /// an imported theme sets it explicitly to something other than
+    /// `activityBar.foreground`, the explicit value must win — the two are
+    /// independent colours, not one derived from the other.
+    #[test]
+    fn from_vscode_json_prefers_explicit_active_border_over_foreground() {
+        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            "name": "Test Theme",
+            "colors": {
+                "activityBar.foreground": "#c8c8d2",
+                "activityBar.activeBorder": "#61afef"
+            }
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.activity_bar_fg, try_from_hex("#c8c8d2").unwrap());
+        assert_eq!(
+            theme.activity_active_accent,
+            try_from_hex("#61afef").unwrap(),
+            "an explicit `activityBar.activeBorder` must win over \
+             `activityBar.foreground`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: VS Code's own default for `activityBar.activeBorder` is
+    /// `activityBar.foreground` (see `ACTIVITY_BAR_ACTIVE_BORDER`'s
+    /// `dark`/`light` entries in VS Code's `colorRegistry`) — so an
+    /// imported theme that sets only `activityBar.foreground` must have
+    /// `activity_active_accent` fall back to that value, not stay at
+    /// whatever built-in default `Theme::onedark()` seeded it with.
+    #[test]
+    fn from_vscode_json_falls_back_to_foreground_when_active_border_absent() {
+        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border_fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            "name": "Test Theme",
+            "colors": {
+                "activityBar.foreground": "#93a1a1"
+            }
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.activity_bar_fg, try_from_hex("#93a1a1").unwrap());
+        assert_eq!(
+            theme.activity_active_accent,
+            try_from_hex("#93a1a1").unwrap(),
+            "with no explicit `activityBar.activeBorder`, `activity_active_accent` \
+             must fall back to `activityBar.foreground`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: `build_activity_bar`'s `active_accent` must come from the
+    /// dedicated `theme.activity_active_accent` colour, not `theme.cursor`
+    /// (the field it silently borrowed before this issue introduced a
+    /// colour dedicated to the activity-bar accent — see that field's own
+    /// doc). `vscode_light`'s `cursor` (`#000000`) and
+    /// `activity_active_accent` (`#646e6e`) are deliberately different, so
+    /// a regression back to `theme.cursor` fails loudly here rather than
+    /// only looking wrong on screen.
+    ///
+    /// Note: as of #1434, `render::build_activity_bar` itself has no
+    /// production caller — `App` renders through
+    /// `quadraui::compose::app_shell::AppShell::build_activity_bar`
+    /// instead, which hardcodes `active_accent: None` pending a quadraui
+    /// hook (that function's own doc cites quadraui#381). This test pins
+    /// the adapter's own field-mapping correctness so it's ready the
+    /// moment such a hook lands and vimcode wires this function (or its
+    /// theme field) back in; it does not claim the accent line paints in
+    /// the shipped app today.
+    #[test]
+    fn build_activity_bar_active_accent_uses_activity_active_accent_not_cursor() {
+        let engine = crate::core::Engine::new_for_test();
+        let theme = Theme::vscode_light();
+        assert_ne!(
+            theme.cursor, theme.activity_active_accent,
+            "fixture must use a theme where the two colours differ, or this \
+             test can't distinguish the fix from the bug"
+        );
+
+        let bar = build_activity_bar(&engine, &theme, true, None);
+
+        let expected = quadraui::Color::rgb(
+            theme.activity_active_accent.r,
+            theme.activity_active_accent.g,
+            theme.activity_active_accent.b,
+        );
+        assert_eq!(bar.active_accent, Some(expected));
     }
 
     /// #1127: `themes_dir()` must derive from the cross-platform
