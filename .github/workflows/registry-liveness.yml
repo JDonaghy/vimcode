@@ -1,0 +1,61 @@
+name: Registry liveness
+
+# #1347: scheduled — deliberately NOT on push/pull_request. This workflow
+# HEAD-requests real upstream download URLs (`raw.githubusercontent.com` for
+# the registry.json itself, then whatever host each manifest's
+# `[lsp.acquire]`/`[dap.acquire]` resolves to — GitHub releases,
+# `api.releases.hashicorp.com`, or a manifest-declared `url-template` host).
+# A transient network blip there must never block a PR, which is exactly why
+# `ci.yml` never runs `tests/registry_liveness.rs`'s `#[ignore]`d live test —
+# see that file's module doc.
+on:
+  schedule:
+    # 06:00 UTC every Monday.
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  liveness:
+    name: Registry liveness (lsp/dap acquire URLs)
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # #691: quadraui is a git dependency pinned to a `rev` in Cargo.toml,
+    # fetched by Cargo itself on the first invocation below — same as ci.yml.
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        # Distinct key from ci.yml's jobs — this only ever builds the
+        # `registry_liveness` test target, never the GTK-on lane.
+        key: ${{ runner.os }}-cargo-build-target-registry-liveness-${{ hashFiles('**/Cargo.lock') }}
+
+    # `--test registry_liveness` scopes the build+run to exactly this one
+    # integration-test binary — it does NOT pull in `tests/nvim_conformance.rs`
+    # (which hard-fails without a pinned nvim oracle installed) or the GTK
+    # feature (`--no-default-features` keeps `src/gtk/` out entirely; this
+    # check is backend-agnostic, it only ever touches `src/core/`).
+    - name: Run the registry liveness check (live registry.json, real network)
+      run: |
+        cargo test --no-default-features --test registry_liveness -- --ignored --nocapture
