@@ -465,6 +465,18 @@ pub struct Settings {
     #[serde(default)]
     pub fold_controls: FoldControlsMode,
 
+    /// Sticky scroll (#1546): pin the header lines of the buffer's
+    /// enclosing scopes (e.g. `impl Foo {`, `fn bar() {`) at the top of the
+    /// editor pane while scrolling, VS Code's `editor.stickyScroll.enabled`
+    /// (on by default there too). No Vim equivalent, so no `:set`
+    /// abbreviation — toggle via the Settings sidebar or `:set
+    /// sticky_scroll=false`. Scope source is the buffer's indent-fold
+    /// hierarchy (`Engine::compute_indent_folds`, computed independent of
+    /// `'foldmethod'` — see `render::sticky_scroll_header_lines`); capped
+    /// at 5 pinned lines, matching VS Code's `editor.stickyScroll.maxLineCount`.
+    #[serde(default = "default_true")]
+    pub sticky_scroll: bool,
+
     /// Whether `/` and `?` search wrap around the end/start of the buffer
     /// when no more matches are found in the current direction. Corresponds
     /// to Vim's `'wrapscan'` / `'ws'`. Default **true**, matching Vim
@@ -1675,6 +1687,7 @@ impl Default for Settings {
             lsp_enabled: default_lsp_enabled(),
             format_on_save: false,
             board_tick_enabled: false,
+            sticky_scroll: true,
             lsp_servers: Vec::new(),
             language_map: std::collections::HashMap::new(),
             terminal_scrollback_lines: default_terminal_scrollback_lines(),
@@ -3735,6 +3748,7 @@ impl Settings {
             "lsp_enabled" => self.lsp_enabled.to_string(),
             "format_on_save" => self.format_on_save.to_string(),
             "board_tick_enabled" => self.board_tick_enabled.to_string(),
+            "sticky_scroll" => self.sticky_scroll.to_string(),
             "terminal_scrollback_lines" => self.terminal_scrollback_lines.to_string(),
             "plugins_enabled" => self.plugins_enabled.to_string(),
             "ai_provider" => self.ai_provider.clone(),
@@ -3886,6 +3900,7 @@ impl Settings {
             "lsp_enabled" => self.lsp_enabled = value == "true",
             "format_on_save" => self.format_on_save = value == "true",
             "board_tick_enabled" => self.board_tick_enabled = value == "true",
+            "sticky_scroll" => self.sticky_scroll = value == "true",
             "terminal_scrollback_lines" => {
                 self.terminal_scrollback_lines = value
                     .parse()
@@ -4118,6 +4133,15 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "cursorline",
         label: "Cursor Line",
         description: "Highlight the line containing the cursor",
+        category: "Appearance",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "sticky_scroll",
+        label: "Sticky Scroll",
+        description: "Pin the header lines of enclosing scopes (e.g. \"impl Foo {\") \
+                       at the top of the editor pane while scrolling, VS Code's \
+                       editor.stickyScroll.enabled",
         category: "Appearance",
         setting_type: SettingType::Bool,
     },
@@ -5096,6 +5120,25 @@ mod tests {
         assert!(SETTING_DEFS
             .iter()
             .any(|d| d.key == "acp_reopen_last_session"));
+    }
+
+    /// #1546's `sticky_scroll` setting (VS Code's
+    /// `editor.stickyScroll.enabled`): defaults **on** (unlike
+    /// `board_tick_enabled`'s default-off — sticky scroll dispatches no
+    /// work, it's a pure display aid, matching VS Code's own default),
+    /// round-trips through `get_value_str`/`set_value_str`, and appears in
+    /// `SETTING_DEFS`.
+    #[test]
+    fn sticky_scroll_defaults_on_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert!(s.sticky_scroll);
+        assert_eq!(s.get_value_str("sticky_scroll"), "true");
+
+        s.set_value_str("sticky_scroll", "false").unwrap();
+        assert!(!s.sticky_scroll);
+        assert_eq!(s.get_value_str("sticky_scroll"), "false");
+
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "sticky_scroll"));
     }
 
     /// #1544's `fold_controls` setting (VS Code's `showFoldingControls`):

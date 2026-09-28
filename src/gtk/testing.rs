@@ -9564,6 +9564,143 @@ mod chrome_surfaces {
     }
 }
 
+/// GTK twin of `tui_main::app_on_tui_tests::tests::sticky_scroll` (#1546):
+/// sticky scroll's whole implementation is a single splice inside the
+/// shared `render::build_rendered_window` (`RenderedLine`s spliced over the
+/// top of `lines[]`, reusing the existing per-row paint + click-to-jump
+/// machinery unchanged), so this is a real dual-backend surface per
+/// CLAUDE.md's multi-backend testing rule, not a TUI-only concern.
+mod sticky_scroll {
+    use super::*;
+
+    /// Same fixture as the TUI twin: two nested headers, 40 body lines,
+    /// scrolled 20 lines past both, cursor safely below the pinned band.
+    fn nested_scopes_engine() -> Engine {
+        let mut engine = Engine::new();
+        let mut text = String::from("fn STICKYOUTER1546() {\n    fn STICKYINNER1546() {\n");
+        for i in 0..40 {
+            text.push_str(&format!("        body line {i}\n"));
+        }
+        text.push_str("    }\n}\n");
+        engine.buffer_mut().insert(0, &text);
+        engine.view_mut().scroll_top = 20;
+        engine.view_mut().cursor.line = 25;
+        engine.view_mut().cursor.col = 0;
+        engine
+    }
+
+    /// **Verified RED against unfixed `develop`**: with `render::
+    /// build_rendered_window`'s sticky-scroll splice block deleted
+    /// entirely (the same change the TUI twin's RED check makes), neither
+    /// header paints and both `screen_contains` assertions below fail.
+    /// Restored before committing.
+    #[test]
+    fn scrolling_past_enclosing_scopes_pins_their_headers_via_gtk_driver() {
+        let mut h = harness(nested_scopes_engine(), 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("STICKYOUTER1546"),
+            "the pinned outer header must reach the painted character grid; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("STICKYINNER1546"),
+            "the pinned inner header must reach the painted character grid; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("body line 18"),
+            "scroll_top's own real content (buffer line 20 = body index 18) \
+             must be covered by the pinned headers, not painted alongside \
+             them; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// `sticky_scroll = false` must turn the whole feature off on GTK too.
+    #[test]
+    fn sticky_scroll_false_disables_the_pinned_band_via_gtk_driver() {
+        let mut engine = nested_scopes_engine();
+        engine.settings.sticky_scroll = false;
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("STICKYOUTER1546"),
+            "no header should be pinned when sticky_scroll is off; painted \
+             texts: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// Clicking a pinned sticky-scroll header must jump the cursor to that
+    /// line on GTK too — same `RenderedLine::line_idx` click hit-test as
+    /// every other row, exercised through a real pixel click.
+    ///
+    /// Locates the pinned row via the painted `RenderedWindow` (never a
+    /// hardcoded coordinate, #555) rather than `GtkDriver::find`/
+    /// `find_bounds`: those resolve against `record_painted_text`, which
+    /// (per `Harness::window_center`'s own doc comment above) GTK never
+    /// calls for editor text.
+    ///
+    /// Dispatches a `WindowResized` before clicking — see
+    /// `editor_mouse_rungs::click_column_tracks_a_runtime_font_size_
+    /// change_on_gtk`'s own doc comment: `App::cached_line_height`/
+    /// `cached_char_width` (what `pixel_to_click_target` actually resolves
+    /// clicks against, unlike `painted_line_height`/`painted_char_width`,
+    /// which are only the paint-side record) refresh only on
+    /// `UiEvent::WindowResized`, which a real GTK session gets from the OS
+    /// on basically every settle but a headless `GtkDriver` test never
+    /// fires on its own — a pre-existing gap, orthogonal to #1546.
+    #[test]
+    fn clicking_a_pinned_sticky_header_jumps_the_cursor_to_it_via_gtk_driver() {
+        let engine = nested_scopes_engine();
+        let win_id = engine.active_window_id();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        let viewport = {
+            use quadraui::Backend as _;
+            h.driver.backend().viewport()
+        };
+        h.driver
+            .dispatch(quadraui::UiEvent::WindowResized { viewport });
+
+        let (rect, view_row, line_height) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have painted");
+            let rw = layout
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted a RenderedWindow");
+            let view_row = rw
+                .lines
+                .iter()
+                .position(|rl| rl.line_idx == 1)
+                .expect("the pinned inner-scope header must occupy a painted row");
+            (
+                rw.rect,
+                view_row,
+                h.painted_line_height()
+                    .expect("line height must be painted"),
+            )
+        };
+        let x = (rect.x + rect.width / 2.0) as f32;
+        let y = (rect.y + view_row as f64 * line_height + line_height / 2.0) as f32;
+        h.driver.click(x, y);
+
+        assert_eq!(
+            h.engine.borrow().view().cursor.line,
+            1,
+            "clicking the pinned inner-scope header must move the cursor \
+             to its real buffer line (1)"
+        );
+    }
+}
+
 /// Black-box paint + click-routing proof for the VS Code-style Command
 /// Center (`◀ ▶` nav arrows + centered `🔍 <project>` search box) dropped by
 /// the #540 Relm4->ShellApp cutover and never re-wired (#676).
