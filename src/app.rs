@@ -6676,6 +6676,12 @@ impl App {
         }
         if starts_interaction {
             engine.ai_has_focus = true;
+            // #1507 review: a mouse click into the panel isn't part of any
+            // keyboard `<leader>ai` gesture, so it breaks one exactly like a
+            // Named key would — discard rather than replay, since a click
+            // (unlike a keystroke) has no natural place in the input to
+            // insert buffered text.
+            engine.ai_leader_toggle_pending.clear();
         }
         let theme = render::Theme::from_name(&engine.settings.colorscheme);
         let backend_rc = self.backend.clone();

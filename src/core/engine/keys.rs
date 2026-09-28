@@ -5312,6 +5312,13 @@ impl Engine {
                     self.acp_attach_visual_selection_and_focus();
                 } else {
                     self.ai_has_focus = true;
+                    // #1507 review: this is a fresh entry into the panel, so
+                    // any `<leader>ai` partial match left buffered from a
+                    // previous session (this arm bypasses
+                    // `clear_sidebar_focus`, unlike `focus_sidebar_panel`)
+                    // must not carry over and wrongly complete against the
+                    // very first characters of this new session's message.
+                    self.ai_leader_toggle_pending.clear();
                 }
             }
             "b" => {

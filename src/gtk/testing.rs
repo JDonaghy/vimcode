@@ -8351,6 +8351,70 @@ second line here
                 h.driver.painted_texts()
             );
         }
+
+        /// #1507 review: on GTK, a partial `<leader>ai` match can be
+        /// interrupted by an ordinary typed character that happens to carry
+        /// real hardware Shift state (`gdk_modifiers_to_quadraui` reports
+        /// `modifiers.shift == true` for a capital letter) — a key shape
+        /// `Engine::ai_leader_toggle_key` never sees at all, since it only
+        /// ever consults a plain, unmodified `Key::Char`. The buffered
+        /// prefix must be replayed into the input rather than silently
+        /// dropped, the GTK twin of the TUI driver test
+        /// `leader_prefix_interrupted_by_enter_is_replayed_not_dropped_via_shell_app`
+        /// (which exercises the same `route_ai_chat_event` fallback via a
+        /// `Named` key instead of a modified `Char`).
+        ///
+        /// RED verified against the pre-fix code (`route_ai_chat_event`
+        /// only ever consulting `ai_leader_toggle_key` for a plain,
+        /// unmodified `Char`, with no fallback for a modified one): typing
+        /// " a" then a capital "B" discards the buffered " a" and the input
+        /// reads back "Bx" instead of " aBx".
+        #[test]
+        fn leader_prefix_interrupted_by_shift_char_is_replayed_not_dropped_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            // Gain focus first via a full `<leader>ai` — the panel doesn't
+            // have keyboard focus yet, so typing it now goes through
+            // `Engine::handle_leader_key`'s "ai" arm, not
+            // `ai_leader_toggle_key` at all.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            // Start a fresh toggle-back match, but interrupt it after 2 of
+            // its 3 keys with a capital letter (real hardware Shift held).
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "",
+                "setup: a partial match must not be visible in the input yet"
+            );
+
+            h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('B'),
+                modifiers: quadraui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+                repeat: false,
+            });
+            h.driver.type_char('x');
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "an interrupted partial match must not toggle focus"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                " aBx",
+                "the buffered ' a' prefix must be replayed into the input \
+                 before the interrupting Shift+B, not silently dropped"
+            );
+        }
     }
 }
 

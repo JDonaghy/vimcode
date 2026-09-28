@@ -781,6 +781,14 @@ impl Engine {
         self.dap_sidebar_has_focus = false;
         self.ext_sidebar_has_focus = false;
         self.ai_has_focus = false;
+        // #1507 review: this is also the chokepoint every focus *grant*
+        // (`focus_sidebar_panel`/`toggle_sidebar_panel`) calls immediately
+        // before `set_panel_focus`, so clearing here discards a
+        // `<leader>ai` partial match abandoned on both the way out (losing
+        // focus to a click elsewhere) and the way back in (re-entering the
+        // AI panel) — otherwise it could stick around and wrongly complete
+        // against an unrelated later message in a future panel session.
+        self.ai_leader_toggle_pending.clear();
         self.settings_has_focus = false;
         self.ext_panel_has_focus = false;
         self.activity_bar_focused = false;

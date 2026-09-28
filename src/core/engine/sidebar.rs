@@ -289,7 +289,14 @@ impl Engine {
                     self.ext_refresh();
                 }
             }
-            PANEL_AI => self.ai_has_focus = true,
+            PANEL_AI => {
+                self.ai_has_focus = true;
+                // #1507 review: not every caller of `set_panel_focus` routes
+                // through `clear_sidebar_focus` first (`handle_nav_overflow`
+                // doesn't), so reset the `<leader>ai` gesture buffer here
+                // too rather than relying on that ordering.
+                self.ai_leader_toggle_pending.clear();
+            }
             PANEL_BOARD => {
                 self.board_has_focus = true;
                 if self.board_model.is_none() && !self.board_fetching {

@@ -8926,15 +8926,36 @@ pub fn route_ai_chat_event(
     // the completion-popup intercepts below: `ai_leader_toggle_key` only
     // ever engages while the input is empty, which is also the one state a
     // completion popup can never be open in, so the two can't race.
-    if let quadraui::UiEvent::KeyPressed {
-        key: quadraui::Key::Char(ch),
-        modifiers,
-        ..
-    } = event
-    {
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
         let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
-        if no_modifiers && engine.ai_leader_toggle_key(*ch) {
-            return engine.ai_has_focus;
+        match key {
+            quadraui::Key::Char(ch) if no_modifiers => {
+                if engine.ai_leader_toggle_key(*ch) {
+                    return engine.ai_has_focus;
+                }
+                // A mismatched plain char already had any pending prefix
+                // replayed by `ai_leader_toggle_key` itself — nothing more
+                // to do here.
+            }
+            // Every other key shape (a modified `Char` — e.g. Shift held for
+            // a capital letter — or any `Named` key: Enter, Tab, Backspace,
+            // arrows, Escape, …) can never be part of the `<leader>ai`
+            // gesture and so never reaches `ai_leader_toggle_key` at all. If
+            // a partial match is still buffered when one of these arrives,
+            // it must be resolved right here or it dangles silently (#1507
+            // review) — replayed into the input for an ordinary interrupting
+            // key, or discarded for `Escape`, which is about to end the
+            // session via `Cancelled` below (see `dispatch_ai_chat_event`'s
+            // `Cancelled` arm for why that one path discards instead of
+            // replaying).
+            _ if !engine.ai_leader_toggle_pending.is_empty() => {
+                if matches!(key, quadraui::Key::Named(quadraui::NamedKey::Escape)) {
+                    engine.ai_leader_toggle_pending.clear();
+                } else {
+                    engine.ai_leader_toggle_flush();
+                }
+            }
+            _ => {}
         }
     }
 

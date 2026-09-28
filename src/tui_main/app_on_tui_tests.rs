@@ -6782,6 +6782,12 @@ mod tests {
         /// `Engine::ai_leader_toggle_key` only engages while the input is
         /// empty, precisely so a real message containing those characters
         /// is never at risk.
+        ///
+        /// RED verified: with the `!self.ai_chat.borrow().input_text().
+        /// is_empty()` guard removed from the top of `ai_leader_toggle_key`,
+        /// this fails — typing "say ai please" toggles focus back to the
+        /// editor partway through and the input reads back without the
+        /// swallowed " ai".
         #[test]
         fn leader_ai_sequence_is_literal_text_once_input_is_non_empty_via_shell_app() {
             let mut h = ai_panel_harness_widened();
@@ -6809,6 +6815,139 @@ mod tests {
                 "say ai please",
                 "every character of the message, including \" ai\", must \
                  land in the chat input verbatim"
+            );
+        }
+
+        /// #1507 review: a partial `<leader>ai` match interrupted by a key
+        /// `Engine::ai_leader_toggle_key` never sees at all (any
+        /// `quadraui::Key::Named`, not just a plain mismatched `Char`) must
+        /// still be replayed into the chat input rather than silently
+        /// dropped. Concrete repro from the review: type the leader (Space)
+        /// then `a` — both buffered, nothing visible yet — then press Enter
+        /// to start a second line (`submit_on_enter` defaults to `false`,
+        /// so Enter inserts a newline rather than submitting) before typing
+        /// the rest of the message.
+        ///
+        /// RED verified against this fix removed (i.e. `route_ai_chat_event`
+        /// only ever consulting `ai_leader_toggle_key` for a plain,
+        /// unmodified `Char`, with no fallback for `Named` keys): the
+        /// buffered " a" is discarded when Enter arrives, and the input
+        /// reads back as "\nrest" instead of " a\nrest".
+        #[test]
+        fn leader_prefix_interrupted_by_enter_is_replayed_not_dropped_via_shell_app() {
+            let mut h = ai_panel_harness_widened();
+            // Gain focus first via a full `<leader>ai` (this goes through
+            // `Engine::handle_leader_key`'s "ai" arm, not
+            // `ai_leader_toggle_key` — the panel doesn't have focus yet, so
+            // `route_ai_chat_event` isn't even reached). Only once focused
+            // does typing the leader sequence again start the *toggle-back*
+            // gesture this test is about.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            // Start a fresh toggle-back match, but interrupt it after 2 of
+            // its 3 keys with Enter.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.render();
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "",
+                "setup: a partial match must not be visible in the input yet"
+            );
+
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            for c in "rest".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "an interrupted partial match must not toggle focus"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                " a\nrest",
+                "the buffered ' a' prefix must be replayed into the input \
+                 before the interrupting Enter's newline, not silently \
+                 dropped"
+            );
+        }
+
+        /// #1507 review, "related" point: a partial match abandoned via
+        /// Escape (leaving the panel) must not survive to wrongly complete
+        /// against an unrelated later message once the panel regains focus.
+        /// Guarded by two independent layers that each discard the buffer
+        /// on the way out — `dispatch_ai_chat_event`'s `Cancelled` arm, and
+        /// `route_ai_chat_event`'s own `Escape`-clears-pending branch ahead
+        /// of it — either one alone is enough to pass this test; see
+        /// `ai_leader_toggle_key_tests::cancelled_discards_a_buffered_partial_match`
+        /// for a unit test that isolates the `Cancelled`-arm layer
+        /// specifically by calling `dispatch_ai_chat_event` directly.
+        ///
+        /// RED verified against the pre-fix code (neither layer present,
+        /// i.e. `develop` before this fix): the second `<leader>a` + `i`
+        /// below (typed as an ordinary message opener, with the panel
+        /// re-entered via the palette-equivalent direct `ai_has_focus =
+        /// true` this harness's re-open step performs) wrongly completes
+        /// the stale match left over from the first, abandoned attempt and
+        /// toggles focus off instead of leaving "i" as literal input text.
+        #[test]
+        fn leader_prefix_abandoned_via_escape_does_not_leak_into_next_session_via_shell_app() {
+            let mut h = ai_panel_harness_widened();
+            // Gain focus first via a full `<leader>ai` — the panel doesn't
+            // have keyboard focus yet, so typing it now goes through
+            // `Engine::handle_leader_key`'s "ai" arm, not
+            // `ai_leader_toggle_key`/`ai_leader_toggle_pending` at all.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            // Now, with the panel already focused, start a *toggle-back*
+            // match (this is the one that uses `ai_leader_toggle_pending`),
+            // then abandon it by leaving the panel via Escape (`Cancelled`)
+            // before it completes.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            h.driver.render();
+            assert!(
+                !h.engine.borrow().ai_has_focus,
+                "setup: Escape must leave the panel"
+            );
+
+            // Re-enter the panel and type an unrelated message that starts
+            // with the single character the abandoned match was still
+            // waiting for ('i', the third character of "<leader>ai").
+            h.engine.borrow_mut().ai_has_focus = true;
+            h.driver.type_char('i');
+            for c in "gnore this".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "a stale, abandoned partial match must not resurrect itself \
+                 and toggle focus off against this unrelated message"
+            );
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "ignore this",
+                "every character of the new, unrelated message must land \
+                 in the chat input verbatim"
             );
         }
     }
