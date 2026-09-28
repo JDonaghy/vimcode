@@ -3971,3 +3971,63 @@ mod curl_transport_history_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ai_mention_completions_exclude_tests {
+    use crate::core::Engine;
+
+    /// #1545: `ai_mention_completions`' workspace-file walk must prune
+    /// `explorer_exclude` entries via `filter_entry`, same as
+    /// `picker_populate_files` — otherwise, with `show_hidden_files`
+    /// defaulting on, typing `@` would walk into `.git/` and could surface
+    /// its object files as `@file` completion candidates (and burn the
+    /// `MAX_SCANNED` budget doing it in a repo with a large `.git/`).
+    ///
+    /// RED-verified against the branch without the `filter_entry` prune:
+    /// commenting it out makes `.git/HEAD1545extpanel` show up in
+    /// `menu.candidates` below (an empty query lists every scanned file).
+    #[test]
+    fn does_not_surface_git_internals_as_at_file_completions() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vc1545_ext_panel_mention_exclude_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(workspace.join(".git")).expect("create .git dir");
+        std::fs::write(
+            workspace.join(".git").join("HEAD1545extpanel"),
+            b"ref: refs/heads/main\n",
+        )
+        .expect("write .git/HEAD");
+        std::fs::write(workspace.join("plain1545.rs"), "").expect("write plain file");
+
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @1545");
+
+        let menu = engine
+            .ai_mention_completions()
+            .expect("typing @ with a matching prefix should show mention completions");
+
+        assert!(
+            menu.candidates.contains(&"@plain1545.rs".to_string()),
+            "the ordinary workspace file must still be offered: {:?}",
+            menu.candidates
+        );
+        assert!(
+            !menu
+                .candidates
+                .iter()
+                .any(|c| c.contains("HEAD1545extpanel")),
+            "'.git/' internals must never surface as @file completions \
+             (#1545): {:?}",
+            menu.candidates
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+}

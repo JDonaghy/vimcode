@@ -643,6 +643,17 @@ pub(crate) fn walk_entry_is_excluded(entry: &ignore::DirEntry, exclude: &[String
 /// one. No other glob syntax (character classes, brace expansion, `**`) is
 /// recognized — deliberately minimal, since every default
 /// `explorer_exclude` entry is a plain literal name.
+///
+/// This is a naive recursive backtracking matcher with textbook exponential
+/// worst-case behaviour on adversarial patterns with many `*`s (e.g.
+/// `"*a*a*a*a*b"` against a matching-prefix string with no trailing `b`).
+/// `explorer_exclude` is user-configurable via `:set`, so a pathological
+/// (if implausible) hand-entered pattern could stall directory listing.
+/// Accepted for now given the trust boundary (local settings, not external
+/// input) and the small size of every shipped default pattern; if this ever
+/// grows beyond the current handful of literal globs, add a length/segment-
+/// count guard or switch to a linear (e.g. two-pointer) matcher instead of
+/// widening the recursion.
 fn explorer_glob_matches(pattern: &str, name: &str) -> bool {
     fn matches(pattern: &[char], name: &[char]) -> bool {
         match pattern.first() {
@@ -989,6 +1000,56 @@ mod explorer_exclude_tests {
             !names.contains(&".git"),
             "'.git' must stay hidden via explorer_exclude even with show_hidden true; \
              got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `walk_entry_is_excluded`'s `depth() == 0` root exemption: a project
+    /// directory literally named `.git` must not exclude itself (which
+    /// would make every walk starting there list empty) — only a *nested*
+    /// `.git` entry is pruned. Covers the edge case the reviewer flagged as
+    /// documented but untested.
+    #[test]
+    fn walk_entry_is_excluded_exempts_only_the_walk_root() {
+        use super::walk_entry_is_excluded;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_walk_root_exempt_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The walk root itself is named `.git` — matches a real project
+        // directory checked out under that name.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".git").join(".git")).unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let walk_root = dir.join(".git");
+        let entries: Vec<ignore::DirEntry> = ignore::WalkBuilder::new(&walk_root)
+            .hidden(false)
+            .build()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        let root_entry = entries
+            .iter()
+            .find(|e| e.depth() == 0)
+            .expect("walk must yield the root entry");
+        assert_eq!(root_entry.file_name(), ".git");
+        assert!(
+            !walk_entry_is_excluded(root_entry, &exclude),
+            "the walk root must never exclude itself, even when named '.git' \
+             — otherwise a project directory named '.git' would list empty"
+        );
+
+        let nested_entry = entries
+            .iter()
+            .find(|e| e.depth() > 0 && e.file_name() == ".git")
+            .expect("walk must yield the nested '.git' entry");
+        assert!(
+            walk_entry_is_excluded(nested_entry, &exclude),
+            "a nested '.git' entry (depth > 0) must still be excluded"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
