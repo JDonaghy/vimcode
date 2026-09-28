@@ -12260,17 +12260,27 @@ mod minimap {
     /// non-background colours — the GTK analogue of the TUI test's
     /// `colors.len()` probe (`minimap_paints_syntax_colour_for_indented_code`
     /// in `src/tui_main/shell_app.rs`). At a 1400px-wide pane the strip
-    /// resolves to exactly `MINIMAP_TARGET_COLS` (120px, == GTK's
-    /// `COLUMN_CAPACITY`), so indents of 20, **40 and 80** columns all land
-    /// inside the range every formula this issue considered ever covered —
-    /// which is what lets the caller assert #1030's deliverable 2 ("colour
-    /// must survive at indent 40 and 80") literally, here, on GTK. The TUI's
-    /// braille strip cannot reach those columns at all (22 source columns
-    /// wide, hardcoded upstream); see the TUI scenario's own doc and
+    /// resolves to exactly `MINIMAP_TARGET_COLS` (120px), which is 120
+    /// character columns in block mode but only ~60 in the GUI default's
+    /// character mode (`MinimapScale::Two`, 2px per column) — so the probe
+    /// reports `painted_cols` alongside the colour count instead of
+    /// assuming a budget, and the caller asserts #1030's deliverable 2
+    /// ("colour must survive at indent 40 and 80") in the mode that really
+    /// does reach column 80. See the caller's own doc comment for the
+    /// #1576 history behind that split. The TUI's braille strip cannot
+    /// reach those columns at all (22 source columns wide, hardcoded
+    /// upstream); see the TUI scenario's own doc and
     /// `docs/PENDING_QUADRAUI_ISSUES.md`.
-    fn minimap_gtk_distinct_colors_for_indent(indent: usize) -> usize {
+    ///
+    /// `render_characters` drives `Settings::minimap_render_characters`,
+    /// i.e. which `MinimapScale` (and therefore which per-column pixel
+    /// width) the painted strip resolves to.
+    fn minimap_gtk_distinct_colors_for_indent(
+        indent: usize,
+        render_characters: bool,
+    ) -> MinimapIndentProbe {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1030_gtk_minimap_colour_{}_{:?}_{indent}",
+            "vimcode_test_1030_gtk_minimap_colour_{}_{:?}_{indent}_{render_characters}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -12293,6 +12303,7 @@ mod minimap {
         engine
             .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
             .unwrap();
+        engine.settings.minimap_render_characters = render_characters;
         let win_id = engine.active_window_id();
         let buf_id = engine.windows.get(&win_id).unwrap().buffer_id;
         let n_highlights = engine.buffer_manager.get(buf_id).unwrap().highlights.len();
@@ -12309,17 +12320,26 @@ mod minimap {
         let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
         let bg = (theme.background.r, theme.background.g, theme.background.b);
 
-        let strip = {
+        let (strip, scale) = {
             let layout = h.screen_layout.borrow();
-            layout
+            let mm = layout
                 .as_ref()
                 .unwrap()
                 .minimap
                 .iter()
                 .find(|m| m.window_id == win_id)
-                .expect("the layout must carry a minimap for the pane")
-                .rect
+                .expect("the layout must carry a minimap for the pane");
+            (mm.rect, mm.minimap_scale)
         };
+        // The strip's real painted column budget: GTK's rasteriser walks at
+        // most `COLUMN_CAPACITY` character columns and steps
+        // `MinimapScale::cell_w_px` logical pixels per column
+        // (`quadraui::gtk::minimap::paint_row_blocks` / `paint_row_chars`),
+        // then clips everything to the strip rect — so a strip only ever
+        // shows the first `strip.width / cell_w_px` of those columns,
+        // whatever `COLUMN_CAPACITY` allows.
+        let painted_cols = ((strip.width / scale.cell_w_px()).floor() as usize)
+            .min(quadraui::primitives::minimap::COLUMN_CAPACITY);
 
         let x0 = strip.x.round() as i32;
         let x1 = (strip.x + strip.width).round() as i32;
@@ -12335,7 +12355,25 @@ mod minimap {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
-        seen.len()
+        MinimapIndentProbe {
+            distinct_colors: seen.len(),
+            painted_cols,
+            scale,
+        }
+    }
+
+    /// One measurement from [`minimap_gtk_distinct_colors_for_indent`] — the
+    /// painted colour count *and* the geometry that decides whether the
+    /// probed indent was reachable at all, so the caller never has to assume
+    /// a column budget the strip may not actually have (#1576).
+    struct MinimapIndentProbe {
+        /// Distinct non-background colours found inside the painted strip.
+        distinct_colors: usize,
+        /// Character columns this strip can actually show — see the
+        /// `painted_cols` computation in the helper.
+        painted_cols: usize,
+        /// The scale the settings under test resolved to.
+        scale: quadraui::MinimapScale,
     }
 
     /// #1052 — GTK minimap syntax colour stopped partway down a long file
@@ -12811,45 +12849,169 @@ mod minimap {
         );
     }
 
+    /// #1030 deliverable 2/3 on GTK: syntax colour must survive at deep
+    /// indentation, not only near column 0.
+    ///
+    /// # Why this test probes *both* minimap render modes (#1576)
+    ///
+    /// The original version of this test measured indents 0/20/40/80 in a
+    /// single pass and justified indent 80 with "the strip is 120px wide and
+    /// GTK paints up to `COLUMN_CAPACITY` (120) character columns, so column
+    /// 80 is inside the painted range". That reasoning stopped being true
+    /// when #1532 made `minimap_render_characters` the *default* for GUI
+    /// backends: at the `MinimapScale::Two` that resolves to, one character
+    /// column costs `MinimapScale::cell_w_px()` = **2** logical pixels, so
+    /// the same 120px strip shows only its first ~60 columns —
+    /// `src/render.rs`'s `gtk_minimap_sizing` still states its target width
+    /// as a bare `MINIMAP_TARGET_COLS` (120) pixels without scaling it by
+    /// the resolved cell width, which is the "keep `reserved_width`/
+    /// `resolve_width` consistent with the larger cell" contract
+    /// quadraui#1143 spells out for hosts. Indent 80 was therefore painting
+    /// *nothing* at the default settings: the measured colour count came
+    /// entirely from the strip's own background/viewport tint, which is one
+    /// or two colours depending on the host's font and theme rounding — a
+    /// bare `> 1` assertion that passed on macOS (3) and failed on Linux (1)
+    /// for reasons that had nothing to do with syntax colour. See this
+    /// session's final report for the follow-up: widening the GTK strip to
+    /// `MINIMAP_TARGET_COLS * cell_w_px` is a real, user-visible minimap
+    /// geometry change and is deliberately not made here, inside a pin bump.
+    ///
+    /// So this test now measures each mode against *its own* geometry:
+    ///
+    /// - **block mode** (`minimap_render_characters` off,
+    ///   `MinimapScale::One`, 1px per column) genuinely reaches column 80 in
+    ///   a 120px strip, so #1030's deliverable 2 is asserted there
+    ///   verbatim — and the reachability itself is asserted, so the probe
+    ///   can never quietly skip the case it exists to cover.
+    /// - **character mode** (the GUI default, `MinimapScale::Two`) is
+    ///   measured across every indent its narrower column budget actually
+    ///   reaches, with the budget read back from the painted strip rather
+    ///   than assumed. If the strip is ever widened to honour the full
+    ///   column capacity at that scale, indent 80 starts being measured
+    ///   here automatically.
+    ///
+    /// `src/tui_main/shell_app.rs`'s
+    /// `minimap_paints_syntax_colour_for_indented_code` covers why the same
+    /// deliverable is *not* reachable on TUI (an 11-cell braille strip
+    /// represents 22 source columns, hardcoded upstream — drafted as a
+    /// quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`).
+    ///
+    /// Measured on this machine (macOS, 1400x900 harness, 60-line `.rs`
+    /// fixture, GTK 4.22): block mode 50 / 50 / 50 / 50 distinct
+    /// non-background colours at indents 0 / 20 / 40 / 80 over a 120-column
+    /// strip; character mode 135 / 135 / 135 at 0 / 20 / 40 over a
+    /// 60-column one (80 is past that budget) — i.e. inside the columns
+    /// each mode can actually paint, GTK's minimap colouring is indifferent
+    /// to indentation, which is the "GTK does not regress" claim
+    /// deliverable 3 asks for, stated as numbers.
+    ///
+    /// RED-verified (#1576): dropping the reachability guard so character
+    /// mode probes indent 80 anyway reproduces the CI failure this rework
+    /// fixes — 3 distinct colours on macOS, 1 on Linux, i.e. strip
+    /// background and viewport tint only — and the `distinct_colors * 4 >=
+    /// baseline` collapse assertion below fails on it (`a fade-out of more
+    /// than 4x`) on *both* hosts, where the old bare `> 1` bar passed on
+    /// macOS and failed on Linux.
     #[test]
     fn minimap_paints_distinct_syntax_colors_at_indentation_via_gtk_driver() {
-        // Indents 0 and 20 are deliverable 3's no-regression measurement;
-        // **40 and 80 are #1030's deliverable 2 verbatim** — "Colour must
-        // survive at indent 40 and 80, not only near column 0" — and they
-        // pass here, on the backend where that is physically reachable.
-        // GTK's strip resolves to 120px at this pane width and its
-        // rasteriser paints one 1px block per character column up to
-        // `COLUMN_CAPACITY` (120), so columns 40 and 80 are both inside the
-        // painted range. See `minimap_gtk_distinct_colors_for_indent`'s doc
-        // for the geometry, and `src/tui_main/shell_app.rs`'s
-        // `minimap_paints_syntax_colour_for_indented_code` for why the same
-        // deliverable is *not* reachable on TUI (an 11-cell braille strip
-        // represents 22 source columns, hardcoded upstream — drafted as a
-        // quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`).
-        //
-        // Measured on this machine (macOS, 1400x900 harness, 60-line `.rs`
-        // fixture, GTK 4.22): 7 / 7 / 7 / 7 distinct non-background colours
-        // at indents 0 / 20 / 40 / 80 — i.e. GTK's minimap colouring is
-        // flat-out indifferent to indentation across the whole range this
-        // issue measured, which is the "GTK does not regress" claim
-        // deliverable 3 asks for, stated as numbers.
-        for indent in [0usize, 20, 40, 80] {
-            let seen = minimap_gtk_distinct_colors_for_indent(indent);
-            println!("#1030 GTK measurement: indent {indent} -> {seen} distinct colours");
-            assert!(
-                seen > 1,
-                "#1030: code indented by {indent} columns must paint more \
-                 than one distinct syntax colour in the GTK minimap strip \
-                 (the strip is 120px wide here and GTK paints up to \
-                 COLUMN_CAPACITY = 120 character columns, so column \
-                 {indent} is inside the painted range) — got {seen}. For \
-                 indent 0 this is the precondition/regression guard; for 20 \
-                 it is deliverable 3's no-regression measurement; for 40 and \
-                 80 it is deliverable 2 itself. If this fails, \
-                 `build_minimap_data`'s `visible_span_cols` floor \
-                 (`src/render.rs`) has regressed below what GTK's rasteriser \
-                 actually needs."
+        // `minimap_gtk_distinct_colors_for_indent`'s fixture line is
+        // `"<indent>let value_N = 1;"` — this many columns of real,
+        // multi-token code after the indent, all of which must be inside
+        // the painted budget for "more than one syntax colour" to be a
+        // meaningful thing to ask for.
+        const FIXTURE_CODE_COLS: usize = 16;
+
+        for render_characters in [false, true] {
+            let mode = if render_characters {
+                "characters"
+            } else {
+                "blocks"
+            };
+            let baseline = minimap_gtk_distinct_colors_for_indent(0, render_characters);
+            println!(
+                "#1030 GTK measurement ({mode}): scale {:?}, {} painted columns, \
+                 indent 0 -> {} distinct colours",
+                baseline.scale, baseline.painted_cols, baseline.distinct_colors
             );
+            assert_eq!(
+                baseline.scale,
+                if render_characters {
+                    quadraui::MinimapScale::Two
+                } else {
+                    quadraui::MinimapScale::One
+                },
+                "test setup sanity: `minimap_render_characters = \
+                 {render_characters}` must resolve to the scale this leg \
+                 means to measure on a GUI backend, or neither branch below \
+                 is exercising what it claims"
+            );
+            assert!(
+                baseline.distinct_colors > 1,
+                "precondition/regression guard: unindented code must paint \
+                 more than one distinct syntax colour in the GTK minimap \
+                 strip in {mode} mode — got {}. If this fails, \
+                 `build_minimap_data`'s `visible_span_cols` floor \
+                 (`src/render.rs`) has regressed below what GTK's \
+                 rasteriser actually needs.",
+                baseline.distinct_colors
+            );
+            if !render_characters {
+                // Block mode is the leg that keeps #1030's deliverable 2
+                // ("colour must survive at indent 40 **and 80**") honest, so
+                // pin that its budget really does reach column 80 rather
+                // than letting the loop below skip it.
+                assert!(
+                    baseline.painted_cols >= 80 + FIXTURE_CODE_COLS,
+                    "#1030 deliverable 2 must stay reachable in block mode: \
+                     the strip must paint at least {} columns so the indent-80 \
+                     fixture lands inside it — got {}",
+                    80 + FIXTURE_CODE_COLS,
+                    baseline.painted_cols
+                );
+            }
+
+            for indent in [20usize, 40, 80] {
+                if indent + FIXTURE_CODE_COLS > baseline.painted_cols {
+                    println!(
+                        "#1030 GTK measurement ({mode}): indent {indent} skipped — \
+                         past the strip's {} painted columns",
+                        baseline.painted_cols
+                    );
+                    continue;
+                }
+                let probe = minimap_gtk_distinct_colors_for_indent(indent, render_characters);
+                println!(
+                    "#1030 GTK measurement ({mode}): indent {indent} -> {} distinct colours",
+                    probe.distinct_colors
+                );
+                assert!(
+                    probe.distinct_colors > 1,
+                    "#1030: code indented by {indent} columns must paint more \
+                     than one distinct syntax colour in the GTK minimap strip \
+                     in {mode} mode (the strip paints {} character columns \
+                     here, so columns {indent}..{} are inside the painted \
+                     range) — got {}. For indent 20 this is deliverable 3's \
+                     no-regression measurement; for 40 and 80 it is \
+                     deliverable 2 itself.",
+                    baseline.painted_cols,
+                    indent + FIXTURE_CODE_COLS,
+                    probe.distinct_colors
+                );
+                // The real #1030 failure mode is colour *fading out* with
+                // depth, not vanishing outright: a strip that still shows
+                // the viewport tint plus a single stray colour would clear
+                // the `> 1` bar above while having lost all its syntax
+                // colour. Compare against the unindented baseline so that
+                // collapse is caught too.
+                assert!(
+                    probe.distinct_colors * 4 >= baseline.distinct_colors,
+                    "#1030: colour must not collapse with indentation — \
+                     indent {indent} painted {} distinct colours in {mode} \
+                     mode against {} at indent 0, a fade-out of more than 4x",
+                    probe.distinct_colors,
+                    baseline.distinct_colors
+                );
+            }
         }
     }
 }
