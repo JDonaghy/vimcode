@@ -346,7 +346,14 @@ impl Engine {
     /// and deterministically exercise the "runtime missing → terminal
     /// fallback" branch without depending on what's actually installed on
     /// the machine running the suite.
-    fn ext_install_from_registry_with_runtime_check(
+    ///
+    /// `pub(crate)` (rather than private) specifically so the driver-tier
+    /// black-box test in `tui_main::app_on_tui_tests` can drive this same
+    /// deterministic seam through a real `TuiDriver` and assert on
+    /// `driver.screen()` — the engine-internal-state test right below this
+    /// one is necessary but not sufficient per CLAUDE.md's black-box
+    /// coverage rule (#1346 review).
+    pub(crate) fn ext_install_from_registry_with_runtime_check(
         &mut self,
         name: &str,
         runtime_present: impl Fn(&str) -> bool,

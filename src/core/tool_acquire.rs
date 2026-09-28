@@ -1226,6 +1226,20 @@ fn install_via_package_manager(
     } else {
         cfg.binary_path.clone()
     };
+    // `bin_name` (from the manifest's `binary_path`, free-form text from a
+    // community-submitted registry manifest) is joined onto `stage_dir`
+    // below, ultimately reaching `link_binary_into_prefix`'s
+    // `stage_dir.join(bin_name)` `link_path`, which that function
+    // `remove_file`s before creating a symlink in its place. Per the
+    // field's own doc comment above it names a single executable, never a
+    // nested path, so gate it with the *stricter* `is_safe_single_segment_
+    // name` (rejects `/`, `\`, and `..` outright) rather than
+    // `is_safe_relative_path` (only rejects `..`, and would let a manifest
+    // walk `link_path` outside `stage_dir` to delete-and-symlink an
+    // arbitrary file the vimcode process can reach, #1346 review).
+    if !is_safe_single_segment_name(&bin_name) {
+        return Err(AcquireError::PathTraversal(bin_name));
+    }
 
     let tool_dir = super::paths::managed_tool_dir(tool_name);
     std::fs::create_dir_all(&tool_dir)?;
@@ -2605,6 +2619,47 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
         };
         let err =
             install_via_package_manager("pyright-langserver", &cfg, Platform::Linux).unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn install_via_package_manager_rejects_traversal_in_binary_path() {
+        // #1346 review: a community-submitted manifest's `binary_path` was
+        // joined onto `stage_dir` (via `package_manager_binary_path` and
+        // then `link_binary_into_prefix`'s `stage_dir.join(bin_name)`) with
+        // no traversal guard at all — a `binary_path` like
+        // `"../../../../../../.ssh/authorized_keys"` made
+        // `link_binary_into_prefix` `remove_file` + symlink an arbitrary
+        // path outside `stage_dir`. Must be rejected before any filesystem
+        // mutation happens, mirroring the sibling `tool_name`/`version`
+        // traversal tests above.
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("pkgmgr_traversal_binary_path");
+
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            binary_path: "../../../../../../.ssh/authorized_keys".to_string(),
+            ..Default::default()
+        };
+        let err =
+            install_via_package_manager("pyright-langserver", &cfg, Platform::Linux).unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+
+        // A bare `/`-separated path with no `..` component would pass the
+        // looser `is_safe_relative_path` check that guards `tool_name`/
+        // `version` above — it must still be rejected here, since
+        // `binary_path` for a package-manager kind names a single
+        // executable, never a nested path (see the field's own doc
+        // comment).
+        let cfg_nested = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            binary_path: "some/nested/pyright".to_string(),
+            ..Default::default()
+        };
+        let err = install_via_package_manager("pyright-langserver", &cfg_nested, Platform::Linux)
+            .unwrap_err();
         assert!(matches!(err, AcquireError::PathTraversal(_)));
     }
 

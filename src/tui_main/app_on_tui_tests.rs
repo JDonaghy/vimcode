@@ -6097,4 +6097,156 @@ mod tests {
             let _ = std::fs::remove_file(&path);
         }
     }
+
+    /// #1346 review: driver-tier black-box coverage for the "package-manager
+    /// acquire kind whose runtime is missing" fallback — CLAUDE.md's
+    /// black-box coverage rule requires a test that drives the running app
+    /// and asserts on rendered output, not just engine-internal state.
+    /// `core::engine::lsp_ops::tests::missing_package_manager_runtime_falls_
+    /// through_to_terminal_tier` already covers the same seam at the
+    /// engine-internal-state level (`tool_acquire_groups`/
+    /// `pending_terminal_command`); this module closes the gap the review
+    /// flagged by asserting on `driver.screen()` instead, through the same
+    /// `pub(crate) Engine::ext_install_from_registry_with_runtime_check`
+    /// seam (stubbed `runtime_present`, deterministic regardless of what's
+    /// actually on the machine running the suite — same rationale as that
+    /// sibling test's own doc comment).
+    mod issue_1346_package_manager_acquire_missing_runtime {
+        use super::*;
+
+        /// Build a [`harness`] wired with a manifest whose `[lsp.acquire]`
+        /// names an `npm` package-manager kind, `unique`-suffixed so
+        /// parallel test runs never collide on extension/language/file-ext
+        /// names.
+        fn harness_with_npm_acquire_manifest(
+            unique: &str,
+        ) -> (
+            crate::harness::ConformanceHarness<
+                quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            >,
+            String,
+        ) {
+            use crate::core::extensions::{ExtensionManifest, LspConfig};
+            use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = format!("vc-tui-pkgmgr-fallback-1346-{unique}");
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.clone(),
+                display_name: format!("Package-manager fallback test 1346-{unique}"),
+                language_ids: vec![format!("vc-tui-pkgmgr-1346-lang-{unique}")],
+                lsp: LspConfig {
+                    binary: format!("vc-tui-pkgmgr-1346-lsp-{unique}"),
+                    acquire: Some(AcquireConfig {
+                        kind: AcquireKind::Npm,
+                        package: format!("vc-tui-pkgmgr-1346-pkg-{unique}"),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+
+            // No sidebar: the default explorer tree is tall enough (this
+            // repo has ~20 top-level entries) to fill the whole 24-row
+            // fixture terminal and share the bottom row with the command
+            // line, truncating the status message before "needs npm" ever
+            // reaches the screen. `harness_no_sidebar` gives the command
+            // line the full row width instead.
+            let h = harness_no_sidebar(engine);
+            (h, ext_name)
+        }
+
+        /// #1346 acceptance: a manifest's `[lsp.acquire]` naming a
+        /// package-manager kind (`npm`) whose runtime isn't on PATH must
+        /// paint a "needs npm" status line — the visible fallback, not a
+        /// silent no-op and not a native-acquisition attempt that would
+        /// just fail. `runtime_present` is stubbed to always return `false`
+        /// via the `pub(crate)` `ext_install_from_registry_with_runtime_
+        /// check` seam, exactly like the engine-internal-state sibling test
+        /// in `core::engine::lsp_ops`.
+        ///
+        /// Verified RED two ways: (1) against the pre-#1346-review-fix
+        /// build, where `ext_install_from_registry_with_runtime_check` was
+        /// still private — this test could not even compile, i.e. the
+        /// black-box coverage gap the review flagged; and (2) against a
+        /// deliberately reintroduced logic regression (commenting out the
+        /// `status_parts.push(format!("LSP: needs {runtime} — {hint}"))`
+        /// line in `lsp_ops.rs`), confirming this test also catches a real
+        /// behavioural break, not just a visibility change — see this
+        /// module's own doc comment above.
+        #[test]
+        fn missing_npm_runtime_paints_needs_npm_status_line() {
+            let (mut h, ext_name) = harness_with_npm_acquire_manifest("status");
+
+            h.engine
+                .borrow_mut()
+                .ext_install_from_registry_with_runtime_check(&ext_name, |_| false);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("needs npm"),
+                "a missing package-manager runtime must paint a visible \
+                 'needs npm' fallback status line; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.engine.borrow().tool_acquire_groups.is_empty(),
+                "a missing runtime must never spawn a native acquisition"
+            );
+        }
+
+        /// #1346 acceptance: the same missing-runtime fallback must also
+        /// queue the terminal-tier command carrying the dependency hint —
+        /// the install path the user actually runs once they've read the
+        /// status line above, exercised here through the extension's DAP
+        /// half (`[dap.acquire]`) so both `resolve_acquire_action` call
+        /// sites in `lsp_ops.rs` get driver-tier coverage, not just the LSP
+        /// one.
+        #[test]
+        fn missing_dotnet_runtime_falls_through_to_visible_terminal() {
+            use crate::core::extensions::{DapConfig, ExtensionManifest};
+            use crate::core::tool_acquire::{AcquireConfig, AcquireKind};
+
+            let mut engine = crate::core::Engine::new_for_test();
+            let ext_name = "vc-tui-pkgmgr-fallback-1346-dap";
+            engine.ext_registry = Some(vec![ExtensionManifest {
+                name: ext_name.to_string(),
+                display_name: "Package-manager DAP fallback test (#1346)".to_string(),
+                dap: DapConfig {
+                    adapter: "vc-tui-pkgmgr-1346-adapter".to_string(),
+                    binary: "vc-tui-pkgmgr-1346-dap-bin".to_string(),
+                    acquire: Some(AcquireConfig {
+                        kind: AcquireKind::DotnetTool,
+                        package: "vc-tui-pkgmgr-1346-dap-pkg".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+
+            let mut h = harness_no_sidebar(engine);
+            h.engine
+                .borrow_mut()
+                .ext_install_from_registry_with_runtime_check(ext_name, |_| false);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen_contains("needs dotnet"),
+                "a missing DAP-side package-manager runtime must also paint \
+                 a visible fallback status line; painted: {:?}",
+                h.driver.screen()
+            );
+            assert!(
+                h.engine
+                    .borrow()
+                    .pending_terminal_command
+                    .clone()
+                    .unwrap_or_default()
+                    .contains("dotnet"),
+                "the queued terminal command must carry the missing runtime's name"
+            );
+        }
+    }
 }
