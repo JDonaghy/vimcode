@@ -6969,6 +6969,274 @@ second line here
         );
     }
 
+    /// #1519 acceptance, GTK's twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// tool_call_update_replace_paints_only_the_new_location_via_shell_app`:
+    /// a `tool_call_update` carrying a DIFFERENT `content`/`locations` than
+    /// the original `tool_call` must REPLACE what's painted, not accumulate
+    /// both. The fixture's `$ACP_FAKE_TOOL_CALL_REPLACE` emits a `tool_call`
+    /// pointing at `src/first.rs`, then a `tool_call_update` pointing at
+    /// `src/second.rs`.
+    ///
+    /// RED verified the same way as the TUI twin: with
+    /// `call.content.append(&mut blocks)`/`call.locations.append(...)`
+    /// restored in place of the plain assignment in `Engine::
+    /// acp_apply_tool_call_update`, this fails — the screen shows both
+    /// `first.rs` and `second.rs` instead of just the latter.
+    #[cfg(unix)]
+    #[test]
+    fn tool_call_update_replace_paints_only_the_new_location_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TOOL_CALL_REPLACE=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("second.rs") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("second.rs"),
+            "the tool_call_update's new location must paint within 5s"
+        );
+        assert!(
+            !h.driver.screen_contains("first.rs"),
+            "the original tool_call's location must be gone once the \
+             update replaces it, not still visible alongside the new one"
+        );
+    }
+
+    /// #1519 acceptance, GTK's twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// cancelled_turn_paints_unfinished_tool_call_as_cancelled_glyph_via_
+    /// shell_app`: `session/cancel` must mark every still-unfinished tool
+    /// call `Cancelled`, painted as the `[-]` glyph, not left showing `[~]`
+    /// (in-progress) forever. The fixture's `$ACP_FAKE_TOOL_CALL_HANGS`
+    /// announces one `in_progress` call and then never answers
+    /// `session/prompt` at all, so the only way this call's painted glyph
+    /// ever changes is the client-side sweep `Engine::acp_cancel_turn`
+    /// does. Drives a real Ctrl+C through the driver.
+    ///
+    /// RED verified the same way as the TUI twin: with the `for call in
+    /// ... is_unfinished()` sweep removed from `acp_cancel_turn`, this
+    /// fails — the screen still shows `[~]`, never `[-]`, after Ctrl+C.
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_turn_paints_unfinished_tool_call_as_cancelled_glyph_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TOOL_CALL_HANGS=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("[~] execute: Run the tests")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("[~] execute: Run the tests"),
+            "sanity: the in-progress tool call must paint before it can be \
+             cancelled"
+        );
+
+        h.driver.ctrl_char('c');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("[-] execute: Run the tests")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("[-] execute: Run the tests"),
+            "cancelling the turn must repaint the still-unfinished tool \
+             call with the Cancelled glyph within 5s"
+        );
+    }
+
+    /// #1519 acceptance, GTK's twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// protocol_version_mismatch_paints_a_refusal_warning_via_shell_app`: a
+    /// mismatched `initialize` `protocolVersion` must abort the handshake
+    /// and surface a warning that actually paints. The fixture's
+    /// `$ACP_FAKE_PROTOCOL_VERSION=99` claims a protocol version this
+    /// client doesn't speak.
+    ///
+    /// RED verified the same way as the TUI twin: deleting the `if
+    /// protocol_version != PROTOCOL_VERSION` guard in `Engine::
+    /// acp_dispatch_events`'s `Initialized` arm makes this fail — the
+    /// screen never shows "protocol version" and instead the turn proceeds
+    /// to a normal "Hello world" reply.
+    #[cfg(unix)]
+    #[test]
+    fn protocol_version_mismatch_paints_a_refusal_warning_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_PROTOCOL_VERSION=99".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("protocol version") && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("protocol version"),
+            "a protocolVersion mismatch must paint a refusal warning \
+             within 5s, not just set `engine.message` in isolation"
+        );
+        assert!(
+            !h.driver.screen_contains("Hello world"),
+            "the handshake must abort before ever reaching a normal reply"
+        );
+    }
+
+    /// #1519 acceptance, GTK's twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// session_info_update_title_paints_on_the_sessions_picker_via_shell_
+    /// app`: a `session_info_update`-learned title must paint on
+    /// `:AiSessions`' picker in place of the first prompt. Sends a prompt
+    /// whose text is deliberately different from the fixture's
+    /// `$ACP_FAKE_SESSION_TITLE`, so a screen showing the title text (and
+    /// not the prompt text) can only mean the title actually painted and
+    /// was preferred.
+    ///
+    /// RED verified the same way as the TUI twin: with
+    /// `parse_session_info_update`'s call site removed from `Engine::
+    /// acp_handle_session_update`, this fails — the picker's painted row
+    /// still reads the literal prompt text, never "Fix the login bug".
+    #[cfg(unix)]
+    #[test]
+    fn session_info_update_title_paints_on_the_sessions_picker_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_SESSION_TITLE=Fix the login bug".to_string(),
+                    "ACP_FAKE_LOAD_SESSION=1".to_string(),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            engine.execute_command("AI a typed prompt distinct from the title");
+        }
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "sanity: the turn must complete within 5s before the session \
+             is recorded/titled"
+        );
+
+        h.engine.borrow_mut().execute_command("AiClear");
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("a typed prompt"),
+            ":AiClear must wipe the transcript before the picker check \
+             below can prove anything"
+        );
+
+        h.engine.borrow_mut().execute_command("AiSessions");
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("Fix the login bug"),
+            "the picker must show the learned title"
+        );
+        assert!(
+            !h.driver.screen_contains("a typed prompt"),
+            "the picker must show the title INSTEAD of the first prompt, \
+             not alongside it"
+        );
+    }
+
     /// #1459 acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
     /// transcript_via_shell_app`: `:AiSessions` lists past sessions for the

@@ -1814,10 +1814,11 @@ pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallU
             .filter_map(parse_tool_call_content_block)
             .collect()
     });
-    let locations = update
-        .get("locations")
-        .and_then(|v| v.as_array())
-        .map(|_| parse_tool_call_locations(update));
+    let locations = if update.get("locations").is_some() {
+        Some(parse_tool_call_locations(update))
+    } else {
+        None
+    };
     Some(AcpToolCallUpdate {
         id,
         status,
