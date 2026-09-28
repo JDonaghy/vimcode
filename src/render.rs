@@ -9136,8 +9136,15 @@ pub fn compose_editor_band(
             }
             // Naturally empty with a single group — `GroupLayout::Leaf
             // ::dividers()` returns `vec![]` — so this needs no
-            // `editor_group_split.is_some()` gate (#551).
-            EditorOp::GroupDividers => !screen.group_dividers.is_empty(),
+            // `editor_group_split.is_some()` gate (#551). Gated on the
+            // *painted* set (#1586's `painted_group_dividers`), not the raw
+            // one: a frame whose only group divider is a stacked one (never
+            // painted, see that fn's doc) composes no line at all, so this
+            // rung isn't live for it either — keeps this filter and
+            // [`paint_editor_band_rungs`]'s body from being able to
+            // disagree about what "live" means for this op, the same
+            // invariant [`tab_bar_is_drawn`] states for `TabBars`.
+            EditorOp::GroupDividers => !painted_group_dividers(&screen.group_dividers).is_empty(),
             EditorOp::TabDragOverlay => drag_active,
             EditorOp::TabTooltip => screen.tab_tooltip.is_some(),
         })
@@ -10088,6 +10095,36 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
 /// `divider_ratio_from_pos`) still sees every divider, stacked or not, and
 /// resizing a stacked split by dragging its (now invisible, tab-row-shaped)
 /// boundary is unaffected.
+///
+/// ## #1586's macOS-GUI symptoms — which of them this fixes
+///
+/// The original report described *three* things wrong with the bottom
+/// group's tab row on macOS/GTK, not just one. This filter's single root
+/// cause — `draw_split` filling `theme.separator` as one *uniform* rect the
+/// full width of the row (`quadraui::primitives::split::
+/// native_surface_paint::paint`) — fully accounts for the first two:
+///
+/// - *"a horizontal line runs through the tab labels"* — the fill, wherever
+///   it lands over a low-contrast (inactive) tab's own background.
+/// - *"a dark block covers the first (active) tab"* — the exact same fill,
+///   at the exact same y, reads as a solid block rather than a thin line
+///   specifically where it happens to land over the *active* tab's own
+///   (higher-contrast, highlighted) background — no second mechanism
+///   needed, confirmed by reading `native_surface_paint::paint`: it issues
+///   one `surface_fill_rect` call over `layout.divider_bounds`, not two, and
+///   nothing there special-cases a tab's active state.
+///
+/// It does **not** explain the third: *"the top-left group's first tab...
+/// looks double-painted, with its label drawn over itself"* — an unrelated
+/// group, not adjacent to the stacked boundary at all. Traced and ruled
+/// out as sharing this cause: `divider_to_split`'s emitted `Rect` is
+/// confined to its own divider's `axis_start`/`cross_start` box (see its
+/// own tests, `divider_to_split_horizontal_maps_direction_ratio_and_bounds`
+/// et al. — the rect never reaches `y = 0`), so nothing this filter touches
+/// can reach the top-left group's own tab row under any input. Left
+/// unfixed and unexplained by this change; needs its own macOS-side
+/// reproduction (a screenshot/screen-recording artifact is also plausible
+/// and hasn't been ruled out) before a cause can be assigned.
 pub fn painted_group_dividers(dividers: &[GroupDivider]) -> Vec<GroupDivider> {
     dividers
         .iter()
