@@ -68,28 +68,41 @@ pub enum EditorMode {
 /// Mirrors VS Code's `window.menuStyle` (v1.101), which the release notes
 /// describe as controlling "the menu style ... for context menus on
 /// macOS" specifically — the macOS menu *bar* is always native and has no
-/// such setting (see `native_menu`/`install_menu_bar`, vimcode#901); this
-/// setting only ever changes anything on a backend that advertises
-/// `quadraui::BackendCaps::native_menu` (macOS's `MacBackend` today). GTK
-/// and TUI report `native_menu: false`, so every variant here resolves to
-/// the same in-window `paint_context_menu_rung` path on those backends —
-/// see `render::context_menu_should_be_native`.
+/// such setting (see `native_menu`/`install_menu_bar`, vimcode#901). Maps
+/// 1:1 onto [`quadraui::MenuStyle`] (quadraui#1187) — see
+/// [`crate::render::to_quadraui_menu_style`] for the translation and
+/// [`Engine`](crate::core::Engine) callers of that for where it reaches
+/// the backend. This setting only ever changes anything on a backend that
+/// advertises `quadraui::BackendCaps::native_menu` (macOS's `MacBackend`
+/// today) — GTK, Win-GUI and TUI report `native_menu: false`, so `Auto`
+/// and `Native` both resolve the same as `Custom` there
+/// (`quadraui::MenuStyle::resolve`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MenuStyle {
+    /// Native where the backend can do it (macOS today), painted
+    /// everywhere else (GTK, Win-GUI, and always TUI) — quadraui's own
+    /// framework-level default (`quadraui::MenuStyle::Auto`) and this
+    /// setting's default too. `#[serde(alias = "inherit")]`: a
+    /// settings.json written before #1580 (or a `:set menu_style=inherit`
+    /// typed out of habit) still parses — `Inherit` meant "follow the
+    /// title-bar style, which vimcode has none of, so behave like
+    /// `Native`" and `Auto` is that same capability-gated resolution
+    /// under quadraui's own name. Never the *serialized* form: a fresh
+    /// save always writes `"auto"` (see `get_value_str`).
+    #[default]
+    #[serde(alias = "inherit")]
+    Auto,
     /// Always use the backend's native context menu when it has one
     /// (`BackendCaps::native_menu`); fall back to the in-window rasteriser
-    /// on a backend that doesn't (GTK, TUI never draw nothing).
+    /// on a backend that doesn't (GTK, TUI never draw nothing). Resolves
+    /// identically to `Auto` today (vimcode has no `titleBarStyle` setting
+    /// for the two to diverge on) but is kept as its own explicit choice,
+    /// matching quadraui's vocabulary.
     Native,
     /// Always paint the in-window `ContextMenuPanel`, even on a backend
     /// that could show a native one.
     Custom,
-    /// Follow the window's title-bar style, matching VS Code. vimcode has
-    /// no `titleBarStyle` setting yet, so until it does this resolves the
-    /// same as `Native` (capability-gated) — revisit this arm once
-    /// `titleBarStyle` exists.
-    #[default]
-    Inherit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1720,7 +1733,7 @@ impl Default for Settings {
             panel_keys: PanelKeys::default(),
             completion_keys: CompletionKeys::default(),
             editor_mode: EditorMode::Vim,
-            menu_style: MenuStyle::Inherit,
+            menu_style: MenuStyle::Auto,
             leader: default_leader(),
             wrap: false,
             linebreak: false,
@@ -3762,9 +3775,9 @@ impl Settings {
                 EditorMode::Vscode => "vscode".to_string(),
             },
             "menu_style" => match self.menu_style {
+                MenuStyle::Auto => "auto".to_string(),
                 MenuStyle::Native => "native".to_string(),
                 MenuStyle::Custom => "custom".to_string(),
-                MenuStyle::Inherit => "inherit".to_string(),
             },
             "explorer_visible_on_startup" => self.explorer_visible_on_startup.to_string(),
             "autoread" => self.autoread.to_string(),
@@ -3912,9 +3925,9 @@ impl Settings {
             }
             "menu_style" => {
                 self.menu_style = match value {
+                    "auto" | "inherit" => MenuStyle::Auto,
                     "native" => MenuStyle::Native,
                     "custom" => MenuStyle::Custom,
-                    "inherit" => MenuStyle::Inherit,
                     _ => return Err(format!("Unknown menu_style: {value}")),
                 };
             }
@@ -4395,11 +4408,12 @@ pub static SETTING_DEFS: &[SettingDef] = &[
     SettingDef {
         key: "menu_style",
         label: "Context Menu Style",
-        description: "Native OS context menu, the in-window one, or inherit \
-                       from the window style (only observable on a backend \
-                       with a native context menu, e.g. macOS)",
+        description: "Native OS context menu where the backend supports one \
+                       (auto), always native, or always the in-window one \
+                       (only observable on a backend with a native context \
+                       menu, e.g. macOS)",
         category: "Workspace",
-        setting_type: SettingType::Enum(&["native", "custom", "inherit"]),
+        setting_type: SettingType::Enum(&["auto", "native", "custom"]),
     },
     SettingDef {
         key: "explorer_visible_on_startup",
@@ -6011,14 +6025,15 @@ mod tests {
         crate::icons::set_gui_backend(prev);
     }
 
-    /// #902: `menu_style` defaults to `Inherit`, matching VS Code's
+    /// #1580: `menu_style` defaults to `Auto`, matching quadraui's own
+    /// `MenuStyle::default()` (quadraui#1187) and VS Code's
     /// `window.menuStyle` default.
     #[test]
-    fn menu_style_defaults_to_inherit() {
-        assert_eq!(Settings::default().menu_style, MenuStyle::Inherit);
+    fn menu_style_defaults_to_auto() {
+        assert_eq!(Settings::default().menu_style, MenuStyle::Auto);
     }
 
-    /// #902: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
+    /// #1580: `get_value_str`/`set_value_str` round-trip every `MenuStyle`
     /// variant, the same contract every other `SETTING_DEFS` `Enum` entry
     /// (e.g. `editor_mode`, `line_numbers`) already has to hold for the
     /// Settings sidebar UI to read/write it.
@@ -6026,9 +6041,9 @@ mod tests {
     fn menu_style_round_trips_through_value_str() {
         let mut s = Settings::default();
         for (text, variant) in [
+            ("auto", MenuStyle::Auto),
             ("native", MenuStyle::Native),
             ("custom", MenuStyle::Custom),
-            ("inherit", MenuStyle::Inherit),
         ] {
             s.set_value_str("menu_style", text).unwrap();
             assert_eq!(s.menu_style, variant);
@@ -6036,6 +6051,31 @@ mod tests {
         }
 
         assert!(s.set_value_str("menu_style", "bogus").is_err());
+    }
+
+    /// #1580: the retired `inherit` value — still accepted by
+    /// `:set menu_style=inherit` and in a settings.json saved before this
+    /// issue — parses to `Auto` rather than erroring. `get_value_str` never
+    /// produces `"inherit"` again (a fresh save always round-trips through
+    /// `"auto"`, covered above), so this only needs to hold for the parse
+    /// direction.
+    #[test]
+    fn menu_style_inherit_parses_to_auto() {
+        let mut s = Settings::default();
+        s.menu_style = MenuStyle::Native; // start off-default so the assert is meaningful
+        s.set_value_str("menu_style", "inherit").unwrap();
+        assert_eq!(s.menu_style, MenuStyle::Auto);
+    }
+
+    /// #1580: a settings.json written before this issue (`"menu_style":
+    /// "inherit"`) still deserializes, via `#[serde(alias = "inherit")]` on
+    /// `MenuStyle::Auto` — the JSON-load counterpart to
+    /// `menu_style_inherit_parses_to_auto` above, which only covers the
+    /// `:set` ex-command path.
+    #[test]
+    fn menu_style_inherit_deserializes_from_json() {
+        let style: MenuStyle = serde_json::from_str("\"inherit\"").unwrap();
+        assert_eq!(style, MenuStyle::Auto);
     }
 
     // ── #1206: generic `+=`/`-=`/`^=` strip ──────────────────────────────

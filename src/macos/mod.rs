@@ -821,18 +821,20 @@ mod mac_driver_tests {
         );
     }
 
-    // ── #902: native macOS context menus ────────────────────────────────
+    // ── #902/#1580: native macOS context menus ────────────────────────────
 
-    /// #902: `menu_style` defaults to `Inherit`, which resolves to native
+    /// #1580: `menu_style` defaults to `Auto`, which resolves native
     /// whenever the backend advertises one (`BackendCaps::native_menu`,
-    /// `true` for `MacBackend`) — see `render::context_menu_should_be_native`.
-    /// So by default, a right-click on macOS must **not** paint the
-    /// in-window `ContextMenuPanel` at all; `Backend::show_context_menu`
-    /// takes over instead. This test never triggers that native popup at
-    /// all (setting `engine.context_menu` directly, not going through a
-    /// real right-click), so it only proves the *other* half of the
-    /// acceptance bar — the one a headless test *can* prove: nothing paints
-    /// in-window when native is resolved.
+    /// `true` for `MacBackend`) — see `quadraui::MenuStyle::resolve`, via
+    /// `Backend::effective_menu_style`. So by default, a right-click on
+    /// macOS must **not** paint the in-window `ContextMenuPanel` at all;
+    /// `Backend::show_context_menu` takes over instead (from `App::handle`,
+    /// see `right_click_opens_then_activated_item_runs_command_without_
+    /// any_render_call` below for that half). This test never triggers
+    /// that native popup at all (setting `engine.context_menu` directly,
+    /// not going through a real right-click), so it only proves the
+    /// *other* half of the acceptance bar — the one a headless test *can*
+    /// prove: nothing paints in-window when native is resolved.
     ///
     /// RED against the pre-#902 body (`paint_context_menu_rung` had no
     /// native branch and always drew in-window): every item label,
@@ -857,13 +859,13 @@ mod mac_driver_tests {
         assert!(
             !driver.screen_contains("Go to Definition"),
             "MacBackend declares `native_menu: true` and `menu_style` \
-             defaults to `Inherit`, so the in-window context menu must not \
+             defaults to `Auto`, so the in-window context menu must not \
              paint; painted text was {:?}",
             driver.painted_texts()
         );
     }
 
-    /// #902: `menu_style = Custom` opts back into the in-window path even
+    /// #1580: `menu_style = Custom` opts back into the in-window path even
     /// on a backend that has a native one — the VS Code-parity escape
     /// hatch (`window.menuStyle: custom`) this setting exists to mirror.
     ///
@@ -885,6 +887,98 @@ mod mac_driver_tests {
              menu even though MacBackend has a native one; painted text \
              was {:?}",
             driver.painted_texts()
+        );
+    }
+
+    /// #1580 root-cause fix: `Backend::show_context_menu` must be invoked
+    /// from the event handler that opens the menu (`App::handle`'s
+    /// `open_context_menu_now_if_native` choke point), never from
+    /// `render_content`'s `FrameOp::ContextMenu` paint rung — calling it
+    /// from inside a paint closure re-entered painting while the closure
+    /// still held the borrows it needed to finish its own frame, which is
+    /// exactly why right-click menus were broken in the macOS GUI (see
+    /// this issue's root-cause writeup).
+    ///
+    /// `MacBackend::show_context_menu` degrades to a silent no-op off the
+    /// real AppKit main thread (quadraui#930's `MainThreadMarker` guard),
+    /// which every `#[test]` thread is — so this test cannot observe the
+    /// native popup itself opening or watch it push its own activation
+    /// event. What it *can* and does prove, purely through `App`'s own
+    /// dispatch, with **no `driver.render()` call anywhere in the test**:
+    /// a right-click resolves through `Engine::open_editor_context_menu`
+    /// to a populated `engine.context_menu`, and a subsequently-dispatched
+    /// `UiEvent::ContextMenuItemActivated` — exactly what
+    /// `MacBackend::show_context_menu` pushes once AppKit's real modal
+    /// loop picks an item — resolves and runs that item's command within
+    /// that same next `dispatch`. The whole round trip never touches
+    /// `render_content`, so nothing exercised here can be the render rung;
+    /// combined with `native_menu_style_suppresses_the_in_window_context_
+    /// menu` above (which proves the *paint* rung never draws the panel
+    /// when native is resolved), this closes the loop the render rung
+    /// used to own alone.
+    ///
+    /// RED against the pre-#1580 body in one concrete way: before this
+    /// issue, `render.rs::paint_context_menu_rung` took a `native: bool`
+    /// and called `Backend::show_context_menu` itself, reachable only from
+    /// a `render()` call — a test written the same way but calling
+    /// `driver.render()` before the `ContextMenuItemActivated` dispatch
+    /// would still have passed then, which is precisely why "no render
+    /// call anywhere" is the part of this test that is load-bearing, not
+    /// incidental.
+    #[test]
+    fn right_click_opens_then_activated_item_runs_command_without_any_render_call() {
+        let (_guards, engine, mut driver) = driver_with_engine(plain_engine());
+        assert!(
+            engine.borrow().context_menu.is_none(),
+            "sanity: no context menu open before the right-click"
+        );
+
+        // Right-click in the editor content area — same coordinates
+        // `gtk::testing`'s identical-purpose right-click tests use on the
+        // same 1400x900 canvas.
+        driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(700.0, 400.0),
+            modifiers: quadraui::Modifiers::default(),
+        });
+
+        let item_count = {
+            let eng = engine.borrow();
+            let cm = eng
+                .context_menu
+                .as_ref()
+                .expect("right-click must open the editor context menu");
+            cm.items.len()
+        };
+        assert!(item_count > 0, "fixture needs a non-empty context menu");
+
+        // "Command Palette" is always enabled and always last in
+        // `Engine::open_editor_context_menu`'s item list.
+        let palette_idx = item_count - 1;
+        assert_eq!(
+            engine.borrow().context_menu.as_ref().unwrap().items[palette_idx].action,
+            "command_palette",
+            "fixture assumption: Command Palette is the last item"
+        );
+
+        // Simulate what `MacBackend::show_context_menu` pushes once
+        // AppKit's modal loop resolves a pick — the exact `WidgetId`
+        // `context_menu_panel_to_quadraui_context_menu` synthesises
+        // (`context:N`) and the exact event `App::handle`'s
+        // `UiEvent::ContextMenuItemActivated` arm consumes.
+        driver.dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+            quadraui::WidgetId::new(format!("context:{palette_idx}")),
+        ));
+
+        assert!(
+            engine.borrow().context_menu.is_none(),
+            "activating an item must close the menu"
+        );
+        assert!(
+            engine.borrow().picker_open,
+            "activating the Command Palette item must run its command \
+             (Engine::open_picker) within this same next dispatch"
         );
     }
 

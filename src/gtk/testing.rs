@@ -15040,19 +15040,20 @@ mod modal_rung {
         );
     }
 
-    /// #902: `menu_style` only ever changes anything on a backend that
-    /// advertises `BackendCaps::native_menu` — `render::
-    /// context_menu_should_be_native` gates every variant on that
-    /// capability, mirroring #901's identical gate for the menu bar. GTK's
-    /// `native_menu` is `false`, so even the most aggressive setting
-    /// (`Native`) must still fall back to painting the in-window
-    /// `ContextMenuPanel`, exactly like the default `Inherit`.
+    /// #902/#1580: `menu_style` only ever changes anything on a backend
+    /// that advertises `BackendCaps::native_menu` — `quadraui::MenuStyle::
+    /// resolve` (via `Backend::effective_menu_style`) gates every variant
+    /// on that capability, mirroring #901's identical gate for the menu
+    /// bar. GTK's `native_menu` is `false`, so even the most aggressive
+    /// setting (`Native`) must still fall back to painting the in-window
+    /// `ContextMenuPanel`, exactly like the default `Auto`.
     ///
-    /// RED-verified: temporarily changing `context_menu_should_be_native`
-    /// to `MenuStyle::Native | MenuStyle::Inherit => true` (dropping the
-    /// `caps.native_menu` gate) makes this fail — GTK's `show_context_menu`
-    /// is quadraui's no-op default, so the menu item never reaches the
-    /// screen and `screen_contains` comes back `false`. Restored before
+    /// RED-verified: temporarily hard-coding `render::paint_context_menu_
+    /// rung`'s caller (the `FrameOp::ContextMenu` rung in `app.rs`) to skip
+    /// painting whenever `menu_style` is anything but `Custom` (i.e.
+    /// dropping the `caps.native_menu` gate `effective_menu_style` already
+    /// encodes) makes this fail — the menu item never reaches the screen
+    /// and `screen_contains` comes back `false`. Restored before
     /// committing.
     #[test]
     fn context_menu_style_native_still_paints_in_window_on_gtk() {
