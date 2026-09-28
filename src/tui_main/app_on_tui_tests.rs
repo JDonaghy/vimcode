@@ -3408,11 +3408,19 @@ mod tests {
         /// with "the click was silently swallowed".
         ///
         /// RED against a body that regressed the paint/click/dismiss round
-        /// trip for any one `MenuStyle` value (e.g. a hypothetical bug that
-        /// special-cased `Native`/`Auto` and skipped in-window painting even
-        /// on a `native_menu: false` backend): the loop runs the full
+        /// trip for any one `MenuStyle` value: the loop runs the full
         /// scenario fresh per variant, so a regression scoped to one value
         /// still fails this test.
+        ///
+        /// **RED-verified against unfixed `develop`.** Flipping the
+        /// `FrameOp::ContextMenu` rung's guard in `App::render_content`
+        /// from `effective_menu_style() == Custom` to `== Native` (the
+        /// exact shape of the special-case bug described above — it still
+        /// resolves `Custom` on `TuiBackend`, since `native_menu` is always
+        /// `false`, so this is testing the rung's own guard, not
+        /// `effective_menu_style` itself) makes this test fail: the menu
+        /// never paints, so `driver.find("Copy Path")` after the first
+        /// `right_click` panics. Restored before committing.
         #[test]
         fn explorer_context_menu_right_click_click_and_escape_round_trip_under_every_menu_style() {
             for style in [
