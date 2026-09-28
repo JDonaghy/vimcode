@@ -4788,16 +4788,27 @@ mod sidebar_panel_clicks {
             .driver
             .find_bounds("EXPLORER")
             .expect("the sidebar header must paint its panel title");
-        // `find_bounds` returns the whole painted run's bounds — the
-        // status-bar segment is `" EXPLORER "` (leading/trailing literal
-        // space, `App::paint_sidebar_panel_rung`'s doc), so a couple of
-        // points in from the run's own left edge lands on that leading
-        // space: still inside the header's own background, not the glyph,
-        // and not spilling left into the activity-bar rail's own column (a
-        // separate, narrower paint immediately adjacent).
-        let probe_x = (bounds.x + 2.0) as i32;
+        // Sample the header's background as the *most common* colour along
+        // a scanline through the middle of the painted `" EXPLORER "` run,
+        // extended a little past its right edge (the header strip spans the
+        // whole sidebar width, far wider than its title). A single probe a
+        // couple of points in from the run's left edge (the original form of
+        // this test) passed locally but depends on where the platform's UI
+        // font lands the first glyph and its anti-aliased fringe — the same
+        // font-metric trap #1586's CI fallout hit on the Linux GUI lane. The
+        // glyphs cover a minority of any scanline, so the mode is the fill
+        // colour on every font configuration.
         let probe_y = (bounds.y + bounds.height / 2.0) as i32;
-        let (r, g, b) = h.driver.pixel(probe_x, probe_y);
+        let x0 = bounds.x.max(0.0) as i32;
+        let x1 = (bounds.x + bounds.width + 24.0) as i32;
+        let mut counts: std::collections::HashMap<(u8, u8, u8), usize> =
+            std::collections::HashMap::new();
+        for x in x0..x1 {
+            *counts.entry(h.driver.pixel(x, probe_y)).or_default() += 1;
+        }
+        let mut ranked: Vec<_> = counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let (r, g, b) = ranked[0].0;
 
         let theme = crate::render::Theme::vscode_light();
         let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
@@ -4806,7 +4817,10 @@ mod sidebar_panel_clicks {
             expected,
             "sidebar header bg must come from theme.status_bg (vimcode's \
              theme, via `to_quadraui_theme_chrome`'s header_bg mapping), \
-             not quadraui's hard-coded #252526 literal; painted text was {:?}",
+             not quadraui's hard-coded #252526 literal; header run bounds \
+             {bounds:?}, scanline y={probe_y} colour counts (top 5) {:?}, \
+             painted text was {:?}",
+            &ranked[..ranked.len().min(5)],
             h.driver.painted_texts()
         );
         assert_ne!(
