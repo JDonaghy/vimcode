@@ -1450,6 +1450,16 @@ pub struct PanelKeys {
     /// Navigate forward in tab history. Default: `<C-A-Right>`
     #[serde(default = "pk_nav_forward")]
     pub nav_forward: String,
+    /// Give the toast/notification stack keyboard focus (#1577) —
+    /// Tab/Shift+Tab/Left/Right/Up/Down/Enter/Escape then navigate its
+    /// buttons via `quadraui::compose::ToastStackController`. Same effect
+    /// as `:Notifications`. Default: `<C-S-n>` — doesn't collide with any
+    /// vim default (vim has no Ctrl-Shift bindings) or vscode-mode default
+    /// (`<C-S-e>` explorer, `<C-S-f>` search, `<C-S-g>` grep, `<C-S-p>`
+    /// command palette, `<C-S-t>` terminal-max, `<C-S-l>` select-all-matches
+    /// are the only other Ctrl-Shift letters this app binds by default).
+    #[serde(default = "pk_focus_notifications")]
+    pub focus_notifications: String,
 }
 
 fn pk_nav_back() -> String {
@@ -1457,6 +1467,9 @@ fn pk_nav_back() -> String {
 }
 fn pk_nav_forward() -> String {
     "<C-A-Right>".to_string()
+}
+fn pk_focus_notifications() -> String {
+    "<C-S-n>".to_string()
 }
 
 impl Default for PanelKeys {
@@ -1476,6 +1489,7 @@ impl Default for PanelKeys {
             split_editor_down: String::new(),
             nav_back: pk_nav_back(),
             nav_forward: pk_nav_forward(),
+            focus_notifications: pk_focus_notifications(),
         }
     }
 }

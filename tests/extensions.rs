@@ -926,26 +926,33 @@ fn ext_install_sets_install_context_for_lsp() {
 //
 // #1397 moved the "recommended extension isn't installed" offer off the
 // status line (where any later `Engine::message` write silently ate it
-// before the user looked) and onto an actionable, sticky toast. These
-// tests therefore read the offer back through the **render layer**
-// (`render::build_toast_stack` — the exact struct both the TUI and GTK
-// backends hand to `draw_toast_stack`), not through `Engine::toasts`:
-// a toast sitting in engine state that never makes it into a paintable
-// stack must still fail here. Full painted-pixel coverage of the offer —
-// title, `N` hint, action-button click, × dismiss — lives in the
-// `TuiDriver` tests in `src/tui_main/shell_app.rs` and the `GtkDriver`
-// tests in `src/gtk/testing.rs`.
+// before the user looked) and onto an actionable, sticky toast. #1577
+// rebuilt it on quadraui#1185's multi-action toast: "Install" and "Don't
+// ask again" are now separate buttons instead of one action button plus
+// keyboard shortcuts printed as body text. These tests therefore read the
+// offer back through the **render layer** (`render::build_toast_stack` —
+// the exact struct both the TUI and GTK backends hand to
+// `draw_toast_overlay`), not through `Engine::toasts`: a toast sitting in
+// engine state that never makes it into a paintable stack must still fail
+// here. Full painted-pixel coverage of the offer — title, both buttons,
+// click, × dismiss, keyboard focus — lives in the `TuiDriver` tests in
+// `src/tui_main/app_on_tui_tests.rs` and the `GtkDriver` tests in
+// `src/gtk/testing.rs`.
 
 /// The install-offer toast currently in the *rendered* toast stack, as
-/// `(title, body, action_button_label)`. `None` when nothing is offering
+/// `(title, body, action_button_labels)`. `None` when nothing is offering
 /// an install — either no toast at all, or only plain (action-less)
 /// toasts such as the LSP-failure notice.
-fn install_offer_toast(e: &vimcode_core::Engine) -> Option<(String, String, String)> {
+fn install_offer_toast(e: &vimcode_core::Engine) -> Option<(String, String, Vec<String>)> {
     let stack = vimcode_core::render::build_toast_stack(e)?;
-    stack
-        .toasts
-        .into_iter()
-        .find_map(|t| Some((t.title, t.body, t.action?.label)))
+    stack.toasts.into_iter().find_map(|t| {
+        if t.actions.is_empty() {
+            None
+        } else {
+            let labels = t.actions.into_iter().map(|a| a.label).collect();
+            Some((t.title, t.body, labels))
+        }
+    })
 }
 
 #[test]
@@ -959,7 +966,7 @@ fn auto_offer_toast_shown_for_uninstalled_extension_on_file_open() {
     e.open_file_in_tab(&path);
     let _ = std::fs::remove_file(&path);
 
-    let (title, body, label) = install_offer_toast(&e).unwrap_or_else(|| {
+    let (title, body, labels) = install_offer_toast(&e).unwrap_or_else(|| {
         panic!(
             "expected an install-offer toast for uninstalled csharp; \
              message was {:?}",
@@ -970,10 +977,14 @@ fn auto_offer_toast_shown_for_uninstalled_extension_on_file_open() {
         title.contains("C# Language Support"),
         "offer title should name the extension: {title}"
     );
-    assert_eq!(label, "Install", "offer needs an Install action button");
+    assert_eq!(
+        labels,
+        vec!["Install".to_string(), "Don't ask again".to_string()],
+        "offer needs both an Install and a Don't ask again action button"
+    );
     assert!(
-        body.contains(":ExtInstall csharp") && body.contains('N'),
-        "offer body should document the keyboard equivalents: {body}"
+        body.contains("C# Language Support"),
+        "offer body should say what installing adds: {body}"
     );
 }
 

@@ -121,14 +121,14 @@ use crate::gtk::backend;
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
-// The 14-entry `PanelAccelerator` id table (`render::ACC_*`) and the
+// The 15-entry `PanelAccelerator` id table (`render::ACC_*`) and the
 // dispatcher itself (`render::dispatch_panel_accelerator`) are shared with
 // TUI (#761 / #734 slice 6) — see the rung's header comment in `render.rs`.
 // What's left here is registration (this backend's own `quadraui::Backend`
 // instance); `render::dispatch_panel_accelerator` queues onto `self.deferred`
 // directly (#1499) for the five actions that need GTK's `DeferredQueue` seam.
 
-// `register_panel_accelerators` (the 14-entry id table + registration loop)
+// `register_panel_accelerators` (the 15-entry id table + registration loop)
 // moved to `render::register_panel_accelerators` in #823 item 1 — it was
 // byte-identical to `tui_main`'s copy and had no backend-specific step.
 // Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
@@ -2217,6 +2217,19 @@ impl App {
         backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) {
+        // ── Shared toast-stack keyboard-focus rung (#1577) ──────────────
+        // Non-modal, unlike every rung below: `Engine::handle_toast_focus_key`
+        // only ever consumes a key once something has explicitly given the
+        // stack focus (`:Notifications` / `panel_keys.focus_notifications`)
+        // — every other key, and every key while unfocused, comes back
+        // `false` untouched, so checking this first (ahead of even the
+        // modal-dialog rung) is safe and replaces the old hardcoded `N`
+        // hijack (`keys.rs`, removed) with a real keyboard-focus cursor.
+        if self.engine.borrow_mut().handle_toast_focus_key(ui_event) {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
         // Bound to a local first: a `RefCell::borrow()` temporary in a `match`
         // scrutinee lives for the whole `match`, and the arms `borrow_mut()`.

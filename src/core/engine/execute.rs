@@ -976,6 +976,16 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // ── :Notifications / :NotifyFocus — give the toast/notification
+        //    stack keyboard focus (#1577) ─────────────────────────────────
+        // Same effect as `panel_keys.focus_notifications` (default
+        // `<C-S-n>`) — see `Engine::focus_toast_stack`'s doc. Two spellings
+        // so both a VS Code habit ("Notifications") and a shorter one work.
+        if cmd == "Notifications" || cmd == "NotifyFocus" {
+            self.focus_toast_stack();
+            return EngineAction::None;
+        }
+
         // ── Extension commands (:ExtInstall / :ExtRemove / :ExtRefresh / :ExtList /
         //                        :ExtEnable / :ExtDisable) ──────────────────────────────
         if let Some(subcmd) = cmd.strip_prefix("Ext").map(|s| s.trim()) {

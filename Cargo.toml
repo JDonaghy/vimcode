@@ -235,7 +235,21 @@ win = ["quadraui/win"]
 # mapping side. Also carries whatever else had landed on quadraui
 # `develop` by then: #1177 (macOS full-screen/traffic-light fix) and
 # #1181–#1183 (TUI minimap slider, Toast layout, TUI Tree badge overlap).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "286eb6c9e3f0a47e22967a625ba1e56018da0068", features = ["tui", "terminal"] }
+#
+# #1577 bumped this to pick up quadraui#1185 (VS Code-style actionable
+# toasts): `ToastOverlay`/`Toast`/`ToastButton` replace the single-action
+# `ToastStack`/`ToastItem`/`ToastAction` (now `#[deprecated]`, kept only so
+# a stale caller still compiles — vimcode migrates onto the new shapes in
+# this same bump, see `render::build_toast_stack`), each toast carries an
+# ordered `actions: Vec<ToastButton>` (one may be `primary`) drawn on its
+# own row at the bottom-right (never over the title), and
+# `compose::ToastStackController` gives a non-modal toast stack
+# Tab/Shift+Tab/Left/Right/Up/Down/Enter/Escape keyboard focus with a
+# theme.link_fg focus ring. `Backend::draw_toast_overlay` is the new paint
+# entry point; `draw_toast_stack` survives as a deprecated, defaulted
+# shim that converts and forwards. Queued after #1576 so the two pin
+# bumps don't collide in this file.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "db92e461ca5376103d3147d5267b697cbe002063", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
