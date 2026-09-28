@@ -51,5 +51,20 @@
 //! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the drafted ask —
 //! both are quadraui-side (`WinBackend`/`win::run`), so nothing changes in
 //! this 1-line re-export.
+//!
+//! # #1582: no menu bar at startup — the same `backend_caps` gap as #1562,
+//! # narrower fix (`native_menu`, not `window_chrome`)
+//!
+//! vimcode#1582 reports no menu bar at all on Win-GUI startup — the same
+//! root cause the `#1562` section above already names
+//! (`WinBackend::backend_caps()` sets neither flag `App::setup`'s branch
+//! checks), but satisfiable by the narrower of the two paths: `native_menu`
+//! (a real `SetMenu`-backed `HMENU`, the shape macOS's `install_menu_bar`
+//! already uses) needs no window-style change, unlike `window_chrome`
+//! (gated on `#1562`'s custom-caption work landing first). See
+//! `src/win/mod.rs`'s `#1582` doc section for the full write-up and
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry (scoped to `native_menu`
+//! only, so it does not duplicate `#1562`'s `window_chrome` entry) — both
+//! quadraui-side, so nothing changes in this 1-line re-export.
 
 pub use quadraui::win::WinBackend;

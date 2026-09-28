@@ -805,3 +805,105 @@ or capability decisions of their own (Platform-Neutrality Rule), and
 vimcode's title-bar/command-centre paint code is already fully backend-
 neutral and would light up on Windows unchanged once these two quadraui
 gaps close.
+
+---
+
+## `WinBackend::install_menu_bar` doesn't exist and `native_menu` is never declared, so Win-GUI has no menu bar at all — nothing discoverable to click (blocks vimcode#1582)
+
+**Title:** `Backend::install_menu_bar`/`show_context_menu` are still the
+trait's no-op defaults on `WinBackend` (no override in
+`quadraui/src/win/backend.rs`, confirmed at the pinned rev), and
+`backend_caps()`'s struct literal never sets `native_menu: true` — unlike
+`MacBackend`, which implements both (`quadraui/src/macos/menu_bar_install.rs`)
+and declares the cap. `event.rs`'s own doc on `UiEvent::MenuActivated`
+already earmarks the intended shape ("system-installed menus (macOS NSMenu;
+**future Win32 `SetMenu`**)") — this issue is building that anticipated,
+not-yet-built half.
+
+**Body:**
+
+vimcode#1582 reports the Windows GUI build (`vimcode.exe`) shows **no menu
+bar at all** on a fresh launch — nothing discoverable to reach File/Edit/
+View/etc. without already knowing a keybinding. Root-caused by reading
+`App::setup` (vimcode `src/app.rs`, ~L8479–8543) against `WinBackend::
+backend_caps()` at the pinned rev (`9f8766d3`, unchanged since `a58e5bec`):
+`App::setup`'s menu-bar-visibility decision is a three-way branch —
+`native_menu` (install a real OS menu, macOS) / `window_chrome` (drawn row
+pinned always-visible, GTK) / neither (the `cell`/TUI profile: hidden by
+default, toggleable at runtime, only started visible in vscode-mode).
+`WinBackend::backend_caps()` sets neither flag, so Win-GUI silently falls
+into the third arm and the whole band — menu row included — starts hidden
+with no chrome to reveal it. This is the *same* capability gap vimcode#1562
+already found blocking the title-bar/command-centre item (see the entry
+immediately above this one and vimcode `src/win/mod.rs`'s `#1562` doc
+section) — but #1582 only needs *one* of the two paths that entry names, and
+the narrower one:
+
+- The `window_chrome` path (the entry above) requires `win::run` to grow
+  `WM_NCCALCSIZE`/`WM_NCHITTEST` custom-caption handling first, or declaring
+  the cap paints a *second* row stacked under the real native caption — a
+  substantial, separate piece of work.
+- The `native_menu` path — this entry — needs no window-style change at
+  all. A real Win32 menu (`CreateMenu`/`AppendMenuW`/`SetMenu`) attaches
+  *underneath* the existing native caption the standard way every classic
+  Win32 app already does (Notepad, the pre-ribbon Office apps) — it does
+  not touch caption hit-testing or the resize border. `App::setup`'s
+  `native_menu` arm (`src/app.rs` L8493–8526) already builds a
+  `MenuBar` from the same platform-neutral `MenuDef`s the drawn row and
+  macOS's `NSMenu` both consume (`render::build_menu_defs`/
+  `menu_defs_to_menu_bar`) and calls `Backend::install_menu_bar(&bar)`
+  unconditionally on any backend declaring the cap — **no vimcode-side
+  change is needed once this lands**, exactly as `#1562`'s title-bar entry
+  already documents for its own path.
+
+`quadraui::macos::menu_bar_install::install_menu_bar` is the reference
+shape: it walks `MenuBar`'s `Vec<MenuDef>`, builds native `NSMenu`/
+`NSMenuItem`s recursively, and wires each leaf item's action selector
+(`quadraMenuAction:`) to look up and dispatch the item's `WidgetId` back
+through the app's event queue as `UiEvent::MenuActivated(id)` — the exact
+variant `crate::event::UiEvent`'s own doc already names Win32's future
+`SetMenu` as the sibling implementation for (`event.rs` ~L843–847), and the
+exact variant vimcode's `App::handle_event` already matches generically
+(`src/app.rs` L7808, no backend-specific branch — it fires from macOS today
+and would fire from Windows unchanged).
+
+**Ask:** in `quadraui/src/win/backend.rs`, override `install_menu_bar` on
+`WinBackend`: build a native `HMENU` tree from the passed `MenuBar` via
+`CreateMenu`/`CreatePopupMenu`/`AppendMenuW` (submenus as `MF_POPUP`, leaf
+items as `MF_STRING` with a per-item command id), call `SetMenu(hwnd,
+hmenu)`, and keep an id→`WidgetId` table on `WinBackend` for dispatch.  In
+`quadraui/src/win/run.rs`'s `wndproc` (~L1599), add a `WM_COMMAND` arm: when
+`wparam`'s high word is `0` (menu, not an accelerator/control notification)
+and the low word matches a table entry, push `UiEvent::MenuActivated(id)`
+the same way the adjacent `WM_LBUTTONDOWN`/`WM_SIZE` arms already push their
+events. Add `native_menu: true` to `backend_caps()`'s struct literal
+alongside the other Windows-only fields, satisfied honestly the moment
+`install_menu_bar` is overridden (`tests/conformance/caps.rs`'s
+`BackendSource::declared` parse). `show_context_menu` can stay the trait
+default for this issue — vimcode#1582 only asks for the menu *bar*, and
+right-click context menus are a separate, already-tracked surface.
+
+**Test:** a `BackendCaps`-only source-parse assertion
+(`WinBackend::backend_caps().native_menu` is `true`, mirroring the pattern
+`tests/conformance/caps.rs` already runs for every other backend) plus a
+`WinDriver`/`HeadlessSurface`-based scenario in `win::backend`'s own
+`#[cfg(test)] mod tests` (same fixture shape the block-cursor entry above
+this one already uses): install a `MenuBar` with one known item, synthesize
+the matching `WM_COMMAND` through `wndproc` directly (or the test seam
+`win::testing` already exposes for synthetic messages), and assert the
+resulting `UiEvent::MenuActivated` carries that item's `WidgetId` — not just
+that `SetMenu` was called, the #587/#592 "assert on effect, not on state
+populated" lesson vimcode's own `CLAUDE.md` states for exactly this reason.
+Runs on `target_os = "windows"` only (real `HMENU`/`SetMenu` calls), type-
+checks everywhere else; observe it RED against the unfixed no-op
+`install_menu_bar` default first, on real Windows hardware (dell64), before
+declaring it fixed.
+
+**Blocks:** `JDonaghy/vimcode#1582`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available: `App::setup`'s `native_menu` arm (`src/app.rs`)
+already builds and installs the menu bar generically on any backend that
+declares the cap, and `App::handle_event` already matches
+`UiEvent::MenuActivated` generically (both proven live today by macOS) — the
+entire gap is `WinBackend::install_menu_bar` not existing and `native_menu`
+never being declared, both inside `quadraui::win`.

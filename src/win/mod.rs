@@ -326,6 +326,48 @@
 //! substantial, and the status-segment item needs a real-hardware
 //! re-check, none of which this repo's `git`-only worker access can close
 //! out further this session.
+//!
+//! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
+//! # gap #1562 found, but the narrower `native_menu` half of it
+//!
+//! vimcode#1582 reports `vimcode.exe` shows **no menu bar at all** on a
+//! fresh launch — nothing discoverable to reach File/Edit/View/etc. without
+//! already knowing a keybinding. This is the identical root cause the
+//! `#1562` section above already found and documented (`App::setup`'s
+//! three-way branch on `backend.backend_caps()` falls into the fully-hidden
+//! `cell`/TUI arm because `WinBackend::backend_caps()` sets neither
+//! `native_menu` nor `window_chrome`), so nothing new needed re-deriving —
+//! see that section for the full read-through of `App::setup`'s branch.
+//!
+//! What #1582 changes is *which half* of the fix to pursue. `#1562`'s own
+//! ask (drafted in `docs/PENDING_QUADRAUI_ISSUES.md`) needs the
+//! `window_chrome` path — a drawn row that doubles as the client-side
+//! titlebar — which is gated on `win::run` first growing
+//! `WM_NCCALCSIZE`/`WM_NCHITTEST` custom-caption handling (declaring the cap
+//! before that lands would just stack a second drawn row under the real
+//! native caption). #1582 only asks for a menu bar being *present and
+//! clickable*, which the *other* named path — `native_menu`, the same one
+//! macOS already uses — satisfies with no window-style change at all: a
+//! real Win32 `HMENU` attached via `SetMenu` sits underneath the existing
+//! native caption the ordinary way any classic Win32 app's menu does, the
+//! same shape `crate::event::UiEvent::MenuActivated`'s own doc comment
+//! already earmarks for it ("future Win32 `SetMenu`", `quadraui/src/
+//! event.rs`). `App::setup`'s `native_menu` arm (`src/app.rs` L8493–8526)
+//! already builds the `MenuBar` from the same platform-neutral `MenuDef`s
+//! every backend shares and calls `Backend::install_menu_bar` unconditionally
+//! for any backend declaring the cap, and `App::handle_event` already
+//! matches `UiEvent::MenuActivated` with no backend-specific branch
+//! (`src/app.rs` L7808) — both proven live today by macOS, so **no
+//! vimcode-side change is needed** once `WinBackend` implements
+//! `install_menu_bar` and declares `native_menu: true`. Both are entirely
+//! inside `quadraui::win` (`win/backend.rs`'s trait impl, `win/run.rs`'s
+//! `wndproc` gaining a `WM_COMMAND` arm) — per the Platform-Neutrality Rule
+//! this is not a fix to attempt in this crate. Drafted as a new pending
+//! quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`, explicitly scoped
+//! to the `native_menu` path so it does not duplicate or conflict with
+//! `#1562`'s separate `window_chrome` entry — either can land
+//! independently, and #1582 needs only this one. Leave #1582 open behind
+//! it.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
