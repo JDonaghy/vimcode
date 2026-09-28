@@ -142,6 +142,12 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// Every architecture vimcode resolves acquisitions for, in a stable
+    /// order — mirrors `extensions::Platform::ALL`. Lets a single test (or
+    /// the #1347 registry liveness check) sweep every arch regardless of
+    /// which one the test binary happens to be compiled for.
+    pub const ALL: [Arch; 2] = [Arch::Amd64, Arch::Arm64];
+
     /// The architecture this binary was actually compiled for.
     pub fn host() -> Arch {
         #[cfg(target_arch = "aarch64")]
@@ -152,6 +158,15 @@ impl Arch {
         {
             Arch::Amd64
         }
+    }
+}
+
+impl std::fmt::Display for Arch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Arch::Amd64 => "amd64",
+            Arch::Arm64 => "arm64",
+        })
     }
 }
 
@@ -1583,6 +1598,15 @@ binary_path = "example-dap"
         let cfg = AcquireConfig::default();
         assert_eq!(resolved_arch(&cfg, Arch::Amd64), "amd64");
         assert_eq!(resolved_arch(&cfg, Arch::Arm64), "arm64");
+    }
+
+    #[test]
+    fn arch_all_covers_both_variants_and_displays_lowercase() {
+        // #1347: the registry liveness check sweeps `Arch::ALL` the same way
+        // the #919 conformance gate sweeps `Platform::ALL`.
+        assert_eq!(Arch::ALL, [Arch::Amd64, Arch::Arm64]);
+        assert_eq!(Arch::Amd64.to_string(), "amd64");
+        assert_eq!(Arch::Arm64.to_string(), "arm64");
     }
 
     #[test]
