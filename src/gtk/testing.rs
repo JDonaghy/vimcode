@@ -4488,6 +4488,55 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #1574: the Settings sidebar panel's `SidebarPanelBody` must be given
+    /// `background: Some(theme.tab_bar_bg)`, not `None` — before this fix,
+    /// nothing filled the panel rect before `FormController` painted over
+    /// it, so the handful of pixels its scrollbar widget only *partially*
+    /// covers (a semi-opaque overlay track at the sidebar's right edge)
+    /// still showed whatever was behind them: GTK's own dark default clear
+    /// colour with `background: None`, the themed sidebar fill with
+    /// `Some(theme.tab_bar_bg)`. Everywhere else in the panel `FormController`
+    /// already paints an opaque per-row background regardless of this field
+    /// (confirmed while writing this test — a plain row probe reads
+    /// identically with either `background` value), so the scrollbar strip
+    /// is the one place this fix is externally observable.
+    ///
+    /// Verified RED against unfixed code (`background: None`): this exact
+    /// probe point read `rgb(120, 121, 124)`, a mid-grey nothing like
+    /// `vscode-light`'s `tab_bar_bg` (`#ececec`); the tolerant assertion
+    /// below only passes once the fix is restored (probed `rgb(206, 206,
+    /// 206)` — close to, not identical to, `tab_bar_bg` because the
+    /// scrollbar overlay still blends its own partial opacity on top).
+    #[test]
+    fn settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.colorscheme = "vscode-light".to_string();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_SETTINGS));
+        let mut h = harness(engine, 1400, 900);
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+
+        // A few pixels in from the sidebar's right edge, well below the
+        // header/search chrome row, so nothing but the scrollbar widget and
+        // the panel background sit under this point.
+        let probe_x = (sb.x + sb.width - 5.0) as i32;
+        let probe_y = (sb.y + 200.0) as i32;
+        let (r, g, b) = h.driver.pixel(probe_x, probe_y);
+
+        let bg = crate::render::Theme::vscode_light().tab_bar_bg;
+        const TOL: i32 = 40; // the scrollbar overlay's own blending, not AA noise
+        let close = |c: u8, target: u8| (c as i32 - target as i32).abs() <= TOL;
+        assert!(
+            close(r, bg.r) && close(g, bg.g) && close(b, bg.b),
+            "the settings scrollbar gutter must blend with the themed sidebar \
+             background {bg:?} (tolerant of the scrollbar widget's own partial \
+             opacity), not the backend's dark default clear colour; probed \
+             rgb=({r}, {g}, {b})"
+        );
+    }
+
     /// Search: clicking the query box at the top of the panel must focus it.
     ///
     /// `search_panel_form_focus` is what the renderer reads to draw the caret

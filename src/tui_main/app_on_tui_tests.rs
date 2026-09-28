@@ -835,6 +835,20 @@ mod tests {
             );
         }
 
+        // #1574: no TUI driver test covers the `PANEL_SETTINGS` arm's
+        // `background: Some(theme.tab_bar_bg)` fix — confirmed empirically
+        // while writing this issue's fix that it can't: on this module's TUI
+        // harness, `FormController` already paints an opaque per-row
+        // background across the full sidebar width regardless of what
+        // `SidebarPanelBody.background` is set to (verified by probing a
+        // blank cell past an ordinary row's text with `background: None` vs
+        // `Some(theme.tab_bar_bg)` — identical `rgb(236, 236, 236)` either
+        // way). The bug is GTK-specific: `settings_panel_scrollbar_gutter_
+        // paints_theme_tab_bar_bg` in `src/gtk/testing.rs` covers it instead,
+        // where the pixel-level probe genuinely goes RED with `background:
+        // None` restored (a mid-grey `rgb(120, 121, 124)` scrollbar-gutter
+        // leak) and GREEN with the fix.
+
         /// Clicking the Search activity-bar icon must switch the sidebar body
         /// to the search panel (the "Replace…" row is unique to it) — located
         /// via its own chrome zone, not a hardcoded coordinate, same technique
