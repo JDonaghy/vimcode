@@ -2222,6 +2222,98 @@ mod tests {
             );
         }
 
+        /// #1586: a *stacked* split (`Ctrl+W s` / `open_editor_group
+        /// (Horizontal)`) must paint the lower group's own tab row with its
+        /// active tab's label — not overwritten by the group-boundary
+        /// divider line, which #1586 traced to landing on exactly that row
+        /// (`GroupLayout::calculate_group_rects`/`dividers` reserve zero
+        /// divider thickness for a stacked split, so the divider's
+        /// `position` coincides exactly with the lower group's tab-row
+        /// band; the fix, `render::painted_group_dividers`, simply never
+        /// paints a line for that direction — see its own doc for why
+        /// reserving extra geometric space instead cannot be made to work
+        /// uniformly across backends).
+        ///
+        /// Deliberately reads the *painted* row the current frame's own
+        /// `ScreenLayout::group_tab_bars` says the bottom group's tab bar
+        /// occupies (`bounds.y - tab_bar_height`, one cell row with
+        /// breadcrumbs off), rather than a hardcoded row number or a bare
+        /// `screen_has` — a bare `screen_has(label)` would pass even on the
+        /// unfixed bug, since the breadcrumb row directly below the (missing)
+        /// tab row already shows the same filename as its last path segment.
+        ///
+        /// RED-verified against unfixed `develop` (53894ed): before #1586,
+        /// [`crate::render::EditorOp::GroupDividers`]'s body painted every
+        /// entry in `screen.group_dividers` unconditionally, including a
+        /// stacked one landing on this exact row — this row then paints the
+        /// divider line (`'─'` repeated across the group's width) and
+        /// contains neither tab label.
+        ///
+        /// Uses a `(80, 25)` driver, not this module's usual `(80, 24)`
+        /// (see [`harness`]): at `24` rows the pre-fix boundary happens to
+        /// land on an exact `.5` row (e.g. `11.5`), and the tab-bar rung
+        /// *rounds* that to place the label row while the divider rung
+        /// *truncates* it to place its own — two different conventions that,
+        /// on a `.5` tie, land one row apart and accidentally dodge the
+        /// collision this test exists to catch. `25` rows lands the boundary
+        /// on a whole row, where both conventions agree and the bug
+        /// reproduces (confirmed empirically against unfixed `develop` before
+        /// picking this size).
+        #[test]
+        fn stacked_groups_bottom_tab_row_shows_its_label_1586() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1586_stacked_tabs_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let top = dir.join("zqxwTOP1586.txt");
+            let bottom = dir.join("zqxwBOTTOM1586.txt");
+            std::fs::write(&top, "TOP\n").unwrap();
+            std::fs::write(&bottom, "BOTTOM\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.settings.breadcrumbs = false; // one-row tab bar, simplest geometry
+            engine.new_tab(Some(&top));
+            // `open_editor_group`'s new group is always the *second* child
+            // (`split_at(..., new_first: false)`) — for `Horizontal` that is
+            // the bottom pane, and it becomes the active group.
+            engine.open_editor_group(SplitDirection::Horizontal);
+            engine.new_tab(Some(&bottom));
+            let bottom_group = engine.active_group;
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 80, 25);
+            collapse_sidebar(&mut h.driver);
+            h.driver.render();
+
+            let bounds = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have been painted");
+                layout
+                    .group_tab_bars
+                    .iter()
+                    .find(|gtb| gtb.group_id == bottom_group)
+                    .map(|gtb| gtb.bounds)
+                    .expect("the bottom group must have its own tab bar entry")
+            };
+            let tab_row_idx = (bounds.y - 1.0).round() as usize;
+
+            let screen = h.driver.screen();
+            let tab_row = screen.lines().nth(tab_row_idx).unwrap_or_else(|| {
+                panic!(
+                    "row {tab_row_idx} (bottom group's tab row) is off-screen; screen:\n{screen}"
+                )
+            });
+            assert!(
+                tab_row.contains("zqxwBOTTOM1586.txt"),
+                "the bottom group's own tab row (row {tab_row_idx}) must show its \
+                 active tab's label, not a group-divider line; row:\n{tab_row}\n\
+                 full screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A single-group frame must not paint a group-divider glyph ('│')
         /// anywhere to the right of the tab label — paint-only twin of
         /// `shell_app.rs`'s `unsplit_editor_composes_no_group_divider_rung_via_shell_app`
