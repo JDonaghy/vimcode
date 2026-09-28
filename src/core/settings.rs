@@ -101,6 +101,23 @@ pub enum LineNumberMode {
     Hybrid,
 }
 
+/// When gutter fold-control markers paint — `fold_controls` setting, VS
+/// Code's `editor.showFoldingControls` equivalent (#1544).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FoldControlsMode {
+    /// Only while the pointer is over the gutter. Collapsed-fold (`+`)
+    /// markers still always paint, matching VS Code: a fold you can't see
+    /// is a fold you can't discover how to reopen.
+    #[default]
+    Mouseover,
+    /// Always paint every fold-control marker (open `-` and closed `+`),
+    /// matching pre-#1544 vimcode behavior.
+    Always,
+    /// Never paint fold-control markers at all (the gutter's fold-indicator
+    /// column always renders blank).
+    Never,
+}
+
 /// User settings loaded from ~/.config/vimcode/settings.json
 ///
 /// IMPORTANT: When adding new settings fields:
@@ -437,6 +454,16 @@ pub struct Settings {
     /// `20`, matching Vim.
     #[serde(default = "default_foldnestmax")]
     pub foldnestmax: usize,
+
+    /// When the gutter fold-control markers (`+`/`-` next to a foldable
+    /// region) are painted: `"mouseover"` (only while the pointer is over
+    /// the gutter — collapsed-fold `+` markers still always paint, matching
+    /// VS Code's `mouseover` behavior of never hiding an already-collapsed
+    /// region's marker), `"always"`, or `"never"`. No Vim equivalent — this
+    /// mirrors VS Code's `editor.showFoldingControls`, default `"mouseover"`
+    /// there too (#1544).
+    #[serde(default)]
+    pub fold_controls: FoldControlsMode,
 
     /// Whether `/` and `?` search wrap around the end/start of the buffer
     /// when no more matches are found in the current direction. Corresponds
@@ -1649,6 +1676,7 @@ impl Default for Settings {
             foldlevel: 0,
             foldmarker: default_foldmarker(),
             foldnestmax: default_foldnestmax(),
+            fold_controls: FoldControlsMode::default(),
             wrapscan: default_true(),
             shiftround: false,
             gdefault: false,
@@ -3608,6 +3636,11 @@ impl Settings {
                 LineNumberMode::Relative => "relative".to_string(),
                 LineNumberMode::Hybrid => "hybrid".to_string(),
             },
+            "fold_controls" => match self.fold_controls {
+                FoldControlsMode::Mouseover => "mouseover".to_string(),
+                FoldControlsMode::Always => "always".to_string(),
+                FoldControlsMode::Never => "never".to_string(),
+            },
             "cursorline" => self.cursorline.to_string(),
             "window_status_line" => self.window_status_line.to_string(),
             "status_line_above_terminal" => self.status_line_above_terminal.to_string(),
@@ -3722,6 +3755,14 @@ impl Settings {
                     "relative" => LineNumberMode::Relative,
                     "hybrid" => LineNumberMode::Hybrid,
                     _ => return Err(format!("Unknown line_numbers value: {value}")),
+                };
+            }
+            "fold_controls" => {
+                self.fold_controls = match value {
+                    "mouseover" => FoldControlsMode::Mouseover,
+                    "always" => FoldControlsMode::Always,
+                    "never" => FoldControlsMode::Never,
+                    _ => return Err(format!("Unknown fold_controls value: {value}")),
                 };
             }
             "cursorline" => self.cursorline = value == "true",
@@ -4014,6 +4055,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         description: "How line numbers are displayed in the gutter",
         category: "Appearance",
         setting_type: SettingType::Enum(&["none", "absolute", "relative", "hybrid"]),
+    },
+    SettingDef {
+        key: "fold_controls",
+        label: "Fold Controls",
+        description: "When gutter fold markers are shown (VS Code's showFoldingControls)",
+        category: "Appearance",
+        setting_type: SettingType::Enum(&["mouseover", "always", "never"]),
     },
     SettingDef {
         key: "cursorline",
@@ -4944,6 +4992,30 @@ mod tests {
         assert!(SETTING_DEFS
             .iter()
             .any(|d| d.key == "acp_reopen_last_session"));
+    }
+
+    /// #1544's `fold_controls` setting (VS Code's `showFoldingControls`):
+    /// defaults to `"mouseover"`, round-trips through `get_value_str`/
+    /// `set_value_str` (the Settings sidebar's contract), rejects an unknown
+    /// value, and appears in `SETTING_DEFS` so the sidebar actually lists
+    /// it.
+    #[test]
+    fn fold_controls_defaults_to_mouseover_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert_eq!(s.fold_controls, FoldControlsMode::Mouseover);
+        assert_eq!(s.get_value_str("fold_controls"), "mouseover");
+
+        s.set_value_str("fold_controls", "always").unwrap();
+        assert_eq!(s.fold_controls, FoldControlsMode::Always);
+        assert_eq!(s.get_value_str("fold_controls"), "always");
+
+        s.set_value_str("fold_controls", "never").unwrap();
+        assert_eq!(s.fold_controls, FoldControlsMode::Never);
+        assert_eq!(s.get_value_str("fold_controls"), "never");
+
+        assert!(s.set_value_str("fold_controls", "bogus").is_err());
+
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "fold_controls"));
     }
 
     #[test]

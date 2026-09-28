@@ -36,7 +36,7 @@ use crate::core::engine::{
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::project_search::QuickfixList;
-use crate::core::settings::{LineNumberMode, Settings};
+use crate::core::settings::{FoldControlsMode, LineNumberMode, Settings};
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -8417,6 +8417,32 @@ pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_doubl
         // first one just toggled (#484).
         engine.handle_ext_panel_key("Return", false, None);
     }
+}
+
+/// Update [`Engine::gutter_hover_window`] from the pointer position against
+/// the last-painted `ScreenLayout` (#1544's `fold_controls = "mouseover"`).
+///
+/// Routes through the exact same [`find_window_at`] + [`window_zone_hit_test`]
+/// pair every pixel→click-target resolver in `src/click.rs` already uses, so
+/// a gutter-hover decision can never drift from what a real click at the
+/// same point would resolve to. Both backends call this from the same
+/// shared `MouseMoved` arm in `App::handle_dispatch` — no per-backend hover
+/// geometry.
+pub fn route_gutter_hover(
+    engine: &mut Engine,
+    layout: &ScreenLayout,
+    x: f64,
+    y: f64,
+    line_height: f64,
+    char_width: f64,
+) {
+    engine.gutter_hover_window = find_window_at(layout, x, y).and_then(|idx| {
+        let rw = &layout.windows[idx];
+        let rel_x = x - rw.rect.x;
+        let rel_y = y - rw.rect.y;
+        let hit = window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width);
+        matches!(hit, WindowZone::Gutter { .. }).then_some(rw.window_id)
+    });
 }
 
 /// Hover feedback for the sidebar — the Source Control toolbar buttons and
@@ -20822,6 +20848,20 @@ fn build_rendered_window(
     let diff_aligned: Option<&[AlignedDiffEntry]> =
         engine.diff_aligned.get(&window_id).map(|v| v.as_slice());
 
+    // Whether *open*-foldable-region markers (`-`) paint in this window's
+    // gutter this frame (#1544, VS Code's `editor.showFoldingControls`).
+    // Closed-fold `+` markers are handled separately, inside
+    // `fold_indicator_char`, and always paint under `Mouseover` — a fold you
+    // can't see is a fold you can't discover how to reopen. `Never` hides
+    // both. `engine.gutter_hover_window` is updated by
+    // `route_gutter_hover`, called from the same shared `MouseMoved` path on
+    // both backends (`App::handle_dispatch`) — no per-backend hover logic.
+    let fold_open_markers_visible = match engine.settings.fold_controls {
+        FoldControlsMode::Always => true,
+        FoldControlsMode::Never => false,
+        FoldControlsMode::Mouseover => engine.gutter_hover_window == Some(window_id),
+    };
+
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
 
@@ -21014,7 +21054,13 @@ fn build_rendered_window(
             })
             .unwrap_or(false);
 
-        let fold_char = fold_indicator_char(buffer, view, line_idx);
+        let fold_char = fold_indicator_char(
+            buffer,
+            view,
+            line_idx,
+            engine.settings.fold_controls,
+            fold_open_markers_visible,
+        );
         // Number of leading marker columns (bp + git) subtracted from the
         // numeric portion so line numbers fill their allotted width correctly.
         let marker_cols = if has_bp { 1 } else { 0 } + if has_git { 1 } else { 0 };
@@ -22192,10 +22238,31 @@ fn line_indent_of(buffer: &Buffer, line_idx: usize) -> usize {
 /// To avoid false positives (e.g. blank lines, function-call continuations),
 /// `-` is only shown when the current line is a **block opener**: non-blank
 /// and whose trimmed text ends with `{` or `:`.
-fn fold_indicator_char(buffer: &Buffer, view: &View, line_idx: usize) -> char {
+///
+/// `controls` is the `fold_controls` setting (#1544, VS Code's
+/// `editor.showFoldingControls`): `Never` blanks every marker regardless of
+/// fold state; `Mouseover`/`Always` always show a closed fold's `+` (VS
+/// Code never hides an already-collapsed region's marker, even under
+/// `mouseover`), but the open-region `-` only shows when
+/// `open_markers_visible` is true (the caller's `fold_controls`/hover
+/// decision — `Always` passes `true` unconditionally, `Mouseover` passes
+/// whether the pointer is currently over this window's gutter).
+fn fold_indicator_char(
+    buffer: &Buffer,
+    view: &View,
+    line_idx: usize,
+    controls: FoldControlsMode,
+    open_markers_visible: bool,
+) -> char {
+    if controls == FoldControlsMode::Never {
+        return ' ';
+    }
     // Closed fold header takes priority.
     if view.fold_at(line_idx).is_some() {
         return '+';
+    }
+    if !open_markers_visible {
+        return ' ';
     }
     // Only show `-` for genuine block-opener lines.
     let cur_line = buffer.content.line(line_idx);

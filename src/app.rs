@@ -7502,6 +7502,35 @@ impl App {
             }
         }
 
+        // ── Gutter hover — #1544 (`fold_controls = "mouseover"`) ───────────
+        // Shared with TUI: both backends reach this same `MouseMoved` arm in
+        // `App::handle_dispatch`, so a fold-control marker's visibility can
+        // never diverge between them the way a per-backend hover tracker
+        // would risk. `render::route_gutter_hover` resolves against
+        // `cached_screen_layout` — the same last-painted geometry
+        // `handle_mouse_click_msg` already hit-tests real clicks against —
+        // so "hovering" and "clicking" the gutter always agree on where it
+        // is.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            let layout_ref = self.cached_screen_layout.borrow();
+            if let Some(layout) = layout_ref.as_ref() {
+                let mut engine = self.engine.borrow_mut();
+                let was = engine.gutter_hover_window;
+                render::route_gutter_hover(
+                    &mut engine,
+                    layout,
+                    position.x as f64,
+                    position.y as f64,
+                    backend.line_height() as f64,
+                    backend.char_width() as f64,
+                );
+                if engine.gutter_hover_window != was {
+                    drop(engine);
+                    self.draw_needed.set(true);
+                }
+            }
+        }
+
         // #955 (ACP-4, review fix): gates the title-bar drag/double-click
         // arms below on the change-review surface being closed. That surface
         // is genuinely full-viewport — its first diff row paints inside
