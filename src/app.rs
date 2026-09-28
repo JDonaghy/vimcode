@@ -3496,6 +3496,12 @@ impl App {
                 // scrollbar's gutter, so the backend's own clear colour
                 // (dark on macOS regardless of the active colourscheme)
                 // showed through there instead of the themed sidebar bg.
+                // GTK-only: `src/gtk/testing.rs`'s
+                // `settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg`
+                // covers it with a pixel probe (that module's own doc
+                // records why an equivalent TUI probe can't reproduce this
+                // one — `FormController` already paints an opaque per-row
+                // background there regardless of this field).
                 let panel = render::SidebarPanelBody {
                     background: Some(theme.tab_bar_bg),
                     chrome: render::search_only_chrome(
