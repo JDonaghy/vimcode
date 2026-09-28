@@ -2398,6 +2398,65 @@ mod tests {
         );
     }
 
+    /// #1545 (GTK): dotfiles show in the explorer tree by default (VS
+    /// Code-style) but the small `explorer_exclude` list (`.git`, `.svn`,
+    /// `.hg`, `.DS_Store`, `Thumbs.db`) stays hidden regardless — the GTK
+    /// twin of `tui_main::app_on_tui_tests`'s
+    /// `render_content_shows_dotfiles_but_hides_git_by_default_via_shell_app`.
+    /// Driven through the real tree build
+    /// (`Engine::explorer_reveal_path` → `explorer_rebuild_rows` →
+    /// `build_explorer_rows`/`collect_explorer_rows`) and read back via
+    /// `GtkDriver::screen_contains`, which resolves through the same
+    /// per-glyph-run paint-time recording (quadraui#489) the sibling
+    /// `explorer_tree_paints_a_distinct_icon_for_cs_files` test above uses —
+    /// not engine state, per CLAUDE.md's "assert on rendered output" rule.
+    ///
+    /// Default settings only (`Engine::new_for_test()`, no explicit
+    /// `show_hidden_files`/`explorer_exclude` override) — the shipped
+    /// defaults are the thing under test.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #1545, `show_hidden_files` defaulted to `false`, so
+    /// `.dotfile1545` never reached `collect_explorer_rows`'s output at
+    /// all and the first assertion below fails.
+    #[test]
+    fn explorer_tree_shows_dotfiles_but_hides_git_by_default_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1545_gtk_explorer_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dotfile = dir.join(".dotfile1545");
+        std::fs::write(&dotfile, "marker\n").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.cwd = dir.clone();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.explorer_reveal_path(&dotfile);
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains(".dotfile1545"),
+            "dotfiles must show in the explorer tree by default (#1545); \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains(".git"),
+            "'.git' must stay hidden via the default explorer_exclude list \
+             even though dotfiles now show by default (#1545); painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── #1381: explorer file-row filetype glyphs match the tab bar's ───────
 
     /// #1381 (GTK): the explorer's filetype glyph must paint in the same
@@ -14424,6 +14483,76 @@ mod modal_rung {
              pixels are unchanged, so the click hit-tested somewhere the panel \
              is not"
         );
+    }
+
+    /// #1545 (GTK): flipping `show_hidden_files` on by default must not leak
+    /// `.git/` internals into the quick-open (Find Files) picker — the GTK
+    /// twin of `tui_main::app_on_tui_tests`'s
+    /// `quick_open_hides_git_internals_but_shows_dotfiles_via_shell_app`.
+    /// `explorer_exclude` is the single source of truth for that noise, and
+    /// `Engine::picker_populate_files` prunes it from the `ignore` walk via
+    /// `filter_entry`, so the *painted* picker list shows an ordinary
+    /// dotfile but no `.git` entry.
+    ///
+    /// Reads the painted popup via `GtkDriver::screen_contains`, which
+    /// resolves through quadraui#489's generic per-glyph-run paint-time
+    /// recording — every Pango `show_layout` call made while
+    /// `painted_text_recording` is enabled gets captured, including the
+    /// picker's own item rows (`quadraui::gtk::draw_palette` paints through
+    /// `native_surface_paint::paint` → `CairoSurface::surface_draw_text_run`
+    /// → the recording `show_layout` shim), not just the handful of
+    /// primitives that used to hand-roll their own recording.
+    ///
+    /// Default settings only (`Engine::new_for_test()`, no explicit
+    /// `show_hidden_files`/`explorer_exclude` override) — the shipped
+    /// defaults are the thing under test.
+    ///
+    /// # Why this fails against unfixed `develop`
+    ///
+    /// Before #1545's `picker_populate_files` `filter_entry` prune (the
+    /// state unfixed `develop` + the `show_hidden_files` default flip
+    /// produces), the picker paints `.git/HEAD1545gtk` and the second
+    /// assertion below fails — the same regression that made
+    /// `test_picker_files_populates_preview` fail with `"ref:
+    /// refs/heads/main"` instead of the real file's first line.
+    #[test]
+    fn quick_open_hides_git_internals_but_shows_dotfiles_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1545_gtk_picker_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(
+            dir.join(".git").join("HEAD1545gtk"),
+            b"ref: refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".dotrc1545gtk"), b"kept\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.cwd = dir.clone();
+        engine.open_picker(crate::core::engine::PickerSource::Files);
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.picker_popup().is_some(),
+            "fixture must actually paint the quick-open picker"
+        );
+        assert!(
+            h.driver.screen_contains(".dotrc1545gtk"),
+            "quick-open must list dotfiles now that show_hidden_files \
+             defaults on (#1545); painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("HEAD1545gtk"),
+            "quick-open must not list '.git/' internals — explorer_exclude \
+             prunes them from the walk (#1545); painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #751: clicking the picker row that is already selected confirms it, the

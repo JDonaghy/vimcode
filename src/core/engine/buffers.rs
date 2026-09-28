@@ -4139,3 +4139,75 @@ fn parse_undo_time_spec(spec: &str) -> Option<std::time::SystemTime> {
     let ago = std::time::Duration::from_secs(count * unit_secs);
     Some(std::time::SystemTime::now() - ago)
 }
+
+#[cfg(test)]
+mod netrw_build_listing_tests {
+    use super::Engine;
+
+    /// #1545: `netrw_build_listing`'s `exclude` parameter must hide
+    /// `.git`/etc. regardless of `show_hidden` — a user browsing a project
+    /// root with `:Explore` (netrw) now shows dotfiles by default, but the
+    /// listing must not lead with a `.git/` row. Unit-level coverage per
+    /// the reviewer's non-blocking note: this is a pure function, trivial
+    /// to test directly, and had no pre-existing test even before #1545.
+    #[test]
+    fn hides_excluded_entries_even_when_show_hidden_is_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_netrw_listing_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let listing = Engine::netrw_build_listing(&dir, true, &exclude);
+
+        assert!(
+            listing.contains(".dotfile"),
+            "dotfiles must show when show_hidden is true; got:\n{listing}"
+        );
+        assert!(
+            listing.contains("plain.txt"),
+            "ordinary files must always show; got:\n{listing}"
+        );
+        assert!(
+            !listing.lines().any(|l| l == ".git/"),
+            "'.git' must stay hidden via explorer_exclude even with \
+             show_hidden true; got:\n{listing}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `show_hidden`, ordinary dotfiles are still hidden by the
+    /// pre-existing `show_hidden` gate — `exclude` only ever narrows the
+    /// listing further, it never widens it.
+    #[test]
+    fn show_hidden_false_still_hides_ordinary_dotfiles() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_netrw_listing_nohidden_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let listing = Engine::netrw_build_listing(&dir, false, &exclude);
+
+        assert!(
+            !listing.contains(".dotfile"),
+            "dotfiles must stay hidden when show_hidden is false; got:\n{listing}"
+        );
+        assert!(
+            listing.contains("plain.txt"),
+            "ordinary files must always show; got:\n{listing}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
