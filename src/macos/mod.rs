@@ -459,6 +459,78 @@ mod mac_driver_tests {
         }
     }
 
+    /// #1576: the sidebar header row (the `" EXPLORER "` strip above the
+    /// tree, painted by quadraui's `AppShell::render`) must come from
+    /// vimcode's own theme on macOS too — the same regression
+    /// `tui_main::app_on_tui_tests::tests::sidebar_panels::
+    /// sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal_via_shell_app`
+    /// covers for the TUI backend. Before quadraui#1180 (picked up by this
+    /// issue's pin bump), `AppShell::render` painted a hard-coded
+    /// `Color::rgb(37, 37, 38)` (`#252526`) regardless of theme; under
+    /// `vscode-light` that read as a dark band behind a light sidebar.
+    /// Samples a pixel inside the header row's own painted-run bounds, on
+    /// its leading literal space (background, not a glyph's anti-aliased
+    /// edge) — a pixel probe, not `style_at`, because `MacDriver` paints
+    /// real pixels via `CGBitmapContext`, not discrete cell styles.
+    ///
+    /// Confirmed red against the pre-#1576 pin: with the old rev, the
+    /// sampled pixel is `(37, 37, 38)`, not `vscode_light`'s status colour
+    /// `(0, 122, 204)`.
+    #[test]
+    fn sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.colorscheme = "vscode-light".to_string();
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.session.explorer_visible = true;
+
+        let (_guards, mut driver) = driver(engine);
+        // `App::sync_per_frame_backend_state` pushes vimcode's theme onto
+        // the backend at the *start* of `render_content`, which quadraui's
+        // shell runs *after* `AppShell::render` paints the header chrome —
+        // so the header's very first frame still reads whatever
+        // `Backend::theme()` returned before any `set_theme` call ever
+        // landed (quadraui's own dark `Theme::default()`). A second frame
+        // (no input, just a re-render) carries the now-set theme forward,
+        // matching what a real window settles on after its first paint.
+        driver.render();
+
+        let bounds = driver
+            .find_bounds("EXPLORER")
+            .expect("the sidebar header must paint its panel title");
+        // `find_bounds` returns the whole painted run's bounds — the
+        // status-bar segment is `" EXPLORER "` (leading/trailing literal
+        // space, `App::paint_sidebar_panel_rung`'s doc), so a couple of
+        // points in from the run's own left edge lands on that leading
+        // space: still inside the header's own background, not the glyph,
+        // and not spilling left into the activity-bar rail's own column
+        // (a separate, narrower `draw_activity_bar` paint immediately
+        // adjacent — sampling *outside* this run's bounds landed there
+        // instead, sampling neither colour).
+        let probe_x = (bounds.x + 2.0) as u32;
+        let probe_y = (bounds.y + bounds.height / 2.0) as u32;
+        let (r, g, b, _a) = driver.pixel(probe_x, probe_y);
+
+        let theme = crate::render::Theme::vscode_light();
+        let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+        assert_eq!(
+            (r, g, b),
+            expected,
+            "sidebar header bg must come from theme.status_bg (vimcode's \
+             theme, via `to_quadraui_theme_chrome`'s header_bg mapping), \
+             not quadraui's hard-coded #252526 literal; painted text was {:?}",
+            driver.painted_texts()
+        );
+        assert_ne!(
+            (r, g, b),
+            (37, 37, 38),
+            "sidebar header bg must not be quadraui's old #252526 literal \
+             under a light theme"
+        );
+    }
+
     /// #896: the first painted frame must complete with the minimap enabled.
     ///
     /// RED against the pre-fix quadraui pin (`9eede7fd`): the process aborts
