@@ -4341,6 +4341,132 @@ mod tests {
                 screen_after.lines().nth(row)
             );
         }
+
+        /// Non-blocking review follow-up (#1544): the settings round-trip
+        /// test in `core::settings` only proves `fold_controls = "always"`
+        /// stores/parses the right string — it never renders a frame. This
+        /// exercises the actual paint path: `Always` must show the `-`
+        /// open-fold marker on a genuine block-opener line **without** any
+        /// hover at all (matching pre-#1544 behavior, restored on request).
+        ///
+        /// **Verified RED**: temporarily making `Always` route through the
+        /// same hover check as `Mouseover` (in `render::
+        /// build_rendered_window`'s `fold_open_markers_visible` match) made
+        /// this fail. Restored before committing.
+        #[test]
+        fn fold_controls_always_shows_open_fold_marker_without_hover_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.fold_controls = crate::core::settings::FoldControlsMode::Always;
+            engine.buffer_mut().insert(0, "fn foo() {\n    body\n}\n");
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let (row, col) = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have painted");
+                let rw = &layout.windows[0];
+                let view_row = rw
+                    .lines
+                    .iter()
+                    .position(|rl| rl.line_idx == 0)
+                    .expect("the block-opener line must be in the painted viewport");
+                (rw.rect.y as usize + view_row, rw.rect.x as usize)
+            };
+
+            let screen = h.driver.screen();
+            let ch = screen
+                .lines()
+                .nth(row)
+                .and_then(|l| l.chars().nth(col))
+                .unwrap_or(' ');
+            assert_eq!(
+                ch,
+                '-',
+                "`fold_controls = always` must paint the open-fold marker \
+                 immediately, with no hover required; row {row}: {:?}",
+                screen.lines().nth(row)
+            );
+        }
+
+        /// Non-blocking review follow-up (#1544): same gap as above for
+        /// `Never`. Covers both marker kinds — the open-fold `-` on a
+        /// block-opener line, and the closed-fold `+` on a manually closed
+        /// fold header (`zfj`) — neither should ever paint under `Never`,
+        /// hovered or not.
+        ///
+        /// **Verified RED**: temporarily disabling `fold_indicator_char`'s
+        /// top `controls == FoldControlsMode::Never` short-circuit made
+        /// this fail (the closed `+` marker painted again). Restored before
+        /// committing.
+        #[test]
+        fn fold_controls_never_hides_open_and_closed_fold_markers_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.settings.fold_controls = crate::core::settings::FoldControlsMode::Never;
+            engine
+                .buffer_mut()
+                .insert(0, "fn foo() {\n    body\n}\nfn bar() {\n    body2\n}\n");
+            // Manually close the second block into a fold header so its
+            // gutter would otherwise show `+`.
+            engine.view_mut().cursor.line = 3;
+            engine.feed_keys("zfj");
+            assert!(
+                engine.view().fold_at(3).is_some(),
+                "test setup sanity: `zfj` must create a closed fold at line 3"
+            );
+            let mut h = harness_no_sidebar(engine);
+            h.driver.render();
+
+            let (open_row, closed_row, col) = {
+                let layout = h.screen_layout.borrow();
+                let layout = layout.as_ref().expect("a frame must have painted");
+                let rw = &layout.windows[0];
+                let open_view_row = rw
+                    .lines
+                    .iter()
+                    .position(|rl| rl.line_idx == 0)
+                    .expect("the open block-opener line must be in the painted viewport");
+                let closed_view_row = rw
+                    .lines
+                    .iter()
+                    .position(|rl| rl.line_idx == 3)
+                    .expect("the closed fold header line must be in the painted viewport");
+                (
+                    rw.rect.y as usize + open_view_row,
+                    rw.rect.y as usize + closed_view_row,
+                    rw.rect.x as usize,
+                )
+            };
+
+            // Hover the open block-opener's gutter cell too, to prove
+            // `Never` wins even over an active hover.
+            h.driver.mouse_move(col as f32, open_row as f32);
+
+            let screen = h.driver.screen();
+            let open_ch = screen
+                .lines()
+                .nth(open_row)
+                .and_then(|l| l.chars().nth(col))
+                .unwrap_or(' ');
+            let closed_ch = screen
+                .lines()
+                .nth(closed_row)
+                .and_then(|l| l.chars().nth(col))
+                .unwrap_or(' ');
+            assert_ne!(
+                open_ch,
+                '-',
+                "`fold_controls = never` must blank the open-fold marker \
+                 even while the gutter is hovered; row {open_row}: {:?}",
+                screen.lines().nth(open_row)
+            );
+            assert_ne!(
+                closed_ch,
+                '+',
+                "`fold_controls = never` must also blank an already-closed \
+                 fold's marker; row {closed_row}: {:?}",
+                screen.lines().nth(closed_row)
+            );
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

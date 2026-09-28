@@ -9361,6 +9361,99 @@ mod chrome_surfaces {
             "tooltip must paint in the band immediately below the tab row"
         );
     }
+
+    /// GTK twin of `tui_main::app_on_tui_tests::tests::fold_controls::
+    /// open_fold_marker_paints_only_while_the_gutter_is_hovered_via_shell_app`
+    /// (#1544 review fix — the original PR shipped only the TUI half, but
+    /// `Engine::gutter_hover_window` is updated from the exact same
+    /// backend-neutral `MouseMoved` arm in `App::handle_dispatch` that GTK's
+    /// `UiEvent::MouseMoved` dispatch already reaches (see e.g.
+    /// `context_menu_hover_moves_the_highlight_via_gtk_driver` above), and
+    /// the fold marker glyph itself is produced once by
+    /// `render::build_rendered_window`/`fold_indicator_char` and painted
+    /// identically by both backends' text renderers — a surface both
+    /// backends render, per CLAUDE.md's dual-backend testing rule).
+    ///
+    /// `small_engine()`'s buffer opens with `fn main() {` on line 0 — a
+    /// genuine block-opener — so line 0's gutter paints `fold_char +
+    /// right-aligned "1"` (`render::format_gutter_with_fold`): `"  1"`
+    /// (blank fold column) while unhovered under the default `fold_controls
+    /// = mouseover`, and `"- 1"` the moment the pointer sits over that
+    /// window's gutter on that row. Both are read back via
+    /// `GtkDriver::screen_contains`/`find_bounds` — real painted Pango text
+    /// runs recorded at the `show_layout` choke point (quadraui#489), not
+    /// `Engine::gutter_hover_window` state (#587/#592's lesson: state can be
+    /// right while paint ignores it). `find_bounds("- 1")`'s reported y is
+    /// cross-checked against the gutter row's own painted `RenderedWindow`
+    /// geometry so this cannot pass by coincidentally matching an unrelated
+    /// `"- 1"` elsewhere on screen.
+    ///
+    /// **Verified RED against unfixed `develop`**: reverting
+    /// `render::fold_indicator_char` to always show `-` for a genuine block
+    /// opener (dropping the `open_markers_visible` gate #1544 adds) makes
+    /// the "before hover" `screen_contains("- 1")` assertion below fail —
+    /// `"- 1"` paints on the very first frame, with no pointer movement at
+    /// all. Restored before committing.
+    #[test]
+    fn open_fold_marker_paints_only_while_the_gutter_is_hovered_via_gtk_driver() {
+        let engine = small_engine();
+        let win_id = engine.active_window_id();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let (rect, view_row, line_height, char_width) = {
+            let layout = h.screen_layout.borrow();
+            let layout = layout.as_ref().expect("a frame must have painted");
+            let rw = layout
+                .windows
+                .iter()
+                .find(|w| w.window_id == win_id)
+                .expect("the active window must have painted a RenderedWindow");
+            let view_row = rw
+                .lines
+                .iter()
+                .position(|rl| rl.line_idx == 0)
+                .expect("the block-opener line must be in the painted viewport");
+            (
+                rw.rect,
+                view_row,
+                h.painted_line_height()
+                    .expect("line height must be painted"),
+                h.painted_char_width(),
+            )
+        };
+        let expected_row_y = rect.y + view_row as f64 * line_height;
+
+        assert!(
+            !h.driver.screen_contains("- 1"),
+            "no pointer has moved onto the gutter yet, so the open-fold \
+             marker must not be painted under the default `fold_controls = \
+             mouseover`; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // Hover the gutter cell on the block-opener's own row (leftmost
+        // gutter column, well inside the fold-indicator's char cell).
+        let x = rect.x + char_width / 2.0;
+        let y = expected_row_y + line_height / 2.0;
+        h.driver.mouse_move(x as f32, y as f32);
+        h.driver.render();
+
+        let bounds = h.driver.find_bounds("- 1").unwrap_or_else(|| {
+            panic!(
+                "hovering this window's gutter must paint the `- 1` \
+                 open-fold marker + line-number run on its block-opener \
+                 line; painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+        assert!(
+            (bounds.y as f64 - expected_row_y).abs() < line_height,
+            "the painted `- 1` run must sit on the block-opener's own row \
+             (expected y ~= {expected_row_y}, got {:?})",
+            bounds
+        );
+    }
 }
 
 /// Black-box paint + click-routing proof for the VS Code-style Command
