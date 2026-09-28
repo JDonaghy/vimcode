@@ -1752,7 +1752,20 @@ mod tests {
             }],
         );
         let win = engine.active_window_id();
-        let mut h = harness(engine, 1400, 900);
+        // 2200px, not the file's usual 1400 (#1586 CI fallout): the window
+        // status bar *priority-drops* right-side segments when they don't
+        // fit, and the segments this test asserts on — `ShowDiagnostics`
+        // most of all — are among the first to go. At 1400px with this
+        // machine's ~11px cell the bar fits them with barely ~100px to
+        // spare, so a runner whose UI font resolves even slightly wider
+        // drops `ShowDiagnostics` and `status_segment_center` below returns
+        // `None`, failing the test for a reason that has nothing to do with
+        // #1548. Measured: at 1400px the counter survives down to a ~1300px
+        // equivalent and vanishes by ~1200px. A wider surface removes the
+        // font-metric dependency entirely without weakening a single
+        // assertion — every one of them is about *what* paints, never about
+        // how narrow a bar it still fits in.
+        let mut h = harness(engine, 2200, 900);
 
         assert!(
             h.driver.screen_contains("UTF-8"),
@@ -14268,22 +14281,28 @@ mod editor_band_order {
     /// immediately above (same pixel-probe pattern over
     /// `h.driver.pixel(x, y)`), transposed to a horizontal band and with the
     /// assertion inverted: that test proves a side-by-side divider *is*
-    /// painted; this one proves a stacked divider is *not*.
+    /// painted; this one proves a stacked divider is *not*. It differs in
+    /// one respect, for the reason spelled out at the comb below: it hunts
+    /// for a *full-width `theme.separator` scanline* rather than for "a
+    /// pixel that isn't the background at one probe column", so that no
+    /// assertion here depends on where the UI font happens to end a tab.
     ///
     /// **RED against unfixed `develop`**: before #1586,
     /// `EditorOp::GroupDividers` painted every entry in
     /// `screen.group_dividers` unconditionally, including the stacked one —
     /// `draw_split` fills `theme.separator` across the whole divider rect
     /// (`quadraui::primitives::split::native_surface_paint::paint`), which
-    /// sits astride the bottom group's tab-row band, so the scan below finds
-    /// a divider-coloured pixel differing from the row's own background.
+    /// sits astride the bottom group's tab-row band, so the comb below finds
+    /// that fill as a separator-coloured scanline spanning the group.
     /// Reverting `painted_group_dividers` to the identity filter and running
     /// this test reproduces that failure — confirmed by hand before
-    /// restoring the fix.
+    /// restoring the fix, and re-confirmed after the comb replaced the
+    /// original single-column probe.
     #[test]
     fn stacked_group_divider_paints_nothing_inside_the_bottom_tab_row_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
-            "vimcode_test_1586_gtk_stacked_tabs_{:?}",
+            "vimcode_test_1586_gtk_stacked_tabs_{}_{:?}",
+            std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -14311,8 +14330,10 @@ mod editor_band_order {
         // Locate the raw (unfiltered) stacked divider and the bottom
         // group's own tab-row band from the geometry the frame actually
         // painted — never from hardcoded coordinates (`CLAUDE.md` rule 1).
-        let char_w = h.painted_char_width();
-        let (probe_x, row_top, row_bottom) = {
+        let line_height = h
+            .painted_line_height()
+            .expect("a frame must have reported its line height");
+        let (row_top, row_bottom, band_x0, band_x1) = {
             let layout = h.screen_layout.borrow();
             let layout = layout.as_ref().expect("a frame must have been painted");
             let raw = layout
@@ -14325,79 +14346,101 @@ mod editor_band_order {
                 .iter()
                 .find(|gtb| gtb.group_id == bottom_group)
                 .expect("the bottom group must have its own tab bar entry");
+            // `GroupTabBar::bounds` is the group's *content* box — the group
+            // rect with its own tab row already carved off the top — so
+            // `bounds.y` is precisely the bottom edge of that tab row, and
+            // the row itself is the one line-height band immediately above
+            // it. (Confirmed empirically on this backend: for the bottom
+            // group of a 900px-tall stacked split, `bounds` came back
+            // `y = 496.5, height = 380.5`, i.e. reaching the bottom of the
+            // editor area, while the active tab's own `tab_active_bg` fill
+            // painted in `[467, 494)` — above `bounds.y`, not inside it.)
             let row_bottom = tab_bar.bounds.y;
             // The raw divider's own geometry proves the collision is real —
             // it must fall inside the tab-row band, otherwise there'd be
             // nothing here for `painted_group_dividers` to have filtered
-            // (twin of the render.rs unit test's part (1)).
+            // (twin of the render.rs unit test's part (1)). Both bounds are
+            // checked: "above the row's bottom edge" alone would also hold
+            // for a divider sitting harmlessly up in the *top* group's own
+            // editor area, which would make this test vacuous. The upper
+            // bound is two line heights rather than one because a one-row
+            // tab bar is a line of text *plus* its own vertical padding
+            // (measured here: a 23px line in a 29px row) — loose enough not
+            // to re-import a font-metric dependency, tight enough that a
+            // divider up in the top pane's editor area could never satisfy
+            // it.
             assert!(
-                raw.position < row_bottom,
-                "raw divider at y={} must sit above the bottom group's tab-row \
-                 bottom (y={row_bottom}) — otherwise this test isn't exercising \
-                 the #1586 collision at all",
+                raw.position < row_bottom && row_bottom - raw.position <= line_height * 2.0,
+                "raw divider at y={} must land inside the bottom group's own \
+                 tab row, i.e. within one tab-row height (line height \
+                 {line_height}) above y={row_bottom} — otherwise this test \
+                 isn't exercising the #1586 collision at all",
                 raw.position
             );
-            // Past the right edge of every real tab (icon+label+close box),
-            // derived from the tab bar's own painted hit-regions rather than
-            // guessed from `bounds.width` — `new_for_test()` opens with a
-            // scratch tab already present, so this group can hold more than
-            // just the one file this test adds (`open_editor_group` also
-            // copies the active tab into the new group before the fixture
-            // adds its own), and any of those tabs' glyphs would otherwise
-            // poison a background sample taken from a hardcoded offset
-            // (confirmed by hand: `width - 20` landed inside a tab's own
-            // icon/text on the first draft).
-            //
-            // `GroupTabBar::hit_regions` is **cell-unit**, not pixel — its
-            // own doc says so ("char-cell units relative to the tab bar's
-            // left edge") and this backend confirms it empirically: bounds
-            // came back `width ~= 23/26, height == 1.0` regardless of the
-            // 1400px-wide GTK surface. Scale by the frame's own painted
-            // char width (`h.painted_char_width()`) before adding to
-            // `bounds.x` (itself real pixels).
-            let tabs_right_edge_cells = tab_bar
-                .hit_regions
-                .visible_tabs
-                .iter()
-                .map(|vt| vt.bounds.x + vt.bounds.width)
-                .fold(0.0_f32, f32::max);
-            let probe_x = tab_bar.bounds.x + tabs_right_edge_cells as f64 * char_w + 15.0;
-            assert!(
-                probe_x < tab_bar.bounds.x + tab_bar.bounds.width,
-                "probe_x={probe_x} must still be inside the tab bar (bounds={:?}) \
-                 — the fixture's tabs left no blank margin to sample",
-                tab_bar.bounds
-            );
-            (probe_x as i32, raw.position as i32, row_bottom as i32)
+            (
+                raw.position as i32,
+                row_bottom as i32,
+                tab_bar.bounds.x as i32,
+                (tab_bar.bounds.x + tab_bar.bounds.width) as i32,
+            )
         };
 
-        // The row's own background: sampled well clear of the divider's own
-        // y (a few px below the top of the band) and well clear of any tab
-        // glyph (x past every real tab, computed above).
-        let row_bg = h.driver.pixel(probe_x, row_bottom - 2);
-        // Scan the whole band a real divider line could have landed in — the
-        // raw (unfiltered) divider's own y down to the bottom of the tab
-        // row — for any pixel that isn't the row's own background. A small
-        // tolerance (`pixel_near`, same threshold as this file's other
-        // colour-diff tests) absorbs ordinary Cairo anti-aliasing at a rect
-        // edge; a real divider-fill line reads as a large, sustained jump
-        // (`theme.separator` vs. the tab-row background), never a 1-2 unit
-        // wobble.
+        // What a painted stacked divider looks like: `draw_split` fills
+        // `theme.separator` as ONE uniform rect spanning the divider's whole
+        // cross-axis extent (`quadraui::primitives::split::
+        // native_surface_paint::paint` issues a single `surface_fill_rect`,
+        // not one per pane), so the signature of the #1586 bug is a scanline
+        // inside the tab row that is separator-coloured all the way across
+        // the group.
+        //
+        // Combing for *that* signature, rather than for "any pixel that
+        // isn't the row background at one probe column", is what makes this
+        // test independent of font metrics — and that independence is
+        // load-bearing, not cosmetic. The first version of this test derived
+        // a single probe column from `hit_regions.visible_tabs` (cell units)
+        // scaled by `painted_char_width()`, which understates the real pixel
+        // width the *UI* font paints tabs at. It passed on the author's
+        // machine and failed in CI, where the column landed inside the
+        // active tab and sampled `tab_active_bg` (#3f3f59) instead of
+        // `tab_bar_bg` (#262633) — a false positive with nothing to do with
+        // dividers. Reproduced locally by running under an empty
+        // `FONTCONFIG_FILE`, which shifts the same metrics. Nothing about a
+        // tab's own background or glyphs can forge a full-width
+        // separator-coloured scanline, so where the tabs end no longer
+        // matters.
+        let sep = crate::render::Theme::onedark().separator;
+        let sep = (sep.r, sep.g, sep.b);
         let pixel_near = |(r, g, b): (u8, u8, u8), target: (u8, u8, u8)| {
             let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
             near(r, target.0) && near(g, target.1) && near(b, target.2)
         };
-        let painted_line = (row_top..row_bottom)
-            .map(|y| (y, h.driver.pixel(probe_x, y)))
-            .find(|(_, p)| !pixel_near(*p, row_bg));
+        // Sampled every 16px rather than every pixel: a fill rect is
+        // uniform, so a coarse comb finds it just as reliably and keeps the
+        // scan cheap. The 80%-of-columns threshold (rather than 100%) leaves
+        // room for a backend insetting its divider rect by a few pixels at
+        // either end, while staying far out of reach of glyph
+        // anti-aliasing, which is never more than a handful of scattered
+        // columns.
+        let xs: Vec<i32> = (band_x0 + 2..band_x1 - 2).step_by(16).collect();
         assert!(
-            painted_line.is_none(),
-            "a divider-fill pixel {painted_line:?} was painted inside the bottom \
-             group's own tab-row band (y in [{row_top}, {row_bottom})) at \
-             x={probe_x} — the stacked group divider must never paint over the \
-             lower group's tab row (#1586); row background sampled at \
-             y={}: {row_bg:?}",
-            row_bottom - 2
+            xs.len() >= 8,
+            "the bottom group's tab row must be wide enough to comb \
+             (x in [{band_x0}, {band_x1}))"
+        );
+        let separator_scanline = (row_top..row_bottom).find(|&y| {
+            let hits = xs
+                .iter()
+                .filter(|&&x| pixel_near(h.driver.pixel(x, y), sep))
+                .count();
+            hits * 5 >= xs.len() * 4
+        });
+        assert!(
+            separator_scanline.is_none(),
+            "a full-width `theme.separator` ({sep:?}) scanline was painted at \
+             y={separator_scanline:?}, inside the bottom group's own tab-row \
+             band (y in [{row_top}, {row_bottom}), x in [{band_x0}, \
+             {band_x1})) — the stacked group divider must never paint over \
+             the lower group's tab row (#1586)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
