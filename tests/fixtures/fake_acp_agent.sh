@@ -19,7 +19,12 @@
 #                           is printed to stdout immediately before the real
 #                           response, to prove the reader skips it without
 #                           desyncing. If $ACP_FAKE_DIE_AFTER_INIT is set,
-#                           this process exits right after replying.
+#                           this process exits right after replying. The
+#                           reply's `protocolVersion` is `1` unless
+#                           $ACP_FAKE_PROTOCOL_VERSION names a different
+#                           number (#1519) — for a test to confirm the
+#                           client refuses to start a session against a
+#                           mismatched protocol version instead of guessing.
 #   - session/new        -> canned sessionId "sess-1". If
 #                           $ACP_FAKE_SESSION_NEW_ERROR is set, replies with a
 #                           JSON-RPC error instead (agent stays alive,
@@ -190,6 +195,38 @@
 #                           the change-review surface opening come from a
 #                           tool_call_update, not just the initial
 #                           tool_call.
+#                           With $ACP_FAKE_TOOL_CALL_REPLACE set (#1519):
+#                           emits a "tool_call" (id "tc-1") carrying one
+#                           `content` text block and one `locations` entry,
+#                           then a "tool_call_update" carrying a DIFFERENT
+#                           `content` block and a DIFFERENT `locations`
+#                           entry — so a test can confirm the update
+#                           *replaces* both fields wholesale rather than
+#                           appending to them (the exact spec deviation
+#                           #1519 fixes; #955 originally appended). With
+#                           $ACP_FAKE_TOOL_CALL_HANGS set (#1519): emits a
+#                           "tool_call" (id "tc-1", in_progress) then BLOCKS
+#                           forever (reads until stdin closes, never
+#                           answering `session/prompt`) — so a test can
+#                           drive `Engine::acp_cancel_turn` against a call
+#                           that is still unfinished and confirm it's
+#                           marked `Cancelled`, without racing a real
+#                           completion. With $ACP_FAKE_UNKNOWN_REQUEST set
+#                           (#1519): emits an agent -> client request whose
+#                           `method` no real vimcode handler recognises
+#                           (fixed id 9030, method "totally/unknown/
+#                           method"), BLOCKS reading one line for the
+#                           reply, then replies end_turn — proving the
+#                           client answers immediately with JSON-RPC
+#                           `-32601` (this line arrives) instead of leaving
+#                           it parked forever (which would hang this
+#                           `read` and the turn would never reach
+#                           `PromptStopped`). With $ACP_FAKE_SESSION_TITLE
+#                           set to a title string (#1519): emits a
+#                           `session_info_update` notification carrying
+#                           that title after the usual message chunks, so a
+#                           test can confirm `:AiSessions`' picker shows it
+#                           instead of the first prompt.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - session/set_mode   -> replies with an empty result, then emits a
 #                           current_mode_update notification carrying the
@@ -405,7 +442,8 @@ while IFS= read -r line; do
       if [ -n "$caps_fields" ]; then
         agent_caps="{${caps_fields}}"
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
+      protocol_version="${ACP_FAKE_PROTOCOL_VERSION:-1}"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":%s,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$protocol_version" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
         exit 7
       fi
@@ -567,6 +605,43 @@ while IFS= read -r line; do
         if [ -n "$ACP_FAKE_FS_WRITE_PATH3" ]; then
           fake_write "$ACP_FAKE_FS_WRITE_PATH3" "${ACP_FAKE_FS_WRITE_CONTENT3:-written by acp 3}" 9013
         fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_REPLACE" ]; then
+        # #1519: a `tool_call` with one `content` text block and one
+        # `locations` entry, then a `tool_call_update` carrying a
+        # DIFFERENT content block and a DIFFERENT locations entry — the
+        # update must REPLACE both fields, not append to them.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit files","kind":"edit","status":"in_progress","locations":[{"path":"src/first.rs","line":1}],"content":[{"type":"content","content":{"type":"text","text":"first content"}}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","locations":[{"path":"src/second.rs","line":2}],"content":[{"type":"content","content":{"type":"text","text":"second content"}}]}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_HANGS" ]; then
+        # #1519: announce an in-progress tool call, then never answer
+        # `session/prompt` at all — blocks reading lines until stdin
+        # closes (the client process being killed at test teardown),
+        # simulating a turn the human cancels mid-flight rather than one
+        # the agent ever finishes on its own.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Run the tests","kind":"execute","status":"in_progress"}}}\n'
+        while IFS= read -r _never; do :; done
+        exit 0
+      elif [ -n "$ACP_FAKE_UNKNOWN_REQUEST" ]; then
+        # #1519: a method this client has no handler for must be answered
+        # immediately with JSON-RPC `-32601`, never left parked — if it
+        # were, this `read` would block forever and neither the
+        # "ANSWERED1519" chunk nor the `end_turn` line below would ever
+        # be sent, hanging the whole turn. The distinct chunk (as opposed to
+        # reusing the unconditional "Hello world" emitted above, which
+        # paints before this request is even sent and so proves nothing
+        # about whether it was ever answered) is what a test actually waits
+        # on.
+        printf '{"jsonrpc":"2.0","id":9030,"method":"totally/unknown/method","params":{"sessionId":"sess-1"}}\n'
+        read -r _reply
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" ANSWERED1519"}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_SESSION_TITLE" ]; then
+        # #1519: a `session_info_update` naming this session, sent after
+        # the usual message chunks — so a test can confirm `:AiSessions`'
+        # picker shows it instead of the first prompt.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"session_info_update","title":"%s"}}}\n' "$ACP_FAKE_SESSION_TITLE"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'

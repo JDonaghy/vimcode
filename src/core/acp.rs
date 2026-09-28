@@ -729,6 +729,30 @@ pub fn parse_usage_update(update: &serde_json::Value) -> Option<AcpUsage> {
     })
 }
 
+/// Parse a `session/update`'s `session_info_update` variant — the
+/// agent-assigned session title (#1519), e.g. an agent summarising "Fix
+/// the login bug" once it has enough of the conversation to name it.
+/// Tolerant of `title` living flattened on `update` directly or nested
+/// under a `sessionInfo`/`info` object, matching [`parse_usage_update`]'s
+/// defensive style for this equally young corner of the ACP v1 schema.
+/// Returns `None` for a non-matching tag or a tag with no usable `title`
+/// string (missing, or present but empty — an empty title is not an
+/// improvement over `first_prompt`).
+pub fn parse_session_info_update(update: &serde_json::Value) -> Option<String> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("session_info_update") {
+        return None;
+    }
+    let info = update
+        .get("sessionInfo")
+        .or_else(|| update.get("info"))
+        .unwrap_or(update);
+    let title = info.get("title").and_then(|v| v.as_str())?;
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.to_string())
+}
+
 /// Format an [`AcpUsage`] for the AI panel's status header — compact, and
 /// only the fields actually present (never e.g. `"0 tok · $0.0000"` for a
 /// report that only carried cost).
@@ -1593,12 +1617,20 @@ pub fn permission_outcome_cancelled() -> serde_json::Value {
 /// `tool_call_update` `status` field. Unknown/missing defaults to
 /// [`Self::Pending`] — same "never default toward done on malformed
 /// input" policy as [`AcpPlanEntryStatus`].
+///
+/// [`Self::Cancelled`] is **client-local only** — the wire schema's
+/// `status` enum has exactly `pending | in_progress | completed |
+/// failed`, no `cancelled` value, so [`Self::parse`] never produces it.
+/// It exists so `session/cancel` (#1519) has somewhere to put "this call
+/// was still unfinished when the user aborted the turn" that's visibly
+/// distinct from an agent-reported `failed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpToolCallStatus {
     Pending,
     InProgress,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl AcpToolCallStatus {
@@ -1613,15 +1645,25 @@ impl AcpToolCallStatus {
 
     /// Bracketed glyph used as the transcript summary line's prefix, e.g.
     /// `[~] edit: Edit src/main.rs` — visually distinct at every stage of
-    /// `pending -> in_progress -> completed | failed` without needing
-    /// colour (both TUI and GTK render this the same plain text).
+    /// `pending -> in_progress -> completed | failed | cancelled` without
+    /// needing colour (both TUI and GTK render this the same plain text).
     pub fn glyph(self) -> &'static str {
         match self {
             Self::Pending => "[ ]",
             Self::InProgress => "[~]",
             Self::Completed => "[x]",
             Self::Failed => "[!]",
+            Self::Cancelled => "[-]",
         }
+    }
+
+    /// A tool call this status describes is still unresolved — neither a
+    /// terminal success nor a terminal failure/cancellation. What
+    /// `session/cancel` (#1519) sweeps over: every call still `Pending`
+    /// or `InProgress` when the turn is aborted gets marked
+    /// [`Self::Cancelled`].
+    pub fn is_unfinished(self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
     }
 }
 
@@ -1741,17 +1783,19 @@ pub fn parse_tool_call(update: &serde_json::Value) -> Option<AcpToolCall> {
 }
 
 /// A parsed `tool_call_update` — a patch against an existing
-/// [`AcpToolCall`] by `id`, never a wholesale replacement. `status: None`
-/// means the update didn't touch status; `content: None` means the wire
-/// message had no `content` field at all. A present `content` is
-/// **appended** to the existing call's content by the caller (never
-/// replaced) — this issue's own framing: "status transitions and
-/// appended content".
+/// [`AcpToolCall`] by `id`, never a wholesale replacement of the call
+/// itself. `status: None` means the update didn't touch status;
+/// `content: None` / `locations: None` mean the wire message had no
+/// `content` / `locations` field at all. Per the ACP spec (#1519, fixing
+/// #955's original append-based reading), a *present* `content` or
+/// `locations` **replaces** the existing call's field wholesale — it is
+/// the tool call's current content/locations, not a delta to append.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcpToolCallUpdate {
     pub id: String,
     pub status: Option<AcpToolCallStatus>,
     pub content: Option<Vec<AcpToolCallContentBlock>>,
+    pub locations: Option<Vec<(String, Option<u32>)>>,
 }
 
 /// Parse a `session/update`'s `tool_call_update` variant. Returns `None`
@@ -1770,10 +1814,15 @@ pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallU
             .filter_map(parse_tool_call_content_block)
             .collect()
     });
+    let locations = update
+        .get("locations")
+        .and_then(|v| v.as_array())
+        .map(|_| parse_tool_call_locations(update));
     Some(AcpToolCallUpdate {
         id,
         status,
         content,
+        locations,
     })
 }
 
@@ -2857,6 +2906,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_info_update_reads_flat_and_nested_title() {
+        let flat = serde_json::json!({
+            "sessionUpdate": "session_info_update",
+            "title": "Fix the login bug",
+        });
+        assert_eq!(
+            parse_session_info_update(&flat),
+            Some("Fix the login bug".to_string())
+        );
+
+        let nested = serde_json::json!({
+            "sessionUpdate": "session_info_update",
+            "sessionInfo": {"title": "Refactor the parser"},
+        });
+        assert_eq!(
+            parse_session_info_update(&nested),
+            Some("Refactor the parser".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_session_info_update_rejects_wrong_tag_and_empty_title() {
+        assert_eq!(
+            parse_session_info_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None
+        );
+        assert_eq!(
+            parse_session_info_update(
+                &serde_json::json!({"sessionUpdate": "session_info_update", "title": ""})
+            ),
+            None
+        );
+        assert_eq!(
+            parse_session_info_update(&serde_json::json!({"sessionUpdate": "session_info_update"})),
+            None
+        );
+    }
+
+    #[test]
     fn format_usage_summary_only_includes_fields_present() {
         let both = AcpUsage {
             input_tokens: Some(10),
@@ -3095,7 +3183,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_call_update_reads_status_and_appends_content() {
+    fn parse_tool_call_update_reads_status_and_content() {
         let update = serde_json::json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "tc-1",
@@ -3114,7 +3202,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_call_update_status_only_leaves_content_none() {
+    fn parse_tool_call_update_reads_locations() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-1",
+            "locations": [{"path": "src/main.rs", "line": 7}],
+        });
+        let upd = parse_tool_call_update(&update).expect("should parse");
+        assert_eq!(
+            upd.locations,
+            Some(vec![("src/main.rs".to_string(), Some(7))])
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_update_status_only_leaves_content_and_locations_none() {
         let update = serde_json::json!({
             "sessionUpdate": "tool_call_update",
             "toolCallId": "tc-1",
@@ -3123,6 +3225,7 @@ mod tests {
         let upd = parse_tool_call_update(&update).expect("should parse");
         assert_eq!(upd.status, Some(AcpToolCallStatus::Failed));
         assert_eq!(upd.content, None);
+        assert_eq!(upd.locations, None);
     }
 
     #[test]

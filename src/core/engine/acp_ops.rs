@@ -155,10 +155,41 @@ impl Engine {
                     redraw = true;
                 }
                 AcpEvent::Initialized {
+                    protocol_version,
                     auth_methods,
                     agent_capabilities,
                     ..
                 } => {
+                    // #1519: the handshake's `protocolVersion` must match
+                    // what this client pinned in its own `initialize`
+                    // request (`AcpClient::PROTOCOL_VERSION` — the module
+                    // doc's "protocol version is pinned at 1"). A mismatch
+                    // means the agent speaks a wire format this client was
+                    // never built against (the v2 draft restructures
+                    // capabilities and drops `fs/*`/`terminal/*` entirely),
+                    // so proceeding to `session/new` would be guessing —
+                    // abort the handshake instead: surface the mismatch,
+                    // kill the agent process (dropping `client` — see
+                    // `AcpClient`'s `Drop` impl), and never call
+                    // `acp_begin_session`.
+                    if protocol_version != crate::core::acp::PROTOCOL_VERSION {
+                        let warning = format!(
+                            "ACP agent speaks protocol version {protocol_version}, \
+                             this client supports {} — refusing to start a session.",
+                            crate::core::acp::PROTOCOL_VERSION
+                        );
+                        self.message = warning.clone();
+                        self.acp_mut().ai_messages.push(AiMessage {
+                            role: "assistant-thought".to_string(),
+                            content: warning,
+                        });
+                        self.acp_mut().ai_streaming = false;
+                        self.acp_mut().pending_prompt = None;
+                        self.acp_mut().pending_prompt_display = None;
+                        self.acp_mut().client = None;
+                        redraw = true;
+                        continue;
+                    }
                     // #1449: capture `promptCapabilities` before anything
                     // else touches this event — both the auth-choice and
                     // straight-to-session branches below need it available
@@ -331,7 +362,7 @@ impl Engine {
                     let inner = update.get("update");
                     if self.acp_mut().session_id.as_deref() == Some(session_id.as_str()) {
                         if let Some(inner) = inner {
-                            self.acp_handle_session_update(inner);
+                            self.acp_handle_session_update(&session_id, inner);
                         }
                     }
                     redraw = true;
@@ -431,12 +462,16 @@ impl Engine {
                         "fs/write_text_file" => {
                             self.acp_handle_write_text_file(request_id, params);
                         }
-                        // Everything else is still left parked, not
-                        // answered — not answering doesn't break the
-                        // transport (`AcpClient::poll` keeps draining), it
-                        // just means a turn that needs one will not reach
-                        // `PromptStopped` yet.
-                        _ => {}
+                        // Any other method this client doesn't implement is
+                        // answered immediately with the JSON-RPC standard
+                        // "method not found" error (-32601), never left
+                        // parked — a parked request stalls the agent's turn
+                        // (it can't reach `PromptStopped` while waiting on a
+                        // reply that will never come) instead of letting the
+                        // agent see the rejection and route around it.
+                        _ => {
+                            self.acp_respond_method_not_found(request_id, &method);
+                        }
                     }
                     redraw = true;
                 }
@@ -1704,6 +1739,21 @@ impl Engine {
         }
     }
 
+    /// Reply to an agent -> client request whose `method` this client has
+    /// no handler for, with the JSON-RPC standard `-32601 Method not
+    /// found` error — never leave it parked (#1519). The agent is then
+    /// free to treat the rejection as "capability not supported" and
+    /// route around it instead of a turn stalling on a reply that would
+    /// otherwise never arrive.
+    fn acp_respond_method_not_found(&self, request_id: i64, method: &str) {
+        if let Some(client) = self.acp().client.as_ref() {
+            client.respond_to_client_request(
+                request_id,
+                Err((-32601, format!("Method not found: {method}"))),
+            );
+        }
+    }
+
     /// Append one `session/update` chunk to the AI panel transcript
     /// (`self.acp_mut().ai_messages`), appending to the in-progress streamed turn
     /// when `kind` matches it and starting a new turn otherwise — the
@@ -1747,7 +1797,12 @@ impl Engine {
     /// delta — most importantly `plan`, whose #956 acceptance bar requires
     /// two successive updates leave exactly one plan rendered.
     /// `tool_call`/`tool_call_update` remain unhandled here (ACP-4's scope).
-    fn acp_handle_session_update(&mut self, inner: &serde_json::Value) {
+    ///
+    /// `session_id` is only needed for `session_info_update` (#1519) — it
+    /// addresses the `AcpSessionIndex` record to title, which is keyed by
+    /// session id rather than living on the (already session-scoped)
+    /// `AcpSession` this method otherwise mutates via `self.acp_mut()`.
+    fn acp_handle_session_update(&mut self, session_id: &str, inner: &serde_json::Value) {
         if let Some((kind, text)) = crate::core::acp::session_update_chunk(inner) {
             self.acp_append_chunk(kind, text);
         } else if let Some(entries) = crate::core::acp::parse_plan_update(inner) {
@@ -1765,6 +1820,11 @@ impl Engine {
         } else if let Some(update) = crate::core::acp::parse_tool_call_update(inner) {
             // #955 (ACP-4).
             self.acp_apply_tool_call_update(update);
+        } else if let Some(title) = crate::core::acp::parse_session_info_update(inner) {
+            // #1519: title the already-recorded `AcpSessionIndex` entry so
+            // `:AiSessions`' picker shows it instead of the first prompt.
+            self.acp_session_index.set_title(session_id, &title);
+            self.acp_session_index.save();
         }
         // Anything else (an update kind this client doesn't know about
         // yet) is a forward-compatible no-op, same policy ACP-1
@@ -1794,11 +1854,13 @@ impl Engine {
     /// Apply a `tool_call_update` patch by id: `status`, when present,
     /// replaces the call's status — the `pending -> in_progress ->
     /// completed | failed` transition the issue's acceptance bar checks —
-    /// and `content`, when present, is **appended** to the call's
-    /// existing content (never replaces it), per `AcpToolCallUpdate`'s
-    /// doc. An update for an id this client never saw a `tool_call` for is
-    /// a no-op — nothing to patch, and inventing a call from a bare update
-    /// would render with an empty title.
+    /// and `content`/`locations`, when present, each **replace** the
+    /// call's existing field wholesale (#1519 — the ACP spec's actual
+    /// contract; #955 originally appended, duplicating blocks and
+    /// re-opening the diff review on every re-sent update for the same
+    /// call). An update for an id this client never saw a `tool_call` for
+    /// is a no-op — nothing to patch, and inventing a call from a bare
+    /// update would render with an empty title.
     fn acp_apply_tool_call_update(&mut self, update: crate::core::acp::AcpToolCallUpdate) {
         if let Some(blocks) = &update.content {
             self.acp_open_review_for_diffs(blocks);
@@ -1814,8 +1876,11 @@ impl Engine {
         if let Some(status) = update.status {
             call.status = status;
         }
-        if let Some(mut blocks) = update.content {
-            call.content.append(&mut blocks);
+        if let Some(blocks) = update.content {
+            call.content = blocks;
+        }
+        if let Some(locations) = update.locations {
+            call.locations = locations;
         }
     }
 
@@ -2162,9 +2227,13 @@ impl Engine {
     /// Abort the in-flight ACP turn (#953: "the user must be able to abort
     /// a running turn from the panel"). Sends `session/cancel`, replies
     /// `cancelled` to any open permission dialog first (never leaves it
-    /// parked once the turn it belonged to is being torn down), and clears
-    /// the panel's busy state immediately rather than waiting for a
-    /// `PromptStopped` that a hung/misbehaving agent might never send.
+    /// parked once the turn it belonged to is being torn down), marks
+    /// every still-unfinished tool call `Cancelled` (#1519 — the wire
+    /// protocol has no obligation to send a final `tool_call_update` for
+    /// a call the client itself aborted, so a `pending`/`in_progress`
+    /// call would otherwise sit spinning forever in the transcript), and
+    /// clears the panel's busy state immediately rather than waiting for
+    /// a `PromptStopped` that a hung/misbehaving agent might never send.
     ///
     /// A no-op when no ACP session is running — callers don't need to
     /// guard on that themselves.
@@ -2175,6 +2244,11 @@ impl Engine {
         self.acp_cancel_pending_permission();
         if let Some(client) = self.acp_mut().client.as_ref() {
             client.cancel(&session_id);
+        }
+        for call in self.acp_mut().tool_calls.iter_mut() {
+            if call.status.is_unfinished() {
+                call.status = crate::core::acp::AcpToolCallStatus::Cancelled;
+            }
         }
         if self.acp_mut().ai_streaming {
             self.acp_mut().ai_streaming = false;
@@ -3948,6 +4022,269 @@ mod tests {
             !engine.acp_mut().ai_messages.is_empty(),
             "unlike ai_clear, cancelling an in-flight turn must not wipe \
              the transcript"
+        );
+    }
+
+    // ── #1519: ACP conformance fixes ────────────────────────────────────────
+
+    /// #1519, fix 3: `session/cancel` must mark every still-unfinished tool
+    /// call `Cancelled` — the fixture's `$ACP_FAKE_TOOL_CALL_HANGS` announces
+    /// one `in_progress` call and then never answers `session/prompt` at
+    /// all, so the only way this call ever leaves `in_progress` is the
+    /// client-side sweep `Engine::acp_cancel_turn` now does.
+    ///
+    /// RED verified: with the `for call in ... is_unfinished()` sweep
+    /// removed from `acp_cancel_turn`, this fails — the call is still
+    /// `InProgress` after cancelling.
+    #[cfg(unix)]
+    #[test]
+    fn acp_cancel_turn_marks_unfinished_tool_calls_cancelled() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_TOOL_CALL_HANGS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please run".to_string());
+        poll_acp_until(&mut engine, |e| {
+            e.acp().tool_calls.iter().any(|c| {
+                c.id == "tc-1" && c.status == crate::core::acp::AcpToolCallStatus::InProgress
+            })
+        });
+        assert_eq!(
+            engine.acp_mut().tool_calls.first().map(|c| c.status),
+            Some(crate::core::acp::AcpToolCallStatus::InProgress),
+            "sanity: the call must still be in-progress before cancelling"
+        );
+
+        engine.acp_cancel_turn();
+
+        assert_eq!(
+            engine.acp_mut().tool_calls.first().map(|c| c.status),
+            Some(crate::core::acp::AcpToolCallStatus::Cancelled),
+            "an unfinished tool call must be marked Cancelled once the turn \
+             it belonged to is aborted: {:?}",
+            engine.acp_mut().tool_calls
+        );
+    }
+
+    /// #1519, fix 1: a `tool_call_update` with `content`/`locations` must
+    /// **replace** the existing call's fields wholesale, never append to
+    /// them — the exact spec deviation the issue reports (#955 originally
+    /// appended). Calls `acp_upsert_tool_call`/`acp_apply_tool_call_update`
+    /// directly (the same pure engine methods `acp_handle_session_update`
+    /// dispatches to) rather than through the fixture, since this is a
+    /// property of the merge logic itself, independent of transport framing
+    /// — `tool_call_update_over_the_wire_replaces_content_and_locations`
+    /// below covers the wire round trip.
+    ///
+    /// RED verified: with `call.content.append(&mut blocks)` /
+    /// `call.locations.append(...)` restored in place of the plain
+    /// assignment, this fails — both fields end up with two entries
+    /// instead of one.
+    #[test]
+    fn acp_apply_tool_call_update_replaces_content_and_locations_not_appends() {
+        use crate::core::acp::{
+            AcpToolCall, AcpToolCallContentBlock, AcpToolCallStatus, AcpToolCallUpdate,
+        };
+        let mut engine = Engine::new_for_test();
+        engine.acp_upsert_tool_call(AcpToolCall {
+            id: "tc-1".to_string(),
+            title: "Edit files".to_string(),
+            kind: "edit".to_string(),
+            status: AcpToolCallStatus::InProgress,
+            locations: vec![("src/first.rs".to_string(), Some(1))],
+            content: vec![AcpToolCallContentBlock::Text("first content".to_string())],
+        });
+
+        engine.acp_apply_tool_call_update(AcpToolCallUpdate {
+            id: "tc-1".to_string(),
+            status: Some(AcpToolCallStatus::Completed),
+            content: Some(vec![AcpToolCallContentBlock::Text(
+                "second content".to_string(),
+            )]),
+            locations: Some(vec![("src/second.rs".to_string(), Some(2))]),
+        });
+
+        let call = engine
+            .acp_mut()
+            .tool_calls
+            .iter()
+            .find(|c| c.id == "tc-1")
+            .expect("the call must still exist after the update");
+        assert_eq!(
+            call.content,
+            vec![AcpToolCallContentBlock::Text("second content".to_string())],
+            "content must replace, not append: {:?}",
+            call.content
+        );
+        assert_eq!(
+            call.locations,
+            vec![("src/second.rs".to_string(), Some(2))],
+            "locations must replace, not append: {:?}",
+            call.locations
+        );
+        assert_eq!(call.status, AcpToolCallStatus::Completed);
+    }
+
+    /// #1519, fix 1 (wire half): the same replace contract as the test
+    /// above, but driven through a real `tool_call`/`tool_call_update` pair
+    /// over the actual NDJSON transport (`$ACP_FAKE_TOOL_CALL_REPLACE`) —
+    /// proves `parse_tool_call_update` actually reads `locations` off the
+    /// wire (it didn't before #1519) and that `acp_handle_session_update`
+    /// routes it through to the replace, not just the pure merge function
+    /// in isolation.
+    #[cfg(unix)]
+    #[test]
+    fn tool_call_update_over_the_wire_replaces_content_and_locations() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_TOOL_CALL_REPLACE", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+
+        let call = engine
+            .acp_mut()
+            .tool_calls
+            .iter()
+            .find(|c| c.id == "tc-1")
+            .expect("the fixture's tool_call must be recorded");
+        assert_eq!(
+            call.locations,
+            vec![("src/second.rs".to_string(), Some(2))],
+            "the update's locations must replace the tool_call's original \
+             one, not accumulate both: {:?}",
+            call.locations
+        );
+        assert_eq!(
+            call.content,
+            vec![crate::core::acp::AcpToolCallContentBlock::Text(
+                "second content".to_string()
+            )],
+            "the update's content must replace the tool_call's original \
+             one, not accumulate both: {:?}",
+            call.content
+        );
+    }
+
+    /// #1519, fix 2: an agent -> client request whose method this client
+    /// has no handler for must be answered immediately with JSON-RPC
+    /// `-32601`, never left parked. `$ACP_FAKE_UNKNOWN_REQUEST` sends one
+    /// mid-turn and BLOCKS reading the reply before it can send `end_turn`
+    /// — if the request were left parked (the pre-#1519 `_ => {}` no-op),
+    /// this poll would time out with `ai_streaming` still `true` and no
+    /// reply ever recorded.
+    ///
+    /// RED verified: reverting the `_` arm in `acp_dispatch_events`'s
+    /// `ClientRequest` match to `_ => {}` makes this fail — the turn never
+    /// reaches `PromptStopped` within `TEST_DEADLINE`.
+    #[cfg(unix)]
+    #[test]
+    fn unknown_agent_request_is_answered_with_method_not_found_not_left_parked() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_UNKNOWN_REQUEST", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please run".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "an unanswered unknown method must not hang the whole turn: {:?}",
+            engine.acp_mut().ai_messages
+        );
+        assert!(
+            engine.acp_mut().client.is_some(),
+            "answering with a JSON-RPC error must not itself kill the \
+             session — only the unknown method is rejected"
+        );
+    }
+
+    /// #1519, fix 4: `initialize`'s `protocolVersion` must be checked
+    /// against what this client pinned in its own request — a mismatch
+    /// aborts the handshake (kills the agent, never sends `session/new`)
+    /// instead of silently proceeding to speak a wire format this client
+    /// was never built against.
+    ///
+    /// RED verified: deleting the `if protocol_version != PROTOCOL_VERSION`
+    /// guard in `acp_dispatch_events`'s `Initialized` arm makes this fail —
+    /// the fixture's `session/new` still succeeds (`session_id` becomes
+    /// `Some`) even though it claimed protocol version `99`.
+    #[cfg(unix)]
+    #[test]
+    fn initialize_protocol_version_mismatch_refuses_to_start_a_session() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_PROTOCOL_VERSION", "99")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        poll_acp_until(&mut engine, |e| e.acp().client.is_none());
+
+        assert!(
+            engine.acp_mut().client.is_none(),
+            "a protocol version mismatch must kill the agent, never proceed \
+             to session/new"
+        );
+        assert!(
+            engine.acp_mut().session_id.is_none(),
+            "no session may ever be created against a mismatched protocol \
+             version"
+        );
+        assert!(
+            engine.message.contains("protocol version"),
+            "the mismatch must be surfaced to the user: {}",
+            engine.message
+        );
+    }
+
+    /// #1519, fix 5: a `session_info_update` notification's `title` must be
+    /// recorded against the session in `AcpSessionIndex`, and
+    /// `:AiSessions`' picker must prefer it over the first prompt.
+    ///
+    /// RED verified: with `parse_session_info_update`'s call site removed
+    /// from `acp_handle_session_update`, this fails — the picker entry
+    /// still reads the literal first-prompt text.
+    #[cfg(unix)]
+    #[test]
+    fn session_info_update_titles_the_session_and_the_picker_prefers_it() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "claude".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec![
+                "ACP_FAKE_SESSION_TITLE=Fix the login bug".to_string(),
+                "ACP_FAKE_LOAD_SESSION=1".to_string(),
+            ],
+            mcp_servers: Vec::new(),
+        }];
+        engine.settings.acp_active_agent = "claude".to_string();
+
+        engine.ai_send_message("a message the title should not surface as".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+
+        let cwd = engine.acp_workspace_cwd();
+        let record = engine
+            .acp_session_index
+            .sessions_for("claude", &cwd)
+            .into_iter()
+            .next()
+            .expect("the session must be recorded");
+        assert_eq!(
+            record.title.as_deref(),
+            Some("Fix the login bug"),
+            "session_info_update's title must be recorded on the index entry"
+        );
+
+        engine.ai_clear();
+        engine.acp_open_sessions_picker();
+        assert!(engine.picker_open);
+        let displays: Vec<String> = engine
+            .picker_all_items
+            .iter()
+            .map(|item| item.display.clone())
+            .collect();
+        assert!(
+            displays.iter().any(|d| d == "Fix the login bug"),
+            "the picker must show the learned title, not the first prompt: {displays:?}"
         );
     }
 

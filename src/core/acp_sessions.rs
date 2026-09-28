@@ -43,8 +43,17 @@ pub struct AcpSessionRecord {
     pub cwd: PathBuf,
     /// The literal text of the first `session/prompt` sent on this session
     /// — shown in the picker as the entry's identifying detail, since a raw
-    /// session id means nothing to a human.
+    /// session id means nothing to a human. Superseded by `title`, when
+    /// present, as the picker's display text (#1519).
     pub first_prompt: String,
+    /// Agent-assigned session title, learned from a `session_info_update`
+    /// `session/update` notification (#1519) — the ACP-native "this
+    /// conversation is about X" the agent itself derives, as opposed to
+    /// `first_prompt`'s "whatever the human happened to type first".
+    /// `None` until (if ever) the agent sends one; `:AiSessions`'s picker
+    /// prefers it over `first_prompt` when set.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Unix seconds, for "most recent first" ordering.
     pub updated_at: u64,
 }
@@ -133,6 +142,7 @@ impl AcpSessionIndex {
             agent_name: agent_name.to_string(),
             cwd: cwd.to_path_buf(),
             first_prompt: first_prompt.to_string(),
+            title: None,
             updated_at: now,
         });
 
@@ -153,6 +163,19 @@ impl AcpSessionIndex {
             for idx in to_drop {
                 self.records.remove(idx);
             }
+        }
+    }
+
+    /// Record a `session_info_update`-learned title against an already-
+    /// recorded session (#1519). A no-op if `session_id` isn't recorded —
+    /// this can happen for a session update that races `record_session`'s
+    /// own call in `SessionCreated`'s handler, and there is nothing to
+    /// title yet in that case; the next `session_info_update` (agents that
+    /// send one typically send it again once the title stabilises) will
+    /// catch it.
+    pub fn set_title(&mut self, session_id: &str, title: &str) {
+        if let Some(record) = self.records.iter_mut().find(|r| r.session_id == session_id) {
+            record.title = Some(title.to_string());
         }
     }
 
@@ -251,6 +274,24 @@ mod tests {
         assert_eq!(idx.load_session_capability("claude"), Some(true));
         idx.set_load_session_capability("claude", false);
         assert_eq!(idx.load_session_capability("claude"), Some(false));
+    }
+
+    #[test]
+    fn set_title_updates_the_matching_record_and_ignores_unknown_ids() {
+        let mut idx = AcpSessionIndex::default();
+        idx.record_session("s1", "claude", Path::new("/work"), "hello");
+        assert_eq!(
+            idx.sessions_for("claude", Path::new("/work"))[0].title,
+            None
+        );
+
+        idx.set_title("s1", "Fixing the login bug");
+        let sessions = idx.sessions_for("claude", Path::new("/work"));
+        assert_eq!(sessions[0].title.as_deref(), Some("Fixing the login bug"));
+
+        // An id that was never recorded is a no-op, not a new record.
+        idx.set_title("does-not-exist", "orphan title");
+        assert_eq!(idx.sessions_for("claude", Path::new("/work")).len(), 1);
     }
 
     #[test]
