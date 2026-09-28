@@ -1027,6 +1027,9 @@ pub enum StatusAction {
     ToggleMenuBar,
     /// Dismiss all completed notifications (click on bell icon).
     DismissNotifications,
+    /// Open the workspace-wide Problems (quickfix) list — click on the
+    /// always-on error/warning counter segment (#1548).
+    ShowDiagnostics,
 }
 
 // ─── Notification System ────────────────────────────────────────────────────
