@@ -15079,6 +15079,49 @@ mod modal_rung {
         );
     }
 
+    /// #1580: `menu_style = Auto` (the default) resolves the same way as
+    /// `Native` on a backend without `BackendCaps::native_menu` — GTK's is
+    /// `false`, so `Auto` must paint the in-window `ContextMenuPanel`, same
+    /// as `context_menu_style_native_still_paints_in_window_on_gtk` above.
+    /// The acceptance criteria for #1580 calls out `Auto` by name
+    /// ("GTK test harness: `auto` shows the painted menu"), and every other
+    /// context-menu test in this file constructs its engine via
+    /// `small_engine()`/`Settings::default()`, which already defaults to
+    /// `Auto` — so this is the one test in the file that says so instead
+    /// of leaving it implicit.
+    ///
+    /// RED-verified the same way as `context_menu_style_native_still_
+    /// paints_in_window_on_gtk`: hard-coding the `FrameOp::ContextMenu`
+    /// rung to skip painting whenever `menu_style` is anything but
+    /// `Custom` makes this fail identically. Restored before committing.
+    #[test]
+    fn context_menu_style_auto_paints_in_window_on_gtk() {
+        let mut engine = small_engine();
+        assert_eq!(
+            engine.settings.menu_style,
+            crate::core::settings::MenuStyle::Auto,
+            "fixture assumption: Auto is the default"
+        );
+        engine.open_editor_context_menu(4, 4);
+        assert!(
+            engine
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| !m.items.is_empty()),
+            "fixture needs a non-empty context menu"
+        );
+
+        let h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("Go to Definition"),
+            "GTK has no native context menu (`BackendCaps::native_menu` is \
+             false) so `menu_style = Auto` must paint the in-window path; \
+             painted text was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// #902: a native popup's activation (`UiEvent::ContextMenuItemActivated`,
     /// fired by `Backend::show_context_menu` on a backend that has one) must
     /// resolve through the exact same `context_menu_hit_to_idx` /

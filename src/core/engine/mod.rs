@@ -1848,6 +1848,14 @@ fn hex_val(b: u8) -> Option<u8> {
 }
 
 /// State for an open context menu popup (engine-driven, rendered by TUI).
+///
+/// Kept as vimcode's own state rather than folded into
+/// [`quadraui::ContextMenuController`] (quadraui#1187, #1580) — see
+/// `render::paint_context_menu_rung`'s doc for the concrete capability
+/// gap (`ContextMenuController::handle` has no `MouseMove` arm yet, so it
+/// can't host the tested hover-follows-pointer behaviour `screen_x`/
+/// `screen_y`/`selected` currently drive) and the follow-up path once
+/// that lands upstream.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ContextMenuState {

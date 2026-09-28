@@ -1791,7 +1791,10 @@ impl App {
     /// (`Engine::open_*_context_menu`, from any surface — editor, tab,
     /// Explorer, Board, ...), show it immediately if the backend resolves
     /// `MenuStyle` to `Native` (#1580, and the root-cause fix for the
-    /// macOS right-click bug it also closes).
+    /// macOS right-click bug it also closes). `render::show_context_menu_now`
+    /// does this through quadraui's own single-call
+    /// `quadraui::ContextMenuController::open` (quadraui#1187) rather than
+    /// calling `Backend::show_context_menu` directly.
     ///
     /// Called once from `Self::handle`'s single choke point, gated on the
     /// `context_menu` open *transition* (`None` -> `Some`) rather than

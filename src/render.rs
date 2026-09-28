@@ -10746,39 +10746,40 @@ pub fn context_menu_state_to_panel(cm: &crate::core::engine::ContextMenuState) -
     }
 }
 
-/// Show `panel` as a native OS context-menu popup right now (#1580).
+/// Show `panel` as a native OS context-menu popup right now, through
+/// quadraui's single-call [`quadraui::ContextMenuController::open`]
+/// (quadraui#1187, #1580) — the event-handler-time counterpart to
+/// [`paint_context_menu_rung`]'s render-time `Custom` half.
 ///
-/// This is the event-handler-time half of what used to be
-/// `paint_context_menu_rung`'s `native` branch (#902) — moved out of the
-/// render rung entirely. Callers **must** invoke this from event-handling
-/// code (typically right after `Engine::open_*_context_menu`), never from
-/// `render_content`'s paint rung: `MacBackend::show_context_menu`
-/// (quadraui's only `native_menu: true` backend) blocks on AppKit's modal
-/// popup loop, and running that from inside a paint closure re-enters
+/// Callers **must** invoke this from event-handling code (typically right
+/// after `Engine::open_*_context_menu`), never from `render_content`'s
+/// paint rung: on the `Native` resolution, `ContextMenuController::open`
+/// calls `Backend::show_context_menu`, which blocks on AppKit's modal
+/// popup loop — running that from inside a paint closure re-enters
 /// painting while the closure still holds borrows it needs to finish its
-/// own frame — the exact bug this fixes (a queued
+/// own frame. That re-entrancy was the macOS right-click bug this
+/// function's introduction fixed (a queued
 /// `UiEvent::ContextMenuItemActivated` that only got handled on the
 /// *next* repaint, when it was handled at all; see `App::handle`'s
-/// context-menu right-click arm for the call site).
+/// `open_context_menu_now_if_native`, the only call site, which already
+/// confirms `effective_menu_style()` is `Native` before calling this, so
+/// the controller's own resolve here is a second, harmless check rather
+/// than the deciding one).
+///
+/// A fresh, throwaway [`quadraui::ContextMenuController`] is correct here
+/// rather than a field kept on `App`: its `Native` branch (`self.close`,
+/// then `backend.show_context_menu`) never touches the controller's own
+/// `open` state, so there is nothing to leak when this transient instance
+/// is dropped at the end of the call. A persistent controller would only
+/// matter for driving the `Custom` branch too, which vimcode does not
+/// route through this controller — see [`paint_context_menu_rung`]'s doc
+/// for the capability gap (no `MouseMove` hover) that keeps the in-window
+/// path on vimcode's own state for now.
 ///
 /// Uses the same `ContextMenu`/`WidgetId`s [`paint_context_menu_rung`]'s
 /// in-window path does, so `UiEvent::ContextMenuItemActivated` resolves
 /// through the exact same `context_menu_hit_to_idx` conversion either
 /// path takes.
-///
-/// `catch_unwind`-guarded defensively, mirroring `Backend::
-/// install_menu_bar`'s call site (#901): quadraui#930 changed
-/// `MacBackend::show_context_menu` from `.expect()`-ing the AppKit
-/// `MainThreadMarker` (which panicked off the main thread) to a graceful
-/// no-op instead — every real invocation is on the main thread
-/// (`quadraui::macos::shell_runner`'s only entry point) anyway, and
-/// `quadraui::macos::testing::driver_with_shell` calling `App::handle`
-/// from a spawned `#[test]` thread (same as every other Rust test) now
-/// just silently skips showing the popup rather than panicking. The
-/// `catch_unwind` is kept as a belt-and-braces guard against a future
-/// backend that doesn't offer the same off-main-thread degradation, so a
-/// headless dispatch pass still can't take the whole test process down
-/// over a call this function doesn't otherwise depend on.
 pub fn show_context_menu_now(
     b: &mut dyn quadraui::Backend,
     panel: &ContextMenuPanel,
@@ -10787,17 +10788,7 @@ pub fn show_context_menu_now(
 ) {
     let menu = context_menu_panel_to_quadraui_context_menu(panel);
     let anchor = context_menu_anchor_point(panel, char_width, line_height);
-    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        b.show_context_menu(&menu, anchor);
-    }))
-    .is_err()
-    {
-        eprintln!(
-            "vimcode: Backend::show_context_menu panicked (quadraui \
-             main-thread assertion, see vimcode#1580) -- the native \
-             context menu may be missing"
-        );
-    }
+    quadraui::ContextMenuController::new().open(menu, anchor, b);
 }
 
 /// The [`FrameOp::ContextMenu`] rung's whole body on both backends —
@@ -10812,6 +10803,27 @@ pub fn show_context_menu_now(
 /// `layout.bounds`, GTK's inside it). TUI's `+1`-inset viewport and panel
 /// (to make room for that border) is genuinely per-backend geometry prep and
 /// stays at the call site, not here.
+///
+/// # Why this stays vimcode's own state instead of
+/// `quadraui::ContextMenuController::handle`/`render` (#1187, #1580)
+///
+/// [`quadraui::ContextMenuController`] is the "one call" entry point
+/// #1580 asks vimcode to adopt for the whole `ContextMenu` life cycle, and
+/// [`show_context_menu_now`] above does adopt it for the `Native` half.
+/// The `Custom` half is not switched over yet: `ContextMenuController::
+/// handle`'s `v1` scope (its own module doc, `quadraui/src/compose/
+/// context_menu_controller.rs`) matches only `KeyPressed(Escape/Down/Up/
+/// Enter)` and `MouseDown` — there is no `MouseMove` arm — so it cannot
+/// host vimcode's own tested hover-follows-pointer behaviour
+/// (`context_menu_hover_moves_the_highlight_via_gtk_driver`, #373/#751):
+/// the highlighted row must move as the mouse moves over it, before any
+/// click. Routing the `Custom` path through the controller today would
+/// regress that test, not just relocate its logic. Once quadraui grows a
+/// `MouseMove` hover arm for `ContextMenuController::handle` (tracked as a
+/// follow-up quadraui issue), this rung, `route_modal_overlay_click`'s
+/// `ContextMenu` arm, `App::context_menu_layout`, and `ContextMenuState`'s
+/// screen-position bookkeeping can all fold into the controller the same
+/// way [`show_context_menu_now`] already did for `Native`.
 pub fn paint_context_menu_rung(
     b: &mut dyn quadraui::Backend,
     panel: &ContextMenuPanel,
