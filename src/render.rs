@@ -9038,9 +9038,14 @@ pub enum EditorOp {
     /// boundaries — `ScreenLayout::group_dividers`), as opposed to the
     /// within-group `:split` lines the [`Self::Windows`] rung draws.
     ///
-    /// Composed *after* the tab bars on purpose: a group boundary is the
-    /// outermost structure in the editor column and must stay visible where
-    /// it runs alongside a neighbouring group's tab row.
+    /// Composed *after* the tab bars on purpose: a side-by-side (`Ctrl+W v`)
+    /// group boundary is the outermost structure in the editor column and
+    /// must stay visible where it runs *alongside* a neighbouring group's
+    /// tab row. A stacked (`Ctrl+W s`) boundary runs *through* one instead —
+    /// this rung's body ([`painted_group_dividers`]) never paints that
+    /// direction at all, relying on the lower group's own tab row to read as
+    /// the separator (#1586) — so composition order is moot for it either
+    /// way.
     GroupDividers,
     /// The tab-drag drop feedback: drop-zone highlight, insertion bar and the
     /// dragged tab's ghost.
@@ -9303,7 +9308,8 @@ pub(crate) fn paint_editor_band_rungs<'screen>(
                 paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
             }
             EditorOp::GroupDividers => {
-                draw_dividers_as_splits(backend, &screen.group_dividers, |div| {
+                let painted = painted_group_dividers(&screen.group_dividers);
+                draw_dividers_as_splits(backend, &painted, |div| {
                     quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
                 })
             }
@@ -10039,6 +10045,55 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
         let (split, rect) = divider_to_split(div, id_for(div));
         backend.draw_split(rect, &split);
     }
+}
+
+/// Which of `screen.group_dividers` [`EditorOp::GroupDividers`] actually
+/// paints a line for (#1586).
+///
+/// A **stacked** (`SplitDirection::Horizontal` in vimcode's own naming —
+/// top/bottom) group divider's `position` sits exactly where
+/// `GroupLayout::calculate_group_rects` starts reserving `tab_bar_height`
+/// for the *lower* group's own tab row (`GroupLayout::dividers`/
+/// `calculate_group_rects` share one `quadraui::SplitTree::layout` pass, so
+/// the two can never disagree about where that boundary is). Painting a real
+/// divider line there — any thickness a backend chooses, TUI's 1-cell-thick
+/// renderer or a GTK/macOS/Win rasteriser's own independently-derived pixel
+/// width — necessarily overwrites part of that row: TUI's whole 1-cell-tall
+/// bar (#1586's reported symptom: "no tab row at all, just a divider line,
+/// then breadcrumbs"), or a GTK/macOS line through the tab labels.
+///
+/// The fix is not to reserve extra space for the divider (the "Wanted"
+/// option this issue's body rejected): a backend's real divider-line
+/// thickness is picked entirely inside that backend's own `Split::layout`
+/// (e.g. quadraui's `pixel::DIVIDER` on GTK/macOS/Win), independent of
+/// whatever thickness vimcode's own core layer might reserve — so a fixed
+/// "reserve N logical units" number picked in `core::window` can never be
+/// guaranteed to cover what each backend actually paints. Instead, a
+/// stacked group divider is simply never painted: the lower group's own tab
+/// row is *already* a full-width, differently-styled band immediately below
+/// the boundary, so it already reads as the separator with nothing extra —
+/// exactly the affordance TUI's own hit-test tolerance already assumed
+/// (`DividerMetrics::group_horizontal`'s `(0.0, tab_bar_rows)` band reaches
+/// across the whole tab-bar block precisely because "there is no separate
+/// glyph to aim at" was already the intended design for this direction, see
+/// `DividerState::on_tab_bar`'s doc).
+///
+/// Side-by-side (`Vertical`) group dividers are untouched — they run
+/// *alongside* a tab row, not *through* one, so nothing here changes for
+/// them (#1586's explicit "keep the side-by-side case exactly as it is
+/// today").
+///
+/// `screen.group_dividers` itself is **not** filtered — only this paint-time
+/// view is. Hit-testing/drag (`route_divider_grab`/`apply_divider_drag`/
+/// `divider_ratio_from_pos`) still sees every divider, stacked or not, and
+/// resizing a stacked split by dragging its (now invisible, tab-row-shaped)
+/// boundary is unaffected.
+pub fn painted_group_dividers(dividers: &[GroupDivider]) -> Vec<GroupDivider> {
+    dividers
+        .iter()
+        .filter(|d| d.direction == SplitDirection::Vertical)
+        .cloned()
+        .collect()
 }
 
 /// Paint the tab-drag drop feedback — the [`EditorOp::TabDragOverlay`] rung's
@@ -33597,6 +33652,62 @@ mod tests {
             split.ratio
         );
         assert_eq!(rect, quadraui::Rect::new(300.0, 40.0, 600.0, 500.0));
+    }
+
+    /// #1586 (the "unit test on group geometry" acceptance bullet): for a
+    /// stacked (`Ctrl+W s`) group split, no *painted* divider rect may
+    /// intersect either group's own tab-row band.
+    ///
+    /// `GroupLayout::calculate_group_rects`/`dividers` are unchanged by
+    /// #1586 (`GroupDivider::position` for a stacked split still coincides
+    /// exactly with the lower group's tab-row top — see
+    /// [`painted_group_dividers`]'s doc for why that geometry is fine to
+    /// leave alone) — so this pins the *paint-time* invariant instead: after
+    /// [`painted_group_dividers`] filters `GroupLayout::dividers`'s raw
+    /// output, nothing left in the result can ever land inside a tab-row
+    /// band, because a stacked entry never survives the filter at all.
+    ///
+    /// Asserts both halves, so this cannot pass vacuously: (1) the *raw*
+    /// divider genuinely does intersect the lower group's tab-row band —
+    /// proving the filter is doing real work, not filtering nothing — and
+    /// (2) the *painted* (filtered) set is empty, so no rect from it can
+    /// intersect anything.
+    #[test]
+    fn painted_group_dividers_excludes_stacked_entries_that_intersect_tab_rows_1586() {
+        use crate::core::window::{GroupId, GroupLayout, WindowRect};
+
+        let mut layout = GroupLayout::leaf(GroupId(0));
+        layout.split_at(GroupId(0), SplitDirection::Horizontal, GroupId(1), false);
+        let bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+        let tab_bar_height = 1.0;
+
+        let rects = layout.calculate_group_rects(bounds, tab_bar_height);
+        let dividers = layout.dividers(bounds, &mut 0);
+        assert_eq!(dividers.len(), 1);
+        let raw = &dividers[0];
+        assert_eq!(raw.direction, SplitDirection::Horizontal);
+
+        // (1) The raw geometry really does collide with the lower group's
+        // tab row — `GroupTabBar::bounds`'s own doc says that band is
+        // `[rect.y - tab_bar_height, rect.y)`.
+        let lower_tab_row = rects
+            .iter()
+            .map(|(_, r)| (r.y - tab_bar_height, r.y))
+            .find(|&(top, _)| (raw.position - top).abs() < 0.001)
+            .expect("the raw divider's position must coincide with some group's tab-row top");
+        assert!(
+            raw.position >= lower_tab_row.0 && raw.position < lower_tab_row.1,
+            "raw divider at {} must fall inside tab row {lower_tab_row:?} — \
+             otherwise there'd be nothing for `painted_group_dividers` to filter",
+            raw.position
+        );
+
+        // (2) After filtering, nothing paints there at all.
+        let painted = painted_group_dividers(&dividers);
+        assert!(
+            painted.is_empty(),
+            "a stacked split must paint no group-divider line at all (#1586); got {painted:?}"
+        );
     }
 
     // ── Menu-bar app icon geometry (#720) ────────────────────────────────
