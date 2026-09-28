@@ -5002,11 +5002,11 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 
 // ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
 //
-// Both backends register the same 14-entry `panel_keys` accelerator set
+// Both backends register the same 15-entry (#1577 added `focus_notifications`) `panel_keys` accelerator set
 // (`register_panel_accelerators` in `gtk/mod.rs` / `tui_main/mod.rs`) and,
 // until now, each restated its own ~100-line `match id { ... }` translating
 // a fired accelerator into the engine call it makes. `PanelAccelerator`
-// states the 14-entry id table once; [`dispatch_panel_accelerator`] states
+// states the 15-entry id table once; [`dispatch_panel_accelerator`] states
 // the nine actions that are pure `Engine` mutations once too.
 //
 // The other five (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
@@ -5040,7 +5040,7 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 // [`dispatch_panel_accelerator`] takes `app: &App` directly and queues onto
 // its `DeferredQueue` inline instead of through a trait object.
 //
-// #823 item 1: the *registration* half (the 14-entry `(id, binding)` table
+// #823 item 1: the *registration* half (the 15-entry `(id, binding)` table
 // and the loop that (un)registers each one) was, until now, a byte-identical
 // 44-line function pasted into `app.rs` and `tui_main/mod.rs`. It has no
 // backend-specific step at all — every call goes through the trait object
@@ -5058,7 +5058,7 @@ pub fn register_panel_accelerators(
     backend: &mut dyn quadraui::Backend,
     pk: &crate::core::settings::PanelKeys,
 ) {
-    let entries: [(&str, &str); 14] = [
+    let entries: [(&str, &str); 15] = [
         (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
         (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
         (ACC_FOCUS_SEARCH, &pk.focus_search),
@@ -5073,6 +5073,7 @@ pub fn register_panel_accelerators(
         (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
         (ACC_NAV_BACK, &pk.nav_back),
         (ACC_NAV_FORWARD, &pk.nav_forward),
+        (ACC_FOCUS_NOTIFICATIONS, &pk.focus_notifications),
     ];
     for (id, binding) in entries {
         let acc_id = quadraui::AcceleratorId::new(id);
@@ -5092,7 +5093,7 @@ pub fn register_panel_accelerators(
     }
 }
 
-/// The 14 panel-key accelerator actions, shared by both backends' registries.
+/// The 15 panel-key accelerator actions, shared by both backends' registries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelAccelerator {
     ToggleSidebar,
@@ -5109,6 +5110,9 @@ pub enum PanelAccelerator {
     SplitEditorDown,
     NavBack,
     NavForward,
+    /// Give the toast/notification stack keyboard focus (#1577). Same
+    /// effect as `:Notifications` — see `Engine::focus_toast_stack`.
+    FocusNotifications,
 }
 
 pub const ACC_TOGGLE_SIDEBAR: &str = "panel.toggle_sidebar";
@@ -5127,6 +5131,7 @@ pub const ACC_SPLIT_EDITOR_RIGHT: &str = "panel.split_editor_right";
 pub const ACC_SPLIT_EDITOR_DOWN: &str = "panel.split_editor_down";
 pub const ACC_NAV_BACK: &str = "panel.nav_back";
 pub const ACC_NAV_FORWARD: &str = "panel.nav_forward";
+pub const ACC_FOCUS_NOTIFICATIONS: &str = "panel.focus_notifications";
 
 impl PanelAccelerator {
     /// Resolve a registered accelerator id to the action it represents.
@@ -5148,6 +5153,7 @@ impl PanelAccelerator {
             ACC_SPLIT_EDITOR_DOWN => Self::SplitEditorDown,
             ACC_NAV_BACK => Self::NavBack,
             ACC_NAV_FORWARD => Self::NavForward,
+            ACC_FOCUS_NOTIFICATIONS => Self::FocusNotifications,
             _ => return None,
         })
     }
@@ -5197,6 +5203,9 @@ pub(crate) fn dispatch_panel_accelerator(
         PanelAccelerator::SplitEditorDown => engine.open_editor_group(SplitDirection::Horizontal),
         PanelAccelerator::NavBack => engine.tab_nav_back(),
         PanelAccelerator::NavForward => engine.tab_nav_forward(),
+        PanelAccelerator::FocusNotifications => {
+            engine.focus_toast_stack();
+        }
     }
     Some(action)
 }
@@ -10811,10 +10820,10 @@ pub fn paint_dialog_rung(
 pub fn paint_toast_stack_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
-    stack: &quadraui::ToastStack,
+    stack: &quadraui::ToastOverlay,
     viewport: quadraui::Rect,
 ) {
-    let layout = b.draw_toast_stack(viewport, stack);
+    let layout = b.draw_toast_overlay(viewport, stack);
     engine.toast_layout.replace(Some(layout));
 }
 
@@ -22717,32 +22726,45 @@ pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::Stat
     }
 }
 
-/// Build a `quadraui::ToastStack` from `engine.toasts` for the
-/// bottom-right corner. Backends call `quadraui::*::draw_toast_stack`
-/// with the result. Returns None when there are no toasts so callers
-/// can skip the draw entirely.
-pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
+/// Build a `quadraui::ToastOverlay` from `engine.toasts` for the
+/// bottom-right corner (#1577 — was `quadraui::ToastStack`, single-action
+/// only). Backends call `quadraui::*::draw_toast_overlay` with the
+/// result. Returns None when there are no toasts so callers can skip the
+/// draw entirely. Also used, with no painting involved, by
+/// `Engine::focus_toast_stack` to hand focus to
+/// `ToastStackController::give_focus`.
+pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
     if engine.toasts.is_empty() {
         return None;
     }
-    Some(quadraui::ToastStack {
+    Some(quadraui::ToastOverlay {
         id: quadraui::WidgetId::new("toasts"),
         corner: quadraui::ToastCorner::BottomRight,
         toasts: engine
             .toasts
             .iter()
-            .map(|t| quadraui::ToastItem {
+            .map(|t| quadraui::Toast {
                 id: quadraui::WidgetId::new(format!("toast-{}", t.id)),
                 title: t.title.clone(),
                 body: t.body.clone(),
                 severity: t.severity,
-                action: t.action.as_ref().map(|a| quadraui::ToastAction {
-                    id: quadraui::WidgetId::new(format!("toast-action-{}", t.id)),
-                    label: a.button_label().to_string(),
-                }),
+                // Widget ids carry the button's index within `t.actions`
+                // (#1577 — `Engine::run_toast_action`'s doc explains why:
+                // a toast can now have more than one action button).
+                actions: t
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| quadraui::ToastButton {
+                        id: quadraui::WidgetId::new(format!("toast-action-{}-{i}", t.id)),
+                        label: a.kind.button_label().to_string(),
+                        primary: a.primary,
+                    })
+                    .collect(),
                 accent: None,
             })
             .collect(),
+        focus: engine.toast_focus.focus(),
     })
 }
 

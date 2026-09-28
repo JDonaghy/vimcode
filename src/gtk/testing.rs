@@ -19219,10 +19219,11 @@ mod acquire_status_paint_1345 {
     }
 }
 
-/// #1397: the recommended-extension install offer, as a non-modal
-/// actionable toast rather than a missable status-line hint — the GTK half
-/// of the black-box coverage; the TUI half is
-/// `tui_main::shell_app::tests::extension_install_offer_toast_*`.
+/// #1397/#1577: the recommended-extension install offer, rebuilt on
+/// quadraui#1185's multi-action toast — a non-modal notification with real
+/// "Install"/"Don't ask again" buttons (not printed-as-body-text shortcuts)
+/// — the GTK half of the black-box coverage; the TUI half is
+/// `tui_main::app_on_tui_tests::issue_1577_ext_install_offer_toast`.
 ///
 /// Unlike the TUI `TuiDriver` (whose wrapped `ShellAdapter` keeps
 /// the pre-#1434 TUI shell crate-private, see that module's own comment on why),
@@ -19232,20 +19233,23 @@ mod acquire_status_paint_1345 {
 /// the layout the paint itself cached (#587's lesson: never guess a corner
 /// offset) — rather than text search, because GTK's `find`/`find_bounds`
 /// return the *first* painted label containing a needle, and the toast's
-/// title ("Install {display_name}?") and its action button (label
-/// "Install") both contain the word "Install"; using the cached bounds
-/// sidesteps the ambiguity entirely instead of engineering around it (as
-/// the TUI tests, which have no such cache-based shortcut, have to).
+/// title ("Install the {display_name} extension?") and its action button
+/// (label "Install") both contain the word "Install"; using the cached
+/// bounds sidesteps the ambiguity entirely instead of engineering around it
+/// (as the TUI tests, which have no such cache-based shortcut, have to).
 #[cfg(test)]
-mod issue_1397_ext_install_offer_toast {
+mod issue_1577_ext_install_offer_toast {
     use super::*;
 
     /// Build a headless [`Harness`] whose first frame already shows the
-    /// #1397 install-offer toast for a synthetic extension: a fake
+    /// #1397/#1577 install-offer toast for a synthetic extension: a fake
     /// `lsp.binary` (never actually resolvable) mapped to a fake language
     /// via `settings.language_map`, opened via `open_file_in_tab` (which
     /// runs `lsp_did_open` for real) before the `Engine` is handed to
-    /// [`harness`].
+    /// [`harness`]. The buffer has two lines of the same word ("hello") so
+    /// `N`'s "leaves the toast unchanged" test below has a real, distinct
+    /// backward search to prove — one line would let `N` no-op and paint
+    /// exactly the same either way.
     fn harness_with_ext_install_offer(
         unique: &str,
     ) -> (Harness<impl AppLogic>, String, String, std::path::PathBuf) {
@@ -19280,12 +19284,12 @@ mod issue_1397_ext_install_offer_toast {
         ));
         {
             let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(b"hello\n").unwrap();
+            f.write_all(b"hello\nworld\nhello\n").unwrap();
         }
 
         engine.open_file_in_tab(&path);
         assert!(
-            engine.ext_hint_pending_name.is_some(),
+            !engine.toasts.is_empty(),
             "precondition: opening the file must queue the install offer toast"
         );
 
@@ -19293,9 +19297,10 @@ mod issue_1397_ext_install_offer_toast {
         (h, ext_name, display_name, path)
     }
 
-    /// Center of the toast's action button, read from the cached
-    /// `toast_layout` (see this module's own doc for why, not text search).
-    fn toast_action_center(h: &Harness<impl AppLogic>) -> (f32, f32) {
+    /// Center of the toast's `index`-th action button (0 = Install, 1 =
+    /// Don't ask again), read from the cached `toast_layout` (see this
+    /// module's own doc for why, not text search).
+    fn toast_action_center(h: &Harness<impl AppLogic>, index: usize) -> (f32, f32) {
         let engine = h.engine.borrow();
         let layout = engine.toast_layout.borrow();
         let vt = layout
@@ -19303,8 +19308,10 @@ mod issue_1397_ext_install_offer_toast {
             .and_then(|l| l.visible_toasts.first())
             .expect("toast must have painted a visible_toasts entry");
         let b = vt
-            .action_bounds
-            .expect("toast must have painted an action button");
+            .action_rects
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| panic!("toast must have painted action button {index}"));
         (b.x + b.width / 2.0, b.y + b.height / 2.0)
     }
 
@@ -19323,37 +19330,53 @@ mod issue_1397_ext_install_offer_toast {
         (b.x + b.width / 2.0, b.y + b.height / 2.0)
     }
 
-    /// #1397 core acceptance (GTK half): opening a file whose recommended
-    /// extension isn't installed must paint a toast offer with an action
-    /// button — not just a status-line hint any later message silently
-    /// overwrites — and it must not steal keyboard focus (#416): typing
-    /// must still reach the editor while it's up.
+    /// #1397/#1577 core acceptance (GTK half): opening a file whose
+    /// recommended extension isn't installed must paint a toast offer with
+    /// separate, non-overlapping "Install" and "Don't ask again" buttons —
+    /// not a missable status-line hint, and not shortcuts printed as body
+    /// text — and it must not steal keyboard focus (#416): typing must
+    /// still reach the editor while it's up.
     ///
     /// **Verified RED against unfixed `develop`:** before #1397,
     /// `lsp_did_open` never called `push_sticky_action_toast` at all — only
     /// `self.message` — so `engine.toast_layout` stayed `None` and the
-    /// first assertion below failed. Reverting `lsp_did_open`'s toast call
-    /// back to the old `self.message = format!(...)` reproduces that
-    /// failure (checked against this test directly, same as the TUI
-    /// sibling's own verification note).
+    /// first assertion below failed. Before #1577, there was only one
+    /// action button (`action_rects.get(1)` would panic) and "Don't ask
+    /// again" was body text, not a button. Reverting either fix reproduces
+    /// the respective failure (checked against this test directly).
     #[test]
     fn ext_install_offer_toast_paints_and_keeps_editor_focus_via_gtk() {
         let (mut h, _ext_name, display_name, _path) = harness_with_ext_install_offer("rd");
 
-        let want_title = format!("Install {display_name}?");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
         assert!(
             h.driver.screen_contains(&want_title),
             "install offer toast title must paint; painted: {:?}",
             h.driver.painted_texts()
         );
         assert!(
-            h.driver.screen_contains("don't ask again"),
-            "toast must document the N keyboard shortcut (keyboard parity \
-             with the action button); painted: {:?}",
+            h.driver.screen_contains("Install") && h.driver.screen_contains("Don't ask again"),
+            "toast must paint both buttons; painted: {:?}",
             h.driver.painted_texts()
         );
-        let (ax, ay) = toast_action_center(&h);
-        assert!(ax > 0.0 && ay > 0.0, "action button must have real bounds");
+        let (ax, ay) = toast_action_center(&h, 0);
+        let (dx, dy) = toast_action_center(&h, 1);
+        assert!(ax > 0.0 && ay > 0.0, "Install button must have real bounds");
+        assert!(
+            dx > 0.0 && dy > 0.0,
+            "Don't ask again button must have real bounds"
+        );
+        assert!(
+            (ax - dx).abs() > 1.0 || (ay - dy).abs() > 1.0,
+            "Install and Don't ask again must be distinct, non-overlapping \
+             buttons, not drawn on top of each other"
+        );
 
         // Type directly (no click first) — the toast must not have grabbed
         // keyboard focus away from the editor.
@@ -19370,25 +19393,32 @@ mod issue_1397_ext_install_offer_toast {
         );
     }
 
-    /// #1397: clicking the toast's action button must run the same install
-    /// path `:ExtInstall <name>` does (`Engine::ext_install_from_registry`),
-    /// proven by the command line's "Extension '…' installed — …" outcome
-    /// message that call always leaves behind — painted output, not
-    /// `engine.pending_terminal_command` directly.
+    /// #1397: clicking the toast's "Install" button must run the same
+    /// install path `:ExtInstall <name>` does
+    /// (`Engine::ext_install_from_registry`), proven by the command line's
+    /// "Extension '…' installed — …" outcome message that call always
+    /// leaves behind — painted output, not `engine.pending_terminal_command`
+    /// directly.
     #[test]
     fn ext_install_offer_toast_install_action_triggers_install_via_gtk() {
         let (mut h, ext_name, display_name, _path) = harness_with_ext_install_offer("ac");
-        let want_title = format!("Install {display_name}?");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
 
-        let (ax, ay) = toast_action_center(&h);
+        let (ax, ay) = toast_action_center(&h, 0);
         h.driver.click(ax, ay);
         h.driver.render();
 
         let want_outcome = format!("Extension '{ext_name}' installed");
         assert!(
             h.driver.screen_contains(&want_outcome),
-            "clicking the toast's action button must run \
-             ext_install_from_registry for the right extension; painted: {:?}",
+            "clicking the Install button must run ext_install_from_registry \
+             for the right extension; painted: {:?}",
             h.driver.painted_texts()
         );
         assert!(
@@ -19398,44 +19428,104 @@ mod issue_1397_ext_install_offer_toast {
         );
     }
 
-    /// #1397 "Don't ask again": `N` (the pre-#1397 keyboard shortcut,
-    /// preserved for parity with the toast's action button / dismiss ×)
-    /// must dismiss the toast *and* persist the dismissal for the rest of
-    /// the session — re-opening the same file must not show the offer
-    /// again.
+    /// #1577: clicking "Don't ask again" must persist the dismissal — the
+    /// same effect the pre-#1577 hijacked `N` key had, now reached only
+    /// through the button (or keyboard focus, covered below).
     #[test]
-    fn ext_install_offer_toast_n_key_dismisses_and_persists_via_gtk() {
-        let (mut h, _ext_name, display_name, path) = harness_with_ext_install_offer("kn");
-        let want_title = format!("Install {display_name}?");
+    fn ext_install_offer_toast_dont_ask_again_button_persists_via_gtk() {
+        let (mut h, ext_name, display_name, path) = harness_with_ext_install_offer("da");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
+
+        let (dx, dy) = toast_action_center(&h, 1);
+        h.driver.click(dx, dy);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains(&want_title),
+            "clicking Don't ask again must dismiss the toast; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().extension_state.is_dismissed(&ext_name),
+            "Don't ask again must persist the dismissal via \
+             ExtensionState::mark_dismissed"
+        );
+
+        h.engine.borrow_mut().open_file_in_tab(&path);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains(&want_title),
+            "a persisted dismissal must not re-prompt on a later open; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1577 core regression: `N` must NOT be hijacked by the toast. With
+    /// the pre-#1577 code, pressing `N` in Normal mode — vim's own
+    /// "previous search match" — while this (sticky, never-expiring) toast
+    /// happened to be up would silently and permanently dismiss the
+    /// extension instead of searching. This drives a real backward search
+    /// (`*` then `N`) and asserts the cursor actually moves like vim `N`,
+    /// AND that the toast and dismissal state are completely unaffected.
+    ///
+    /// **Verified RED against unfixed `develop`:** with the old `N`
+    /// interception restored ahead of the normal key dispatch, this test's
+    /// cursor-line assertion fails (`N` dismisses instead of searching) and
+    /// `is_dismissed` comes back `true`.
+    #[test]
+    fn ext_install_offer_toast_n_key_searches_backward_and_leaves_toast_untouched_via_gtk() {
+        let (mut h, ext_name, display_name, path) = harness_with_ext_install_offer("nk");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
         assert!(
             h.driver.screen_contains(&want_title),
             "precondition: offer must be showing; painted: {:?}",
             h.driver.painted_texts()
         );
+        assert_eq!(h.engine.borrow().view().cursor.line, 0, "precondition");
 
+        // `*`: search forward for the word under the cursor ("hello") —
+        // wraps past "world" (line 1) to the next "hello" (line 2).
+        h.driver.type_char('*');
+        h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.line,
+            2,
+            "precondition: '*' must land on the next 'hello' match"
+        );
+
+        // `N`: previous match relative to '*'s forward search — must go
+        // BACK to line 0, not dismiss the toast.
         h.driver.type_char('N');
         h.driver.render();
+        assert_eq!(
+            h.engine.borrow().view().cursor.line,
+            0,
+            "'N' must perform vim's own backward search, not be hijacked by \
+             the extension-offer toast"
+        );
         assert!(
-            !h.driver.screen_contains(&want_title),
-            "'N' must dismiss the toast; painted: {:?}",
+            h.driver.screen_contains(&want_title),
+            "'N' must leave the toast exactly as it was; painted: {:?}",
             h.driver.painted_texts()
         );
         assert!(
-            h.driver.screen_contains("dismissed"),
-            "'N' must confirm the dismissal on the command line; painted: {:?}",
-            h.driver.painted_texts()
-        );
-
-        // Re-open the same file — `open_file_in_tab`'s "already shows this
-        // buffer" branch re-runs `lsp_did_open` — and confirm the offer
-        // does not come back this session.
-        h.engine.borrow_mut().open_file_in_tab(&path);
-        h.driver.render();
-        assert!(
-            !h.driver.screen_contains(&want_title),
-            "'N' ('Don't ask again') must persist for the rest of the \
-             session, not just the first showing; painted: {:?}",
-            h.driver.painted_texts()
+            !h.engine.borrow().extension_state.is_dismissed(&ext_name),
+            "'N' must not dismiss/persist anything — that is the \
+             \"Don't ask again\" button's job now, not a hijacked vim key"
         );
 
         let _ = std::fs::remove_file(&path);
@@ -19444,12 +19534,19 @@ mod issue_1397_ext_install_offer_toast {
     /// #1397 "Not now": dismissing the toast via its × must hide it
     /// without asking again this session (`prompted_extensions`, recorded
     /// when the toast is *pushed*, not when it's dismissed — see
-    /// `lsp_did_open`) — but is not a permanent dismissal (that's `N`'s
-    /// job, covered above).
+    /// `lsp_did_open`) — but is not a permanent dismissal (that's "Don't
+    /// ask again"'s job, covered above) — nothing is written to
+    /// `extension_state`.
     #[test]
     fn ext_install_offer_toast_dismiss_x_hides_for_session_via_gtk() {
-        let (mut h, _ext_name, display_name, path) = harness_with_ext_install_offer("kx");
-        let want_title = format!("Install {display_name}?");
+        let (mut h, ext_name, display_name, path) = harness_with_ext_install_offer("kx");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
         assert!(
             h.driver.screen_contains(&want_title),
             "precondition: offer must be showing; painted: {:?}",
@@ -19464,6 +19561,11 @@ mod issue_1397_ext_install_offer_toast {
             "clicking × must dismiss the toast; painted: {:?}",
             h.driver.painted_texts()
         );
+        assert!(
+            !h.engine.borrow().extension_state.is_dismissed(&ext_name),
+            "× must not persist a dismissal — only session-scoped \
+             (prompted_extensions)"
+        );
 
         h.engine.borrow_mut().open_file_in_tab(&path);
         h.driver.render();
@@ -19471,6 +19573,59 @@ mod issue_1397_ext_install_offer_toast {
             !h.driver.screen_contains(&want_title),
             "'Not now' must not re-prompt again this session \
              (prompted_extensions); painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1577: keyboard access to the toast's buttons via
+    /// `Engine::focus_toast_stack` (`:Notifications` /
+    /// `panel_keys.focus_notifications`) + quadraui's
+    /// `ToastStackController` — Tab from the dismiss `×` to "Install" to
+    /// "Don't ask again", then Enter — must have the same effect as
+    /// clicking "Don't ask again" directly.
+    #[test]
+    fn ext_install_offer_toast_keyboard_focus_tab_enter_dont_ask_again_via_gtk() {
+        let (mut h, ext_name, display_name, path) = harness_with_ext_install_offer("kb");
+        // GTK's fixed 320px toast box
+        // (`quadraui::primitives::layout_metrics::pixel::TOAST_WIDTH`)
+        // truncates the title's trailing " extension?" before it ever
+        // paints (confirmed against this harness's real Cairo surface) —
+        // assert on the guaranteed-visible prefix instead of the full
+        // wording.
+        let want_title = format!("Install the {display_name}");
+
+        assert!(
+            h.engine.borrow_mut().focus_toast_stack(),
+            "focus_toast_stack must succeed while the toast is showing"
+        );
+
+        // Focus starts on the dismiss "×" (`ToastStackController::give_focus`'s
+        // documented seed) — Tab once for "Install", Tab again for "Don't
+        // ask again".
+        h.driver.press_named(quadraui::NamedKey::Tab);
+        h.driver.press_named(quadraui::NamedKey::Tab);
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains(&want_title),
+            "Enter on the focused 'Don't ask again' button must dismiss the \
+             toast; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.engine.borrow().extension_state.is_dismissed(&ext_name),
+            "keyboard-driven 'Don't ask again' must persist the dismissal, \
+             exactly like clicking it"
+        );
+
+        h.engine.borrow_mut().open_file_in_tab(&path);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains(&want_title),
+            "the persisted dismissal must not re-prompt; painted: {:?}",
             h.driver.painted_texts()
         );
 

@@ -1068,8 +1068,10 @@ pub struct Notification {
 pub const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A transient toast popup, rendered in the bottom-right corner by the
-/// backend via `quadraui::*::draw_toast_stack`. Currently used to surface
-/// LSP `$/progress` lifecycle events (#450); general-purpose for any
+/// backend via `quadraui::*::draw_toast_overlay` (#1577; was
+/// `draw_toast_stack`, still available as a deprecated shim). Currently
+/// used to surface LSP `$/progress` lifecycle events (#450) and the
+/// extension-recommendation offer (#1397/#1577); general-purpose for any
 /// future transient notification (build done, save error, etc.).
 #[derive(Debug, Clone)]
 pub struct EngineToast {
@@ -1078,29 +1080,47 @@ pub struct EngineToast {
     pub body: String,
     pub severity: quadraui::ToastSeverity,
     pub created_at: std::time::Instant,
-    /// Optional action button. `None` = plain toast — only the dismiss
-    /// "×" (`quadraui::ToastHit::Dismiss`) is clickable. `Some` wires the
-    /// button's `ToastHit::Action` to a semantic follow-up, dispatched by
-    /// `Engine::handle_toast_hit`.
-    pub action: Option<ToastActionKind>,
+    /// Ordered action buttons (#1577 — was `action: Option<ToastActionKind>`,
+    /// at most one). Empty = plain toast — only the dismiss "×"
+    /// (`quadraui::ToastHit::Dismiss`) is clickable. Each entry's
+    /// `ToastHit::Action` is dispatched by `Engine::handle_toast_hit` /
+    /// `run_toast_action`.
+    pub actions: Vec<EngineToastAction>,
     /// If true, `prune_toasts` never auto-expires this toast via
-    /// `TOAST_LIFETIME` — it stays until the user acts (the action
+    /// `TOAST_LIFETIME` — it stays until the user acts (an action
     /// button) or explicitly dismisses it (×). Used for offers that need
     /// a decision: disappearing after 5s would silently revert to
     /// "never asked", with no record the user ever saw it (#1397).
     pub sticky: bool,
 }
 
-/// Semantic action wired to a toast's action button
-/// (`quadraui::ToastAction`). `Engine::handle_toast_hit` matches on this
-/// to decide what `ToastHit::Action` actually does — previously the
-/// engine had no consumer for action-button taps at all (#1397 is the
-/// first).
+/// One action button on an [`EngineToast`] (`quadraui::ToastButton`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineToastAction {
+    pub kind: ToastActionKind,
+    /// Painted with the theme's accent fill instead of the plain
+    /// secondary look (`quadraui::ToastButton::primary`, #1577). At most
+    /// one action per toast should set this.
+    pub primary: bool,
+}
+
+/// Semantic action wired to one of a toast's action buttons
+/// (`quadraui::ToastButton`). `Engine::handle_toast_hit` matches on this
+/// (via `run_toast_action`) to decide what `ToastHit::Action` actually
+/// does — previously the engine had no consumer for action-button taps at
+/// all (#1397 is the first, #1577 grew it to more than one action per
+/// toast).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToastActionKind {
     /// Install the named extension via `ext_install_from_registry`. Shown
     /// from `lsp_did_open`'s "recommended extension" offer.
     InstallExtension(String),
+    /// "Don't ask again" (#1577): permanently dismiss the named extension
+    /// recommendation via `ExtensionState::mark_dismissed` + save, the
+    /// same effect the pre-#1577 `N` keyboard shortcut had — but reached
+    /// only via the toast's own button or the `ToastStackController`
+    /// keyboard focus now, never a hijacked vim key.
+    DismissExtension(String),
 }
 
 impl ToastActionKind {
@@ -1108,6 +1128,7 @@ impl ToastActionKind {
     pub(crate) fn button_label(&self) -> &'static str {
         match self {
             ToastActionKind::InstallExtension(_) => "Install",
+            ToastActionKind::DismissExtension(_) => "Don't ask again",
         }
     }
 }
@@ -4172,8 +4193,6 @@ pub struct Engine {
     pub extension_state: ExtensionState,
     /// Extensions for which an install prompt was shown this session (avoids re-prompting).
     pub prompted_extensions: HashSet<String>,
-    /// Name of the extension currently being hinted in the status bar (enables N-to-dismiss).
-    pub ext_hint_pending_name: Option<String>,
 
     // --- Extension registry (remote) ---
     /// Fetched remote registry entries (None until first :ExtRefresh or sidebar open).
@@ -4503,6 +4522,14 @@ pub struct Engine {
     /// status (#450); general-purpose for any future transient UX.
     pub toasts: Vec<EngineToast>,
     next_toast_id: u64,
+    /// Keyboard-focus cursor for the toast stack (#1577,
+    /// `quadraui::compose::ToastStackController`) — non-modal, so it only
+    /// ever consumes a key once something has explicitly given it focus
+    /// (`focus_toast_stack`, wired to `:Notifications` and
+    /// `panel_keys.focus_notifications`). `render::build_toast_stack`
+    /// attaches `self.toast_focus.focus()` to the painted
+    /// `quadraui::ToastOverlay` so the focused control gets a ring.
+    pub toast_focus: quadraui::compose::ToastStackController,
 
     // --- Editor hover popup ---
     /// Active editor hover popup with rendered markdown content.
@@ -5089,7 +5116,6 @@ impl Engine {
             force_motion_mode: None,
             extension_state: ExtensionState::load(),
             prompted_extensions: HashSet::new(),
-            ext_hint_pending_name: None,
             ext_registry: registry::load_cache(),
             ext_registry_fetching: false,
             ext_registry_rx: None,
@@ -5188,6 +5214,7 @@ impl Engine {
             next_notification_id: 1,
             toasts: Vec::new(),
             next_toast_id: 1,
+            toast_focus: quadraui::compose::ToastStackController::new(),
             editor_hover: None,
             editor_hover_dwell: None,
             editor_hover_dismiss_at: None,
@@ -5537,21 +5564,46 @@ impl Engine {
         body: &str,
         severity: quadraui::ToastSeverity,
     ) -> u64 {
-        self.push_toast_inner(title, body, severity, None, false)
+        self.push_toast_inner(title, body, severity, Vec::new(), false)
     }
 
-    /// Push a toast with an action button and no auto-expiry (#1397): the
-    /// offer stays until the user picks the action or dismisses it (×) —
-    /// see `EngineToast::sticky`'s doc for why a 5s auto-expiry is wrong
-    /// for a decision the user might not have looked up from yet.
-    pub fn push_sticky_action_toast(
+    /// Push a toast with one or more action buttons and no auto-expiry
+    /// (#1397/#1577): the offer stays until the user picks an action or
+    /// dismisses it (×) — see `EngineToast::sticky`'s doc for why a 5s
+    /// auto-expiry is wrong for a decision the user might not have looked
+    /// up from yet. Single code path for every action toast vimcode pushes
+    /// (#1577) — `lsp_did_open`'s extension-recommendation offer is the
+    /// only caller today.
+    pub fn push_sticky_actions_toast(
         &mut self,
         title: &str,
         body: &str,
         severity: quadraui::ToastSeverity,
-        action: ToastActionKind,
+        actions: Vec<EngineToastAction>,
     ) -> u64 {
-        self.push_toast_inner(title, body, severity, Some(action), true)
+        self.push_toast_inner(title, body, severity, actions, true)
+    }
+
+    /// The #1397/#1577 "recommended extension" offer: `Install` (primary)
+    /// and `Don't ask again`, VS Code's own wording pattern — see the
+    /// issue's "Wanted" section. `body` is one short line naming what
+    /// installing adds (e.g. "Adds language support for Markdown.").
+    pub fn push_extension_recommendation_toast(&mut self, name: &str, display_name: &str) -> u64 {
+        self.push_sticky_actions_toast(
+            &format!("Install the {display_name} extension?"),
+            &format!("Adds language support for {display_name}."),
+            quadraui::ToastSeverity::Info,
+            vec![
+                EngineToastAction {
+                    kind: ToastActionKind::InstallExtension(name.to_string()),
+                    primary: true,
+                },
+                EngineToastAction {
+                    kind: ToastActionKind::DismissExtension(name.to_string()),
+                    primary: false,
+                },
+            ],
+        )
     }
 
     fn push_toast_inner(
@@ -5559,7 +5611,7 @@ impl Engine {
         title: &str,
         body: &str,
         severity: quadraui::ToastSeverity,
-        action: Option<ToastActionKind>,
+        actions: Vec<EngineToastAction>,
         sticky: bool,
     ) -> u64 {
         let id = self.next_toast_id;
@@ -5570,7 +5622,7 @@ impl Engine {
             body: body.to_string(),
             severity,
             created_at: std::time::Instant::now(),
-            action,
+            actions,
             sticky,
         });
         id
@@ -5614,6 +5666,9 @@ impl Engine {
 
     /// Remove a toast whose adapter-side widget id matches `widget_id`.
     /// Widget ids are formatted as `toast-{id}` by `build_toast_stack`.
+    /// This is the × dismiss / `Escape` path — session-only, never
+    /// persists anything (that's `ToastActionKind::DismissExtension`'s
+    /// job, run through `run_toast_action` instead).
     fn dismiss_toast_by_widget(&mut self, widget_id: &quadraui::WidgetId) {
         let key = widget_id.as_str();
         let target_id: Option<u64> = key.strip_prefix("toast-").and_then(|s| s.parse().ok());
@@ -5623,22 +5678,30 @@ impl Engine {
     }
 
     /// Run the semantic action behind an action-button tap. Action button
-    /// widget ids are formatted as `toast-action-{id}` by
-    /// `build_toast_stack`, matching the toast's own `toast-{id}` scheme.
-    /// The toast is removed once its action has run — the offer has been
-    /// answered (#1397).
+    /// widget ids are formatted as `toast-action-{toast_id}-{index}` by
+    /// `build_toast_stack` (#1577 — `index` is the button's position in
+    /// `EngineToast::actions`, needed now that a toast can have more than
+    /// one), matching the toast's own `toast-{id}` scheme. The toast is
+    /// removed once its action has run — the offer has been answered
+    /// (#1397).
     fn run_toast_action(&mut self, widget_id: &quadraui::WidgetId) {
         let key = widget_id.as_str();
-        let Some(target_id) = key
-            .strip_prefix("toast-action-")
-            .and_then(|s| s.parse::<u64>().ok())
-        else {
+        let Some(rest) = key.strip_prefix("toast-action-") else {
+            return;
+        };
+        let Some((toast_id_str, index_str)) = rest.rsplit_once('-') else {
+            return;
+        };
+        let Some(target_id) = toast_id_str.parse::<u64>().ok() else {
+            return;
+        };
+        let Some(index) = index_str.parse::<usize>().ok() else {
             return;
         };
         let Some(toast) = self.toasts.iter().find(|t| t.id == target_id) else {
             return;
         };
-        let Some(action) = toast.action.clone() else {
+        let Some(action) = toast.actions.get(index).map(|a| a.kind.clone()) else {
             return;
         };
         self.toasts.retain(|t| t.id != target_id);
@@ -5646,6 +5709,62 @@ impl Engine {
             ToastActionKind::InstallExtension(name) => {
                 self.ext_install_from_registry(&name);
             }
+            ToastActionKind::DismissExtension(name) => {
+                self.extension_state.mark_dismissed(&name);
+                let _ = self.extension_state.save();
+                self.message =
+                    format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
+            }
+        }
+    }
+
+    /// Give the toast stack keyboard focus (`:Notifications` /
+    /// `panel_keys.focus_notifications`, #1577) — the keyboard-only
+    /// equivalent of clicking a toast's button, through quadraui's
+    /// `ToastStackController` rather than a hijacked vim key (the
+    /// pre-#1577 `N` shortcut this replaces). Returns `false` (and leaves
+    /// `self.message` set to say so) if there are no toasts to focus.
+    pub fn focus_toast_stack(&mut self) -> bool {
+        let Some(stack) = crate::render::build_toast_stack(self) else {
+            self.message = "No notifications".to_string();
+            return false;
+        };
+        self.toast_focus.give_focus(&stack)
+    }
+
+    /// Feed one `UiEvent` to the toast stack's keyboard-focus controller
+    /// (#1577), called from `app.rs`'s shared `handle_key_press` before
+    /// any vim-key dispatch. Returns `true` if the controller consumed the
+    /// event (caller should stop and redraw), `false` if it should fall
+    /// through to normal key handling.
+    ///
+    /// Cheap to call unconditionally: `ToastStackController::handle` only
+    /// ever consumes a key when the stack has focus (given explicitly via
+    /// `focus_toast_stack`) — every other key, and every key while
+    /// unfocused, comes back `Ignored` untouched, so this can never steal a
+    /// vim key the way the pre-#1577 hardcoded `N` did.
+    pub fn handle_toast_focus_key(&mut self, ui_event: &quadraui::UiEvent) -> bool {
+        if !self.toast_focus.is_focused() {
+            return false;
+        }
+        let Some(stack) = crate::render::build_toast_stack(self) else {
+            // Focus flag stale (every toast gone by some other path) —
+            // clear it defensively rather than leave a dangling focus.
+            self.toast_focus.take_focus();
+            return false;
+        };
+        match self.toast_focus.handle(ui_event, &stack) {
+            quadraui::compose::ToastStackEvent::Action(id) => {
+                self.handle_toast_hit(quadraui::ToastHit::Action(id));
+                true
+            }
+            quadraui::compose::ToastStackEvent::Dismiss(id) => {
+                self.handle_toast_hit(quadraui::ToastHit::Dismiss(id));
+                true
+            }
+            quadraui::compose::ToastStackEvent::Consumed
+            | quadraui::compose::ToastStackEvent::FocusReturned => true,
+            quadraui::compose::ToastStackEvent::Ignored => false,
         }
     }
 
