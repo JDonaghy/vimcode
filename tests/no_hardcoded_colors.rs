@@ -36,6 +36,14 @@
 //!   any themed colour — see `src/gtk/mod.rs`'s `per_segment_contrast_deltas`)
 //!   are test fixtures asserting *against* the theme, not shipped chrome.
 //!   They are outside the rule's scope by construction.
+//!
+//!   Finding where a `#[cfg(test)]` item *ends* means counting braces, and
+//!   #1576 found that counting them naively (every `{`/`}` character,
+//!   including the ones inside strings and comments) silently loses the
+//!   exemption: `src/tui_main/app_on_tui_tests.rs` is wholly `#[cfg(test)]`
+//!   yet its raw brace count never balances, so the block "never closed"
+//!   and the entire test-only file got scanned. [`strip_non_code_runs`]
+//!   is what makes this allowlist entry actually hold.
 //! - **The theme-constructor bodies** (`Theme::onedark`, `gruvbox_dark`,
 //!   `tokyo_night`, `solarized_dark`, `vscode_dark`, `vscode_light`).
 //!   These functions ARE the palette: something has to spell out
@@ -107,16 +115,156 @@ fn violation_regexes() -> Vec<(&'static str, Regex)> {
     ]
 }
 
+/// What [`strip_non_code_runs`] is in the middle of when a line ends: a
+/// string, a raw string (carrying its `#` count), or a block comment
+/// (carrying its nesting depth — Rust's `/* /* */ */` nest).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum ScanState {
+    #[default]
+    Code,
+    Str,
+    RawStr(usize),
+    BlockComment(usize),
+}
+
+/// Blank out every run on `line` that cannot hold a *structural* brace: a
+/// `//` line comment, a `/* ... */` comment, a string literal (plain or
+/// raw), or a single-character literal. `state` carries the scan across line
+/// boundaries — Rust strings, raw strings and block comments all span
+/// lines — and must be threaded through consecutive lines by the caller.
+/// [`block_end`] counts braces over the result.
+///
+/// Without this, one `format!("{")`-shaped brace inside a string
+/// desynchronises the depth count for the rest of the file. That is not
+/// hypothetical: `src/tui_main/app_on_tui_tests.rs` is a single 5.6k-line
+/// `#[cfg(test)] mod tests`, and its raw brace count never returns to zero
+/// (net +4, all from braces inside string literals and comments), so
+/// `block_end` returned `None` and the whole test-only file was scanned —
+/// the exact opposite of the "`#[cfg(test)]` code is exempt by
+/// construction" allowlist in this file's module doc. #1576 hit it when the
+/// first colour literal landed in that file's test bodies.
+///
+/// The cross-line state is load-bearing in the other direction too:
+/// `render.rs`'s `test_strip_json_comments` opens a multi-line raw string
+/// with `r#"{` and closes it with `}"#`. A line-scoped scan drops the `{`
+/// (it is inside a string) but keeps the `}` (its line looks like code), so
+/// it would end the enclosing `mod tests` ~6.5k lines early and start
+/// flagging test assertions.
+fn strip_non_code_runs(line: &str, state: &mut ScanState) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        // First, finish whatever construct the previous line left open.
+        match *state {
+            ScanState::Str => {
+                // Scan to the first unescaped `"`.
+                if chars[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '"' {
+                    *state = ScanState::Code;
+                }
+                i += 1;
+                continue;
+            }
+            ScanState::RawStr(hashes) => {
+                if chars[i] == '"' && count_hashes(&chars, i + 1) >= hashes {
+                    *state = ScanState::Code;
+                    i += 1 + hashes;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            ScanState::BlockComment(depth) => {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    *state = ScanState::BlockComment(depth + 1);
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    *state = if depth <= 1 {
+                        ScanState::Code
+                    } else {
+                        ScanState::BlockComment(depth - 1)
+                    };
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            ScanState::Code => {}
+        }
+
+        let c = chars[i];
+        // `//` line comment: nothing structural can follow on this line.
+        if c == '/' && chars.get(i + 1) == Some(&'/') {
+            break;
+        }
+        // `/* ... */` comment, possibly spanning lines.
+        if c == '/' && chars.get(i + 1) == Some(&'*') {
+            *state = ScanState::BlockComment(1);
+            i += 2;
+            continue;
+        }
+        // Raw string opener: `r"`, `r#"`, `r##"`, ...
+        if c == 'r' {
+            let hashes = count_hashes(&chars, i + 1);
+            if chars.get(i + 1 + hashes) == Some(&'"') {
+                *state = ScanState::RawStr(hashes);
+                i += 2 + hashes;
+                continue;
+            }
+        }
+        // Plain string opener.
+        if c == '"' {
+            *state = ScanState::Str;
+            i += 1;
+            continue;
+        }
+        // Char literal — `'{'`, `'\''`, `'\u{7f}'` (note the braces that one
+        // carries). A lifetime (`'a`, `'static`) is NOT a char literal, so
+        // only consume when a closing quote is actually there.
+        if c == '\'' {
+            if chars.get(i + 1) == Some(&'\\') {
+                if let Some(close) = chars[i + 2..].iter().position(|c| *c == '\'') {
+                    i += 2 + close + 1;
+                    continue;
+                }
+            } else if chars.get(i + 2) == Some(&'\'') {
+                i += 3;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// How many consecutive `#` characters start at `from` (a raw string's hash
+/// count, on either its opening or closing side).
+fn count_hashes(chars: &[char], from: usize) -> usize {
+    chars[from.min(chars.len())..]
+        .iter()
+        .take_while(|c| **c == '#')
+        .count()
+}
+
 /// Find the line index (relative to `lines`, absolute) at which the brace
 /// block starting on `lines[start]` closes — i.e. the first line, at or
 /// after `start`, where running `{`/`}` counts from `start` return to 0
-/// after having gone positive at least once. Returns `None` if the block
-/// never closes (shouldn't happen for well-formed Rust source).
+/// after having gone positive at least once. Braces inside comments, string
+/// literals and char literals don't count (see [`strip_non_code_runs`]).
+/// Returns `None` if the block never closes (shouldn't happen for
+/// well-formed Rust source).
 fn block_end(lines: &[&str], start: usize) -> Option<usize> {
     let mut depth = 0i32;
     let mut started = false;
+    let mut state = ScanState::default();
     for (offset, line) in lines[start..].iter().enumerate() {
-        for ch in line.chars() {
+        for ch in strip_non_code_runs(line, &mut state).chars() {
             match ch {
                 '{' => {
                     depth += 1;
@@ -321,5 +469,133 @@ fn scanner_flags_planted_violations_and_ignores_allowlisted_ones() {
     assert!(
         hits.is_empty(),
         "Color::from_rgb(...) with variable arguments must never be flagged, found: {hits:?}"
+    );
+}
+
+/// #1576: the `#[cfg(test)]` exemption must survive a stray brace inside a
+/// string literal, a comment or a char literal. `block_end` used to count
+/// every `{`/`}` character, so a single `"{"` in a test body desynchronised
+/// the depth count for the rest of the file, the `mod tests` block never
+/// appeared to close, and the exemption silently stopped applying from
+/// there on.
+#[test]
+fn cfg_test_exemption_survives_braces_inside_strings_comments_and_chars() {
+    // A brace that only appears inside a string literal, an escaped-quote
+    // string, a raw string, a `//` comment and a char literal — the module
+    // still closes on its real `}`, so the literal inside stays exempt.
+    let tricky = concat!(
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn t() {\n",
+        "        let unbalanced = \"{\";\n",
+        "        let escaped = \"he said \\\"{\\\" loudly\";\n",
+        "        let raw = r#\"{{{\"#;\n",
+        "        let brace_char = '{';\n",
+        "        // a comment with a lone { in it\n",
+        "        let c = quadraui::Color::rgb(10, 20, 30);\n",
+        "    }\n",
+        "}\n",
+        "fn shipped() {\n",
+        "    let c = quadraui::Color::rgb(40, 50, 60);\n",
+        "}\n",
+    );
+    let hits = scan_content("tricky.rs", &strip_allowlisted_regions(tricky));
+    assert_eq!(
+        hits.len(),
+        1,
+        "the literal inside the #[cfg(test)] module must stay exempt and the \
+         one in shipped code below it must still be flagged, found: {hits:?}"
+    );
+    assert!(
+        hits[0].contains("40, 50, 60"),
+        "the flagged hit must be the shipped-code literal, not the test one: {hits:?}"
+    );
+
+    // A lifetime is not a char literal: consuming `'a` as one would swallow
+    // the rest of the line (including its braces) and break the count.
+    let mut state = ScanState::default();
+    assert!(
+        strip_non_code_runs("impl<'a> Foo<'a> { fn f(&'a self) -> &'a str {", &mut state)
+            .contains("{ "),
+        "lifetimes must not be mistaken for char literals"
+    );
+    assert_eq!(state, ScanState::Code, "that line opens nothing");
+    assert_eq!(
+        strip_non_code_runs("let brace = '{'; if x {", &mut state)
+            .matches('{')
+            .count(),
+        1,
+        "only the structural brace should survive; the char literal's must not"
+    );
+
+    // A *multi-line* raw string — `render.rs`'s `test_strip_json_comments`
+    // shape. The opening `{` and the closing `}` must both be invisible to
+    // the brace count, or the enclosing block ends thousands of lines early.
+    let mut state = ScanState::default();
+    let opened = strip_non_code_runs("        let input = r#\"{", &mut state);
+    assert!(!opened.contains('{'), "a raw string's brace must not count");
+    assert_eq!(state, ScanState::RawStr(1), "the raw string stays open");
+    let inside = strip_non_code_runs("  \"key\": \"value\", /* block */ }", &mut state);
+    assert!(
+        !inside.contains('}'),
+        "a line wholly inside a raw string contributes no braces, got {inside:?}"
+    );
+    let closed = strip_non_code_runs("}\"#;", &mut state);
+    assert!(
+        !closed.contains('}'),
+        "the raw string's closing line contributes no braces either, got {closed:?}"
+    );
+    assert_eq!(state, ScanState::Code, "the raw string closed on `\"#`");
+
+    // A multi-line `/* ... */` comment, nesting included.
+    let mut state = ScanState::default();
+    assert!(!strip_non_code_runs("/* opens { and /* nests", &mut state).contains('{'));
+    assert_eq!(state, ScanState::BlockComment(2));
+    assert!(!strip_non_code_runs("still commented }", &mut state).contains('}'));
+    assert_eq!(
+        strip_non_code_runs("*/ */ fn f() {", &mut state)
+            .matches('{')
+            .count(),
+        1,
+        "code after the comment closes must count again"
+    );
+}
+
+/// #1576 regression guard, against the real file that exposed the bug:
+/// `src/tui_main/app_on_tui_tests.rs` is one 5.6k-line `#[cfg(test)] mod
+/// tests`, and its raw brace count never returns to zero (braces inside
+/// strings and comments), so before [`strip_non_code_runs`] the whole
+/// test-only file was scanned. Asserts the file does contain literals the
+/// gate would otherwise flag, and that the exemption blanks every one.
+#[test]
+fn a_wholly_cfg_test_file_with_colour_literals_is_exempt_end_to_end() {
+    let path = Path::new("src/tui_main/app_on_tui_tests.rs");
+    let content = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    assert!(
+        content
+            .lines()
+            .next()
+            .unwrap_or("")
+            .starts_with("#[cfg(test)]"),
+        "this guard assumes {} is wholly #[cfg(test)]",
+        path.display()
+    );
+    let raw_hits = scan_content("raw", &content);
+    assert!(
+        !raw_hits.is_empty(),
+        "this guard is only meaningful while {} still contains colour \
+         literals in its test bodies — if it no longer does, point it at \
+         another wholly-#[cfg(test)] file that does",
+        path.display()
+    );
+    let filtered_hits = scan_content(
+        &path.display().to_string(),
+        &strip_allowlisted_regions(&content),
+    );
+    assert!(
+        filtered_hits.is_empty(),
+        "every colour literal in a wholly-#[cfg(test)] file must be exempt \
+         (#1575's own allowlist says so), found: {filtered_hits:?}"
     );
 }
