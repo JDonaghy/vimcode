@@ -3557,6 +3557,32 @@ impl Engine {
         true
     }
 
+    /// Replay any in-flight `<leader>ai` partial match back into the input
+    /// verbatim and clear the buffer (#1507 review).
+    ///
+    /// `ai_leader_toggle_key` only ever sees a plain, unmodified
+    /// [`quadraui::Key::Char`] — `render::route_ai_chat_event` calls this
+    /// instead for every key that function can never see at all (a modified
+    /// `Char`, or any `Named` key such as Enter/Tab/Backspace/arrows), so a
+    /// partial match doesn't silently vanish just because the *interrupting*
+    /// key happens to arrive on a path `ai_leader_toggle_key` was never
+    /// wired to intercept. Mirrors the replay `ai_leader_toggle_key` itself
+    /// already does on an ordinary same-shape mismatch (e.g. typing `<leader>x`
+    /// after `<leader>a`) — this just extends that same "never silently drop
+    /// buffered keystrokes" guarantee to keys outside its own dispatch.
+    ///
+    /// Callers must not use this for `Escape`: that key is about to fire
+    /// `ChatControllerEvent::Cancelled` and leave the panel, so the buffer
+    /// should be discarded (`ai_leader_toggle_pending.clear()`) rather than
+    /// replayed into an input the user is walking away from — see
+    /// `dispatch_ai_chat_event`'s `Cancelled` arm, which does exactly that.
+    pub fn ai_leader_toggle_flush(&mut self) {
+        let pending = std::mem::take(&mut self.ai_leader_toggle_pending);
+        if !pending.is_empty() {
+            self.ai_chat.borrow_mut().input_insert_str(&pending);
+        }
+    }
+
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
     /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
     /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
@@ -3576,6 +3602,14 @@ impl Engine {
             }
             Ev::Cancelled => {
                 self.ai_has_focus = false;
+                // #1507 review: an abandoned `<leader>ai` partial match must
+                // not survive a focus-losing Escape — replaying it here
+                // would inject stray text into an input the user is walking
+                // away from, and leaving it buffered would let it resurface
+                // and wrongly complete against an unrelated future message
+                // once the panel regains focus (unlike `ai_leader_toggle_flush`,
+                // which is for keys that *don't* end the session).
+                self.ai_leader_toggle_pending.clear();
                 false
             }
             // Ctrl+C: clear the conversation. `ChatController` has no
@@ -4159,6 +4193,81 @@ mod ai_leader_toggle_key_tests {
         assert!(
             engine.ai_has_focus,
             "typing ' ai' into a non-empty input must never toggle focus"
+        );
+    }
+
+    /// #1507 review: `ai_leader_toggle_flush` — the method
+    /// `render::route_ai_chat_event` calls for every key shape
+    /// `ai_leader_toggle_key` itself never sees (a modified `Char`, or any
+    /// `Named` key) — must replay a buffered partial match into the input
+    /// and clear the buffer, the unit-level twin of the black-box
+    /// `leader_prefix_interrupted_by_enter_is_replayed_not_dropped_via_shell_app`
+    /// driver test.
+    ///
+    /// RED verified: with `ai_leader_toggle_flush`'s body replaced with a
+    /// bare `self.ai_leader_toggle_pending.clear();` (i.e. discarding
+    /// instead of replaying), this fails.
+    #[test]
+    fn flush_replays_buffered_prefix_into_input() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        assert_eq!(engine.ai_leader_toggle_pending, " a");
+
+        engine.ai_leader_toggle_flush();
+
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            " a",
+            "the buffered ' a' prefix must be replayed into the input"
+        );
+        assert_eq!(
+            engine.ai_leader_toggle_pending, "",
+            "the buffer must be cleared once flushed"
+        );
+    }
+
+    /// `ai_leader_toggle_flush` on an empty buffer is a no-op — the common
+    /// case, since most keys arrive with no partial match pending at all.
+    #[test]
+    fn flush_is_a_no_op_when_nothing_is_pending() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        engine.ai_leader_toggle_flush();
+        assert_eq!(engine.ai_chat.borrow().input_text(), "");
+    }
+
+    /// #1507 review, "related" point: `Cancelled` (Escape) must discard —
+    /// not replay — a partial match still buffered when the panel loses
+    /// focus, so it can never resurface and wrongly complete against an
+    /// unrelated later message once the panel regains focus. The black-box
+    /// twin of this is
+    /// `leader_prefix_abandoned_via_escape_does_not_leak_into_next_session_via_shell_app`.
+    ///
+    /// RED verified: with the `self.ai_leader_toggle_pending.clear();` line
+    /// removed from `dispatch_ai_chat_event`'s `Cancelled` arm, this fails.
+    #[test]
+    fn cancelled_discards_a_buffered_partial_match() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        assert_eq!(engine.ai_leader_toggle_pending, " a");
+
+        let still_focused = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::Cancelled);
+
+        assert!(!still_focused);
+        assert!(!engine.ai_has_focus);
+        assert_eq!(
+            engine.ai_leader_toggle_pending, "",
+            "an abandoned partial match must not survive Escape"
+        );
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            "",
+            "an abandoned partial match must be discarded, not replayed, \
+             into an input the user is walking away from"
         );
     }
 }

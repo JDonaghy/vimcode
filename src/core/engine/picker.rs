@@ -2141,6 +2141,11 @@ impl Engine {
                     // Focus the AI chat panel
                     self.close_picker();
                     self.ai_has_focus = true;
+                    // #1507 review: fresh entry into the panel from the
+                    // command palette bypasses `clear_sidebar_focus`, so
+                    // reset here too — see the identical comment on the
+                    // `<leader>ai` entry arm in `keys.rs`.
+                    self.ai_leader_toggle_pending.clear();
                     EngineAction::None
                 } else if let Some(question) = key.strip_prefix("chat_send:") {
                     // Send a question to the AI provider
@@ -2148,6 +2153,7 @@ impl Engine {
                     self.close_picker();
                     self.ai_send_message(question);
                     self.ai_has_focus = true;
+                    self.ai_leader_toggle_pending.clear();
                     EngineAction::None
                 } else if key == "chat_configure" {
                     // Open settings to configure AI
