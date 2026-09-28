@@ -28179,6 +28179,31 @@ mod tests {
         }
     }
 
+    // ── Status bar polish (#1548) ────────────────────────────────────────
+    //
+    // Black-box coverage note (#1548 review): the six tests below are
+    // ordinary unit tests against `build_window_status_line`/
+    // `handle_status_action` — they assert on the returned `StatusSegment`/
+    // `quickfix` struct fields, not on anything actually painted, and an
+    // earlier revision of this PR mislabeled them as "black-box tests" in
+    // the commit message. That label was wrong: this is exactly the
+    // "state populated, not painted" gap CLAUDE.md's `ScreenLayout.picker`
+    // history warns about. The real driver-tier coverage for the new
+    // clickable `ShowDiagnostics` counter, the `UTF-8` encoding label, the
+    // language display name, and the branch icon lives in
+    // `src/gtk/testing.rs`'s
+    // `status_bar_1548_polish_paints_and_problems_counter_click_opens_workspace_quickfix`,
+    // which asserts each segment's text actually paints
+    // (`GtkDriver::screen_contains`) and drives a real click at the
+    // painted problems-counter segment (recovered from
+    // `status_segment_map`, never a hardcoded coordinate), asserting the
+    // quickfix panel actually paints the diagnostic text — mirroring the
+    // established `status_bar_segment_click_opens_go_to_line_picker` (#672)
+    // precedent for this exact regression class. The unit tests below are
+    // kept alongside it because they pin down the segment *content*
+    // (exact text, per-severity counts, display-name mapping) more
+    // precisely and more cheaply than a pixel/text-search assertion could.
+
     /// #1548: the problems counter must always paint, even with zero
     /// diagnostics — VS Code shows `0`/`0`, not nothing, and the previous
     /// per-window bar had no counter segment at all (only the older,
@@ -28339,7 +28364,16 @@ mod tests {
     fn test_window_status_line_language_segment_uses_display_name() {
         use crate::core::engine::Engine;
 
-        let rs_path = std::env::temp_dir().join("vimcode_status_bar_1548.rs");
+        // Unique per (process, thread) so concurrent test runs can never
+        // collide on this path (#1548 review nit — the fixed-name version
+        // this replaced was low-risk but diverged from the unique-temp-name
+        // convention used elsewhere, e.g. `src/gtk/testing.rs`'s
+        // `gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_on_gtk`).
+        let rs_path = std::env::temp_dir().join(format!(
+            "vimcode_status_bar_1548_{}_{:?}.rs",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&rs_path, "fn main() {}\n").unwrap();
 
         let mut engine = Engine::new();

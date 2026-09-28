@@ -1679,6 +1679,134 @@ mod tests {
         );
     }
 
+    /// #1548 driver-tier coverage for all four status-bar polish changes at
+    /// once — the engine-level unit tests in `src/render.rs` prove each
+    /// segment's *content*, this proves each one actually *paints* through
+    /// the real click/paint pipeline, the gap the review flagged (the
+    /// `ScreenLayout.picker`/#587/#592 "state populated, not painted"
+    /// failure mode):
+    ///
+    /// 1. Encoding label reads `UTF-8`, not `utf-8`.
+    /// 2. Language segment shows the display name (`Rust`), not the raw
+    ///    LSP id (`rust`).
+    /// 3. Branch segment is prefixed with the branch icon, not bare text.
+    /// 4. The problems counter is a real, clickable segment that opens the
+    ///    workspace Problems (quickfix) list — this drives a real click at
+    ///    the counter's painted `(start_x, end_x)` zone (recovered from
+    ///    `status_segment_map`, same as
+    ///    [`status_bar_segment_click_opens_go_to_line_picker`] above) and
+    ///    asserts the quickfix panel actually *paints* the diagnostic
+    ///    message, not merely that `engine.quickfix.open` flips.
+    ///
+    /// RED against unfixed `develop`: before this issue's fix (a) the
+    /// encoding segment painted `utf-8 `, not `UTF-8 `; (b) the language
+    /// segment painted the raw id `rust`, never the string `Rust`; (c) the
+    /// branch segment painted no icon glyph at all; and (d) the per-window
+    /// status bar painted no diagnostics segment at all, so
+    /// `status_segment_center` returns `None` and the click assertions below
+    /// never run — each was confirmed by reverting the corresponding hunk in
+    /// `render.rs` and re-running (see that file's `#1548` unit tests for
+    /// the itemized RED confirmations this test's paint-level assertions
+    /// mirror).
+    #[test]
+    fn status_bar_1548_polish_paints_and_problems_counter_click_opens_workspace_quickfix() {
+        const DIAG_MSG: &str = "STATUSBAR_QF_PROBE_1548";
+
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1548_status_bar_gtk_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe1548.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let canonical = file.canonicalize().unwrap();
+
+        let mut engine = engine_with_long_buffer();
+        // Off before the file is opened: otherwise opening a `.rs` file with
+        // no Rust extension installed fires the "Install Rust Language
+        // Support?" toast (`Engine::lsp_did_open`'s extension-hint path in
+        // `lsp_ops.rs`), which paints the substring "Rust " itself and
+        // would make the language segment's own
+        // `screen_contains("Rust")` assertion below a false positive
+        // against a notification, not the status bar.
+        engine.settings.lsp_enabled = false;
+        engine
+            .open_file_with_mode(&file, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+        // `Engine::new()` auto-detects the real cwd git branch (this
+        // worktree's own long `issue-1548-...` branch name is wide enough
+        // to priority-drop every other right-side segment off the bar
+        // entirely) — pin it to a short, deterministic name so this test
+        // isn't at the mercy of whatever branch happens to be checked out.
+        engine.git_branch = Some("main".to_string());
+        engine.lsp_diagnostics.insert(
+            canonical,
+            vec![crate::core::lsp::Diagnostic {
+                range: crate::core::lsp::LspRange::default(),
+                severity: crate::core::lsp::DiagnosticSeverity::Error,
+                message: DIAG_MSG.to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+        let win = engine.active_window_id();
+        let mut h = harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.screen_contains("UTF-8"),
+            "the encoding segment must paint 'UTF-8', not 'utf-8'; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Rust"),
+            "the language segment must paint the display name 'Rust', \
+             not the raw id 'rust'; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver
+                .screen_contains(&format!("{} main", crate::icons::GIT_BRANCH.s())),
+            "the branch segment must paint the branch icon prefixed to \
+             the branch name; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        assert!(
+            !h.engine.borrow().quickfix.open,
+            "quickfix must not be open before the click"
+        );
+        assert!(
+            !h.driver.screen_contains(DIAG_MSG),
+            "the diagnostic message must not be painted before the click"
+        );
+
+        let (x, y) = h
+            .status_segment_center(win, crate::core::engine::StatusAction::ShowDiagnostics)
+            .expect(
+                "the per-window status bar must have painted a \
+                 ShowDiagnostics (problems counter) segment into \
+                 status_segment_map",
+            );
+        h.driver.click(x, y);
+
+        assert!(
+            h.engine.borrow().quickfix.open,
+            "clicking the problems counter must open the workspace \
+             quickfix list (#1548)"
+        );
+        assert!(
+            h.driver.screen_contains(DIAG_MSG),
+            "the quickfix panel must actually paint the diagnostic \
+             message, not just flip engine state; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Three tabs in the default **single** editor group — the exact shape
     /// #553 reports as dead (tab clicks came back to life as soon as a second
     /// group existed).
