@@ -23332,8 +23332,8 @@ pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
 /// navy `(35,40,58)` unfocused-selection row under `vscode-light`) instead
 /// of failing the build with `error[E0063]: missing field`. quadraui's own
 /// `theme.rs` uses the identical exhaustive-literal technique for exactly
-/// this reason — that one guards its downstream consumers (e.g. what
-/// caught `tab_active_border_top` for `coord-tui`, #620) rather than a
+/// this reason — that one guards quadraui's downstream consumers (e.g. the
+/// unmapped `tab_active_border_top` it caught in quadraui#620) rather than a
 /// consumer's own mapping, but the compile-time guarantee is the same one
 /// this literal now gives vimcode. Adding a field to `quadraui::Theme` is
 /// a compile error here until it's mapped (or deliberately assigned a
