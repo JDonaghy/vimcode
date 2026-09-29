@@ -416,16 +416,17 @@ impl Engine {
     /// decision.
     ///
     /// Safe to write `new_text` as the buffer's entire content precisely
-    /// because it's guaranteed whole-file by construction (#1454): every
-    /// entry in `self.change_review` was built by
-    /// `Engine::acp_open_review_for_diffs` -> `Engine::acp_resolve_diff_block`
-    /// (`acp_ops.rs`), which resolves a possibly-fragment ACP `diff` block
-    /// against the file's actual current content *before* a
-    /// `ProposedChange` (and the `ChangeReviewEntry`/`DiffView` built from
-    /// it) ever exists — an ambiguous or unlocatable fragment is refused
-    /// there and never reaches an entry at all. This function itself does
-    /// no fragment resolution; that would be the bug this issue reports
-    /// (writing an edited-region fragment over the whole file).
+    /// because it's guaranteed whole-file by construction. Since #1516
+    /// retired the ACP proposal-review write path (a `diff` content block
+    /// is display-only — see `acp_ops.rs`'s
+    /// `Engine::acp_upsert_tool_call` doc), the only feeder that still
+    /// reaches this branch is a
+    /// non-ACP one that builds whole-file
+    /// [`crate::core::review::ProposedChange`]s directly (#525's
+    /// git-branch diff list), so no possibly-fragment text can arrive here
+    /// at all. This function itself does no fragment resolution — writing
+    /// an edited-region fragment over a whole file is exactly the #1454
+    /// data loss that motivated the retirement.
     pub(crate) fn change_review_accept_current(&mut self) {
         // #1460: a turn review's files are already written to disk — "keep"
         // is a pure decision, never a write (see `acp_turn_ops.rs`'s module

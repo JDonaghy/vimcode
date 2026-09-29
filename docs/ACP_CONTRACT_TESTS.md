@@ -151,13 +151,37 @@ assert on a user-visible outcome — not on state merely being populated (see
 so the test asserts the entry's actual `old_text`/`new_text`, and the
 actual bytes on disk after accepting).
 
-`fragment_diff_transcript_preserves_surrounding_file_content_on_accept` is
-the issue's own acceptance bar ("reverting the #1454 fix makes a contract
-test fail") — verified RED against the pre-#1454 pass-through during this
-work (temporarily reverting `Engine::acp_open_review_for_diffs` to feed the
-wire fragment straight through, confirming the test failed on both the
-opened entry's content and the post-accept file content, then restoring the
-fix).
+#### The #1516 pair (retiring the proposal-review write path)
+
+`#1454`'s original contract test
+(`fragment_diff_transcript_preserves_surrounding_file_content_on_accept`)
+asserted that a `diff` content block opened a review whose `a` wrote
+`newText` back to disk with the surrounding file content intact. #1516
+retired that write path outright — a `diff` block is display-only per the
+ACP spec, and an adapter is free to *also* apply the same edit itself via
+`fs/write_text_file`, which made the second write path a standing
+double-apply hazard #1454's fragment resolution could only heuristically
+mitigate. Two tests replace it:
+
+| Test | Transcript | Asserts |
+|---|---|---|
+| `fragment_diff_transcript_is_display_only_and_never_writes` | `fragment_diff_edit.transcript` | a turn whose only edit report is a `diff` block opens **no** review and leaves the file byte-identical, while the block is still stored on the tool call for the card's own display |
+| `turn_write_transcript_opens_a_hunk_level_turn_review_over_the_wire` | `turn_write_hunk_review.transcript` | a real `fs/write_text_file` + a `diff` block reporting the same edit writes exactly once; the turn review (checkpoint-backed) opens with the whole pre-turn vs post-turn content; `r` reverts **only** the hunk under the cursor, leaving the other hunk's agent content on disk; `a` on the remainder auto-closes |
+
+Both were verified RED against unfixed `develop` (2026-09-29) by checking
+out `origin/develop -- src/` with the new tests in place: the first failed
+its "must never open the change-review surface" assertion, the second
+failed "the OTHER hunk's agent content must survive a hunk-level reject"
+(develop's `r` reverted the whole file).
+
+`turn_write_hunk_review.transcript` is hand-authored to the exact wire
+shape `fake_acp_agent.sh`'s `ACP_FAKE_FS_WRITE_PATH` branch emits (request
+id `9011`, `write:ok` chunk, `stopReason: end_turn`) rather than captured
+by `record_acp_transcript` — that recorder auto-answers agent requests with
+`{}` and never performs the write, so it cannot produce a transcript for a
+scenario whose whole point is a served `fs/write_text_file`. Per the corpus
+provenance note above, every other transcript here is scripted-fixture
+derived too, so this is the same class of realism, not a weaker one.
 
 ## What's deliberately out of scope for this pass
 

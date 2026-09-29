@@ -209,9 +209,11 @@ fn main() {
     // the session-scoped state, `self.change_review = None` included (#955).
     // Because `poll_acp` drains every queued event before returning, a test
     // whose poll tick happened to land after the exit saw the review opened
-    // and cleared again inside one `poll_acp()` call — so
-    // `fragment_diff_transcript_preserves_surrounding_file_content_on_accept`
-    // failed roughly half its runs on its 30s deadline with `change_review`
+    // and cleared again inside one `poll_acp()` call — so the contract test
+    // that then asserted on a `diff` block opening a review (since retired
+    // by #1516; `turn_write_transcript_opens_a_hunk_level_turn_review_over_
+    // the_wire` asserts on a turn review the same way today) failed roughly
+    // half its runs on its 30s deadline with `change_review`
     // never observably `Some`, on `develop` as much as on any branch. Staying
     // up removes the exit from the middle of the scenario entirely rather
     // than papering over it with a longer deadline or a retry.
