@@ -55,6 +55,24 @@
 //! real and covered, but a live pixel re-check needs dell64's interactive
 //! session unlocked first. Not re-attempted blind a third time.
 //!
+//! **Reconciliation (#1622 fix round 1):** a second dell64 session
+//! reproduced the identical blocker — `GetForegroundWindow()` returned
+//! `NULL` throughout, confirming the session was locked again — and added a
+//! sharper signal for *why* the editor pane reads blank rather than merely
+//! stale: a direct `GetWindowDC` + `BitBlt` read of the live window (as
+//! opposed to `PrintWindow`'s synthetic `WM_PRINT` fallback) returned solid
+//! **black** for the entire client area while the native, GDI-owned menu
+//! row still painted correctly — the same "solid black" signature #1558's
+//! own investigation already recorded for `Graphics.CopyFromScreen` under a
+//! locked session on this host. This still is not a pixel-level VERIFIED or
+//! FAILED result for the cursor glyph specifically (the whole surface is
+//! unreadable, not just the cursor), so #1559 remains genuinely blocked —
+//! not by lack of trying twice now, but by this host's interactive session
+//! relocking on every session that has attempted this check
+//! (#1558/#1561/#1622). See `docs/PENDING_QUADRAUI_ISSUES.md`'s "Correction
+//! (#1622 fix round 1)" note (filed against the neighbouring #1562 entry)
+//! for the full capture-method write-up, which applies identically here.
+//!
 //! # #1561: left-edge desktop strip — investigated, no fix here
 //!
 //! vimcode#1561's reported left-edge desktop strip was investigated against
@@ -124,6 +142,23 @@
 //! participate in. See `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for
 //! the drafted ask. `src/win/mod.rs`'s `#1562` doc section has the fuller
 //! write-up.
+//!
+//! **Reconciliation (#1622 fix round 1):** the correction above's "the
+//! drawn CSD row/command centre never goes live" claim conflated two rungs
+//! #939 deliberately decoupled — `render::FramePresence::from_screen`
+//! (`src/render.rs`) computes `command_center` from `title_bar_band_live`
+//! alone, not from `menu_bar_visible`/this branch, and both
+//! `command_center_liveness_is_split_from_menu_bar_visible` (`src/
+//! render.rs`) and this module's own `command_center_paints_on_a_native_
+//! menu_backend` test below pin exactly that contract for `WinBackend`
+//! specifically. That half of the claim is retracted; see
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "Correction (#1622 fix round 1)" for
+//! the full write-up, including a second dell64 session's evidence that the
+//! *entire* client area (not selectively the Command Center) was blank/
+//! black under the same locked-session Direct2D suspension #1559 above
+//! already discloses. The `WS_CAPTION`-not-cleared half of this correction
+//! (native caption + native menu row, no CSD) is unaffected and independently
+//! reproduced again this round.
 //!
 //! # #1582: no menu bar at startup — the same `backend_caps` gap as #1562,
 //! # narrower fix (`native_menu`, not `window_chrome`)
