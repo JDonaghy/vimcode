@@ -17195,7 +17195,7 @@ fn test_plugin_loads_and_command_runs() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -17214,7 +17214,7 @@ fn test_plugin_on_save_fires() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -17240,7 +17240,7 @@ fn test_plugin_disabled_not_registered() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &["test_disabled".to_string()]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27561,7 +27561,7 @@ fn test_lua_feedkeys_deletes_word() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27581,7 +27581,7 @@ fn test_lua_feedkeys_insert_and_escape() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27605,7 +27605,7 @@ fn test_lua_eval_register() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27630,7 +27630,7 @@ fn test_lua_eval_cursor_position() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27660,7 +27660,7 @@ fn test_lua_get_lines() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27684,7 +27684,7 @@ fn test_lua_get_lines_negative_index() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27718,7 +27718,7 @@ fn test_lua_set_lines_replace_range() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -27741,7 +27741,7 @@ fn test_lua_set_lines_insert_at_beginning() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -31550,7 +31550,7 @@ fn test_tick_git_branch_fires_plugin_event() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -31579,7 +31579,7 @@ fn test_tick_git_branch_no_event_when_unchanged() {
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33405,7 +33405,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33431,7 +33431,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }
@@ -33461,7 +33461,7 @@ end)
     match plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            engine.plugin_manager = Some(mgr);
+            engine.set_plugin_manager(mgr);
         }
         Err(_) => return,
     }

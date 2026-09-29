@@ -7,10 +7,63 @@
 //! The plugin system is intentionally unrestricted (Neovim-style): plugins have
 //! full access to file I/O, OS processes, and the network. Users are
 //! responsible for trusting the plugins they install.
+//!
+//! # Two API tiers: legacy queued (`vimcode.buf.*`) vs immediate (`vimcode.buffer.*`)
+//!
+//! There are two ways for Lua to touch the editor, and they differ in *when*
+//! the edit lands (#1214):
+//!
+//! * **Legacy, queued — `vimcode.buf.*`, `vimcode.opt.*`, …** Reads come from
+//!   a snapshot taken *before* the callback ran ([`PluginCallContext`]); writes
+//!   are appended to `Vec`s on that context and replayed by
+//!   `Engine::apply_plugin_ctx` *after* the callback returns. Read-after-write
+//!   inside one callback therefore sees the *old* text. This behaviour is
+//!   relied on by shipped extensions and is preserved exactly.
+//! * **Immediate — `vimcode.buffer.*`, `vimcode.window.*`.** These reach a live
+//!   `&mut Engine` and take effect at call time, so a `set_lines` followed by a
+//!   `get_lines` in the same callback reads back what was just written, and a
+//!   buffer other than the active one can be targeted by handle.
+//!
+//! **Mixing the two in one callback:** every immediate call has already been
+//! applied by the time the callback returns, and the queued calls are applied
+//! afterwards — so a queued write always lands *after* (and therefore wins
+//! over) an immediate write to the same lines, no matter the order the Lua
+//! source called them in.
+//!
+//! ## Handles
+//!
+//! Buffers and windows are plain integers (`BufferId` / `WindowId`), with `0`
+//! meaning "current". Real ids always start at 1, so `0` is never ambiguous.
+//!
+//! ## Line and cursor conventions (immediate API)
+//!
+//! * `get_lines(buf, start, end)` / `set_lines(buf, start, end, lines)` are
+//!   **0-indexed with an exclusive end**, and a negative index counts back from
+//!   the end of the buffer — the same convention as the legacy
+//!   `vimcode.buf.get_lines` / `set_lines`.
+//! * `get_lines` returns lines **without their trailing newline**. (The legacy
+//!   `vimcode.buf.get_lines` passes ropey's `Rope::line()` straight through, so
+//!   its strings *do* include the terminator. That difference is deliberate;
+//!   the legacy behaviour is frozen for back-compat.)
+//! * `line_count(buf)` counts **logical** lines: a buffer ending in a newline
+//!   does *not* report ropey's phantom trailing empty line, so
+//!   `set_lines(b, 0, line_count(b), get_lines(b, 0, line_count(b)))` is a
+//!   round-trip. (Legacy `vimcode.buf.line_count()` returns the raw
+//!   `Rope::len_lines()` and so is one larger on such buffers; also frozen.)
+//! * Every line written by `set_lines` is newline-terminated, matching the
+//!   queued replay path.
+//! * Cursors are `{line, col}` **1-indexed**, matching `vimcode.buf.cursor()`.
+//!   `window.get_cursor` returns a table carrying both named (`line`, `col`)
+//!   and positional (`[1]`, `[2]`) fields, and `window.set_cursor` accepts
+//!   either shape.
 
 use mlua::prelude::*;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+use super::engine::Engine;
 
 /// A request from Lua to open a scratch buffer with content.
 pub struct ScratchBufferRequest {
@@ -31,6 +84,121 @@ pub struct AsyncShellRequest {
 }
 
 use super::git;
+
+// ─── Live engine access for the immediate API (#1214) ────────────────────────
+
+thread_local! {
+    /// The engine currently loaned to Lua, or null when no plugin dispatch is
+    /// in flight. Thread-local because `mlua::Lua` is `!Send`: every callback
+    /// runs on the thread that owns the `PluginManager`, which is the thread
+    /// that owns the `Engine`.
+    static LIVE_ENGINE: Cell<*mut Engine> = const { Cell::new(std::ptr::null_mut()) };
+    /// Set while a `&mut Engine` reborrow of [`LIVE_ENGINE`] is live, so a
+    /// nested reborrow can be refused instead of aliasing.
+    static ENGINE_BORROWED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII loan of `&mut Engine` into the Lua state for the duration of one
+/// plugin dispatch.
+///
+/// # Why a guarded raw pointer and not `Lua::scope`
+///
+/// #1214 requires that a Lua function which was **stored and invoked later**
+/// (kept in a Lua table or the registry and fired from a subsequent event) can
+/// use the immediate API — that is the shape a timer callback and a UI widget
+/// event handler will have. `Lua::scope` cannot express that: everything it
+/// creates is non-`'static` and may not escape the scope, so a callback stored
+/// at load time could not be handed a scoped buffer/window object, and a scoped
+/// *function* cannot be put in the registry at all. Integer handles plus a
+/// pointer parked outside the Lua value graph have no lifetime relationship to
+/// the Lua values that use them, so "stored at load, invoked much later" needs
+/// no special support: whatever dispatch is in flight installs the loan, and
+/// every Lua function reached from it — however it was reached — sees it.
+///
+/// # Borrow discipline (asserted, not assumed)
+///
+/// 1. `EngineLoan` borrows the `Engine` for the loan's whole lifetime, so the
+///    caller cannot touch `self` while Lua may be mutating through the pointer.
+/// 2. Reborrows are short: [`with_live_engine`] hands `&mut Engine` to exactly
+///    one closure and drops it before returning to Lua.
+/// 3. While a reborrow is live, `ENGINE_BORROWED` is set and a nested
+///    [`with_live_engine`] returns `None` (debug builds assert) rather than
+///    creating a second `&mut`.
+/// 4. Nested *dispatch* — Lua → engine edit → event → Lua — cannot happen at
+///    all: `Engine::plugin_event` defers a nested event onto a queue instead of
+///    re-entering Lua (see `Engine::plugin_dispatch_depth`).
+/// 5. Loans nest lexically (`prev` is restored on drop), so an engine that
+///    somehow dispatches from inside a dispatch still restores the outer
+///    pointer rather than clearing it.
+pub(crate) struct EngineLoan<'a> {
+    prev: *mut Engine,
+    /// Holds the `&mut Engine` borrow for the loan's lifetime (rule 1).
+    _borrow: PhantomData<&'a mut Engine>,
+}
+
+impl<'a> EngineLoan<'a> {
+    pub(crate) fn new(engine: &'a mut Engine) -> Self {
+        let ptr: *mut Engine = engine;
+        let prev = LIVE_ENGINE.with(|c| c.replace(ptr));
+        Self {
+            prev,
+            _borrow: PhantomData,
+        }
+    }
+}
+
+impl Drop for EngineLoan<'_> {
+    fn drop(&mut self) {
+        LIVE_ENGINE.with(|c| c.set(self.prev));
+    }
+}
+
+/// Run `f` against the engine currently loaned to Lua.
+///
+/// Returns `None` when there is no live engine (the immediate API was called
+/// outside any plugin dispatch) or when a reborrow is already live.
+pub(crate) fn with_live_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
+    let ptr = LIVE_ENGINE.with(|c| c.get());
+    if ptr.is_null() {
+        return None;
+    }
+    if ENGINE_BORROWED.with(|b| b.replace(true)) {
+        debug_assert!(
+            false,
+            "vimcode immediate API re-entered while the engine was already \
+             borrowed — see EngineLoan's borrow discipline"
+        );
+        return None;
+    }
+    /// Clears the borrow flag even if `f` panics (a Lua error unwinds through
+    /// here), so one failed call cannot wedge the API for the whole session.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            ENGINE_BORROWED.with(|b| b.set(false));
+        }
+    }
+    let _clear = ClearOnDrop;
+    // SAFETY: `ptr` came from `EngineLoan::new(&mut Engine)`, whose lifetime
+    // holds that borrow open; the loan is still on the stack (it is what put a
+    // non-null pointer here, and it nulls/restores the slot on drop), so the
+    // `Engine` is alive and not otherwise aliased. `ENGINE_BORROWED` above
+    // guarantees this is the only live reborrow, and the thread-local keeps
+    // this the same thread that created the loan.
+    let engine: &mut Engine = unsafe { &mut *ptr };
+    Some(f(engine))
+}
+
+/// [`with_live_engine`], but surfacing the "no live engine" case to Lua as a
+/// runtime error rather than a silent `nil`.
+fn live_engine<R>(what: &str, f: impl FnOnce(&mut Engine) -> R) -> LuaResult<R> {
+    with_live_engine(f).ok_or_else(|| {
+        LuaError::RuntimeError(format!(
+            "{what}: no live editor — the immediate vimcode.buffer/vimcode.window \
+             API is only available while a vimcode callback is running"
+        ))
+    })
+}
 
 // ─── Extension panel types ──────────────────────────────────────────────────
 
@@ -1902,7 +2070,210 @@ impl PluginManager {
             })?,
         )?;
 
+        // ── vimcode.buffer / vimcode.window: the immediate API (#1214) ──────
+        Self::setup_live_api(lua, &vimcode)?;
+
         lua.globals().set("vimcode", vimcode)?;
+        Ok(())
+    }
+
+    /// Install `vimcode.buffer.*` and `vimcode.window.*` — the immediate,
+    /// handle-based API that reads and writes through a live `&mut Engine`
+    /// instead of the [`PluginCallContext`] snapshot/queue.
+    ///
+    /// See this module's doc comment for the handle, line-index and cursor
+    /// conventions, and [`EngineLoan`] for the borrow discipline these
+    /// closures depend on.
+    fn setup_live_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        // ── vimcode.buffer ─────────────────────────────────────────────────
+        let buffer = lua.create_table()?;
+
+        // vimcode.buffer.current() → handle of the active buffer
+        buffer.set(
+            "current",
+            lua.create_function(|_, ()| {
+                live_engine("vimcode.buffer.current", |e| e.active_buffer_id().0 as i64)
+            })?,
+        )?;
+
+        // vimcode.buffer.is_valid(buf) → bool
+        buffer.set(
+            "is_valid",
+            lua.create_function(|_, handle: Option<i64>| {
+                let handle = handle.unwrap_or(0);
+                live_engine("vimcode.buffer.is_valid", move |e| {
+                    e.plugin_api_resolve_buf(handle).is_some()
+                })
+            })?,
+        )?;
+
+        // vimcode.buffer.line_count(buf) → logical line count (0 if invalid)
+        buffer.set(
+            "line_count",
+            lua.create_function(|_, handle: Option<i64>| {
+                let handle = handle.unwrap_or(0);
+                live_engine("vimcode.buffer.line_count", move |e| {
+                    e.plugin_api_resolve_buf(handle)
+                        .map(|b| e.plugin_api_line_count(b) as i64)
+                        .unwrap_or(0)
+                })
+            })?,
+        )?;
+
+        // vimcode.buffer.get_lines(buf, start, end) → table of strings,
+        // newline-terminator stripped.
+        buffer.set(
+            "get_lines",
+            lua.create_function(|lua, (handle, start, end): (i64, i64, i64)| {
+                let lines = live_engine("vimcode.buffer.get_lines", move |e| {
+                    e.plugin_api_resolve_buf(handle)
+                        .map(|b| e.plugin_api_get_lines(b, start, end))
+                        .unwrap_or_default()
+                })?;
+                let t = lua.create_table()?;
+                for (i, line) in lines.into_iter().enumerate() {
+                    t.set(i + 1, line)?;
+                }
+                Ok(t)
+            })?,
+        )?;
+
+        // vimcode.buffer.set_lines(buf, start, end, lines) → bool (false when
+        // the handle does not name a live buffer). Takes effect immediately.
+        buffer.set(
+            "set_lines",
+            lua.create_function(
+                |_, (handle, start, end, lines): (i64, i64, i64, LuaTable)| {
+                    let mut new_lines = Vec::new();
+                    for i in 1..=lines.len().unwrap_or(0) {
+                        if let Ok(line) = lines.get::<_, String>(i) {
+                            new_lines.push(line);
+                        }
+                    }
+                    live_engine("vimcode.buffer.set_lines", move |e| {
+                        match e.plugin_api_resolve_buf(handle) {
+                            Some(b) => {
+                                e.plugin_api_set_lines(b, start, end, new_lines);
+                                true
+                            }
+                            None => false,
+                        }
+                    })
+                },
+            )?,
+        )?;
+
+        // vimcode.buffer.create({scratch=bool, name=string}) → handle
+        //
+        // `listed` is deliberately absent: vimcode has no unlisted-buffer
+        // concept yet, and inventing one is outside #1214's seam-only scope.
+        buffer.set(
+            "create",
+            lua.create_function(|_, opts: Option<LuaTable>| {
+                let mut scratch = false;
+                let mut name = None;
+                if let Some(ref t) = opts {
+                    if let Ok(v) = t.get::<_, bool>("scratch") {
+                        scratch = v;
+                    }
+                    if let Ok(v) = t.get::<_, String>("name") {
+                        if !v.is_empty() {
+                            name = Some(v);
+                        }
+                    }
+                }
+                live_engine("vimcode.buffer.create", move |e| {
+                    e.plugin_api_create_buffer(scratch, name).0 as i64
+                })
+            })?,
+        )?;
+
+        vimcode.set("buffer", buffer)?;
+
+        // ── vimcode.window ─────────────────────────────────────────────────
+        let window = lua.create_table()?;
+
+        // vimcode.window.current() → handle of the focused window
+        window.set(
+            "current",
+            lua.create_function(|_, ()| {
+                live_engine("vimcode.window.current", |e| e.active_window_id().0 as i64)
+            })?,
+        )?;
+
+        // vimcode.window.is_valid(win) → bool
+        window.set(
+            "is_valid",
+            lua.create_function(|_, handle: Option<i64>| {
+                let handle = handle.unwrap_or(0);
+                live_engine("vimcode.window.is_valid", move |e| {
+                    e.plugin_api_resolve_win(handle).is_some()
+                })
+            })?,
+        )?;
+
+        // vimcode.window.get_buf(win) → buffer handle (0 when invalid)
+        window.set(
+            "get_buf",
+            lua.create_function(|_, handle: Option<i64>| {
+                let handle = handle.unwrap_or(0);
+                live_engine("vimcode.window.get_buf", move |e| {
+                    e.plugin_api_win_get_buf(handle)
+                        .map(|b| b.0 as i64)
+                        .unwrap_or(0)
+                })
+            })?,
+        )?;
+
+        // vimcode.window.set_buf(win, buf) → bool. Shows `buf` in `win`.
+        window.set(
+            "set_buf",
+            lua.create_function(|_, (win, buf): (i64, i64)| {
+                live_engine("vimcode.window.set_buf", move |e| {
+                    e.plugin_api_win_set_buf(win, buf)
+                })
+            })?,
+        )?;
+
+        // vimcode.window.get_cursor(win) → {line=, col=, [1]=line, [2]=col}
+        // (1-indexed, like vimcode.buf.cursor()).
+        window.set(
+            "get_cursor",
+            lua.create_function(|lua, handle: Option<i64>| {
+                let handle = handle.unwrap_or(0);
+                let pos = live_engine("vimcode.window.get_cursor", move |e| {
+                    e.plugin_api_win_get_cursor(handle)
+                })?;
+                let t = lua.create_table()?;
+                let (line, col) = pos.unwrap_or((1, 1));
+                t.set("line", line)?;
+                t.set("col", col)?;
+                t.set(1, line)?;
+                t.set(2, col)?;
+                Ok(t)
+            })?,
+        )?;
+
+        // vimcode.window.set_cursor(win, {line, col}) → bool. Accepts either
+        // named (`line`/`col`) or positional (`[1]`/`[2]`) fields.
+        window.set(
+            "set_cursor",
+            lua.create_function(|_, (handle, pos): (i64, LuaTable)| {
+                let line = pos
+                    .get::<_, usize>("line")
+                    .or_else(|_| pos.get::<_, usize>(1))
+                    .unwrap_or(1);
+                let col = pos
+                    .get::<_, usize>("col")
+                    .or_else(|_| pos.get::<_, usize>(2))
+                    .unwrap_or(1);
+                live_engine("vimcode.window.set_cursor", move |e| {
+                    e.plugin_api_win_set_cursor(handle, line, col)
+                })
+            })?,
+        )?;
+
+        vimcode.set("window", window)?;
         Ok(())
     }
 }
