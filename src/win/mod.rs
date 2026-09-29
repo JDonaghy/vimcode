@@ -709,7 +709,28 @@ mod win_driver_tests {
     // (target_os = "windows"-gated, `quadraui::win::backend`) reports
     // `native_menu: true` for the first time. Like the rest of this
     // module, only registered as an actual `#[test]` on real Windows —
-    // see the `win_driver_tests` module doc above for why.
+    // see the `win_driver_tests` module doc above for why `cargo xwin test`
+    // can't execute either one from this Linux worktree, or on dell64
+    // (#1558's DLL-load crash, unrelated to and not fixed by this pin).
+    //
+    // RED-verification for these two specifically (distinct from the
+    // module-wide #1558 blanket disclaimer above, which explains why
+    // *neither* test has ever run as an executed `#[test]` on any host):
+    // both assert directly on `WinBackend::backend_caps().native_menu`
+    // being live (`!screen_contains("File")`, `backend_caps().native_menu`
+    // itself). Read against the pin *before* this bump —
+    // `WinBackend::backend_caps()` returned `native_menu: false`
+    // unconditionally (confirmed by reading that struct literal at
+    // `db92e461`, the pre-#1618 pin) — `App::render_content`'s branch would
+    // have kept painting the drawn menu row (`screen_contains("File")` ==
+    // `true`, failing the first test's `!` assertion) and
+    // `h.driver.backend().backend_caps().native_menu` would have been
+    // `false` (failing the second test's `assert!`). Both fail by
+    // construction against the pre-bump pin; neither has been executed as
+    // a running `#[test]` (blocked by #1558, same as scenarios 1-3 above),
+    // so this is a source-level RED confirmation, not an executed one —
+    // stated explicitly here rather than left to the inherited blanket
+    // disclaimer.
 
     /// #1618/quadraui#1200: `WinBackend` now declares `BackendCaps::
     /// native_menu`, so `App::setup` must install the real `HMENU` and

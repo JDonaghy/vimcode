@@ -8631,19 +8631,19 @@ impl quadraui::ShellApp for App {
         let menu_defs = render::build_menu_defs(is_vscode_mode);
         if backend.backend_caps().native_menu {
             let bar = render::menu_defs_to_menu_bar(&menu_defs);
-            // `install_menu_bar`'s only in-tree implementation (macOS's
-            // `MacBackend`) asserts it is called on the real AppKit main
-            // thread and panics otherwise — a documented quadraui
-            // limitation with no portable pre-check exposed through the
-            // `Backend` trait. Every real invocation of `ShellApp::setup`
-            // *is* on the main thread (`quadraui::macos::shell_runner`'s
-            // only entry point), so this never fires outside a test
-            // harness — but `quadraui::macos::testing::driver_with_shell`
-            // (used by `src/macos/mod.rs::mac_driver_tests`) necessarily
-            // calls `setup` from a spawned test thread, same as every
-            // other `#[test]` fn, per Rust's own test runner. Catching it
-            // here keeps `setup()` — which every backend, including the
-            // ones with no native menu, must be able to complete without
+            // `install_menu_bar`'s macOS implementation (`MacBackend`)
+            // asserts it is called on the real AppKit main thread and
+            // panics otherwise — a documented quadraui limitation with no
+            // portable pre-check exposed through the `Backend` trait.
+            // Every real invocation of `ShellApp::setup` *is* on the main
+            // thread (`quadraui::macos::shell_runner`'s only entry point),
+            // so this never fires outside a test harness — but
+            // `quadraui::macos::testing::driver_with_shell` (used by
+            // `src/macos/mod.rs::mac_driver_tests`) necessarily calls
+            // `setup` from a spawned test thread, same as every other
+            // `#[test]` fn, per Rust's own test runner. Catching it here
+            // keeps `setup()` — which every backend, including the ones
+            // with no native menu, must be able to complete without
             // aborting the process — from taking the whole test process
             // down over a call this method doesn't otherwise depend on.
             // Filed upstream: `install_menu_bar` should degrade
@@ -8651,6 +8651,15 @@ impl quadraui::ShellApp for App {
             // helpers already do (`menu_bar_install.rs`'s `let Some(mtm)
             // = MainThreadMarker::new() else { return }`), not hard
             // `.expect()`.
+            //
+            // #1618: `WinBackend` (quadraui#1200) also declares
+            // `native_menu: true` and implements `install_menu_bar` now
+            // (a real Win32 `HMENU` via `SetMenu`), so `MacBackend` is no
+            // longer the *only* in-tree implementation — but Win32's
+            // `SetMenu`/`CreateMenu` calls carry no main-thread assertion
+            // the way AppKit's do, so `catch_unwind` here is a no-op on
+            // that path and this comment's panic-recovery rationale
+            // stays macOS-specific.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 backend.install_menu_bar(&bar);
             }))
