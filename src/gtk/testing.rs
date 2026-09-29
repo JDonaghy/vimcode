@@ -7999,6 +7999,161 @@ second line here
         );
     }
 
+    /// #1514 acceptance, the toast half: a `session/request_permission`
+    /// must paint a toast when the AI panel isn't focused — not just the
+    /// tab-strip `!` badge #1463 already gives a backgrounded session. Here
+    /// the session is the *only* one (so it's technically "foreground" too)
+    /// but the AI panel was never shown/focused — `engine.ai_send_message`
+    /// is called directly, the same "drive the session without touching the
+    /// chat input" shape the toast is supposed to cover, rather than
+    /// clicking into the sidebar first (which would defeat the point of the
+    /// test by focusing the very thing being asserted unfocused).
+    ///
+    /// RED verified: with the `if !self.ai_has_focus { self.push_toast(...) }`
+    /// block deleted from `Engine::acp_handle_permission_request`, this
+    /// fails — the screen never shows "AI agent needs your input", only the
+    /// existing tab-strip badge/native dialog machinery.
+    #[cfg(unix)]
+    #[test]
+    fn permission_request_toasts_when_ai_panel_is_unfocused_via_gtk_driver() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        // Deliberately never shows/focuses the AI panel — `ai_has_focus`
+        // stays false, same as a human working in the editor with the
+        // sidebar on a different panel (or closed).
+        let argv = vec![
+            "sh".to_string(),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            )
+            .to_string(),
+        ];
+        let cwd = std::env::temp_dir();
+        let mut client = crate::core::acp::AcpClient::spawn_with_env(
+            &argv,
+            &cwd,
+            &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
+        )
+        .expect("fixture agent should spawn");
+        client.initialize();
+        engine.acp_mut().client = Some(client);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        assert!(
+            !engine.ai_has_focus,
+            "setup: the AI panel must start unfocused"
+        );
+        engine.ai_send_message("please edit".to_string());
+
+        let mut h = harness(engine, 1400, 900);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("AI agent needs your input")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("AI agent needs your input"),
+            "a permission request on an unfocused AI panel must paint a \
+             toast within 5s"
+        );
+        assert!(
+            h.driver.screen_contains("Edit src/main.rs"),
+            "the toast body must name the tool call waiting on a decision"
+        );
+        assert!(
+            !h.engine.borrow().ai_has_focus,
+            "the toast itself must never steal keyboard focus into the \
+             chat input"
+        );
+    }
+
+    /// #1514 acceptance, the reveal half: with `acp_follow_agent` on, a
+    /// `tool_call`'s own `locations` (`$ACP_FAKE_TOOL_CALL_CARD`) must open
+    /// the file at its line with **no click at all** — GTK's twin of
+    /// `tui_main::app_on_tui_tests::tests::issue_1514_acp_follow_agent::
+    /// acp_follow_agent_reveals_tool_call_location_without_a_click_via_
+    /// shell_app`. Same painted "Ln 3, Col 1"/file name signal that test's
+    /// doc explains is unambiguous proof of an actual open+jump, not just
+    /// an engine field flipping (#587/#592).
+    ///
+    /// RED verified the same way as the TUI twin: with
+    /// `Engine::acp_follow_reveal` stubbed to return immediately, this
+    /// fails — the screen never shows `target.txt`/"Ln 3" since nothing
+    /// opens the file without a click.
+    #[cfg(unix)]
+    #[test]
+    fn acp_follow_agent_reveals_tool_call_location_without_a_click_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "issue-1514-follow-agent-gtk-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "one\ntwo\nthree\nfour\n").unwrap();
+        let target_str = target.to_string_lossy().into_owned();
+
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_follow_agent = true;
+            engine.workspace_root = Some(dir.clone());
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            let argv = vec!["sh".to_string(), fixture.to_string()];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[
+                    ("ACP_FAKE_TOOL_CALL_CARD", "1"),
+                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
+                ],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_mut().client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        // Deliberately never click the resulting tool-call card — the
+        // reveal must happen purely from the `tool_call`'s own `locations`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Ln 3") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("target.txt"),
+            "acp_follow_agent must open the tool call's location's file \
+             with no click at all"
+        );
+        assert!(
+            h.driver.screen_contains("Ln 3"),
+            "acp_follow_agent must move the cursor to the tool call's \
+             location's line (3)"
+        );
+        assert!(
+            h.engine.borrow().ai_has_focus,
+            "revealing a file automatically must never steal keyboard \
+             focus away from the chat input"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1374 (review round 1): see `core::engine::acp_ops::tests::
     /// ensure_no_zsh_newuser_wizard`'s doc comment for the full rationale —
     /// same helper, duplicated here rather than shared because

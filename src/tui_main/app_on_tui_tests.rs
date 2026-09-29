@@ -8502,6 +8502,147 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // #1514: "follow the agent" — `acp_follow_agent` + `:AiFollow`, and the
+    // "session waiting on a permission" toast. GTK twin:
+    // `gtk::testing::acp_follow_agent_reveals_tool_call_location_without_a_
+    // click_via_gtk_driver` / `gtk::testing::
+    // permission_request_toasts_when_ai_panel_is_unfocused_via_gtk_driver`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1514_acp_follow_agent {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// Core acceptance: with `acp_follow_agent` on, a `tool_call`'s own
+        /// `locations` (`$ACP_FAKE_TOOL_CALL_CARD`, the same fixture
+        /// scenario `issue_1511_ai_panel_tool_call_cards`'s sibling test
+        /// drives via an explicit click) must reveal the file at its line
+        /// **without any click at all** — `Engine::acp_upsert_tool_call` ->
+        /// `Engine::acp_follow_reveal`, not the user-initiated
+        /// `Engine::ai_open_tool_call_location` path. Reuses the same
+        /// painted "Ln 3"/`target.txt` signal
+        /// `expanded_card_click_jumps_to_the_tool_calls_location_via_shell_app`
+        /// established as unambiguous proof the editor actually opened and
+        /// jumped, not just that some engine field got set (#587/#592).
+        ///
+        /// Also asserts the chat input never loses keyboard focus
+        /// (`ai_has_focus`) — the issue's "never steal focus from the chat
+        /// input" requirement.
+        ///
+        /// RED verified: on unfixed `develop` (no `acp_follow_agent`
+        /// setting, no `Engine::acp_follow_reveal` call site), this fails —
+        /// the screen never shows `target.txt`/`"Ln 3"` since nothing opens
+        /// the file without a click.
+        #[cfg(unix)]
+        #[test]
+        fn acp_follow_agent_reveals_tool_call_location_without_a_click_via_shell_app() {
+            let dir = std::env::temp_dir()
+                .join(format!("issue-1514-follow-agent-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("target.txt");
+            std::fs::write(&target, "one\ntwo\nthree\nfour\n").unwrap();
+            let target_str = target.to_string_lossy().into_owned();
+
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.settings.acp_follow_agent = true;
+            engine.workspace_root = Some(dir.clone());
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_TOOL_CALL_CARD=1".to_string(),
+                    format!("ACP_FAKE_TOOL_CALL_PATH={target_str}"),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+
+            h.driver.type_char(':');
+            for c in "AI hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+
+            // Deliberately never click the card — the reveal must happen
+            // purely from the `tool_call`'s own `locations`.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = h.driver.screen();
+            while !screen.contains("Ln 3") && Instant::now() < deadline {
+                h.driver.tick();
+                screen = h.driver.screen();
+            }
+            assert!(
+                screen.contains("target.txt"),
+                "acp_follow_agent must open the tool call's location's \
+                 file with no click at all; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("Ln 3"),
+                "acp_follow_agent must move the cursor to the tool call's \
+                 location's line (3); screen:\n{screen}"
+            );
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "revealing a file automatically must never steal keyboard \
+                 focus away from the chat input"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `:AiFollow` toggles `settings.acp_follow_agent` and echoes the
+        /// new state on the command line — the only UI this ex command has.
+        ///
+        /// RED verified: `:AiFollow` doesn't exist on unfixed `develop`, so
+        /// the command line would show an "Unknown command" style message
+        /// instead of either of the asserted strings.
+        #[test]
+        fn ai_follow_command_toggles_and_echoes_status_via_shell_app() {
+            let engine = plain_engine();
+            let mut h = harness(engine);
+            assert!(!h.engine.borrow().settings.acp_follow_agent);
+
+            h.driver.type_char(':');
+            for c in "AiFollow".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            assert!(h.engine.borrow().settings.acp_follow_agent);
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("follow-the-agent mode: on"),
+                "toggling :AiFollow on must echo confirmation on the \
+                 command line; screen:\n{screen}"
+            );
+
+            h.driver.type_char(':');
+            for c in "AiFollow".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            assert!(!h.engine.borrow().settings.acp_follow_agent);
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("follow-the-agent mode: off"),
+                "toggling :AiFollow off again must echo confirmation; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // #1512: AI panel queues a message typed while the agent is busy.
     // GTK twin: `gtk::testing::issue_1512_queue_message_while_busy`.
     // ─────────────────────────────────────────────────────────────────────
