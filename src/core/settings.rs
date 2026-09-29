@@ -771,6 +771,20 @@ pub struct Settings {
     #[serde(default)]
     pub acp_review_on_turn_end: AcpReviewOnTurnEnd,
 
+    /// "Follow the agent" (#1514, Zed-style): when on, every file an ACP
+    /// agent touches — a served `fs/read_text_file`/`fs/write_text_file`
+    /// request, or a `tool_call`/`tool_call_update`'s `locations` — is
+    /// revealed at its line in the last-used editor window
+    /// (`Engine::acp_follow_reveal`), so the user doesn't have to chase
+    /// `→ path:line` text in the transcript. Never steals keyboard focus
+    /// from the chat input — it only moves the *editor* cursor/viewport,
+    /// leaving `ai_has_focus`/`sidebar_focus_requested` untouched. **Default
+    /// off**: an agent that reads dozens of files while exploring would
+    /// otherwise yank the visible editor around on every one of them.
+    /// Toggled via `:AiFollow`.
+    #[serde(default)]
+    pub acp_follow_agent: bool,
+
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer. Default **true**
     /// (#1545), matching VS Code — dotfiles like `.vscode`, `.github` and
@@ -1840,6 +1854,7 @@ impl Default for Settings {
             acp_reopen_last_session: false,
             acp_mcp_servers: Vec::new(),
             acp_review_on_turn_end: AcpReviewOnTurnEnd::default(),
+            acp_follow_agent: false,
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
             explorer_exclude: default_explorer_exclude(),
@@ -3859,6 +3874,7 @@ impl Settings {
                 AcpReviewOnTurnEnd::Badge => "badge".to_string(),
                 AcpReviewOnTurnEnd::Off => "off".to_string(),
             },
+            "acp_follow_agent" => self.acp_follow_agent.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -4027,6 +4043,7 @@ impl Settings {
                     _ => return Err(format!("Unknown acp_review_on_turn_end value: {value}")),
                 };
             }
+            "acp_follow_agent" => self.acp_follow_agent = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4652,6 +4669,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Enum(&["auto", "badge", "off"]),
     },
     SettingDef {
+        key: "acp_follow_agent",
+        label: "Follow Agent",
+        description: "Reveal every file the ACP agent reads/writes/touches at its line in the last-used editor window, without stealing focus from the chat input (off by default)",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "indent_guides",
         label: "Indent Guides",
         description: "Show vertical lines at each indentation level",
@@ -5244,6 +5268,21 @@ mod tests {
         assert!(SETTING_DEFS
             .iter()
             .any(|d| d.key == "acp_reopen_last_session"));
+    }
+
+    /// #1514's "follow the agent" setting: same default-off/round-trip/
+    /// registry contract as `acp_reopen_last_session` above.
+    #[test]
+    fn acp_follow_agent_defaults_off_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert!(!s.acp_follow_agent);
+        assert_eq!(s.get_value_str("acp_follow_agent"), "false");
+
+        s.set_value_str("acp_follow_agent", "true").unwrap();
+        assert!(s.acp_follow_agent);
+        assert_eq!(s.get_value_str("acp_follow_agent"), "true");
+
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "acp_follow_agent"));
     }
 
     /// #1515's `acp_review_on_turn_end` setting: defaults to `"badge"` (not

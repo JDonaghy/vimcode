@@ -1235,6 +1235,25 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiFollow — toggle "follow the agent" (#1514, Zed-style):
+        // `settings.acp_follow_agent`. While on, every file the ACP agent
+        // touches (a served `fs/read_text_file`/`fs/write_text_file`, or a
+        // `tool_call`/`tool_call_update`'s `locations`) is revealed at its
+        // line in the last-used editor window without stealing keyboard
+        // focus from the chat input — see `Engine::acp_follow_reveal`'s doc.
+        if cmd == "AiFollow" {
+            self.settings.acp_follow_agent = !self.settings.acp_follow_agent;
+            self.message = format!(
+                "AI follow-the-agent mode: {}",
+                if self.settings.acp_follow_agent {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            return EngineAction::None;
+        }
+
         // :AiAgent          — list configured agents (settings.acp_agents)
         //                     and which is active (#958, ACP-7)
         // :AiAgent <name>   — switch the active agent; takes effect on the

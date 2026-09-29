@@ -1765,6 +1765,10 @@ impl Engine {
         };
         match self.acp_read_text_file(std::path::Path::new(&req.path), req.line, req.limit) {
             Ok(content) => {
+                // #1514: reveal what the agent just read, when "follow the
+                // agent" is on — after the read itself succeeds, so a
+                // rejected/invalid request never moves the editor.
+                self.acp_follow_reveal(std::path::Path::new(&req.path), req.line);
                 if let Some(client) = self.acp_mut().client.as_ref() {
                     client.respond_to_client_request(
                         request_id,
@@ -1773,6 +1777,71 @@ impl Engine {
                 }
             }
             Err(msg) => self.acp_respond_error(request_id, &msg),
+        }
+    }
+
+    /// "Follow the agent" (#1514, Zed-style): reveal `path` at `line`
+    /// (1-based, the ACP wire convention every caller here already has —
+    /// [`crate::core::acp::ReadTextFileParams::line`], a tool call's
+    /// `locations` entry — same convention [`Self::ai_open_tool_call_location`]
+    /// takes for the user-initiated "click a card to jump to its location"
+    /// gesture, #1511) in the last-used editor window, when
+    /// `settings.acp_follow_agent` is on. A silent no-op when the setting is
+    /// off (the default), when `path` can't be resolved inside
+    /// [`Self::acp_workspace_roots`], or when it doesn't name a real file
+    /// (e.g. a `tool_call` location for a path the agent hasn't created
+    /// yet).
+    ///
+    /// Unlike [`Self::ai_open_tool_call_location`] (an explicit, one-off
+    /// user click), this fires automatically on *every* served
+    /// `fs/read_text_file`/`fs/write_text_file` and every `tool_call`/
+    /// `tool_call_update` with `locations` — an agent can easily touch
+    /// dozens of files in one turn while exploring. Two differences follow
+    /// from that:
+    /// - Resolution goes through [`crate::core::acp::resolve_path_within_roots`]
+    ///   (the same safety check `fs/write_text_file` uses) rather than a bare
+    ///   "join the workspace cwd" — this is unattended, so there's no reason
+    ///   to let an agent point the editor at an arbitrary filesystem path
+    ///   outside the workspace, even for a read-only reveal.
+    /// - It opens in [`OpenMode::Preview`], not `Permanent`: a permanent tab
+    ///   per file would otherwise leave dozens behind from one turn — the
+    ///   same "dimmed tab, replaced by the next one" behaviour a file
+    ///   explorer single-click already gives. The cursor-placement half
+    ///   (`active_window_id` + `set_cursor_for_window` +
+    ///   `ensure_cursor_visible`) is shared with
+    ///   [`Self::ai_open_tool_call_location`] verbatim.
+    ///
+    /// Never touches keyboard focus: `open_file_with_mode`/
+    /// `switch_window_buffer`/`set_cursor_for_window` only mutate
+    /// `self.active_window`'s buffer/view and the buffer manager — none of
+    /// the sidebar focus flags (`ai_has_focus`, `sidebar_focus_requested`)
+    /// the chat input's caret depends on. Because focusing the AI panel
+    /// (`focus_sidebar_panel`) never touches `self.active_group`/
+    /// `self.active_window` either, "the last-used editor window" is simply
+    /// whatever window was active before the user moved into the chat
+    /// input — exactly what the issue asks for.
+    pub(crate) fn acp_follow_reveal(&mut self, path: &Path, line: Option<u32>) {
+        if !self.settings.acp_follow_agent {
+            return;
+        }
+        let roots = self.acp_workspace_roots();
+        let Ok(resolved) = crate::core::acp::resolve_path_within_roots(path, &roots) else {
+            return;
+        };
+        if !resolved.is_file() {
+            return;
+        }
+        if self
+            .open_file_with_mode(&resolved, OpenMode::Preview)
+            .is_err()
+        {
+            return;
+        }
+        if let Some(line) = line {
+            let wid = self.active_window_id();
+            let line0 = (line as usize).saturating_sub(1);
+            self.set_cursor_for_window(wid, line0, 0);
+            self.ensure_cursor_visible();
         }
     }
 
@@ -1818,6 +1887,9 @@ impl Engine {
         };
         match self.acp_write_text_file(std::path::Path::new(&req.path), &req.content) {
             Ok(()) => {
+                // #1514: reveal what the agent just wrote, when "follow the
+                // agent" is on. No line info on a whole-file write.
+                self.acp_follow_reveal(std::path::Path::new(&req.path), None);
                 if let Some(client) = self.acp_mut().client.as_ref() {
                     client.respond_to_client_request(request_id, Ok(serde_json::Value::Null));
                 }
@@ -2084,6 +2156,11 @@ impl Engine {
     /// agent's real writes is what the turn-review surface (#1460, #1516)
     /// is for.
     fn acp_upsert_tool_call(&mut self, call: crate::core::acp::AcpToolCall) {
+        // #1514: reveal a location this call already carries at creation
+        // time (some agents send it on the initial `tool_call`, not only a
+        // later `tool_call_update`) — before the move into `tool_calls`
+        // below.
+        self.acp_follow_reveal_locations(&call.locations);
         match self
             .acp_mut()
             .tool_calls
@@ -2107,6 +2184,18 @@ impl Engine {
         }
     }
 
+    /// "Follow the agent" (#1514) for a tool call's `locations` list:
+    /// reveal the first entry via [`Self::acp_follow_reveal`] — a tool call
+    /// rarely carries more than one, and revealing every one in a list
+    /// would just make the editor jump around repeatedly for a single
+    /// `session/update`. A no-op on an empty list (most tool calls carry
+    /// none).
+    fn acp_follow_reveal_locations(&mut self, locations: &[(String, Option<u32>)]) {
+        if let Some((path, line)) = locations.first() {
+            self.acp_follow_reveal(Path::new(path), *line);
+        }
+    }
+
     /// Apply a `tool_call_update` patch by id: `status`, when present,
     /// replaces the call's status — the `pending -> in_progress ->
     /// completed | failed` transition the issue's acceptance bar checks —
@@ -2122,6 +2211,10 @@ impl Engine {
     /// and nothing is written from a `diff` block arriving on an update
     /// either.
     fn acp_apply_tool_call_update(&mut self, update: crate::core::acp::AcpToolCallUpdate) {
+        // #1514: locations this update replaces `call.locations` with, if
+        // any — captured to reveal *after* the mutable borrow of `call`
+        // below ends (`acp_follow_reveal` needs its own `&mut self`).
+        let mut revealed_locations: Option<Vec<(String, Option<u32>)>> = None;
         let Some(call) = self
             .acp_mut()
             .tool_calls
@@ -2137,7 +2230,8 @@ impl Engine {
             call.content = blocks;
         }
         if let Some(locations) = update.locations {
-            call.locations = locations;
+            call.locations = locations.clone();
+            revealed_locations = Some(locations);
         }
         // #1511: same "present replaces" contract as content/locations
         // above — most agents don't know `rawOutput` until the tool
@@ -2147,6 +2241,9 @@ impl Engine {
         }
         if let Some(raw_output) = update.raw_output {
             call.raw_output = Some(raw_output);
+        }
+        if let Some(locations) = revealed_locations {
+            self.acp_follow_reveal_locations(&locations);
         }
     }
 
@@ -2442,6 +2539,22 @@ impl Engine {
         // parking.
         if is_foreground {
             self.show_dialog("acp_permission", &title, body, buttons);
+        }
+        // #1514: a toast, not just the tab-strip `!` badge above — any
+        // session waiting on a permission decision while the AI panel isn't
+        // focused is otherwise easy to miss entirely: a backgrounded
+        // session's badge lives on a tab the human isn't looking at, and
+        // even a *foreground* session's modal dialog is only obvious if the
+        // human's eyes are actually on this window right now. `ai_has_focus`
+        // (not `is_foreground`) is the right gate — it's "is the human
+        // already looking at the chat input", which is the only case this
+        // toast would be pure noise on top of.
+        if !self.ai_has_focus {
+            self.push_toast(
+                "AI agent needs your input",
+                &format!("\"{}\" is waiting for permission", title),
+                quadraui::ToastSeverity::Warning,
+            );
         }
         self.acp_mut().pending_permission = Some((request_id, req));
     }
