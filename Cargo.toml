@@ -268,17 +268,21 @@ win = ["quadraui/win"]
 # while `win::run`'s outer call already holds `ws.state.borrow_mut()` —
 # `wndproc`'s existing `pump_depth.is_pumping()` re-entrancy guard (#702)
 # does not cover this path, since it fires during window creation, before
-# the main message pump starts. Confirmed present starting at quadraui
-# `90e4310` (the native-menu-bar commit) through `cc2b80d` and `928f2b5`
-# (same panic site, same 100%-reproducible startup crash at each); the
-# immediately-prior pin (`db92e46`, still below) launches cleanly — real
-# window, `Get-Process` shows `Responding: True`. Full repro, isolation
-# steps and stack trace are in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
-# entry — file that as a quadraui issue and get a fix merged before
-# attempting this bump again. Leave vimcode#1559/#1562/#1582 open behind
-# it; none of the three can be verified end-to-end while Win-GUI can't
-# start.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "db92e461ca5376103d3147d5267b697cbe002063", features = ["tui", "terminal"] }
+# the main message pump starts. Filed as JDonaghy/quadraui#1213.
+#
+# #1618 (refile of #1614) bumps to `6e14d8a` (quadraui `develop` HEAD),
+# which contains the fix for #1213 on top of the three Win-GUI fixes above:
+# `ce1c763` arms a `ModalPumpGuard` around `install_menu_bar_now`'s `SetMenu`
+# call so the nested `WM_SIZE` it triggers bounces off wndproc's existing
+# `pump_depth.is_pumping()` re-entrancy guard instead of re-entering the
+# already-borrowed `ws.state`, and `6e14d8a` adds a live wndproc regression
+# test for it. No further vimcode-side change was needed to pick any of
+# #1197/#1199/#1200 up — `App::setup`'s `native_menu` arm and
+# `App::render_content`'s `backend_caps()` three-way branch (both already
+# in `src/app.rs`, unrelated to this bump) already handle whatever
+# `WinBackend::backend_caps()` reports, and picked these three flags up for
+# free purely from the pin moving.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "6e14d8a081929cb5c6792c91e15e5ffa26fc47da", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
