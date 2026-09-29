@@ -3612,6 +3612,20 @@ impl Engine {
                 self.ai_leader_toggle_pending.clear();
                 false
             }
+            // #1509 (quadraui#1137): the clickable Send/Stop segment reads
+            // "Stop" while `ChatController::set_busy(true)` — i.e. exactly
+            // while `engine.acp().ai_streaming` — and clicking it there
+            // emits this event instead of touching the input buffer.
+            // Routes to the identical `session/cancel` path as `Ctrl+C`
+            // below rather than a full `ai_clear`: a mouse "Stop" click is
+            // the same "abort the running turn, keep the conversation"
+            // gesture, just via click instead of keyboard.
+            // `acp_cancel_turn` is a documented no-op with no session in
+            // flight, so no extra guard is needed here.
+            Ev::StopRequested => {
+                self.acp_cancel_turn();
+                true
+            }
             // Ctrl+C: clear the conversation. `ChatController` has no
             // built-in binding for it (only Escape/Ctrl+S/Alt+Enter/
             // Ctrl+Enter/PageUp/PageDown/Ctrl+A/Ctrl+E are handled

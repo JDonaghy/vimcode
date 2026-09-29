@@ -620,6 +620,18 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub ai_attach_current_buffer: bool,
 
+    /// Whether plain `Enter` submits the AI panel's input (Zed-style), or
+    /// inserts a newline like today's default (#1509, quadraui#1137).
+    /// Plumbed straight through to
+    /// [`quadraui::ChatController::set_submit_on_enter`] every
+    /// `populate_ai_chat_controller` call (`crate::render`) — see that
+    /// method's own doc for the full keybinding table in each mode.
+    /// Default: true (Zed parity) — set to `false` to keep the pre-#1509
+    /// behaviour where `Enter` always inserts a newline and
+    /// `Ctrl+S`/`Alt+Enter`/`Ctrl+Enter` submit.
+    #[serde(default = "default_true")]
+    pub ai_chat_submit_on_enter: bool,
+
     /// ACP (Agent Client Protocol) agent command line, e.g.
     /// `"claude-code-acp"` — parsed into argv via
     /// `crate::core::acp::parse_agent_command`. The agent is spawned with
@@ -1780,6 +1792,7 @@ impl Default for Settings {
             ai_base_url: String::new(),
             ai_completions: false,
             ai_attach_current_buffer: default_true(),
+            ai_chat_submit_on_enter: default_true(),
             acp_agent_command: String::new(),
             acp_agents: Vec::new(),
             acp_active_agent: String::new(),
@@ -2826,6 +2839,7 @@ impl Settings {
             "splitright" | "spr" => self.splitright = enable,
             "ai_completions" => self.ai_completions = enable,
             "ai_attach_current_buffer" => self.ai_attach_current_buffer = enable,
+            "ai_chat_submit_on_enter" => self.ai_chat_submit_on_enter = enable,
             "formatonsave" | "fos" => self.format_on_save = enable,
             "showhiddenfiles" | "shf" => self.show_hidden_files = enable,
             "explorersortcaseinsensitive" | "esci" => self.explorer_sort_case_insensitive = enable,
@@ -3795,6 +3809,7 @@ impl Settings {
             "ai_base_url" => self.ai_base_url.clone(),
             "ai_completions" => self.ai_completions.to_string(),
             "ai_attach_current_buffer" => self.ai_attach_current_buffer.to_string(),
+            "ai_chat_submit_on_enter" => self.ai_chat_submit_on_enter.to_string(),
             "acp_agent_command" => self.acp_agent_command.clone(),
             "acp_reopen_last_session" => self.acp_reopen_last_session.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
@@ -3954,6 +3969,7 @@ impl Settings {
             "ai_base_url" => self.ai_base_url = value.to_string(),
             "ai_completions" => self.ai_completions = value == "true",
             "ai_attach_current_buffer" => self.ai_attach_current_buffer = value == "true",
+            "ai_chat_submit_on_enter" => self.ai_chat_submit_on_enter = value == "true",
             "acp_agent_command" => self.acp_agent_command = value.to_string(),
             "acp_reopen_last_session" => self.acp_reopen_last_session = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
@@ -4549,6 +4565,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         key: "ai_attach_current_buffer",
         label: "Attach Current Buffer",
         description: "Attach the active buffer's path to every ACP prompt so the agent knows which file the user is looking at",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
+        key: "ai_chat_submit_on_enter",
+        label: "Submit AI Message on Enter",
+        description: "Plain Enter sends the AI panel message (Zed-style); Shift+Enter/Alt+Enter inserts a newline. Off keeps Enter as newline, with Ctrl+S/Alt+Enter/Ctrl+Enter to send",
         category: "AI",
         setting_type: SettingType::Bool,
     },

@@ -20196,6 +20196,13 @@ pub fn populate_ai_chat_controller(
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     chat.set_busy(engine.acp().ai_streaming);
+    // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
+    // `ChatController` every call — cheap enough to set unconditionally
+    // (`ChatController::set_submit_on_enter` is a plain field write) and
+    // this is the one place both backends already funnel through before
+    // every `render()`/`handle()` pass, so a `:set` toggle takes effect on
+    // the very next frame without either backend needing its own wiring.
+    chat.set_submit_on_enter(engine.settings.ai_chat_submit_on_enter);
     // #1508: advance the status-strip's `Spinner` primitive to the frame
     // `Engine::tick_ai_spinner` last stamped (`poll_idle`, ≥4 Hz while busy
     // — see `App::tick_dispatch`'s `request_frame_in` re-arm). Harmless to
@@ -20278,7 +20285,7 @@ pub fn populate_ai_chat_controller(
     }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
     chat.set_hint(Some(quadraui::StyledText::colored(
-        ai_chat_hint_line(backend),
+        ai_chat_hint_line(backend, engine.settings.ai_chat_submit_on_enter),
         theme.comment,
     )));
 }
@@ -20375,7 +20382,17 @@ fn ai_busy_status_text(engine: &Engine) -> String {
 /// [`Engine::ai_leader_toggle_key`], called from this same
 /// `route_ai_chat_event`) — so both are named rather than just `Esc` alone,
 /// closing the discoverability gap #1507 reports for the focus toggle too.
-fn ai_chat_hint_line(backend: &dyn quadraui::Backend) -> String {
+///
+/// `submit_on_enter` (#1509, `Settings::ai_chat_submit_on_enter`) flips which
+/// key does what, per [`quadraui::ChatController`]'s own *Keyboard
+/// behaviour* doc: when `true` (the default, Zed parity) plain `Enter` sends
+/// and `Shift+Enter`/`Alt+Enter` insert a newline instead; when `false`
+/// (the pre-#1509 default) `Enter` always inserts a newline and the
+/// `send_keys` chord below sends. Either way `Ctrl+S`/`Ctrl+Enter` (when
+/// available) still send, matching `ChatController::handle`'s "in both
+/// modes" bindings — but the hint only needs to name the *primary* gesture
+/// for whichever mode is active, not every equivalent chord.
+fn ai_chat_hint_line(backend: &dyn quadraui::Backend, submit_on_enter: bool) -> String {
     let caps = backend.backend_caps();
     let send_keys = if caps.generic_font_families {
         "Ctrl+Enter".to_string()
@@ -20388,7 +20405,12 @@ fn ai_chat_hint_line(backend: &dyn quadraui::Backend) -> String {
     // actual character — the same convention every other leader-sequence
     // hint in this codebase uses (e.g. `mod.rs`'s command-palette
     // `shortcut: "<leader>sw"` fields), not a literal re-expansion.
-    format!("\u{23ce} newline \u{b7} {send_keys} send \u{b7} ^C stop \u{b7} Esc/<leader>ai editor")
+    let entry_line = if submit_on_enter {
+        "\u{23ce} send \u{b7} \u{21e7}\u{23ce} newline".to_string()
+    } else {
+        format!("\u{23ce} newline \u{b7} {send_keys} send")
+    };
+    format!("{entry_line} \u{b7} ^C stop \u{b7} Esc/<leader>ai editor")
 }
 
 /// Paint the slash-command or `@`-mention completion popup above the AI

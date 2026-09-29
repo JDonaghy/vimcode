@@ -6637,7 +6637,7 @@ mod tests {
         /// production `alt_resized_sidebar_width` (`current + 1`, clamped
         /// at `ALT_SIDEBAR_WIDTH_MAX = 150`) takes the 20-cell default to
         /// 60, comfortably past this hint's ~57-character width.
-        fn ai_panel_harness_widened() -> crate::harness::ConformanceHarness<
+        pub(super) fn ai_panel_harness_widened() -> crate::harness::ConformanceHarness<
             quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
         > {
             let mut engine = plain_engine();
@@ -6824,9 +6824,15 @@ mod tests {
         /// still be replayed into the chat input rather than silently
         /// dropped. Concrete repro from the review: type the leader (Space)
         /// then `a` — both buffered, nothing visible yet — then press Enter
-        /// to start a second line (`submit_on_enter` defaults to `false`,
-        /// so Enter inserts a newline rather than submitting) before typing
-        /// the rest of the message.
+        /// to start a second line before typing the rest of the message.
+        /// `ai_chat_submit_on_enter` is forced `false` here (#1509 flipped
+        /// its default to `true`, Zed parity — see
+        /// `issue_1509_ai_chat_submit_on_enter_and_stop`) so plain Enter
+        /// still inserts a newline rather than submitting: this test is
+        /// about the leader-prefix replay, not about which key sends, and
+        /// keeping it pinned to the newline-on-Enter mode is what makes the
+        /// two-line " a\nrest" assertion below meaningful regardless of the
+        /// setting's default.
         ///
         /// RED verified against this fix removed (i.e. `route_ai_chat_event`
         /// only ever consulting `ai_leader_toggle_key` for a plain,
@@ -6836,6 +6842,7 @@ mod tests {
         #[test]
         fn leader_prefix_interrupted_by_enter_is_replayed_not_dropped_via_shell_app() {
             let mut h = ai_panel_harness_widened();
+            h.engine.borrow_mut().settings.ai_chat_submit_on_enter = false;
             // Gain focus first via a full `<leader>ai` (this goes through
             // `Engine::handle_leader_key`'s "ai" arm, not
             // `ai_leader_toggle_key` — the panel doesn't have focus yet, so
@@ -7105,6 +7112,273 @@ mod tests {
                 "the spinner glyph painted on screen right before the \
                  tool-call title must change every so often while a turn \
                  is streaming, not stay frozen at its starting glyph"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1509: AI panel adopts wrapping/auto-grow input and `Enter`-sends
+    // (`submit_on_enter`) with a Send/Stop segment (quadraui#1136/#1137).
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1509_ai_chat_submit_on_enter_and_stop_segment {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// An ACP agent registry pointing at the shared echo fixture — every
+        /// test below needs a live (fake) agent so a `Submit` actually
+        /// completes a turn deterministically, with no real network call
+        /// and no dependence on whether `ANTHROPIC_API_KEY` happens to be
+        /// set in the ambient environment (`Engine::ai_send_message`'s
+        /// direct-provider fallback would otherwise spawn a real `curl`).
+        fn fixture_agent(extra_env: &[&str]) -> crate::core::acp::AcpAgentProfile {
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: extra_env.iter().map(|s| s.to_string()).collect(),
+                mcp_servers: Vec::new(),
+            }
+        }
+
+        /// Same widening (`Alt+Right` x40) as
+        /// `ai_panel_hint_and_focus_toggle::ai_panel_harness_widened`, plus
+        /// a configured fixture agent — built fresh per test since each one
+        /// wants different `extra_env`.
+        fn widened_harness_with_agent(
+            extra_env: &[&str],
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            engine.settings.acp_agents = vec![fixture_agent(extra_env)];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// #1509 acceptance: `ai_chat_submit_on_enter` defaults to `true`
+        /// (Zed parity, quadraui#1137) — typing a message into the focused
+        /// AI panel and pressing plain `Enter` (no modifiers) must actually
+        /// send it, not insert a newline. Proven by the fake agent's own
+        /// echoed "Hello world" reply reaching the screen: that text can
+        /// only paint once `session/prompt` was actually dispatched, which
+        /// only happens if `Enter` triggered `ChatControllerEvent::Submit`
+        /// (`quadraui::ChatController::handle`, driven by
+        /// `Settings::ai_chat_submit_on_enter` via
+        /// `render::populate_ai_chat_controller`'s
+        /// `chat.set_submit_on_enter` call) rather than `ChatController`'s
+        /// own newline-insertion path.
+        ///
+        /// RED verified: with `populate_ai_chat_controller`'s
+        /// `chat.set_submit_on_enter(...)` call removed (leaving
+        /// `ChatController`'s own hardcoded `submit_on_enter: false`
+        /// default in effect, the pre-#1509 behaviour this issue changes),
+        /// this fails — plain `Enter` only inserts a newline, the message
+        /// is never sent, and "Hello world" never reaches the screen within
+        /// the deadline.
+        #[cfg(unix)]
+        #[test]
+        fn default_submit_on_enter_sends_message_on_plain_enter_via_shell_app() {
+            let mut h = widened_harness_with_agent(&[]);
+            let driver = &mut h.driver;
+
+            driver.type_char(' ');
+            driver.type_char('a');
+            driver.type_char('i');
+            driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = h.driver.screen();
+            while !screen.contains("Hello world") && Instant::now() < deadline {
+                h.driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = h.driver.screen();
+            }
+            assert!(
+                screen.contains("Hello world"),
+                "plain Enter must submit the message by default (#1509) — \
+                 the fake agent's echoed reply never reached the screen \
+                 within the deadline; screen:\n{screen}"
+            );
+        }
+
+        /// #1509 acceptance: `ai_chat_submit_on_enter = false` must keep the
+        /// pre-#1509 behaviour — plain `Enter` inserts a newline instead of
+        /// sending — while the always-available `Ctrl+S` chord still sends.
+        /// Proves the setting genuinely gates the behaviour rather than the
+        /// default simply being read once at startup: the message must
+        /// *not* reach the fake agent (no "Hello world" reply, even after
+        /// several driven ticks) until `Ctrl+S` is pressed.
+        ///
+        /// RED verified: with `chat.set_submit_on_enter` hardcoded to
+        /// `true` regardless of the setting (ignoring
+        /// `engine.settings.ai_chat_submit_on_enter`), this fails — plain
+        /// `Enter` sends immediately and "Hello world" appears well before
+        /// `Ctrl+S` is ever pressed, at the first wait loop's very first
+        /// iteration.
+        #[cfg(unix)]
+        #[test]
+        fn submit_on_enter_false_keeps_enter_as_newline_via_shell_app() {
+            let mut h = widened_harness_with_agent(&[]);
+            h.engine.borrow_mut().settings.ai_chat_submit_on_enter = false;
+            let driver = &mut h.driver;
+
+            driver.type_char(' ');
+            driver.type_char('a');
+            driver.type_char('i');
+            driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "hi\n",
+                "with the setting off, plain Enter must insert a newline \
+                 into the input rather than submitting it"
+            );
+
+            // Give any wrongly-sent request a few ticks to arrive — it must
+            // not, since nothing has submitted yet.
+            for _ in 0..10 {
+                h.driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !h.driver.screen().contains("Hello world"),
+                "the message must not have been sent yet — Enter only \
+                 inserted a newline"
+            );
+
+            // `Ctrl+S` still sends in both `submit_on_enter` modes
+            // (`ChatController::handle`'s own doc).
+            h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char('s'),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                repeat: false,
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = h.driver.screen();
+            while !screen.contains("Hello world") && Instant::now() < deadline {
+                h.driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = h.driver.screen();
+            }
+            assert!(
+                screen.contains("Hello world"),
+                "Ctrl+S must still submit the message even with \
+                 ai_chat_submit_on_enter off; screen:\n{screen}"
+            );
+        }
+
+        /// #1509 acceptance (quadraui#1137): clicking the Send/Stop segment
+        /// while a turn is streaming (it reads "Stop" then) must abort the
+        /// turn via the same `session/cancel` path as `Ctrl+C`
+        /// (`Engine::acp_cancel_turn`) — `Engine::dispatch_ai_chat_event`'s
+        /// `ChatControllerEvent::StopRequested` arm. The fixture's
+        /// `$ACP_FAKE_TOOL_CALL_HANGS` announces one `in_progress` tool
+        /// call and then never answers `session/prompt`, so the scenario
+        /// stays busy (and the segment keeps reading "Stop") until this
+        /// click cancels it.
+        ///
+        /// Asserts on rendered output only: the transcript's
+        /// `"[cancelled by user]"` line (`acp_cancel_turn`'s own message)
+        /// must paint, and the busy tool-call status line must be gone —
+        /// never an internal `ai_streaming` flag read in isolation.
+        ///
+        /// RED verified: with `Engine::dispatch_ai_chat_event`'s
+        /// `Ev::StopRequested => { self.acp_cancel_turn(); true }` arm
+        /// removed (falling through to the catch-all `_ => true`, a no-op),
+        /// this fails — the click is consumed but nothing happens: the
+        /// screen still shows the busy "execute: Run the tests" status
+        /// line and never shows "[cancelled by user]", even after waiting
+        /// out the full deadline.
+        #[cfg(unix)]
+        #[test]
+        fn clicking_stop_segment_cancels_the_turn_via_shell_app() {
+            let mut h = widened_harness_with_agent(&["ACP_FAKE_TOOL_CALL_HANGS=1"]);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(6);
+            let mut screen = driver.screen();
+            while !screen.contains("execute: Run the tests \u{b7}") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("execute: Run the tests \u{b7}"),
+                "setup: the fixture's hung tool call must show up as busy \
+                 first; screen:\n{screen}"
+            );
+
+            let (x, y) = driver
+                .find("Stop")
+                .expect("the Send/Stop segment must read \"Stop\" while busy");
+            driver.click(x, y);
+            driver.render();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("[cancelled by user]") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("[cancelled by user]"),
+                "clicking the Stop segment must abort the turn via \
+                 session/cancel, same as Ctrl+C; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("execute: Run the tests \u{b7}"),
+                "the busy tool-call status line must be gone once the \
+                 turn is cancelled; screen:\n{screen}"
             );
         }
     }
