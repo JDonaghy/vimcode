@@ -1,0 +1,12 @@
+> {"id":1,"jsonrpc":"2.0","method":"initialize","params":{"clientCapabilities":{"auth":{"terminal":true},"fs":{"readTextFile":true,"writeTextFile":true}},"clientInfo":{"name":"vimcode","version":"0.13.0"},"protocolVersion":1}}
+< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":true,"sawWriteCap":true,"sawAuthTerminalCap":true},"authMethods":[]}}
+> {"id":2,"jsonrpc":"2.0","method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}
+< {"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}
+> {"id":3,"jsonrpc":"2.0","method":"session/prompt","params":{"prompt":[{"text":"hi","type":"text"}],"sessionId":"sess-1"}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit __FIXTURE_DIR__/target.txt","kind":"edit","status":"pending","locations":[{"path":"__FIXTURE_DIR__/target.txt","line":1}]}}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"in_progress"}}}
+< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","content":[{"type":"diff","path":"__FIXTURE_DIR__/target.txt","oldText":"old line\n","newText":"new line\n"}]}}}
+< {"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}

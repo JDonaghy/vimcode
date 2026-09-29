@@ -433,6 +433,58 @@ pub struct WindowGeometry {
     pub maximized: bool,
 }
 
+impl WindowGeometry {
+    /// Clamp a saved `x`/`y`/`width`/`height` so a monitor that was
+    /// unplugged (or swapped for a smaller one) since the geometry was
+    /// saved can never strand the restored window off-screen or oversized
+    /// (#1529).
+    ///
+    /// Position: if `x`/`y` fall inside some connected display's `bounds`,
+    /// that display becomes the clamp target and they pass through
+    /// unchanged; otherwise (including when either is `None` — e.g. GTK,
+    /// which never saves a real position at all — or when `displays` is
+    /// empty, meaning `PlatformServices::displays()` reported
+    /// `Unsupported` or genuinely found none) both are cleared to `None`
+    /// so the caller falls back to whatever default placement the window
+    /// manager/OS picks, rather than applying coordinates that used to be
+    /// on a monitor that no longer exists.
+    ///
+    /// Size: clamped to fit the clamp target display — the one the saved
+    /// position resolved to above, or (when position didn't resolve to
+    /// one, including the "no position saved at all" GTK case) the
+    /// largest connected display, so a window saved on a big external
+    /// monitor doesn't reopen larger than a much smaller built-in panel
+    /// left behind after that monitor is unplugged. Never grown — only
+    /// ever shrunk to fit. Left unchanged if `displays` is empty.
+    pub fn clamp_to_displays(&self, displays: &[quadraui::Display]) -> Self {
+        let mut clamped = self.clone();
+
+        let position_target = self.x.zip(self.y).and_then(|(x, y)| {
+            let (xf, yf) = (x as f32, y as f32);
+            displays.iter().find(|d| {
+                let b = d.bounds;
+                xf >= b.x && xf < b.x + b.width && yf >= b.y && yf < b.y + b.height
+            })
+        });
+        if position_target.is_none() {
+            clamped.x = None;
+            clamped.y = None;
+        }
+
+        let size_target = position_target.or_else(|| {
+            displays.iter().max_by(|a, b| {
+                (a.bounds.width * a.bounds.height).total_cmp(&(b.bounds.width * b.bounds.height))
+            })
+        });
+        if let Some(d) = size_target {
+            clamped.width = clamped.width.min(d.bounds.width.round() as i32);
+            clamped.height = clamped.height.min(d.bounds.height.round() as i32);
+        }
+
+        clamped
+    }
+}
+
 fn default_sidebar_width() -> i32 {
     260
 }
@@ -610,6 +662,163 @@ mod tests {
         assert_eq!(session.window.width, 800);
         assert_eq!(session.window.height, 600);
         assert!(!session.explorer_visible);
+    }
+
+    /// #1529: `WindowGeometry`'s `x`/`y`/`maximized` must round-trip through
+    /// JSON, not just `width`/`height` (the fields `Default` already
+    /// covered). Before this fix nothing ever wrote `x`/`y`/`maximized`, so
+    /// a round-trip test against the un-fixed save path would have found
+    /// them silently absent from the saved JSON.
+    #[test]
+    fn test_window_geometry_round_trip() {
+        let geo = WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(50),
+            y: Some(75),
+            maximized: true,
+        };
+        let json = serde_json::to_string(&geo).unwrap();
+        let restored: WindowGeometry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.width, 1000);
+        assert_eq!(restored.height, 700);
+        assert_eq!(restored.x, Some(50));
+        assert_eq!(restored.y, Some(75));
+        assert!(restored.maximized);
+    }
+
+    /// #1529: a saved position that falls inside a connected display's
+    /// bounds passes through `clamp_to_displays` unchanged.
+    #[test]
+    fn test_window_geometry_clamp_keeps_position_on_known_display() {
+        let geo = WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(100),
+            y: Some(100),
+            maximized: false,
+        };
+        let displays = [quadraui::Display {
+            bounds: quadraui::Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            work_area: quadraui::Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            scale: 1.0,
+            primary: true,
+        }];
+        let clamped = geo.clamp_to_displays(&displays);
+        assert_eq!(clamped.x, Some(100));
+        assert_eq!(clamped.y, Some(100));
+        // Size/maximized pass through untouched.
+        assert_eq!(clamped.width, 1000);
+        assert_eq!(clamped.height, 700);
+        assert!(!clamped.maximized);
+    }
+
+    /// #1529: a saved position that no longer sits on *any* connected
+    /// display (the monitor it was saved on was unplugged, or moved) is
+    /// cleared to `None` rather than stranding the restored window
+    /// off-screen.
+    #[test]
+    fn test_window_geometry_clamp_drops_offscreen_position() {
+        let geo = WindowGeometry {
+            width: 1000,
+            height: 700,
+            // Saved while a second monitor sat to the right of the
+            // primary; that monitor is gone now.
+            x: Some(2500),
+            y: Some(200),
+            maximized: false,
+        };
+        let displays = [quadraui::Display {
+            bounds: quadraui::Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            work_area: quadraui::Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            scale: 1.0,
+            primary: true,
+        }];
+        let clamped = geo.clamp_to_displays(&displays);
+        assert_eq!(clamped.x, None);
+        assert_eq!(clamped.y, None);
+    }
+
+    /// #1529: no connected displays at all (backend reports `Unsupported`,
+    /// surfaced here as an empty slice) also clears the position — there is
+    /// nothing to validate it against, so trusting a stale saved
+    /// coordinate would be no safer than trusting an actually-offscreen
+    /// one.
+    #[test]
+    fn test_window_geometry_clamp_no_displays_drops_position() {
+        let geo = WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(100),
+            y: Some(100),
+            maximized: false,
+        };
+        let clamped = geo.clamp_to_displays(&[]);
+        assert_eq!(clamped.x, None);
+        assert_eq!(clamped.y, None);
+    }
+
+    /// #1529 review (non-blocking finding): a window saved at 1000x700 on
+    /// a display too small to hold it (a laptop's 1024x768 built-in panel,
+    /// left behind after the bigger external monitor it was saved on was
+    /// unplugged) must have its *size* shrunk to fit, not just its
+    /// position cleared — an unclamped size could otherwise reopen larger
+    /// than the only display left.
+    #[test]
+    fn test_window_geometry_clamp_shrinks_size_to_fit_the_target_display() {
+        let geo = WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(100),
+            y: Some(100),
+            maximized: false,
+        };
+        let displays = [quadraui::Display {
+            bounds: quadraui::Rect::new(0.0, 0.0, 800.0, 600.0),
+            work_area: quadraui::Rect::new(0.0, 0.0, 800.0, 600.0),
+            scale: 1.0,
+            primary: true,
+        }];
+        let clamped = geo.clamp_to_displays(&displays);
+        // The saved position (100, 100) is still on this display, so it
+        // survives — only the oversized dimensions are shrunk.
+        assert_eq!(clamped.x, Some(100));
+        assert_eq!(clamped.y, Some(100));
+        assert_eq!(clamped.width, 800);
+        assert_eq!(clamped.height, 600);
+    }
+
+    /// #1529 review: when the saved position no longer resolves to a
+    /// display (or there was never one to begin with — GTK, structurally),
+    /// size still gets clamped, against the *largest* connected display
+    /// rather than left unbounded — an unplugged-monitor window shouldn't
+    /// reopen bigger than anything the user has left connected.
+    #[test]
+    fn test_window_geometry_clamp_with_no_position_shrinks_size_to_largest_display() {
+        let geo = WindowGeometry {
+            width: 3000,
+            height: 2000,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        let displays = [
+            quadraui::Display {
+                bounds: quadraui::Rect::new(0.0, 0.0, 1024.0, 768.0),
+                work_area: quadraui::Rect::new(0.0, 0.0, 1024.0, 768.0),
+                scale: 1.0,
+                primary: true,
+            },
+            quadraui::Display {
+                bounds: quadraui::Rect::new(1024.0, 0.0, 1920.0, 1080.0),
+                work_area: quadraui::Rect::new(1024.0, 0.0, 1920.0, 1080.0),
+                scale: 1.0,
+                primary: false,
+            },
+        ];
+        let clamped = geo.clamp_to_displays(&displays);
+        assert_eq!(clamped.width, 1920);
+        assert_eq!(clamped.height, 1080);
     }
 
     #[test]

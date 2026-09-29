@@ -57,46 +57,59 @@ pub struct MdRendered {
 
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
+/// If `bytes[i..]` starts with `https://` or `http://`, return the
+/// scheme's byte length (`8`/`7`). Shared scheme-prefix check for the two
+/// bare-URL walks below (#1496).
+fn url_scheme_len(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes[i..].starts_with(b"https://") {
+        Some(8)
+    } else if bytes[i..].starts_with(b"http://") {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+/// Given a confirmed URL scheme starting at byte `i` (`scheme_len` long),
+/// walk forward to the next ASCII whitespace, then back over trailing
+/// `.`/`,`/`)` punctuation. Returns the resulting end offset — this may
+/// equal `i + scheme_len` if trimming leaves nothing but the scheme
+/// itself, which callers are free to treat as "no URL found" or not.
+///
+/// No regex crate is used. Shared by [`scan_bare_urls`] (span-only) and
+/// `linkify_bare_urls_in_line` (rewrites into a markdown link) — the same
+/// walk, previously duplicated between the two (#1496).
+fn bare_url_end(bytes: &[u8], i: usize, scheme_len: usize) -> usize {
+    let len = bytes.len();
+    let mut j = i + scheme_len;
+    while j < len && !bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    while j > i + scheme_len {
+        match bytes[j - 1] {
+            b'.' | b',' | b')' => j -= 1,
+            _ => break,
+        }
+    }
+    j
+}
+
 /// Scan a plain-text chunk for bare `http://` / `https://` URLs and push
 /// `MdStyle::LinkUrl` spans into `spans`.
 ///
 /// * `chunk_bytes` — the raw bytes of the text chunk (UTF-8).
 /// * `line_offset` — byte position where this chunk starts inside `cur_line`.
 /// * `spans`       — destination span list for the current line.
-///
-/// No regex crate is used: we scan byte-by-byte for the scheme prefix, walk
-/// forward to the next ASCII whitespace, then strip trailing punctuation
-/// (`.`, `,`, `)`).
 fn scan_bare_urls(chunk_bytes: &[u8], line_offset: usize, spans: &mut Vec<MdSpan>) {
     let len = chunk_bytes.len();
     let mut i = 0usize;
     while i < len {
-        // Detect scheme prefix.
-        let scheme_len = if chunk_bytes[i..].starts_with(b"https://") {
-            8
-        } else if chunk_bytes[i..].starts_with(b"http://") {
-            7
-        } else {
+        let Some(scheme_len) = url_scheme_len(chunk_bytes, i) else {
             i += 1;
             continue;
         };
-
         let url_start = i;
-
-        // Walk to next ASCII whitespace.
-        let mut j = i + scheme_len;
-        while j < len && !chunk_bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-
-        // Strip trailing punctuation characters.
-        while j > url_start + scheme_len {
-            match chunk_bytes[j - 1] {
-                b'.' | b',' | b')' => j -= 1,
-                _ => break,
-            }
-        }
-
+        let j = bare_url_end(chunk_bytes, i, scheme_len);
         if j > url_start + scheme_len {
             spans.push(MdSpan {
                 start_byte: line_offset + url_start,
@@ -104,9 +117,35 @@ fn scan_bare_urls(chunk_bytes: &[u8], line_offset: usize, spans: &mut Vec<MdSpan
                 style: MdStyle::LinkUrl,
             });
         }
-
         // Advance past the URL (or at least by 1 to avoid an infinite loop).
         i = j.max(url_start + 1);
+    }
+}
+
+/// Build a byte-offset-to-line-start map for `raw_lines` joined by `'\n'`
+/// (i.e. exactly as fed to `Syntax::parse`) — `starts[i]` is the byte
+/// offset of `raw_lines[i]`'s first byte within that joined text.
+/// Shared by the two fenced-code-block highlight mappers below —
+/// `render_markdown`'s `TagEnd::CodeBlock` arm (4-space indent) and
+/// [`hover_code_highlights`] (no indent) — which previously built this
+/// same map independently (#1496).
+fn code_block_line_starts(raw_lines: &[&str]) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(raw_lines.len());
+    let mut offset = 0usize;
+    for raw in raw_lines {
+        starts.push(offset);
+        offset += raw.len() + 1; // +1 for the joining '\n'
+    }
+    starts
+}
+
+/// Given `line_starts` (see [`code_block_line_starts`]) and a tree-sitter
+/// highlight's absolute byte offset `pos` into the joined code text,
+/// return the index of the raw line `pos` falls on.
+fn code_block_line_at(line_starts: &[usize], pos: usize) -> usize {
+    match line_starts.binary_search(&pos) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
     }
 }
 
@@ -266,18 +305,10 @@ pub fn render_markdown(input: &str) -> MdRendered {
                         let indent = 4usize;
                         // Build a line-start-byte map for the raw code text.
                         let raw_lines: Vec<&str> = code_block_text.split('\n').collect();
-                        let mut line_byte_starts = Vec::with_capacity(raw_lines.len());
-                        let mut offset = 0usize;
-                        for raw in &raw_lines {
-                            line_byte_starts.push(offset);
-                            offset += raw.len() + 1; // +1 for '\n'
-                        }
+                        let line_byte_starts = code_block_line_starts(&raw_lines);
                         for (start, end, scope) in &highlights {
                             // Find which raw line this highlight starts on.
-                            let raw_line_idx = match line_byte_starts.binary_search(start) {
-                                Ok(i) => i,
-                                Err(i) => i.saturating_sub(1),
-                            };
+                            let raw_line_idx = code_block_line_at(&line_byte_starts, *start);
                             let out_line_idx = code_block_start_line + raw_line_idx;
                             if out_line_idx >= code_highlights.len() {
                                 continue;
@@ -676,14 +707,7 @@ fn linkify_bare_urls_in_line(line: &str, out: &mut String) {
             i += ch.len_utf8();
             continue;
         }
-        let scheme_len = if bytes[i..].starts_with(b"https://") {
-            Some(8usize)
-        } else if bytes[i..].starts_with(b"http://") {
-            Some(7usize)
-        } else {
-            None
-        };
-        let Some(scheme_len) = scheme_len else {
+        let Some(scheme_len) = url_scheme_len(bytes, i) else {
             let ch = line[i..].chars().next().unwrap();
             out.push(ch);
             i += ch.len_utf8();
@@ -697,16 +721,7 @@ fn linkify_bare_urls_in_line(line: &str, out: &mut String) {
             continue;
         }
         let start = i;
-        let mut j = i + scheme_len;
-        while j < len && !bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        while j > start + scheme_len {
-            match bytes[j - 1] {
-                b'.' | b',' | b')' => j -= 1,
-                _ => break,
-            }
-        }
+        let j = bare_url_end(bytes, i, scheme_len);
         let url = &line[start..j];
         out.push('[');
         out.push_str(url);
@@ -812,18 +827,10 @@ fn hover_code_highlights(
         let mut syntax = Syntax::new_for_language(lang);
         let highlights = syntax.parse(&code_text);
 
-        let mut line_byte_starts = Vec::with_capacity(raw_lines.len());
-        let mut offset = 0usize;
-        for raw in &raw_lines {
-            line_byte_starts.push(offset);
-            offset += raw.len() + 1; // +1 for the joining '\n'
-        }
+        let line_byte_starts = code_block_line_starts(&raw_lines);
 
         for (start, end, scope) in &highlights {
-            let raw_line_idx = match line_byte_starts.binary_search(start) {
-                Ok(i) => i,
-                Err(i) => i.saturating_sub(1),
-            };
+            let raw_line_idx = code_block_line_at(&line_byte_starts, *start);
             let out_line_idx = content_start + raw_line_idx;
             if out_line_idx >= out.len() {
                 continue;

@@ -976,6 +976,16 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // ── :Notifications / :NotifyFocus — give the toast/notification
+        //    stack keyboard focus (#1577) ─────────────────────────────────
+        // Same effect as `panel_keys.focus_notifications` (default
+        // `<C-S-n>`) — see `Engine::focus_toast_stack`'s doc. Two spellings
+        // so both a VS Code habit ("Notifications") and a shorter one work.
+        if cmd == "Notifications" || cmd == "NotifyFocus" {
+            self.focus_toast_stack();
+            return EngineAction::None;
+        }
+
         // ── Extension commands (:ExtInstall / :ExtRemove / :ExtRefresh / :ExtList /
         //                        :ExtEnable / :ExtDisable) ──────────────────────────────
         if let Some(subcmd) = cmd.strip_prefix("Ext").map(|s| s.trim()) {
@@ -1094,16 +1104,75 @@ impl Engine {
             return EngineAction::None;
         }
 
-        // :AI <message> — send a message to the AI assistant
+        // :AI <message> — send a message to the AI assistant. #1453: the
+        // reply streams into the AI panel, so the panel must actually be
+        // revealed (`focus_sidebar_panel`, which expands the sidebar and
+        // switches it to PANEL_AI) rather than just flipping the
+        // `ai_has_focus` flag — that flag alone routes *keyboard* focus but
+        // does nothing to `app_shell`'s active panel, which is what
+        // `render::sidebar_owner` actually paints. Deliberately does not
+        // also raise `sidebar_focus_requested` (contrast
+        // `Engine::ai_attach_range`'s empty-message arm): the user handed
+        // over a complete ex command and should stay where they were, per
+        // the #958 regression this mirrors — pulling the keyboard into the
+        // chat input would turn the next `:` typed after `:AI hi` into chat
+        // text instead of opening the command line.
         if let Some(msg) = cmd.strip_prefix("AI ").map(|s| s.trim()) {
             if !msg.is_empty() {
                 self.ai_send_message(msg.to_string());
-                self.ai_has_focus = true;
+                self.focus_sidebar_panel(crate::core::engine::sidebar::PANEL_AI);
             }
             return EngineAction::None;
         }
         if cmd == "AiClear" || cmd == "AIclear" {
             self.ai_clear();
+            return EngineAction::None;
+        }
+
+        // :AiReview — open the combined review of everything the most
+        // recently completed ACP turn wrote (#1460), the same surface
+        // `PromptStopped` -> `Engine::acp_end_turn` auto-opens under the
+        // `acp_review_on_turn_end = auto` setting — this is the manual
+        // "look at it again" path always available regardless of that
+        // setting: under the default `badge` (or `off`), this is the only
+        // way the modal opens at all (#1515) — the status-strip badge
+        // segment (`render::populate_ai_chat_controller`) is a summary
+        // only, not (yet) itself clickable; see #1515's PR notes. A status
+        // message, not an error, when there's nothing to review yet.
+        if cmd == "AiReview" {
+            self.cmd_ai_review();
+            return EngineAction::None;
+        }
+
+        // :AiRestore [id] — revert to a past ACP turn's checkpoint (#1460):
+        // every file that checkpoint (or a later one) touched reverts to
+        // its pre-turn content, except one a human has since hand-edited
+        // (refused, never clobbered — see `Engine::acp_restore_checkpoint`).
+        // No `id` restores the most recently completed turn.
+        if cmd == "AiRestore" {
+            match self.acp_restore_checkpoint(None) {
+                Ok(summary) => self.message = summary,
+                Err(e) => {
+                    self.message = e;
+                    return EngineAction::Error;
+                }
+            }
+            return EngineAction::None;
+        }
+        if let Some(arg) = cmd.strip_prefix("AiRestore ").map(|s| s.trim()) {
+            match arg.parse::<usize>() {
+                Ok(id) => match self.acp_restore_checkpoint(Some(id)) {
+                    Ok(summary) => self.message = summary,
+                    Err(e) => {
+                        self.message = e;
+                        return EngineAction::Error;
+                    }
+                },
+                Err(_) => {
+                    self.message = format!("Usage: AiRestore [checkpoint id] — got {arg:?}");
+                    return EngineAction::Error;
+                }
+            }
             return EngineAction::None;
         }
 
@@ -1121,6 +1190,70 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiConfig               — list the agent's declared config options
+        //                           and each one's current value
+        // :AiConfig <id>          — show one option's declared values and
+        //                           which is current
+        // :AiConfig <id> <value>  — switch it (matched by id or name) via
+        //                           `session/set_config_option` (#1520 —
+        //                           ACP v1's generic session-config knob,
+        //                           the mechanism `:AiModel` below is sugar
+        //                           over)
+        if cmd == "AiConfig" {
+            self.message = self.acp_config_status_line();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("AiConfig ").map(|s| s.trim()) {
+            if !rest.is_empty() {
+                match rest.split_once(char::is_whitespace) {
+                    Some((id, value)) if !value.trim().is_empty() => {
+                        self.acp_set_config_option(id, value.trim());
+                    }
+                    _ => {
+                        self.message = self.acp_config_option_status_line(rest);
+                    }
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // :AiModel          — show the agent's declared model choices and
+        //                     which is current (sugar for the config
+        //                     option whose `category` is "model" — ACP v1
+        //                     has no dedicated `session/set_model`, so this
+        //                     is the only model picker the spec offers)
+        // :AiModel <name>   — switch model, matched by id or name, via
+        //                     `session/set_config_option` (#1520)
+        if cmd == "AiModel" {
+            self.message = self.acp_model_status_line();
+            return EngineAction::None;
+        }
+        if let Some(target) = cmd.strip_prefix("AiModel ").map(|s| s.trim()) {
+            if !target.is_empty() {
+                self.acp_set_model(target);
+            }
+            return EngineAction::None;
+        }
+
+        // :AiFollow — toggle "follow the agent" (#1514, Zed-style):
+        // `settings.acp_follow_agent`. While on, every file the ACP agent
+        // touches (a served `fs/read_text_file`/`fs/write_text_file`, or a
+        // `tool_call`/`tool_call_update`'s `locations`) is revealed at its
+        // line in the last-used editor window without stealing keyboard
+        // focus from the chat input — see `Engine::acp_follow_reveal`'s doc.
+        if cmd == "AiFollow" {
+            self.settings.acp_follow_agent = !self.settings.acp_follow_agent;
+            self.message = format!(
+                "AI follow-the-agent mode: {}",
+                if self.settings.acp_follow_agent {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            return EngineAction::None;
+        }
+
         // :AiAgent          — list configured agents (settings.acp_agents)
         //                     and which is active (#958, ACP-7)
         // :AiAgent <name>   — switch the active agent; takes effect on the
@@ -1133,6 +1266,66 @@ impl Engine {
             if !target.is_empty() {
                 self.acp_switch_agent(target);
             }
+            return EngineAction::None;
+        }
+
+        // :AiSessions — open the `:AiSessions` picker of past sessions for
+        // the active agent + workspace, or resume one via `session/load`
+        // (#1459). See `Engine::acp_open_sessions_picker`'s doc for the
+        // "agent doesn't support resume" refusal.
+        if cmd == "AiSessions" {
+            self.acp_open_sessions_picker();
+            return EngineAction::None;
+        }
+
+        // :AiNew [agent] / :AiNext / :AiPrev / :AiClose — multiple
+        // concurrent ACP session tabs (#1463). See `Engine::acp_new_
+        // session`'s doc for the "reuse a still-blank tab" policy and
+        // `Engine::acp_close_session`'s for what closing the last tab does.
+        if cmd == "AiNew" {
+            self.acp_new_session(None);
+            return EngineAction::None;
+        }
+        if let Some(agent) = cmd.strip_prefix("AiNew ").map(|s| s.trim()) {
+            self.acp_new_session(if agent.is_empty() { None } else { Some(agent) });
+            return EngineAction::None;
+        }
+        if cmd == "AiNext" {
+            self.acp_next_session();
+            return EngineAction::None;
+        }
+        if cmd == "AiPrev" {
+            self.acp_prev_session();
+            return EngineAction::None;
+        }
+        if cmd == "AiClose" {
+            self.acp_close_session();
+            return EngineAction::None;
+        }
+
+        // :AiAttach <path> — stage a file or image at `path` as the next
+        // prompt's attachment (#1464). See `Engine::acp_attach_file`'s doc
+        // for the workspace-resolution, `promptCapabilities.image` gate and
+        // size-limit refusals.
+        if cmd == "AiAttach" {
+            self.message = "Usage: :AiAttach <path>".to_string();
+            return EngineAction::None;
+        }
+        if let Some(path_arg) = cmd.strip_prefix("AiAttach ") {
+            self.acp_attach_file(path_arg);
+            return EngineAction::None;
+        }
+
+        // :AiPasteImage — attach whatever image is currently on the system
+        // clipboard as the next prompt's attachment (#1464): the ex-command
+        // "paste an image" entry point, since a raw Ctrl+V that finds no
+        // *text* on the clipboard never reaches the app at all (quadraui's
+        // Ctrl+V interception swallows the keypress rather than forwarding
+        // it — no image-paste event exists yet to bind to a literal Ctrl+V
+        // uniformly across backends; see `Engine::acp_attach_clipboard_image`'s
+        // doc for the capability/size gates this shares with `:AiAttach`).
+        if cmd == "AiPasteImage" {
+            self.acp_attach_clipboard_image();
             return EngineAction::None;
         }
 
@@ -1962,17 +2155,12 @@ impl Engine {
 
         // Handle :! {command} — run a shell command and show output
         if let Some(shell_cmd_raw) = cmd.strip_prefix('!') {
-            let shell_cmd = shell_cmd_raw.trim();
-            if shell_cmd.is_empty() {
+            let shell_cmd_str = shell_cmd_raw.trim();
+            if shell_cmd_str.is_empty() {
                 self.message = "Usage: :!command".to_string();
                 return EngineAction::None;
             }
-            let (shell, flag) = shell_command();
-            match std::process::Command::new(shell)
-                .arg(flag)
-                .arg(shell_cmd)
-                .output()
-            {
+            match crate::core::terminal::shell_cmd(shell_cmd_str).output() {
                 Ok(output) => {
                     let stdout = String::from_utf8_lossy(&output.stdout);
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2002,18 +2190,13 @@ impl Engine {
         // Handle :r[ead] {file} / :r[ead] !{cmd} — read a file, or the stdout
         // of a shell command, and insert it after the cursor line (#879).
         if let Some(arg) = cmd.strip_prefix("read ").map(|s| s.trim()) {
-            if let Some(shell_cmd) = arg.strip_prefix('!') {
-                let shell_cmd = shell_cmd.trim();
-                if shell_cmd.is_empty() {
+            if let Some(shell_cmd_raw) = arg.strip_prefix('!') {
+                let shell_cmd_str = shell_cmd_raw.trim();
+                if shell_cmd_str.is_empty() {
                     self.message = "Usage: :r !command".to_string();
                     return EngineAction::None;
                 }
-                let (shell, flag) = shell_command();
-                match std::process::Command::new(shell)
-                    .arg(flag)
-                    .arg(shell_cmd)
-                    .output()
-                {
+                match crate::core::terminal::shell_cmd(shell_cmd_str).output() {
                     Ok(output) => {
                         let content = String::from_utf8_lossy(&output.stdout).to_string();
                         let inserted_lines = self.insert_read_content(&content);
@@ -5514,6 +5697,11 @@ impl Engine {
             StatusAction::DismissNotifications => {
                 self.dismiss_done_notifications();
             }
+            StatusAction::ShowDiagnostics => {
+                let items = self.diagnostics_as_quickfix_items();
+                self.qf_set_list(None, items);
+                let _ = self.qf_open(None);
+            }
         }
         None
     }
@@ -5581,6 +5769,18 @@ impl Engine {
         let is = |canonical: &str, min: usize| {
             name.len() >= min && name.len() <= canonical.len() && canonical.starts_with(name)
         };
+
+        // `:[range]AI [message]` (#1450 point 1) — attach `[range]`'s lines
+        // of the current buffer as context, then send `message` (or, given
+        // none, just focus the panel so it can be typed in — see
+        // `Engine::ai_attach_range`'s doc). Case-sensitive `"AI"`, no
+        // abbreviation — matches the existing plain `:AI <message>` in this
+        // function's fallback dispatch further down in `execute_command`.
+        if name == "AI" {
+            let (start, end) = self.range_with_count(range, None, last_line);
+            self.ai_attach_range(start, end, args);
+            return Some(EngineAction::None);
+        }
 
         // `:[range]sor[t][!] [flags] [/pattern/]` — sort just the given range.
         // `sor` is Vim's minimum abbreviation (`so` is `:source`).

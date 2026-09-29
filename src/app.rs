@@ -15,34 +15,36 @@
 //! #813 retired the biggest blocker the #47 re-audit found: `backend` used
 //! to be typed as the concrete GTK backend struct, which is what forced
 //! every one of the ~19 modal-stack/drag-state handle call sites — and by
-//! extension this whole file — to depend on it. It is now typed against
-//! [`TextMetricsBackend`], a narrow local trait for the text-measurement
-//! hooks that still have no portable `quadraui::Backend` equivalent; see
-//! that trait's doc comment for why it survives #1104's click/drag/
-//! modal-stack refactor (which did delete the trait's third method,
-//! `set_text_measurement_context` — a GTK/Pango-context setter #861 had
-//! already type-erased to keep the trait itself toolkit-neutral) and what
-//! quadraui-side work would let the remaining two go too.
+//! extension this whole file — to depend on it. It was then typed against
+//! `TextMetricsBackend`, a narrow local trait for the two text-measurement
+//! setters (`set_current_line_height`/`set_current_char_width`) that had no
+//! portable `quadraui::Backend` equivalent yet; #1497 deleted that trait
+//! once JDonaghy/quadraui#1086 put both methods directly on `Backend`, so
+//! `backend` is typed `Box<dyn quadraui::Backend>` now with no local
+//! supertrait at all.
 //!
 //! #862 closed the three items the previous revision of this doc comment
 //! listed as the remaining blockers to dropping the `gui` gate:
 //!
-//! 1. **The platform-typed fields** (`window`, `css_provider`) are now
-//!    type-erased. `css_provider` goes behind the small local
-//!    [`PlatformCssProvider`] trait (the same shape as [`TextMetricsBackend`]
-//!    and `Engine::clipboard_read`/`clipboard_write`, #417); `window` had the
-//!    same treatment (`PlatformWindowHandle`) until #1234 deleted it outright
-//!    once `quadraui::Backend::window()` (`WindowControl`, quadraui#950)
-//!    became a full replacement — see that issue's note further down for why
-//!    the field itself, not just its type erasure, is gone. A third field
-//!    used to live in this list, `settings_monitor`,
-//!    holding a GTK-only `gio::FileMonitor` behind a `Box<dyn Any>`
-//!    drop-guard; #949 deleted it outright rather than type-erasing it —
-//!    `Engine::check_settings_reload`'s portable mtime poll (already the
-//!    sole reload mechanism on TUI, and already called from GTK's own
-//!    `handle_poll_tick` every tick) made it redundant, and deleting it
-//!    closed the settings-hot-reload gap on macOS/Win-GUI that this file's
-//!    `new_portable` doc table used to list as deliberately skipped.
+//! 1. **The platform-typed fields.** `window` was type-erased
+//!    (`PlatformWindowHandle`) until #1234 deleted it outright once
+//!    `quadraui::Backend::window()` (`WindowControl`, quadraui#950) became a
+//!    full replacement — see that issue's note further down for why the
+//!    field itself, not just its type erasure, is gone. A second field used
+//!    to live in this list, `settings_monitor`, holding a GTK-only
+//!    `gio::FileMonitor` behind a `Box<dyn Any>` drop-guard; #949 deleted it
+//!    outright rather than type-erasing it — `Engine::check_settings_reload`'s
+//!    portable mtime poll (already the sole reload mechanism on TUI, and
+//!    already called from GTK's own `handle_poll_tick` every tick) made it
+//!    redundant, and deleting it closed the settings-hot-reload gap on
+//!    macOS/Win-GUI that this file's `new_portable` doc table used to list
+//!    as deliberately skipped. A third field, `css_provider` (a
+//!    `PlatformCssProvider`-erased `gtk4::CssProvider` theming the native
+//!    file dialog's fallback widgets, the same shape the now-deleted
+//!    `TextMetricsBackend` used to have, #1497), was deleted outright by
+//!    #1498 once JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
+//!    equivalent stylesheet, reloaded every frame by
+//!    `sync_per_frame_backend_state`'s `Backend::set_theme` call.
 //! 2. **The platform hook call sites** (colorscheme reload, OS window title /
 //!    size / maximized-check / decoration / minimize) now go through
 //!    `quadraui::Backend::window()` (`WindowControl`, quadraui#950) and
@@ -55,29 +57,32 @@
 //!    internally, so `app.rs` never had a genuine discovery gap, only a
 //!    missing *portable accessor* to reach a window quadraui's own backend
 //!    already had a handle to. Only the `gdk::Display`/`gtk4::IconTheme`
-//!    icon-search-path setup inside `App::new` stays behind inline
-//!    `#[cfg(feature = "gui")]` — quadraui has no portable icon-theme
+//!    icon-search-path setup — [`crate::gtk::util::add_icon_theme_search_path`]
+//!    since #1498 folded `App::new` into [`App::new_portable`] — stays
+//!    genuinely GTK-only, called directly by `crate::gtk::run` instead of
+//!    from inside this file; quadraui has no portable icon-theme
 //!    search-path surface. A `gtk4::Settings` dark/light-variant push used
-//!    to live here too (`App::new` and `handle_poll_tick` both);
+//!    to live here too (the old `App::new` and `handle_poll_tick` both);
 //!    quadraui#1016 moved it into `Backend::set_theme`, so both call sites
 //!    were deleted rather than kept behind the gate.
 //! 3. **`crate::gtk::{click, css, util}`.** The portable majority of these —
 //!    `pixel_to_click_target` and the rest of the click-resolution/tab-bar
-//!    pixel-geometry functions, `make_theme_css`/`STATIC_CSS`, `open_url` —
-//!    moved to the backend-neutral
-//!    `crate::click`/`crate::css`/`crate::app_support`, which `src/gtk/{click,
-//!    css,mod,util}.rs` now re-export so nothing else in `crate::gtk` had to
-//!    change. The genuinely GTK-only remainder — `css::load_css` and
-//!    `util`'s icon-install/log helpers — stayed in `crate::gtk` and is
-//!    reached from here through explicit `#[cfg(feature = "gui")]` call
-//!    sites in `App::new`. (`click::build_editor_click_context`, the
-//!    Pango/Cairo text-measurement context builder this list used to name
-//!    here too, is `#[cfg(test)]`-only since #1104 — see its doc comment.)
-//!    `app_icon_image_for_paint` used to be a
-//!    third such site — GTK got a pre-rasterised PNG, every other backend the
-//!    raw SVG — until quadraui#1014 added a decode cache to
-//!    `Backend::draw_image` itself (#1102), so it now hands every backend the
-//!    same [`crate::render::app_icon_image`] with no fork at all.
+//!    pixel-geometry functions, `open_url` — moved to the backend-neutral
+//!    `crate::click`/`crate::app_support`, which `src/gtk/{click,mod,util}.rs`
+//!    now re-export so nothing else in `crate::gtk` had to change. `css.rs`
+//!    (`make_theme_css`/`STATIC_CSS`/`load_css`) is gone entirely as of
+//!    #1498 — see item 1 above. The genuinely GTK-only remainder —
+//!    `util`'s icon-install/log helpers plus the icon-theme search path —
+//!    stayed in `crate::gtk` and is reached from here (or, for the
+//!    icon-theme path, from `crate::gtk::run` directly) through explicit
+//!    `#[cfg(feature = "gui")]` call sites. (`click::build_editor_click_context`,
+//!    the Pango/Cairo text-measurement context builder this list used to
+//!    name here too, is `#[cfg(test)]`-only since #1104 — see its doc
+//!    comment.) `app_icon_image_for_paint` used to be a third such site —
+//!    GTK got a pre-rasterised PNG, every other backend the raw SVG — until
+//!    quadraui#1014 added a decode cache to `Backend::draw_image` itself
+//!    (#1102), so it now hands every backend the same
+//!    [`crate::render::app_icon_image`] with no fork at all.
 //!
 //! None of this was a "route around it" job: per `CLAUDE.md`'s
 //! Platform-Neutrality Rule, the parts that stayed behind the `gui` feature
@@ -85,16 +90,16 @@
 //! backend-neutral window-chrome/file-watcher/file-picker surface) rather
 //! than new per-backend code — see `docs/IRREDUCIBLE_SURFACE.md`.
 //!
-//! #937's quadraui pin bump deprecated `Backend::draw_status_bar`
-//! (quadraui#819, replacement is `draw_status_bar_interactive`) that this
-//! file's status-bar paint calls still use; migrating them to the
-//! hover/pressed `InteractionState` API is an unrelated refactor deferred to
-//! a follow-up, so it's silenced here rather than left as a stray warning
-//! under `-D warnings`.
-#![allow(deprecated)]
+//! #1490 migrated this file's `Backend::draw_status_bar` (quadraui#819)
+//! calls to `draw_status_bar_interactive`, so the file-level deprecation
+//! suppression that used to sit here no longer covers that. #1491 removed
+//! the other tenant too — the deprecated `ShellApp::on_shell_event` shim
+//! `on_shell_event_ctx` used to call directly — by pulling the shared body
+//! into a plain [`App::dispatch_shell_event`] both the (now default, no-op)
+//! trait override and `on_shell_event_ctx` can call without dispatching
+//! through the deprecated trait method. This file needs no deprecation
+//! suppression of any kind anymore.
 
-#[cfg(feature = "gui")]
-use gtk4::gdk;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -102,8 +107,6 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::core;
-#[cfg(feature = "gui")]
-use crate::icons;
 use crate::render;
 
 use core::engine::EngineAction;
@@ -113,428 +116,23 @@ use render::Theme;
 use crate::app_support::*;
 use crate::click::*;
 use crate::core::engine::sidebar::*;
-use crate::css::*;
-#[cfg(feature = "gui")]
+#[cfg(all(feature = "gui", any(test, feature = "test-support")))]
 use crate::gtk::backend;
-#[cfg(feature = "win")]
-use crate::win::backend as win_backend;
 
 // ─── Panel-key accelerator registry ─────────────────────────────────────────
 //
-// The 14-entry `PanelAccelerator` id table (`render::ACC_*`) and the
+// The 15-entry `PanelAccelerator` id table (`render::ACC_*`) and the
 // dispatcher itself (`render::dispatch_panel_accelerator`) are shared with
 // TUI (#761 / #734 slice 6) — see the rung's header comment in `render.rs`.
 // What's left here is registration (this backend's own `quadraui::Backend`
-// instance) and [`GtkAccelHost`], the five-hook impl for the actions that
-// need GTK's `DeferredQueue` seam.
+// instance); `render::dispatch_panel_accelerator` queues onto `self.deferred`
+// directly (#1499) for the five actions that need GTK's `DeferredQueue` seam.
 
-// `register_panel_accelerators` (the 14-entry id table + registration loop)
+// `register_panel_accelerators` (the 15-entry id table + registration loop)
 // moved to `render::register_panel_accelerators` in #823 item 1 — it was
 // byte-identical to `tui_main`'s copy and had no backend-specific step.
 // Called from `ShellApp::setup` (#587) — mirrors `tui_main`'s call at
 // startup.
-
-/// [`render::PanelAcceleratorHost`] impl for GTK: each hook just queues the
-/// matching [`DeferredAction`] — GTK's `UiEvent::Accelerator` arm has no
-/// engine-mutation seam of its own for these five actions (see the rung's
-/// header comment in `render.rs`), so the real work happens in `tick()`
-/// (which does have `&mut App`) on the next frame, same as every other
-/// App-only GTK callback.
-struct GtkAccelHost<'a> {
-    deferred: &'a DeferredQueue,
-}
-
-impl render::PanelAcceleratorHost for GtkAccelHost<'_> {
-    fn toggle_sidebar(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleSidebar);
-    }
-    fn focus_explorer(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleFocusExplorer);
-    }
-    fn focus_search(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleFocusSearch);
-    }
-    fn open_terminal(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleTerminal);
-    }
-    fn terminal_toggle_max(&mut self, _engine: &mut Engine) {
-        self.deferred.send(DeferredAction::ToggleTerminalMaximize);
-    }
-}
-
-/// [`render::ShellShadowSyncHost`] impl for GTK (#1062): GTK has no panel id
-/// that's absent from the shadow `engine.app_shell` other than the `ext:`
-/// ids `render::sync_shell_event_shadow` already excludes itself, so this is
-/// a unit struct answering `false` unconditionally.
-struct GtkShellShadowHost;
-
-impl render::ShellShadowSyncHost for GtkShellShadowHost {
-    fn panel_absent_from_shadow(&self, _panel_id: &quadraui::WidgetId) -> bool {
-        false
-    }
-}
-
-/// [`render::EngineActionHost`] impl for GTK (#1063) — see the rung's header
-/// comment in `render.rs`. Unlike [`GtkAccelHost`] above, these hooks run
-/// with full `&mut App` in hand (`App::dispatch_engine_action`, the sole
-/// caller, has no engine borrow outstanding when it builds this), so there's
-/// no need to defer to `tick()` via `DeferredQueue` — except most method
-/// bodies below read/mutate the `engine: &mut Engine` parameter
-/// `apply_engine_action` hands them directly, rather than going through
-/// `self.engine.borrow()/borrow_mut()` the way the pre-#1063 `App` methods
-/// they replace did. That's not stylistic: `apply_engine_action`'s own
-/// `engine` parameter is already a live `RefMut` borrow of that same
-/// `Rc<RefCell<Engine>>` — reaching for a second, independent
-/// `self.app.engine.borrow_mut()` from in here would double-borrow the same
-/// `RefCell` and panic at runtime. `open_terminal`/`open_workspace_dialog`
-/// below used to be `App::new_terminal_tab`/`App::open_workspace_dialog`
-/// verbatim, until this rewrite left both with no other caller (menu, key
-/// and macro dispatch all go through here now) and #1063 deleted them
-/// rather than ship dead code.
-struct GtkEngineActionHost<'a> {
-    app: &'a mut App,
-}
-
-impl GtkEngineActionHost<'_> {
-    /// Shared by [`Self::quit`] and [`Self::quit_with_unsaved`]'s
-    /// no-unsaved-changes branch — inlines `App::save_session_and_exit`
-    /// against the already-borrowed `engine` instead of calling it (see this
-    /// struct's own doc for why).
-    fn save_session_and_exit(app: &App, engine: &mut Engine) {
-        // #1234: reads `App::cached_window_width`/`cached_window_height`
-        // (refreshed every tick from `WindowControl::bounds()`) rather than
-        // querying a live `backend` handle — this call chain
-        // (`EngineActionHost`) carries none; see those fields' own doc.
-        engine.session.window.width = app.cached_window_width.get();
-        engine.session.window.height = app.cached_window_height.get();
-        engine.save_session_state();
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        app.exit_requested.set(true);
-    }
-}
-
-impl render::EngineActionHost for GtkEngineActionHost<'_> {
-    /// Was `App::new_terminal_tab`; see this struct's own doc.
-    fn open_terminal(&mut self, engine: &mut Engine) {
-        let cols = self.app.terminal_cols();
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab(cols, rows);
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::toggle_terminal_maximize`.
-    fn toggle_terminal_maximize(&mut self, engine: &mut Engine) {
-        let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: self.app.terminal_cols(),
-            terminal_max_rows: self.app.terminal_target_maximize_rows(),
-        };
-        engine.handle_ui_event(
-            crate::core::engine::UiEvent::Accelerator(
-                crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
-                quadraui::Modifiers::default(),
-            ),
-            ctx,
-        );
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::run_command_in_terminal`.
-    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self.app.terminal_cols();
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(&cmd, cols, rows);
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::open_folder_dialog`.
-    fn open_folder_dialog(&mut self, engine: &mut Engine) {
-        let controller = quadraui::FolderPickerController::new(
-            engine.cwd.clone(),
-            vec![".vimcode-workspace".to_string()],
-            engine.settings.show_hidden_files,
-        );
-        *self.app.folder_picker.borrow_mut() = Some(controller);
-        self.app.draw_needed.set(true);
-    }
-    /// Was `App::open_workspace_dialog` (see this struct's own doc), inlining
-    /// the `refresh_file_tree` / `refresh_explorer` / `reveal_path_in_explorer`
-    /// chain it called — `queue_explorer_draw` (that chain's last step) is a
-    /// documented no-op under the `ShellApp` runner, so dropping it changes
-    /// nothing.
-    fn open_workspace_dialog(&mut self, engine: &mut Engine) {
-        engine.explorer_rebuild_rows();
-        if let Some(path) = engine.file_path().cloned() {
-            engine.explorer_reveal_path(&path);
-        }
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::save_workspace_as_dialog` — touches no engine state, so
-    /// this one calls straight through.
-    fn save_workspace_as_dialog(&mut self, _engine: &mut Engine) {
-        self.app.save_workspace_as_dialog();
-    }
-    /// Inlines `App::open_recent_dialog`.
-    fn open_recent_dialog(&mut self, engine: &mut Engine) {
-        if engine.session.recent_workspaces.is_empty() {
-            engine.message = "No recent workspaces".to_string();
-        } else {
-            engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
-        }
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
-    /// the `ShellApp` runner (see that method's own doc comment).
-    fn sidebar_toggled(&mut self, _engine: &mut Engine) {
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::show_quit_confirm`.
-    fn quit_with_unsaved(&mut self, engine: &mut Engine) {
-        if !engine.has_any_unsaved() {
-            Self::save_session_and_exit(self.app, engine);
-            return;
-        }
-        engine.show_quit_confirm();
-        self.app.draw_needed.set(true);
-    }
-    /// Inlines `App::quit_confirmed` (itself just `save_session_and_exit`).
-    fn quit(&mut self, engine: &mut Engine) {
-        Self::save_session_and_exit(self.app, engine);
-    }
-    /// Matches the former inline `EngineAction::QuitWithError` arm in
-    /// `dispatch_engine_action` exactly — no `save_session_state` (unlike
-    /// `quit` above). This asymmetry is GTK-specific, not something
-    /// `tui_main::handle_action` itself does: TUI's `Quit`/`SaveQuit` and
-    /// `QuitWithError` arms both call `save_session` (`tui_main/mod.rs`),
-    /// i.e. TUI treats the two variants *symmetrically*. The divergence is
-    /// cross-backend (GTK skips the save on `QuitWithError`, TUI doesn't),
-    /// preserved here exactly as it behaved pre-#1063 rather than changed
-    /// as a side effect of this convergence.
-    fn quit_with_error(&mut self, engine: &mut Engine) -> ! {
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        std::process::exit(1);
-    }
-}
-
-/// [`render::ExplorerContextHost`] impl for GTK (#1418) — see the rung's
-/// header comment above [`render::apply_explorer_context_action`]. Same
-/// `app: &'a mut App` / `self.engine.clone()`-before-borrowing shape as
-/// [`GtkEngineActionHost`] above, for the same reason: the caller
-/// (`App::dispatch_context_menu_key`) already holds the confirmed action
-/// string, which was read out from a now-dropped `engine.borrow_mut()`, so
-/// building this host doesn't double-borrow the engine `RefCell`.
-struct GtkExplorerCtxHost<'a> {
-    app: &'a mut App,
-}
-
-impl render::ExplorerContextHost for GtkExplorerCtxHost<'_> {
-    /// Was the `"open_terminal"` arm of the deleted
-    /// `App::dispatch_explorer_ctx_action`, which called `App::open_terminal_at`
-    /// — inlined here (rather than calling it) because that method reaches
-    /// for its own `self.engine.borrow_mut()`, and the caller
-    /// (`App::dispatch_context_menu_key`) already holds this same `Engine`
-    /// borrowed mutably as the `engine` parameter below; a second borrow
-    /// would panic (`RefCell` already mutably borrowed).
-    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf) {
-        let cols = self.app.terminal_cols();
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_new_tab_at(cols, rows, Some(&dir));
-        self.app.draw_needed.set(true);
-    }
-}
-
-/// [`render::TickHost`] impl for GTK — the tick-time background chores
-/// `App::handle_poll_tick` shares with TUI's `TuiShellApp::tick` (#1248).
-/// Holds `app: &mut App` and `backend` as plain borrows, same shape as
-/// [`GtkEngineActionHost`]/[`GtkAccelHost`] above.
-///
-/// Every method that needs `Engine` mutation takes it via the `engine`
-/// parameter [`render::run_shared_tick_chores`] passes through — **never**
-/// via `self.app.engine.borrow_mut()`. The caller already holds that
-/// `RefCell` borrowed for the whole call (see `App::handle_poll_tick`), so a
-/// method reaching for `self.app`'s own `engine`-touching helpers (e.g.
-/// `App::quit_confirmed`, `App::run_command_in_terminal`) would panic with
-/// `BorrowMutError` — this struct inlines those helpers' bodies against the
-/// passed-in `engine` instead.
-struct GtkTickHost<'a> {
-    app: &'a mut App,
-    backend: &'a mut dyn quadraui::Backend,
-}
-
-impl render::TickHost for GtkTickHost<'_> {
-    fn with_last_layout(&self, f: &mut dyn FnMut(&render::ScreenLayout)) {
-        if let Some(layout) = self.app.cached_screen_layout.borrow().as_ref() {
-            f(layout);
-        }
-    }
-
-    fn tab_visible_counts(&self) -> Vec<(core::window::GroupId, usize)> {
-        self.app.tab_visible_counts.borrow().clone()
-    }
-
-    fn yank_highlight_deadline(&self) -> Option<std::time::Instant> {
-        self.app.yank_hl_deadline.get()
-    }
-
-    /// Inlines `App::clear_yank_highlight`'s body against `engine` directly
-    /// — see this struct's own doc for why it can't call that method.
-    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine) {
-        engine.clear_yank_highlight();
-        self.app.yank_hl_deadline.set(None);
-    }
-
-    /// Inlines `App::sync_sidebar_from_engine` — a redraw trigger only under
-    /// the `ShellApp` runner (see that method's own doc comment).
-    fn on_idle_dirty(&mut self, _engine: &mut Engine) {
-        self.app.draw_needed.set(true);
-    }
-
-    fn sidebar_refresh_due(&mut self) -> bool {
-        if self.app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2) {
-            self.app.last_sc_refresh = std::time::Instant::now();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Inlines `App::run_command_in_terminal`'s body against `engine`
-    /// directly — see this struct's own doc for why it can't call that
-    /// method.
-    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String) {
-        let cols = self.app.terminal_cols();
-        let rows = engine.session.terminal_panel_rows;
-        engine.terminal_run_command(&cmd, cols, rows);
-    }
-
-    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String) {
-        if !engine.app_shell.sidebar_visible() {
-            engine.app_shell.toggle_sidebar();
-        }
-        engine.ext_panel_has_focus = true;
-        engine.ext_panel_active = Some(panel_name);
-        self.app.sync_sidebar_widgets();
-    }
-
-    /// Inlines `App::save_session_and_exit`'s body against `engine` directly
-    /// — see this struct's own doc for why it can't call that method.
-    fn quit_after_format_save(&mut self, engine: &mut Engine) {
-        engine.session.window.width = self.app.cached_window_width.get();
-        engine.session.window.height = self.app.cached_window_height.get();
-        engine.save_session_state();
-        engine.cleanup_all_swaps();
-        engine.lsp_shutdown();
-        self.app.exit_requested.set(true);
-    }
-
-    fn run_platform_action(
-        &mut self,
-        engine: &mut Engine,
-        action: crate::core::engine::PendingPlatformAction,
-    ) {
-        render::run_pending_platform_action(engine, action, self.backend);
-    }
-
-    /// Sync the OS window title with the active buffer name (taskbar/
-    /// pager). Routed through `Backend::window()` (quadraui#950, #1124)
-    /// rather than the old GTK-only `self.window`/`PlatformWindowHandle`
-    /// title setter (deleted #1234) — that seam was `None` on
-    /// macOS/Win-GUI, so this used to be a silent no-op there;
-    /// `WindowControl` is backed on every windowed backend.
-    fn sync_window_title(&mut self, engine: &Engine) {
-        let win_title = render::window_title(engine);
-        if let Some(w) = self.backend.window() {
-            let _ = w.set_title(&win_title);
-            // Refresh the session-restore size cache (#1234) — see
-            // `cached_window_width`'s doc for why this is cached here rather
-            // than read live from `save_session_and_exit`, and why it's
-            // gated on `!is_maximized()`.
-            if matches!(w.is_maximized(), Ok(false)) {
-                if let Ok(bounds) = w.bounds() {
-                    self.app
-                        .cached_window_width
-                        .set(bounds.width.round() as i32);
-                    self.app
-                        .cached_window_height
-                        .set(bounds.height.round() as i32);
-                }
-            }
-        }
-    }
-}
-
-/// [`render::EditorBandHost`] impl for GTK (#1251) — the four [`render::
-/// EditorOp`] rungs `App::compose_editor_band_rungs`'s shared walk still
-/// hands back per-backend. See that trait's own doc for why each of these
-/// four, specifically, can't be inlined into the walk.
-///
-/// `window_editors`/`hit_bars` accumulate across the `Windows`/`TabBars`
-/// calls the same way the pre-#1251 local variables did — they used to live
-/// on the stack inside `compose_editor_band_rungs`'s loop; now they live here
-/// so the host can be threaded through `render::paint_editor_band_rungs`
-/// without a callback per rung. `compose_editor_band_rungs` destructures them
-/// back out once the walk returns, to build this frame's `FrameHitMap`.
-struct GtkEditorBandHost<'a> {
-    app: &'a App,
-    lh: f64,
-    tab_row_h: f64,
-    tab_bar_h: f64,
-    window_editors: Vec<quadraui::Editor>,
-    hit_bars: Vec<(core::window::GroupId, quadraui::Rect, &'a quadraui::TabBar)>,
-}
-
-impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
-    fn paint_windows(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        _engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app
-            .paint_editor_windows_rung(backend, screen, self.lh, &mut self.window_editors);
-    }
-
-    fn paint_tab_bars(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app.paint_tab_bars_rung(
-            backend,
-            engine,
-            screen,
-            self.tab_row_h,
-            self.tab_bar_h,
-            &mut self.hit_bars,
-        );
-    }
-
-    fn paint_group_dividers(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        render::draw_dividers_as_splits(backend, &screen.group_dividers, |div| {
-            quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
-        });
-    }
-
-    fn paint_tab_drag_overlay(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'a render::ScreenLayout,
-        _theme: &Theme,
-    ) {
-        self.app
-            .cache_tab_drop_geometry(screen, engine, self.tab_bar_h);
-        let ctx = self.app.cached_drop_ctx.borrow();
-        let (mx, my) = self.app.mouse_pos_cell.get();
-        render::paint_tab_drop_overlay(backend, &ctx, (mx as f32, my as f32), 2.0, self.lh as f32);
-    }
-}
 
 /// Work that a GTK callback with no `&mut App` in hand must hand back to the
 /// next frame.
@@ -542,7 +140,8 @@ impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
 /// #732 tranche 3: the six deferrals below are all that is left of the
 /// Relm4-era `Msg` bus. They are genuine deferrals, not translations — each
 /// originates somewhere that cannot call an `&mut self` method at all:
-/// [`GtkAccelHost`], which holds only a clone of the queue. (The 200 ms
+/// `render::dispatch_panel_accelerator`'s `UiEvent::Accelerator` arm, which
+/// only ever holds a clone of the queue. (The 200 ms
 /// yank-highlight one-shot used to be a seventh, scheduled via a one-shot
 /// toolkit timer; #813 ported it to the portable `yank_hl_deadline`
 /// poll-in-`tick` pattern TUI already used — see [`App::yank_hl_deadline`] —
@@ -557,7 +156,7 @@ impl<'a> render::EditorBandHost<'a> for GtkEditorBandHost<'a> {
 /// the queued payload is necessarily app-specific, so the queue stays here
 /// rather than becoming a quadraui gap to file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredAction {
+pub(crate) enum DeferredAction {
     /// Redraw after an accelerator mutated engine state directly.
     Resize,
     /// Toggle focus between the explorer and the editor.
@@ -584,7 +183,7 @@ impl DeferredQueue {
     }
 
     /// Enqueue an action for processing in the next `tick()` call.
-    fn send(&self, action: DeferredAction) {
+    pub(crate) fn send(&self, action: DeferredAction) {
         self.0.borrow_mut().push_back(action);
     }
 
@@ -595,94 +194,18 @@ impl DeferredQueue {
     }
 }
 
-/// Narrow extension trait for the text-measurement hooks that
-/// `quadraui::Backend` has no portable equivalent for yet (#813): a backend
-/// needs some way to be told the current line height / char width, and (for
-/// backends whose click-time hit-testing wants per-glyph accuracy, like
-/// GTK's Pango) some way to be handed a fresh measurement context each
-/// frame.
-///
-/// `App::backend` used to be typed as the concrete `backend::GtkBackend` —
-/// the sole reason `struct App` couldn't compile without the GTK toolkit
-/// in scope — purely so these calls would resolve. Retyping the field to a
-/// bare `Box<dyn quadraui::Backend>` would drop them; this supertrait lets
-/// `App::backend` hold one trait object that still exposes both the 19
-/// generic `modal_stack_handle`/`drag_state_handle` call sites (via the
-/// `Backend` supertrait bound) *and* these narrow ones, without naming a
-/// concrete backend type anywhere outside its `impl` below.
-///
-/// #861: this trait used to expose `set_pango_context(ctx: pango::Context)`
-/// (a GTK/Pango-typed context setter for the editor-click Pango layout), which
-/// meant *no non-GTK backend could implement this trait at all*. #1104
-/// deleted that method along with its one caller (`App::render_content`'s
-/// per-frame sync onto a second, separately-constructed `GtkBackend` used
-/// only for click-time hit-testing — see the doc comment where that call used
-/// to live) once threading the runner's own live backend through the click/
-/// drag/modal-stack call chain made the second backend, and so the context it
-/// needed, unnecessary. What is left, `set_current_line_height`/
-/// `set_current_char_width`, has no GTK/Pango type in its signature and so
-/// was never the compilation blocker.
-///
-/// #969: `set_current_line_height`/`set_current_char_width` deliberately have
-/// **no default**: both are load-bearing for click correctness
-/// (`App::explorer_ui_event` / `App::route_ai_chat_event` re-apply them,
-/// immediately before hit-testing, to undo the #540/#819 drift guard's
-/// namesake drift), so every impl must write *something* for them rather
-/// than silently inheriting a no-op. That alone does not stop an impl from
-/// writing an empty body anyway — #967 did exactly that on `MacBackend` —
-/// which is what
-/// [`crate::harness::assert_text_metrics_backend_applies_metrics`] is for:
-/// it round-trips a value through the trait object and the
-/// `quadraui::Backend` getter these setters are supposed to feed, so a stub
-/// fails a test instead of shipping silently.
-///
-/// #1104 could not delete this trait outright: `App::explorer_ui_event`,
-/// `App::route_ai_sidebar_event` and the DAP-sidebar key route all call these
-/// setters from deep inside the keyboard/mouse dispatch tree, at call sites
-/// with no live `backend: &mut dyn quadraui::Backend` reference threaded in
-/// (unlike the click/drag chain #1104 *did* convert) — and even if one were
-/// threaded in, `quadraui::Backend` has no `Any`/downcast escape hatch and no
-/// portable equivalent of these two setters, so there is no way to reach a
-/// concrete backend's inherent methods through the trait object without this
-/// local supertrait (or an equivalent) naming the concrete type somewhere.
-/// Closing that gap is quadraui-side work (a portable
-/// `text_metrics_handle()`-style accessor, mirroring `modal_stack_handle()`/
-/// `drag_state_handle()`), tracked as the follow-up this issue's report
-/// files against `JDonaghy/quadraui`.
-pub(crate) trait TextMetricsBackend: quadraui::Backend {
-    fn set_current_line_height(&mut self, line_height: f64);
-    fn set_current_char_width(&mut self, char_width: f64);
-}
-
-#[cfg(feature = "gui")]
-impl TextMetricsBackend for backend::GtkBackend {
-    fn set_current_line_height(&mut self, line_height: f64) {
-        backend::GtkBackend::set_current_line_height(self, line_height);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        backend::GtkBackend::set_current_char_width(self, char_width);
-    }
-}
-
-/// [`TextMetricsBackend`] for quadraui's `WinBackend` (#866, the Win-GUI
-/// twin of #859's `MacBackend` impl in `src/macos/mod.rs`).
-///
-/// The two metric setters forward to `WinBackend`'s own public
-/// `set_current_line_height`/`set_current_char_width` (`f32`, matching
-/// DirectWrite's unit — GTK's are `f64` Pango units), the Win-GUI
-/// counterparts of `GtkBackend`'s methods of the same name at the pinned
-/// rev `9eede7fd`.
-#[cfg(feature = "win")]
-impl TextMetricsBackend for win_backend::WinBackend {
-    fn set_current_line_height(&mut self, line_height: f64) {
-        win_backend::WinBackend::set_current_line_height(self, line_height as f32);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        win_backend::WinBackend::set_current_char_width(self, char_width as f32);
-    }
-}
+// #1497: `TextMetricsBackend`, the narrow local supertrait that used to
+// live here, is gone. It existed only because `set_current_line_height`/
+// `set_current_char_width` were inherent methods on each pixel backend
+// (`GtkBackend`/`MacBackend`/`WinBackend`) with no portable
+// `quadraui::Backend` equivalent to reach them through `&mut dyn Backend`
+// — closing that gap was JDonaghy/quadraui#1086, filed from this trait's
+// own doc comment. quadraui#1086 landed `Backend::set_current_line_height`/
+// `set_current_char_width` (`f32`, default no-op; GTK/macOS/Win-GUI
+// override to forward onto their existing inherent setters) at the pinned
+// rev, so `App::backend` is typed `Box<dyn quadraui::Backend>` directly now
+// and every former `TextMetricsBackend::set_current_*` call site below
+// calls the `quadraui::Backend` method instead.
 
 // #1234: `PlatformWindowHandle`, the local seam that used to live here, is
 // gone. It existed because quadraui's `WindowControl` had no portable
@@ -699,19 +222,13 @@ impl TextMetricsBackend for win_backend::WinBackend {
 // none of this needs a `#[cfg(feature = "gui")]` gate or a per-backend impl
 // the way the deleted trait's sole `gtk4::Window` impl did.
 
-/// Narrow seam over the platform stylesheet provider (#862). `App::css_provider`
-/// stores one of these type-erased so the colorscheme-reload/`setup` methods can reload it
-/// without naming `gtk4::CssProvider`.
-pub(crate) trait PlatformCssProvider {
-    fn load_css_data(&self, css: &str);
-}
-
-#[cfg(feature = "gui")]
-impl PlatformCssProvider for gtk4::CssProvider {
-    fn load_css_data(&self, css: &str) {
-        self.load_from_data(css);
-    }
-}
+// #1498: `PlatformCssProvider`, the local seam that used to live here, is
+// gone. It existed to reload a `gtk4::CssProvider` theming the native file
+// dialog's fallback widgets (sidebar/scrollbar/popover) on every colorscheme
+// change; JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own
+// equivalent stylesheet, rebuilt from `Theme` on every `Backend::set_theme`
+// call (which `sync_per_frame_backend_state` already makes every frame), so
+// there is nothing left for `App` itself to own or reload.
 
 pub(crate) struct App {
     pub(crate) engine: Rc<RefCell<Engine>>,
@@ -772,7 +289,7 @@ pub(crate) struct App {
     /// old TUI-local `FolderPickerState`/native `gtk4::FileDialog` split.
     /// `render_content` (`&self`) needs to *read* it while `handle_key_press`
     /// (`&mut self`) mutates it, hence the `RefCell` — mirrors
-    /// `dialog_layout` above. `TuiShellApp` carries the identical field type.
+    /// `dialog_layout` above. the pre-#1434 TUI shell carries the identical field type.
     pub(crate) folder_picker: RefCell<Option<quadraui::FolderPickerController>>,
     /// Edge-trigger flag for #727's native message-dialog path: `true`
     /// once a native present has been queued (or already shown) for the
@@ -806,28 +323,38 @@ pub(crate) struct App {
     pub(crate) mouse_pos_cell: Rc<Cell<(f64, f64)>>,
     /// True while user is drag-selecting text inside a find/replace input field.
     pub(crate) fr_input_dragging: bool,
+    /// Explorer drag-and-drop source row, armed on press
+    /// (`TreeControllerEvent::RowSelected`) and disarmed either into
+    /// [`Self::explorer_drag_active`] (once the pointer moves to a
+    /// different row) or back to `None` on release. Plain row indices, not
+    /// GTK-specific state — mirrors the pre-#1434 TUI shell's identically-named field
+    /// (#1429; see `render::apply_explorer_drag_move`/`apply_explorer_drop`,
+    /// the shared functions both backends apply this through).
+    pub(crate) explorer_drag_src: Option<usize>,
+    /// `(src_row, target_row)` once an explorer drag-and-drop gesture has
+    /// actually started (moved off the source row) — `target_row` is `None`
+    /// while the pointer is outside the tree, keeping the gesture armed
+    /// without a drop target. Mirrors the pre-#1434 TUI shell's `explorer_drag_active`
+    /// (#1429).
+    pub(crate) explorer_drag_active: Option<(usize, Option<usize>)>,
     pub(crate) deferred: DeferredQueue,
     /// Last content written to system clipboard.
     /// Used to avoid redundant writes on every keystroke.
     pub(crate) last_clipboard_content: Option<String>,
     /// Which tab close button (×) the mouse is over: (group_id.0, tab_idx).
     pub(crate) tab_close_hover: Option<(usize, usize)>,
-    /// Absolute tight close-glyph rects captured in `render_content`. Consumed
-    /// by `tab_close_hit_test` (hover) so it hit-tests against the exact drawn
-    /// geometry — including the activity-bar/sidebar x-offset — instead of
-    /// re-deriving group rects from a `(0,0)` content origin (which ignored the
-    /// offset and made hover never fire in ShellApp mode). (#515)
-    pub(crate) cached_tab_close_abs: Rc<RefCell<TabCloseAbsMap>>,
     /// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`),
     /// captured in `render_content`. Feeds the tab drop-zone computation so a
     /// short drag inside a group's own tab bar resolves to a `TabReorder` (with
     /// an insertion bar) rather than a new-split overlay. (#515)
     pub(crate) cached_tab_slots_abs: Rc<RefCell<TabSlotsAbsMap>>,
-    /// Pixel-accurate per-group tab-bar hit geometry from the ShellApp
-    /// `render_content` pass (via `Backend::tab_bar_layout`). Consumed by the
-    /// GTK tab-bar click hit-test instead of the char-cell `hit_regions`, which
-    /// don't match GTK's proportional-font tab layout. (#515)
-    pub(crate) cached_tab_pixel_hits: Rc<RefCell<TabPixelHitMap>>,
+    /// Per-group `(Rect, TabBarLayout)` — the exact pixel-accurate geometry
+    /// the ShellApp `render_content` pass just painted (via
+    /// `Backend::draw_tab_bar_icons_layout`). Consumed by the GTK tab-bar
+    /// click hit-test (`GroupTabBarLayoutMap`, #1491) instead of the
+    /// char-cell `hit_regions`, which don't match GTK's proportional-font tab
+    /// layout. (#515)
+    pub(crate) cached_group_tab_bar_layouts: Rc<RefCell<GroupTabBarLayoutMap>>,
     /// Cached per-window status bar segment hit zones from draw_window_status_bar.
     pub(crate) status_segment_map: Rc<RefCell<StatusSegmentMap>>,
     /// Painted rect of the separated status line's status bar (#671/#672),
@@ -914,7 +441,7 @@ pub(crate) struct App {
     /// overwrite for its own metrics; by the time a later mouse/keyboard
     /// event reaches `route_ai_chat_event`, whatever painted *last* this
     /// frame or the previous one may have left a different value there.
-    /// Re-applied via `TextMetricsBackend::set_current_line_height`/
+    /// Re-applied via `quadraui::Backend::set_current_line_height`/
     /// `set_current_char_width` before `ChatController::handle` runs, so its
     /// row-wrap math (`total_rows`/`visible_rows`) matches what `render()`
     /// used rather than silently reading a smaller/larger viewport and
@@ -955,7 +482,7 @@ pub(crate) struct App {
     pub(crate) csd_applied: Cell<bool>,
     /// Cached window width/height (#1234), refreshed every tick
     /// (`handle_poll_tick`) from `WindowControl::bounds()` rather than read
-    /// live at quit time: quit runs through `EngineActionHost`/
+    /// live at quit time: quit runs through `render::apply_engine_action`/
     /// `handle_menu_action`/dialog-button call chains with no live
     /// `backend: &mut dyn quadraui::Backend` in scope (only `tick`/`setup`/
     /// paint entry points have one) — the same "no backend in scope"
@@ -976,6 +503,42 @@ pub(crate) struct App {
     /// un-maximizes again.
     pub(crate) cached_window_width: Cell<i32>,
     pub(crate) cached_window_height: Cell<i32>,
+    /// Cached window position, refreshed alongside `cached_window_width`/
+    /// `cached_window_height` in `sync_window_title` (#1529). `None`
+    /// before the first successful *non-sentinel* `bounds()` read, while
+    /// maximized (same freeze as width/height), and permanently on
+    /// GTK/Wayland — `WindowControl::bounds` structurally always answers
+    /// `x: 0.0, y: 0.0` there (see that method's own doc), which
+    /// `sync_window_title` treats as "no real position" and skips caching
+    /// rather than writing `Some(0)` (#1529 review: an earlier version of
+    /// this cached the sentinel unconditionally on the theory that
+    /// `WindowControl::set_bounds` being unconditionally `Unsupported` on
+    /// the same backend made it harmless — true only for a GTK-authored
+    /// session file read back by GTK; a `Some(0), Some(0)` value read on a
+    /// `set_bounds`-capable backend, e.g. via synced dotfiles, would be
+    /// misapplied as a genuine position). macOS/Win-GUI report (and later
+    /// restore) a real, non-`(0, 0)` position in the overwhelming common
+    /// case, so this only misses the rare case of a window genuinely
+    /// parked at the screen origin — falling back to OS default placement
+    /// there, not a functional regression.
+    pub(crate) cached_window_x: Cell<Option<i32>>,
+    pub(crate) cached_window_y: Cell<Option<i32>>,
+    /// Cached maximized state, refreshed every tick from
+    /// `WindowControl::is_maximized()` (#1529) — unlike
+    /// `cached_window_width`/`height`/`x`/`y`, this one is read
+    /// *unconditionally*, specifically so it can flip to `true` at the one
+    /// moment those size/position caches freeze (see their own docs).
+    pub(crate) cached_window_maximized: Cell<bool>,
+    /// Whether `App::restore_window_geometry` has already applied
+    /// `session.window` to the runner's window this run (#1529). Mirrors
+    /// `csd_applied`'s "retry every tick until the window is mapped" gate —
+    /// `Backend::window()` is `None` on the `setup()` fast path (the
+    /// runner hasn't called `window.present()` yet) and reliably `Some` by
+    /// the first `tick()`, same as `capture_window_and_apply_csd`'s own doc
+    /// explains. Idempotent either way (re-applying the same geometry is
+    /// harmless), but this avoids fighting a user resize/move that happens
+    /// to land before the window is confirmed mapped.
+    pub(crate) window_geometry_restored: Cell<bool>,
     /// Editor content bounds + tab-bar height as used by the LAST
     /// `render_content` pass, in the same **absolute** DA coordinate frame
     /// that mouse events arrive in (#550, #582).
@@ -996,6 +559,20 @@ pub(crate) struct App {
     /// makes hit-test-agrees-with-paint true *by construction* instead of by
     /// two formulas being kept in sync by hand.
     pub(crate) cached_editor_bounds: Cell<Option<(core::WindowRect, f64)>>,
+    /// Main-content pixel height last painted by `render_content` — the `h`
+    /// argument it hands `render::compute_editor_layout` (before that call
+    /// subtracts the status bar / debug toolbar / quickfix / terminal bands
+    /// out of it). Distinct from `cached_editor_bounds`'s rect height, which
+    /// is `compute_editor_layout`'s *output* (`editor_bottom`, i.e. already
+    /// net of those bands) — reusing that would feed the already-reduced
+    /// figure back in as the total and double-subtract.
+    ///
+    /// [`App::terminal_maximize_target_rows`] replays the same
+    /// `compute_editor_layout` call against this cached value for callers
+    /// (accelerators, menu/tick paths) with no live viewport height of their
+    /// own in scope. Defaults to `600.0`, matching `cached_window_height`'s
+    /// own pre-first-paint default. (#1421)
+    pub(crate) cached_main_content_height: Cell<f64>,
     /// Menu bar row rect (full content width, `lh` tall) computed in
     /// `render_content` each frame. Reused by `handle()` so `MenuSystem`'s
     /// click/key routing tests against the exact rect the bar was drawn
@@ -1032,6 +609,27 @@ pub(crate) struct App {
     /// same primitive so the buttons get real hover/press highlighting and
     /// click-on-release semantics instead of firing on press. (#552)
     pub(crate) title_bar_interaction: RefCell<quadraui::StatusBarInteraction>,
+    /// The last inline window-control action dispatched (`render::
+    /// WINDOW_MINIMIZE_ACTION` / `_MAXIMIZE_ACTION` / `_CLOSE_ACTION`), or
+    /// `None` before any click. (#1530)
+    ///
+    /// A pure test-observability seam, `Rc`-wrapped like [`Self::
+    /// title_bar_rect`] so the headless test harness can clone a handle —
+    /// minimize/maximize genuinely have no other headlessly-observable
+    /// effect. `WindowControl::minimize`/`Backend::toggle_window_maximize`
+    /// both route through `Backend::window()`, which this crate's own GTK
+    /// test harness deliberately reports `None` from (see `src/gtk/
+    /// testing.rs`'s module doc, "No window" — there is no live
+    /// `gtk4::Window` for a click to actually iconify/zoom), so a black-box
+    /// test asserting "the click dispatched `minimize`" has nothing else to
+    /// read. `window_close`'s equivalent bypass is `show_quit_confirm`'s own
+    /// engine-visible state (`native_dialog_shown`/`exit_requested`); this
+    /// field is the same idea for the two buttons with no engine-visible
+    /// state of their own to piggyback on. Written unconditionally
+    /// (production code, not `cfg(test)`) exactly like every other `Rc<Cell<
+    /// _>>` seam in this struct — cheap enough that it costs nothing outside
+    /// a test.
+    pub(crate) last_window_control_action: Rc<Cell<Option<&'static str>>>,
     /// Last time sc_refresh() was called for the Git sidebar auto-refresh.
     pub(crate) last_sc_refresh: std::time::Instant,
     /// Link hit rects populated during hover popup draw: (rect, url, is_native).
@@ -1058,7 +656,7 @@ pub(crate) struct App {
     /// `render_content` — every arm that draws pushes its own
     /// [`render::FrameOp`], and arms whose surface turned out to be absent do
     /// not. It is the *observable* that makes "both backends compose the frame
-    /// in the same order" testable: `TuiShellApp` keeps the identical field,
+    /// in the same order" testable: the pre-#1434 TUI shell keeps the identical field,
     /// and the two backends' recorded sequences are asserted equal against the
     /// same expected `Vec<FrameOp>` (`render::frame_sequence_fixture`).
     ///
@@ -1087,12 +685,13 @@ pub(crate) struct App {
     /// where it could neither paint nor *clear its own click-routing cache*
     /// once the sidebar collapsed.
     pub(crate) composed_bottom_band: Rc<RefCell<Vec<render::BottomOp>>>,
-    /// Per-group tab-bar `available_cols`, as this frame's `TabBars` rung
-    /// actually painted them — the GTK twin of `TuiShellApp::tab_visible_counts`
-    /// (#1165). `paint_tab_bars`'s doc used to say "TUI reads
-    /// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
-    /// `hits` for its pixel hit maps" as if that were a deliberate
-    /// backend-specific split — it wasn't: GTK simply never called
+    /// Per-group tab-bar visible-column budget (`click::tab_bar_available_cols`),
+    /// as this frame's `TabBars` rung actually painted them — the GTK twin of
+    /// the pre-#1434 TUI shell's `tab_visible_counts` (#1165). `paint_tab_bars`'s
+    /// doc used to say "TUI reads `hits.available_cols` for
+    /// `set_tab_visible_count`; GTK reads the full `hits` for its pixel hit
+    /// maps" (before #1491 dropped `TabBarHits` entirely) as if that were a
+    /// deliberate backend-specific split — it wasn't: GTK simply never called
     /// `Engine::post_draw_apply_widths` at all, so a tab scrolled out of view
     /// by a resize/sidebar-toggle/new-tab could stay off-screen forever on
     /// this backend, while TUI self-corrected within two frames. Populated by
@@ -1137,14 +736,13 @@ pub(crate) struct App {
     /// `draw_editor_hover_popup`; consumed by click + drag handlers
     /// in this file.
     pub(crate) editor_hover_scrollbar: Rc<Cell<Option<render::PopupScrollbarHit>>>,
-    /// CSS provider registered with the GTK display — updated when colorscheme changes.
-    ///
-    /// `None` only under the headless test harness ([`App::new_headless`], #646):
-    /// `gtk4::CssProvider::new()` asserts `gtk::init` has run, which it cannot
-    /// with no display, and a provider that is attached to no `GdkDisplay`
-    /// styles nothing anyway. Always `Some` in a live run.
-    pub(crate) css_provider: Option<Box<dyn PlatformCssProvider>>,
-    /// Colorscheme name at the time the CSS was last applied.
+    /// Colorscheme name as of the last `handle_poll_tick` check — lets that
+    /// method detect a runtime `:colorscheme` change and schedule a redraw.
+    /// Used to also gate reloading a GTK-only CSS provider theming the
+    /// native file dialog; #1498 deleted that provider (JDonaghy/
+    /// quadraui#1091 moved the equivalent stylesheet into
+    /// `GtkPlatformServices` itself), leaving only the change-detection use
+    /// below.
     pub(crate) last_colorscheme: String,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
     /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
@@ -1157,14 +755,12 @@ pub(crate) struct App {
     ///   `core::engine` code with no `Backend` parameter of their own at all,
     ///   long after any `handle`/`render` call that held the runner's live
     ///   backend has returned — this handle is what they close over.
-    /// - **`TextMetricsBackend`'s two metric setters** (`explorer_ui_event`,
+    /// - **The click-drift guard's two metric setters** (`explorer_ui_event`,
     ///   `route_ai_sidebar_event`, the DAP-sidebar key route):
-    ///   `set_current_line_height`/`set_current_char_width` are inherent
-    ///   `GtkBackend` methods with no portable `quadraui::Backend` trait
-    ///   equivalent, called from dispatch-tree call sites that #1104 could
-    ///   not thread a live `backend: &dyn quadraui::Backend` reference into
-    ///   without quadraui growing new portable surface — see
-    ///   [`TextMetricsBackend`]'s own doc comment.
+    ///   `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+    ///   (JDonaghy/quadraui#1086) re-apply the metrics the tree/panel was
+    ///   painted with, called from dispatch-tree call sites that #1104 could
+    ///   not thread a live `backend: &dyn quadraui::Backend` reference into.
     ///
     /// #1104 removed the third historical reason this field existed: click/
     /// drag/modal-stack hit-testing (`pixel_to_click_target` and friends)
@@ -1179,10 +775,28 @@ pub(crate) struct App {
     /// The `init` drain timer holds a clone and pumps `poll_events()` every
     /// 16 ms.
     ///
-    /// Typed against [`TextMetricsBackend`] rather than the concrete
-    /// `backend::GtkBackend` (#813) — see that trait's doc comment for why
-    /// a bare `Box<dyn quadraui::Backend>` isn't quite enough on its own.
-    pub(crate) backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    /// Typed against `Box<dyn quadraui::Backend>` directly, not the
+    /// concrete `backend::GtkBackend` (#813) — the now-deleted
+    /// `TextMetricsBackend` local supertrait used to sit between the two
+    /// (#1497; see the module doc's "Why this module no longer needs
+    /// `#[cfg(feature = "gui")]`" section).
+    pub(crate) backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
+    /// #1426: the geometry unit this `App` instance paints in, chosen once at
+    /// construction by the caller that already knows its own backend
+    /// (GTK/macOS/Win pass [`render::UnitProfile::px`], the `tui` harness arm
+    /// passes [`render::UnitProfile::cell`]) — never inferred from a runtime
+    /// "am I GTK?" check, per the Platform-Neutrality Rule. Every fork this
+    /// file used to hardcode as `render::gtk_*`/`render::GTK_*` (tab-row
+    /// height, minimap sizing, picker/tab-switcher/find-replace geometry,
+    /// divider hit tolerances, sidebar `MsvLayoutMetrics`, the activity-bar
+    /// width and title-bar height fed to [`Self::shell_config`], and
+    /// [`crate::icons::set_gui_backend`]'s argument) now reads from this
+    /// field instead. `UnitProfile::px()` reproduces every value this file
+    /// hardcoded before #1426 exactly, so GTK/macOS/Win behaviour is
+    /// unchanged; `UnitProfile::cell()` is what makes the *same* `App` paint
+    /// correctly on a cell grid — see `UnitProfile`'s own doc for the two
+    /// constructors.
+    pub(crate) units: render::UnitProfile,
     /// #1064: what this app believes the **runner's** `AppShell` (the
     /// `ShellAdapter`-owned instance that paints the activity bar and
     /// sidebar header — NOT `engine.app_shell`, the shadow copy
@@ -1195,11 +809,11 @@ pub(crate) struct App {
     /// **app-initiated** switch (e.g. `Engine::process_pending_sidebar`'s
     /// DAP `dap_wants_sidebar` reveal, or the `toggle_focus_explorer`/
     /// `toggle_focus_search` keyboard accelerators) the runner would
-    /// otherwise never learn about. Mirrors `TuiShellApp::last_shell_panel`
+    /// otherwise never learn about. Mirrors the pre-#1434 TUI shell's `last_shell_panel`
     /// verbatim — see that field's own doc for the full rationale. Plain
     /// field, not `Rc`/`RefCell`: `take_requested_panel` and
     /// [`Self::on_shell_event`] both take `&mut self`, so no interior
-    /// mutability is needed (matching `TuiShellApp`'s own field).
+    /// mutability is needed (matching the pre-#1434 TUI shell's own field).
     pub(crate) last_shell_panel: Option<quadraui::WidgetId>,
     /// #1064: set by `take_requested_panel` just before it returns `Some`,
     /// consumed by the `PanelChanged` arm of [`Self::on_shell_event`].
@@ -1210,115 +824,52 @@ pub(crate) struct App {
     /// re-run the click path in `switch_panel`/`draw_needed`, which for an
     /// already-active `ext:` panel would toggle the sidebar back **off**
     /// (see `render::apply_activity_panel_switch`'s `already_showing`
-    /// arm). Mirrors `TuiShellApp::suppress_shell_panel_echo`.
+    /// arm). Mirrors the pre-#1434 TUI shell's `suppress_shell_panel_echo`.
     pub(crate) suppress_shell_panel_echo: bool,
-}
-
-/// Decode an activity bar widget ID into a panel ID for [`App::switch_panel`].
-/// Dead in ShellApp mode until the activity bar DA is re-wired (#448-C follow-on).
-#[allow(dead_code)]
-fn activity_id_to_panel_id(id: &str) -> Option<String> {
-    match id {
-        "activity:explorer" => Some(PANEL_EXPLORER.to_string()),
-        "activity:search" => Some(PANEL_SEARCH.to_string()),
-        "activity:debug" => Some(PANEL_DEBUG.to_string()),
-        "activity:git" => Some(PANEL_GIT.to_string()),
-        "activity:extensions" => Some(PANEL_EXTENSIONS.to_string()),
-        "activity:ai" => Some(PANEL_AI.to_string()),
-        "activity:board" => Some(PANEL_BOARD.to_string()),
-        "activity:settings" => Some(PANEL_SETTINGS.to_string()),
-        other => other
-            .strip_prefix("activity:ext:")
-            .map(|name| format!("ext:{name}")),
-    }
-}
-
-/// Map GDK key names to the engine's expected key names.
-///
-/// This is the canonical superset mapping — callers that only care about a
-/// subset simply ignore the extra translations (they're harmless).
-fn map_gtk_key_name(gdk_name: &str) -> &str {
-    match gdk_name {
-        "Return" | "KP_Enter" => "Return",
-        "Escape" => "Escape",
-        "BackSpace" => "BackSpace",
-        "Delete" => "Delete",
-        "Tab" => "Tab",
-        "ISO_Left_Tab" => "BackTab",
-        "Up" => "Up",
-        "Down" => "Down",
-        "Left" => "Left",
-        "Right" => "Right",
-        "Home" => "Home",
-        "End" => "End",
-        "Page_Down" | "KP_Page_Down" => "PageDown",
-        "Page_Up" | "KP_Page_Up" => "PageUp",
-        "space" => " ",
-        "slash" => "/",
-        "question" => "?",
-        other => other,
-    }
-}
-
-fn gtk_key_name_to_quadraui(mapped: &str, ctrl: bool) -> Option<quadraui::UiEvent> {
-    use quadraui::{Key, Modifiers, NamedKey, UiEvent};
-    let key = match mapped {
-        "Down" => Key::Named(NamedKey::Down),
-        "Up" => Key::Named(NamedKey::Up),
-        "Home" => Key::Named(NamedKey::Home),
-        "End" => Key::Named(NamedKey::End),
-        "PageDown" => Key::Named(NamedKey::PageDown),
-        "PageUp" => Key::Named(NamedKey::PageUp),
-        "Tab" => Key::Named(NamedKey::Tab),
-        "Return" => Key::Named(NamedKey::Enter),
-        " " => Key::Char(' '),
-        "j" => Key::Char('j'),
-        "k" => Key::Char('k'),
-        "g" => Key::Char('g'),
-        "G" => Key::Char('G'),
-        _ => return None,
-    };
-    Some(UiEvent::KeyPressed {
-        key,
-        modifiers: Modifiers {
-            ctrl,
-            ..Modifiers::default()
-        },
-        repeat: false,
-    })
-}
-
-/// Map a GDK key name and extract the unicode character for input-mode handlers.
-///
-/// Returns `(mapped_key_name, unicode)`.  Special keys return `None` for unicode;
-/// single-character key names return the character as `Some(ch)`.
-fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
-    match gdk_name {
-        "Return" | "KP_Enter" => ("Return", None),
-        "Escape" => ("Escape", None),
-        "BackSpace" => ("BackSpace", None),
-        "Delete" => ("Delete", None),
-        "Up" => ("Up", None),
-        "Down" => ("Down", None),
-        "Left" => ("Left", None),
-        "Right" => ("Right", None),
-        "Home" => ("Home", None),
-        "End" => ("End", None),
-        "Tab" => ("Tab", None),
-        "ISO_Left_Tab" => ("BackTab", None),
-        "Page_Up" => ("Page_Up", None),
-        "Page_Down" => ("Page_Down", None),
-        "question" => ("?", Some('?')),
-        "slash" => ("/", Some('/')),
-        other => {
-            let mut chars = other.chars();
-            if let (Some(ch), None) = (chars.next(), chars.next()) {
-                (other, Some(ch))
-            } else {
-                (other, None)
-            }
-        }
-    }
+    /// #1428: cached copy of `quadraui::BackendCaps::kitty_keyboard`, read
+    /// once in `ShellApp::setup` (a live capability probe, not a
+    /// construction-time decision — see the pre-#1434 TUI shell's `keyboard_enhanced`'s
+    /// own doc, ported here verbatim) and threaded into every
+    /// `render::engine_key_from_ui` call this file makes. Defaults `false`
+    /// (every constructor's assembled default, same as the pre-#1434 TUI shell's `new`),
+    /// which resolves the disambiguation the same conservative way a
+    /// terminal without the kitty protocol needs — a hardcoded `true` here
+    /// used to feed `engine_key_from_ui` the wrong answer on any such
+    /// terminal (#826), the same class of bug TUI's own field exists to
+    /// avoid.
+    pub(crate) keyboard_enhanced: bool,
+    /// #1428: a one-shot startup notice queued in [`App::assemble`] and
+    /// drained by the first `tick()`/`handle_poll_tick` — mirrors
+    /// the pre-#1434 TUI shell's `pending_startup_msg` verbatim (see that field's own
+    /// doc for why the nudge exists and why it can only be computed once,
+    /// at construction, rather than every frame). `None` on every
+    /// GUI-backend `App` (`units.is_gui_backend` — GTK/macOS/Win-GUI all
+    /// bundle the icon font, so `nerd_fonts_undiscovered` is never true
+    /// for them); populated only for a `cell`-profile (TUI-via-`App`)
+    /// construction where `settings.use_nerd_fonts` was never explicitly
+    /// set and the backend-derived default resolved to ASCII fallback
+    /// icons.
+    pub(crate) pending_startup_msg: Option<String>,
+    /// #1428: `true` for a real, running application (`App::new`/
+    /// `App::new_portable`), `false` for every test/headless construction
+    /// (`App::new_headless_with_backend`, which every test seam —
+    /// `crate::gtk::testing`, the macOS driver-tier test, and the `tui`
+    /// harness arm — funnels through). Mirrors the pre-#1434 TUI shell's `live`'s own
+    /// doc: gates exactly one call, `tick_dispatch`'s
+    /// `backend.set_caret_shape` write, from running under a test harness.
+    /// `Backend::set_caret_shape`'s only real-writing override
+    /// (`TuiBackend`, quadraui#1015) writes straight to the real process
+    /// `std::io::stdout()` unconditionally — no test-mode guard of its
+    /// own — so calling it during a `conformance_harness`/`app_on_tui_
+    /// tests` driver's `tick()` would emit a raw DECSCUSR escape sequence
+    /// into the test process's real stdout on every tick, exactly the
+    /// corruption the pre-#1434 TUI shell's `live` exists to prevent. GTK/macOS/Win-GUI
+    /// never override the hook (a genuine no-op there), so this gate only
+    /// ever changes behaviour for a `TuiBackend`-backed `App` — today that
+    /// is test-only, since no live TUI-via-`App` entry point exists yet
+    /// (`tui_main::run` still runs the pre-#1434 TUI shell, not `App` — see
+    /// `GOALS.md`'s milestone #7).
+    pub(crate) live: bool,
 }
 
 /// Set up system clipboard callbacks on the engine via
@@ -1326,7 +877,7 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
 /// `PlatformServices` seam, replacing the bespoke `copypasta_ext` stack).
 ///
 /// `backend` is `App`'s own held handle — `Rc<RefCell<Box<dyn
-/// TextMetricsBackend>>>`, distinct from the runner-owned `&mut dyn
+/// quadraui::Backend>>>`, distinct from the runner-owned `&mut dyn
 /// quadraui::Backend` `ShellApp::setup`/`handle`/`tick` receive only
 /// transiently (see [`PendingFileDialog`]'s doc for why that distinction
 /// matters for file dialogs). Cloning the `Rc` into each closure lets
@@ -1342,14 +893,13 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
 /// from the runner's own, each with its own independent `PlatformServices` —
 /// is safe: `Clipboard::read_text`/`write_text` talk straight to the OS
 /// clipboard (`arboard` on GTK, matching what TUI's `TuiPlatformServices`
-/// already uses — see `tui_main::mod::setup_tui_clipboard`), not to any
-/// runner-owned state.
+/// already uses), not to any runner-owned state.
 ///
-/// `TextMetricsBackend: quadraui::Backend` (see that trait's doc), so this
+/// `backend` is typed `Box<dyn quadraui::Backend>` directly (#1497), so this
 /// names no concrete toolkit type and works unchanged for GTK, macOS, and
 /// Win-GUI — every `App::new`/`App::new_portable` caller passes its own
 /// concrete backend through the same `Rc<RefCell<Box<dyn
-/// TextMetricsBackend>>>` seam #861 opened.
+/// quadraui::Backend>>>` seam #861 opened.
 ///
 /// ## #587 follow-up: does `arboard`'s X11 connection contend with GTK's?
 ///
@@ -1372,9 +922,10 @@ fn map_gtk_key_with_unicode(gdk_name: &str) -> (&str, Option<char>) {
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub(crate) fn setup_gtk_clipboard(
     engine: &mut Engine,
-    backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+    backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
 ) {
     let read_backend = backend.clone();
+    let read_image_backend = backend.clone();
     engine.clipboard_read = Some(Box::new(move || {
         read_backend
             .borrow()
@@ -1391,6 +942,19 @@ pub(crate) fn setup_gtk_clipboard(
             .clipboard()
             .write_text_result(text)
             .map_err(|e| format!("clipboard write: {e:?}"))
+    }));
+
+    // #1464: `Engine::acp_attach_clipboard_image`'s image twin of
+    // `clipboard_read` above — GTK's `Clipboard` impl overrides
+    // `read_image`, so this is a real decoded-pixel read, not the
+    // `Err(BackendError::Unsupported)` default a backend without one
+    // returns.
+    engine.clipboard_read_image = Some(Box::new(move || {
+        read_image_backend
+            .borrow()
+            .services()
+            .clipboard()
+            .read_image()
     }));
 }
 
@@ -1451,169 +1015,53 @@ fn app_icon_image_for_paint() -> quadraui::Image {
 
 /// Create a new `App` instance.
 ///
-/// All widget-dependent setup (window handle, CSS) is deferred to
+/// All widget-dependent setup (window handle) is deferred to
 /// `ShellApp::setup()`, called by the runner once the window exists.
 impl App {
+    /// The single `App` constructor every GUI/TUI entry point calls (#1498
+    /// folded the once-GTK-only `App::new` into this — see this file's
+    /// module doc for the history: by the time #1498 landed, the two
+    /// constructors differed by exactly one GDK-only step,
+    /// [`crate::gtk::util::add_icon_theme_search_path`], which
+    /// [`crate::gtk::run`] now calls directly before this constructor
+    /// instead of `App::new` calling it inline).
+    ///
     /// `backend` is supplied by the caller rather than constructed here
     /// (#861): before this, `App::assemble` hardcoded
     /// `Box::new(backend::GtkBackend::new())`, so nothing upstream of this
-    /// function — including `App::new` itself — had any seam to hand
-    /// `App` a different `TextMetricsBackend` impl. `src/gtk/mod.rs::run`
-    /// is the only caller today and it still passes a `GtkBackend`, but
-    /// the choice of concrete type now lives at the call site instead of
-    /// being baked into `App`.
-    #[cfg(feature = "gui")]
-    pub(crate) fn new(
-        file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
-    ) -> Self {
-        // Icon search path setup.
-        if let Some(home) = std::env::var_os("HOME") {
-            let icon_dir = std::path::PathBuf::from(home).join(".local/share/icons");
-            if let Some(display) = gdk::Display::default() {
-                let icon_theme = gtk4::IconTheme::for_display(&display);
-                icon_theme.add_search_path(&icon_dir);
-            }
-        }
-        let mut engine = {
-            let mut e = Engine::new();
-            // #999: record this as a GUI backend *before* resolving
-            // `use_nerd_fonts()` — GUI bundles the icon font, so an unset
-            // setting inherits `true` regardless of OS.
-            icons::set_gui_backend(true);
-            icons::set_nerd_fonts(e.settings.use_nerd_fonts());
-            e.startup(file_path.as_deref());
-            e
-        };
-        setup_gtk_clipboard(&mut engine, backend.clone());
-
-        let initial_theme = Theme::from_name(&engine.settings.colorscheme);
-        let css_provider: Option<Box<dyn PlatformCssProvider>> =
-            Some(Box::new(crate::gtk::css::load_css(&initial_theme)));
-        let last_colorscheme = engine.settings.colorscheme.clone();
-
-        let engine = Rc::new(RefCell::new(engine));
-        unsafe {
-            crate::core::swap::register_emergency_engine(
-                engine.as_ptr() as *const crate::core::Engine
-            );
-        }
-
-        let deferred = DeferredQueue::new();
-
-        // #949: settings.json hot-reload used to need a GTK-only
-        // `gio::FileMonitor` constructed here. It's gone — `handle_poll_tick`
-        // now calls `Engine::check_settings_reload`'s portable mtime poll on
-        // every tick, the same mechanism TUI has always used, so there is
-        // nothing left for this constructor to set up.
-        Self::assemble(engine, deferred, css_provider, last_colorscheme, backend)
-    }
-
-    /// Backend-neutral twin of [`App::new`] (#859) — what a wrapper over a
-    /// non-GTK quadraui backend calls to get the *same* `App`, and therefore
-    /// the same `impl ShellApp`, the GTK entry point runs.
+    /// function had any seam to hand `App` a different `quadraui::Backend`
+    /// impl. `src/gtk/mod.rs::run`, `src/tui_main/mod.rs::run`,
+    /// `src/macos/mod.rs::run` and `src/win/mod.rs::run` are today's
+    /// callers, each passing its own concrete backend.
     ///
-    /// This is [`App::new`] minus exactly two steps in its prologue that
-    /// need a live GTK display, each of which is a platform *resource*
-    /// rather than a decision:
-    ///
-    /// | skipped | why | what replaces it |
-    /// |---|---|---|
-    /// | `gdk::Display` icon-theme search path | GDK-only; no portable icon-theme concept exists off GTK | nothing — no other backend has an icon theme to seed |
-    /// | `crate::gtk::css::load_css` | `unwrap()`s `gdk::Display::default()` | `css_provider: None` — a GTK stylesheet styles nothing on another toolkit |
-    ///
-    /// A third row used to live in this table: the GTK-only
-    /// `gtk4::Settings` dark/light-variant push, run once from `App::new`'s
-    /// prologue and again from `handle_poll_tick` on every colorscheme
-    /// change. quadraui#1016 moved that push into
-    /// `Backend::set_theme` itself, which `sync_per_frame_backend_state`
-    /// already calls every frame on both constructors' `App`s — so both
-    /// call sites were deleted outright rather than needing a row here.
-    ///
-    /// A fourth row used to live in this table: the GTK-only
-    /// `gio::FileMonitor` on `settings.json`, replaced here by
-    /// `settings_monitor: None` — a known hot-reload gap off GTK. #949
-    /// deleted the monitor from [`App::new`] entirely rather than adding a
-    /// portable equivalent here, since `Engine::check_settings_reload`'s
-    /// mtime poll (already the sole mechanism on TUI) now runs from the
-    /// shared `handle_poll_tick`, which both constructors' `App`s reach via
-    /// `ShellApp::tick`. That closes this gap **for macOS** for free —
-    /// nothing needed adding here at all — because quadraui's
-    /// `macos::run` keeps the same `IDLE_POLL_CEILING` (250ms) idle-tick
-    /// fallback GTK does (quadraui#940's `idlePollTick:` timer).
-    ///
-    /// **Win-GUI is only half-fixed, per the very doc this claim leans
-    /// on** (quadraui#832/#940's `AppLogic::tick` table, `runner.rs`):
-    /// Windows gets *no* idle-poll fallback at all — `tick` there only
-    /// runs after a batch of native events or an explicit
-    /// `RedrawAfter`/`request_frame_in` ask, neither of which this diff
-    /// arranges. So a future Win-GUI backend picks up an
-    /// externally-edited `settings.json` while the user is actively
-    /// generating native events (typing, moving the mouse), but not while
-    /// the app sits idle — the exact "edit settings.json externally, come
-    /// back to it" scenario hot-reload exists for. Whoever builds the
-    /// Win-GUI backend (quadraui#19–#31) needs an explicit periodic
-    /// `RedrawAfter`/`request_frame_in` nudge for this to work there the
-    /// way it does on GTK/macOS/TUI; there is no such backend in this
-    /// repo yet, so this is not a live regression today, only a caveat
-    /// for that future work.
-    ///
-    /// A fifth row used to live in this table: `install_bundled_icon_font()`
-    /// (#920's fontconfig filesystem install + font-cache-refresh shell-out).
-    /// #1130
-    /// deleted that function outright now that quadraui#1013 gives
-    /// `GtkBackend` a real `register_font_from_memory` override — every
-    /// backend, GTK included, now registers the bundled Nerd Font subset
-    /// in-process via `ShellApp::setup`'s `render::register_nerd_font_
-    /// fallback(backend)` call instead, so there is nothing left for either
-    /// constructor to call here.
-    ///
-    /// Everything else — engine construction and startup, nerd-font
-    /// selection, the clipboard provider (`setup_gtk_clipboard` (#1100)
-    /// names no concrete toolkit type — it goes through the generic
-    /// `TextMetricsBackend: quadraui::Backend` seam), the emergency-engine
-    /// registration the panic hook's swap flush needs, and the whole of
-    /// [`App::assemble`] — is shared verbatim, so the two constructors
-    /// cannot drift on anything that affects behaviour.
-    ///
-    /// `backend` is the caller's [`TextMetricsBackend`], the seam #861 opened
-    /// and `src/gtk/mod.rs::run` names in its own comment as "the seam a
-    /// future non-GTK wrapper (#859) would pass a different
-    /// `TextMetricsBackend` impl through".
-    ///
-    /// The `allow(dead_code)` is feature-shaped, not a silencer: the callers
-    /// are `crate::macos::run` (double-gated on `macos` + `target_os =
-    /// "macos"`) and, since #866, `crate::win::run` (`win`, un-target-gated
-    /// — see that module's doc comment for why). Keeping the function itself
-    /// **un**gated means every lane still type-checks it.
-    #[cfg_attr(
-        not(any(feature = "win", all(feature = "macos", target_os = "macos"))),
-        allow(dead_code)
-    )]
+    /// Nothing here needs a live GTK display: the two steps that used to
+    /// ([`crate::gtk::util::add_icon_theme_search_path`] and the deleted
+    /// `css::load_css`, GDK-only and gone respectively — the latter since
+    /// JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own equivalent
+    /// stylesheet, reloaded every frame by `sync_per_frame_backend_state`'s
+    /// `Backend::set_theme` call) both moved or vanished. `settings_monitor`
+    /// (a GTK-only `gio::FileMonitor`) was deleted outright by #949 rather
+    /// than replaced — `Engine::check_settings_reload`'s portable mtime
+    /// poll, already the sole reload mechanism on TUI, made it redundant on
+    /// every backend via the shared `handle_poll_tick`. A GTK-only
+    /// `gtk4::Settings` dark/light-variant push used to live here too;
+    /// quadraui#1016 moved that into `Backend::set_theme` itself, so it
+    /// needed no portable replacement either.
     pub(crate) fn new_portable(
         file_path: Option<PathBuf>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
+        units: render::UnitProfile,
     ) -> Self {
-        let mut engine = {
-            let mut e = Engine::new();
-            // #999: same GUI-backend-then-resolve ordering as `App::new`
-            // above — every non-GTK GUI backend this constructor serves
-            // (macOS, Win-GUI) bundles the icon font too.
-            crate::icons::set_gui_backend(true);
-            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
-            e.startup(file_path.as_deref());
-            e
-        };
-        setup_gtk_clipboard(&mut engine, backend.clone());
-
-        let last_colorscheme = engine.settings.colorscheme.clone();
-
-        let engine = Rc::new(RefCell::new(engine));
-        // SAFETY: identical contract to `App::new`'s own call — the `Rc` is
-        // moved into the returned `App`, which the caller hands straight to
-        // a `run_with_shell` that owns it for the rest of the process, so
-        // the pointer never dangles. `crate::macos::run` is the only caller
-        // and does exactly that.
+        let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
+        // SAFETY: the `Rc` is moved into the returned `App`, which the
+        // caller hands straight to a `run_with_shell` that owns it for the
+        // rest of the process, so the pointer never dangles.
+        // `crate::gtk::run`/`crate::tui_main::run`/`crate::macos::run`/
+        // `crate::win::run` are today's callers and each does exactly that.
+        // [`Self::new_portable_for_test`] below is a second caller of
+        // [`Self::build_portable_engine`], but deliberately **not** of
+        // `register_emergency_engine` — see its own doc for why a second,
+        // test-scoped caller of that unsafe fn would be unsound.
         unsafe {
             crate::core::swap::register_emergency_engine(
                 engine.as_ptr() as *const crate::core::Engine
@@ -1623,16 +1071,103 @@ impl App {
         Self::assemble(
             engine,
             DeferredQueue::new(),
-            None,
             last_colorscheme,
             backend,
+            units,
+            true,
+        )
+    }
+
+    /// Shared prologue for [`Self::new_portable`] and
+    /// [`Self::new_portable_for_test`]: build the real, startup-run `Engine`
+    /// (not the headless fixture [`Self::new_headless_with_backend`] wraps)
+    /// plus the clipboard wiring and last-known colorscheme both callers
+    /// need before deciding what to do about the emergency-engine pointer
+    /// and `App::live`.
+    #[cfg_attr(
+        not(any(
+            feature = "win",
+            all(feature = "macos", target_os = "macos"),
+            test,
+            feature = "test-support"
+        )),
+        allow(dead_code)
+    )]
+    fn build_portable_engine(
+        file_path: Option<PathBuf>,
+        backend: &Rc<RefCell<Box<dyn quadraui::Backend>>>,
+        units: render::UnitProfile,
+    ) -> (Rc<RefCell<Engine>>, String) {
+        let mut engine = {
+            let mut e = Engine::new();
+            // #999: same GUI-backend-then-resolve ordering as `App::new`
+            // above — every non-GTK GUI backend this constructor serves
+            // (macOS, Win-GUI) bundles the icon font too. #1426: reads
+            // `units.is_gui_backend` rather than a hardcoded `true` — every
+            // caller of this constructor today (macOS, Win-GUI) passes
+            // `UnitProfile::px()`, whose `is_gui_backend` is `true`, so this
+            // is not a behaviour change; it just stops the constructor from
+            // assuming its own answer.
+            crate::icons::set_gui_backend(units.is_gui_backend);
+            crate::icons::set_nerd_fonts(e.settings.use_nerd_fonts());
+            e.startup(file_path.as_deref());
+            e
+        };
+        setup_gtk_clipboard(&mut engine, backend.clone());
+
+        let last_colorscheme = engine.settings.colorscheme.clone();
+        (Rc::new(RefCell::new(engine)), last_colorscheme)
+    }
+
+    /// Test/headless twin of [`Self::new_portable`] — the seam
+    /// `tui_main::testing::tui_driver`/`tui_driver_with` (#1500) build on,
+    /// so an App-on-TUI scenario runs through the *exact same* construction
+    /// path `tui_main::run`/`crate::macos::run` use (real `Engine::startup`,
+    /// real clipboard wiring), rather than the headless
+    /// [`Self::new_headless_with_backend`] shortcut every `crate::harness`
+    /// scenario uses on a caller-supplied fixture `Engine`.
+    ///
+    /// Differs from [`Self::new_portable`] in exactly two ways, both because
+    /// this `App` is dropped at the end of a test function rather than
+    /// living "for the rest of the process":
+    ///
+    /// - **No `core::swap::register_emergency_engine` call.** That fn's own
+    ///   safety contract requires the pointee to outlive the process;
+    ///   registering it here would leave the process-global
+    ///   `EMERGENCY_ENGINE` static holding a dangling `*const Engine` the
+    ///   moment this function's caller's `App`/driver drops — a
+    ///   use-after-free the next test's panic hook (or an external crate's
+    ///   own crash hook, since this constructor backs a `test-support`
+    ///   seam) could dereference. Exactly the hazard
+    ///   [`Self::new_headless_with_backend`]'s own doc names, and the one
+    ///   the pre-#1434 TUI shell's `setup`'s `if self.live` gate exists to avoid on the
+    ///   production TUI path (`src/tui_main/shell_app.rs`).
+    /// - **Passes `live: false`** to [`Self::assemble`], not `true` — see
+    ///   `App::live`'s own doc: that flag gates `tick_dispatch`'s
+    ///   `backend.set_caret_shape` call, whose only real-writing override
+    ///   (`TuiBackend`) writes a raw DECSCUSR escape sequence straight to
+    ///   the test process's real stdout with no test-mode guard of its own.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_portable_for_test(
+        file_path: Option<PathBuf>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
+        units: render::UnitProfile,
+    ) -> Self {
+        let (engine, last_colorscheme) = Self::build_portable_engine(file_path, &backend, units);
+        Self::assemble(
+            engine,
+            DeferredQueue::new(),
+            last_colorscheme,
+            backend,
+            units,
+            false,
         )
     }
 
     /// Map a built-in activity-bar panel id to its glyph — the single table
     /// every backend's `shell_config` builder resolves icons from (#1107).
     ///
-    /// Before this, `tui_main::shell_app::TuiShellApp::shell_config` carried
+    /// Before this, the pre-#1434 TUI shell's own `build_shell_config` carried
     /// its own icon literal (zipped positionally against
     /// `sidebar::FIXED_ACTIVITY_PANEL_IDS`), entirely independent of this
     /// match — which is exactly how the search panel ended up resolving to
@@ -1656,6 +1191,7 @@ impl App {
             "panel:ai" => crate::icons::AI_CHAT.s(),
             "panel:board" => crate::icons::BOARD.s(),
             "bottom:settings" => crate::icons::SETTINGS.s(),
+            crate::core::engine::sidebar::HAMBURGER_PANEL_ID => crate::icons::HAMBURGER.s(),
             _ => return None,
         })
     }
@@ -1722,6 +1258,33 @@ impl App {
         // so the id→glyph match above deliberately needs no arm for them.
         top_panels.extend(self.engine.borrow().ext_activity_panels());
 
+        // #1427: on the `cell` profile (TUI, and any future `App`-hosted
+        // backend whose `BackendCaps::window_chrome` is `false` — see
+        // `App::setup`'s three-way branch) the menu bar starts hidden and is
+        // fully hideable, so it needs a hamburger `PanelDefinition` to
+        // reveal it — the pre-#1434 TUI shell's `build_shell_config`'s own
+        // first panel, ported here verbatim (same id/icon/title/tooltip).
+        // `px()` backends (GTK/macOS/Win) never take this branch, so their
+        // shadow-`app_shell`-derived `top_panels` list is unaffected — the
+        // hamburger is *runner-only* either way (see
+        // `render::reclaim_hamburger_sidebar_reservation`'s doc for why the
+        // shadow never gets a matching entry).
+        if !self.units.is_gui_backend {
+            top_panels.insert(
+                0,
+                quadraui::PanelDefinition {
+                    id: quadraui::WidgetId::new(crate::core::engine::sidebar::HAMBURGER_PANEL_ID),
+                    icon: Self::resolve_builtin_panel_icon(
+                        crate::core::engine::sidebar::HAMBURGER_PANEL_ID,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
+                    title: "Menu".to_string(),
+                    tooltip: "Menu".to_string(),
+                },
+            );
+        }
+
         // (#552/#710) Reserve a full-width title-bar band across the top of
         // the shell. `App::render_content` paints vimcode's own menu bar and
         // inline window controls into it, so a GUI backend that does not
@@ -1749,9 +1312,9 @@ impl App {
         // band's pixel height from the *current* line height every frame —
         // there is no runtime hook to re-derive the multiple when the user
         // later shrinks their font, and no fixed-pixel-floor knob on
-        // `ShellConfig::with_title_bar` to fall back to (unlike
-        // `with_activity_bar_width_px` below, which exists for exactly this
-        // reason on the activity bar). Concretely: a user who runs
+        // `ShellConfig::with_title_bar` to fall back to (unlike the
+        // activity bar's own fixed-pixel-width field below, which exists
+        // for exactly this reason). Concretely: a user who runs
         // `:set font_size=6` at runtime can still shrink the band under
         // macOS's real traffic-light height, and nothing in this file can
         // stop that without quadraui growing a `with_title_bar_min_px`-style
@@ -1762,22 +1325,47 @@ impl App {
         // sizes; the pathological extreme remains open pending that API.
         let mut cfg = quadraui::ShellConfig::new("VimCode", top_panels)
             .with_bottom_items(bottom_items)
-            .with_title_bar(2.0)
-            // #940/quadraui#947: opt into the client-side titlebar so a
-            // capable backend (macOS today) puts the reserved band *in* the
-            // real titlebar, beside the native traffic lights, instead of
-            // underneath it. Requested unconditionally rather than gated on
-            // `target_os = "macos"` (the Platform-Neutrality Rule) — GTK and
-            // Win-GUI simply don't honour this field yet
-            // (`ShellConfig::client_side_titlebar`'s own doc, and
-            // `ACCEPTED_DEFAULTS` in quadraui's `tests/conformance/caps.rs`),
-            // so setting it there is inert today and each backend adopts it
-            // on its own schedule with no vimcode-side change needed.
-            .with_client_side_titlebar()
-            // #719/quadraui#657: the activity bar's row height is the fixed
-            // `ACTIVITY_ROW_PX = 48.0` (VS Code parity), so sizing its
-            // *width* from the editor font makes it oblong. Pin to 48px.
-            .with_activity_bar_width_px(48.0);
+            .with_title_bar(self.units.title_bar_lh);
+        // #1427: `with_title_bar` above always sets `has_title_bar: true` —
+        // correct for GTK/macOS/Win, whose menu bar is either the CSD
+        // titlebar (`window_chrome`) or hidden behind a real OS one
+        // (`native_menu`), so the band is reserved unconditionally from
+        // frame zero. The `cell` profile's menu bar is fully hideable
+        // instead (`App::setup`'s three-way branch), so its *initial*
+        // reservation has to follow the engine's own already-resolved
+        // `menu_bar_visible` (true only in vscode-mode — `Engine::new`'s own
+        // default) the same way the pre-#1434 TUI shell's `build_shell_config`'s
+        // `menu_bar_visible` parameter did pre-#1427. Every dispatch after
+        // frame zero keeps this in sync via `render::sync_menu_bar_title_row`.
+        if !self.units.is_gui_backend {
+            cfg.has_title_bar = self.engine.borrow().menu_bar_visible;
+        }
+        // #940/quadraui#947: opt into the client-side titlebar so a
+        // capable backend (macOS today) puts the reserved band *in* the
+        // real titlebar, beside the native traffic lights, instead of
+        // underneath it. Requested unconditionally (via `self.units`, which
+        // is `true` on every GUI backend) rather than gated on `target_os =
+        // "macos"` (the Platform-Neutrality Rule) — GTK and Win-GUI simply
+        // don't honour this field yet (`ShellConfig::client_side_titlebar`'s
+        // own doc, and `ACCEPTED_DEFAULTS` in quadraui's
+        // `tests/conformance/caps.rs`), so setting it there is inert today
+        // and each backend adopts it on its own schedule with no
+        // vimcode-side change needed. `UnitProfile::cell()` (the `tui`
+        // harness arm) leaves it off, matching the pre-#1434 TUI shell's
+        // `build_shell_config`, which never calls this either.
+        if self.units.client_side_titlebar {
+            cfg = cfg.with_client_side_titlebar();
+        }
+        // #719/quadraui#657: on GTK/macOS/Win the activity bar's row height
+        // is fixed (VS Code parity), so sizing its *width* from the editor
+        // font makes it oblong — `UnitProfile::px()` pins a fixed-pixel
+        // width. `UnitProfile::cell()` leaves this `None`, so
+        // `ShellConfig::activity_bar_width`'s own default (a 3-line-height
+        // multiple) stays in charge, matching the pre-#1434 TUI shell's
+        // `build_shell_config`'s explicit `3.0`. Assigned to the field
+        // directly — `ShellConfig`'s own builder method does the identical
+        // one-line `Some(..)` assignment.
+        cfg.activity_bar_width_px = self.units.activity_bar_width_px;
         // #947: seed the *initial* editor font from `settings.font_family`/
         // `font_size` before the runner's first frame, not just via
         // `sync_per_frame_backend_state`'s per-frame `set_editor_font` call.
@@ -1802,10 +1390,19 @@ impl App {
         // already consistent — `sync_per_frame_backend_state`'s per-frame
         // call remains the only thing that matters for a runtime `:set
         // guifont`/`:set font_size=N`/`zoomin`/`zoomout` after that.
-        cfg = cfg.with_editor_font(
-            self.engine.borrow().settings.font_family.clone(),
-            self.engine.borrow().settings.font_size as f32,
-        );
+        //
+        // #1542: resolved through `app_support::resolve_editor_font` rather
+        // than reading `settings.font_family`/`font_size` verbatim, so a
+        // user who has never customized either setting gets *this*
+        // backend's platform-native convention (Menlo 12 on macOS,
+        // Consolas 14 on Win-GUI, ...) instead of one hardcoded literal on
+        // every backend — see that function's doc. `self.backend` is
+        // already the live concrete backend by this point (`App::new_portable`
+        // stores it before `build_shell_config`/`shell_config` ever runs),
+        // so `default_fonts()` answers for real here, not a guess.
+        let (editor_family, editor_size_pt) =
+            resolve_editor_font(&self.engine.borrow().settings, &**self.backend.borrow());
+        cfg = cfg.with_editor_font(editor_family, editor_size_pt);
         // #759: the shared Alt rung clamps sidebar width, so Alt+Left/Right
         // resolve identically on every backend.
         cfg.min_sidebar_width = render::ALT_SIDEBAR_WIDTH_MIN as f32;
@@ -1822,24 +1419,45 @@ impl App {
     /// `gdk::Display::default()` and panics outright with no `DISPLAY`, and
     /// `register_emergency_engine` would leave a dangling `*const Engine` in a
     /// process-global once a short-lived test's `App` is dropped (the same
-    /// soundness trap #635 documented on `TuiShellApp::live`).
+    /// soundness trap #635 documented on the pre-#1434 TUI shell's `live`).
     ///
     /// Everything below this line is plain `Rc`/`Cell`/`RefCell` allocation;
     /// none of it touches GDK. `backend` is taken as a parameter rather than
-    /// constructed here (#861) — see [`App::new`]'s doc comment.
+    /// constructed here (#861) — see [`App::new_portable`]'s doc comment.
     ///
     /// Named no toolkit type in its own signature even before #862 (#861
     /// already erased `backend`'s concrete type), so it stays un-gated
-    /// itself; only `App::new`/`App::new_headless` — its sole callers today,
-    /// both `gui`-gated — construct the arguments this needs.
-    #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+    /// itself; called from every constructor above/below (`new_portable`,
+    /// `new_portable_for_test`, `new_headless_with_backend`).
     fn assemble(
         engine: Rc<RefCell<Engine>>,
         deferred: DeferredQueue,
-        css_provider: Option<Box<dyn PlatformCssProvider>>,
         last_colorscheme: String,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
+        units: render::UnitProfile,
+        live: bool,
     ) -> Self {
+        // #1428: computed before `engine` moves into the struct literal
+        // below — see `App::pending_startup_msg`'s own doc for why this
+        // has to be shared across every constructor rather than living
+        // only in `new_portable`.
+        let pending_startup_msg = if !units.is_gui_backend {
+            let e = engine.borrow();
+            let resolved_nerd_fonts = e.settings.use_nerd_fonts();
+            let nerd_fonts_undiscovered =
+                e.settings.use_nerd_fonts.is_none() && !resolved_nerd_fonts;
+            if nerd_fonts_undiscovered {
+                Some(
+                    "Using ASCII fallback icons. If your terminal has a Nerd Font, run \
+                     :CheckNerdFonts to check and enable them."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         App {
             engine,
             draw_needed: Rc::new(Cell::new(false)),
@@ -1858,12 +1476,13 @@ impl App {
             char_width_cell: Rc::new(Cell::new(9.0)),
             mouse_pos_cell: Rc::new(Cell::new((-1.0, -1.0))),
             fr_input_dragging: false,
+            explorer_drag_src: None,
+            explorer_drag_active: None,
             deferred,
             last_clipboard_content: None,
             tab_close_hover: None,
-            cached_tab_close_abs: Rc::new(RefCell::new(HashMap::new())),
             cached_tab_slots_abs: Rc::new(RefCell::new(HashMap::new())),
-            cached_tab_pixel_hits: Rc::new(RefCell::new(HashMap::new())),
+            cached_group_tab_bar_layouts: Rc::new(RefCell::new(HashMap::new())),
             status_segment_map: Rc::new(RefCell::new(HashMap::new())),
             separated_status_bar_rect: Rc::new(Cell::new(None)),
             global_status_zones: Rc::new(RefCell::new(Vec::new())),
@@ -1887,11 +1506,17 @@ impl App {
             // used before #1234 when `self.window` was `None`.
             cached_window_width: Cell::new(800),
             cached_window_height: Cell::new(600),
+            cached_window_x: Cell::new(None),
+            cached_window_y: Cell::new(None),
+            cached_window_maximized: Cell::new(false),
+            window_geometry_restored: Cell::new(false),
             cached_editor_bounds: Cell::new(None),
+            cached_main_content_height: Cell::new(600.0),
             menu_row_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             menu_items_rect: Cell::new(quadraui::Rect::default()),
             title_bar_rect: Rc::new(Cell::new(quadraui::Rect::default())),
             title_bar_interaction: RefCell::new(quadraui::StatusBarInteraction::new()),
+            last_window_control_action: Rc::new(Cell::new(None)),
             last_sc_refresh: std::time::Instant::now(),
             panel_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             panel_hover_popup_rect: Rc::new(Cell::new(None)),
@@ -1910,9 +1535,9 @@ impl App {
             painted_char_width: Rc::new(Cell::new(None)),
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
-            css_provider,
             last_colorscheme,
             backend,
+            units,
             // #1064: seeded to `None` rather than the active panel — GTK
             // has no hamburger `PanelDefinition` (unlike TUI's `AppShell`,
             // which activates index 0 = hamburger at construction while
@@ -1924,21 +1549,22 @@ impl App {
             // whichever panel is already active, a harmless no-op switch.
             last_shell_panel: None,
             suppress_shell_panel_echo: false,
+            keyboard_enhanced: false,
+            pending_startup_msg,
+            live,
         }
     }
 
     /// Build an `App` around a caller-supplied, fully in-memory [`Engine`] with
-    /// **no** display-dependent setup — the GTK twin of `TuiShellApp::new` for
+    /// **no** display-dependent setup — the GTK twin of the pre-#1434 TUI shell's `new` for
     /// tests (#646). Feed the result to `crate::gtk::testing::harness`, which
     /// wraps it in `quadraui::gtk::testing::driver_with_shell`.
     ///
-    /// Deliberately skips, relative to [`App::new`]:
+    /// Deliberately skips, relative to [`App::new_portable`]:
     ///
-    /// - `gdk::Display::default()` icon-theme search paths.
-    /// - `load_css`, which `unwrap()`s `gdk::Display::default()` and therefore
-    ///   panics with no `DISPLAY`. `css_provider` is left `None` — even
-    ///   `gtk4::CssProvider::new()` asserts `gtk::init` has run, and a provider
-    ///   attached to no display styles nothing.
+    /// - `crate::gtk::util::add_icon_theme_search_path`'s
+    ///   `gdk::Display::default()` icon-theme search path — GDK-only, and
+    ///   `crate::gtk::run` (its sole caller) is skipped entirely here.
     /// - `setup_gtk_clipboard` (#1100), which would install
     ///   `backend.services().clipboard()` callbacks. Every other test in
     ///   `src/gtk/testing.rs` that needs `engine.clipboard_read`/
@@ -1967,6 +1593,7 @@ impl App {
         Self::new_headless_with_backend(
             engine,
             Rc::new(RefCell::new(Box::new(backend::GtkBackend::new()))),
+            render::UnitProfile::px(),
         )
     }
 
@@ -1980,8 +1607,8 @@ impl App {
     /// same `App` a `MacBackend` instead, because the whole point is to paint
     /// through quadraui's macOS rasterisers. Taking the backend as a
     /// parameter keeps **one** headless constructor rather than a second copy
-    /// per backend — the `TextMetricsBackend` trait object is already the
-    /// only place either backend's concrete type appears.
+    /// per backend — the `Box<dyn quadraui::Backend>` trait object is already
+    /// the only place either backend's concrete type appears.
     ///
     /// Ungated on `gui` deliberately: every caller is a test lane, and the
     /// macOS lane (`--no-default-features --features macos`) compiles no GTK
@@ -1989,13 +1616,19 @@ impl App {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_headless_with_backend(
         engine: Rc<RefCell<Engine>>,
-        backend: Rc<RefCell<Box<dyn TextMetricsBackend>>>,
+        backend: Rc<RefCell<Box<dyn quadraui::Backend>>>,
+        units: render::UnitProfile,
     ) -> Self {
-        // #999: this constructor is the shared headless `App` test seam for
-        // every GUI backend (GTK, and the macOS driver-tier test per this
-        // fn's own doc), so it's a GUI backend for `use_nerd_fonts()`
-        // resolution purposes the same as `App::new`/`App::new_portable`.
-        crate::icons::set_gui_backend(true);
+        // #999/#1426: this constructor is the shared headless `App` test
+        // seam for every backend `crate::harness::build_app_and_config`
+        // wraps — GTK, the macOS driver-tier test, and (since #1425) the
+        // `tui` harness arm — so `units.is_gui_backend` (not a hardcoded
+        // `true`) decides `use_nerd_fonts()` resolution the same way
+        // `App::new`/`App::new_portable` do for their own single backend.
+        // Before this, every `tui`-arm scenario built through
+        // `build_app_and_config` ran with `is_gui_backend` wrongly forced
+        // `true`.
+        crate::icons::set_gui_backend(units.is_gui_backend);
         let (use_nerd_fonts, last_colorscheme) = {
             let e = engine.borrow();
             (e.settings.use_nerd_fonts(), e.settings.colorscheme.clone())
@@ -2006,9 +1639,10 @@ impl App {
         Self::assemble(
             engine,
             DeferredQueue::new(),
-            None,
             last_colorscheme,
             backend,
+            units,
+            false,
         )
     }
 }
@@ -2153,6 +1787,48 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// After `handle_dispatch` may have opened a context menu
+    /// (`Engine::open_*_context_menu`, from any surface — editor, tab,
+    /// Explorer, Board, ...), show it immediately if the backend resolves
+    /// `MenuStyle` to `Native` (#1580, and the root-cause fix for the
+    /// macOS right-click bug it also closes). `render::show_context_menu_now`
+    /// does this through quadraui's own single-call
+    /// `quadraui::ContextMenuController::open` (quadraui#1187) rather than
+    /// calling `Backend::show_context_menu` directly.
+    ///
+    /// Called once from `Self::handle`'s single choke point, gated on the
+    /// `context_menu` open *transition* (`None` -> `Some`) rather than
+    /// from each individual `open_*_context_menu` call site — every
+    /// right-click/keyboard path that opens a menu funnels through
+    /// `handle_dispatch` before returning to `handle`, so one check there
+    /// covers all of them without per-surface backend threading. See
+    /// `render::show_context_menu_now`'s doc for why this must run from
+    /// event-handling code and never from `render_content`'s paint rung
+    /// (`FrameOp::ContextMenu`): `MacBackend::show_context_menu` blocks on
+    /// AppKit's modal popup loop, and running that from inside a paint
+    /// closure re-enters painting while the closure still holds the
+    /// borrows it needs to finish its own frame.
+    fn open_context_menu_now_if_native(&mut self, backend: &mut dyn quadraui::Backend) {
+        if backend.effective_menu_style() != quadraui::ResolvedMenuStyle::Native {
+            return;
+        }
+        let panel = self
+            .engine
+            .borrow()
+            .context_menu
+            .as_ref()
+            .map(render::context_menu_state_to_panel);
+        let Some(panel) = panel else {
+            return;
+        };
+        if panel.items.is_empty() {
+            return;
+        }
+        let cw = self.cached_char_width.max(1.0);
+        let lh = self.cached_line_height.max(1.0);
+        render::show_context_menu_now(backend, &panel, cw, lh);
+    }
+
     /// Handle a window/viewport resize.
     fn handle_resize(&mut self) {
         // #731: both branches here were gated on `self.overlay` /
@@ -2187,7 +1863,7 @@ impl App {
                     self.cached_line_height,
                     self.cached_char_width,
                     layout,
-                    &self.cached_tab_pixel_hits.borrow(),
+                    &self.cached_group_tab_bar_layouts.borrow(),
                     self.cached_frame_hit_map.borrow().as_ref(),
                     &self.cached_tab_bar_zones.borrow(),
                     true, // real click: focus/tab/gutter side effects are intended
@@ -2265,7 +1941,7 @@ impl App {
                         self.cached_line_height,
                         self.cached_char_width,
                         layout,
-                        &self.cached_tab_pixel_hits.borrow(),
+                        &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                         &mut drag_rc.borrow_mut(),
@@ -2368,17 +2044,22 @@ impl App {
         // was unconditionally `None`; and even had it run, a `(0, 0)`
         // origin is the exact coordinate-frame mismatch #582 fixed for
         // divider hit-testing.
-        let hovered_window_id = self
-            .last_editor_pointer
-            .get()
-            .zip(self.cached_editor_bounds.get())
-            .and_then(|((x, y), (editor_bounds, tab_bar_height))| {
-                let (rects, _) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-                rects
-                    .iter()
-                    .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
-                    .map(|(id, _)| *id)
-            });
+        //
+        // #1433: resolved via `render::find_window_at` against
+        // `self.cached_screen_layout` — the same painted-window lookup the
+        // double-click branch above already uses — instead of a second,
+        // hand-rolled `calculate_group_window_rects` scan. `find_window_at`
+        // is the *shared* hit-test both backends' mouse code already routes
+        // through everywhere else (`tui_main::mouse`'s `render::
+        // find_window_at` call sites), so this was the one remaining
+        // GTK-only reimplementation of it — inlined here since #240, before
+        // `find_window_at` existed as a shared helper.
+        let hovered_window_id = self.last_editor_pointer.get().and_then(|(x, y)| {
+            let layout = self.cached_screen_layout.borrow();
+            let layout = layout.as_ref()?;
+            let idx = render::find_window_at(layout, x, y)?;
+            Some(layout.windows[idx].window_id)
+        });
         if delta_y.abs() > 0.01 {
             let scroll_count = (delta_y * 3.0).round().abs() as usize;
             let active_id = engine.active_window_id();
@@ -2430,29 +2111,71 @@ impl App {
         self.queue_explorer_draw();
     }
 
-    /// Save the current session state and request a clean shutdown.
+    /// Snapshot the cached window geometry (#1234, extended #1529 for
+    /// position/maximized) into a [`core::session::WindowGeometry`] ready to
+    /// write into `engine.session.window` before `Engine::save_session_state`
+    /// persists it.
+    ///
+    /// Reads the `cached_window_*` cells rather than a live `backend`
+    /// handle: every call site that needs to save on quit
+    /// ([`Self::quit_and_save_session`] and, through it,
+    /// [`Self::save_session_and_exit`] below) runs through
+    /// `apply_engine_action`/`run_shared_tick_chores`/menu/dialog call chains
+    /// with no live `backend: &mut dyn quadraui::Backend` in scope — only
+    /// `tick`/`setup`/paint entry points have one — the same "no backend in
+    /// scope" problem `cached_line_height`/`cached_char_width` solve for text
+    /// metrics, solved the same way here. A free function (shared by both
+    /// sites) rather than duplicated field-copies keeps the five-field list
+    /// in one place.
+    fn cached_window_geometry(&self) -> core::session::WindowGeometry {
+        core::session::WindowGeometry {
+            width: self.cached_window_width.get(),
+            height: self.cached_window_height.get(),
+            x: self.cached_window_x.get(),
+            y: self.cached_window_y.get(),
+            maximized: self.cached_window_maximized.get(),
+        }
+    }
+
+    /// Save session state and request a clean shutdown, given an already
+    /// mutably-borrowed `engine`.
     ///
     /// Sets [`App::exit_requested`] rather than calling `process::exit`
     /// itself (#813) — `ShellApp::handle`/`tick` check the flag once they
     /// return and surface [`quadraui::Reaction::Exit`] to the runner, which
     /// tears the window down via `ReactionSink::request_exit`
     /// (`gtk/run.rs`), the same mechanism every other quadraui backend uses.
-    fn save_session_and_exit(&self) {
-        let mut engine = self.engine.borrow_mut();
+    ///
+    /// Takes `engine` as a parameter rather than borrowing `self.engine`
+    /// itself (unlike [`Self::save_session_and_exit`] below) because its
+    /// callers — `render::apply_engine_action`'s `Quit`/`SaveQuit`/
+    /// `QuitWithUnsaved` arms and `render::run_shared_tick_chores`'s
+    /// format-on-save-then-quit chore — already hold `engine: &mut Engine`
+    /// borrowed from this same `Rc<RefCell<Engine>>` for the whole call; a
+    /// second, independent `self.engine.borrow_mut()` from in here would
+    /// double-borrow and panic at runtime (#1063, #1248, folded here by
+    /// #1499).
+    pub(crate) fn quit_and_save_session(&self, engine: &mut Engine) {
         // Capture the cached window geometry into session state *before*
         // `save_session_state` persists it — `Engine` has no window handle
-        // of its own to read this from (#823 item 5). Reads
-        // `cached_window_width`/`cached_window_height` (refreshed every
-        // tick from `WindowControl::bounds()`) rather than a live `backend`
-        // handle, which this call chain carries none of — see those
-        // fields' own doc (#1234).
-        engine.session.window.width = self.cached_window_width.get();
-        engine.session.window.height = self.cached_window_height.get();
+        // of its own to read this from (#823 item 5). See
+        // `cached_window_geometry`'s own doc for why this reads cached
+        // cells rather than a live `backend` handle (#1234, #1529).
+        engine.session.window = self.cached_window_geometry();
         engine.save_session_state();
         engine.cleanup_all_swaps();
         engine.lsp_shutdown();
-        drop(engine);
         self.exit_requested.set(true);
+    }
+
+    /// Save the current session state and request a clean shutdown.
+    ///
+    /// Thin wrapper around [`Self::quit_and_save_session`] for call sites
+    /// that don't already hold `engine` borrowed — see that method's own
+    /// doc for why the two can't simply be one.
+    fn save_session_and_exit(&self) {
+        let mut engine = self.engine.borrow_mut();
+        self.quit_and_save_session(&mut engine);
     }
 
     /// Dispatch an `EngineAction` produced by `handle_key`, macro playback,
@@ -2482,8 +2205,7 @@ impl App {
             }
         }
         let engine_rc = self.engine.clone();
-        let mut host = GtkEngineActionHost { app: self };
-        render::apply_engine_action(action, &mut engine_rc.borrow_mut(), &mut host);
+        render::apply_engine_action(action, &mut engine_rc.borrow_mut(), self);
     }
 
     /// Return focus to the main editor drawing area when a sidebar loses
@@ -2502,7 +2224,9 @@ impl App {
     /// whenever their content changes (clipboard=unnamedplus semantics).
     ///
     /// Thin wrapper — see [`render::sync_register_to_clipboard`] (#1239) for
-    /// the shared implementation TUI's `sync_tui_clipboard` also delegates to.
+    /// the shared implementation TUI's `sync_tui_clipboard` also delegated to
+    /// before #1434 deleted that wrapper along with the rest of the
+    /// pre-#1434 TUI shell.
     fn sync_plus_register_to_clipboard(&mut self) {
         render::sync_register_to_clipboard(
             &mut self.engine.borrow_mut(),
@@ -2518,7 +2242,12 @@ impl App {
     /// syncs it out at end of dispatch), and `ShellContext::shell_mut` is the
     /// only handle to it. `ui_event` (#815) is the raw event `key_name`/
     /// `unicode`/... were decoded from, needed by the folder-picker rung —
-    /// mirrors TUI's `KeyDispatchState::ui_event`.
+    /// mirrors TUI's `KeyDispatchState::ui_event`. `backend` (#1428) is
+    /// solely for the Ctrl+L rung's `backend.request_full_repaint()` call —
+    /// GTK's `DrawingArea` repaints in full every frame regardless (no
+    /// incremental diff to desync), so this is a no-op there; see
+    /// `render::is_force_redraw_key`'s own doc for why the hook still needs
+    /// calling from every backend rather than being TUI-only code.
     fn handle_key_press(
         &mut self,
         key_name: String,
@@ -2527,8 +2256,22 @@ impl App {
         shift: bool,
         alt: bool,
         ui_event: &quadraui::UiEvent,
+        backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) {
+        // ── Shared toast-stack keyboard-focus rung (#1577) ──────────────
+        // Non-modal, unlike every rung below: `Engine::handle_toast_focus_key`
+        // only ever consumes a key once something has explicitly given the
+        // stack focus (`:Notifications` / `panel_keys.focus_notifications`)
+        // — every other key, and every key while unfocused, comes back
+        // `false` untouched, so checking this first (ahead of even the
+        // modal-dialog rung) is safe and replaces the old hardcoded `N`
+        // hijack (`keys.rs`, removed) with a real keyboard-focus cursor.
+        if self.engine.borrow_mut().handle_toast_focus_key(ui_event) {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared modal keyboard rung (#734 slice 1) ──────────────────
         // Bound to a local first: a `RefCell::borrow()` temporary in a `match`
         // scrutinee lives for the whole `match`, and the arms `borrow_mut()`.
@@ -2578,6 +2321,18 @@ impl App {
             engine.mode == crate::core::Mode::Insert && engine.insert_ctrl_x_pending
         };
         if render::is_force_redraw_key(&key_name, unicode, ctrl, insert_ctrl_x_pending) {
+            // #1428: was an ordinary redraw only — no rung called
+            // `Backend::request_full_repaint` on GTK at all. Harmless
+            // no-op there today (Cairo's `DrawingArea` repaints in full
+            // every frame, no incremental diff to desync — see
+            // `render::is_force_redraw_key`'s own doc), but load-bearing
+            // the moment `App` backs a real terminal (the `tui` harness
+            // arm today, a future live TUI-via-`App` entry point
+            // eventually): without this, Ctrl+L would only request an
+            // ordinary `Reaction::Redraw`, which a diffing backend's next
+            // paint could resolve as "nothing changed" for any cell
+            // written outside its own diff tracking.
+            backend.request_full_repaint();
             self.draw_needed.set(true);
             return;
         }
@@ -2638,6 +2393,28 @@ impl App {
             None => {}
         }
 
+        // ── Shared Ctrl-W sidebar chord rung (#1419, closes #406) ──────
+        // GTK kept no per-keypress chord latch of its own, so `Ctrl-W`
+        // followed by `h`/`l` in a sidebar panel silently did nothing here
+        // while TUI's TUI-only `TuiSidebar::pending_ctrl_w` handled it.
+        // `Engine::sidebar_ctrl_w_pending` is the shared latch both backends
+        // now read/write through `route_sidebar_chord_key`; GTK has no
+        // "sidebar band holds focus" shadow flag to clear on
+        // `SidebarChordAction::FocusOut` (unlike TUI's `sidebar.has_focus`),
+        // so there is nothing else to do here besides redraw.
+        if focus_route != render::FocusKeyRoute::None
+            && render::route_sidebar_chord_key(
+                &mut self.engine.borrow_mut(),
+                &key_name,
+                unicode,
+                ctrl,
+            )
+            .is_some()
+        {
+            self.draw_needed.set(true);
+            return;
+        }
+
         // ── Shared focus-owner *dispatch* rung (#762 / #734 slice 7) ───
         // Slice 2 shared only the *routing*; `render::dispatch_sidebar_panel_key`
         // now states the six pure-`Engine` arms too, and TUI's
@@ -2646,18 +2423,30 @@ impl App {
         // hands back `None` for the two it cannot own — Debug needs a live
         // `Backend`, Explorer is a backend widget — which the fallback match
         // below still spells out.
-        let (sc_mapped, sc_unicode) = map_gtk_key_with_unicode(key_name.as_str());
-        let mapped = map_gtk_key_name(key_name.as_str());
-        let panel_key = match focus_route {
-            render::FocusKeyRoute::SourceControl => sc_mapped,
-            _ => mapped,
-        };
+        //
+        // #1422: `key_name` is already the shared `render::engine_key_from_ui`
+        // spelling (`"Page_Up"`/`"Page_Down"`, `"ISO_Left_Tab"`, …) — the same
+        // one TUI's `engine_name()` produces — so there is no second,
+        // GTK-local mapping to apply here. The old `map_gtk_key_name` /
+        // `map_gtk_key_with_unicode` pair round-tripped `key_name` through a
+        // GDK-spelled table (`"Page_Up"` -> `"PageUp"`, `"ISO_Left_Tab"` ->
+        // `"BackTab"`) whose output every downstream consumer already accepts
+        // in its *un*-mapped, `key_name` form too (`panels.rs`/`search.rs`/
+        // `ext_panel.rs`/`source_control.rs` all dual-accept `"ISO_Left_Tab"`
+        // since #1060; nothing reads plain `"PageUp"`/`"PageDown"` at all —
+        // see issue #1422). `sc_unicode` collapses into `unicode` the same
+        // way: for a `Key::Char` press `unicode` is already `Some(c)`
+        // independent of `ctrl` (decoded once, above, when `key_name`/
+        // `unicode` were built from the raw `UiEvent`), matching what
+        // TUI's Source-Control arm (`shell_app.rs`) re-derives with `ctrl`
+        // forced off; for a `Key::Named` press both were always `None`.
+        let panel_key = key_name.as_str();
         let shared = render::dispatch_sidebar_panel_key(
             &mut self.engine.borrow_mut(),
             focus_route,
             panel_key,
             unicode,
-            sc_unicode,
+            unicode,
             ctrl,
             alt,
         );
@@ -2791,25 +2580,31 @@ impl App {
         ctrl: bool,
         ui_event: &quadraui::UiEvent,
     ) -> Option<Option<bool>> {
-        let mapped = map_gtk_key_name(key_name);
         match route {
             render::FocusKeyRoute::Debug => {
+                // #1422: pass the real `ui_event` straight to `SidebarSystem::
+                // handle` instead of reconstructing a `UiEvent` from `key_name`
+                // through the old `gtk_key_name_to_quadraui` table (which only
+                // covered a dozen named/nav keys and silently skipped `.handle`
+                // for everything else). Mirrors TUI's identical, unconditional
+                // `.handle(ui_event, backend, rect)` call for this route
+                // (`shell_app.rs`'s `handle_focus_owner_key`) — see
+                // `dispatch_dap_sidebar_event`'s own doc: it already reports
+                // `Ignored` as `false` so an unrecognised key still falls
+                // through to `dispatch_dap_sidebar_action_key` below exactly
+                // as before.
                 let mut engine = self.engine.borrow_mut();
                 let rect = engine.dap_sidebar_body_rect.get();
                 render::populate_dap_sidebar_system(&engine);
-                let consumed = if let Some(ui_event) = gtk_key_name_to_quadraui(mapped, ctrl) {
-                    let backend_rc = self.backend.clone();
-                    let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
-                        &ui_event,
-                        &mut **backend_rc.borrow_mut(),
-                        rect,
-                    );
-                    engine.dispatch_dap_sidebar_event(sidebar_event)
-                } else {
-                    false
-                };
+                let backend_rc = self.backend.clone();
+                let sidebar_event = engine.dap_sidebar_system.borrow_mut().handle(
+                    ui_event,
+                    &mut **backend_rc.borrow_mut(),
+                    rect,
+                );
+                let consumed = engine.dispatch_dap_sidebar_event(sidebar_event);
                 if !consumed {
-                    engine.dispatch_dap_sidebar_action_key(mapped);
+                    engine.dispatch_dap_sidebar_action_key(key_name);
                 }
                 Some(Some(engine.dap_sidebar_has_focus))
             }
@@ -2817,8 +2612,7 @@ impl App {
                 // Unlike Debug (nav-only), the AI panel's `ChatController`
                 // needs the real, un-round-tripped `UiEvent` — `KeyPressed`
                 // *or* `CharTyped` — so free-form typed text reaches its
-                // input buffer; `gtk_key_name_to_quadraui`'s reconstruction
-                // only covers a handful of named/nav keys (#819).
+                // input buffer.
                 let mut engine = self.engine.borrow_mut();
                 let rect = engine.ai_chat_rect.get();
                 let theme = render::Theme::from_name(&engine.settings.colorscheme);
@@ -2829,8 +2623,8 @@ impl App {
                 let metrics = self.cached_ai_chat_metrics.get();
                 {
                     let mut b = backend_rc.borrow_mut();
-                    b.set_current_line_height(metrics.0);
-                    b.set_current_char_width(metrics.1);
+                    quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+                    quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
                 }
                 let still_focused = render::route_ai_chat_event(
                     &mut engine,
@@ -2845,7 +2639,7 @@ impl App {
                 // Explorer keys used to be routed through a per-DrawingArea
                 // key controller when the DA had focus (#732 retired the
                 // `Msg` variant it sent; nothing has produced it since #540).
-                self.handle_explorer_da_key(mapped.to_string(), unicode, ctrl);
+                self.handle_explorer_da_key(key_name.to_string(), unicode, ctrl);
                 self.draw_needed.set(true);
                 Some(None)
             }
@@ -2879,16 +2673,11 @@ impl App {
     /// went red at the second-click assertion — the engine-side state
     /// (`sidebar_visible()`) was already correct, only the paint wasn't.
     fn sync_runner_sidebar_visibility(&self, ctx: &quadraui::ShellContext<'_>) {
-        let shadow_visible = self.engine.borrow().app_shell.sidebar_visible();
-        if ctx.shell().sidebar_visible() != shadow_visible {
-            if shadow_visible {
-                if let Some(id) = self.engine.borrow().app_shell.active_panel_id().cloned() {
-                    ctx.shell_mut().show_panel(&id);
-                }
-            } else {
-                ctx.shell_mut().hide_sidebar();
-            }
-        }
+        // #1427: moved to `render::sync_runner_sidebar_visibility`, shared
+        // with the pre-#1434 TUI shell — see its own doc, including the #1029/#988
+        // hamburger guard this method used to lack entirely (harmless on
+        // GTK/macOS/Win, which never register the hamburger panel).
+        render::sync_runner_sidebar_visibility(&self.engine.borrow(), ctx);
     }
 
     /// GTK's half of the shared after-every-editor-keypress epilogue.
@@ -2905,7 +2694,7 @@ impl App {
     /// from the runner's own `AppShell`, reachable solely through
     /// `ShellContext::shell_mut` (see `handle_key_press`'s doc comment on
     /// `ctx`, and TUI's identical shadow/runner split documented on
-    /// `TuiShellApp::on_shell_event`). Without pushing the change through,
+    /// the pre-#1434 TUI shell's `on_shell_event`). Without pushing the change through,
     /// `should_autohide_sidebar` flips a flag nothing paints from and the
     /// sidebar visually stays open.
     fn run_post_key_epilogue(&mut self, ctx: &quadraui::ShellContext<'_>) {
@@ -2964,21 +2753,16 @@ impl App {
     }
 
     fn handle_poll_tick(&mut self, backend: &mut dyn quadraui::Backend) {
-        // Reload CSS if the colorscheme changed (e.g. via :colorscheme command).
+        // Schedule a redraw if the colorscheme changed (e.g. via
+        // `:colorscheme`). #1498: this used to also reload a GTK-only CSS
+        // provider theming the native file dialog here; that provider is
+        // gone (JDonaghy/quadraui#1091 moved the equivalent stylesheet into
+        // `GtkPlatformServices`, reloaded every frame by
+        // `sync_per_frame_backend_state`'s `Backend::set_theme` call), so
+        // this block's only remaining job is the redraw schedule.
         {
             let current = self.engine.borrow().settings.colorscheme.clone();
             if current != self.last_colorscheme {
-                let theme = Theme::from_name(&current);
-                let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-                if let Some(p) = &self.css_provider {
-                    p.load_css_data(&combined);
-                }
-                // GTK dark/light preference for native widgets & menus
-                // (the file dialog) is no longer pushed here: quadraui#1016
-                // made `Backend::set_theme` do it, and
-                // `sync_per_frame_backend_state` calls that every frame —
-                // this block's `draw_needed.set(true)` below is what
-                // schedules the next one.
                 self.last_colorscheme = current;
                 self.draw_needed.set(true);
             }
@@ -3023,14 +2807,13 @@ impl App {
         // #1248: the rest of this function's chores — per-window viewport
         // sync, tab-visibility re-check, window title, yank-highlight clear,
         // idle/SC polling, deferred quit, terminal command, ext-panel focus,
-        // platform-action drain — are shared with `TuiShellApp::tick`. See
-        // `render::run_shared_tick_chores`'s header comment for the full
-        // list and why the pieces left in `GtkTickHost` below differ.
+        // platform-action drain — are shared with the pre-#1434 TUI shell's
+        // `tick`. See `render::run_shared_tick_chores`'s header comment for
+        // the full list.
         let engine_rc = self.engine.clone();
         let needs_redraw = {
             let mut engine = engine_rc.borrow_mut();
-            let mut host = GtkTickHost { app: self, backend };
-            render::run_shared_tick_chores(&mut engine, &mut host)
+            render::run_shared_tick_chores(&mut engine, self, backend)
         };
         if needs_redraw {
             self.draw_needed.set(true);
@@ -3080,11 +2863,13 @@ impl App {
                 links: &links,
                 scrollbar: self.editor_hover_scrollbar.get(),
                 has_focus,
-                // `draw_editor_hover_popup` insets its text by 4px on both
-                // axes; the content grid is the editor's own cell size.
+                // #1429: `units.hover_popup_pad` — was hardcoded to GTK's
+                // 4px/4px inset even on the `tui` harness arm (`App` on
+                // `TuiBackend`), disagreeing with that arm's own painted
+                // 2-cell/1-cell popup frame.
                 content: render::PopupContentMetrics {
-                    pad_x: 4.0,
-                    pad_y: 4.0,
+                    pad_x: self.units.hover_popup_pad.0,
+                    pad_y: self.units.hover_popup_pad.1,
                     col_width: self.cached_char_width.max(1.0) as f32,
                     line_height: self.cached_line_height.max(1.0) as f32,
                 },
@@ -3339,7 +3124,7 @@ impl App {
     ///
     /// TUI's twin is `render_impl::render_all_windows`, which also paints its
     /// within-group separators (`render_separators`) from the same rung.
-    fn paint_editor_windows_rung(
+    pub(crate) fn paint_editor_windows_rung(
         &self,
         backend: &mut dyn quadraui::Backend,
         screen: &render::ScreenLayout,
@@ -3387,8 +3172,12 @@ impl App {
             //
             // #764: this is the layout the *paint* resolved, not a second
             // `status_bar_layout` re-measure of the same bar as it used to be —
-            // same reasoning as `render::PaintedTabBar::hits`.
-            let sb_layout = backend.draw_status_bar(sb_rect, &win_bar, None, None);
+            // same reasoning as `render::PaintedTabBar::layout`.
+            let sb_layout = backend.draw_status_bar_interactive(
+                sb_rect,
+                &win_bar,
+                &quadraui::InteractionState::new(),
+            );
             self.status_segment_map.borrow_mut().insert(
                 rw.window_id.0,
                 render::status_bar_zones_from_layout(&sb_layout),
@@ -3488,8 +3277,8 @@ impl App {
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
                 // called on this backend — the exact #971 gap
-                // (`gui_sidebar_system_metrics`'s own doc) that left
-                // `SidebarSystem::handle_cached` returning
+                // (`render::UnitProfile::sidebar_system_metrics`'s own doc)
+                // that left `SidebarSystem::handle_cached` returning
                 // `SidebarEvent::Ignored` unconditionally, fixed for
                 // `sc_sidebar_system` (this match's `PANEL_GIT` arm) and
                 // `ext_sidebar_system` (`refresh_ext_sidebar_metrics`) but
@@ -3502,8 +3291,8 @@ impl App {
                 engine
                     .search_sidebar_system
                     .borrow_mut()
-                    .set_backend_info(search_lh, render::gui_sidebar_system_metrics(search_lh));
-                render::populate_search_sidebar_system(engine, &engine.cwd);
+                    .set_backend_info(search_lh, (self.units.sidebar_system_metrics)(search_lh));
+                render::populate_search_sidebar_system(engine, &engine.cwd, theme);
                 engine.search_sidebar_body_rect.set(q_sb);
                 engine.search_sidebar_system.borrow().render(backend, q_sb);
             }
@@ -3586,7 +3375,11 @@ impl App {
                         );
                         self.cached_sc_bands.set(Some(bands));
                         let header_bar = render::sc_header_status_bar(sc, theme);
-                        let _ = backend.draw_status_bar(bands.header, &header_bar, None, None);
+                        let _ = backend.draw_status_bar_interactive(
+                            bands.header,
+                            &header_bar,
+                            &quadraui::InteractionState::new(),
+                        );
 
                         let ti = render::sc_commit_message_to_text_input(sc);
                         backend.draw_text_input(bands.commit_input, &ti);
@@ -3601,7 +3394,11 @@ impl App {
                         // has focus) so it can't show unreserved space.
                         if let Some(hint_rect) = bands.hint {
                             let hint_bar = render::sc_hint_status_bar(theme);
-                            let _ = backend.draw_status_bar(hint_rect, &hint_bar, None, None);
+                            let _ = backend.draw_status_bar_interactive(
+                                hint_rect,
+                                &hint_bar,
+                                &quadraui::InteractionState::new(),
+                            );
                         }
                         let body_rect = engine
                             .sc_panel_layout
@@ -3613,8 +3410,9 @@ impl App {
                         // #971: without this, `sc_sidebar_system.handle_cached`
                         // returns `Ignored` unconditionally and every
                         // content-row press (header collapse, row select) is a
-                        // silent no-op — see `render::gui_sidebar_system_metrics`'s
-                        // own doc for the full story. Reads `backend.line_height()`
+                        // silent no-op — see `render::UnitProfile::
+                        // sidebar_system_metrics`'s own doc for the full
+                        // story. Reads `backend.line_height()`
                         // directly — not the `lh` parameter above, whose
                         // `self.cached_line_height.max(backend.line_height())`
                         // derivation (`render_content`'s own top) can lag behind
@@ -3626,7 +3424,7 @@ impl App {
                         engine
                             .sc_sidebar_system
                             .borrow_mut()
-                            .set_backend_info(sc_lh, render::gui_sidebar_system_metrics(sc_lh));
+                            .set_backend_info(sc_lh, (self.units.sidebar_system_metrics)(sc_lh));
                         render::populate_sc_sidebar_system(engine, theme);
                         engine.sc_sidebar_system.borrow().render(backend, body_rect);
 
@@ -3697,7 +3495,7 @@ impl App {
                     scrollbar_gutter: None,
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
-                    Self::refresh_ext_sidebar_metrics(backend, engine);
+                    Self::refresh_ext_sidebar_metrics(backend, engine, self.units);
                     render::populate_ext_sidebar_system(engine);
                     engine.ext_sidebar_body_rect.set(body_rect);
                     engine
@@ -3722,7 +3520,11 @@ impl App {
                         if let Some(ref status) = board.status {
                             let bar = render::board_status_bar(status, theme);
                             let rect = quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, lh as f32);
-                            let _ = backend.draw_status_bar(rect, &bar, None, None);
+                            let _ = backend.draw_status_bar_interactive(
+                                rect,
+                                &bar,
+                                &quadraui::InteractionState::new(),
+                            );
                         }
                     }
                 }
@@ -3741,8 +3543,22 @@ impl App {
                 // by this issue) — see `render::search_only_chrome`'s doc.
                 // TUI's `panels::render_settings_panel` builds the identical
                 // chrome through the same helper.
+                //
+                // #1574: `background` is `Some(theme.tab_bar_bg)`, not
+                // `None` — the same sidebar background the `PANEL_EXPLORER`
+                // arm's doc comment above says TUI passes for this composer.
+                // With `None`, nothing fills the strip under the settings
+                // scrollbar's gutter, so the backend's own clear colour
+                // (dark on macOS regardless of the active colourscheme)
+                // showed through there instead of the themed sidebar bg.
+                // GTK-only: `src/gtk/testing.rs`'s
+                // `settings_panel_scrollbar_gutter_paints_theme_tab_bar_bg`
+                // covers it with a pixel probe (that module's own doc
+                // records why an equivalent TUI probe can't reproduce this
+                // one — `FormController` already paints an opaque per-row
+                // background there regardless of this field).
                 let panel = render::SidebarPanelBody {
-                    background: None,
+                    background: Some(theme.tab_bar_bg),
                     chrome: render::search_only_chrome(
                         &engine.settings_query,
                         "",
@@ -3838,12 +3654,40 @@ impl App {
                 // `draw_ai_sidebar_panel`. `ai_chat_rect` is cached on
                 // `Engine` (not here) so `route_ai_chat_event` re-derives
                 // the identical layout `render()` painted (#544/#582/#646).
-                render::populate_ai_chat_controller(engine, theme);
-                engine.ai_chat_rect.set(q_sb);
-                engine.ai_chat.borrow().render(backend, q_sb);
+                render::populate_ai_chat_controller(engine, theme, backend);
+                // #1513: the pinned plan block gets a band carved off the
+                // top of the panel rect *before* `ChatController` ever sees
+                // the remainder — `ai_chat_rect` (and therefore every
+                // `route_ai_chat_event` hit-test) is the shrunk rect, so a
+                // click inside the band never reaches the transcript below
+                // it. Zero-height (no-op split) while there's no plan.
+                let plan_h = render::ai_plan_band_height(engine, backend.line_height());
+                let (plan_rect, chat_rect) = if plan_h > 0.0 {
+                    (
+                        quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, plan_h),
+                        quadraui::Rect::new(
+                            q_sb.x,
+                            q_sb.y + plan_h,
+                            q_sb.width,
+                            (q_sb.height - plan_h).max(0.0),
+                        ),
+                    )
+                } else {
+                    (quadraui::Rect::new(q_sb.x, q_sb.y, 0.0, 0.0), q_sb)
+                };
+                render::paint_ai_plan_band(backend, engine, theme, plan_rect);
+                engine.ai_chat_rect.set(chat_rect);
+                engine.ai_chat.borrow().render(backend, chat_rect);
                 // #956 (ACP-5): slash-command completions, painted on top —
                 // no-op unless the input matches an agent-declared command.
-                render::paint_ai_command_completions(backend, engine, q_sb);
+                // `chat_rect` (not `q_sb`), per `paint_ai_command_completions`'s
+                // own contract: the same rect `ai_chat.render()` just used,
+                // so the popup anchors off the input box's *actual* position
+                // — unaffected by the #1513 plan-band split in the common
+                // case (the band only eats space off the top), but wrong to
+                // silently keep passing the unshrunk sidebar rect here now
+                // that the two can differ.
+                render::paint_ai_command_completions(backend, engine, chat_rect);
                 // `cached_explorer_metrics`'s drift guard, ported: `backend`'s
                 // "current" line_height/char_width are mutable and can be
                 // overwritten by whatever paints next this frame or the
@@ -3871,8 +3715,8 @@ impl App {
     /// Without this, `ext_sidebar_system.handle_cached` returns `Ignored`
     /// unconditionally and every content-row press on the plugin ext panel
     /// (header collapse, row select) is a silent no-op — see
-    /// `render::gui_sidebar_system_metrics`'s own doc for the full story.
-    /// Reads `backend.line_height()` directly rather than accepting a
+    /// `render::UnitProfile::sidebar_system_metrics`'s own doc for the full
+    /// story. Reads `backend.line_height()` directly rather than accepting a
     /// cached `lh` parameter — see the `PANEL_GIT` arm's identical comment
     /// in [`Self::paint_sidebar_panel_rung`] on why: a cached value can lag
     /// behind what `backend` reports by the time `render()` actually reads
@@ -3881,12 +3725,16 @@ impl App {
     /// `PANEL_EXTENSIONS` arm and the `id if id.starts_with("ext:")` arm
     /// above, which were previously two verbatim copies of this same
     /// four-line snippet.
-    fn refresh_ext_sidebar_metrics(backend: &mut dyn quadraui::Backend, engine: &Engine) {
+    fn refresh_ext_sidebar_metrics(
+        backend: &mut dyn quadraui::Backend,
+        engine: &Engine,
+        units: render::UnitProfile,
+    ) {
         let ext_lh = backend.line_height();
         engine
             .ext_sidebar_system
             .borrow_mut()
-            .set_backend_info(ext_lh, render::gui_sidebar_system_metrics(ext_lh));
+            .set_backend_info(ext_lh, (units.sidebar_system_metrics)(ext_lh));
     }
 
     /// Compose the editor-anchored popups: completion menu, LSP hover, editor
@@ -3965,8 +3813,28 @@ impl App {
         // modal stack.
         let completion = screen.completion.as_ref().and_then(|menu| {
             let (cursor_x, cursor_y) = anchor_points.completion?;
-            // Longest candidate + 2 cells of padding/border, floored at
-            // 100px.
+            // Longest candidate + 4 cells of padding/border, floored at 12
+            // cells' worth of raw units (`cw`-scaled, not a bare pixel
+            // constant — #1432: this function runs unmodified for both `gtk`
+            // and TUI-via-`App`, and a flat `100.0` floor is a GTK pixel
+            // width. On TUI `cw` is `1.0` (cell = 1 raw unit), so that same
+            // constant used to demand a 100-*cell*-wide popup — wider than
+            // most terminals — which made `Completions::layout`'s own
+            // right-edge-overflow branch always fire and clamp `x` straight
+            // back to `viewport.x`, discarding the correctly-computed cursor
+            // anchor outright (observed: popup pinned at the window's left
+            // edge regardless of cursor column). Both the `+4`/`.max(12.0)`
+            // now match `tui_main::render_impl`'s independent
+            // completion-width calc exactly (its own comment there names
+            // the same reasoning) — this used to read `+2`, which happened
+            // to never matter while `100.0` always dominated it, but once
+            // scaled down to a real cell-sized floor a too-narrow candidate
+            // term clipped the popup's own last character (observed:
+            // `"ZQXWFOOBAR"` painted as `"ZQXWFOOBA"`, missing the border's
+            // trailing padding cell). Scaling the shared `12.0` floor by
+            // `cw` here keeps GTK's effective minimum close to its old
+            // ~100px (12 * a typical ~8px cell) while giving TUI-via-`App`
+            // the same sane 12-cell floor `render_impl` already ships.
             //
             // #420: `Completions::layout` clamps the popup's *position*
             // into `win_viewport` (`x.max(viewport.x)`) but never clamps
@@ -3979,7 +3847,7 @@ impl App {
             // Tracked as a follow-up pending a quadraui-side fix rather than
             // duplicating a `.min(...)` clamp here and in
             // `tui_main::render_impl`.
-            let popup_w = ((menu.max_width + 2) as f64 * cw).max(100.0);
+            let popup_w = ((menu.max_width + 4) as f64 * cw).max(12.0 * cw);
             let max_popup_h = 10.0 * lh;
             Some((
                 render::PopupAnchor {
@@ -4068,6 +3936,13 @@ impl App {
         theme: &Theme,
     ) {
         backend.set_theme(render::to_quadraui_theme(theme));
+        // #1580: re-synced every frame, same reasoning as the theme sync
+        // right above — a runtime `:set menu_style=...` (or its Settings-
+        // sidebar equivalent) reaches quadraui's own `MenuStyle` on the
+        // very next paint. `set_menu_style` only persists a value on the
+        // backend struct (no popup, no blocking call), so calling it
+        // every frame is as cheap as the theme/font syncs it sits next to.
+        backend.set_menu_style(render::to_quadraui_menu_style(engine.settings.menu_style));
         // (#547) Re-synced every frame so runtime toggles (`:set
         // nonerdfonts`) take effect immediately, matching TUI.
         render::sync_nerd_fonts(backend, engine);
@@ -4078,7 +3953,7 @@ impl App {
         // raw-Pango chrome that doesn't go through `Backend::set_ui_font`)
         // read the process-global atomic this writes, so before this port it
         // silently stayed pinned at the default size forever.
-        sync_ui_font_size(&engine.settings);
+        sync_ui_font_size(&engine.settings, backend);
         // #705 item 3 / quadraui#624: push the same UI_FONT() family+size
         // onto the *paint* backend's `ui_font`, which `draw_status_bar`
         // (breadcrumbs, per-window/global status lines), `draw_tree`
@@ -4104,10 +3979,13 @@ impl App {
         // "set_editor_font" src/` returned zero hits before this issue), so
         // the editor painted at whatever default quadraui's `GtkBackend`/
         // `MacBackend` ship with ("Monospace 11") regardless of the setting.
-        backend.set_editor_font(
-            &engine.settings.font_family,
-            engine.settings.font_size as f32,
-        );
+        //
+        // #1542: resolved through `resolve_editor_font` (same function
+        // `shell_config`'s pre-seed above uses) instead of the raw fields,
+        // so an un-customized setting keeps tracking this backend's
+        // platform-native convention every frame, not just at startup.
+        let (editor_family, editor_size_pt) = resolve_editor_font(&engine.settings, backend);
+        backend.set_editor_font(&editor_family, editor_size_pt);
 
         // #672: scroll surfaces are re-registered from scratch every frame
         // (mirrors TUI's `render_impl.rs` `scroll_surfaces.borrow_mut().clear()`)
@@ -4132,10 +4010,10 @@ impl App {
     /// shared walk by #1251) and recover this frame's `FrameHitMap` from it.
     ///
     /// Walks `render::paint_editor_band_rungs`, the single loop both this
-    /// method and `TuiShellApp::paint_editor_band` now call — see that
-    /// function's doc and `GtkEditorBandHost`'s for exactly which four rungs
-    /// still need a per-backend body and why. Extracted out of
-    /// `render_content` (#766) so that function reads as the frame's *order*.
+    /// method and the pre-#1434 TUI shell's `paint_editor_band` now call —
+    /// see that function's own doc for exactly which rungs need `self` and
+    /// why. Extracted out of `render_content` (#766) so that function reads
+    /// as the frame's *order*.
     ///
     /// `band` carries the editor column's origin and width (its height is not
     /// used); `metrics` is `(line_height, char_width)` and `tab_metrics` is
@@ -4160,8 +4038,7 @@ impl App {
         // geometry (#515). Cleared here, before the walk, rather than from an
         // absent-rung branch: `compose_editor_band` returns only the live
         // rungs, so a frame with no tab bars has no arm to clear them from.
-        self.cached_tab_pixel_hits.borrow_mut().clear();
-        self.cached_tab_close_abs.borrow_mut().clear();
+        self.cached_group_tab_bar_layouts.borrow_mut().clear();
         self.cached_tab_slots_abs.borrow_mut().clear();
         // #1165: reset alongside the hit caches above — this frame's
         // `TabBars` rung (if any) repopulates it, and `handle_poll_tick`
@@ -4172,8 +4049,8 @@ impl App {
         // `window_editors`/`hit_bars` stash what the `Windows`/`TabBars`
         // rungs painted, past the walk (#449), so the `FrameHitMap` built
         // below references the SAME objects just painted rather than a
-        // second copy that could drift — see `GtkEditorBandHost`'s doc for
-        // why this bookkeeping can't move into the shared walk itself.
+        // second copy that could drift — see `render::paint_editor_band_rungs`'s
+        // doc for why this bookkeeping can't move into the shared walk itself.
         //
         // #1128 (was #731): both scrollbars ARE painted for the editor on
         // GTK today. quadraui#968 taught `gtk::editor::draw_editor` (the
@@ -4191,20 +4068,14 @@ impl App {
         //
         // `app_support::editor_scrollbar_layout` builds the same
         // `Editor`/`EditorLayout` pair (minus the rendered text, which
-        // scrollbar geometry never reads) so `h_scrollbar_thumb_geometry`/
-        // `v_scrollbar_thumb_geometry`/`h_scrollbar_hit_test`/
-        // `v_scrollbar_hit_test` below can never resolve a hover/drag rect
-        // paint didn't actually draw — #1128 deleted the pre-#968 h-scrollbar
-        // geometry helper that independently guessed its own track width and
-        // could disagree with what was actually painted.
-        let mut host = GtkEditorBandHost {
-            app: self,
-            lh,
-            tab_row_h,
-            tab_bar_h,
-            window_editors: Vec::with_capacity(screen.windows.len()),
-            hit_bars: Vec::new(),
-        };
+        // scrollbar geometry never reads) so the axis-parameterised
+        // `scrollbar_thumb_geometry`/`scrollbar_hit_test` (#1493, was one
+        // hand-rolled pair per axis) below can never resolve a hover/drag
+        // rect paint didn't actually draw — #1128 deleted the pre-#968
+        // h-scrollbar geometry helper that independently guessed its own
+        // track width and could disagree with what was actually painted.
+        let mut window_editors = Vec::with_capacity(screen.windows.len());
+        let mut hit_bars = Vec::new();
         let units = render::EditorBandUnits::px(lh, cw, tab_row_h);
         let composed_editor = render::paint_editor_band_rungs(
             backend,
@@ -4213,14 +4084,12 @@ impl App {
             theme,
             band,
             units,
+            tab_bar_h,
             self.tab_drag.is_dragging(),
-            &mut host,
+            self,
+            &mut window_editors,
+            &mut hit_bars,
         );
-        let GtkEditorBandHost {
-            window_editors,
-            hit_bars,
-            ..
-        } = host;
         *self.composed_editor_band.borrow_mut() = composed_editor;
         // Same contract as the chrome/overlay bands: read back through the
         // field rather than the local, so the *stored* observable is what gets
@@ -4344,7 +4213,7 @@ impl App {
                         continue;
                     };
                     // GTK has no persistent `quickfix_scroll_top` to advance
-                    // from key events (unlike TUI's `TuiShellApp`), so the
+                    // from key events (unlike TUI's the pre-#1434 TUI shell), so the
                     // "keep the selection visible" offset is recomputed
                     // statelessly each frame — through the shared
                     // `quickfix_scroll_top`, so the two backends cannot
@@ -4459,7 +4328,7 @@ impl App {
         }
     }
 
-    fn paint_tab_bars_rung<'a>(
+    pub(crate) fn paint_tab_bars_rung<'a>(
         &self,
         backend: &mut dyn quadraui::Backend,
         engine: &Engine,
@@ -4477,35 +4346,38 @@ impl App {
             self.tab_close_hover
                 .map(|(gid, i)| (core::window::GroupId(gid), i)),
         );
-        let mut pixel_hits = self.cached_tab_pixel_hits.borrow_mut();
-        let mut close_abs = self.cached_tab_close_abs.borrow_mut();
+        let char_width = backend.char_width();
+        let mut group_layouts = self.cached_group_tab_bar_layouts.borrow_mut();
         let mut slots_abs = self.cached_tab_slots_abs.borrow_mut();
         let mut visible_counts = self.tab_visible_counts.borrow_mut();
         for bar in painted {
-            // #1165: same `hits.available_cols` TUI reads for
-            // `set_tab_visible_count` — see `Self::tab_visible_counts`'s doc.
-            visible_counts.push((bar.group_id, bar.hits.available_cols));
+            // #1165/#1491: the engine-feedback "how many columns of tab
+            // strip fit" number `Engine::set_tab_visible_count` budgets
+            // against — see `click::tab_bar_available_cols`'s doc for why
+            // this reads the paint's own rect/layout instead of the
+            // deprecated `TabBarHits::available_cols`.
+            visible_counts.push((
+                bar.group_id,
+                tab_bar_available_cols(bar.rect, &bar.layout, char_width),
+            ));
             // Recover the exact pixel geometry the rasteriser just drew and
-            // cache it (relative to the bar's left edge) for hit-testing.
+            // cache it for hit-testing and tab-drop geometry.
             //
-            // #764: `bar.hits` is what the *paint* returned, not the separate
-            // `tab_bar_layout_icons` re-measure this used to make. The icon
-            // reservation widens every decorated tab, so an icon-less or
-            // differently-fonted twin reports slot and close bounds shifted
-            // left of the painted glyphs — i.e. the close × of tab N lands
-            // inside tab N+1's painted slot, and clicking it closes the wrong
-            // tab. Exactly the measure/paint desync of #654; reading the
-            // paint's own answer makes it unreachable rather than merely
-            // fixed (#703).
-            let ph = tab_hits_to_pixel_hits(&bar.hits, bar.bar, bar.rect.x as f64);
-            let bar_top = bar.rect.y as f64;
-            close_abs.insert(
+            // #764: `bar.layout` is what the *paint* returned, not a separate
+            // re-measure this used to make. The icon reservation widens
+            // every decorated tab, so an icon-less or differently-fonted
+            // twin reports slot and close bounds shifted left of the
+            // painted glyphs — i.e. the close × of tab N lands inside tab
+            // N+1's painted slot, and clicking it closes the wrong tab.
+            // Exactly the measure/paint desync of #654; reading the paint's
+            // own answer makes it unreachable rather than merely fixed
+            // (#703).
+            slots_abs.insert(
                 bar.group_id.0,
-                abs_close_record(&ph.close, bar.rect.x as f64, bar_top, bar_top + tab_row_h),
+                abs_slot_positions_from_layout(bar.rect, bar.bar, &bar.layout),
             );
-            slots_abs.insert(bar.group_id.0, abs_slot_positions(&bar.hits));
-            pixel_hits.insert(bar.group_id.0, ph);
             hit_bars.push((bar.group_id, bar.rect, bar.bar));
+            group_layouts.insert(bar.group_id.0, (bar.rect, bar.layout));
         }
     }
 
@@ -4528,7 +4400,7 @@ impl App {
     /// of `screen_to_drop_group_bounds` derived its rect from a caller-supplied
     /// origin/size instead; `group_tab_bars` now covers one group too, so both
     /// the branch and the parameters it fed are gone (#551).
-    fn cache_tab_drop_geometry(
+    pub(crate) fn cache_tab_drop_geometry(
         &self,
         screen: &render::ScreenLayout,
         engine: &Engine,
@@ -4570,7 +4442,7 @@ impl App {
             self.cached_line_height,
             self.cached_char_width,
             layout,
-            &self.cached_tab_pixel_hits.borrow(),
+            &self.cached_group_tab_bar_layouts.borrow(),
             self.cached_frame_hit_map.borrow().as_ref(),
             &self.cached_tab_bar_zones.borrow(),
             true, // resolving the original tab-bar mouse-down; switching tabs is intended
@@ -4625,7 +4497,7 @@ impl App {
                 rect,
                 lh,
                 engine_ref.picker_preview.is_some(),
-                &render::gtk_picker_rows(lh),
+                &(self.units.picker_rows)(lh),
                 &engine_ref,
             )
         });
@@ -4637,7 +4509,7 @@ impl App {
                 render::FindReplaceHitGeometry::from_panel(
                     panel,
                     (self.painted_char_width() as f32, lh),
-                    &render::GTK_FIND_REPLACE_ANCHOR,
+                    &(self.units.find_replace_anchor),
                 )
             });
 
@@ -4689,7 +4561,7 @@ impl App {
                 rect,
                 lh,
                 engine.picker_preview.is_some(),
-                &render::gtk_picker_rows(lh),
+                &(self.units.picker_rows)(lh),
                 &engine,
             )
         };
@@ -4778,6 +4650,127 @@ impl App {
         true
     }
 
+    /// Resolve a press against one editor scrollbar axis — thumb-drag vs.
+    /// track page-jump — shared between the horizontal and vertical rungs
+    /// of `handle_mouse_click_msg` (#1493). Returns `true` when the point
+    /// landed on a scrollbar and the click was consumed (either scrolled
+    /// immediately or armed a drag); the caller should `return` without
+    /// falling through to the next rung.
+    ///
+    /// Window rects always come from [`Self::painted_editor_bounds`] — the
+    /// same cached, already-painted geometry the divider rung below reads
+    /// via `painted_divider_geometry` — never a `compute_editor_window_rects`
+    /// recompute from the drawing area's raw `width`/`height`, which always
+    /// assumes the editor area starts at `x = 0`. That only holds with the
+    /// activity bar/sidebar at zero width; with either painted, the real
+    /// left edge is `AppShellLayout::main_content_bounds.x`, so a rect
+    /// rebuilt from `(0, 0, width, height)` lands columns off from what was
+    /// actually drawn (this is what made the pre-#1493 horizontal-only copy
+    /// of this method resolve against a phantom rect once the sidebar/
+    /// activity bar reserved real width).
+    fn editor_scrollbar_press(
+        &mut self,
+        backend: &dyn quadraui::Backend,
+        x: f64,
+        y: f64,
+        axis: ScrollbarAxis,
+    ) -> bool {
+        let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() else {
+            return false;
+        };
+        let lh = self.cached_line_height;
+        let cw = self.cached_char_width;
+        let engine = self.engine.borrow();
+        let (rects, _dividers) = engine.calculate_group_window_rects(content_bounds, tab_bar_h);
+        let Some((win_id, scroll_at_click)) =
+            scrollbar_hit_test(&engine, x, y, &rects, cw, lh, axis)
+        else {
+            return false;
+        };
+        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
+        let geom = win_rect
+            .and_then(|rect| scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh, axis));
+        drop(engine);
+        let Some((track_x, track_y, track_w, track_h, thumb_pos, thumb_len, scroll_range, _)) =
+            geom
+        else {
+            return false;
+        };
+        let max_scroll = scroll_range.round() as usize;
+        // #1061: `resolve_editor_scrollbar_click` below is the shared
+        // click-vs-drag resolver used by this (now axis-parameterised, #1493)
+        // press handler — the standalone TUI `tui_main/mouse.rs` module this
+        // comment used to reference was deleted by #1434 once #1433 flipped
+        // TUI's `run` onto this same shared `App` dispatch; see that
+        // function's doc for the full click/drag rationale.
+        let (click_pos, track_visible, track_start, track_length) = match axis {
+            ScrollbarAxis::Horizontal => (
+                x as f32,
+                (track_w / cw).floor() as usize,
+                track_x as f32,
+                track_w as f32,
+            ),
+            ScrollbarAxis::Vertical => (
+                y as f32,
+                (track_h / lh.max(1.0)).floor() as usize,
+                track_y as f32,
+                track_h as f32,
+            ),
+        };
+        match render::resolve_editor_scrollbar_click(
+            click_pos,
+            thumb_pos as f32,
+            (thumb_pos + thumb_len) as f32,
+            track_visible,
+            max_scroll,
+            scroll_at_click,
+        ) {
+            render::EditorScrollbarClick::PageTo(new_scroll) => {
+                let mut engine = self.engine.borrow_mut();
+                match axis {
+                    ScrollbarAxis::Horizontal => {
+                        engine.set_scroll_left_for_window(win_id, new_scroll);
+                    }
+                    ScrollbarAxis::Vertical => {
+                        engine.set_scroll_top_for_window(win_id, new_scroll);
+                        engine.sync_scroll_binds();
+                    }
+                }
+            }
+            render::EditorScrollbarClick::BeginDrag { grab_offset } => {
+                let drag_rc = backend.drag_state_handle();
+                let widget_prefix = match axis {
+                    ScrollbarAxis::Horizontal => "editor:h_sb",
+                    ScrollbarAxis::Vertical => "editor:v_sb",
+                };
+                let widget = quadraui::WidgetId::new(format!("{widget_prefix}:{}", win_id.0));
+                let target = match axis {
+                    ScrollbarAxis::Horizontal => quadraui::DragTarget::ScrollbarX {
+                        widget,
+                        track_start,
+                        track_length,
+                        thumb_length: thumb_len as f32,
+                        max_scroll,
+                        grab_offset,
+                        inverted: false,
+                    },
+                    ScrollbarAxis::Vertical => quadraui::DragTarget::ScrollbarY {
+                        widget,
+                        track_start,
+                        track_length,
+                        thumb_length: thumb_len as f32,
+                        max_scroll,
+                        grab_offset,
+                        inverted: false,
+                    },
+                };
+                drag_rc.borrow_mut().begin(target);
+            }
+        }
+        self.draw_needed.set(true);
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse_click_msg(
         &mut self,
@@ -4785,7 +4778,6 @@ impl App {
         x: f64,
         y: f64,
         width: f64,
-        height: f64,
         alt: bool,
     ) {
         // ── Folder picker mouse handling (#815) ─────────────────────────
@@ -5095,7 +5087,7 @@ impl App {
                     // it. This is what feeds `ToggleSplit`'s initial
                     // full_cols when opening a split.
                     terminal_cols: self.terminal_panel_cols(width),
-                    terminal_max_rows: self.terminal_target_maximize_rows(),
+                    terminal_max_rows: self.terminal_maximize_target_rows(&self.engine.borrow()),
                 };
                 let effect =
                     render::apply_bottom_panel_route(&mut self.engine.borrow_mut(), route, x, ctx);
@@ -5117,192 +5109,58 @@ impl App {
                 // widget (which has can_target=true while a menu is open).
                 // If we reach here, no menu is open and we proceed with normal handling.
 
-                // ── H scrollbar hit-test (before editor click) ────────────────
-                // If the click lands on a Cairo h scrollbar:
-                //   - on the thumb → start a DragTarget::ScrollbarX drag.
-                //   - on the empty track → page-jump toward the click.
-                // Either way, consume the click.
-                {
-                    let lh = self.cached_line_height;
-                    let cw = self.cached_char_width;
-                    let engine = self.engine.borrow();
-                    let rects = compute_editor_window_rects(&engine, width, height, lh);
-                    if let Some((win_id, scroll_left)) =
-                        h_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
-                    {
-                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect.and_then(|rect| {
-                            h_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
-                        });
-                        drop(engine);
-                        if let Some((
-                            track_x,
-                            _ty,
-                            track_w,
-                            _sb_h,
-                            thumb_x,
-                            thumb_w,
-                            scroll_range,
-                            _,
-                        )) = geom
-                        {
-                            let max_scroll = scroll_range.round() as usize;
-                            let page_cols = (track_w / cw).floor() as usize;
-                            // #1061: shared with TUI's own h/v scrollbar
-                            // click handlers (`tui_main/mouse.rs`) via
-                            // `render::resolve_editor_scrollbar_click` —
-                            // see that function's doc for the full
-                            // rationale.
-                            match render::resolve_editor_scrollbar_click(
-                                x as f32,
-                                thumb_x as f32,
-                                (thumb_x + thumb_w) as f32,
-                                page_cols,
-                                max_scroll,
-                                scroll_left,
-                            ) {
-                                render::EditorScrollbarClick::PageTo(new_left) => {
-                                    let mut engine = self.engine.borrow_mut();
-                                    engine.set_scroll_left_for_window(win_id, new_left);
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = backend.drag_state_handle();
-                                    drag_rc
-                                        .borrow_mut()
-                                        .begin(quadraui::DragTarget::ScrollbarX {
-                                            widget: quadraui::WidgetId::new(format!(
-                                                "editor:h_sb:{}",
-                                                win_id.0
-                                            )),
-                                            track_start: track_x as f32,
-                                            track_length: track_w as f32,
-                                            thumb_length: thumb_w as f32,
-                                            max_scroll,
-                                            grab_offset,
-                                            inverted: false,
-                                        });
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── V scrollbar hit-test (before divider) — #1026/#987 ────────
-                // Mirrors the H-scrollbar rung immediately above:
-                //   - on the thumb → start a DragTarget::ScrollbarY drag.
+                // ── H/V scrollbar hit-test (before divider) — #1026/#987/#1493 ──
+                // If the click lands on either editor scrollbar:
+                //   - on the thumb → start a DragTarget::ScrollbarX/Y drag.
                 //   - on the empty track → page-jump toward the click.
                 // Either way, consume the click *before* the divider hit-test
-                // below gets a look. Without this rung, `handle_mouse_click_msg`
-                // had no vertical-scrollbar hit-test at all, so a click on a
-                // window's own scrollbar column (the last `cell_width` before
-                // its edge, painted since quadraui#968) fell straight through
-                // to `route_divider_grab` — inert on any window, and silently
-                // resizing the split for any window whose scrollbar-adjacent
-                // side happened to sit inside the divider's own grab margin.
+                // below gets a look. Without a vertical rung here,
+                // `handle_mouse_click_msg` had no vertical-scrollbar hit-test
+                // at all, so a click on a window's own scrollbar column (the
+                // last `cell_width` before its edge, painted since
+                // quadraui#968) fell straight through to `route_divider_grab`
+                // — inert on any window, and silently resizing the split for
+                // any window whose scrollbar-adjacent side happened to sit
+                // inside the divider's own grab margin.
                 //
-                // Window rects come from `self.painted_editor_bounds()` (the
-                // same cached, already-painted `content_bounds`/`tab_bar_h`
-                // the divider rung below reads via `painted_divider_geometry`)
-                // rather than `compute_editor_window_rects`'s `width`/`height`
-                // recompute: that helper always assumes the editor area starts
-                // at `x = 0`, which only holds with the activity bar/sidebar at
-                // zero width. With either painted, its real left edge is
-                // `AppShellLayout::main_content_bounds.x`, so a rect rebuilt
-                // from `(0, 0, width, height)` lands columns off from what was
-                // actually drawn — verified while building this rung: TUI's
-                // own conformance fixture (activity bar always reserves a
-                // real column, no sidebar needed to see it) reproduced exactly
-                // that drift.
-                if let Some((content_bounds, tab_bar_h)) = self.painted_editor_bounds() {
-                    let lh = self.cached_line_height;
-                    let cw = self.cached_char_width;
-                    let engine = self.engine.borrow();
-                    let (rects, _dividers) =
-                        engine.calculate_group_window_rects(content_bounds, tab_bar_h);
-                    if let Some((win_id, scroll_top)) =
-                        v_scrollbar_hit_test(&engine, x, y, &rects, cw, lh)
-                    {
-                        let win_rect = rects.iter().find(|(id, _)| *id == win_id).map(|(_, r)| *r);
-                        let geom = win_rect.and_then(|rect| {
-                            v_scrollbar_thumb_geometry(&engine, win_id, &rect, cw, lh)
-                        });
-                        drop(engine);
-                        if let Some((
-                            _track_x,
-                            track_y,
-                            _track_w,
-                            track_h,
-                            thumb_y,
-                            thumb_h,
-                            scroll_range,
-                            _,
-                        )) = geom
-                        {
-                            let max_scroll = scroll_range.round() as usize;
-                            let page_rows = (track_h / lh.max(1.0)).floor() as usize;
-                            // #1061: shared with TUI's own h/v scrollbar
-                            // click handlers (`tui_main/mouse.rs`) via
-                            // `render::resolve_editor_scrollbar_click` —
-                            // see that function's doc for the full
-                            // rationale.
-                            match render::resolve_editor_scrollbar_click(
-                                y as f32,
-                                thumb_y as f32,
-                                (thumb_y + thumb_h) as f32,
-                                page_rows,
-                                max_scroll,
-                                scroll_top,
-                            ) {
-                                render::EditorScrollbarClick::PageTo(new_top) => {
-                                    let mut engine = self.engine.borrow_mut();
-                                    engine.set_scroll_top_for_window(win_id, new_top);
-                                    engine.sync_scroll_binds();
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                                render::EditorScrollbarClick::BeginDrag { grab_offset } => {
-                                    let drag_rc = backend.drag_state_handle();
-                                    drag_rc
-                                        .borrow_mut()
-                                        .begin(quadraui::DragTarget::ScrollbarY {
-                                            widget: quadraui::WidgetId::new(format!(
-                                                "editor:v_sb:{}",
-                                                win_id.0
-                                            )),
-                                            track_start: track_y as f32,
-                                            track_length: track_h as f32,
-                                            thumb_length: thumb_h as f32,
-                                            max_scroll,
-                                            grab_offset,
-                                            inverted: false,
-                                        });
-                                    self.draw_needed.set(true);
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                // Horizontal tried first (matches the pre-#1493 ordering);
+                // shared axis-parameterised `App::editor_scrollbar_press`
+                // (#1493) — was two hand-rolled ~85-line copies here, one per
+                // axis, which had already drifted: the horizontal copy
+                // rebuilt window rects via `compute_editor_window_rects`'s
+                // `width`/`height` recompute, which always assumes the
+                // editor area starts at `x = 0`, while the vertical copy had
+                // already been fixed (this rung's own prior comment) to read
+                // `self.painted_editor_bounds()` instead — the real left
+                // edge, `AppShellLayout::main_content_bounds.x`, once the
+                // activity bar/sidebar reserves real width. Both axes now go
+                // through the same method, so that offset can never
+                // re-diverge per axis again.
+                if self.editor_scrollbar_press(backend, x, y, ScrollbarAxis::Horizontal) {
+                    return;
+                }
+                if self.editor_scrollbar_press(backend, x, y, ScrollbarAxis::Vertical) {
+                    return;
                 }
 
                 // ── Divider hit-test (#753 shared rung) ───────────────────────
                 // Editor-group boundaries then `:split`/`:vsplit` boundaries
-                // (#582), sequenced by `render::route_divider_grab`. GTK's only
-                // contribution is its own painted geometry and its own grab
-                // margin — a symmetric 6px around the thin drawn line, against
-                // continuous positions (`quantize: false`); TUI's cell metrics
-                // differ, the ordering does not.
+                // (#582), sequenced by `render::route_divider_grab`. This
+                // backend's only contribution is its own painted geometry and
+                // its own grab margin — `self.units.divider_metrics`, a
+                // symmetric 6px around the thin drawn line on GTK
+                // (`quantize: false`) vs TUI's cell metrics (`quantize:
+                // true`, `group_horizontal` reaching across the tab bar's
+                // row count) — the ordering does not differ.
                 if let Some((group_dividers, window_dividers, on_tab_bar)) =
                     self.painted_divider_geometry(x, y)
                 {
+                    let breadcrumbs = self.engine.borrow().settings.breadcrumbs;
                     if let Some(grab) = render::route_divider_grab(
                         &render::DividerState {
                             group_dividers: &group_dividers,
                             window_dividers: &window_dividers,
-                            metrics: render::GTK_DIVIDER_METRICS,
+                            metrics: (self.units.divider_metrics)(breadcrumbs),
                             on_tab_bar,
                         },
                         x,
@@ -5333,7 +5191,7 @@ impl App {
                                 self.cached_line_height,
                                 self.cached_char_width,
                                 layout,
-                                &self.cached_tab_pixel_hits.borrow(),
+                                &self.cached_group_tab_bar_layouts.borrow(),
                                 self.cached_frame_hit_map.borrow().as_ref(),
                                 &self.cached_tab_bar_zones.borrow(),
                                 &mut drag,
@@ -5352,7 +5210,9 @@ impl App {
                             // Create the terminal tab immediately (not via
                             // the deferred `DeferredAction::ToggleTerminal`)
                             // so the panel appears on this same draw cycle.
-                            let cols = self.terminal_cols();
+                            // #1421: `width` is this handler's own live panel
+                            // width — prefer it over the cached one.
+                            let cols = self.terminal_panel_cols(width);
                             let rows = engine.session.terminal_panel_rows;
                             engine.terminal_new_tab(cols, rows);
                             drop(engine);
@@ -5479,9 +5339,9 @@ impl App {
                         &engine.calculate_window_dividers(&window_rects),
                         x,
                         y,
-                        (6.0, 6.0),
-                        (6.0, 6.0),
-                        false,
+                        self.units.hit_tolerance,
+                        self.units.hit_tolerance,
+                        (self.units.divider_metrics)(engine.settings.breadcrumbs).quantize,
                     )
                     .is_some()
                 });
@@ -5512,7 +5372,7 @@ impl App {
                     .handle_breadcrumb_click(group_id, idx);
             }
             render::ChromeRoute::StatusAction(action) => {
-                let cols = self.terminal_cols();
+                let cols = self.terminal_panel_cols(self.painted_editor_content_width());
                 let follow_up =
                     render::apply_status_action(&mut self.engine.borrow_mut(), &action, cols);
                 if matches!(
@@ -5549,7 +5409,7 @@ impl App {
     /// #555: re-deriving was wrong on two counts, and together they put the
     /// hit rect in a different place than the pixels. `render_content` centres
     /// the popup in `backend.viewport()` (the whole window) at
-    /// `gtk_picker_sizing(line_height)`, whereas both callers here pass the
+    /// `self.units.picker`'s own sizing, whereas both callers here pass the
     /// `width`/`height` of `ctx.layout.main_content_bounds` — the editor area
     /// only, minus activity bar / sidebar / title bar — anchored at `(0, 0)`,
     /// and a `line_h: 1.0, header_h: 0.0` sizing. So with any shell chrome
@@ -5568,7 +5428,7 @@ impl App {
         let sizing = render::PickerSizing {
             header_h: 0.0,
             line_h: 1.0,
-            ..render::gtk_picker_sizing(1.0)
+            ..(self.units.picker)(1.0)
         };
         let geo =
             render::PickerGeometry::compute(width as f32, height as f32, has_preview, &sizing);
@@ -5633,10 +5493,10 @@ impl App {
                         y: y as f32,
                     })
                     .is_some(),
-                // GTK has no canvas sidebar separator or explorer drag-and-drop:
-                // the separator is a `gtk::Paned` and the file tree is a native
-                // widget with its own DnD. Stated here rather than omitted so
-                // the asymmetry is visible at the call site.
+                // GTK has no canvas sidebar separator: it's a `gtk::Paned`.
+                // Explorer drag-and-drop *is* shared now (#1429) — see
+                // `explorer_dnd_active` below; this used to read `false`
+                // unconditionally, the App-side gap that issue closes.
                 //
                 // Command-line selection *is* shared now (#816):
                 // `engine.cmd_dragging` is armed by `handle_mouse_click_msg`'s
@@ -5645,7 +5505,8 @@ impl App {
                 // closed the "no character hit test" gap the old comment here
                 // recorded.
                 sidebar_resizing: false,
-                sidebar_dnd: false,
+                explorer_dnd_active: self.explorer_drag_src.is_some()
+                    || self.explorer_drag_active.is_some(),
                 sidebar_body: None,
                 command_line_selecting: engine.cmd_dragging.get(),
                 tab_dragging: self.tab_drag.is_armed_or_dragging(),
@@ -5689,7 +5550,7 @@ impl App {
                         width as f32,
                         height as f32,
                         has_preview,
-                        &render::gtk_picker_sizing(lh as f32),
+                        &(self.units.picker)(lh as f32),
                     )
                     .visible_rows
                 } else {
@@ -5720,7 +5581,13 @@ impl App {
                 {
                     let px = px as f64;
                     let py = py as f64;
-                    let padding = 4.0;
+                    // #1429: same `units.hover_popup_pad` the press rung
+                    // (`route_and_apply_editor_hover_popup`) now reads —
+                    // was hardcoded `4.0`/`4.0` here too, which is why a
+                    // TUI-native `App` (`tui` harness arm) picked a
+                    // different content cell mid-drag than the press had
+                    // already landed on.
+                    let (pad_x, pad_y) = self.units.hover_popup_pad;
                     let lh = self.cached_line_height.max(1.0);
                     let scroll = self
                         .engine
@@ -5729,8 +5596,8 @@ impl App {
                         .as_ref()
                         .map(|h| h.scroll_top)
                         .unwrap_or(0);
-                    let rel_x = x - px - padding;
-                    let rel_y = y - py - padding;
+                    let rel_x = x - px - pad_x as f64;
+                    let rel_y = y - py - pad_y as f64;
                     let content_line = (rel_y / lh).max(0.0) as usize + scroll;
                     let content_col = self.pixel_to_editor_hover_col(rel_x, content_line);
                     self.engine
@@ -5865,7 +5732,7 @@ impl App {
                         self.painted_line_height(),
                         self.painted_char_width(),
                         layout,
-                        &self.cached_tab_pixel_hits.borrow(),
+                        &self.cached_group_tab_bar_layouts.borrow(),
                         self.cached_frame_hit_map.borrow().as_ref(),
                         &self.cached_tab_bar_zones.borrow(),
                         &mut drag_rc.borrow_mut(),
@@ -5892,6 +5759,30 @@ impl App {
                         self.engine.borrow().cmd_sel.set(Some(sel));
                     }
                 }
+            }
+            render::MouseDragRoute::ExplorerDnd => {
+                // #1429: shared with TUI's `mouse::handle_mouse` — the row
+                // under the pointer is resolved against `explorer_tree_rect`
+                // (the rect this frame's `paint_sidebar_panel_rung` painted
+                // the tree into) and the row's own pixel/cell pitch
+                // (`units.explorer_row_h`, GTK: `quadraui::gtk::tree`'s
+                // `item_height = (line_height * 1.4).round()`; TUI: one
+                // whole cell) applied to `cached_explorer_metrics`'s
+                // paint-time line-height (#540's re-apply, same value the
+                // press rung already uses). Plain `cached_explorer_metrics`
+                // alone under-counts every row past the first on GTK — its
+                // row pitch is *not* the bare line height.
+                let rect = self.engine.borrow().explorer_tree_rect.get();
+                let row_height = (self.units.explorer_row_h)(self.cached_explorer_metrics.get().0);
+                render::apply_explorer_drag_move(
+                    &self.engine.borrow(),
+                    rect,
+                    row_height,
+                    x,
+                    y,
+                    &mut self.explorer_drag_src,
+                    &mut self.explorer_drag_active,
+                );
             }
             // #192: a drag inside an open modal with nothing armed is swallowed
             // so it cannot leak to the editor underneath.
@@ -5940,6 +5831,19 @@ impl App {
         if self.tab_drag.handle_release(&mut self.engine.borrow_mut()) {
             self.draw_needed.set(true);
         }
+        // Explorer drag-and-drop: execute the move on release (#1429 —
+        // shared with TUI's identical `mouse.rs` release arm). Also clears
+        // `sidebar_pointer_captured` — `try_route_sidebar_mouse_event` left
+        // it set (it stopped resetting it once a DnD gesture bypassed that
+        // function to reach here) and a future unrelated press must not
+        // start out already "dragging".
+        if self.explorer_drag_src.take().is_some() || self.explorer_drag_active.is_some() {
+            self.sidebar_pointer_captured.set(false);
+        }
+        if let Some((src_row, target_row)) = self.explorer_drag_active.take() {
+            render::apply_explorer_drop(&mut self.engine.borrow_mut(), src_row, target_row);
+            self.draw_needed.set(true);
+        }
         if self.terminal_split_dragging {
             self.terminal_split_dragging = false;
             if self.cached_char_width > 0.0 {
@@ -5972,9 +5876,8 @@ impl App {
         if self.terminal_resize_dragging {
             self.terminal_resize_dragging = false;
             let rows = self.engine.borrow().session.terminal_panel_rows;
-            // #731: was `if let Some(da) = self.drawing_area…`, permanently
-            // `None` under the ShellApp runner — see `terminal_cols`.
-            let cols = self.terminal_cols();
+            // #1421: `width` is this handler's own live panel width.
+            let cols = self.terminal_panel_cols(width);
             self.engine.borrow_mut().terminal_resize(cols, rows);
             let _ = self.engine.borrow().session.save();
         }
@@ -6000,8 +5903,8 @@ impl App {
                 && engine.terminal_panes.is_empty()
         };
         if needs_new_tab {
-            // Use the actual drawing area width so the PTY matches the visible panel.
-            let cols = self.terminal_cols();
+            // Use the actual editor content width so the PTY matches the visible panel.
+            let cols = self.terminal_panel_cols(self.painted_editor_content_width());
             let rows = self.engine.borrow().session.terminal_panel_rows;
             self.engine.borrow_mut().terminal_new_tab(cols, rows);
         } else {
@@ -6016,8 +5919,8 @@ impl App {
         // path as the keybinding above + the EngineAction handler
         // + the toolbar click handler.
         let ctx = crate::core::engine::UiEventContext {
-            terminal_cols: self.terminal_cols(),
-            terminal_max_rows: self.terminal_target_maximize_rows(),
+            terminal_cols: self.terminal_panel_cols(self.painted_editor_content_width()),
+            terminal_max_rows: self.terminal_maximize_target_rows(&self.engine.borrow()),
         };
         self.engine.borrow_mut().handle_ui_event(
             crate::core::engine::UiEvent::Accelerator(
@@ -6119,7 +6022,7 @@ impl App {
     /// sync — `render_content` repaints the whole sidebar from
     /// `engine.app_shell` every frame — so this is now just the redraw
     /// trigger (#731).
-    fn sync_sidebar_widgets(&mut self) {
+    pub(crate) fn sync_sidebar_widgets(&mut self) {
         self.draw_needed.set(true);
     }
 
@@ -6191,7 +6094,7 @@ impl App {
     /// The `TreeController` widget dispatch itself — populate, re-apply the
     /// paint-time metrics, `handle()`, resolve a `ContextMenuRequested` —
     /// is [`render::route_explorer_tree_event`], shared with TUI's
-    /// `TuiShellApp::handle_mouse_event` explorer intercept. What stays here
+    /// the pre-#1434 TUI shell's `handle_mouse_event` explorer intercept. What stays here
     /// is GTK-only plumbing: which events this panel claims at all
     /// (`dominated`), pulling the metrics/backend/theme it needs to make the
     /// call, and its own draw-invalidation bookkeeping.
@@ -6228,8 +6131,8 @@ impl App {
         let metrics = self.cached_explorer_metrics.get();
         let backend_rc = self.backend.clone();
         let mut b = backend_rc.borrow_mut();
-        b.set_current_line_height(metrics.0);
-        b.set_current_char_width(metrics.1);
+        quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+        quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
         let tree_event = {
             let mut engine = self.engine.borrow_mut();
             render::route_explorer_tree_event(&mut engine, &ev, rect, metrics, &theme, &mut **b)
@@ -6245,11 +6148,37 @@ impl App {
             self.draw_needed.set(true);
             return;
         };
+        // #1429: shared empty-space right-click fallback, mirroring
+        // `tui_main::mouse`'s right-click arm — see
+        // `route_tree_empty_space_context_menu`'s doc for the upstream
+        // quadraui#1045 gap this stands in for and the deletion plan.
+        if let quadraui::UiEvent::MouseDown {
+            button: quadraui::MouseButton::Right,
+            position,
+            ..
+        } = ev
+        {
+            render::route_tree_empty_space_context_menu(
+                &mut self.engine.borrow_mut(),
+                rect,
+                metrics,
+                position,
+            );
+        }
         if matches!(ev, quadraui::UiEvent::DoubleClick { .. }) {
             self.engine
                 .borrow_mut()
                 .dispatch_explorer_tree_event(tree_event);
         } else if matches!(ev, quadraui::UiEvent::MouseDown { .. }) {
+            // #1429: record a potential drag-and-drop source — mirrors
+            // TUI's identical arm in `mouse::handle_mouse` — only a genuine
+            // row selection (not a chevron toggle or a scrollbar drag) arms
+            // one.
+            if let quadraui::TreeControllerEvent::RowSelected { ref path } = tree_event {
+                if let Some(&row_idx) = path.first() {
+                    self.explorer_drag_src = Some(row_idx as usize);
+                }
+            }
             self.engine
                 .borrow_mut()
                 .handle_explorer_mouse_event(tree_event);
@@ -6293,6 +6222,61 @@ impl App {
         }
     }
 
+    /// Restore the window's saved size, position and maximized state
+    /// (#1529), the first time each run `Backend::window()` returns `Some`.
+    /// Called from both `setup()` (fast path, usually too early — the
+    /// runner hasn't called `window.present()` yet, so `backend.window()`
+    /// is still `None`) and `tick()` (reliable path — retried every frame
+    /// via `window_geometry_restored` until it succeeds), mirroring
+    /// `capture_window_and_apply_csd`'s own identical two-call-site shape
+    /// and doc (#552).
+    ///
+    /// Order matters: size and (clamped) position are applied first, then
+    /// maximized state last — `Backend::toggle_window_maximize` is a
+    /// *toggle*, not a setter (`WindowControl` has no `maximize()`; see
+    /// that trait's own doc), so it only flips from "restored" to
+    /// "maximized" correctly if the restored geometry is already in place
+    /// underneath it, the same way GTK's own `restore()` falls back to the
+    /// pre-maximize size/position rather than a hardcoded one.
+    ///
+    /// `saved.x`/`y` are clamped against the live display list
+    /// (`WindowGeometry::clamp_to_displays`) before use, so a monitor that
+    /// was unplugged since the position was saved can never strand the
+    /// restored window off-screen; an unclamped position (or no displays
+    /// at all) falls back to `None`, leaving placement to the OS/window
+    /// manager default. `set_size`/`set_bounds` failing (e.g. GTK's
+    /// structural inability to reposition at all — see
+    /// `WindowControl::set_bounds`'s own doc) is not an error here — every
+    /// call is best-effort, exactly like `capture_window_and_apply_csd`'s
+    /// own `set_decorated` call.
+    fn restore_window_geometry(&mut self, backend: &mut dyn quadraui::Backend) {
+        if self.window_geometry_restored.get() {
+            return;
+        }
+        let saved = self.engine.borrow().session.window.clone();
+        let displays = backend.services().displays().unwrap_or_default();
+        let clamped = saved.clamp_to_displays(&displays);
+        let already_maximized = {
+            let Some(w) = backend.window() else {
+                return;
+            };
+            let _ = w.set_size(clamped.width as f32, clamped.height as f32);
+            if let Some((x, y)) = clamped.x.zip(clamped.y) {
+                let _ = w.set_bounds(quadraui::Rect::new(
+                    x as f32,
+                    y as f32,
+                    clamped.width as f32,
+                    clamped.height as f32,
+                ));
+            }
+            matches!(w.is_maximized(), Ok(true))
+        };
+        self.window_geometry_restored.set(true);
+        if clamped.maximized && !already_maximized {
+            backend.toggle_window_maximize();
+        }
+    }
+
     /// Forward a pointer event over the sidebar content area to the active panel's
     /// controller. In ShellApp mode the sidebar has no dedicated per-panel
     /// `DrawingArea`, so events the Relm4 build delivered straight to each panel's
@@ -6331,20 +6315,32 @@ impl App {
             return false;
         };
         let dragging = self.sidebar_pointer_captured.get();
+        // #1429: once an explorer row has been picked up (`explorer_drag_src`)
+        // or the drag is already active (`explorer_drag_active`), the *move*
+        // and *release* that follow the initial press must reach
+        // `handle_mouse_drag_msg`/`handle_mouse_up_msg` — the
+        // `MouseDragRoute::ExplorerDnd` rung and `render::apply_explorer_drop`
+        // — not loop back through here into `explorer_ui_event`, which would
+        // hand a plain `MouseMoved` to `TreeController::handle` and get its
+        // *scrollbar*-drag `drag_to`, never the row-under-pointer tracking a
+        // DnD gesture needs. The press itself still claims capture as usual
+        // (`explorer_ui_event` arms `explorer_drag_src` from that same press).
+        let explorer_dnd_active =
+            self.explorer_drag_src.is_some() || self.explorer_drag_active.is_some();
         let pos = match event {
             UiEvent::MouseDown { position, .. }
             | UiEvent::DoubleClick { position, .. }
             | UiEvent::Scroll { position, .. } => *position,
             // Follow-through only: never *start* an interaction from a move or
             // a release (see the doc comment above).
-            UiEvent::MouseUp { position, .. } if dragging => {
+            UiEvent::MouseUp { position, .. } if dragging && !explorer_dnd_active => {
                 self.sidebar_pointer_captured.set(false);
                 *position
             }
             UiEvent::MouseMoved {
                 position,
                 buttons: quadraui::ButtonMask { left: true, .. },
-            } if dragging => *position,
+            } if dragging && !explorer_dnd_active => *position,
             _ => return false,
         };
         // A captured drag keeps its grab even when the pointer leaves the
@@ -6544,7 +6540,7 @@ impl App {
                 }
                 true
             }
-            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, starts_interaction),
+            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, pos, starts_interaction),
             render::SidebarOwner::Board => {
                 self.route_board_sidebar_event(event, pos, starts_interaction)
             }
@@ -6699,15 +6695,40 @@ impl App {
     fn route_ai_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
+        pos: quadraui::Point,
         starts_interaction: bool,
     ) -> bool {
         let mut engine = self.engine.borrow_mut();
         let rect = engine.ai_chat_rect.get();
-        if rect.width <= 0.0 {
+        let plan_rect = engine.ai_plan_rect.get();
+        if rect.width <= 0.0 && plan_rect.width <= 0.0 {
             return false;
         }
         if starts_interaction {
             engine.ai_has_focus = true;
+            // #1507 review: a mouse click into the panel isn't part of any
+            // keyboard `<leader>ai` gesture, so it breaks one exactly like a
+            // Named key would — discard rather than replay, since a click
+            // (unlike a keystroke) has no natural place in the input to
+            // insert buffered text.
+            engine.ai_leader_toggle_pending.clear();
+            // #1513: a press landing on the pinned plan block's band
+            // toggles its collapse state instead of reaching `ChatController`
+            // — checked first (before the metrics re-apply/`route_ai_chat_
+            // event` call below) exactly like `route_board_sidebar_event`'s
+            // right-click resolves against its own cached layout ahead of
+            // falling through to generic nav.
+            if plan_rect.width > 0.0
+                && plan_rect.height > 0.0
+                && pos.y >= plan_rect.y
+                && pos.y < plan_rect.y + plan_rect.height
+            {
+                render::route_ai_plan_band_click(&mut engine, pos);
+                return true;
+            }
+        }
+        if rect.width <= 0.0 {
+            return true;
         }
         let theme = render::Theme::from_name(&engine.settings.colorscheme);
         let backend_rc = self.backend.clone();
@@ -6716,8 +6737,8 @@ impl App {
         let metrics = self.cached_ai_chat_metrics.get();
         {
             let mut b = backend_rc.borrow_mut();
-            b.set_current_line_height(metrics.0);
-            b.set_current_char_width(metrics.1);
+            quadraui::Backend::set_current_line_height(&mut **b, metrics.0 as f32);
+            quadraui::Backend::set_current_char_width(&mut **b, metrics.1 as f32);
         }
         render::route_ai_chat_event(
             &mut engine,
@@ -6828,7 +6849,7 @@ impl App {
     /// GTK sink for the actions it names.
     fn handle_activity_bar_key(&mut self, key_name: &str, ctrl: bool) {
         use render::ActivityBarKeyAction;
-        match render::activity_bar_key_action(map_gtk_key_name(key_name), ctrl) {
+        match render::activity_bar_key_action(key_name, ctrl) {
             ActivityBarKeyAction::MoveDown => self.engine.borrow_mut().activity_bar_move_down(),
             ActivityBarKeyAction::MoveUp => self.engine.borrow_mut().activity_bar_move_up(),
             ActivityBarKeyAction::Activate => {
@@ -6857,17 +6878,29 @@ impl App {
         // Suppress the default engine key handler — key is consumed.
     }
 
-    /// #734 slice 1: the single GTK-side sink for the shared context-menu
-    /// key rung (`render::ModalKeyRoute::ContextMenu`).
+    /// #734 slice 1: the single sink for the shared context-menu key rung
+    /// (`render::ModalKeyRoute::ContextMenu`) — on every backend `App` hosts
+    /// now (#1433 flips TUI onto this same method; it was written when
+    /// `App` was still GTK-only, hence the "GTK-side" framing this doc used
+    /// to carry).
     ///
     /// Replaces two hand-rolled copies — the block that opened
     /// `handle_key_press` and `handle_explorer_ctx_menu_key` (#426) on the
     /// explorer DA path — both of which reimplemented selection movement
     /// inline instead of calling `Engine::handle_context_menu_key`, and so
     /// disagreed with TUI on `l` (confirm), `q`/`h` (close) and disabled-item
-    /// skipping. The engine owns all of that now; the only GTK-specific part
+    /// skipping. The engine owns all of that now; the only per-action part
     /// left is dispatching the confirmed action, since `new_file` /
-    /// `open_terminal` / `find_in_folder` need backend plumbing.
+    /// `open_terminal` / `find_in_folder` need backend plumbing —
+    /// `find_in_folder` itself has no remaining backend fork to record:
+    /// #1418 already converged TUI's explicit-target `"delete"`/
+    /// `"move_file"` handling and GTK's mismatched `"find_in_folder"`
+    /// (Search-panel-focus vs Grep-picker) onto the one shared
+    /// `render::apply_explorer_context_action`, which is what this method
+    /// calls below — #1433 re-checked this while auditing what became
+    /// backend-shared vs stayed backend-specific once `App` started running
+    /// on TUI in production, and confirmed there is nothing left to
+    /// reconcile here.
     fn dispatch_context_menu_key(&mut self, key_name: &str, unicode: Option<char>) {
         let effective_key = if key_name.is_empty() {
             unicode.map(|c| c.to_string()).unwrap_or_default()
@@ -6882,13 +6915,24 @@ impl App {
         };
         if let (Some(ref act), Some((ref path, is_dir))) = (action, target) {
             let engine_rc = self.engine.clone();
-            let mut host = GtkExplorerCtxHost { app: self };
+            // Was the `"open_terminal"` arm of the deleted
+            // `App::dispatch_explorer_ctx_action`, which called the deleted
+            // `App::open_terminal_at` — inlined here (rather than calling a
+            // method) because that method reached for its own
+            // `self.engine.borrow_mut()`, and this closure runs while
+            // `engine_rc` is already borrowed mutably below; a second borrow
+            // would panic (`RefCell` already mutably borrowed).
             render::apply_explorer_context_action(
                 &mut engine_rc.borrow_mut(),
                 act,
                 path,
                 is_dir,
-                &mut host,
+                &mut |engine: &mut Engine, dir: std::path::PathBuf| {
+                    let cols = self.terminal_panel_cols(self.painted_editor_content_width());
+                    let rows = engine.session.terminal_panel_rows;
+                    engine.terminal_new_tab_at(cols, rows, Some(&dir));
+                    self.draw_needed.set(true);
+                },
             );
         }
         let needs_refresh = {
@@ -6912,6 +6956,8 @@ impl App {
     /// silent no-op there; `WindowControl` is backed on every windowed
     /// backend.
     fn window_minimize(&mut self, backend: &mut dyn quadraui::Backend) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_MINIMIZE_ACTION));
         if let Some(w) = backend.window() {
             let _ = w.minimize();
         }
@@ -6927,6 +6973,8 @@ impl App {
     /// one place that operates the real OS window instead of two that have
     /// to agree.
     fn window_toggle_maximize(&mut self, backend: &mut dyn quadraui::Backend) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_MAXIMIZE_ACTION));
         backend.toggle_window_maximize();
     }
 
@@ -6947,6 +6995,8 @@ impl App {
     /// then tears the window down with `destroy()`, which does not re-enter
     /// `close-request`.
     fn window_close(&mut self) {
+        self.last_window_control_action
+            .set(Some(render::WINDOW_CLOSE_ACTION));
         self.show_quit_confirm();
     }
 
@@ -7119,7 +7169,7 @@ impl App {
     }
 
     /// Show a native "Save Workspace As" dialog.
-    fn save_workspace_as_dialog(&mut self) {
+    pub(crate) fn save_workspace_as_dialog(&mut self) {
         // Deferred to tick() — see PendingFileDialog (#572).
         self.pending_file_dialog
             .set(Some(PendingFileDialog::SaveWorkspaceAs));
@@ -7153,26 +7203,25 @@ impl App {
         self.draw_needed.set(true);
     }
 
-    /// #731: was `if let Some(da) = self.drawing_area…` — that field is
-    /// permanently `None` under the ShellApp runner (see its removal in
-    /// #731), so this always took the `else` branch. The real fix is a way
-    /// to read the live DA's pixel width without a widget handle (e.g. from
-    /// `backend: &mut dyn quadraui::Backend`, which none of this method's
-    /// callers currently have in scope) — until then this is pinned at the
-    /// fallback, same as it was silently pinned at runtime before the dead
-    /// field was deleted.
+    /// Editor content pixel width last painted by `render_content`
+    /// (`cached_editor_bounds`) — the same width the bottom (terminal) panel
+    /// spans, since `editor_bounds` is derived from `main_content_bounds`
+    /// with the sidebar/activity bar already excluded (#582). Used by
+    /// [`Self::terminal_panel_cols`] callers with no live pixel width of
+    /// their own in scope (accelerator/menu/tick paths) — callers that DO
+    /// have one (a click/drag handler's own `width` parameter) should pass
+    /// that same-frame value to `terminal_panel_cols` directly instead, for
+    /// the #1058 reason recorded on `terminal_panel_cols` itself.
     ///
-    /// Callers that DO have a live pixel width in scope (a click/drag's own
-    /// `width` parameter, or `ctx.layout.main_content_bounds` off the
-    /// `ShellContext` `handle_dispatch` already receives) must call
-    /// [`Self::terminal_panel_cols`] instead — see #1058, where the
-    /// terminal-split finalize path used this method's `80` fallback (and a
-    /// separate `da_w = 800.0` guess) rather than converting the real width,
-    /// so any window that wasn't exactly 800px wide split the terminal into
-    /// the wrong column counts.
-    #[allow(dead_code)]
-    fn terminal_cols(&self) -> u16 {
-        80
+    /// Falls back to the cached window width before the first frame has
+    /// painted (`cached_editor_bounds` is still `None`).
+    ///
+    /// #1421: replaces the old hardcoded `terminal_cols() -> 80`.
+    pub(crate) fn painted_editor_content_width(&self) -> f64 {
+        self.cached_editor_bounds
+            .get()
+            .map(|(r, _)| r.width)
+            .unwrap_or_else(|| self.cached_window_width.get() as f64)
     }
 
     /// Terminal panel pixel width reserved for the panel's own vertical
@@ -7182,24 +7231,36 @@ impl App {
     const TERMINAL_PANEL_SB_W: f64 = 6.0;
 
     /// Convert a *live* terminal-panel pixel width to a column count using
-    /// the last-painted char advance (`cached_char_width`) — the real
-    /// pixel→cell conversion `terminal_cols()` cannot do because it has no
-    /// width in scope. Falls back to `terminal_cols()`'s pinned `80` only
-    /// when no char width has been measured yet (`cached_char_width <= 0.0`,
-    /// i.e. before the first paint).
-    fn terminal_panel_cols(&self, width: f64) -> u16 {
-        if self.cached_char_width > 0.0 {
-            ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / self.cached_char_width) as u16
-        } else {
-            self.terminal_cols()
-        }
+    /// the last-painted char advance (`cached_char_width`). #1058: this used
+    /// to be a fallback of a hardcoded `terminal_cols() -> 80` (and, for the
+    /// terminal-split finalize path specifically, a separate `da_w = 800.0`
+    /// guess) rather than a real conversion of the live width, so any window
+    /// that wasn't exactly 800px wide split the terminal into the wrong
+    /// column counts. `cached_char_width` is seeded to a positive default in
+    /// `App::new` and only ever grows from a real paint, so clamping it to a
+    /// `1.0` floor (rather than branching on a `<= 0.0` fallback) is enough
+    /// to avoid a divide-by-zero without a second hardcoded column count.
+    pub(crate) fn terminal_panel_cols(&self, width: f64) -> u16 {
+        let cw = self.cached_char_width.max(1.0);
+        ((width - Self::TERMINAL_PANEL_SB_W).max(0.0) / cw) as u16
     }
 
-    /// #731: see `terminal_cols` — was `if let Some(da) =
-    /// self.drawing_area…`, permanently `None`, so this always took the
-    /// `else` branch.
-    fn terminal_target_maximize_rows(&self) -> u16 {
-        10
+    /// Terminal-maximize target row count for the next
+    /// `terminal.toggle_maximize` dispatch — the exact
+    /// `render::compute_editor_layout` call `render_content` makes every
+    /// frame, replayed here against the content height/line height last
+    /// painted (`cached_main_content_height`, `cached_line_height`) so
+    /// accelerator/menu paths — which have no live pixel height of their own
+    /// in scope — agree with what was actually painted. Same reasoning as
+    /// [`Self::painted_editor_content_width`]'s fallback.
+    ///
+    /// #1421: replaces the old hardcoded `terminal_target_maximize_rows() ->
+    /// 10`. Mirrors the TUI equivalent,
+    /// `tui_main::terminal_target_maximize_rows_tui`.
+    pub(crate) fn terminal_maximize_target_rows(&self, engine: &Engine) -> u16 {
+        let h = self.cached_main_content_height.get();
+        let lh = self.cached_line_height.max(1.0);
+        render::compute_editor_layout(engine, h, lh, false).terminal_max_target_rows
     }
 }
 
@@ -7292,11 +7353,13 @@ impl App {
                 .unwrap_or(false);
             let controls_bar = render::window_controls_status_bar(theme, maximized);
             let interaction = self.title_bar_interaction.borrow();
-            let hits = backend.draw_status_bar(
+            let hits = backend.draw_status_bar_interactive(
                 controls_rect,
                 &controls_bar,
-                interaction.hovered_id(),
-                interaction.pressed_id(),
+                &quadraui::InteractionState::from_parts(
+                    interaction.hovered_id().cloned(),
+                    interaction.pressed_id().cloned(),
+                ),
             );
             interaction.set_layout(hits);
         }
@@ -7316,6 +7379,36 @@ impl App {
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
         use quadraui::{Key, MouseButton, UiEvent};
+
+        // ── #1427: shared menu-bar reveal/hide routing ───────────────────────
+        // The #318 Alt+<letter> shim (only fires while the bar is hidden —
+        // GTK's is always visible, see `ShellApp::setup`'s three-way branch)
+        // and the #988/#1029 stale-hamburger-corner-click guard (only ever
+        // armed by a hamburger panel click, which GTK/macOS/Win never
+        // register — see `Self::shell_config`'s `cell`-profile branch). A
+        // no-op on those backends; see `render::route_menu_bar_reveal`'s own
+        // doc. Must run before the `MenuSystem` intercept just below, since
+        // the shim's reveal has to take effect in the *same* dispatch that
+        // intercept reads `menu_bar_visible` from.
+        let menu_bar_reveal_reaction = {
+            let mut engine = self.engine.borrow_mut();
+            // Nothing in `handle_dispatch` returns before this point, so
+            // consuming the one-shot guard here is equivalent to TUI's "at
+            // the very top of `handle`, before any early exit" placement —
+            // see `consume_hamburger_stale_click_guard`'s own doc.
+            let stale_hamburger_corner_click =
+                render::consume_hamburger_stale_click_guard(&mut engine, &event);
+            render::route_menu_bar_reveal(
+                &mut engine,
+                &event,
+                stale_hamburger_corner_click,
+                backend,
+                ctx,
+            )
+        };
+        if let Some(reaction) = menu_bar_reveal_reaction {
+            return reaction;
+        }
 
         // ── Menu system intercept (#552) ─────────────────────────────────────
         // GTK's menu bar is always visible (see `ShellApp::setup`) and its
@@ -7337,9 +7430,13 @@ impl App {
         // regardless (`menu_system.borrow().is_open()`), matching every
         // other "topmost modal wins" precedent in this function — only the
         // idle bar itself yields.
-        let (menu_bar_visible, menu_system) = {
+        let (menu_bar_visible, menu_bar_toggleable, menu_system) = {
             let eng = self.engine.borrow();
-            (eng.menu_bar_visible, eng.menu_system.clone())
+            (
+                eng.menu_bar_visible,
+                eng.menu_bar_toggleable,
+                eng.menu_system.clone(),
+            )
         };
         let menu_open = menu_system.borrow().is_open();
         let change_review_open = self.engine.borrow().change_review.is_some();
@@ -7351,7 +7448,19 @@ impl App {
             // whatever label now sits a slot to its left. `render_content`
             // writes this from the same `split_menu_row_for_app_icon` call
             // that positions the paint.
-            let bar_rect = self.menu_items_rect.get();
+            //
+            // #1427: on the toggleable-menu-bar profile, `route_menu_bar_
+            // reveal`'s Alt+<letter> shim (just above) can reveal the bar in
+            // this very dispatch, before any paint has refreshed
+            // `menu_items_rect` — `render::menu_bar_intercept_rect` falls
+            // back to a synthetic full-width row for exactly that frame; see
+            // its own doc. Always `cached` unchanged on GTK/macOS/Win
+            // (`menu_bar_toggleable` is never `true` there).
+            let bar_rect = render::menu_bar_intercept_rect(
+                menu_bar_toggleable,
+                self.menu_items_rect.get(),
+                backend.viewport().width,
+            );
             let menu_event = menu_system.borrow_mut().handle(&event, backend, bar_rect);
             match menu_event {
                 quadraui::MenuEvent::Activated(id) => {
@@ -7388,13 +7497,19 @@ impl App {
             ..
         } = &event
         {
+            // `command_center_hit_in_band`, not `CommandCenterLayout::
+            // hit_test` directly (#1494 CI): the cached layout's `SearchBox`
+            // rect overflows the band whenever the band is narrower than the
+            // primitive's 344px content floor, and the overflow lands
+            // squarely on the inline window-control buttons that start where
+            // the Command Center band ends. See that function's doc.
             let cc_hit = self
                 .engine
                 .borrow()
                 .command_center_layout
                 .borrow()
                 .as_ref()
-                .map(|l| l.hit_test(position.x, position.y));
+                .and_then(|l| crate::render::command_center_hit_in_band(l, position.x, position.y));
             // `Bar` (command-center background, not an interactive segment)
             // and `Outside`/`None` fall through so the drag-to-move fallback
             // below still works for genuine empty-band clicks.
@@ -7441,19 +7556,39 @@ impl App {
 
         // ── Outer window border: edge-resize cursor hint (quadraui#406) ──
         // Pure side effect on hover — hint the resize pointer over the outer
-        // window border, default everywhere else (including the non-resizable
-        // full-width CSD title bar, which owns the top edge). Falls through so
-        // the editor/sidebar hover handling below still runs. Mirrors
+        // window border, default everywhere else. Falls through so the
+        // editor/sidebar hover handling below still runs. Mirrors
         // `full_chrome_demo`'s `MouseMoved` arm. GTK-only; TUI `set_cursor`
         // is a documented no-op.
+        //
+        // #1528: `render::WINDOW_RESIZE_GRIP_PX` (a few px), not
+        // `backend.line_height()` (a full title-bar/command-line row) — see
+        // that constant's doc. With a thin grip there's no need to special-case
+        // `ctx.in_title_bar` here the way this used to: the title bar is only
+        // as wide as the whole row, and the grip only occupies its outermost
+        // sliver, so a point inside the title bar but outside the grip already
+        // resolves to `None` on its own. Checked on the SAME predicate the
+        // press path below uses when no change-review surface is open — so
+        // the cursor never promises a resize the press won't honor in that
+        // (overwhelmingly common) case.
+        //
+        // Pre-existing quirk, NOT fixed by #1528 (review, non-blocking
+        // finding #2): this `MouseMoved` arm does not check
+        // `change_review_open` at all — it never has — while the press path
+        // below does, for the top edge only
+        // (`render::resize_edge_overlaps_change_review_band`). So while a
+        // change-review surface is open, hovering near the top edge can
+        // still show a resize cursor that a press in the same spot won't
+        // honor (it falls through to the change-review click handling
+        // instead). Narrowing this hint to match would need
+        // `change_review_open` computed above the `MouseMoved` arm instead
+        // of below it — out of scope for this fix; called out here so the
+        // "share one predicate" guarantee above isn't read as unconditional.
         if let UiEvent::MouseMoved { position, .. } = &event {
-            let shape = if ctx.in_title_bar(position.x, position.y) {
-                quadraui::PointerShape::Default
-            } else {
-                match ctx.window_edge(position.x, position.y, backend.line_height()) {
-                    Some(edge) => quadraui::PointerShape::Resize(edge),
-                    None => quadraui::PointerShape::Default,
-                }
+            let shape = match ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
+            {
+                Some(edge) => quadraui::PointerShape::Resize(edge),
+                None => quadraui::PointerShape::Default,
             };
             backend.set_cursor(shape);
         }
@@ -7496,30 +7631,116 @@ impl App {
             }
         }
 
-        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
-        // (quadraui#400) + outer window border: edge-resize (quadraui#406).
-        // Runs after the menu-item intercept and the window-control-button
-        // check above, so both take priority — only a press/double-click that
-        // lands in the title bar band but misses every interactive segment
-        // (menu item, min/max/close button) reaches here, matching
-        // `Backend::begin_window_drag`'s documented contract. The title bar
-        // takes priority over the top window edge (a full-width CSD header
-        // owns it), so `in_title_bar` is checked before `window_edge` —
-        // mirrors quadraui's `full_chrome_demo` reference. TUI has no window,
-        // so `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
-        // are all documented no-ops there; this path is GTK-only.
-        //
-        // #955 (ACP-4, review fix): also gated on the change-review surface
-        // being closed. That surface is genuinely full-viewport — its first
-        // diff row paints inside `ctx.in_title_bar`'s band, underneath the
-        // (visually hidden but still logically live) CSD title bar — so
-        // without this guard, a click there was silently reinterpreted as
-        // "start dragging the window" instead of reaching
-        // `handle_mouse_click_msg`'s change-review branch further down.
-        // `ctx.in_title_bar` has no such reach today for the folder picker
-        // (its popup is centred, never touching row 0), which is why this
-        // wasn't already latent there in a way any existing test could see.
+        // ── Gutter hover — #1544 (`fold_controls = "mouseover"`) ───────────
+        // Shared with TUI: both backends reach this same `MouseMoved` arm in
+        // `App::handle_dispatch`, so a fold-control marker's visibility can
+        // never diverge between them the way a per-backend hover tracker
+        // would risk. `render::route_gutter_hover` resolves against
+        // `cached_screen_layout` — the same last-painted geometry
+        // `handle_mouse_click_msg` already hit-tests real clicks against —
+        // so "hovering" and "clicking" the gutter always agree on where it
+        // is.
+        if let UiEvent::MouseMoved { position, .. } = &event {
+            let layout_ref = self.cached_screen_layout.borrow();
+            if let Some(layout) = layout_ref.as_ref() {
+                let mut engine = self.engine.borrow_mut();
+                let was = engine.gutter_hover_window;
+                render::route_gutter_hover(
+                    &mut engine,
+                    layout,
+                    position.x as f64,
+                    position.y as f64,
+                    backend.line_height() as f64,
+                    backend.char_width() as f64,
+                );
+                if engine.gutter_hover_window != was {
+                    drop(engine);
+                    self.draw_needed.set(true);
+                }
+            }
+        }
+
+        // #955 (ACP-4, review fix): gates the title-bar drag/double-click
+        // arms below on the change-review surface being closed. That surface
+        // is genuinely full-viewport — its first diff row paints inside
+        // `ctx.in_title_bar`'s band, underneath the (visually hidden but
+        // still logically live) CSD title bar — so without this guard, a
+        // click there was silently reinterpreted as "start dragging the
+        // window" instead of reaching `handle_mouse_click_msg`'s
+        // change-review branch further down. `ctx.in_title_bar` has no such
+        // reach today for the folder picker (its popup is centred, never
+        // touching row 0), which is why this wasn't already latent there in
+        // a way any existing test could see.
         let change_review_open = self.engine.borrow().change_review.is_some();
+
+        // ── Outer window border: edge-resize press (quadraui#406) ──────────
+        // Checked BEFORE the CSD title-bar drag-to-move / double-click-
+        // maximize arms and the #816 command-line click below (#1528, review
+        // of #816/#1026/#987): `render::WINDOW_RESIZE_GRIP_PX` is a thin,
+        // fixed pixel margin (see that constant's doc) — a few px, not a full
+        // `line_height` row — so it sits *inside* the title bar and
+        // command-line rows instead of spanning them. It has to win over
+        // both to ever fire at all: a full-width CSD title bar otherwise owns
+        // every pixel of the top row (dead North/NE/NW), and the command
+        // line likewise owns every pixel of the bottom row (dead South/SE/
+        // SW, the #816 bug this replaces the guard for). Everywhere else in
+        // those rows — the overwhelming majority of both — `window_edge`
+        // returns `None` and this falls through to the drag/click handling
+        // below untouched, same as before #1528. The same thin margin also
+        // keeps the East edge out of the vertical scrollbar's and the
+        // minimap's own hit-test area with a single editor group (see the
+        // constant's doc); no guard is needed for those the way the command
+        // line needed one, because the margin no longer reaches them.
+        //
+        // #1026/#987 review: `begin_window_resize`'s own doc contract is
+        // explicit — it returns `false` "when the backend owns no window
+        // (TUI...)" and callers "should treat `false` as a no-op, not an
+        // error". `ctx.window_edge`'s margin math is generic geometry, not
+        // GTK-gated — it fires for any backend near the outer window bounds
+        // — so only consume the event when the backend actually armed a
+        // resize; otherwise fall through so a window's own rightmost column
+        // (exactly where a vertical scrollbar or minimap gutter can sit) on
+        // a backend with no window still reaches the editor's own hit-test.
+        //
+        // #1528 review (blocking finding #3): the base commit's guard here
+        // was `!change_review_open` applied to EVERY edge — a regression
+        // this PR introduced and the review caught, since the base-commit
+        // pre-#1528 code had no `change_review_open` guard on edge-resize at
+        // all. The change-review surface only ever overlaps the *top* of the
+        // window (see the doc above), so only `North`/`NorthEast`/
+        // `NorthWest` need to defer to it —
+        // `render::resize_edge_overlaps_change_review_band` is the
+        // (unit-tested) decision. Resizing from the bottom, left, right, or
+        // the two southern corners must keep working while a change-review
+        // surface is open; nothing in that surface ever paints there.
+        if let UiEvent::MouseDown {
+            button: MouseButton::Left,
+            position,
+            ..
+        } = &event
+        {
+            if let Some(edge) =
+                ctx.window_edge(position.x, position.y, render::WINDOW_RESIZE_GRIP_PX)
+            {
+                let blocked_by_change_review =
+                    change_review_open && render::resize_edge_overlaps_change_review_band(edge);
+                if !blocked_by_change_review && backend.begin_window_resize(edge) {
+                    self.draw_needed.set(true);
+                    return quadraui::Reaction::Redraw;
+                }
+            }
+        }
+
+        // ── CSD titlebar background: drag-to-move / double-click-maximize ──
+        // (quadraui#400). Runs after the menu-item intercept, the
+        // window-control-button check, and the edge-resize press above, so
+        // all three take priority — only a press/double-click that lands in
+        // the title bar band but misses every interactive segment (menu
+        // item, min/max/close button, resize grip) reaches here, matching
+        // `Backend::begin_window_drag`'s documented contract. Mirrors
+        // quadraui's `full_chrome_demo` reference. TUI has no window, so
+        // `begin_window_drag`/`begin_window_resize`/`toggle_window_maximize`
+        // are all documented no-ops there; this path is GTK-only.
         match &event {
             UiEvent::MouseDown {
                 button: MouseButton::Left,
@@ -7536,53 +7757,6 @@ impl App {
                 backend.toggle_window_maximize();
                 self.draw_needed.set(true);
                 return quadraui::Reaction::Redraw;
-            }
-            UiEvent::MouseDown {
-                button: MouseButton::Left,
-                position,
-                ..
-            } => {
-                // #816: the command line paints in the window's literal last
-                // `line_height` pixels — exactly the margin `window_edge`
-                // treats as the bottom resize border — so without this guard
-                // a click on it landing here first (before
-                // `handle_mouse_click_msg`'s command-line rung ever ran)
-                // ordered `begin_window_resize` instead of ever reaching the
-                // click. No prior GTK feature lived in that exact band to
-                // expose the conflict; the command line is the first.
-                //
-                // `render::point_over_command_line` checks BOTH axes — see
-                // its doc comment for why a y-only version silently disables
-                // the window's only S/SW/SE resize grab (#816 review).
-                let over_command_line = render::point_over_command_line(
-                    self.engine.borrow().command_line_rect.get(),
-                    *position,
-                );
-                if !over_command_line {
-                    if let Some(edge) =
-                        ctx.window_edge(position.x, position.y, backend.line_height())
-                    {
-                        // #1026/#987 review: `begin_window_resize`'s own doc
-                        // contract is explicit — it returns `false` "when the
-                        // backend owns no window (TUI...)" and callers
-                        // "should treat `false` as a no-op, not an error".
-                        // This call site used to discard that return value
-                        // and swallow the click unconditionally, so on TUI
-                        // (`ctx.window_edge`'s margin math is generic
-                        // geometry, not GTK-gated — it fires for any backend
-                        // near the outer window bounds) a click on a
-                        // window's own rightmost column — exactly where a
-                        // vertical scrollbar column sits when that window is
-                        // flush with the screen's own right edge — never
-                        // reached `handle_mouse_click_msg` at all. Only
-                        // consume the event when the backend actually armed
-                        // a resize.
-                        if backend.begin_window_resize(edge) {
-                            self.draw_needed.set(true);
-                            return quadraui::Reaction::Redraw;
-                        }
-                    }
-                }
             }
             _ => {}
         }
@@ -7666,25 +7840,30 @@ impl App {
                         //    arm so both backends get the same, still-working
                         //    `"Insert"` spelling.
                         //
-                        // `key_name` doesn't reach engine consumers raw: it
-                        // passes through a second, GTK-local decode layer —
-                        // `map_gtk_key_name` / `map_gtk_key_with_unicode`
-                        // below in this file — before `handle_key_press`
-                        // dispatches it. Both tables already had an
-                        // `"ISO_Left_Tab"` arm from before this PR, but it
-                        // was dead code on the GTK path (GTK never produced
-                        // that spelling as `key_name` pre-#1060). Making
-                        // `"ISO_Left_Tab"` live here is what surfaced their
-                        // disagreement: `map_gtk_key_name` round-trips it to
-                        // `"BackTab"` correctly, but `map_gtk_key_with_unicode`
-                        // used to collapse both `"Tab"` and `"ISO_Left_Tab"`
-                        // to plain `"Tab"`, silently turning Shift+Tab into
-                        // Tab for the one route that consumes its output
-                        // (`FocusKeyRoute::SourceControl`'s `sc_mapped`).
-                        // Fixed alongside this comment so `map_gtk_key_with_unicode`
-                        // now matches `map_gtk_key_name`'s `"ISO_Left_Tab" =>
-                        // "BackTab"` round-trip.
-                        let n = render::engine_key_from_ui(&key, modifiers, true)
+                        // #1422: `key_name` now reaches every engine consumer
+                        // exactly as produced here — `handle_key_press` and
+                        // its callees (`dispatch_sidebar_panel_key`,
+                        // `dispatch_focus_owner_residual`,
+                        // `activity_bar_key_action`, …) used to round-trip it
+                        // through a second, GTK-local decode layer
+                        // (`map_gtk_key_name` / `map_gtk_key_with_unicode` /
+                        // `gtk_key_name_to_quadraui`) that this shared
+                        // decoder's own spelling already made redundant — see
+                        // issue #1422 for the full audit of why every
+                        // consumer already accepted this decoder's spelling
+                        // directly.
+                        // #1428: `self.keyboard_enhanced` (read once in
+                        // `setup()` from the live `BackendCaps::
+                        // kitty_keyboard`) rather than a hardcoded `true` —
+                        // wrong on a TUI-via-`App` construction running on a
+                        // terminal without the kitty protocol (#826);
+                        // unaffected on GTK/macOS/Win-GUI since that
+                        // capability is always `false` there anyway, which
+                        // is exactly what a literal `true` used to paper
+                        // over by disabling the terminal-only fallback arms
+                        // unconditionally rather than because a real
+                        // capability read said so.
+                        let n = render::engine_key_from_ui(&key, modifiers, self.keyboard_enhanced)
                             .map(|(name, _, _)| name)
                             .unwrap_or_default();
                         (n, None)
@@ -7698,6 +7877,7 @@ impl App {
                         modifiers.shift,
                         modifiers.alt,
                         &raw_event,
+                        backend,
                         ctx,
                     );
                 }
@@ -7715,22 +7895,20 @@ impl App {
                     false,
                     false,
                     &UiEvent::CharTyped(c),
+                    backend,
                     ctx,
                 );
             }
             UiEvent::Accelerator(id, _mods) => {
-                let mut host = GtkAccelHost {
-                    deferred: &self.deferred,
-                };
                 if let Some(action) = render::dispatch_panel_accelerator(
                     id.as_str(),
                     &mut self.engine.borrow_mut(),
-                    &mut host,
+                    self,
                 ) {
                     // `dispatch_panel_accelerator` already mutated `engine`
-                    // directly for these five (no `GtkAccelHost` hook — see
-                    // `render.rs`), but they still need geometry recomputed
-                    // before the next paint — matches the pre-#761 per-arm
+                    // directly for the nine pure-`Engine` actions, but every
+                    // action still needs geometry recomputed before the next
+                    // paint — matches the pre-#761 per-arm
                     // `deferred.send(DeferredAction::Resize)`.
                     use render::PanelAccelerator::*;
                     if matches!(
@@ -7758,16 +7936,20 @@ impl App {
                 return quadraui::Reaction::Redraw;
             }
             UiEvent::ContextMenuItemActivated(id) => {
-                // #902: fired by a *native* right-click popup (macOS
-                // `NSMenu` via `Backend::show_context_menu`, only reachable
-                // when `render::context_menu_should_be_native` resolved
-                // `true`). `id` is one of `context_menu_panel_to_quadraui_
+                // #902/#1580: fired by a *native* right-click popup (macOS
+                // `NSMenu` via `Backend::show_context_menu`, opened by
+                // `Self::open_context_menu_now_if_native` when
+                // `Backend::effective_menu_style()` resolved `Native`).
+                // `id` is one of `context_menu_panel_to_quadraui_
                 // context_menu`'s synthesised `"context:N"` ids — the exact
                 // same ids `route_modal_overlay_click`'s in-window hit-test
                 // (`ContextMenuHit::Item` → `context_menu_hit_to_idx`)
                 // resolves, so routing the activation through
                 // `apply_context_menu_route` reuses that one conversion
-                // instead of duplicating it.
+                // instead of duplicating it. Reached from `handle_dispatch`
+                // itself, i.e. event-handler time — same as every other
+                // `UiEvent` arm here, and (per #1580's root-cause fix)
+                // never queued from inside a paint closure any more.
                 let idx = crate::core::engine::context_menu_hit_to_idx(
                     &quadraui::ContextMenuHit::Item(id),
                 );
@@ -7794,7 +7976,7 @@ impl App {
                 ..
             } => {
                 let main = ctx.layout.main_content_bounds;
-                let (w, h) = (main.width as f64, main.height as f64);
+                let w = main.width as f64;
                 match button {
                     MouseButton::Left if modifiers.ctrl => {
                         self.handle_ctrl_mouse_click(
@@ -7809,7 +7991,6 @@ impl App {
                             position.x as f64,
                             position.y as f64,
                             w,
-                            h,
                             modifiers.alt,
                         );
                     }
@@ -7856,7 +8037,7 @@ impl App {
                                         self.cached_line_height,
                                         self.cached_char_width,
                                         layout,
-                                        &self.cached_tab_pixel_hits.borrow(),
+                                        &self.cached_group_tab_bar_layouts.borrow(),
                                         self.cached_frame_hit_map.borrow().as_ref(),
                                         &self.cached_tab_bar_zones.borrow(),
                                     )
@@ -7968,6 +8149,28 @@ impl App {
                 self.line_height_cell.set(self.cached_line_height);
                 self.char_width_cell.set(self.cached_char_width);
                 self.handle_resize();
+                // #1428: forward the resize to any open terminal PTY —
+                // mirrors TUI's identical `WindowResized` rung
+                // (`route_terminal_resize`), a latent gap on GTK (and any
+                // future win-gui/macOS backend hosting a terminal panel)
+                // rather than TUI-only behaviour: nothing resized the PTY
+                // on a window resize before this, so a shell running
+                // inside the terminal panel kept painting at its stale
+                // column/row count (`$COLUMNS`/`$LINES`, and any full-
+                // screen program reading the real ioctl) after the window
+                // — and therefore the panel — changed size.
+                //
+                // `terminal_panel_cols` off `painted_editor_content_width`
+                // (not the just-updated `cached_char_width` against a live
+                // pixel width `WindowResized` doesn't carry) — the same
+                // "no live pixel width in scope" fallback every other
+                // accelerator/menu/tick call site of `terminal_panel_cols`
+                // already uses; the *next* `render_content` repaints the
+                // terminal panel at the corrected geometry regardless of
+                // which frame's width this resize computed against.
+                let cols = self.terminal_panel_cols(self.painted_editor_content_width());
+                let rows = self.engine.borrow().session.terminal_panel_rows;
+                render::route_terminal_resize(&mut self.engine.borrow_mut(), cols, rows);
             }
             UiEvent::WindowClose => {
                 self.show_quit_confirm();
@@ -8000,6 +8203,21 @@ impl App {
     /// doc comment (#813). `run_pending_native_dialog`, reachable from
     /// here via `apply_dialog_action`, can also request exit.
     fn tick_dispatch(&mut self, backend: &mut dyn quadraui::Backend) -> quadraui::Reaction {
+        // ── Terminal chrome the runner doesn't own (#1428) ──────────────
+        // Mirrors the pre-#1434 TUI shell's `tick`'s identical rung verbatim, including
+        // the `self.live` gate — see `Self::live`'s own doc for why an
+        // unconditional call would corrupt a `TuiBackend`-backed test
+        // harness's real stdout. A no-op on GTK/macOS/Win-GUI either way
+        // (`Backend::set_caret_shape`'s trait default), so gating this
+        // costs nothing there.
+        if self.live {
+            let engine = self.engine.borrow();
+            backend.set_caret_shape(render::caret_shape_for_mode(
+                &engine,
+                engine.sidebar_has_focus(),
+            ));
+        }
+
         // Keep cached metrics up to date.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;
@@ -8010,6 +8228,11 @@ impl App {
         // is mapped — see `capture_window_and_apply_csd` (#552). No-ops once
         // `csd_applied` is set.
         self.capture_window_and_apply_csd(backend);
+
+        // Retry restoring the saved window size/position/maximized state
+        // until the runner's window is mapped — see `restore_window_geometry`
+        // (#1529). No-ops once `window_geometry_restored` is set.
+        self.restore_window_geometry(backend);
 
         // Drain the actions async GTK callbacks queued for this frame.
         for action in self.deferred.drain() {
@@ -8046,6 +8269,38 @@ impl App {
         // chore list `render::run_shared_tick_chores` shares with TUI.
         self.handle_poll_tick(backend);
 
+        // #1428: the one-shot nerd-font startup nudge — mirrors
+        // the pre-#1434 TUI shell's `tick`'s identical drain (`pending_startup_msg`),
+        // unconditional on `Self::live`, unlike the caret-shape write
+        // above: this only ever writes to `engine.message`, never touches
+        // the real terminal, so there is nothing here a test harness needs
+        // protecting from. Always `None` on a GUI-backend `App` (see
+        // `Self::pending_startup_msg`'s own doc), so this is a no-op there.
+        if let Some(msg) = self.pending_startup_msg.take() {
+            self.engine.borrow_mut().message = msg;
+            self.draw_needed.set(true);
+        }
+
+        // #1508: while any ACP session (or the direct-curl transport, which
+        // also flips `ai_streaming`) has a turn in flight, keep re-arming
+        // `tick` at the cadence `quadraui::runner::Reaction::RedrawAfter`'s
+        // own doc recommends for exactly this case (its "thinking-spinner
+        // countdown" example) — 100ms, i.e. ≥4 Hz — rather than trusting
+        // the coarser 250ms `IDLE_POLL_CEILING` fallback every backend
+        // keeps regardless. `Engine::tick_ai_spinner` (called from
+        // `poll_idle` above, inside `handle_poll_tick`) already advanced
+        // the frame this tick and set `draw_needed`, so the `Redraw` below
+        // paints the new frame now; this re-arms the *next* wake.
+        if self
+            .engine
+            .borrow()
+            .acp_sessions
+            .iter()
+            .any(|s| s.ai_streaming)
+        {
+            backend.request_frame_in(std::time::Duration::from_millis(100));
+        }
+
         if self.draw_needed.get() {
             self.draw_needed.set(false);
             quadraui::Reaction::Redraw
@@ -8055,8 +8310,279 @@ impl App {
     }
 }
 
+impl App {
+    /// The logic behind [`Self::on_shell_event_ctx`], the real
+    /// (non-deprecated, `ShellContext`-aware) hook the runner calls.
+    ///
+    /// #1491 pulled this out of what used to be `App`'s override of the
+    /// deprecated ctx-less `ShellApp::on_shell_event` (issue #617's
+    /// predecessor) and into this plain inherent method, so
+    /// `on_shell_event_ctx` calls it directly instead of dispatching through
+    /// the deprecated trait method — `App` no longer overrides
+    /// `on_shell_event` at all (the trait's own no-op default applies),
+    /// which was the last deprecation-lint suppression this file needed
+    /// once the tab-bar hit-testing migration cleared the others.
+    fn dispatch_shell_event(&mut self, event: &quadraui::AppShellEvent) {
+        use quadraui::AppShellEvent;
+        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
+        // first — see `render::sync_shell_event_shadow`'s rung comment for
+        // why this call has to come before any of the id-specific branching
+        // below rather than be repeated inside each arm.
+        {
+            let mut engine = self.engine.borrow_mut();
+            render::sync_shell_event_shadow(event, &mut engine);
+        }
+        match event {
+            AppShellEvent::PanelChanged { panel_id } => {
+                // #1427: the hamburger panel only exists on the `cell`
+                // profile (`Self::shell_config`) — reveal the menu bar
+                // instead of switching to a nonexistent shadow panel.
+                // Mirrors the pre-#1434 TUI shell's `on_shell_event`'s own
+                // hamburger arm, now shared via
+                // `render::route_hamburger_panel_changed`; see its own doc.
+                // A no-op check on GTK/macOS/Win, which never register this
+                // panel id in the first place.
+                if render::route_hamburger_panel_changed(&mut self.engine.borrow_mut(), panel_id) {
+                    self.last_shell_panel = Some(panel_id.clone());
+                    return;
+                }
+                // #1064: record what the runner's own `AppShell` now
+                // believes is active, whether this notification came from
+                // a real click or from `take_requested_panel`'s own echo
+                // below — see `Self::last_shell_panel`'s doc.
+                self.last_shell_panel = Some(panel_id.clone());
+                if std::mem::take(&mut self.suppress_shell_panel_echo) {
+                    // Echo of our own `take_requested_panel` reconciliation:
+                    // the engine already holds this state (an app-initiated
+                    // switch, e.g. a DAP reveal or a panel-focus keyboard
+                    // accelerator) — re-running `switch_panel` below would
+                    // toggle an already-active `ext:` panel back **off**
+                    // (`render::apply_activity_panel_switch`'s
+                    // `already_showing` arm treats a second "click" on the
+                    // active plugin panel as a close).
+                    return;
+                }
+                // #557: plugin-provided panels are now real `PanelDefinition`s
+                // in the runner's `AppShell` (`build_shell_config`), so their
+                // icon clicks arrive here like any built-in panel's. They are
+                // *not* engine-`AppShell` panels though — `render_content`
+                // dispatches on `engine.ext_panel_active`, which
+                // `sync_shell_event_shadow` deliberately leaves untouched for
+                // an `ext:` id (see that function's doc) — so route them
+                // through the existing `switch_panel` handler that owns the
+                // ext-panel focus/toggle bookkeeping.
+                if is_ext_panel_id(panel_id.as_str()) {
+                    // #1427: a real activity-bar click is exactly as much
+                    // "the user moved on" as a keystroke — spend the guard
+                    // (mirrors TUI's identical call in this arm). A no-op
+                    // when never armed (GTK/macOS/Win).
+                    render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                    self.switch_panel(panel_id.as_str().to_string());
+                    return;
+                }
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // #1360: a built-in panel's activity-bar icon click must move
+                // keyboard focus into that panel, exactly as TUI's own
+                // `PanelChanged` arm does (`focus_sidebar_panel` +
+                // `sidebar.has_focus = true` in the pre-#1434 TUI shell's `on_shell_event`)
+                // — before this, GTK only redrew, so `render::route_focus_key`
+                // (which every keystroke passes through, see
+                // `Self::handle_key_press`'s "Shared focus-owner keyboard
+                // rung") kept reading `sidebar_has_focus() == false` and sent
+                // every subsequent key straight to the editor. `sidebar.
+                // has_focus`/`ext_panel_name` have no GTK equivalent to set —
+                // GTK's `route_focus_key` call passes
+                // `engine.sidebar_has_focus()` itself as the "band" (see
+                // that call site's own comment), so the one engine call
+                // below is the whole fix, and it is the same
+                // already-shared `Engine::focus_sidebar_panel` this method's
+                // own `toggle_focus_search`/`toggle_focus_explorer` already
+                // call for the keyboard-accelerator path.
+                self.engine
+                    .borrow_mut()
+                    .focus_sidebar_panel(panel_id.as_str());
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarHidden => {
+                // #1427: a real panel's own second click — the hamburger's
+                // is intercepted by `Self::on_shell_event_ctx` before it
+                // ever reaches this ctx-less method (see that method's own
+                // doc) — so spend the guard here too (mirrors TUI).
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // #557: this is also how a *second* click on an open
+                // extension panel's icon arrives — `sync_shell_event_shadow`
+                // already dropped the plugin panel's claim (its
+                // `SidebarHidden` arm clears the same two fields
+                // unconditionally). Re-opening still works:
+                // `AppShell::handle_activity_click` reports a click on the
+                // active panel as `PanelChanged`, not `SidebarHidden`, once
+                // the sidebar is hidden.
+                //
+                // #1427: `Engine::clear_sidebar_focus()` — a real second
+                // click must clear the sidebar's own keyboard focus the
+                // same way the keyboard-driven `ActivityBarKeyAction::
+                // Collapse` arm above already does (via the wider
+                // `Engine::collapse_sidebar`, which also touches
+                // `session.explorer_visible` — not appropriate here, since
+                // this arm fires for *any* panel's close, not just
+                // Explorer's), or a subsequent keystroke keeps routing to
+                // whichever sidebar panel last held focus instead of the
+                // editor. A pre-existing gap on every backend (this arm
+                // never cleared focus before), invisible until #1427's own
+                // `App`-on-TUI driver tests started clicking a real panel's
+                // icon twice in a row (reveal, then collapse) — the
+                // pre-#1427 "tui" arm never needed a first click at all,
+                // since Explorer was already the runner's default-active
+                // panel.
+                self.engine.borrow_mut().clear_sidebar_focus();
+                self.draw_needed.set(true);
+            }
+            AppShellEvent::SidebarResized { .. } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+            }
+            AppShellEvent::BottomItemClicked { id } => {
+                render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut());
+                // The runner treats bottom activity-bar items as action
+                // buttons (not sidebar panels), so it never toggles or
+                // hides on its own — it only ever reports the click.
+                // #1057: this used to unconditionally `show_panel`, so a
+                // second click on an already-open bottom item (e.g.
+                // "bottom:settings") re-showed it instead of collapsing the
+                // sidebar like VS Code does for an active-tab click — while
+                // the old, hand-rolled the pre-#1434 TUI shell's `on_shell_event` (same
+                // arm) already ran the toggle. Route through `switch_panel`,
+                // the same shared `render::apply_activity_panel_switch`
+                // call site `PanelChanged`'s ext-panel arm above already
+                // uses, so both backends make the identical toggle decision
+                // from one place instead of drifting again. #1433: this is
+                // no longer "two arms that happen to agree" — `App` is what
+                // TUI dispatches through in production now too, so this one
+                // arm *is* both backends' Settings-bottom-item-toggle
+                // behaviour; there was no remaining fork to reconcile when
+                // auditing this for the flip.
+                self.switch_panel(id.as_str().to_string());
+            }
+            // #1427: every remaining `AppShellEvent` variant is likewise a
+            // shell-consumed user interaction — spend the guard and let any
+            // variant quadraui adds later default to the safe direction
+            // (mirrors TUI's identical catch-all).
+            _ => render::disarm_hamburger_stale_click_guard(&mut self.engine.borrow_mut()),
+        }
+    }
+}
+
+/// #1549: the macOS report ("command-line row below the status bar is
+/// clipped to about half its height by the window's bottom edge")
+/// reduces to one portable geometric invariant on the painted rect: it
+/// must fit entirely inside the real window content area (`viewport`,
+/// the exact portable equivalent of AppKit's `contentView.bounds`
+/// on every backend — see `quadraui::Backend::viewport`) and be at
+/// least one full line tall.
+///
+/// This should hold on *every* backend by construction: quadraui's
+/// `compose::app_shell::compute_layout` derives `AppShellLayout::
+/// main_content_bounds` from this exact `viewport` (title bar carved off
+/// the top; nothing reserved below, since vimcode never opts into
+/// quadraui's own status-bar/command-line bands — `render_content`'s own
+/// `status_bar_h`/`cmd_y` locals lay both rows out entirely inside
+/// `main_content_bounds` instead), and `cmd_y + lh` always resolves to
+/// `main.y + main.height` (see the `FrameOp::CommandLine` arm below). A
+/// live macOS run is the one environment this fleet cannot check that
+/// construction against directly — no macOS cross-toolchain is
+/// installed (`src/macos/mod.rs`'s "Verifying this file without a Mac").
+/// `debug_assert!` (not a hard `assert!`) so a violation surfaces loudly
+/// in a debug build's log/console — exactly the signal a future live-
+/// macOS debug run needs to confirm or rule out this shape of bug —
+/// instead of crashing a release build over a cosmetic clip.
+fn debug_assert_command_line_fits_viewport(
+    cmd_rect: quadraui::Rect,
+    viewport: quadraui::Viewport,
+    line_height: f64,
+) {
+    debug_assert!(
+        (cmd_rect.y + cmd_rect.height) as f64 <= viewport.height as f64 + 0.5,
+        "#1549: command-line row bottom ({}) exceeds the real window's \
+         content height ({}) — the row will be clipped by the window edge",
+        cmd_rect.y + cmd_rect.height,
+        viewport.height,
+    );
+    debug_assert!(
+        cmd_rect.height as f64 + 0.5 >= line_height,
+        "#1549: command-line row height ({}) is shorter than one full \
+         line ({})",
+        cmd_rect.height,
+        line_height,
+    );
+}
+
+#[cfg(test)]
+mod command_line_viewport_geometry_tests {
+    //! #1549: coverage for `debug_assert_command_line_fits_viewport` in
+    //! isolation — no live window (or even a constructed `App`) needed,
+    //! since the check is a pure function of the three values the bug
+    //! report's own "next step" asked to be logged. `cargo test`'s
+    //! default debug profile keeps `debug_assert!` live, so these panics
+    //! are real, observable failures, not silently-compiled-out no-ops.
+
+    use super::*;
+
+    fn viewport(height: f32) -> quadraui::Viewport {
+        quadraui::Viewport::new(800.0, height, 1.0)
+    }
+
+    /// The exact shape `render_content`'s `FrameOp::CommandLine` arm
+    /// produces on a healthy frame: the row ends precisely at the
+    /// viewport's bottom edge. Must not panic.
+    #[test]
+    fn row_flush_with_viewport_bottom_does_not_panic() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 24.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(600.0), 24.0);
+    }
+
+    /// RED-verified: with the assertion's first check removed, this test
+    /// still passes (proving it *can* fail) — see the reasoning in the
+    /// function's own doc for why this shape is exactly #1549's report.
+    /// Mirrors a real window whose usable content height is ~12px
+    /// shorter than the layout assumed (half of a 24px line).
+    #[test]
+    #[should_panic(expected = "#1549: command-line row bottom")]
+    fn row_extending_past_viewport_bottom_panics() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 24.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(588.0), 24.0);
+    }
+
+    /// The second, independent invariant: a row shorter than one full
+    /// line (even if it does fit inside the viewport) still reproduces
+    /// the reported symptom — only part of a line of glyphs has room to
+    /// paint.
+    #[test]
+    #[should_panic(expected = "is shorter than one full")]
+    fn row_shorter_than_line_height_panics() {
+        let rect = quadraui::Rect::new(0.0, 576.0, 800.0, 12.0);
+        debug_assert_command_line_fits_viewport(rect, viewport(600.0), 24.0);
+    }
+}
+
 impl quadraui::ShellApp for App {
     fn setup(&mut self, backend: &mut dyn quadraui::Backend) {
+        // #1428: read the live kitty-keyboard-protocol capability once, at
+        // setup time — mirrors the pre-#1434 TUI shell's `setup`'s identical read
+        // (`self.keyboard_enhanced = backend.backend_caps().kitty_keyboard`)
+        // verbatim, except unconditional rather than gated behind TUI's own
+        // `self.live` (that gate exists solely because a *second*,
+        // TUI-only, direct crossterm round-trip used to live at this call
+        // site before #1109 — see the pre-#1434 TUI shell's `setup`'s own doc; reading
+        // `backend_caps()` itself is a plain field access on every backend,
+        // never I/O, so there is nothing here for a "don't do this under a
+        // test harness" gate to protect against). A GUI backend's
+        // `BackendCaps::kitty_keyboard` is always `false` (GDK/AppKit/Win32
+        // hand over an already-resolved keysym per physical key, never the
+        // terminal-only ambiguity this flag exists to disambiguate — see
+        // `render::engine_key_from_ui`'s own doc), so this is a no-op there;
+        // TUI's own capability is unaffected by living on the shared `App`
+        // instead of the pre-#1434 TUI shell — `backend.backend_caps()` reads the same
+        // `TuiBackend` state either way.
+        self.keyboard_enhanced = backend.backend_caps().kitty_keyboard;
         // Seed cached metrics from runner defaults.
         self.cached_line_height = backend.line_height() as f64;
         self.cached_char_width = backend.char_width() as f64;
@@ -8083,6 +8609,11 @@ impl quadraui::ShellApp for App {
         // still `None` here. `tick()` retries every frame until the window
         // is mapped, which is the reliable path (#552).
         self.capture_window_and_apply_csd(backend);
+
+        // Same "very likely still None here, tick() retries" story as the
+        // CSD drop above, for restoring the saved window size/position/
+        // maximized state instead (#1529).
+        self.restore_window_geometry(backend);
 
         // GTK draws its own VSCode-style menu bar (File/Edit/View/...) — it
         // acts as the client-side titlebar, always visible (unlike TUI, which
@@ -8132,8 +8663,22 @@ impl quadraui::ShellApp for App {
                 );
             }
             self.engine.borrow_mut().menu_bar_visible = false;
-        } else {
+        } else if backend.backend_caps().window_chrome {
+            // GTK's (and any future Win-GUI's) drawn menu bar doubles as the
+            // client-side titlebar — pinned visible always, same as before
+            // #1427 (this `else` used to be the only other arm).
             self.engine.borrow_mut().menu_bar_visible = true;
+        } else {
+            // #1427: no OS menu bar to hide behind (`native_menu`) and no
+            // window chrome for the drawn row to double as (`window_chrome`)
+            // — the `cell` profile (TUI-via-`App`) today. The bar is fully
+            // hideable at runtime (mirrors the pre-#1434 TUI shell's `setup`,
+            // `event_loop`'s `mod.rs:797`) and starts however
+            // `Engine::new` already resolved `menu_bar_visible` (`true`
+            // only in vscode-mode) — left untouched here, unlike the two
+            // arms above, which both *force* a value regardless of what the
+            // engine was constructed with.
+            self.engine.borrow_mut().menu_bar_toggleable = true;
         }
         self.engine
             .borrow()
@@ -8141,13 +8686,13 @@ impl quadraui::ShellApp for App {
             .borrow_mut()
             .set_menus(menu_defs);
 
-        // Apply initial CSS (no-op under the headless test harness, which has
-        // no display to attach a provider to — see the field's doc, #646).
-        if let Some(p) = &self.css_provider {
-            let theme = Theme::from_name(&self.engine.borrow().settings.colorscheme);
-            let combined = format!("{STATIC_CSS}\n{}", make_theme_css(&theme));
-            p.load_css_data(&combined);
-        }
+        // #1498: initial CSS used to be applied here by hand (a GTK-only
+        // `css_provider` theming the native file dialog). That provider is
+        // gone — `GtkPlatformServices::set_theme` (JDonaghy/quadraui#1091)
+        // now owns the equivalent stylesheet, and `render_content`'s first
+        // frame already calls `sync_per_frame_backend_state`, which calls
+        // `Backend::set_theme` unconditionally before anything paints — so
+        // there is nothing left for `setup` to do here.
 
         // Register the panel-keys accelerator set (toggle sidebar, fuzzy
         // finder, live grep, command palette, ...) on the runner's backend.
@@ -8181,6 +8726,15 @@ impl quadraui::ShellApp for App {
         self.painted_line_height.set(Some(lh));
         self.painted_char_width.set(Some(cw));
 
+        // #1427: correct this frame's layout for the hamburger's own
+        // phantom sidebar reservation — a no-op unless
+        // `engine.menu_bar_toggleable` (the `cell` profile; always `false`
+        // on GTK/macOS/Win). See `render::reclaim_hamburger_sidebar_
+        // reservation`'s own doc; mirrors pre-#1427
+        // the pre-#1434 TUI shell's `render_content`'s identical rebind.
+        let corrected_layout = render::reclaim_hamburger_sidebar_reservation(&engine, layout);
+        let layout = &corrected_layout;
+
         let main = layout.main_content_bounds;
         let (x, y, w, h) = (
             main.x as f64,
@@ -8193,8 +8747,8 @@ impl quadraui::ShellApp for App {
         }
 
         // ── Layout ────────────────────────────────────────────────────────────
-        let tab_row_h = render::tab_row_height_px(lh);
-        let tab_bar_h = render::tab_bar_height_px(lh, engine.settings.breadcrumbs);
+        let tab_row_h = (self.units.tab_row_h)(lh);
+        let tab_bar_h = (self.units.tab_bar_h)(lh, engine.settings.breadcrumbs);
         // Whether the *global* (non-per-window) status bar occupies its own
         // row — `global_status_bar_visible`, not `effective_window_status_line`
         // directly, since `'laststatus'` can hide the status line entirely
@@ -8224,6 +8778,10 @@ impl quadraui::ShellApp for App {
         // instead of on a second, differently-originated guess (#582).
         self.cached_editor_bounds
             .set(Some((editor_bounds, tab_bar_h)));
+        // #1421: the raw `h` this frame's `compute_editor_layout` call above
+        // was given — see `cached_main_content_height`'s own doc for why
+        // this is `h`, not `editor_area_h`/`editor_bounds`'s height.
+        self.cached_main_content_height.set(h);
         let (window_rects, _dividers) =
             engine.calculate_group_window_rects(editor_bounds, tab_bar_h);
 
@@ -8240,9 +8798,9 @@ impl quadraui::ShellApp for App {
             lh,
             cw,
             false,
-            render::BREADCRUMB_ROW_HEIGHT_PX,
+            (self.units.breadcrumb_row_h)(lh),
             backend.scrollbar_reserve() as f64,
-            render::gtk_minimap_sizing(),
+            self.units.minimap,
         );
 
         // Cache for click handlers (move into RefCell, then borrow back for drawing).
@@ -8270,13 +8828,12 @@ impl quadraui::ShellApp for App {
         // `backend` *is* the click backend now.
         //
         // `self.backend` still exists for the handful of callers this refactor
-        // could not reach without quadraui growing new portable surface (see
-        // `TextMetricsBackend`'s doc comment): `explorer_ui_event`,
-        // `route_ai_sidebar_event` and the DAP-sidebar key route all need
-        // `set_current_line_height`/`set_current_char_width`, which are
-        // inherent `GtkBackend` methods with no `quadraui::Backend`-trait
-        // equivalent, called from deep inside the keyboard/mouse dispatch tree
-        // where only `&mut self` (no live `backend` reference) is available.
+        // could not reach: `explorer_ui_event`, `route_ai_sidebar_event` and
+        // the DAP-sidebar key route all call
+        // `quadraui::Backend::set_current_line_height`/`set_current_char_width`
+        // (JDonaghy/quadraui#1086) to undo click drift, from deep inside the
+        // keyboard/mouse dispatch tree where only `&mut self` (no live
+        // `backend` reference) is available.
 
         // ══ Editor band (#764, #735 slice 3) ═════════════════════════════════
         // Composed from `render::compose_editor_band`, then the `FrameHitMap`
@@ -8387,12 +8944,24 @@ impl quadraui::ShellApp for App {
         // drained by `tick()` since the blocking `PlatformServices` call can't
         // run from inside this paint callback, mirroring `PendingFileDialog`
         // #572) and flips the flag; a *closed* dialog re-arms it.
+        //
+        // #1432: `quadraui::native_dialog_options` is a pure content-shape
+        // check (no table/no input) — it says nothing about whether *this*
+        // backend actually has a native alert facility to show it with. Its
+        // own doc says as much: "callers should consult [`BackendCaps::
+        // native_dialogs`] before calling [`Backend::show_message_dialog`],
+        // and fall back to `draw_dialog` when it returns `None`." Gating here
+        // (rather than only inside `Some(opts) =>`) also keeps `presence.dialog`
+        // below correct — an ungated `native_dialog_shown` would still have
+        // suppressed the in-canvas rung on a backend with no native dialog at
+        // all (TUI), leaving the dialog painted nowhere.
         match screen
             .dialog
             .as_ref()
             .map(render::dialog_panel_to_quadraui_dialog)
             .as_ref()
             .and_then(quadraui::native_dialog_options)
+            .filter(|_| backend.backend_caps().native_dialogs)
         {
             Some(opts) => {
                 if !self.native_dialog_shown.get() {
@@ -8637,6 +9206,10 @@ impl quadraui::ShellApp for App {
                     let cmd_y = status_y + (status_bar_h - lh);
                     let cmd = render::command_line_view(&screen.command);
                     let cmd_rect = quadraui::Rect::new(x as f32, cmd_y as f32, w as f32, lh as f32);
+                    // #1549: catch a "row clipped by the window edge"
+                    // regression the instant it's introduced, on every
+                    // backend, rather than only on a live macOS run.
+                    debug_assert_command_line_fits_viewport(cmd_rect, backend.viewport(), lh);
                     // #816: publish the painted rect for
                     // `render::command_line_click_char_idx` — the exact twin
                     // of `global_status_rect` above, and TUI's identical
@@ -8738,7 +9311,7 @@ impl quadraui::ShellApp for App {
                 // to port — `draw.rs::draw_find_replace_popup` — but it routed
                 // through `Surface::FindReplace` with a rect the rasteriser
                 // ignores; calling `Backend::draw_find_replace` directly (same
-                // trait method TUI's `TuiShellApp::render_content` calls) is
+                // trait method TUI's the pre-#1434 TUI shell's `render_content` calls) is
                 // simpler and identical in effect. The GTK rasteriser positions
                 // the panel from its own `panel.group_bounds` (already absolute
                 // pixel coordinates — #550, same as TUI's absolute cell
@@ -8763,15 +9336,16 @@ impl quadraui::ShellApp for App {
                 // engine state (`picker_open = true`, items populated) but
                 // nothing ever painted — the "command palette fails to open
                 // silently" symptom. Geometry comes from the same generic
-                // helpers the legacy path used (`PickerGeometry` +
-                // `gtk_picker_sizing`), so no Pango/Cairo access is needed here.
+                // helpers the legacy path used (`PickerGeometry` + this
+                // profile's own picker sizing), so no Pango/Cairo access is
+                // needed here.
                 render::FrameOp::UnifiedPicker => {
                     if let Some(ref picker) = screen.picker {
                         let rect = render::paint_picker_rung(
                             backend,
                             picker,
                             popup_viewport,
-                            &render::gtk_picker_sizing(lh as f32),
+                            &(self.units.picker)(lh as f32),
                         );
                         // Hand the *painted* rect to the click/drag handlers (#555).
                         self.picker_popup_rect.set(Some(rect));
@@ -8789,7 +9363,7 @@ impl quadraui::ShellApp for App {
                 // percent-of-terminal-columns sizing, which wouldn't make sense
                 // in pixel space); content comes from the same shared
                 // `render::tab_switcher_to_quadraui_list_view` adapter TUI's
-                // `TuiShellApp::render_content` uses, through
+                // the pre-#1434 TUI shell's `render_content` uses, through
                 // `Backend::draw_list`.
                 render::FrameOp::TabSwitcher => {
                     if let Some(ref ts) = screen.tab_switcher {
@@ -8801,7 +9375,7 @@ impl quadraui::ShellApp for App {
                         if let Some(geo) = render::TabSwitcherGeometry::compute(
                             popup_viewport,
                             ts.items.len(),
-                            &render::gtk_tab_switcher_sizing(lh as f32),
+                            &(self.units.tab_switcher)(lh as f32),
                         ) {
                             let list =
                                 render::tab_switcher_to_quadraui_list_view(ts, geo.visible_rows);
@@ -8812,7 +9386,7 @@ impl quadraui::ShellApp for App {
                     }
                 }
 
-                // ── Context menu (#546) ──────────────────────────────────────
+                // ── Context menu (#546, #1580) ────────────────────────────────
                 // The ShellApp render path never painted `screen.context_menu`
                 // at all — its draw + click-geometry cache was populated only by
                 // the dead legacy `draw_editor` Cairo path (src/gtk/draw.rs),
@@ -8824,29 +9398,29 @@ impl quadraui::ShellApp for App {
                     if let Some(panel) =
                         screen.context_menu.as_ref().filter(|p| !p.items.is_empty())
                     {
-                        // #902: a native popup (`Backend::show_context_menu`)
-                        // paints nothing in-window — no layout to cache, and
-                        // no in-window rung to record as painted. Gated on
-                        // the same `BackendCaps::native_menu` capability
-                        // #901 uses for the menu bar, via the `menu_style`
-                        // setting.
-                        let native = render::context_menu_should_be_native(
-                            engine.settings.menu_style,
-                            backend.backend_caps(),
-                        );
-                        let mlayout = render::paint_context_menu_rung(
-                            backend,
-                            panel,
-                            popup_viewport,
-                            cw,
-                            lh,
-                            0.0,
-                            native,
-                        );
-                        let painted = mlayout.is_some();
-                        *self.context_menu_layout.borrow_mut() = mlayout;
-                        if painted {
+                        // #1580: a native popup (`Backend::show_context_menu`)
+                        // was already shown from the event handler that opened
+                        // it (`App::handle`'s `open_context_menu_now_if_native`
+                        // choke point) — never from here. This rung paints
+                        // nothing in-window when the backend resolves `Native`
+                        // (no layout to cache, no rung to record as painted),
+                        // and must not call `show_context_menu` itself: doing
+                        // so from inside `render_content` re-enters AppKit's
+                        // modal popup loop from a paint closure that still
+                        // holds the borrows it needs to finish its own frame.
+                        if backend.effective_menu_style() == quadraui::ResolvedMenuStyle::Custom {
+                            let layout = render::paint_context_menu_rung(
+                                backend,
+                                panel,
+                                popup_viewport,
+                                cw,
+                                lh,
+                                0.0,
+                            );
+                            *self.context_menu_layout.borrow_mut() = Some(layout);
                             composed.push(render::FrameOp::ContextMenu);
+                        } else {
+                            *self.context_menu_layout.borrow_mut() = None;
                         }
                     }
                 }
@@ -8937,7 +9511,74 @@ impl quadraui::ShellApp for App {
         backend: &mut dyn quadraui::Backend,
         ctx: &quadraui::ShellContext<'_>,
     ) -> quadraui::Reaction {
+        let had_context_menu_before = self.engine.borrow().context_menu.is_some();
         let reaction = self.handle_dispatch(event, backend, ctx);
+        // #1580: open the native context-menu popup exactly once, from
+        // this event-handler choke point — never from `render_content`'s
+        // paint rung. Gated on the open *transition* (`None` -> `Some`),
+        // not just `is_some()`, so a native menu that's still open (the
+        // real runner blocks on AppKit's own modal loop for the whole
+        // `show_context_menu` call, so this can't actually re-enter, but a
+        // headless test driver that calls `handle` again while nothing
+        // closed the menu must not re-show it either).
+        if !had_context_menu_before {
+            self.open_context_menu_now_if_native(backend);
+        }
+        // #1427: keep the runner's `AppShell` title-bar reservation in sync
+        // with `engine.menu_bar_visible` — that flag can flip from any one
+        // of several places inside `handle_dispatch` (the #1427 reveal/hide
+        // routing at its top, a `:set menu`/`nomenu` ex-command, the
+        // status-bar `[M]` toggle segment's `Engine::handle_status_action`,
+        // ...), each with its own early `return`, so this single choke point
+        // — run once, after every path through `handle_dispatch` has
+        // already returned — is what makes the sync unconditional rather
+        // than requiring one call per mutation site. See
+        // `render::sync_menu_bar_title_row`'s own doc.
+        //
+        // Gated on `menu_bar_toggleable`, not unconditional: on GTK/macOS/
+        // Win the title-bar *band* is a permanent, construction-time
+        // reservation (`shell_config`'s `with_title_bar`) that survives
+        // `menu_bar_visible` going `false` on its own — only the *drawn*
+        // row/dropdown inside it are coupled to that flag (#939's own
+        // regression pin, `gtk::testing::command_center_stays_live_when_
+        // menu_bar_is_hidden`: a native-menu backend, or a test forcing the
+        // flag false directly, must not lose the Command Center's anchor
+        // band). Calling `set_title_bar_visible` there unconditionally
+        // would collapse that reservation the moment anything sets the
+        // flag false, which is wrong for every profile except the
+        // toggleable one, where the band genuinely is meant to come and go
+        // with the flag.
+        if self.engine.borrow().menu_bar_toggleable {
+            render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
+        }
+        // #1427: keep the runner's `AppShell` sidebar *visibility* in sync
+        // with the shadow's too, unconditionally — not just from the two
+        // narrower call sites this method already had
+        // (`run_post_key_epilogue`, `on_shell_event_ctx`'s `BottomItemClicked`
+        // arm) — but *only* on the toggleable-menu-bar profile
+        // (`menu_bar_toggleable`), where it's what corrects `AppShell::
+        // new`'s "active + visible" construction-time default away from the
+        // hamburger *before* the very first hamburger click ever lands, so
+        // that click resolves as a reveal rather than `AppShell::
+        // handle_activity_click`'s already-active toggle-hide branch — see
+        // `render::sync_runner_sidebar_visibility`'s own doc.
+        //
+        // Deliberately gated, not unconditional like the title-row sync
+        // above: GTK/macOS/Win's existing two call sites already keep their
+        // runner/shadow sidebar visibility converged on every path that
+        // needs it, and a *third*, blanket call on every dispatch surfaced
+        // a pre-existing staleness in numerous test fixtures that mutate
+        // `session.explorer_visible` post-construction without also calling
+        // `Engine::sync_app_shell_sidebar_visibility`/`AppShell::show_panel`
+        // (harmless before #1427, since nothing ever read the shadow's
+        // `sidebar_visible()` this eagerly) — collapsing their sidebar
+        // reservation the moment any dispatch ran. The toggleable profile
+        // needs the correction regardless (that's the whole fix), but
+        // GTK/macOS/Win do not, so this stays scoped to where #1427
+        // actually requires it.
+        if self.engine.borrow().menu_bar_toggleable {
+            self.sync_runner_sidebar_visibility(ctx);
+        }
         if self.exit_requested.get() {
             return quadraui::Reaction::Exit;
         }
@@ -8972,7 +9613,7 @@ impl quadraui::ShellApp for App {
     /// response to `AppShell::handle`'s own click hit-testing, or this poll
     /// — so it silently kept showing the previous panel's title forever.
     ///
-    /// `TuiShellApp::take_requested_panel` already had this override (see
+    /// the pre-#1434 TUI shell's `take_requested_panel` already had this override (see
     /// its own doc for the shared mechanics, mirrored verbatim here); this
     /// is the same logic against `App`'s fields.
     fn take_requested_panel(&mut self) -> Option<quadraui::WidgetId> {
@@ -9001,107 +9642,7 @@ impl quadraui::ShellApp for App {
         Some(current)
     }
 
-    fn on_shell_event(&mut self, event: &quadraui::AppShellEvent) {
-        use quadraui::AppShellEvent;
-        // #1062: the shadow-`engine.app_shell` sync, unconditionally and
-        // first — see `render::sync_shell_event_shadow`'s rung comment for
-        // why this call has to come before any of the id-specific branching
-        // below rather than be repeated inside each arm. GTK has no id that
-        // needs `ShellShadowSyncHost::panel_absent_from_shadow` to answer
-        // `true` (it has no hamburger panel), so `GtkShellShadowHost` is a
-        // unit struct.
-        {
-            let mut engine = self.engine.borrow_mut();
-            render::sync_shell_event_shadow(event, &mut engine, &GtkShellShadowHost);
-        }
-        match event {
-            AppShellEvent::PanelChanged { panel_id } => {
-                // #1064: record what the runner's own `AppShell` now
-                // believes is active, whether this notification came from
-                // a real click or from `take_requested_panel`'s own echo
-                // below — see `Self::last_shell_panel`'s doc.
-                self.last_shell_panel = Some(panel_id.clone());
-                if std::mem::take(&mut self.suppress_shell_panel_echo) {
-                    // Echo of our own `take_requested_panel` reconciliation:
-                    // the engine already holds this state (an app-initiated
-                    // switch, e.g. a DAP reveal or a panel-focus keyboard
-                    // accelerator) — re-running `switch_panel` below would
-                    // toggle an already-active `ext:` panel back **off**
-                    // (`render::apply_activity_panel_switch`'s
-                    // `already_showing` arm treats a second "click" on the
-                    // active plugin panel as a close).
-                    return;
-                }
-                // #557: plugin-provided panels are now real `PanelDefinition`s
-                // in the runner's `AppShell` (`build_shell_config`), so their
-                // icon clicks arrive here like any built-in panel's. They are
-                // *not* engine-`AppShell` panels though — `render_content`
-                // dispatches on `engine.ext_panel_active`, which
-                // `sync_shell_event_shadow` deliberately leaves untouched for
-                // an `ext:` id (see that function's doc) — so route them
-                // through the existing `switch_panel` handler that owns the
-                // ext-panel focus/toggle bookkeeping.
-                if is_ext_panel_id(panel_id.as_str()) {
-                    self.switch_panel(panel_id.as_str().to_string());
-                    return;
-                }
-                // #1360: a built-in panel's activity-bar icon click must move
-                // keyboard focus into that panel, exactly as TUI's own
-                // `PanelChanged` arm does (`focus_sidebar_panel` +
-                // `sidebar.has_focus = true` in `TuiShellApp::on_shell_event`)
-                // — before this, GTK only redrew, so `render::route_focus_key`
-                // (which every keystroke passes through, see
-                // `Self::handle_key_press`'s "Shared focus-owner keyboard
-                // rung") kept reading `sidebar_has_focus() == false` and sent
-                // every subsequent key straight to the editor. `sidebar.
-                // has_focus`/`ext_panel_name` have no GTK equivalent to set —
-                // GTK's `route_focus_key` call passes
-                // `engine.sidebar_has_focus()` itself as the "band" (see
-                // that call site's own comment), so the one engine call
-                // below is the whole fix, and it is the same
-                // already-shared `Engine::focus_sidebar_panel` this method's
-                // own `toggle_focus_search`/`toggle_focus_explorer` already
-                // call for the keyboard-accelerator path.
-                self.engine
-                    .borrow_mut()
-                    .focus_sidebar_panel(panel_id.as_str());
-                self.draw_needed.set(true);
-            }
-            AppShellEvent::SidebarHidden => {
-                // #557: this is also how a *second* click on an open
-                // extension panel's icon arrives — `sync_shell_event_shadow`
-                // already dropped the plugin panel's claim (its
-                // `SidebarHidden` arm clears the same two fields
-                // unconditionally). Re-opening still works:
-                // `AppShell::handle_activity_click` reports a click on the
-                // active panel as `PanelChanged`, not `SidebarHidden`, once
-                // the sidebar is hidden.
-                self.draw_needed.set(true);
-            }
-            AppShellEvent::SidebarResized { .. } => {}
-            AppShellEvent::BottomItemClicked { id } => {
-                // The runner treats bottom activity-bar items as action
-                // buttons (not sidebar panels), so it never toggles or
-                // hides on its own — it only ever reports the click
-                // (TUI's `on_shell_event`, same arm, carries the matching
-                // comment). #1057: this used to unconditionally
-                // `show_panel`, so a second click on an already-open
-                // bottom item (e.g. "bottom:settings") re-showed it
-                // instead of collapsing the sidebar like VS Code does for
-                // an active-tab click — while TUI, one click handler
-                // over, already ran the toggle. Route through
-                // `switch_panel`, the same shared
-                // `render::apply_activity_panel_switch` call site
-                // `PanelChanged`'s ext-panel arm above already uses, so
-                // both backends make the identical toggle decision from
-                // one place instead of drifting again.
-                self.switch_panel(id.as_str().to_string());
-            }
-            _ => {}
-        }
-    }
-
-    /// #1057: the ctx-aware override TUI's `TuiShellApp` already had (its
+    /// #1057: the ctx-aware override TUI's the pre-#1434 TUI shell already had (its
     /// own title-bar sync, quadraui#617) — `App` only implemented the
     /// deprecated ctx-less [`Self::on_shell_event`] until now, so nothing
     /// here could ever push a shell-state change back into the runner's own
@@ -9136,8 +9677,27 @@ impl quadraui::ShellApp for App {
         event: &quadraui::AppShellEvent,
         ctx: &quadraui::ShellContext<'_>,
     ) {
-        #[allow(deprecated)]
-        self.on_shell_event(event);
+        // #1427: a `SidebarHidden` for the hamburger — the runner's second
+        // click on it while the menu is open — has to be special-cased
+        // *here*, before delegating to the ctx-less `Self::on_shell_event`
+        // below, because only `ctx` (the runner's own `AppShell`) can tell
+        // the hamburger apart from a real panel's own second click; the
+        // shadow `engine.app_shell` has no hamburger `PanelDefinition` at
+        // all (see `render::route_hamburger_panel_changed`'s doc). Mirrors
+        // the pre-#1434 TUI shell's `on_shell_event_ctx`'s identical check, now
+        // shared via `render::route_hamburger_sidebar_hidden`. A no-op check
+        // on GTK/macOS/Win, which never register this panel id.
+        if matches!(event, quadraui::AppShellEvent::SidebarHidden)
+            && ctx
+                .shell()
+                .active_panel_id()
+                .map(quadraui::WidgetId::as_str)
+                == Some(crate::core::engine::sidebar::HAMBURGER_PANEL_ID)
+        {
+            render::route_hamburger_sidebar_hidden(&mut self.engine.borrow_mut(), ctx);
+            return;
+        }
+        self.dispatch_shell_event(event);
         // #1356 (quadraui bump for quadraui#1055): a bottom item's click
         // never moves the *real* `AppShell` on its own — the `BottomItemClicked`
         // arm above only toggles the engine-side shadow via `switch_panel`.
@@ -9156,6 +9716,19 @@ impl quadraui::ShellApp for App {
             }
         }
         self.sync_runner_sidebar_visibility(ctx);
+        // #1427: `ShellAdapter::handle` consumes a `PanelChanged`/
+        // `SidebarHidden` for a top-row panel itself and returns without
+        // ever calling `Self::handle` — the one place `Self::handle`'s own
+        // `render::sync_menu_bar_title_row` call can never reach. Mirrors
+        // the pre-#1434 TUI shell's `on_shell_event_ctx`'s identical tail call
+        // — see that function's own doc for why running this on every path
+        // (not just the hamburger arm above) is what makes any *future* arm
+        // that flips `menu_bar_visible` get the same same-frame guarantee
+        // for free. Gated on `menu_bar_toggleable` for the same reason as
+        // `Self::handle`'s own identical call — see that call site's doc.
+        if self.engine.borrow().menu_bar_toggleable {
+            render::sync_menu_bar_title_row(ctx, &self.engine.borrow());
+        }
     }
 }
 
@@ -9252,143 +9825,6 @@ mod portable_entry_point_tests {
         assert_eq!(cfg.max_sidebar_width, render::ALT_SIDEBAR_WIDTH_MAX as f32);
     }
 
-    /// #1107: `App::shell_config` (this GTK/macOS/Win-GUI builder) and
-    /// `TuiShellApp::build_shell_config` used to carry two entirely
-    /// independent icon tables for the built-in activity-bar panels — which
-    /// is exactly how the search panel ended up resolving to `SEARCH_COD`
-    /// on GTK and `SEARCH` on TUI for months before #950 noticed by
-    /// inspection and hand-aligned the two literals. Hand-aligning the
-    /// *values* doesn't stop the *tables* from drifting again the next time
-    /// either one gains a panel; this test pins the fact that both
-    /// backends now resolve every shared built-in panel id — not just
-    /// search — through the one `App::resolve_builtin_panel_icon` table
-    /// (#1107), so a future edit to only one of them fails here instead of
-    /// shipping a silent per-backend icon fork again.
-    ///
-    /// Note for reviewers: this does **not** go red against unfixed
-    /// `develop` — #950 already made the two *values* agree by hand. #1107
-    /// is the refactor that deletes the machinery which let them diverge in
-    /// the first place (no user-visible behaviour change), and this test is
-    /// the structural regression guard for it, not a bug-fix repro.
-    #[cfg(feature = "gui")]
-    #[test]
-    fn shell_config_resolves_the_same_icon_on_every_backend_for_every_shared_panel() {
-        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let app = App::new_headless(engine);
-        let gtk_cfg = app.shell_config();
-        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
-
-        let icon_for = |cfg: &quadraui::ShellConfig, id: &str| -> Option<String> {
-            cfg.panels
-                .iter()
-                .chain(cfg.bottom_items.iter())
-                .find(|p| p.id.as_str() == id)
-                .map(|p| p.icon.clone())
-        };
-
-        // Every built-in id both backends' `ShellConfig`s claim to carry —
-        // not just search, so a future panel doesn't get a free pass.
-        let shared_ids: Vec<&str> = gtk_cfg
-            .panels
-            .iter()
-            .chain(gtk_cfg.bottom_items.iter())
-            .map(|p| p.id.as_str())
-            .filter(|id| {
-                tui_cfg
-                    .panels
-                    .iter()
-                    .chain(tui_cfg.bottom_items.iter())
-                    .any(|p| p.id.as_str() == *id)
-            })
-            .collect();
-        assert!(
-            shared_ids.contains(&"panel:search"),
-            "precondition: both backends must claim the search panel for \
-             this test to mean anything"
-        );
-
-        for id in shared_ids {
-            let gtk_icon = icon_for(&gtk_cfg, id).unwrap();
-            let tui_icon = icon_for(&tui_cfg, id).unwrap();
-            assert_eq!(
-                gtk_icon, tui_icon,
-                "panel {id:?} resolved to different icons per backend \
-                 (GTK: {gtk_icon:?}, TUI: {tui_icon:?})"
-            );
-        }
-    }
-
-    /// #1166: `App::shell_config` (GTK/macOS/Win-GUI) derives its panel
-    /// *order* from `self.engine.app_shell.panels()` — the engine's shadow
-    /// `AppShell`, built by `Engine::new_from_state` from
-    /// `sidebar::engine_app_shell_panel_definitions()` — while
-    /// `TuiShellApp::build_shell_config` derives its order by iterating
-    /// `sidebar::FIXED_ACTIVITY_PANEL_IDS` directly. Both now trace back to
-    /// the same constant, but the icon test above only compares icons *per
-    /// id* — it never looks at relative order, so a future edit that
-    /// reintroduces an independent order for one side (e.g. a
-    /// hand-transcribed panel list, or a stray `.sort()`) would still pass
-    /// it while shipping a different activity-bar order per backend, the
-    /// same shape of bug #1107 fixed for icons. This pins order the same
-    /// way that test pins icons.
-    ///
-    /// Note for reviewers: like the icon test above, this does not go red
-    /// against unfixed `develop` — the hand-transcribed literal
-    /// `Engine::new_from_state` used to build `self.app_shell` from
-    /// happened to list the same six ids in the same order as
-    /// `FIXED_ACTIVITY_PANEL_IDS` already, so the *values* never
-    /// disagreed. #1166 is the refactor that deletes the second copy of
-    /// the order (no user-visible behaviour change) so the two can no
-    /// longer independently drift; this test is the structural regression
-    /// guard for that, not a bug-fix repro (verified red by temporarily
-    /// reverting `engine_app_shell_panel_definitions` to a hand-ordered
-    /// literal with two ids swapped: this test caught it, the icon test
-    /// above did not).
-    #[cfg(feature = "gui")]
-    #[test]
-    fn shell_config_resolves_the_same_panel_order_on_every_backend_for_every_shared_panel() {
-        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
-        let app = App::new_headless(engine);
-        let gtk_cfg = app.shell_config();
-        let tui_cfg = crate::tui_main::testing::TuiShellApp::build_shell_config(false);
-
-        let order_of = |cfg: &quadraui::ShellConfig| -> Vec<String> {
-            cfg.panels
-                .iter()
-                .chain(cfg.bottom_items.iter())
-                .map(|p| p.id.as_str().to_string())
-                .collect()
-        };
-        let gtk_order = order_of(&gtk_cfg);
-        let tui_order = order_of(&tui_cfg);
-
-        // Both orderings restricted to the ids the two backends share, each
-        // kept in that backend's own relative order — panels only one
-        // backend claims (extension panels; there are no built-in-only ids
-        // today) are irrelevant to whether the *shared* panels agree.
-        let shared_gtk_order: Vec<String> = gtk_order
-            .iter()
-            .filter(|id| tui_order.contains(id))
-            .cloned()
-            .collect();
-        let shared_tui_order: Vec<String> = tui_order
-            .iter()
-            .filter(|id| gtk_order.contains(id))
-            .cloned()
-            .collect();
-
-        assert!(
-            shared_gtk_order.iter().any(|id| id == "panel:search"),
-            "precondition: both backends must claim the search panel for \
-             this test to mean anything"
-        );
-        assert_eq!(
-            shared_gtk_order, shared_tui_order,
-            "GTK and TUI resolved the shared activity-bar panels to \
-             different relative orders (GTK: {gtk_order:?}, TUI: {tui_order:?})"
-        );
-    }
-
     /// #949 review: makes the "closes the macOS/Win-GUI settings hot-reload
     /// gap for free" claim testable. `handle_poll_tick` used to be reached
     /// only via a GTK-only `gio::FileMonitor` callback
@@ -9436,13 +9872,13 @@ mod portable_entry_point_tests {
             "vimcode_test_949_handle_poll_tick_{:?}.json",
             std::thread::current().id()
         ));
-        std::fs::write(&tmp, r#"{"line_numbers":"Absolute"}"#).expect("write temp settings.json");
+        std::fs::write(&tmp, r#"{"line_numbers":"Relative"}"#).expect("write temp settings.json");
         let _guard = TestSettingsPathGuard::install(tmp.clone());
 
         let engine = Rc::new(RefCell::new(Engine::new_for_test()));
         assert_eq!(
             engine.borrow().settings.line_numbers,
-            LineNumberMode::None,
+            LineNumberMode::Absolute,
             "precondition: the constructor's default must differ from the \
              on-disk value, or a reload would be indistinguishable from a no-op"
         );
@@ -9453,7 +9889,7 @@ mod portable_entry_point_tests {
 
         assert_eq!(
             engine.borrow().settings.line_numbers,
-            LineNumberMode::Absolute,
+            LineNumberMode::Relative,
             "handle_poll_tick did not pick up the externally-edited settings file"
         );
 
@@ -9525,7 +9961,14 @@ mod portable_entry_point_tests {
     /// `PlatformWindowHandle`/`gtk4::Window` seam that used to back them.
     /// They inherit the identical structural gap this test documents — this
     /// assertion covering all of them, not just title-sync/minimize, is why
-    /// it was not split into one copy per call site.
+    /// it was not split into one copy per call site. #1529's
+    /// `App::restore_window_geometry` (the `set_size`/`set_bounds`/
+    /// `toggle_window_maximize` restore) and `sync_window_title`'s new
+    /// `cached_window_x`/`y`/`maximized` caching are the same story again:
+    /// both gate on this identical `Some`/`None` split, so both are live-
+    /// smoke-only for the same reason — see `restore_window_geometry_*`
+    /// tests below for what *is* covered headlessly (the retry-until-mapped
+    /// contract and the pure clamp/snapshot logic feeding it).
     #[cfg(feature = "gui")]
     #[test]
     fn gtk_backend_window_is_none_without_a_live_window_so_title_sync_and_minimize_stay_black_box_untestable(
@@ -9552,7 +9995,7 @@ mod portable_entry_point_tests {
     /// happened to touch `tab_scroll_offset` (`goto_tab`/`close_tab`/etc.).
     /// TUI already self-corrected within two frames via the identical
     /// `tab_visible_counts` → `post_draw_apply_widths` drain in
-    /// `TuiShellApp::tick`.
+    /// the pre-#1434 TUI shell's `tick`.
     ///
     /// Follows `handle_poll_tick_reloads_settings_changed_on_disk`'s
     /// established pattern of driving `App::handle_poll_tick` directly
@@ -9563,9 +10006,10 @@ mod portable_entry_point_tests {
     /// file, not a vimcode workaround, per `CLAUDE.md`'s Platform-Neutrality
     /// Rule). What this test stands in for a real paint: `tab_visible_counts`
     /// is normally populated by `paint_tab_bars_rung` from
-    /// `bar.hits.available_cols`, the exact geometry
-    /// `render::paint_tab_bars` (shared with TUI, already covered by its own
-    /// driver-tier tests) just painted — here it's pushed by hand to isolate
+    /// `click::tab_bar_available_cols(bar.rect, &bar.layout, ..)`, off the
+    /// exact geometry `render::paint_tab_bars` (shared with TUI, already
+    /// covered by its own driver-tier tests) just painted — here it's pushed
+    /// by hand to isolate
     /// the wiring bug this issue is about from that already-tested paint
     /// step.
     ///
@@ -9612,7 +10056,7 @@ mod portable_entry_point_tests {
         );
     }
 
-    /// #1360: the GTK mirror of `TuiShellApp`'s own
+    /// #1360: the GTK mirror of the pre-#1434 TUI shell's own
     /// `take_requested_panel_echo_does_not_steal_focus` (`src/tui_main/
     /// shell_app.rs`) — a *reconciliation* `PanelChanged` (the one
     /// `Self::take_requested_panel` synthesizes to steer the runner's own
@@ -9639,7 +10083,7 @@ mod portable_entry_point_tests {
 
         let mut app = App::new_headless(Rc::clone(&engine));
         let _ = app.take_requested_panel(); // returns Some(explorer), arms suppress
-        app.on_shell_event(&quadraui::AppShellEvent::PanelChanged {
+        app.dispatch_shell_event(&quadraui::AppShellEvent::PanelChanged {
             panel_id: quadraui::WidgetId::new(PANEL_EXPLORER),
         });
 
@@ -9647,6 +10091,247 @@ mod portable_entry_point_tests {
             !engine.borrow().explorer_has_focus,
             "the take_requested_panel echo must only update the runner-state \
              belief, not steal focus like a user click"
+        );
+    }
+
+    /// #1529: `App::restore_window_geometry` gates on `Backend::window()`
+    /// returning `Some`, exactly like `capture_window_and_apply_csd` does
+    /// for CSD (see `gtk_backend_window_is_none_without_a_live_window_
+    /// so_title_sync_and_minimize_stay_black_box_untestable`'s doc above)
+    /// — so the one thing headlessly testable here is the
+    /// retry-until-mapped contract: calling it against a `GtkBackend`
+    /// nobody has attached a window to must be a complete no-op (no
+    /// panic, and crucially `window_geometry_restored` stays `false` so
+    /// `tick()` keeps retrying next frame instead of giving up on a
+    /// window that simply isn't mapped yet).
+    ///
+    /// RED-verification note: symmetric with the neighbouring
+    /// `gtk_backend_window_is_none_...` test's own note — before this fix
+    /// `restore_window_geometry` did not exist at all (nothing restored
+    /// anything, the bug this issue is about), so there is no
+    /// "unfixed but present" version of *this* method to turn red. Its
+    /// job is guarding the fix's shape (idempotent no-op until mapped)
+    /// against regression going forward; the actual restore-something
+    /// behaviour this issue fixes can only be confirmed on a live window
+    /// — see this PR's `SMOKE_TESTS`.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn restore_window_geometry_is_a_noop_until_the_window_is_mapped() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        engine.borrow_mut().session.window = core::session::WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: Some(10),
+            y: Some(20),
+            maximized: true,
+        };
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
+
+        app.restore_window_geometry(&mut backend);
+
+        assert!(
+            !app.window_geometry_restored.get(),
+            "restore_window_geometry must not mark itself done before \
+             Backend::window() ever returns Some, or tick() would give up \
+             retrying and the saved geometry would never actually be \
+             applied once the window is mapped"
+        );
+    }
+
+    /// #1529: `App::cached_window_geometry` is the save-side snapshot
+    /// `App::quit_and_save_session`/`App::save_session_and_exit` (folded
+    /// from three separate near-duplicate sites into one by #1499) funnel
+    /// through before `Engine::save_session_state` persists it. Before
+    /// this fix each of those three sites wrote only `width`/`height`
+    /// into `engine.session.window` — `x`/`y`/`maximized` were never
+    /// saved no matter what `sync_window_title` cached, the exact "save
+    /// is partial" bug this issue reports. This drives the cells
+    /// directly (`sync_window_title`'s own live-window dependency is the
+    /// same structural gap `gtk_backend_window_is_none_...` documents,
+    /// so it can't be exercised headlessly) and asserts the snapshot
+    /// carries all five fields through — a data-plumbing assertion, not
+    /// a painted one: these cells feed a session-file write, not a
+    /// screen, so CLAUDE.md's "assert on rendered output" rule (aimed at
+    /// paint paths that never consume the state they populate) has no
+    /// paint path to apply to here.
+    #[cfg(feature = "gui")]
+    #[test]
+    fn cached_window_geometry_snapshots_position_and_maximized() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(Rc::clone(&engine));
+
+        app.cached_window_width.set(1000);
+        app.cached_window_height.set(700);
+        app.cached_window_x.set(Some(50));
+        app.cached_window_y.set(Some(75));
+        app.cached_window_maximized.set(true);
+
+        let geo = app.cached_window_geometry();
+
+        assert_eq!(geo.width, 1000);
+        assert_eq!(geo.height, 700);
+        assert_eq!(geo.x, Some(50));
+        assert_eq!(geo.y, Some(75));
+        assert!(geo.maximized);
+    }
+
+    /// #1529 review: the black-box GTK coverage the acceptance criteria
+    /// asked for ("start with a session holding e.g. 1000x700 and verify
+    /// the window's reported size; start with `maximized: true` and
+    /// verify it's maximized") and the review found missing.
+    /// `restore_window_geometry_is_a_noop_until_the_window_is_mapped`
+    /// above only proves the retry-until-mapped *contract* — it never
+    /// attaches a window, so it cannot observe a single pixel of the
+    /// restore behaviour this issue is actually about.
+    ///
+    /// This drives a real `gtk4::ApplicationWindow`, attached via
+    /// `quadraui::gtk::GtkBackend::set_window` (`pub fn`, the same call
+    /// `quadraui::gtk::run::activate` makes in production — see that
+    /// function for the identical `ApplicationWindow::builder()` shape
+    /// this mirrors), then calls the *production* `restore_window_geometry`
+    /// against it and reads back the *real* `WindowControl::bounds()`/
+    /// `is_maximized()` — not a cached `Cell`, not a struct field.
+    ///
+    /// **RED verification: NOT executed, and this says so explicitly**
+    /// rather than repeating the review's own complaint about an
+    /// unverifiable claim. This worker's sandbox is macOS with no live
+    /// desktop session attached to the test process, and — independent of
+    /// that — `cargo test`'s worker-thread model makes `gtk4::init()`
+    /// unusable here at all (see the macOS note below); there was no way
+    /// to actually run this test to green, let alone flip
+    /// `restore_window_geometry` back to a no-op and watch it go red, in
+    /// this environment. This test's own runtime probe (`catch_unwind`
+    /// around `gtk4::init()`) reflects that honestly by skipping rather
+    /// than asserting anything. Whoever next runs this on a Linux machine
+    /// with a live desktop should do that RED/GREEN check by hand — revert
+    /// `restore_window_geometry`'s body to a no-op, confirm both
+    /// assertions fail, restore it, confirm both pass — and record having
+    /// done so, since nobody has yet.
+    ///
+    /// `#[ignore]`d for the identical reason as `src/gtk/testing.rs`'s
+    /// `setup_gtk_clipboard_round_trips_yank_and_paste_through_real_
+    /// backend_1100`: `gtk4::init()` needs a live windowing session
+    /// (X11/Wayland, or macOS's native windowing). CI's headless
+    /// GUI-feature job asserts `DISPLAY`/`WAYLAND_DISPLAY` are both unset
+    /// before running `cargo test`, so this must stay `#[ignore]`d rather
+    /// than runtime-skip only; run manually with `cargo test -- --ignored
+    /// restore_window_geometry_applies_size_and_maximized_to_a_real_window`
+    /// on a machine with a live desktop.
+    ///
+    /// **macOS note**: `gtk4-rs` asserts `gtk4::init()` runs on the
+    /// process's main thread (Cocoa's own requirement) and *panics*
+    /// rather than returning `Err` when it doesn't — and `cargo test`
+    /// always runs each test on a worker thread, never the main one. The
+    /// probe below wraps the call in `catch_unwind` (with the panic hook
+    /// silenced for its duration, so a graceful skip doesn't print a
+    /// misleading backtrace) specifically to turn that unconditional
+    /// macOS panic into the same graceful skip a missing display gets on
+    /// Linux — so on macOS this test *always* skips under the ordinary
+    /// `cargo test` harness, `--ignored` or not; verifying it for real
+    /// requires a single-main-threaded runner (a plain `fn main` calling
+    /// the test function directly), which is out of scope for this issue.
+    /// Linux (X11/Wayland) has no such restriction and is the platform
+    /// this test can actually exercise end-to-end.
+    #[cfg(feature = "gui")]
+    #[test]
+    #[ignore = "needs a live windowing session — gtk4::init() has no display \
+                to talk to in headless CI; run with `cargo test -- --ignored` \
+                on a machine with a live desktop (see doc comment)"]
+    fn restore_window_geometry_applies_size_and_maximized_to_a_real_window() {
+        use gtk4::prelude::*;
+        use quadraui::Backend;
+
+        let _paint = crate::test_paint::PaintGuard::acquire();
+
+        // See this test's doc comment's "macOS note": `gtk4::init()`
+        // panics (does not return `Err`) when called off the main thread,
+        // which every `cargo test` worker thread is. Silence the panic
+        // hook for the duration of the probe so that expected panic
+        // doesn't print a backtrace that looks like a real failure.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let init_result = std::panic::catch_unwind(gtk4::init);
+        std::panic::set_hook(previous_hook);
+
+        if !matches!(init_result, Ok(Ok(()))) {
+            eprintln!(
+                "skipping restore_window_geometry_applies_size_and_maximized_to_a_real_window: \
+                 gtk4::init() did not succeed on this thread/platform (no live windowing \
+                 session, or — on macOS — cargo test's worker thread isn't the main thread; \
+                 see this test's doc comment)"
+            );
+            return;
+        }
+
+        let gapp = gtk4::Application::builder()
+            .application_id("dev.vimcode.test.restore-window-geometry-1529")
+            .build();
+        let window = gtk4::ApplicationWindow::builder()
+            .application(&gapp)
+            .default_width(320)
+            .default_height(240)
+            .build();
+        window.present();
+        // Let the initial `present()` request land before seeding the
+        // "before" measurement below, and after every later mutation, so
+        // `bounds()`/`is_maximized()` read the window's settled state
+        // rather than racing GTK4's asynchronous resize/maximize requests.
+        let pump = || while gtk4::glib::MainContext::default().iteration(false) {};
+        pump();
+
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        engine.borrow_mut().session.window = core::session::WindowGeometry {
+            width: 1000,
+            height: 700,
+            x: None,
+            y: None,
+            maximized: false,
+        };
+        let mut app = App::new_headless(Rc::clone(&engine));
+        let mut backend = quadraui::gtk::GtkBackend::new();
+        backend.set_window(window.clone());
+
+        app.restore_window_geometry(&mut backend);
+        pump();
+
+        let bounds = backend
+            .window()
+            .expect("set_window was just called")
+            .bounds()
+            .expect("bounds() must succeed once a window is attached");
+        assert_eq!(
+            bounds.width.round() as i32,
+            1000,
+            "restore_window_geometry did not apply the saved width to the \
+             real window"
+        );
+        assert_eq!(
+            bounds.height.round() as i32,
+            700,
+            "restore_window_geometry did not apply the saved height to the \
+             real window"
+        );
+        assert!(
+            !matches!(backend.window().unwrap().is_maximized(), Ok(true)),
+            "window must not be maximized when the saved session says \
+             maximized: false"
+        );
+
+        // Second case, same window: `maximized: true` must actually
+        // maximize it. `window_geometry_restored` reset by hand since a
+        // real run only restores once per process lifetime; this test
+        // exercises both branches of `clamped.maximized` against the one
+        // window rather than tearing down and reattaching a second one.
+        app.window_geometry_restored.set(false);
+        engine.borrow_mut().session.window.maximized = true;
+        app.restore_window_geometry(&mut backend);
+        pump();
+
+        assert!(
+            matches!(backend.window().unwrap().is_maximized(), Ok(true)),
+            "restore_window_geometry did not maximize the real window when \
+             the saved session says maximized: true"
         );
     }
 }

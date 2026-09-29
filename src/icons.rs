@@ -268,6 +268,68 @@ pub const DIFF_FOLD: Icon = Icon::new("\u{F0233}", "=");
 pub const SPLIT_RIGHT: Icon = Icon::new("\u{F0932}", "|");
 pub const SPLIT_DOWN: Icon = Icon::new("\u{f0d7}", "_");
 
+// ─── Status Bar Toggles / Notification Bell (#1540) ────────────────────────
+//
+// These lived as raw PUA literals directly in `render.rs` (`" 󰍜 "`,
+// `" 󰆍 "`, `" 󰘖 "`, `"󰂞"`) rather than `Icon::new` constants, which is why
+// `scripts/gen_icon_font.py`/`tests/icon_font_coverage.rs` (both of which
+// scan only this file) never saw them and the bundled subset font never
+// picked up their codepoints -- they painted as tofu on any platform whose
+// system font lacks the same PUA assignment a Nerd Font uses (macOS's
+// LastResort box, in the reported case). Moving them here is the actual
+// fix; the raw literals are gone from `render.rs`.
+
+/// Status-bar menu-bar visibility toggle. Distinct constant from
+/// [`HAMBURGER`] (same nerd codepoint, different context) because the
+/// status-bar fallback is a bracketed abbreviation (`[M]`) to match its
+/// sibling toggles below, not `HAMBURGER`'s single-glyph fallback.
+pub const STATUS_MENU_TOGGLE: Icon = Icon::new("\u{f035c}", "[M]");
+pub const STATUS_PANEL_TOGGLE: Icon = Icon::new("\u{f018d}", "[P]");
+pub const STATUS_SIDEBAR_TOGGLE: Icon = Icon::new("\u{f0616}", "[S]");
+/// "Notification done" bell, shown in the status bar once an in-progress
+/// notification completes.
+pub const STATUS_BELL_DONE: Icon = Icon::new("\u{f009e}", "*");
+
+/// Problems-counter icons (#1548): error/warning glyphs prefixing the
+/// always-on diagnostic-count segments. Ordinary BMP Unicode below the
+/// nerd-font PUA range — same reasoning as the "Window Controls" section
+/// below: these read fine as plain monospace glyphs on any system font, on
+/// both GTK and TUI, so `nerd`/fallback are deliberately identical and
+/// there's no bundled subset-font codepoint to maintain for them (see
+/// `tests/icon_font_coverage.rs`'s `NERD_RANGE_START` gate).
+pub const STATUS_ERROR: Icon = Icon::new("\u{2297}", "\u{2297}"); // ⊗
+pub const STATUS_WARNING: Icon = Icon::new("\u{26a0}", "\u{26a0}"); // ⚠
+
+// ─── Terminal Panel Toolbar (#1540) ─────────────────────────────────────────
+//
+// Same story as the status-bar toggles above: these were raw PUA literals
+// in `render.rs` (`NF_TERM_*` consts) with **no** ASCII fallback at all --
+// they painted unconditionally regardless of `nerd_fonts_enabled()`, so a
+// non-Nerd-Font system (or one whose PUA mapping differs) always saw tofu
+// here, never a fallback glyph. Now real `Icon`s with fallbacks, gated by
+// `nerd_fonts_enabled()` at the render call sites like every other icon.
+pub const TERM_CLOSE: Icon = Icon::new("\u{f0156}", "x");
+pub const TERM_SPLIT: Icon = Icon::new("\u{f093c}", "|");
+pub const TERM_MAXIMIZE: Icon = Icon::new("\u{f0297}", "\u{25a1}"); // □
+pub const TERM_UNMAXIMIZE: Icon = Icon::new("\u{f0293}", "\u{29c9}"); // ⧉
+
+// ─── LSP Symbol Kind Icons (#1540) ──────────────────────────────────────────
+//
+// `src/core/lsp.rs`'s `SymbolKind::icon()` (outline view / breadcrumbs, via
+// `picker.rs`) had these as raw PUA literals too -- same bug class as the
+// status-bar/terminal-toolbar ones above, just a different call site the
+// original #1540 report didn't spot. `icon()` has never gated on
+// `nerd_fonts_enabled()` (most `SymbolKind` variants already render no
+// glyph at all, by design, predating this fix) so these are read via
+// `.nerd` directly rather than `.s()` -- moving the literal into `icons.rs`
+// without changing that existing behaviour.
+pub const SYM_FILE: Icon = Icon::new("\u{f0214}", "F"); // nf-md-file
+pub const SYM_MODULE: Icon = Icon::new("\u{f03d7}", "M"); // nf-md-package_variant_closed
+pub const SYM_FUNCTION: Icon = Icon::new("\u{f0295}", "f"); // nf-md-function
+pub const SYM_PRIMITIVE: Icon = Icon::new("\u{f03a0}", "v"); // nf-md-numeric
+pub const SYM_ARRAY: Icon = Icon::new("\u{f016a}", "[]"); // nf-md-code_brackets
+pub const SYM_OPERATOR: Icon = Icon::new("\u{f0195}", "+"); // nf-md-contrast
+
 // ─── File Icon Lookup ────────────────────────────────────────────────────────
 
 /// Return the icon string for a given file extension.

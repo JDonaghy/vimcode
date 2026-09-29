@@ -15,6 +15,148 @@ lanes that host can support, and prints a lane matrix. It exits non-zero if a
 lane the probe says should run didn't, or if a lane ran but executed **zero**
 tests — see the script's own header comment for the full rationale (#645).
 
+**#1092 made it gateable.** Before that it was an on-demand runner whose only
+output was a human-readable matrix on a terminal, so a release could roll with
+a platform-specific regression nobody had run it against (#1086–#1089 were four
+such regressions, all found by an operator looking at a screenshot). It now has:
+
+- a **documented exit contract** — four codes, below, everything but `0` meaning
+  *do not roll*;
+- a **machine-readable summary** — `--summary <path>` writes a JSON document
+  covering all four lanes including the ones this host never probed, plus a
+  single greppable `PLATFORM_CONFORMANCE_SUMMARY …` line on stdout;
+- a **lane-to-machine map** (below) so the release procedure is written against
+  real fleet capability rather than a wish.
+
+`tests/platform_conformance.rs` pins all of it through the script's stub hooks,
+so the contract is enforced on any host — no gtk4, no Darwin, no cargo-xwin
+required.
+
+## Exit contract
+
+Anything other than `0` means **do not roll**.
+
+| Code | Verdict | Meaning |
+|---|---|---|
+| `0` | `pass` | Every in-scope lane reached a green terminal state (`passed`, or `check-only` for the win cross-compile tier). |
+| `1` | `fail` | At least one lane is `failed` or `error`: a real test failure, a non-zero lane exit, a check-only build that did not compile, a `--lane X` forced onto a host whose probe says X is unsupported, or — the load-bearing case — **a lane that ran but executed zero tests** (#645). An unexpected termination (bash abort, signal, #933) is also forced to `1` by the EXIT trap. |
+| `2` | — | **Usage error**: bad invocation (unknown lane, missing argument, unwritable `--summary` path). **No lane ran and no summary file was written.** A release caller must treat a missing summary file exactly like `1`: there is no evidence, so do not roll. |
+| `3` | `coverage-gap` | Every lane that ran is green, but at least one lane was **skipped on a host whose probe says it is capable** (`skipped-capable` — e.g. GTK on Darwin, capable but opt-in). Nothing is known to be broken; the run simply does not cover what it could have. Do not roll on this host's evidence alone: re-run with `--lane <name>` to force it, or point at another machine's summary that covers it. |
+
+The `--summary` destination is validated (and truncated) **before any lane
+runs**, so a bad path costs a second rather than a full `cargo test`. That
+truncation is also why `1` has a shape `2` does not: if the script dies via
+the `on_exit` EXIT trap (#933) *after* the path was validated (the file now
+exists, truncated to empty) but *before* the final JSON is written, the exit
+code is still correctly `1` — do not roll — but the summary path is left
+behind as an **existing, empty, invalid-JSON file**, not "no file at all."
+A parser that only checks "does the file exist" and then reads it must also
+treat empty/unparseable content as `1`, the same as a missing file; a naive
+"file exists ⇒ trust it" parser would mishandle this one shape.
+
+## Machine-readable summary
+
+```bash
+scripts/platform-conformance.sh --summary /tmp/conformance-$(uname -n).json
+scripts/platform-conformance.sh --summary -     # same JSON on stdout, after a marker line
+```
+
+Every run — `--summary` or not — ends with one greppable line:
+
+```
+PLATFORM_CONFORMANCE_SUMMARY schema=1 verdict=coverage-gap exit=3 mode=run host=Darwin lanes=tui:passed,gtk:skipped-capable,macos:passed,win:not-in-scope tests_passed=2837 tests_failed=0
+```
+
+That line alone is enough to gate on: it names all four lanes and their
+statuses, whether or not this host probed them. Split the `lanes=` field on
+commas and each pair on its **first** colon — under `--print-plan` a status is
+itself `plan:run` / `plan:check-only`, so a naive split on every colon
+mis-parses a plan run (which is never a gate result anyway: `verdict=plan`).
+
+`--summary <path>` writes the full document (schema
+`vimcode.platform-conformance/1`):
+
+```json
+{
+  "schema": "vimcode.platform-conformance/1",
+  "generated_at": "2026-09-29T14:24:01Z",
+  "mode": "run",
+  "host": {"uname": "Darwin", "node": "macmini"},
+  "verdict": "coverage-gap",
+  "exit_code": 3,
+  "scope": ["tui", "gtk", "macos", "win"],
+  "forced": [],
+  "totals": {"tests_passed": 2837, "tests_failed": 0, "binaries": 49},
+  "lanes": [
+    {"lane": "tui", "status": "passed", "in_scope": true, "forced": false,
+     "capable": true, "auto_selected": true, "tier": "full",
+     "command": "cargo test --no-default-features",
+     "tests_passed": 2837, "tests_failed": 0, "binaries": 49,
+     "detail": "2837 passed across 49 binaries"},
+    {"lane": "gtk", "status": "skipped-capable", "...": "..."}
+  ]
+}
+```
+
+Fields that did not apply are `null` (a skipped lane has no test counts; an
+unprobed lane has no `capable`), never `0` — a zero test count is a *failure*
+signal in this tool and must not be confused with "did not run".
+
+With `--summary -` the same JSON goes to stdout after the marker line
+`===PLATFORM-CONFORMANCE-JSON===`, so a caller can
+`sed -n '/===PLATFORM-CONFORMANCE-JSON===/,$p' | tail -n +2 | jq .`.
+
+## Lane-to-machine map
+
+**No single fleet host covers all four lanes.** A roll needs the union of at
+least two machines' summaries (three to cover Windows).
+
+| Lane | Machine(s) | Typical status there | Why only that machine |
+|---|---|---|---|
+| `tui` | any (`precision`, `dellserver`, `macmini`, `dell64`) | `passed` | No prereqs — `cargo test --no-default-features`. |
+| `gtk` | `precision` or `dellserver` (Linux) | `passed` | Needs gtk4 dev libs *and* the FreeType rasteriser the pixel probes were baselined against. On `macmini` gtk4 is installed but the lane is `skipped-capable` (exit 3) — see below. |
+| `macos` | `macmini` **only** | `passed` (degraded, see below) | `uname = Darwin`; nothing else in the fleet is a Mac. |
+| `win` | `dell64` **only** | `passed` (full tier, via WSL interop) | Only host that can both cross-compile with `cargo-xwin` and execute the `.exe` on an attached Windows 11 host. Elsewhere: `skipped` (no cargo-xwin) or `check-only` (cargo-xwin, no interop). |
+
+## What the release side calls
+
+The release procedure runs, **on each machine in the map above**:
+
+```bash
+scripts/platform-conformance.sh --summary "/tmp/conformance-$(uname -n).json"
+```
+
+plus, on `macmini` only, a second forced run for the opt-in GTK lane if that
+roll wants Darwin GTK evidence:
+
+```bash
+scripts/platform-conformance.sh --lane gtk --summary "/tmp/conformance-$(uname -n)-gtk.json"
+```
+
+Then it applies these rules to the collected summaries:
+
+1. **Any summary with `exit_code` `1` or `2` ⇒ do not roll.** Exit `2` includes
+   the "summary file missing entirely" case — no evidence is the same as bad
+   evidence.
+2. **Union the lanes across every summary.** Each of `tui`, `gtk`, `macos`,
+   `win` must appear with status `passed` or `check-only` in *at least one*
+   summary. A lane that is only ever `skipped`, `skipped-capable` or
+   `not-in-scope` across the whole fleet is **uncovered** ⇒ do not roll (or
+   roll with that gap recorded deliberately in the release notes; the point is
+   that it is now a decision rather than an oversight).
+3. **`exit_code` `3` on a single host is not automatically fatal** — it means
+   that host left a capable lane uncovered. It is fatal only if rule 2 then
+   finds no other summary covering that lane.
+4. **Archive the summaries with the release artifacts.** "Was the GTK lane
+   green for this build?" must be answerable from a file six months later, not
+   from a terminal scrollback.
+
+> **Outstanding (not in this repo):** nothing in the fleet's release lane
+> (propagate / publish, which lives in the `claude-coordinator` repo) calls the
+> script yet. This document is the contract that change will consume; wiring it
+> up is a separate, operator-coordinated change (#1092 scope explicitly stops
+> at this repo's boundary).
+
 ## Non-goal — read this before reaching for it in CI
 
 **This is not a per-story gate.** It does not run in the per-PR CI jobs and is
@@ -28,7 +170,10 @@ Day-to-day issue work is unaffected; nothing here changes the per-PR
 ```bash
 scripts/platform-conformance.sh                  # probe this host, run every supported lane
 scripts/platform-conformance.sh --lane tui --lane gtk   # force a subset (repeatable)
+scripts/platform-conformance.sh --summary c.json # also write the machine-readable matrix
+scripts/platform-conformance.sh --summary -      # ... to stdout instead
 scripts/platform-conformance.sh --print-plan     # resolve + print the matrix, run nothing
+scripts/platform-conformance.sh --help           # usage + the exit contract
 ```
 
 Forcing a lane the host cannot support (`--lane <name>` whose probe fails) is
@@ -68,11 +213,16 @@ green run there as "the native builds are fine everywhere":
    Pangocairo rasterises via Core Text rather than FreeType, so glyph ink and
    colour compositing differ from the Linux baseline those tests were written
    against. The script therefore reports the `gtk` lane
-   `skipped (opt-in on Darwin...)` by default on a Darwin host. Force it
-   anyway with `--lane gtk` when you specifically want to see those three
-   fail again (e.g. checking whether a Pangocairo bump changed anything) —
-   forcing does **not** fix them, it just runs the lane instead of skipping
-   it.
+   `skipped-capable (opt-in on Darwin...)` by default on a Darwin host — and
+   since #1092 a `skipped-capable` lane makes the whole run **exit `3`
+   (coverage-gap)**, not `0`. That is deliberate: `macmini` *could* have
+   covered GTK and didn't, so its summary alone must not read as a clean
+   bill of health. Force it anyway with `--lane gtk` when you specifically
+   want to see those three fail again (e.g. checking whether a Pangocairo
+   bump changed anything) — forcing does **not** fix them, it just runs the
+   lane instead of skipping it. In the normal release flow the GTK lane's
+   green record comes from `precision`/`dellserver` instead (see the
+   lane-to-machine map above).
 2. **The macOS driver lane passes but is degraded — do not read 4/4 green as
    "the native menu bar works".** Measured on a Darwin host (arm64, gtk4
    4.22.4 present) at `develop`:
@@ -136,14 +286,15 @@ fail the run.
 ## Reading the matrix
 
 ```
-LANE     STATUS         DETAIL
-tui      passed         195 passed across 1 binaries
-gtk      passed         134 passed across 1 binaries
-macos    skipped        host is not Darwin (uname: Linux)
-win      check-only     cargo-xwin present but no WSL interop detected ...; compiled ok; not executed
+LANE     STATUS           DETAIL
+tui      passed           195 passed across 1 binaries
+gtk      passed           134 passed across 1 binaries
+macos    skipped          host is not Darwin (uname: Linux)
+win      check-only       cargo-xwin present but no WSL interop detected ...; compiled ok; not executed
 ```
 
-Four states, each meaning something different:
+Seven states, each meaning something different (the same strings appear in
+the machine-readable summary's `status` field):
 
 - **`passed`** — the lane ran and every test in it passed. The script also
   guards against this being reported when zero tests actually executed (the
@@ -152,9 +303,20 @@ Four states, each meaning something different:
 - **`failed`** — the lane ran and something is wrong: a real test failure, a
   nonzero exit code, or (this is the part worth remembering) **zero tests
   executed**. All three read as `failed`, not `passed` or `skipped`.
-- **`skipped (<reason>)`** — the host's probe says this lane isn't supported
-  here (missing toolchain, wrong OS, or a deliberate policy opt-out like GTK
-  on Darwin). Does not fail the run.
+- **`skipped (<reason>)`** — the host's probe says this lane **isn't supported
+  here** (missing toolchain, wrong OS). Does not fail the run: there is
+  nothing this machine could have covered and didn't.
+- **`skipped-capable (<reason>)`** — the probe says the host **is** capable but
+  the lane was not auto-selected (the deliberate policy opt-out: GTK on
+  Darwin). This is the coverage gap, and it exits `3` — distinct from both a
+  green run and a failure, because nothing is broken but nothing is proven
+  either. Force it with `--lane <name>` to turn it into a real result.
+- **`error`** — a lane forced with `--lane <name>` whose probe says the host
+  cannot support it. Exits `1`: insisting on a lane the machine can't run is a
+  mistake worth failing over, not a silent skip.
+- **`not-in-scope`** — appears in the machine-readable summary only: the run
+  used a forced `--lane` subset and this lane was never probed at all. The
+  release caller's job is to find another machine's summary that covers it.
 - **`check-only`** — win-lane-specific: `cargo-xwin` is on `PATH` so the
   win-feature code was cross-compiled and type-checked, but there was no WSL
   interop to a Windows host to actually execute the result. Real signal
@@ -214,3 +376,9 @@ editing this script should sanity-check unfamiliar bash constructs against
   a test that passes despite an internally-caught error. Also follow-up work.
 - Any GitHub Actions workflow — the operator chose the fleet route; CI wiring
   can reuse the same script later if wanted.
+- **Calling the script from the fleet's release lane** (#1092). This repo now
+  publishes the contract — exit codes, summary schema, lane-to-machine map,
+  and the rules the caller applies — but the propagate/publish lane lives in
+  the `claude-coordinator` repo and still does not invoke it. That wiring is
+  an operator-coordinated change consuming this document, deliberately kept
+  outside this repo's diff.

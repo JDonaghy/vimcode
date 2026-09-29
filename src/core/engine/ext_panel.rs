@@ -1861,17 +1861,15 @@ impl Engine {
     pub fn populate_ext_sidebar_system(&self) {
         use quadraui::{Decoration, StyledText, TreeRow};
 
-        let manifests = self.ext_available_manifests();
-        let q = self.ext_sidebar_query.to_lowercase();
-
-        let installed_rows: Vec<TreeRow> = manifests
+        // #1489: installed/available filtering used to be inlined here a
+        // third time, alongside the identical filter in `ext_installed_items`
+        // / `ext_available_items` (used by `dispatch_ext_sidebar_action_key`)
+        // and a since-deleted dead copy in `render.rs::build_ext_sidebar_data`.
+        // Reuse those two so there is exactly one definition of "installed"
+        // and "matches the search query" left.
+        let installed_rows: Vec<TreeRow> = self
+            .ext_installed_items()
             .iter()
-            .filter(|m| self.extension_state.is_installed(&m.name))
-            .filter(|m| {
-                q.is_empty()
-                    || m.name.to_lowercase().contains(&q)
-                    || m.display_name.to_lowercase().contains(&q)
-            })
             .enumerate()
             .map(|(i, m)| {
                 let display = if m.display_name.is_empty() {
@@ -1898,14 +1896,9 @@ impl Engine {
             })
             .collect();
 
-        let available_rows: Vec<TreeRow> = manifests
+        let available_rows: Vec<TreeRow> = self
+            .ext_available_items()
             .iter()
-            .filter(|m| !self.extension_state.is_installed(&m.name))
-            .filter(|m| {
-                q.is_empty()
-                    || m.name.to_lowercase().contains(&q)
-                    || m.display_name.to_lowercase().contains(&q)
-            })
             .enumerate()
             .map(|(i, m)| {
                 let display = if m.display_name.is_empty() {
@@ -2950,34 +2943,98 @@ impl Engine {
     /// (`ai_send_message_via_curl`, `crate::core::ai`) — kept as a
     /// no-agent-binary escape hatch per #952's "Decide in this slice"
     /// through ACP-7.
+    ///
+    /// #1446: when neither transport is usable — no ACP agent *and* no
+    /// resolvable API key for a provider that needs one — this fails
+    /// synchronously with an actionable message instead of spawning curl,
+    /// which used to surface as a bare "AI error: curl failed:" once the
+    /// doomed request predictably failed. The failure follows the same
+    /// shape as `ai_send_message_via_acp`'s spawn-failure arm: the user's
+    /// turn still lands in the transcript (the panel must not silently
+    /// swallow what was typed) and the explanation lands *in the
+    /// transcript* as an `assistant-thought`, not only on the status line
+    /// a chat user is not looking at.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
-        if text.is_empty() || self.ai_streaming {
+        // #1512: a message submitted while a turn is already in flight is
+        // queued rather than silently dropped — `quadraui::ChatController`
+        // itself swallows an empty `Submit` before it ever reaches this
+        // function (see `try_submit`'s doc), so an empty `text` here can
+        // only come from a call site other than the chat input's own
+        // Enter/Ctrl+S (there is none today) — kept as a no-op, matching
+        // the pre-#1512 behaviour for that case, rather than queuing an
+        // empty message.
+        if self.acp_mut().ai_streaming {
+            if !text.is_empty() {
+                self.ai_queue_message(text);
+            }
+            return;
+        }
+        if text.is_empty() {
             return;
         }
         let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
             || !self.settings.acp_agents.is_empty();
         if acp_configured {
             self.ai_send_message_via_acp(text);
-        } else {
-            self.ai_send_message_via_curl(text);
+            return;
         }
+        // #1446: fail fast with an actionable message when neither transport
+        // is usable, instead of spawning curl and reporting whatever (often
+        // empty) stderr it produces once the request inevitably fails.
+        let provider = self.settings.ai_provider.clone();
+        if crate::core::ai::provider_needs_api_key(&provider)
+            && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
+        {
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "user".to_string(),
+                content: text,
+            });
+            self.message = format!(
+                "AI: no ACP agent configured (acp_agents / acp_agent_command) and no \
+                 API key for provider \"{provider}\""
+            );
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "assistant-thought".to_string(),
+                content: format!(
+                    "\u{26a0} Cannot send: no ACP agent is configured (set `acp_agents` or \
+                     `acp_agent_command`) and no API key is available for provider \
+                     \"{provider}\" (set `ai_api_key`, or the provider's API-key \
+                     environment variable)."
+                ),
+            });
+            return;
+        }
+        self.ai_send_message_via_curl(text);
     }
 
     /// Direct-provider transport: spawns the blocking `curl` background
     /// thread (`crate::core::ai::send_chat`), polled by `poll_ai`.
     fn ai_send_message_via_curl(&mut self, text: String) {
-        self.ai_messages.push(AiMessage {
+        self.acp_mut().ai_messages.push(AiMessage {
             role: "user".to_string(),
             content: text,
         });
-        self.ai_streaming = true;
+        self.ai_dispatch_curl_request();
+    }
+
+    /// Spawn the blocking `curl` background thread off whatever's
+    /// currently in `ai_messages` (`curl_transport_history` filters to
+    /// `"user"`/`"assistant"` turns, dropping ACP-only roles like
+    /// `"user-queued"`/`"assistant-thought"`). Split out from
+    /// `ai_send_message_via_curl` so #1512's queued-message dispatch
+    /// (`Engine::ai_dispatch_queued_message`) can reuse it without
+    /// pushing a second transcript turn for a message that's already
+    /// there — it just flips the existing dimmed `"user-queued"` turn
+    /// back to plain `"user"` first.
+    fn ai_dispatch_curl_request(&mut self) {
+        self.acp_begin_streaming();
 
         let provider = self.settings.ai_provider.clone();
         let api_key = self.settings.ai_api_key.clone();
         let base_url = self.settings.ai_base_url.clone();
         let model = self.settings.ai_model.clone();
-        let messages = curl_transport_history(&self.ai_messages);
+        let messages = curl_transport_history(&self.acp_mut().ai_messages);
         let system = String::new();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2998,24 +3055,100 @@ impl Engine {
     /// (`src/core/engine/acp_ops.rs`), driven off the non-blocking
     /// `AcpClient::poll` — nothing here blocks the tick.
     fn ai_send_message_via_acp(&mut self, text: String) {
-        self.ai_messages.push(AiMessage {
-            role: "user".to_string(),
-            content: text.clone(),
-        });
-        self.ai_streaming = true;
-        self.acp_streaming_turn = None;
+        // #1449/#1450: chip line(s) naming what got attached (if anything)
+        // go on the *displayed* transcript message — the wire content built
+        // below (`acp_prompt_content_blocks`) carries the actual
+        // `resource_link`/`resource` blocks regardless of whether these
+        // chips are shown, so the two never disagree about what was
+        // attached. The range/selection attachment (#1450) is only *read*
+        // here (`.as_ref()`, not `.take()`) — `acp_prompt_content_blocks`
+        // below is what consumes it, since a not-yet-connected session
+        // defers that call to `poll_acp`'s `SessionCreated` handler instead.
+        let mut chip_lines = Vec::new();
+        if let Some((_, chip)) = self.acp_current_buffer_attachment() {
+            chip_lines.push(chip);
+        }
+        if let Some(attachment) = self.acp_pending_attachment.as_ref() {
+            chip_lines.push(attachment.chip(&self.acp_workspace_cwd()));
+        }
+        // #1464: one chip line per manually attached file/image, same
+        // "named on the displayed transcript, regardless of whether the
+        // chip is also shown live in the header" contract as the two
+        // attachments above.
+        for attachment in &self.acp_manual_attachments {
+            chip_lines.push(attachment.chip());
+        }
+        let displayed_text = if chip_lines.is_empty() {
+            text.clone()
+        } else {
+            format!("{}\n{text}", chip_lines.join("\n"))
+        };
 
-        if let Some(client) = self.acp_client.as_mut() {
-            if let Some(session_id) = self.acp_session_id.clone() {
-                client.prompt(
-                    &session_id,
-                    vec![serde_json::json!({"type": "text", "text": text})],
-                );
+        // #1459: on the very first `:AI`/message of the process, and only
+        // then, honour `acp_reopen_last_session` — resume the most recent
+        // recorded session for the about-to-launch agent/workspace instead
+        // of starting empty. `acp_client.is_none()` guards against this
+        // ever firing on a message sent to an agent that's already running
+        // (that's a continuation of a session already chosen, not a fresh
+        // start to redirect). #1459 review: also honours the learned
+        // `loadSession` capability the same way `acp_open_sessions_picker`
+        // does — an agent that has already told us it doesn't support
+        // resume must fall straight through to a fresh session below, not
+        // attempt one that can only fail on the wire.
+        let mut auto_resume_session_id: Option<String> = None;
+        if !self.acp_startup_reopen_attempted {
+            self.acp_startup_reopen_attempted = true;
+            if self.settings.acp_reopen_last_session && self.acp_mut().client.is_none() {
+                let agent_name = self.acp_active_agent_name();
+                if self.acp_session_index.load_session_capability(&agent_name) != Some(false) {
+                    let cwd = self.acp_workspace_cwd();
+                    auto_resume_session_id = self
+                        .acp_session_index
+                        .sessions_for(&agent_name, &cwd)
+                        .into_iter()
+                        .next()
+                        .map(|record| record.session_id);
+                }
+            }
+        }
+
+        if let Some(session_id) = auto_resume_session_id {
+            // #1459 review: pushing the just-typed message immediately
+            // (like the no-resume branch below does) would put it *above*
+            // the replayed history that's about to land after it — the
+            // resumed session's `session/update` notifications append to
+            // whatever is already in `ai_messages`. Reset first (matching
+            // the picker's `acp_resume_session` — a no-op here in practice
+            // since this is the first message of the process, but keeps
+            // the two resume entry points consistent) and hold the display
+            // line back until the resume actually finishes or is abandoned
+            // — see `AcpEvent::SessionLoaded`/`AcpEvent::RequestFailed` in
+            // `acp_ops.rs`, and the `Err(e)` spawn-failure arm below.
+            self.acp_reset_transcript_for_resume();
+            self.acp_pending_resume = Some(session_id);
+            self.acp_mut().pending_prompt_display = Some(displayed_text);
+        } else {
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "user".to_string(),
+                content: displayed_text,
+            });
+        }
+        self.acp_begin_streaming();
+        self.acp_mut().streaming_turn = None;
+
+        if self.acp_mut().client.is_some() {
+            if let Some(session_id) = self.acp_mut().session_id.clone() {
+                let content = self.acp_prompt_content_blocks(&text);
+                if let Some(client) = self.acp_mut().client.as_mut() {
+                    client.prompt(&session_id, content);
+                }
             } else {
                 // The initialize -> session/new handshake from a previous
                 // message is still in flight; `poll_acp`'s `SessionCreated`
-                // handler sends this the moment the session id lands.
-                self.acp_pending_prompt = Some(text);
+                // handler sends this the moment the session id lands,
+                // rebuilding the content blocks fresh at that point (see
+                // its doc for why that's the correct order).
+                self.acp_mut().pending_prompt = Some(text);
             }
             return;
         }
@@ -3026,25 +3159,184 @@ impl Engine {
         let (argv, cwd, env, agent_label) = self.acp_resolve_agent_launch();
         let env_refs: Vec<(&str, &str)> =
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        // #1463: label this tab with the agent's registry *name* (e.g.
+        // "claude"), not `agent_label` (the raw command string, used below
+        // only for the spawn-failure message) — that's what the session
+        // tab strip and `:AiNext`/`:AiPrev`'s status line show.
+        self.acp_mut().label = self.acp_active_agent_name();
         match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
             Ok(mut client) => {
-                client.initialize();
-                self.acp_client = Some(client);
-                self.acp_pending_prompt = Some(text);
+                client.initialize(self.settings.acp_terminal_enabled);
+                self.acp_mut().client = Some(client);
+                self.acp_mut().pending_prompt = Some(text);
             }
             Err(e) => {
                 // Acceptance (#952): agent binary missing from PATH must be
                 // a clear, actionable panel message, not a crash or a
                 // silently empty panel — so this lands in the transcript
                 // itself, not just the status line.
-                self.ai_streaming = false;
+                self.acp_mut().ai_streaming = false;
+                // #1459: the auto-resume path deferred showing the user's
+                // typed message until the resume finished — it never will
+                // now (there's no client to finish it), so show it here
+                // instead of silently dropping it.
+                self.acp_pending_resume = None;
+                if let Some(display) = self.acp_mut().pending_prompt_display.take() {
+                    self.acp_mut().ai_messages.push(AiMessage {
+                        role: "user".to_string(),
+                        content: display,
+                    });
+                }
                 self.message = format!("ACP agent failed to start: {e}");
-                self.ai_messages.push(AiMessage {
+                self.acp_mut().ai_messages.push(AiMessage {
                     role: "assistant-thought".to_string(),
                     content: format!("\u{26a0} Could not start ACP agent \"{agent_label}\": {e}"),
                 });
             }
         }
+    }
+
+    // ── #1512: queue a message typed while the agent is busy ────────────
+
+    /// Called from `ai_send_message` when a turn is already in flight
+    /// (`ai_streaming`) instead of the pre-#1512 silent no-op. Only one
+    /// message can be queued at a time — a second call while one is
+    /// already queued *replaces* its content in place (same dimmed
+    /// transcript turn, new text) rather than stacking a second one, so
+    /// the status strip's "queued (1)" segment (`render::
+    /// populate_ai_chat_controller`) never has to count higher than one.
+    fn ai_queue_message(&mut self, text: String) {
+        if let Some(idx) = self.acp_mut().queued_prompt_idx {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.content = text.clone();
+            }
+        } else {
+            // #1512: rendered dimmed (`render::populate_ai_chat_controller`'s
+            // `"user-queued"` arm) and prefixed `"(queued) "` on the
+            // painted text itself, not just a colour — a colour alone
+            // isn't something a black-box test (or a low-color terminal)
+            // can reliably read back, unlike a literal substring.
+            let idx = self.acp_mut().ai_messages.len();
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "user-queued".to_string(),
+                content: text.clone(),
+            });
+            self.acp_mut().queued_prompt_idx = Some(idx);
+        }
+        self.acp_mut().queued_prompt = Some(text);
+        self.message = "Queued (1) \u{2014} sends automatically once the \
+                         current turn finishes (Ctrl+G to send now, Ctrl+R to discard)."
+            .to_string();
+    }
+
+    /// Drop whatever's queued without sending it (Ctrl+R,
+    /// `dispatch_ai_chat_event` — the busy-panel analogue of that same key's
+    /// existing "drop the most-recently-staged attachment" behaviour,
+    /// falling through to this once neither attachment kind is staged).
+    /// Returns `false` (and does nothing) if nothing was queued, so the
+    /// caller can chain further Ctrl+R fallbacks / know whether to show a
+    /// message.
+    ///
+    /// The dimmed transcript turn is left in place rather than removed —
+    /// this panel's transcript is append-only everywhere else (e.g.
+    /// `acp_cancel_turn`'s `"[cancelled by user]"` notice never removes
+    /// the turn it's about either), and removing it would shift every
+    /// `ai_messages` index recorded after it (`tool_call_anchor`,
+    /// `thought_expanded`, `markdown_turn_cache`) out from under whatever
+    /// they name. Relabelled `"(discarded)"` instead so the history stays
+    /// honest about what happened without needing index surgery.
+    pub(crate) fn ai_discard_queued_message(&mut self) -> bool {
+        if self.acp_mut().queued_prompt.take().is_none() {
+            return false;
+        }
+        if let Some(idx) = self.acp_mut().queued_prompt_idx.take() {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.content = format!("{} (discarded)", m.content);
+            }
+        }
+        true
+    }
+
+    /// Send whatever's queued right now instead of waiting for the
+    /// in-flight turn to reach `PromptStopped` on its own (Ctrl+G,
+    /// `dispatch_ai_chat_event`) — cancels the current turn
+    /// (`acp_cancel_turn`, the same "[cancelled by user]" path `Ctrl+C`
+    /// uses while streaming) and immediately dispatches the queued
+    /// message. A no-op if nothing is queued.
+    pub(crate) fn ai_send_queued_now(&mut self) {
+        if self.acp_mut().queued_prompt.is_none() {
+            return;
+        }
+        self.acp_cancel_turn();
+        self.ai_dispatch_queued_message();
+    }
+
+    /// Actually send whatever's queued (`AcpSession::queued_prompt`) — the
+    /// shared tail both `Engine::ai_send_queued_now` ("send now") and the
+    /// natural `AcpEvent::PromptStopped`/curl-completion paths
+    /// (`poll_acp`/`poll_ai`) call once a turn genuinely ends. Flips the
+    /// dimmed `"user-queued"` transcript turn back to a plain `"user"`
+    /// one (it's already showing the right text; no second push) and then
+    /// dispatches it over whichever transport is currently configured —
+    /// deliberately re-read from `self.settings` here rather than
+    /// remembered from queue time, since a setting could plausibly change
+    /// while the previous turn was still running. A no-op if nothing is
+    /// queued.
+    pub(crate) fn ai_dispatch_queued_message(&mut self) {
+        let Some(text) = self.acp_mut().queued_prompt.take() else {
+            return;
+        };
+        if let Some(idx) = self.acp_mut().queued_prompt_idx.take() {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.role = "user".to_string();
+            }
+        }
+        let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
+            || !self.settings.acp_agents.is_empty();
+        if acp_configured && self.acp_mut().client.is_some() {
+            self.acp_begin_streaming();
+            self.acp_mut().streaming_turn = None;
+            if let Some(session_id) = self.acp_mut().session_id.clone() {
+                let content = self.acp_prompt_content_blocks(&text);
+                if let Some(client) = self.acp_mut().client.as_mut() {
+                    client.prompt(&session_id, content);
+                }
+            } else {
+                // The handshake somehow isn't finished yet (shouldn't
+                // normally happen — queuing only ever starts once
+                // `ai_streaming` was already `true`, which implies a
+                // session already existed) — fall back to the handshake
+                // mechanism (`AcpEvent::SessionCreated`/`SessionLoaded`)
+                // rather than losing the message.
+                self.acp_mut().pending_prompt = Some(text);
+            }
+            return;
+        }
+        // #1446: same fail-fast shape as `ai_send_message`'s no-transport
+        // branch — a queued message that can no longer be sent (agent
+        // process died, or no API key) must say so, not just silently
+        // vanish now that its dimmed turn has already flipped to plain
+        // "user".
+        let provider = self.settings.ai_provider.clone();
+        if crate::core::ai::provider_needs_api_key(&provider)
+            && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
+        {
+            self.message = format!(
+                "AI: no ACP agent configured (acp_agents / acp_agent_command) and no \
+                 API key for provider \"{provider}\""
+            );
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "assistant-thought".to_string(),
+                content: format!(
+                    "\u{26a0} Cannot send queued message: no ACP agent is configured \
+                     (set `acp_agents` or `acp_agent_command`) and no API key is \
+                     available for provider \"{provider}\" (set `ai_api_key`, or the \
+                     provider's API-key environment variable)."
+                ),
+            });
+            return;
+        }
+        self.ai_dispatch_curl_request();
     }
 
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
@@ -3058,10 +3350,10 @@ impl Engine {
             return false;
         };
         self.ai_rx = None;
-        self.ai_streaming = false;
+        self.acp_mut().ai_streaming = false;
         match res {
             Ok(reply) => {
-                self.ai_messages.push(AiMessage {
+                self.acp_mut().ai_messages.push(AiMessage {
                     role: "assistant".to_string(),
                     content: reply,
                 });
@@ -3070,6 +3362,9 @@ impl Engine {
                 self.message = format!("AI error: {e}");
             }
         }
+        // #1512: the curl transport's analogue of `AcpEvent::PromptStopped`
+        // — send whatever queued up while this request was in flight.
+        self.ai_dispatch_queued_message();
         true
     }
 
@@ -3086,7 +3381,7 @@ impl Engine {
         // before the client (and its stdin) goes away below — the agent is
         // still alive at this point, only about to be killed.
         self.acp_cancel_pending_permission();
-        self.acp_remembered_decisions.clear();
+        self.acp_mut().remembered_decisions.clear();
         // #957 (ACP-6): the auth-choice dialog holds no reply to send (unlike
         // `acp_pending_permission`, it isn't a parked agent request — see
         // `"acp_auth_choice"`'s `process_dialog_result` arm), so it just
@@ -3100,33 +3395,95 @@ impl Engine {
         {
             self.dialog = None;
         }
-        self.ai_messages.clear();
+        self.acp_mut().ai_messages.clear();
+        // #1510: drop cached markdown renders alongside the transcript they
+        // describe — otherwise the next conversation's messages could land
+        // at the same indices and (if a coincidentally equal content length
+        // ever occurred) read a stale render meant for different text.
+        self.acp_mut().markdown_turn_cache.get_mut().clear();
         self.ai_rx = None;
-        self.ai_streaming = false;
-        self.acp_client = None;
-        self.acp_session_id = None;
-        self.acp_pending_prompt = None;
-        self.acp_streaming_turn = None;
+        self.acp_mut().ai_streaming = false;
+        self.acp_mut().client = None;
+        self.acp_mut().session_id = None;
+        self.acp_mut().pending_prompt = None;
+        // #1459: an unconsumed resume request (`:AiSessions` picked a
+        // session, then the user ran `:AiClear` before the handshake
+        // finished) must not resurface on whatever session starts next —
+        // same for its deferred display line, if the auto-resume path had
+        // queued one.
+        self.acp_pending_resume = None;
+        self.acp_mut().pending_prompt_display = None;
+        // #1512: a queued message belongs to the conversation being
+        // cleared — nothing left to send it to, or to un-dim once this
+        // clear wipes the transcript it was queued into.
+        self.acp_mut().queued_prompt = None;
+        self.acp_mut().queued_prompt_idx = None;
+        self.acp_mut().streaming_turn = None;
         // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
         // clearing the conversation ends the session, so none of it should
         // survive into whatever session starts next (same reasoning as
         // `acp_remembered_decisions.clear()` above).
-        self.acp_plan.clear();
-        self.acp_available_commands.clear();
-        self.acp_command_completion_idx = 0;
-        self.acp_modes.clear();
-        self.acp_current_mode_id = None;
-        self.acp_usage = None;
+        self.acp_mut().plan.clear();
+        self.acp_mut().available_commands.clear();
+        self.acp_mut().command_completion_idx = 0;
+        self.acp_mut().modes.clear();
+        self.acp_mut().current_mode_id = None;
+        self.acp_mut().usage = None;
         // #957 (ACP-6): session-scoped, same as the rest above.
-        self.acp_auth_methods.clear();
-        self.acp_authenticated = false;
+        self.acp_mut().auth_methods.clear();
+        self.acp_mut().authenticated = false;
+        // #1449: `promptCapabilities` came off the same `initialize`
+        // response as `authMethods` — reset alongside it.
+        self.acp_mut().prompt_capabilities = crate::core::acp::AcpPromptCapabilities::default();
+        // #1487: same reasoning — `mcpCapabilities` came off that same
+        // response, and the MCP servers the (now-ending) session started
+        // with no longer apply to whatever session starts next.
+        self.acp_mut().mcp_capabilities = crate::core::acp::AcpMcpCapabilities::default();
+        self.acp_mut().active_mcp_servers.clear();
+        // #1450: a staged Visual-selection/`:{range}AI` attachment is
+        // composed content the user hasn't sent yet — clearing the
+        // conversation drops it too, same as clearing the typed-but-
+        // unsubmitted input would (the input itself is `ChatController`'s
+        // own state, untouched here, matching this function's existing
+        // scope).
+        self.acp_pending_attachment = None;
+        // #1464: manually attached files/images are composed content too,
+        // same reasoning as `acp_pending_attachment` immediately above.
+        self.acp_manual_attachments.clear();
+        // #1513: staged `@symbol` mentions are composed content too, same
+        // reasoning.
+        self.acp_pending_symbol_mentions.clear();
         // #955 (ACP-4): tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
         // ends it" reasoning as everything else in this block).
-        self.acp_tool_calls.clear();
+        self.acp_mut().tool_calls.clear();
+        // #1511: the tool-call/thought expand state and the anchor/kind
+        // maps `populate_ai_chat_controller` builds them from are all
+        // session-scoped too, same reasoning as `tool_calls` just above —
+        // otherwise a fresh conversation's tool calls could reuse an id or
+        // index a previous one left expanded.
+        self.acp_mut().tool_call_anchor.clear();
+        self.acp_mut().tool_call_expanded.clear();
+        self.acp_mut().thought_expanded.clear();
+        self.acp_mut().transcript_turn_kinds.get_mut().clear();
         self.change_review = None;
+        // #1460: the per-turn tracking + checkpoint history are session-
+        // scoped too, same reasoning as `acp_tool_calls`/`change_review`
+        // just above — clearing the conversation ends any restore point a
+        // later `:AiRestore` could have picked from it.
+        self.acp_current_turn_entries.clear();
+        self.acp_turn_checkpoints.clear();
+        self.turn_review_checkpoint_id = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
+        // #1463: clearing the tab's transcript must also clear its label,
+        // or `AcpSession::is_blank` would keep reporting this tab as
+        // "used" forever — `:AiClose`-ing the last remaining tab (which
+        // resets it via this same function, see `Engine::
+        // acp_close_session`'s doc) needs `is_blank` to flip back to
+        // `true` so a later `:AiNew` reuses it instead of piling up a
+        // second tab next to a supposedly-empty one.
+        self.acp_mut().label = String::new();
         self.message = "AI conversation cleared.".to_string();
     }
 
@@ -3142,7 +3499,7 @@ impl Engine {
     /// existing completion machinery" guidance; there is no bespoke widget
     /// here, only a different feeder for one that already exists.
     pub fn ai_command_completions(&self) -> Option<crate::render::CompletionMenu> {
-        if self.acp_available_commands.is_empty() {
+        if self.acp().available_commands.is_empty() {
             return None;
         }
         let input = self.ai_chat.borrow().input_text().to_string();
@@ -3152,7 +3509,8 @@ impl Engine {
         }
         let prefix_lower = prefix.to_lowercase();
         let mut candidates: Vec<String> = self
-            .acp_available_commands
+            .acp()
+            .available_commands
             .iter()
             .filter(|c| c.name.to_lowercase().starts_with(&prefix_lower))
             .map(|c| format!("/{}", c.name))
@@ -3166,7 +3524,7 @@ impl Engine {
             .map(|c| c.chars().count())
             .max()
             .unwrap_or(0);
-        let selected_idx = self.acp_command_completion_idx.min(candidates.len() - 1);
+        let selected_idx = self.acp().command_completion_idx.min(candidates.len() - 1);
         Some(crate::render::CompletionMenu {
             candidates,
             selected_idx,
@@ -3181,7 +3539,7 @@ impl Engine {
         let Some(menu) = self.ai_command_completions() else {
             return false;
         };
-        self.acp_command_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        self.acp_mut().command_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
         true
     }
 
@@ -3203,6 +3561,351 @@ impl Engine {
         true
     }
 
+    /// `@`-mention completions for the AI panel input (#1449): open
+    /// buffers first, then workspace files, filtered by whatever's typed
+    /// after the `@` in the trailing word currently under construction
+    /// (see [`crate::core::acp::trailing_at_mention_query`] for why it's
+    /// the *trailing* word rather than the *whole* input, unlike the
+    /// slash-command case above). `None` — never an empty popup — when the
+    /// trailing word isn't a `@mention` in progress, or nothing matches.
+    /// Reuses `render::CompletionMenu`, same shape/widget as
+    /// [`Self::ai_command_completions`] — there is no second popup here,
+    /// only a different feeder.
+    pub fn ai_mention_completions(&self) -> Option<crate::render::CompletionMenu> {
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let (_, query) = crate::core::acp::trailing_at_mention_query(&input)?;
+        let query_lower = query.to_lowercase();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Open buffers first (#1449's ordering requirement).
+        let mut buffer_matches: Vec<String> = self
+            .buffer_manager
+            .iter()
+            .filter_map(|(_, state)| {
+                let path = state.file_path.as_ref()?;
+                let rel = path.strip_prefix(&self.cwd).unwrap_or(path);
+                Some(rel.to_string_lossy().into_owned())
+            })
+            .filter(|display| display.to_lowercase().contains(&query_lower))
+            .filter(|display| seen.insert(display.clone()))
+            .collect();
+        buffer_matches.sort();
+
+        // Then workspace files — same ignore-aware walk
+        // `picker_populate_files` uses, capped so a huge repo can't make
+        // every keystroke slow.
+        const MAX_CANDIDATES: usize = 20;
+        const MAX_SCANNED: usize = 5000;
+        let mut file_matches: Vec<String> = Vec::new();
+        if buffer_matches.len() < MAX_CANDIDATES {
+            let show_hidden = self.settings.show_hidden_files;
+            // #1545: same `explorer_exclude` pruning `picker_populate_files`
+            // applies — with dotfiles shown by default the walk would burn
+            // its `MAX_SCANNED` budget inside `.git/` and surface object
+            // files as `@file` completions.
+            let exclude = self.settings.explorer_exclude.clone();
+            let walker = ignore::WalkBuilder::new(&self.cwd)
+                .hidden(!show_hidden)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .filter_entry(move |entry| {
+                    !super::explorer_ops::walk_entry_is_excluded(entry, &exclude)
+                })
+                .build();
+            for (scanned, entry) in walker.enumerate() {
+                if file_matches.len() + buffer_matches.len() >= MAX_CANDIDATES
+                    || scanned >= MAX_SCANNED
+                {
+                    break;
+                }
+                let Ok(entry) = entry else { continue };
+                // #1513: `@dir` mentions — a directory entry is a candidate
+                // too, not just files, marked with a trailing `/` so it's
+                // unambiguous at accept/send time (`acp_mention_content_
+                // blocks` branches on exactly that suffix). Depth 0 is the
+                // walk root itself (`self.cwd`) — never offered as `@.` /
+                // `@` (empty relative path).
+                let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
+                let is_file = entry.file_type().map(|f| f.is_file()).unwrap_or(false);
+                if !(is_file || (is_dir && entry.depth() > 0)) {
+                    continue;
+                }
+                let Ok(rel) = entry.path().strip_prefix(&self.cwd) else {
+                    continue;
+                };
+                let mut display = rel.to_string_lossy().into_owned();
+                if is_dir {
+                    display.push('/');
+                }
+                if display.to_lowercase().contains(&query_lower) && seen.insert(display.clone()) {
+                    file_matches.push(display);
+                }
+            }
+            file_matches.sort();
+        }
+
+        // #1513: `@symbol` candidates — from `self.ai_mention_symbol_cache`
+        // (last `workspace/symbol` response `Engine::ai_mention_tick`
+        // fetched for this query; see that method's doc for why the
+        // request itself can't happen from this `&self` method). Formatted
+        // `@path#Name` — unambiguous at both accept time (`ai_mention_
+        // accept_selected` branches on the `#`) and send time
+        // (`Engine::acp_mention_content_blocks` skips any mention
+        // containing `#`, since the range only exists in `ai_mention_
+        // symbol_cache`, not in anything re-derivable from the text
+        // alone). Appended after files/dirs, same ordering rationale
+        // (buffers, then files, then the broader/fuzzier symbol search).
+        let mut symbol_matches: Vec<String> = Vec::new();
+        let workspace_cwd = self.acp_workspace_cwd();
+        for sym in &self.ai_mention_symbol_cache {
+            if symbol_matches.len() + file_matches.len() + buffer_matches.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if !sym.name.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+            let Some(path) = sym.path.as_ref() else {
+                continue;
+            };
+            let display = crate::core::acp::workspace_relative_display(path, &workspace_cwd);
+            let candidate = format!("{display}#{}", sym.name);
+            if seen.insert(candidate.clone()) {
+                symbol_matches.push(candidate);
+            }
+        }
+
+        let candidates: Vec<String> = buffer_matches
+            .into_iter()
+            .chain(file_matches)
+            .take(MAX_CANDIDATES)
+            .map(|display| format!("@{display}"))
+            .chain(
+                symbol_matches
+                    .into_iter()
+                    .map(|display| format!("@{display}")),
+            )
+            .take(MAX_CANDIDATES)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let max_width = candidates
+            .iter()
+            .map(|c| c.chars().count())
+            .max()
+            .unwrap_or(0);
+        let selected_idx = self.acp().mention_completion_idx.min(candidates.len() - 1);
+        Some(crate::render::CompletionMenu {
+            candidates,
+            selected_idx,
+            max_width,
+        })
+    }
+
+    /// Advance the `@`-mention completion selection to the next candidate
+    /// (wrapping), if the popup is currently showing. Returns `false` (a
+    /// no-op) when [`Self::ai_mention_completions`] is `None`.
+    pub fn ai_mention_completion_cycle(&mut self) -> bool {
+        let Some(menu) = self.ai_mention_completions() else {
+            return false;
+        };
+        self.acp_mut().mention_completion_idx = (menu.selected_idx + 1) % menu.candidates.len();
+        true
+    }
+
+    /// Accept the currently-selected `@`-mention completion: splice
+    /// `"@path "` (trailing space) in place of the `@`-word currently under
+    /// construction, leaving the rest of the input untouched. Returns
+    /// `false` (a no-op) when [`Self::ai_mention_completions`] is `None`.
+    pub fn ai_mention_accept_selected(&mut self) -> bool {
+        let Some(menu) = self.ai_mention_completions() else {
+            return false;
+        };
+        let chosen = menu.candidates[menu.selected_idx].clone();
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let Some((start, _)) = crate::core::acp::trailing_at_mention_query(&input) else {
+            return false;
+        };
+        self.acp_mut().mention_completion_idx = 0;
+        // #1513: a `@symbol` candidate (`@path#Name`, see `ai_mention_
+        // completions`' doc for the format) stages an `AcpSymbolMention`
+        // right now, while `ai_mention_symbol_cache` still has the entry
+        // it was built from — `acp_mention_content_blocks` (send time)
+        // deliberately can't re-derive a line number from the literal text
+        // alone, so this is the one moment the range is actually known.
+        if let Some(rest) = chosen.strip_prefix('@') {
+            if let Some((path_display, name)) = rest.split_once('#') {
+                if let Some(sym) = self
+                    .ai_mention_symbol_cache
+                    .iter()
+                    .find(|s| s.name == name)
+                    .cloned()
+                {
+                    // `sym.path` is always `Some` for a `workspace/symbol`
+                    // response (`parse_symbol_information` requires
+                    // `location.uri`) — the `self.cwd`-joined fallback below
+                    // only matters if that ever changes.
+                    let path = sym
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| self.cwd.join(path_display));
+                    self.acp_pending_symbol_mentions
+                        .push(crate::core::acp::AcpSymbolMention {
+                            path,
+                            name: sym.name.clone(),
+                            line: sym.line,
+                            detail: sym.detail.clone(),
+                        });
+                }
+            }
+        }
+        let mut new_input = input[..start].to_string();
+        new_input.push_str(&chosen);
+        new_input.push(' ');
+        let mut chat = self.ai_chat.borrow_mut();
+        chat.clear_input();
+        chat.input_insert_str(&new_input);
+        true
+    }
+
+    /// Keep `ai_mention_symbol_cache` fresh for `@symbol` completion
+    /// (#1513) — called once per frame from `poll_idle`, mirroring `tick_
+    /// ai_completion`'s "debounce counter checked every tick" shape but
+    /// simpler: no counter, just "did the trailing `@`-mention query
+    /// change since the last fetch". `ai_mention_completions` is `&self`
+    /// (read-only, called from the paint path) and can't itself fire an
+    /// LSP request, which is why this exists as a separate `&mut self`
+    /// step instead of living inside that method.
+    ///
+    /// A no-op whenever: the AI panel doesn't have keyboard focus; the
+    /// trailing word isn't a `@`-mention in progress; the query is shorter
+    /// than 2 chars (same floor the Command Center's `#`-prefixed
+    /// workspace-symbol picker mode uses — a 1-char workspace-wide symbol
+    /// query is rarely useful and every keystroke would refire); the query
+    /// contains `/` (almost certainly a file/dir mention, not a symbol
+    /// name — skips a pointless LSP round trip on every path the user
+    /// types); or the query hasn't changed since the last fetch already
+    /// covering it.
+    pub fn ai_mention_tick(&mut self) {
+        if !self.ai_has_focus {
+            return;
+        }
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let Some((_, query)) = crate::core::acp::trailing_at_mention_query(&input) else {
+            self.ai_mention_symbol_query.clear();
+            return;
+        };
+        if query.len() < 2 || query.contains('/') {
+            return;
+        }
+        if query == self.ai_mention_symbol_query || self.lsp_pending_ai_mention_symbols.is_some() {
+            return;
+        }
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let Some(path) = self.active_buffer_path() else {
+            return;
+        };
+        let query = query.to_string();
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_workspace_symbols(&path, &query) {
+                self.lsp_pending_ai_mention_symbols = Some(id);
+                self.ai_mention_symbol_query = query;
+            }
+        }
+    }
+
+    /// Intercept a plain, unmodified character key that might be starting,
+    /// continuing, or completing the `<leader>ai` focus-toggle gesture
+    /// (#1507) — checked by `render::route_ai_chat_event` *before* the key
+    /// reaches `ChatController::handle`'s ordinary text-insertion path,
+    /// exactly like that function's existing slash-command/`@`-mention Tab
+    /// and Enter intercepts above it.
+    ///
+    /// Only engages while `self.ai_chat`'s input buffer is empty — the same
+    /// convention Vim's own `<leader>` sequences follow by only ever being
+    /// read from Normal mode's "nothing pending" state — chosen specifically
+    /// so this gesture can never eat characters out of a message the user is
+    /// actually composing: the moment the buffer holds anything, this
+    /// returns `false` unconditionally and every key goes back to being
+    /// ordinary typed text.
+    ///
+    /// A separate small buffer ([`Engine::ai_leader_toggle_pending`]) tracks
+    /// the match rather than reusing the Normal-mode leader machinery
+    /// (`Engine::leader_partial`/`Engine::handle_leader_key`): that machinery
+    /// runs from `Engine::handle_key`'s own dispatch ladder, which
+    /// `render::route_focus_key` never reaches while `ai_has_focus` is set —
+    /// every keystroke goes straight to this panel instead (see
+    /// `render::route_focus_key`'s doc). There is no path left for the
+    /// existing "ai" arm in `Engine::handle_leader_key` to fire a *second*
+    /// time once the panel already has focus, which is exactly the gap
+    /// #1507 reports.
+    ///
+    /// Returns `true` when the key was consumed as part of the gesture
+    /// (still matching, or matched in full — either way the caller must not
+    /// also feed it to `ChatController::handle`). Returns `false` when the
+    /// key breaks a match: any previously-buffered prefix is first replayed
+    /// into the input verbatim (via `ChatController::input_insert_str`) so
+    /// nothing typed is silently dropped, then the caller is free to run the
+    /// *current* key through the normal path itself.
+    pub fn ai_leader_toggle_key(&mut self, ch: char) -> bool {
+        if !self.ai_chat.borrow().input_text().is_empty() {
+            self.ai_leader_toggle_pending.clear();
+            return false;
+        }
+        let pending = std::mem::take(&mut self.ai_leader_toggle_pending);
+        let expected = match pending.chars().count() {
+            0 => self.settings.leader,
+            1 => 'a',
+            _ => 'i',
+        };
+        if ch != expected {
+            if !pending.is_empty() {
+                self.ai_chat.borrow_mut().input_insert_str(&pending);
+            }
+            return false;
+        }
+        let mut matched = pending;
+        matched.push(ch);
+        if matched.chars().count() >= 3 {
+            // Full `<leader>ai` match: toggle focus back to the editor,
+            // mirroring `dispatch_ai_chat_event`'s `Cancelled` (Escape) arm.
+            self.ai_has_focus = false;
+        } else {
+            self.ai_leader_toggle_pending = matched;
+        }
+        true
+    }
+
+    /// Replay any in-flight `<leader>ai` partial match back into the input
+    /// verbatim and clear the buffer (#1507 review).
+    ///
+    /// `ai_leader_toggle_key` only ever sees a plain, unmodified
+    /// [`quadraui::Key::Char`] — `render::route_ai_chat_event` calls this
+    /// instead for every key that function can never see at all (a modified
+    /// `Char`, or any `Named` key such as Enter/Tab/Backspace/arrows), so a
+    /// partial match doesn't silently vanish just because the *interrupting*
+    /// key happens to arrive on a path `ai_leader_toggle_key` was never
+    /// wired to intercept. Mirrors the replay `ai_leader_toggle_key` itself
+    /// already does on an ordinary same-shape mismatch (e.g. typing `<leader>x`
+    /// after `<leader>a`) — this just extends that same "never silently drop
+    /// buffered keystrokes" guarantee to keys outside its own dispatch.
+    ///
+    /// Callers must not use this for `Escape`: that key is about to fire
+    /// `ChatControllerEvent::Cancelled` and leave the panel, so the buffer
+    /// should be discarded (`ai_leader_toggle_pending.clear()`) rather than
+    /// replayed into an input the user is walking away from — see
+    /// `dispatch_ai_chat_event`'s `Cancelled` arm, which does exactly that.
+    pub fn ai_leader_toggle_flush(&mut self) {
+        let pending = std::mem::take(&mut self.ai_leader_toggle_pending);
+        if !pending.is_empty() {
+            self.ai_chat.borrow_mut().input_insert_str(&pending);
+        }
+    }
+
     /// Apply a [`quadraui::ChatControllerEvent`] the AI panel's `ChatController`
     /// (`self.ai_chat`) returned from `handle()`. Shared by GTK and TUI via
     /// `render::route_ai_chat_event` (#819 — the ChatController adoption that
@@ -3222,7 +3925,29 @@ impl Engine {
             }
             Ev::Cancelled => {
                 self.ai_has_focus = false;
+                // #1507 review: an abandoned `<leader>ai` partial match must
+                // not survive a focus-losing Escape — replaying it here
+                // would inject stray text into an input the user is walking
+                // away from, and leaving it buffered would let it resurface
+                // and wrongly complete against an unrelated future message
+                // once the panel regains focus (unlike `ai_leader_toggle_flush`,
+                // which is for keys that *don't* end the session).
+                self.ai_leader_toggle_pending.clear();
                 false
+            }
+            // #1509 (quadraui#1137): the clickable Send/Stop segment reads
+            // "Stop" while `ChatController::set_busy(true)` — i.e. exactly
+            // while `engine.acp().ai_streaming` — and clicking it there
+            // emits this event instead of touching the input buffer.
+            // Routes to the identical `session/cancel` path as `Ctrl+C`
+            // below rather than a full `ai_clear`: a mouse "Stop" click is
+            // the same "abort the running turn, keep the conversation"
+            // gesture, just via click instead of keyboard.
+            // `acp_cancel_turn` is a documented no-op with no session in
+            // flight, so no extra guard is needed here.
+            Ev::StopRequested => {
+                self.acp_cancel_turn();
+                true
             }
             // Ctrl+C: clear the conversation. `ChatController` has no
             // built-in binding for it (only Escape/Ctrl+S/Alt+Enter/
@@ -3237,14 +3962,189 @@ impl Engine {
             // conversation history the way a full `ai_clear` would. Idle
             // (not streaming) keeps the existing full-clear behaviour.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('c')" => {
-                if self.acp_client.is_some() && self.ai_streaming {
+                if self.acp_mut().client.is_some() && self.acp_mut().ai_streaming {
                     self.acp_cancel_turn();
                 } else {
                     self.ai_clear();
                 }
                 true
             }
+            // #1450 point 4 / #1464 / #1512: Ctrl+R drops the most-
+            // recently-staged "about to send" thing without sending it —
+            // "let the user remove it before sending". Checks the
+            // Visual-selection/`:{range}AI` range attachment first
+            // (unchanged #1450 behaviour), then falls through to popping
+            // the last manually attached file/image (#1464) once that's
+            // empty, then finally a message already queued while the
+            // agent was busy (#1512, `ai_discard_queued_message`) — one
+            // key, most-recent-first, across all three. Same escape-hatch
+            // shape as Ctrl+C above: `ChatController` doesn't bind Ctrl+R
+            // internally, so it reaches here as a plain `KeyPressed`. A
+            // no-op (still consumes the key) when nothing is staged at
+            // all.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('r')" => {
+                if self.acp_pending_attachment.take().is_some() {
+                    self.message = "Attachment removed.".to_string();
+                } else if let Some(removed) = self.acp_manual_attachments.pop() {
+                    self.message = format!("Removed {}.", removed.chip());
+                } else if self.ai_discard_queued_message() {
+                    self.message = "Queued message discarded.".to_string();
+                }
+                true
+            }
+            // #1512: Ctrl+G ("go now") — cancel the in-flight turn and
+            // immediately dispatch whatever's queued instead of waiting
+            // for it to be sent automatically once the turn reaches
+            // `PromptStopped` on its own. `ChatController` doesn't bind
+            // Ctrl+G internally (unlike Enter/Ctrl+S/Ctrl+Enter, all of
+            // which fully consume "submit" — including on an *empty*
+            // input, where `try_submit` returns `Ignored` before this
+            // function is ever called — which is why "send now" can't
+            // reuse the ordinary submit chord), so it reaches here as a
+            // plain `KeyPressed`, same as Ctrl+C/Ctrl+R above. A no-op
+            // (still consumes the key) when nothing is queued.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('g')" => {
+                self.ai_send_queued_now();
+                true
+            }
+            // #1511: a click landed on transcript turn `turn_idx`, row
+            // `row_in_turn` into it (`quadraui::ChatController`'s own doc:
+            // row 0 is always the role-header row). See
+            // `Self::ai_chat_turn_clicked` for what each turn kind does
+            // with it — a tool-call card's header toggles it, a click
+            // inside its expanded body jumps to its first location, a
+            // thought card toggles on any row (it's a single summary row
+            // while collapsed).
+            Ev::TurnClicked {
+                turn_idx,
+                row_in_turn,
+            } => {
+                self.ai_chat_turn_clicked(turn_idx, row_in_turn);
+                true
+            }
             _ => true,
+        }
+    }
+
+    /// Apply a [`quadraui::ChatControllerEvent::TurnClicked`] (#1511): a
+    /// click or the equivalent focused-turn `Enter` (see
+    /// `render::route_ai_chat_event`'s Enter intercept, which resolves the
+    /// same way this does before calling this method) landed on transcript
+    /// turn `turn_idx`. Resolves `turn_idx` back to what it actually is via
+    /// `AcpSession::transcript_turn_kinds` — populated fresh every frame by
+    /// `render::populate_ai_chat_controller`, which always runs before this
+    /// can be reached (see that field's own doc) — and toggles/acts on it:
+    ///
+    /// - A genuine thought turn ([`crate::render::is_genuine_thought_chunk`])
+    ///   toggles regardless of `row_in_turn` — a collapsed thought card is
+    ///   already exactly one summary row, so there's no header/body
+    ///   distinction to make.
+    /// - A tool-call card toggles on `row_in_turn <= 1` — row 0 is
+    ///   `ChatController`'s own role-header row ("System"/"System ▸"), row 1
+    ///   is the card's own title line (`tool_call_title_line`/
+    ///   `tool_call_summary_line`'s first line), present at that same row
+    ///   position whether the card is collapsed (it's the whole body) or
+    ///   expanded (it's the body's first line) — so this is "click the
+    ///   card's header", collapsed or not. Any higher `row_in_turn` (only
+    ///   reachable once expanded, since a collapsed card is exactly rows 0
+    ///   and 1) instead jumps to the call's first location, if it has one
+    ///   (`Self::ai_open_tool_call_location`) — per-line resolution (mapping
+    ///   a *specific* higher `row_in_turn` to a *specific* `-> path:line`)
+    ///   isn't attempted: the card's word-wrapped body means a given
+    ///   `row_in_turn` doesn't map losslessly back to a specific source line
+    ///   the way it would for unwrapped text, so "first location" is the
+    ///   honest, unsurprising behaviour rather than a heuristic that's right
+    ///   most of the time and silently wrong the rest.
+    /// - An ordinary message turn has no collapse state at all — ignored.
+    pub fn ai_chat_turn_clicked(&mut self, turn_idx: usize, row_in_turn: usize) {
+        use crate::core::acp_session::TranscriptTurnKind;
+        let Some(kind) = self
+            .acp()
+            .transcript_turn_kinds
+            .borrow()
+            .get(turn_idx)
+            .cloned()
+        else {
+            return;
+        };
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                if crate::render::is_genuine_thought_chunk(&self.acp().ai_messages, idx) {
+                    self.ai_chat_toggle_turn(turn_idx);
+                }
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                if row_in_turn <= 1 {
+                    self.ai_chat_toggle_turn(turn_idx);
+                } else if let Some(loc) = self
+                    .acp()
+                    .tool_calls
+                    .iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.locations.first().cloned())
+                {
+                    self.ai_open_tool_call_location(&loc.0, loc.1);
+                }
+            }
+        }
+    }
+
+    /// Flip `turn_idx`'s persistent expand state (#1511) — the shared
+    /// bottom half of [`Self::ai_chat_turn_clicked`] and
+    /// `render::route_ai_chat_event`'s focused-turn `Enter` intercept.
+    /// Resolves `turn_idx` via `AcpSession::transcript_turn_kinds` (same as
+    /// its caller) and writes to `AcpSession::thought_expanded`/
+    /// `tool_call_expanded` — **not** `quadraui::ChatController`'s own
+    /// internal collapsed-turn map, which `populate_ai_chat_controller`
+    /// treats as a pure render target and overwrites from these two maps
+    /// every frame (see that function's doc on why the vimcode-side maps,
+    /// not quadraui's, are the source of truth).
+    pub(crate) fn ai_chat_toggle_turn(&mut self, turn_idx: usize) {
+        use crate::core::acp_session::TranscriptTurnKind;
+        let Some(kind) = self
+            .acp()
+            .transcript_turn_kinds
+            .borrow()
+            .get(turn_idx)
+            .cloned()
+        else {
+            return;
+        };
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                if !self.acp_mut().thought_expanded.remove(&idx) {
+                    self.acp_mut().thought_expanded.insert(idx);
+                }
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                if !self.acp_mut().tool_call_expanded.remove(&id) {
+                    self.acp_mut().tool_call_expanded.insert(id);
+                }
+            }
+        }
+    }
+
+    /// Open `path` (resolved against the ACP workspace root if relative) and
+    /// jump the active window's cursor to `line` (#1511, "jump to a
+    /// location" — a `tool_call`'s `locations` line is 1-based per the ACP
+    /// v1 schema, [`crate::core::acp::AcpToolCallInfo`]'s own doc; internal
+    /// cursor positions are 0-indexed, same conversion
+    /// `Engine::open_search_result` already does for project-search
+    /// results). `line: None` just opens the file without moving the
+    /// cursor.
+    pub(crate) fn ai_open_tool_call_location(&mut self, path: &str, line: Option<u32>) {
+        let p = std::path::Path::new(path);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.acp_workspace_cwd().join(p)
+        };
+        self.open_file_in_tab(&p);
+        if let Some(line) = line {
+            let wid = self.active_window_id();
+            let line0 = (line as usize).saturating_sub(1);
+            self.set_cursor_for_window(wid, line0, 0);
+            self.ensure_cursor_visible();
         }
     }
 
@@ -3593,7 +4493,7 @@ impl Engine {
 /// `"assistant"` roles.
 ///
 /// Review regression (#952): if the panel previously talked over ACP
-/// (`Engine::ai_send_message_via_acp`), `self.ai_messages` can also contain
+/// (`Engine::ai_send_message_via_acp`), `self.acp_mut().ai_messages` can also contain
 /// ACP-only roles like `"assistant-thought"` (real `agent_thought_chunk`
 /// reasoning, and the system/error notices `Engine::poll_acp` appends — see
 /// `acp_ops.rs`). A user who switches transports mid-session by clearing
@@ -3631,7 +4531,7 @@ mod curl_transport_history_tests {
     }
 
     /// RED verified: removing the `.filter(...)` call (sending
-    /// `self.ai_messages.clone()` straight through) makes this fail — the
+    /// `self.acp_mut().ai_messages.clone()` straight through) makes this fail — the
     /// stray `"assistant-thought"` turn survives into the direct-provider
     /// request body.
     #[test]
@@ -3658,5 +4558,345 @@ mod curl_transport_history_tests {
             "the ACP-only assistant-thought turn must not reach a \
              direct-provider request body: {filtered:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ai_mention_completions_exclude_tests {
+    use crate::core::Engine;
+
+    /// #1545: `ai_mention_completions`' workspace-file walk must prune
+    /// `explorer_exclude` entries via `filter_entry`, same as
+    /// `picker_populate_files` — otherwise, with `show_hidden_files`
+    /// defaulting on, typing `@` would walk into `.git/` and could surface
+    /// its object files as `@file` completion candidates (and burn the
+    /// `MAX_SCANNED` budget doing it in a repo with a large `.git/`).
+    ///
+    /// RED-verified against the branch without the `filter_entry` prune:
+    /// commenting it out makes `.git/HEAD1545extpanel` show up in
+    /// `menu.candidates` below (an empty query lists every scanned file).
+    #[test]
+    fn does_not_surface_git_internals_as_at_file_completions() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vc1545_ext_panel_mention_exclude_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(workspace.join(".git")).expect("create .git dir");
+        std::fs::write(
+            workspace.join(".git").join("HEAD1545extpanel"),
+            b"ref: refs/heads/main\n",
+        )
+        .expect("write .git/HEAD");
+        std::fs::write(workspace.join("plain1545.rs"), "").expect("write plain file");
+
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @1545");
+
+        let menu = engine
+            .ai_mention_completions()
+            .expect("typing @ with a matching prefix should show mention completions");
+
+        assert!(
+            menu.candidates.contains(&"@plain1545.rs".to_string()),
+            "the ordinary workspace file must still be offered: {:?}",
+            menu.candidates
+        );
+        assert!(
+            !menu
+                .candidates
+                .iter()
+                .any(|c| c.contains("HEAD1545extpanel")),
+            "'.git/' internals must never surface as @file completions \
+             (#1545): {:?}",
+            menu.candidates
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+}
+
+#[cfg(test)]
+mod ai_leader_toggle_key_tests {
+    use crate::core::Engine;
+
+    /// A full `<leader>ai` match (default leader: Space) while the chat
+    /// input is empty toggles `ai_has_focus` off and leaves the pending
+    /// buffer clean — the unit-level twin of the driver tests in
+    /// `tui_main::app_on_tui_tests`/`gtk::testing` (#1507).
+    #[test]
+    fn full_match_toggles_focus_off() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '), "1st key must be consumed");
+        assert!(engine.ai_has_focus, "still armed after 1 of 3 keys");
+        assert!(engine.ai_leader_toggle_key('a'), "2nd key must be consumed");
+        assert!(engine.ai_has_focus, "still armed after 2 of 3 keys");
+        assert!(engine.ai_leader_toggle_key('i'), "3rd key must be consumed");
+        assert!(
+            !engine.ai_has_focus,
+            "the full <leader>ai sequence must toggle focus off"
+        );
+        assert_eq!(engine.ai_leader_toggle_pending, "");
+    }
+
+    /// A key that breaks the match replays the buffered prefix into the
+    /// chat input verbatim and reports "not consumed", so the caller feeds
+    /// the breaking key through the ordinary text-insertion path itself —
+    /// nothing typed is silently dropped.
+    ///
+    /// RED verified: with the `if !pending.is_empty() { ...
+    /// input_insert_str(&pending) }` replay removed from
+    /// `ai_leader_toggle_key`, this fails — the input stays empty instead
+    /// of holding the replayed `" a"` prefix.
+    #[test]
+    fn mismatch_replays_buffered_prefix_into_input() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        // 'x' breaks the "<leader>ai" match at the third key.
+        assert!(!engine.ai_leader_toggle_key('x'));
+        assert!(engine.ai_has_focus, "a broken match must not toggle focus");
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            " a",
+            "the buffered ' a' prefix must be replayed into the input \
+             verbatim rather than silently dropped"
+        );
+        assert_eq!(engine.ai_leader_toggle_pending, "");
+    }
+
+    /// Once the input already holds text, every key is ordinary typed text
+    /// — the gesture never engages, so a message containing " ai" is never
+    /// at risk of being swallowed as the toggle.
+    #[test]
+    fn never_engages_once_input_is_non_empty() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        engine.ai_chat.borrow_mut().input_insert_str("hello");
+        assert!(!engine.ai_leader_toggle_key(' '));
+        assert!(!engine.ai_leader_toggle_key('a'));
+        assert!(!engine.ai_leader_toggle_key('i'));
+        assert!(
+            engine.ai_has_focus,
+            "typing ' ai' into a non-empty input must never toggle focus"
+        );
+    }
+
+    /// #1507 review: `ai_leader_toggle_flush` — the method
+    /// `render::route_ai_chat_event` calls for every key shape
+    /// `ai_leader_toggle_key` itself never sees (a modified `Char`, or any
+    /// `Named` key) — must replay a buffered partial match into the input
+    /// and clear the buffer, the unit-level twin of the black-box
+    /// `leader_prefix_interrupted_by_enter_is_replayed_not_dropped_via_shell_app`
+    /// driver test.
+    ///
+    /// RED verified: with `ai_leader_toggle_flush`'s body replaced with a
+    /// bare `self.ai_leader_toggle_pending.clear();` (i.e. discarding
+    /// instead of replaying), this fails.
+    #[test]
+    fn flush_replays_buffered_prefix_into_input() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        assert_eq!(engine.ai_leader_toggle_pending, " a");
+
+        engine.ai_leader_toggle_flush();
+
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            " a",
+            "the buffered ' a' prefix must be replayed into the input"
+        );
+        assert_eq!(
+            engine.ai_leader_toggle_pending, "",
+            "the buffer must be cleared once flushed"
+        );
+    }
+
+    /// `ai_leader_toggle_flush` on an empty buffer is a no-op — the common
+    /// case, since most keys arrive with no partial match pending at all.
+    #[test]
+    fn flush_is_a_no_op_when_nothing_is_pending() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        engine.ai_leader_toggle_flush();
+        assert_eq!(engine.ai_chat.borrow().input_text(), "");
+    }
+
+    /// #1507 review, "related" point: `Cancelled` (Escape) must discard —
+    /// not replay — a partial match still buffered when the panel loses
+    /// focus, so it can never resurface and wrongly complete against an
+    /// unrelated later message once the panel regains focus. The black-box
+    /// twin of this is
+    /// `leader_prefix_abandoned_via_escape_does_not_leak_into_next_session_via_shell_app`.
+    ///
+    /// RED verified: with the `self.ai_leader_toggle_pending.clear();` line
+    /// removed from `dispatch_ai_chat_event`'s `Cancelled` arm, this fails.
+    #[test]
+    fn cancelled_discards_a_buffered_partial_match() {
+        let mut engine = Engine::new_for_test();
+        engine.ai_has_focus = true;
+        assert!(engine.ai_leader_toggle_key(' '));
+        assert!(engine.ai_leader_toggle_key('a'));
+        assert_eq!(engine.ai_leader_toggle_pending, " a");
+
+        let still_focused = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::Cancelled);
+
+        assert!(!still_focused);
+        assert!(!engine.ai_has_focus);
+        assert_eq!(
+            engine.ai_leader_toggle_pending, "",
+            "an abandoned partial match must not survive Escape"
+        );
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            "",
+            "an abandoned partial match must be discarded, not replayed, \
+             into an input the user is walking away from"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_1513_at_symbol_and_at_dir_mentions {
+    use crate::core::Engine;
+
+    /// #1513: a workspace-symbol candidate from `ai_mention_symbol_cache`
+    /// must show up in `ai_mention_completions` formatted `@path#Name`
+    /// (the unambiguous-at-send-time convention `acp_mention_content_
+    /// blocks`/`ai_mention_accept_selected` both rely on), filtered by the
+    /// query, and appear after any file/dir matches.
+    #[test]
+    fn symbol_candidates_are_offered_formatted_path_hash_name() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(engine.cwd.clone());
+        engine.ai_mention_symbol_cache = vec![
+            crate::core::lsp::SymbolInfo {
+                name: "MyStruct".to_string(),
+                kind: crate::core::lsp::SymbolKind::Struct,
+                detail: Some("struct MyStruct".to_string()),
+                container: None,
+                path: Some(engine.cwd.join("src/lib.rs")),
+                line: 41,
+                character: 0,
+                children: Vec::new(),
+            },
+            crate::core::lsp::SymbolInfo {
+                name: "unrelated_fn".to_string(),
+                kind: crate::core::lsp::SymbolKind::Function,
+                detail: None,
+                container: None,
+                path: Some(engine.cwd.join("src/lib.rs")),
+                line: 5,
+                character: 0,
+                children: Vec::new(),
+            },
+        ];
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @MyStr");
+
+        let menu = engine
+            .ai_mention_completions()
+            .expect("a matching symbol query should show mention completions");
+        assert!(
+            menu.candidates.iter().any(|c| c == "@src/lib.rs#MyStruct"),
+            "expected a @path#Name symbol candidate: {:?}",
+            menu.candidates
+        );
+        assert!(
+            !menu.candidates.iter().any(|c| c.contains("unrelated_fn")),
+            "a non-matching symbol must be filtered out: {:?}",
+            menu.candidates
+        );
+    }
+
+    /// #1513: accepting a `@path#Name` symbol candidate stages an
+    /// `AcpSymbolMention` (`Engine::acp_pending_symbol_mentions`) carrying
+    /// the exact line the cached `SymbolInfo` reported, and splices the
+    /// literal `@path#Name ` text into the input — the same "chosen text
+    /// verbatim, plus a trailing space" contract `ai_mention_accept_
+    /// selected` already has for files.
+    ///
+    /// RED verified: with the `chosen.strip_prefix('@')`/`split_once('#')`
+    /// staging block removed from `ai_mention_accept_selected`, `acp_
+    /// pending_symbol_mentions` stays empty and the second assertion below
+    /// fails.
+    #[test]
+    fn accepting_a_symbol_candidate_stages_a_symbol_mention_and_splices_the_text() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(engine.cwd.clone());
+        engine.ai_mention_symbol_cache = vec![crate::core::lsp::SymbolInfo {
+            name: "MyStruct".to_string(),
+            kind: crate::core::lsp::SymbolKind::Struct,
+            detail: Some("struct MyStruct".to_string()),
+            container: None,
+            path: Some(engine.cwd.join("src/lib.rs")),
+            line: 41,
+            character: 0,
+            children: Vec::new(),
+        }];
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @MyStr");
+
+        assert!(engine.ai_mention_accept_selected());
+
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            "look at @src/lib.rs#MyStruct ",
+            "the literal @path#Name text must be spliced in verbatim"
+        );
+        assert_eq!(
+            engine.acp_pending_symbol_mentions.len(),
+            1,
+            "accepting a symbol candidate must stage an AcpSymbolMention"
+        );
+        assert_eq!(engine.acp_pending_symbol_mentions[0].name, "MyStruct");
+        assert_eq!(engine.acp_pending_symbol_mentions[0].line, 41);
+    }
+
+    /// #1513: a directory entry is offered as an `@`-mention candidate too,
+    /// marked with a trailing `/` — `ai_mention_completions`' unambiguous
+    /// marker for "this resolves to a directory, not a file" that `acp_
+    /// mention_content_blocks` branches on at send time.
+    #[test]
+    fn directory_candidates_are_offered_with_a_trailing_slash() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1513_dir_candidate_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(workspace.join("subdir")).expect("create test dir");
+        std::fs::write(workspace.join("subdir/a.rs"), "").expect("write file");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @subd");
+        let menu = engine
+            .ai_mention_completions()
+            .expect("typing @ with a matching dir prefix should show mention completions");
+        assert!(
+            menu.candidates.contains(&"@subdir/".to_string()),
+            "expected a trailing-slash directory candidate: {:?}",
+            menu.candidates
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

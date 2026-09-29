@@ -70,54 +70,25 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::app::{App, TextMetricsBackend};
+use crate::app::App;
 
-/// [`TextMetricsBackend`] for quadraui's `MacBackend`.
-///
-/// - `set_text_measurement_context` stays a no-op, and that is what the
-///   trait's own doc comment predicts for this backend rather than an
-///   omission: "a backend with no persistent-context concept … can
-///   implement this as a no-op"; macOS text measurement
-///   (`quadraui::macos::text::measure_text(&CTFont, &str)`) takes the font
-///   per call instead of storing a context. The only producer of a context
-///   (`click::build_editor_click_context`) is GTK-only and its call site in
-///   `render_content` is `#[cfg(feature = "gui")]`, so nothing ever calls
-///   this here anyway.
-/// - the two metric setters forward to `MacBackend`'s own public
-///   `set_current_line_height`/`set_current_char_width` (`f64`, matching
-///   Pango's unit — quadraui#934, pinned rev `f3b3aed9`), the macOS
-///   counterparts of `GtkBackend`'s methods of the same name and the
-///   `WinBackend` impl below. Before quadraui#934 `MacBackend` had no such
-///   setters and both were stubbed no-ops (#859); #967 found that stub left
-///   `App::explorer_ui_event`'s #540 drift guard — which re-applies the
-///   metrics the tree was *painted* with immediately before hit-testing —
-///   silently doing nothing on macOS, so hit-testing ran against
-///   `MacBackend::new()`'s default `current_line_height` instead of the
-///   real CoreText metric the paint used. `tree_layout`'s row pitch is
-///   `(line_height * 1.4).round()`, so a stale default drifted the hit
-///   bands by a pixel per row, growing with row index until clicks
-///   resolved to the row below.
-impl TextMetricsBackend for quadraui::macos::MacBackend {
-    // `set_text_measurement_context` is deliberately not overridden here —
-    // the trait's default (empty) body is exactly this backend's no-op, per
-    // the reasoning above (#969).
-
-    fn set_current_line_height(&mut self, line_height: f64) {
-        quadraui::macos::MacBackend::set_current_line_height(self, line_height);
-    }
-
-    fn set_current_char_width(&mut self, char_width: f64) {
-        quadraui::macos::MacBackend::set_current_char_width(self, char_width);
-    }
-}
+// #1497: the local `TextMetricsBackend for quadraui::macos::MacBackend`
+// impl that used to live here is gone. It forwarded
+// `set_current_line_height`/`set_current_char_width` onto `MacBackend`'s
+// own inherent setters (quadraui#934, pinned rev `f3b3aed9`) purely because
+// `quadraui::Backend` had no portable equivalent of them; JDonaghy/
+// quadraui#1086 put both directly on `Backend`, with `MacBackend`'s own
+// override doing exactly the forwarding this impl used to do by hand — see
+// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc for
+// the #967 stub-setter bug this conformance-checks against.
 
 /// Entry point for the native macOS GUI, mirroring `crate::gtk::run`.
 ///
 /// Panic hook + swap flush, choose the backend, construct the shared
-/// [`App`], derive its [`quadraui::ShellConfig`], hand both to the runner.
-/// Nothing else — no `gtk4::init` equivalent, because
-/// `quadraui::macos::run` does AppKit's own bootstrap (main-thread check,
-/// `NSApplication`, default font) itself.
+/// [`App`], derive its [`quadraui::ShellConfig`] via [`build_shell_config`],
+/// hand both to the runner. Nothing else — no `gtk4::init` equivalent,
+/// because `quadraui::macos::run` does AppKit's own bootstrap (main-thread
+/// check, `NSApplication`, default font) itself.
 pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The same panic hook `crate::gtk::run` installs: flush every dirty
     // buffer to its swap file, then write a crash log.
@@ -126,14 +97,68 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The concrete backend is chosen here, at the entry point, and handed to
     // `App` — the seam #861 opened and `src/gtk/mod.rs::run` names in its own
     // comment as the one "a future non-GTK wrapper (#859) would pass a
-    // different `TextMetricsBackend` impl through". This is that wrapper.
-    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> = std::rc::Rc::new(
+    // different `quadraui::Backend` impl through". This is that wrapper.
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> = std::rc::Rc::new(
         std::cell::RefCell::new(Box::new(quadraui::macos::MacBackend::new())),
     );
 
-    let app = App::new_portable(file_path, backend);
-    let config = app.shell_config();
+    let app = App::new_portable(file_path, backend, crate::render::UnitProfile::px());
+    let config = build_shell_config(&app);
     quadraui::macos::shell_runner::run_with_shell(app, config)
+}
+
+/// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine
+/// state — the macOS twin of `crate::gtk::build_shell_config`.
+///
+/// Adds only [`quadraui::ShellConfig::with_app_icon`] on top of
+/// `app.shell_config()`: #1531/quadraui#1142's Dock/Cmd-Tab icon. A bare
+/// unbundled binary has no `Info.plist` `CFBundleIconFile` to supply one, so
+/// it falls back to the generic executable glyph unless something sets one
+/// at runtime — this is that something. Split out (rather than inlined in
+/// [`run`]) so a headless test can assert the bytes reach `ShellConfig`
+/// without needing a live `NSApplication`.
+pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
+    app.shell_config()
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
+}
+
+/// #1531/quadraui#1142: same reasoning as `crate::gtk`'s
+/// `shell_config_identity_tests` — there is no headless Dock to render into
+/// and assert on (that's the SMOKE_TESTS item, run on real hardware), but a
+/// headless build *can* assert the bytes reach the `ShellConfig` the real
+/// `run` hands `run_with_shell`, and that they decode as a real image.
+/// `#[cfg(test)]` only, gated by the whole module's own
+/// `all(feature = "macos", target_os = "macos")` — this never runs off a
+/// Mach-O host, matching every other test in this file.
+#[cfg(test)]
+mod shell_config_identity_tests {
+    use super::{build_shell_config, App};
+    use crate::core::Engine;
+    use quadraui::macos::MacBackend;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(MacBackend::new())));
+        let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        assert!(
+            image::load_from_memory(&bytes).is_ok(),
+            "app icon bytes must decode as an image"
+        );
+    }
 }
 
 /// The `MacDriver` instantiation of [`crate::harness::ConformanceHarness`]
@@ -160,9 +185,13 @@ pub(crate) fn conformance_harness(
     let paint = crate::test_paint::PaintGuard::acquire();
     let cwd = crate::test_cwd::CwdReadGuard::acquire();
     let engine = std::rc::Rc::new(std::cell::RefCell::new(engine));
-    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+    let backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(Box::new(MacBackend::new())));
-    let (app, config) = crate::harness::build_app_and_config(std::rc::Rc::clone(&engine), backend);
+    let (app, config) = crate::harness::build_app_and_config(
+        std::rc::Rc::clone(&engine),
+        backend,
+        crate::render::UnitProfile::px(),
+    );
     let driver = driver_with_shell(app, config, width, height);
     crate::harness::ConformanceHarness::new(driver, engine, paint, cwd)
 }
@@ -197,7 +226,7 @@ mod mac_driver_tests {
     use quadraui::macos::testing::driver_with_shell;
     use quadraui::macos::MacBackend;
 
-    use crate::app::{App, TextMetricsBackend};
+    use crate::app::App;
     use crate::core::Engine;
 
     /// Surface size in points — wide enough that the minimap's own column is
@@ -243,9 +272,13 @@ mod mac_driver_tests {
             crate::test_paint::PaintGuard::acquire(),
             crate::test_cwd::CwdReadGuard::acquire(),
         );
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
-        let app = App::new_headless_with_backend(Rc::new(RefCell::new(engine)), backend);
+        let app = App::new_headless_with_backend(
+            Rc::new(RefCell::new(engine)),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let config = app.shell_config();
         // `driver_with_shell` paints the first frame inside `new` — which is
         // precisely where #896 aborted.
@@ -270,9 +303,13 @@ mod mac_driver_tests {
             crate::test_cwd::CwdReadGuard::acquire(),
         );
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(MacBackend::new())));
-        let app = App::new_headless_with_backend(Rc::clone(&engine), backend);
+        let app = App::new_headless_with_backend(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let config = app.shell_config();
         let driver = driver_with_shell(app, config, W, H);
         (guards, engine, driver)
@@ -293,7 +330,6 @@ mod mac_driver_tests {
         use quadraui::macos::testing::driver_with_shell;
         use quadraui::macos::MacBackend;
 
-        use crate::app::TextMetricsBackend;
         use crate::core::Engine;
         use crate::harness::ConformanceHarness;
 
@@ -306,9 +342,13 @@ mod mac_driver_tests {
             let paint = crate::test_paint::PaintGuard::acquire();
             let cwd = crate::test_cwd::CwdReadGuard::acquire();
             let engine = Rc::new(RefCell::new(engine));
-            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
-            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let (app, config) = crate::harness::build_app_and_config(
+                Rc::clone(&engine),
+                backend,
+                crate::render::UnitProfile::px(),
+            );
             let driver = driver_with_shell(app, config, width, height);
             ConformanceHarness::new(driver, engine, paint, cwd)
         }
@@ -323,9 +363,13 @@ mod mac_driver_tests {
             let paint = crate::test_paint::PaintGuard::acquire();
             let cwd = crate::test_cwd::CwdReadGuard::acquire();
             let engine = Rc::new(RefCell::new(engine));
-            let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+            let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
                 Rc::new(RefCell::new(Box::new(MacBackend::new())));
-            let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+            let (app, config) = crate::harness::build_app_and_config(
+                Rc::clone(&engine),
+                backend,
+                crate::render::UnitProfile::px(),
+            );
             crate::harness::install_folder_picker(&app, dir);
             let driver = driver_with_shell(app, config, width, height);
             ConformanceHarness::new(driver, engine, paint, cwd)
@@ -413,6 +457,78 @@ mod mac_driver_tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// #1576: the sidebar header row (the `" EXPLORER "` strip above the
+    /// tree, painted by quadraui's `AppShell::render`) must come from
+    /// vimcode's own theme on macOS too — the same regression
+    /// `tui_main::app_on_tui_tests::tests::sidebar_panels::
+    /// sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal_via_shell_app`
+    /// covers for the TUI backend. Before quadraui#1180 (picked up by this
+    /// issue's pin bump), `AppShell::render` painted a hard-coded
+    /// `Color::rgb(37, 37, 38)` (`#252526`) regardless of theme; under
+    /// `vscode-light` that read as a dark band behind a light sidebar.
+    /// Samples a pixel inside the header row's own painted-run bounds, on
+    /// its leading literal space (background, not a glyph's anti-aliased
+    /// edge) — a pixel probe, not `style_at`, because `MacDriver` paints
+    /// real pixels via `CGBitmapContext`, not discrete cell styles.
+    ///
+    /// Confirmed red against the pre-#1576 pin: with the old rev, the
+    /// sampled pixel is `(37, 37, 38)`, not `vscode_light`'s status colour
+    /// `(0, 122, 204)`.
+    #[test]
+    fn sidebar_header_paints_vimcode_theme_not_quadraui_dark_literal() {
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.colorscheme = "vscode-light".to_string();
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.session.explorer_visible = true;
+
+        let (_guards, mut driver) = driver(engine);
+        // `App::sync_per_frame_backend_state` pushes vimcode's theme onto
+        // the backend at the *start* of `render_content`, which quadraui's
+        // shell runs *after* `AppShell::render` paints the header chrome —
+        // so the header's very first frame still reads whatever
+        // `Backend::theme()` returned before any `set_theme` call ever
+        // landed (quadraui's own dark `Theme::default()`). A second frame
+        // (no input, just a re-render) carries the now-set theme forward,
+        // matching what a real window settles on after its first paint.
+        driver.render();
+
+        let bounds = driver
+            .find_bounds("EXPLORER")
+            .expect("the sidebar header must paint its panel title");
+        // `find_bounds` returns the whole painted run's bounds — the
+        // status-bar segment is `" EXPLORER "` (leading/trailing literal
+        // space, `App::paint_sidebar_panel_rung`'s doc), so a couple of
+        // points in from the run's own left edge lands on that leading
+        // space: still inside the header's own background, not the glyph,
+        // and not spilling left into the activity-bar rail's own column
+        // (a separate, narrower `draw_activity_bar` paint immediately
+        // adjacent — sampling *outside* this run's bounds landed there
+        // instead, sampling neither colour).
+        let probe_x = (bounds.x + 2.0) as u32;
+        let probe_y = (bounds.y + bounds.height / 2.0) as u32;
+        let (r, g, b, _a) = driver.pixel(probe_x, probe_y);
+
+        let theme = crate::render::Theme::vscode_light();
+        let expected = (theme.status_bg.r, theme.status_bg.g, theme.status_bg.b);
+        assert_eq!(
+            (r, g, b),
+            expected,
+            "sidebar header bg must come from theme.status_bg (vimcode's \
+             theme, via `to_quadraui_theme_chrome`'s header_bg mapping), \
+             not quadraui's hard-coded #252526 literal; painted text was {:?}",
+            driver.painted_texts()
+        );
+        assert_ne!(
+            (r, g, b),
+            (37, 37, 38),
+            "sidebar header bg must not be quadraui's old #252526 literal \
+             under a light theme"
+        );
     }
 
     /// #896: the first painted frame must complete with the minimap enabled.
@@ -606,6 +722,8 @@ mod mac_driver_tests {
     /// coupling the issue describes.
     #[test]
     fn command_center_paints_on_a_native_menu_backend() {
+        use quadraui::Backend;
+
         let mut engine = plain_engine();
         // A distinctive, non-default `cwd` so the Command Center's "🔍
         // <project>" search label is unmistakable in `painted_texts()` --
@@ -616,6 +734,33 @@ mod mac_driver_tests {
         engine.cwd = std::path::PathBuf::from("omnibar-fixture-939");
 
         let (_guards, driver) = driver(engine);
+
+        // #1541 sanity check: the positive assertion below only proves the
+        // Command Center paints when `titlebar_control_inset()` is the
+        // trait's all-zero default -- the one value `MacDriver` can ever
+        // report, per `control_inset_is_default_because_mac_driver_never_
+        // sets_a_window`'s doc comment just above this test. It says
+        // nothing about a *real* window: quadraui#1154 had
+        // `titlebar_control_inset` return the full window width there,
+        // which (via `render::measure_title_bar_bands`'s otherwise-correct
+        // clamp-to-empty arithmetic, `render.rs`'s
+        // `leading_inset_wider_than_the_row_clamps_to_an_empty_band`)
+        // collapses the Command Center band to zero width -- the exact
+        // "never paints" symptom this test exists to catch, and exactly
+        // what this headless harness cannot reproduce. Pin the assumption
+        // explicitly so this test cannot quietly start "passing" against a
+        // degenerate real-window inset: if this fires, `MacDriver` has
+        // started reporting a real inset, and the positive assertion below
+        // needs re-verifying against it before it can be trusted (real-
+        // window verification is this issue's SMOKE_TESTS item, not
+        // something this harness can do).
+        assert_eq!(
+            driver.backend().titlebar_control_inset(),
+            quadraui::Rect::default(),
+            "MacDriver's backend reported a non-default titlebar control \
+             inset -- the Command Center assertions below no longer prove \
+             what this test's doc comment claims; see that comment"
+        );
 
         assert!(
             !driver.screen_contains("File"),
@@ -676,18 +821,20 @@ mod mac_driver_tests {
         );
     }
 
-    // ── #902: native macOS context menus ────────────────────────────────
+    // ── #902/#1580: native macOS context menus ────────────────────────────
 
-    /// #902: `menu_style` defaults to `Inherit`, which resolves to native
+    /// #1580: `menu_style` defaults to `Auto`, which resolves native
     /// whenever the backend advertises one (`BackendCaps::native_menu`,
-    /// `true` for `MacBackend`) — see `render::context_menu_should_be_native`.
-    /// So by default, a right-click on macOS must **not** paint the
-    /// in-window `ContextMenuPanel` at all; `Backend::show_context_menu`
-    /// takes over instead. This test never triggers that native popup at
-    /// all (setting `engine.context_menu` directly, not going through a
-    /// real right-click), so it only proves the *other* half of the
-    /// acceptance bar — the one a headless test *can* prove: nothing paints
-    /// in-window when native is resolved.
+    /// `true` for `MacBackend`) — see `quadraui::MenuStyle::resolve`, via
+    /// `Backend::effective_menu_style`. So by default, a right-click on
+    /// macOS must **not** paint the in-window `ContextMenuPanel` at all;
+    /// `Backend::show_context_menu` takes over instead (from `App::handle`,
+    /// see `right_click_opens_then_activated_item_runs_command_without_
+    /// any_render_call` below for that half). This test never triggers
+    /// that native popup at all (setting `engine.context_menu` directly,
+    /// not going through a real right-click), so it only proves the
+    /// *other* half of the acceptance bar — the one a headless test *can*
+    /// prove: nothing paints in-window when native is resolved.
     ///
     /// RED against the pre-#902 body (`paint_context_menu_rung` had no
     /// native branch and always drew in-window): every item label,
@@ -712,13 +859,13 @@ mod mac_driver_tests {
         assert!(
             !driver.screen_contains("Go to Definition"),
             "MacBackend declares `native_menu: true` and `menu_style` \
-             defaults to `Inherit`, so the in-window context menu must not \
+             defaults to `Auto`, so the in-window context menu must not \
              paint; painted text was {:?}",
             driver.painted_texts()
         );
     }
 
-    /// #902: `menu_style = Custom` opts back into the in-window path even
+    /// #1580: `menu_style = Custom` opts back into the in-window path even
     /// on a backend that has a native one — the VS Code-parity escape
     /// hatch (`window.menuStyle: custom`) this setting exists to mirror.
     ///
@@ -740,6 +887,98 @@ mod mac_driver_tests {
              menu even though MacBackend has a native one; painted text \
              was {:?}",
             driver.painted_texts()
+        );
+    }
+
+    /// #1580 root-cause fix: `Backend::show_context_menu` must be invoked
+    /// from the event handler that opens the menu (`App::handle`'s
+    /// `open_context_menu_now_if_native` choke point), never from
+    /// `render_content`'s `FrameOp::ContextMenu` paint rung — calling it
+    /// from inside a paint closure re-entered painting while the closure
+    /// still held the borrows it needed to finish its own frame, which is
+    /// exactly why right-click menus were broken in the macOS GUI (see
+    /// this issue's root-cause writeup).
+    ///
+    /// `MacBackend::show_context_menu` degrades to a silent no-op off the
+    /// real AppKit main thread (quadraui#930's `MainThreadMarker` guard),
+    /// which every `#[test]` thread is — so this test cannot observe the
+    /// native popup itself opening or watch it push its own activation
+    /// event. What it *can* and does prove, purely through `App`'s own
+    /// dispatch, with **no `driver.render()` call anywhere in the test**:
+    /// a right-click resolves through `Engine::open_editor_context_menu`
+    /// to a populated `engine.context_menu`, and a subsequently-dispatched
+    /// `UiEvent::ContextMenuItemActivated` — exactly what
+    /// `MacBackend::show_context_menu` pushes once AppKit's real modal
+    /// loop picks an item — resolves and runs that item's command within
+    /// that same next `dispatch`. The whole round trip never touches
+    /// `render_content`, so nothing exercised here can be the render rung;
+    /// combined with `native_menu_style_suppresses_the_in_window_context_
+    /// menu` above (which proves the *paint* rung never draws the panel
+    /// when native is resolved), this closes the loop the render rung
+    /// used to own alone.
+    ///
+    /// RED against the pre-#1580 body in one concrete way: before this
+    /// issue, `render.rs::paint_context_menu_rung` took a `native: bool`
+    /// and called `Backend::show_context_menu` itself, reachable only from
+    /// a `render()` call — a test written the same way but calling
+    /// `driver.render()` before the `ContextMenuItemActivated` dispatch
+    /// would still have passed then, which is precisely why "no render
+    /// call anywhere" is the part of this test that is load-bearing, not
+    /// incidental.
+    #[test]
+    fn right_click_opens_then_activated_item_runs_command_without_any_render_call() {
+        let (_guards, engine, mut driver) = driver_with_engine(plain_engine());
+        assert!(
+            engine.borrow().context_menu.is_none(),
+            "sanity: no context menu open before the right-click"
+        );
+
+        // Right-click in the editor content area — same coordinates
+        // `gtk::testing`'s identical-purpose right-click tests use on the
+        // same 1400x900 canvas.
+        driver.dispatch(quadraui::UiEvent::MouseDown {
+            widget: None,
+            button: quadraui::MouseButton::Right,
+            position: quadraui::Point::new(700.0, 400.0),
+            modifiers: quadraui::Modifiers::default(),
+        });
+
+        let item_count = {
+            let eng = engine.borrow();
+            let cm = eng
+                .context_menu
+                .as_ref()
+                .expect("right-click must open the editor context menu");
+            cm.items.len()
+        };
+        assert!(item_count > 0, "fixture needs a non-empty context menu");
+
+        // "Command Palette" is always enabled and always last in
+        // `Engine::open_editor_context_menu`'s item list.
+        let palette_idx = item_count - 1;
+        assert_eq!(
+            engine.borrow().context_menu.as_ref().unwrap().items[palette_idx].action,
+            "command_palette",
+            "fixture assumption: Command Palette is the last item"
+        );
+
+        // Simulate what `MacBackend::show_context_menu` pushes once
+        // AppKit's modal loop resolves a pick — the exact `WidgetId`
+        // `context_menu_panel_to_quadraui_context_menu` synthesises
+        // (`context:N`) and the exact event `App::handle`'s
+        // `UiEvent::ContextMenuItemActivated` arm consumes.
+        driver.dispatch(quadraui::UiEvent::ContextMenuItemActivated(
+            quadraui::WidgetId::new(format!("context:{palette_idx}")),
+        ));
+
+        assert!(
+            engine.borrow().context_menu.is_none(),
+            "activating an item must close the menu"
+        );
+        assert!(
+            engine.borrow().picker_open,
+            "activating the Command Palette item must run its command \
+             (Engine::open_picker) within this same next dispatch"
         );
     }
 
@@ -983,13 +1222,14 @@ mod mac_driver_tests {
     /// whole time. Any sweep point that disagrees with the top-of-row
     /// baseline is exactly #967's bug.
     ///
-    /// **RED-verification (#967):** reverting `TextMetricsBackend for
-    /// quadraui::macos::MacBackend`'s two metric setters in this file back
-    /// to their pre-fix no-op bodies takes this test red — the sweep's
-    /// lower sample points mis-hit `core` a row down instead of `src`,
-    /// disagreeing with the top-of-row baseline, and
-    /// `sweep_hit_band_integrity`'s `assert_eq!` fires. Confirmed locally
-    /// with `cargo test --no-default-features --features macos
+    /// **RED-verification (#967):** reverting `MacBackend`'s
+    /// `Backend::set_current_line_height`/`set_current_char_width` overrides
+    /// (quadraui-side since #1497; this file's own wrapper impl before that)
+    /// back to no-op bodies takes this test red — the sweep's lower sample
+    /// points mis-hit `core` a row down instead of `src`, disagreeing with
+    /// the top-of-row baseline, and `sweep_hit_band_integrity`'s
+    /// `assert_eq!` fires. Confirmed locally with `cargo test
+    /// --no-default-features --features macos
     /// explorer_click_hit_band_matches_the_painted_row` before restoring
     /// the fix; see this issue's PR notes.
     #[test]
@@ -1016,8 +1256,8 @@ mod mac_driver_tests {
     /// #969: the direct, driver-free half of the coverage above —
     /// `explorer_click_hit_band_matches_the_painted_row` proves #967's
     /// *symptom* (a mis-hit row) is fixed; this proves the *mechanism* is
-    /// sound by round-tripping a value through `TextMetricsBackend` and
-    /// `quadraui::Backend` directly, no paint or click involved. See
+    /// sound by round-tripping a value through `quadraui::Backend` directly,
+    /// no paint or click involved. See
     /// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc
     /// for why a `&mut self`-with-no-return setter needs exactly this kind
     /// of check to catch a silent stub — the class of bug #967 was.
@@ -1386,6 +1626,19 @@ mod mac_driver_tests {
             "zqxw971_pickb.txt",
             5,
             |d| {
+                // #1576: the quadraui pin bump brought in macOS
+                // double-click folding (quadraui#486 — `MacBackend`'s
+                // `DoubleClickDetector`, 400 ms window, 4 pt radius). The
+                // sweep's samples are ~3 pt apart and back-to-back, so
+                // sample 1 arrived as a `UiEvent::DoubleClick` — which
+                // confirms the still-selected file `a` instead of
+                // row-clicking `b`, a false "#971 hit-band drift". Unlike
+                // `TuiDriver`/`GtkDriver`, `MacDriver` has no
+                // `set_double_click_folding(false)` (see
+                // docs/PENDING_QUADRAUI_ISSUES.md), so let the fold window
+                // lapse instead: every sample is meant to be an
+                // independent single click on a freshly re-opened picker.
+                std::thread::sleep(std::time::Duration::from_millis(450));
                 engine.borrow_mut().close_picker();
                 engine.borrow_mut().open_picker(PickerSource::Files);
                 d.render();

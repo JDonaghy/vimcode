@@ -19,7 +19,12 @@
 #                           is printed to stdout immediately before the real
 #                           response, to prove the reader skips it without
 #                           desyncing. If $ACP_FAKE_DIE_AFTER_INIT is set,
-#                           this process exits right after replying.
+#                           this process exits right after replying. The
+#                           reply's `protocolVersion` is `1` unless
+#                           $ACP_FAKE_PROTOCOL_VERSION names a different
+#                           number (#1519) — for a test to confirm the
+#                           client refuses to start a session against a
+#                           mismatched protocol version instead of guessing.
 #   - session/new        -> canned sessionId "sess-1". If
 #                           $ACP_FAKE_SESSION_NEW_ERROR is set, replies with a
 #                           JSON-RPC error instead (agent stays alive,
@@ -31,8 +36,54 @@
 #                           result also carries a `modes` field with two
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
-#                           against.
-#   - session/prompt     -> emits a session/update "agent_thought_chunk"
+#                           against. If $ACP_FAKE_SESSION_CONFIG_OPTIONS is
+#                           set (#1520), the result also carries a
+#                           `configOptions` field with one option (id
+#                           "model", category "model", current value
+#                           "sonnet", values "sonnet"/"opus") — for a test to
+#                           drive `:AiConfig`/`:AiModel`/
+#                           `session/set_config_option` against, independently
+#                           of $ACP_FAKE_SESSION_MODES (either, both, or
+#                           neither can be set). (#1487) If $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+#                           names a file, the raw request line is appended to
+#                           it first, unconditionally — lets a test assert on
+#                           the actual `mcpServers` array `session/new`
+#                           carried, the same "capture the raw line, parse it
+#                           with serde_json on the Rust side" shape
+#                           $ACP_FAKE_CAPTURE_PROMPT_TO already uses below.
+#   - session/load       -> (#1459) only reachable when $ACP_FAKE_LOAD_SESSION
+#                           also made `initialize` advertise the capability
+#                           (see below), matching the real Claude ACP
+#                           adapter's contract: replays a three-turn history
+#                           (one `user_message_chunk`, one
+#                           `agent_message_chunk`, one completed `tool_call`)
+#                           as `session/update` notifications *before*
+#                           answering the request — so a test can assert the
+#                           transcript rebuilds every turn kind the live
+#                           path renders (user, assistant, tool-call) through
+#                           the exact same chunk-mapping path, not a second
+#                           renderer — then replies with an empty result (no
+#                           `sessionId` echoed back; the caller already knows
+#                           it, see `AcpEvent::SessionLoaded`'s doc). If
+#                           $ACP_FAKE_LOAD_SESSION_ERROR is set, replies with
+#                           a JSON-RPC error instead, for the "resume against
+#                           an agent that doesn't actually support it"
+#                           regression path. (#1487) If
+#                           $ACP_FAKE_CAPTURE_SESSION_LOAD_TO names a file,
+#                           the raw request line is appended to it first,
+#                           unconditionally — same shape as
+#                           $ACP_FAKE_CAPTURE_SESSION_NEW_TO above, for the
+#                           "a resume also resends the configured MCP
+#                           servers" acceptance bar.
+#   - session/prompt     -> (#1449) if $ACP_FAKE_CAPTURE_PROMPT_TO names a
+#                           file, the raw request line is appended to it
+#                           first, unconditionally — lets a test assert on
+#                           the actual `prompt` content-block array
+#                           (`resource_link` for an attached buffer/
+#                           mention, plain `text` otherwise) via
+#                           `serde_json` on the Rust side, without teaching
+#                           this jq/python/node-free script to parse JSON.
+#                           Then, emits a session/update "agent_thought_chunk"
 #                           notification, then two "agent_message_chunk"
 #                           notifications (split across two lines, to prove
 #                           chunk *streaming* rather than one whole-turn
@@ -48,7 +99,13 @@
 #                           registry entries (only `env` differs) and tell
 #                           their replies apart, proving the multi-agent
 #                           registry is a config fact, not a Rust
-#                           special-case.
+#                           special-case. If $ACP_FAKE_MARKDOWN_REPLY is set
+#                           (#1510), both the thought chunk and the message
+#                           chunk instead carry markdown source (a heading +
+#                           bold text) so a test can assert the AI panel
+#                           renders it — heading/emphasis styled, syntax
+#                           characters stripped — rather than showing the
+#                           raw markdown text.
 #                           Then, unless $ACP_FAKE_NO_TOOL_REQUEST is set, a
 #                           scripted agent->client request (fixed id 9001,
 #                           method fs/read_text_file) that BLOCKS reading one
@@ -75,7 +132,16 @@
 #                           second one's request never needs a dialog
 #                           (client-side allow_always memory) while still
 #                           proving the reply actually reaches this process
-#                           each time. With $ACP_FAKE_DIE_DURING_PERMISSION
+#                           each time. With $ACP_FAKE_REQUEST_PERMISSION_DIFF
+#                           set (#1518): same request_permission shape, but
+#                           the toolCall also carries a `diff` content block
+#                           — for asserting the dialog previews the
+#                           proposed change. With
+#                           $ACP_FAKE_REQUEST_PERMISSION_EXECUTE set (#1518):
+#                           an execute-kind toolCall with `rawInput` and no
+#                           diff content — for asserting the dialog falls
+#                           back to showing the raw command. With
+#                           $ACP_FAKE_DIE_DURING_PERMISSION
 #                           set: emits that same request_permission request
 #                           and exits immediately without reading a reply —
 #                           for the "agent dies with a permission dialog
@@ -109,7 +175,20 @@
 #                           "write:ok" or "write:error:<message>" depending
 #                           on whether the reply was a JSON-RPC error —
 #                           same "drive it for real, read the transcript"
-#                           shape as the read case. With $ACP_FAKE_PLAN set
+#                           shape as the read case. (#1460) Additionally,
+#                           when $ACP_FAKE_FS_WRITE_PATH2/3 are also set
+#                           (each with an optional matching
+#                           $ACP_FAKE_FS_WRITE_CONTENT2/3, default "written
+#                           by acp 2"/"3"), the same request/block/reply
+#                           round trip repeats for each of them (ids 9012,
+#                           9013) — all still ONE turn/`session/prompt`
+#                           reply — so a test can drive a single agent turn
+#                           that writes several files, the shape #1460's
+#                           per-turn change-review surface needs to prove
+#                           itself against a turn that touches more than
+#                           one file, not just a repeated single-file
+#                           scenario.
+#                           With $ACP_FAKE_PLAN set
 #                           (#956, ACP-5): emits an available_commands_update
 #                           (two commands, "commit" and "compact", sharing
 #                           the "co" prefix on purpose so a test can confirm
@@ -139,12 +218,81 @@
 #                           the change-review surface opening come from a
 #                           tool_call_update, not just the initial
 #                           tool_call.
+#                           With $ACP_FAKE_TOOL_CALL_REPLACE set (#1519):
+#                           emits a "tool_call" (id "tc-1") carrying one
+#                           `content` text block and one `locations` entry,
+#                           then a "tool_call_update" carrying a DIFFERENT
+#                           `content` block and a DIFFERENT `locations`
+#                           entry — so a test can confirm the update
+#                           *replaces* both fields wholesale rather than
+#                           appending to them (the exact spec deviation
+#                           #1519 fixes; #955 originally appended). With
+#                           $ACP_FAKE_TOOL_CALL_HANGS set (#1519): emits a
+#                           "tool_call" (id "tc-1", in_progress) then BLOCKS
+#                           forever (reads until stdin closes, never
+#                           answering `session/prompt`) — so a test can
+#                           drive `Engine::acp_cancel_turn` against a call
+#                           that is still unfinished and confirm it's
+#                           marked `Cancelled`, without racing a real
+#                           completion. With $ACP_FAKE_UNKNOWN_REQUEST set
+#                           (#1519): emits an agent -> client request whose
+#                           `method` no real vimcode handler recognises
+#                           (fixed id 9030, method "totally/unknown/
+#                           method"), BLOCKS reading one line for the
+#                           reply, then replies end_turn — proving the
+#                           client answers immediately with JSON-RPC
+#                           `-32601` (this line arrives) instead of leaving
+#                           it parked forever (which would hang this
+#                           `read` and the turn would never reach
+#                           `PromptStopped`). With $ACP_FAKE_TOOL_CALL_CARD
+#                           set (#1511): emits a "tool_call" (id "tc-1")
+#                           carrying a `rawInput` object and a `locations`
+#                           entry pointing at `$ACP_FAKE_TOOL_CALL_PATH`
+#                           (default "src/main.rs"), a "tool_call_update"
+#                           attaching `rawOutput`, and — AFTER the tool
+#                           call, not before it — a second thought+message
+#                           pair ("more thinking" / "Goodbye") so a test can
+#                           confirm the card paints chronologically between
+#                           the first and second reply rather than after the
+#                           whole conversation (the pre-#1511 behaviour).
+#                           With $ACP_FAKE_SESSION_TITLE
+#                           set to a title string (#1519): emits a
+#                           `session_info_update` notification carrying
+#                           that title after the usual message chunks, so a
+#                           test can confirm `:AiSessions`' picker shows it
+#                           instead of the first prompt. With
+#                           $ACP_FAKE_TERMINAL set (#1522): announces a
+#                           "tool_call" (id "tc-1", kind "execute",
+#                           pending), sends a `terminal/create` request
+#                           (fixed id 9040, command "echo", args
+#                           ["acp-terminal-output"], cwd "/tmp"), BLOCKS
+#                           until the client answers it with a
+#                           `terminalId`, emits a "tool_call_update" moving
+#                           the call to in_progress and attaching
+#                           `{type:"terminal",terminalId:<id>}` content,
+#                           sends `terminal/wait_for_exit` (fixed id 9041)
+#                           for that terminal id and BLOCKS until answered,
+#                           emits a second "tool_call_update" moving the
+#                           call to completed, then sends `terminal/
+#                           release` (fixed id 9042) for the same terminal
+#                           id and BLOCKS until answered, before finally
+#                           replying end_turn — so a test can drive the
+#                           whole client-served-terminal round trip
+#                           (creation, live content reference, completion,
+#                           release) against a real spawned process, not a
+#                           mock.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - session/set_mode   -> replies with an empty result, then emits a
 #                           current_mode_update notification carrying the
 #                           same modeId the request asked for (#956, ACP-5)
 #                           — proving the displayed mode follows the
 #                           notification, not the request succeeding.
+#   - session/set_config_option -> (#1520) replies with an empty result,
+#                           then emits a config_option_update notification
+#                           carrying back the same configOptionId/valueId
+#                           the request asked for — same "displayed value
+#                           follows the notification" shape as
+#                           session/set_mode above.
 #   - authenticate       -> (#957, ACP-6) if $ACP_FAKE_AUTH_FAIL is set,
 #                           replies with a JSON-RPC error; otherwise replies
 #                           with an empty success result.
@@ -164,6 +312,34 @@
 # that contract (an authMethods array with no `type: "terminal"` entry at
 # all yields no `AcpAuthMethodKind::Terminal` results).
 #
+# #1450: `initialize`'s `agentCapabilities.promptCapabilities.embeddedContext`
+# is `false`/absent (`agentCapabilities: {}`) unless $ACP_FAKE_EMBEDDED_CONTEXT
+# is set, in which case it's `true` — lets a test drive both branches of
+# `Engine::acp_prompt_content_blocks`'s range-attachment content-block choice
+# (an embedded `resource` block with the exact buffer text vs. a
+# `resource_link` + fenced-text fallback) against the same fixture.
+#
+# #1464: `initialize`'s `agentCapabilities.promptCapabilities.image` is
+# `false`/absent unless $ACP_FAKE_IMAGE_CAPABILITY is set, in which case
+# it's `true` — lets a test drive both branches of
+# `Engine::acp_attach_file`/`Engine::acp_attach_clipboard_image`'s refusal
+# gate against the same fixture.
+#
+# #1459: `initialize`'s `agentCapabilities.loadSession` is `false`/absent
+# unless $ACP_FAKE_LOAD_SESSION is set, in which case it's `true` and
+# `session/load` becomes reachable (see that method's entry above) — lets a
+# test drive both the ":AiSessions says so and does nothing else" refusal
+# (capability absent/false) and the actual resume path (capability true)
+# against the same fixture.
+#
+# #1487 (redo of #1462 on the multi-session engine): `initialize`'s
+# `agentCapabilities.mcpCapabilities.http`/`.sse` are each `false`/absent
+# unless the matching $ACP_FAKE_MCP_HTTP/$ACP_FAKE_MCP_SSE is set, in which
+# case that one flag is `true` — independently of one another, so a test can
+# drive `parse_mcp_capabilities`/`build_mcp_servers_wire`'s "dropped without
+# the capability, sent with it" branches against the same fixture, for
+# either transport on its own.
+#
 # #957 (ACP-6) interactive terminal-auth login. When this script's own
 # stdin is a real TTY — i.e. it was launched by `Engine::
 # acp_launch_terminal_login`'s `TerminalSession` (a real PTY) rather than
@@ -173,14 +349,14 @@
 # unmodified through `settings.acp_agent_command`'s own trailing word — no
 # environment variable or other test-only side channel needed, since both
 # the NDJSON spawn and the interactive re-spawn share that one string)
-# selects the outcome: "fail" simulates a declined/failed login (exit 1);
-# "hang" skips this shortcut entirely and falls into the ordinary
-# NDJSON-shaped `read` loop below, which blocks forever on this real TTY
-# instead of a piped-closed one — simulating a login a human abandons by
-# closing the pane before it ever exits, for a test to race against with
-# `Engine::terminal_close_active_tab`. "succeed-slow" is the same success
-# path plus a two-second `sleep` before exiting — for a `TuiDriver` black-box
-# test (`tui_main::shell_app::tests::
+# selects the outcome, and is optional: "fail" simulates a declined/failed
+# login (exit 1); "hang" skips this shortcut entirely and falls into the
+# ordinary NDJSON-shaped `read` loop below, which blocks forever on this
+# real TTY instead of a piped-closed one — simulating a login a human
+# abandons by closing the pane before it ever exits, for a test to race
+# against with `Engine::terminal_close_active_tab`. "succeed-slow" is the
+# same success path plus a two-second `sleep` before exiting — for a
+# `TuiDriver` black-box test (`tui_main::shell_app::tests::
 # ai_panel_terminal_auth_choice_opens_visible_login_pane_and_resumes_session_via_shell_app`)
 # that needs a real window to poll-and-render the login pane's own painted
 # PTY output ("...login succeeded") before the pane closes itself and is
@@ -188,18 +364,41 @@
 # only asserting `terminal_panes.len()` / `acp_authenticated` state (#957
 # review). GTK's twin test uses a different visibility proof instead (the
 # bottom panel's tab-strip chrome, not PTY cell text — see that test's own
-# doc comment for why) so it doesn't need this arg. Anything else
-# (including no arg) succeeds (exit 0) immediately.
-if [ -t 0 ] && [ "$1" != "hang" ]; then
-  if [ "$1" = "fail" ]; then
-    echo "fake-acp-agent: interactive login failed" 1>&2
-    exit 1
+# doc comment for why) so it doesn't need this arg.
+#
+# #1444: after that optional control word, every remaining arg must be
+# exactly the "claude-ai-login" method's own `args` above
+# (`--cli auth login --claudeai`) — `Engine::acp_launch_terminal_login` is
+# responsible for appending them to the resolved command
+# (`AcpAuthMethod::args`), and this fixture *refuses to "log in"* (exit 1,
+# distinct stderr message) if they are missing or wrong, so a regression
+# that drops them (the exact bug #1444 reported: the bare command was run,
+# which a real adapter answers by starting its NDJSON server and never
+# logging in at all) fails every test below this comment, not just a
+# dedicated one.
+if [ -t 0 ]; then
+  ctrl=""
+  case "$1" in
+    fail | hang | succeed-slow)
+      ctrl="$1"
+      shift
+      ;;
+  esac
+  if [ "$ctrl" != "hang" ]; then
+    if [ "$1 $2 $3 $4" != "--cli auth login --claudeai" ] || [ -n "$5" ]; then
+      echo "fake-acp-agent: interactive login refused: expected args '--cli auth login --claudeai', got '$*'" 1>&2
+      exit 1
+    fi
+    if [ "$ctrl" = "fail" ]; then
+      echo "fake-acp-agent: interactive login failed" 1>&2
+      exit 1
+    fi
+    echo "fake-acp-agent: interactive login succeeded"
+    if [ "$ctrl" = "succeed-slow" ]; then
+      sleep 2
+    fi
+    exit 0
   fi
-  echo "fake-acp-agent: interactive login succeeded"
-  if [ "$1" = "succeed-slow" ]; then
-    sleep 2
-  fi
-  exit 0
 fi
 
 echo "fake-acp-agent: starting" 1>&2
@@ -236,28 +435,145 @@ while IFS= read -r line; do
       auth_methods='[]'
       if [ -n "$ACP_FAKE_AUTH_METHODS" ]; then
         if [ "$saw_auth_terminal" = "true" ]; then
-          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"},{"id":"claude-ai-login","name":"Claude Subscription","type":"terminal"}]'
+          auth_methods='[{"id":"api-key","name":"API Key","type":"agent"},{"id":"claude-ai-login","name":"Claude Subscription","type":"terminal","args":["--cli","auth","login","--claudeai"]}]'
         else
           auth_methods='[{"id":"api-key","name":"API Key","type":"agent"}]'
         fi
       fi
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
+      # #1450: $ACP_FAKE_EMBEDDED_CONTEXT set -> agentCapabilities carries
+      # promptCapabilities.embeddedContext:true, so a test can drive the
+      # "agent understands `resource` content blocks" branch of
+      # `Engine::acp_prompt_content_blocks`. Unset (every pre-#1450 test)
+      # keeps the empty `{}` every prior slice relies on, which parses as
+      # all-`false` per `parse_prompt_capabilities`'s doc.
+      # #1464: $ACP_FAKE_IMAGE_CAPABILITY set -> promptCapabilities also
+      # carries image:true (nested in the same object as embeddedContext,
+      # not a sibling of it — both are fields of `promptCapabilities` per
+      # the ACP schema), so a test can drive both branches of
+      # `Engine::acp_attach_file`/`acp_attach_clipboard_image`'s
+      # `promptCapabilities.image` gate against the same fixture. Built
+      # independently of $ACP_FAKE_EMBEDDED_CONTEXT so either, both, or
+      # neither can be set without a case per combination.
+      # #1459: $ACP_FAKE_LOAD_SESSION set -> agentCapabilities also carries
+      # (or, absent embeddedContext, carries alone) loadSession:true, so a
+      # test can drive `parse_load_session_capability` and the actual
+      # `session/load` path. Built independently of embeddedContext above so
+      # either, both, or neither can be set without the fixture needing a
+      # case for every combination.
+      prompt_caps_fields=""
+      if [ -n "$ACP_FAKE_EMBEDDED_CONTEXT" ]; then
+        prompt_caps_fields='"embeddedContext":true'
+      fi
+      if [ -n "$ACP_FAKE_IMAGE_CAPABILITY" ]; then
+        if [ -n "$prompt_caps_fields" ]; then
+          prompt_caps_fields="${prompt_caps_fields},"
+        fi
+        prompt_caps_fields="${prompt_caps_fields}\"image\":true"
+      fi
+      caps_fields=""
+      if [ -n "$prompt_caps_fields" ]; then
+        caps_fields="\"promptCapabilities\":{${prompt_caps_fields}}"
+      fi
+      if [ -n "$ACP_FAKE_LOAD_SESSION" ]; then
+        if [ -n "$caps_fields" ]; then
+          caps_fields="${caps_fields},"
+        fi
+        caps_fields="${caps_fields}\"loadSession\":true"
+      fi
+      # #1487: mcpCapabilities.http/.sse, each independently gated on its
+      # own env var — see this file's top-of-file doc.
+      mcp_caps_fields=""
+      if [ -n "$ACP_FAKE_MCP_HTTP" ]; then
+        mcp_caps_fields='"http":true'
+      fi
+      if [ -n "$ACP_FAKE_MCP_SSE" ]; then
+        if [ -n "$mcp_caps_fields" ]; then
+          mcp_caps_fields="${mcp_caps_fields},"
+        fi
+        mcp_caps_fields="${mcp_caps_fields}\"sse\":true"
+      fi
+      if [ -n "$mcp_caps_fields" ]; then
+        if [ -n "$caps_fields" ]; then
+          caps_fields="${caps_fields},"
+        fi
+        caps_fields="${caps_fields}\"mcpCapabilities\":{${mcp_caps_fields}}"
+      fi
+      agent_caps='{}'
+      if [ -n "$caps_fields" ]; then
+        agent_caps="{${caps_fields}}"
+      fi
+      protocol_version="${ACP_FAKE_PROTOCOL_VERSION:-1}"
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":%s,"agentCapabilities":%s,"agentInfo":{"name":"fake-acp-agent","version":"0.0.1","sawReadCap":%s,"sawWriteCap":%s,"sawAuthTerminalCap":%s},"authMethods":%s}}\n' "$id" "$protocol_version" "$agent_caps" "$saw_read" "$saw_write" "$saw_auth_terminal" "$auth_methods"
       if [ -n "$ACP_FAKE_DIE_AFTER_INIT" ]; then
         exit 7
       fi
       ;;
     *'"method":"session/new"'*)
       id=$(extract_id "$line")
+      # #1487: same capture-to-file shape as $ACP_FAKE_CAPTURE_PROMPT_TO —
+      # let a test assert on the real `mcpServers` array via serde_json.
+      if [ -n "$ACP_FAKE_CAPTURE_SESSION_NEW_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_NEW_TO"
+      fi
+      # #1520: $ACP_FAKE_SESSION_MODES and $ACP_FAKE_SESSION_CONFIG_OPTIONS
+      # are independent result fields — built up separately so a test can
+      # set either, both, or neither without this script needing a case
+      # per combination (same shape as the capability flags in `initialize`
+      # above).
+      result_fields="\"sessionId\":\"sess-1\""
+      if [ -n "$ACP_FAKE_SESSION_MODES" ]; then
+        result_fields="${result_fields},\"modes\":{\"currentModeId\":\"code\",\"availableModes\":[{\"id\":\"code\",\"name\":\"Code\"},{\"id\":\"plan\",\"name\":\"Plan\"}]}"
+      fi
+      if [ -n "$ACP_FAKE_SESSION_CONFIG_OPTIONS" ]; then
+        result_fields="${result_fields},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"currentValueId\":\"sonnet\",\"values\":[{\"id\":\"sonnet\",\"name\":\"Claude Sonnet\"},{\"id\":\"opus\",\"name\":\"Claude Opus\"}]}]"
+      fi
       if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
-      elif [ -n "$ACP_FAKE_SESSION_MODES" ]; then
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
       else
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{%s}}\n' "$id" "$result_fields"
+      fi
+      ;;
+    *'"method":"session/load"'*)
+      id=$(extract_id "$line")
+      # #1459: only reachable when `initialize` advertised loadSession —
+      # see this file's top-of-file doc for the full contract. Replays a
+      # two-turn history as `session/update` notifications *before*
+      # answering, matching the real Claude ACP adapter's documented
+      # behaviour, then answers with an empty result (no `sessionId` of its
+      # own to echo — the caller already knows it).
+      # #1487: same capture-to-file shape as $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+      # — a resume must resend `mcpServers` too, and a test needs to be
+      # able to see that.
+      if [ -n "$ACP_FAKE_CAPTURE_SESSION_LOAD_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_LOAD_TO"
+      fi
+      if [ -n "$ACP_FAKE_LOAD_SESSION_ERROR" ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"unknown session"}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"what does main.rs do"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"It prints hello."}}}}\n'
+        # A completed tool call is part of the replayed history too, not
+        # just message chunks — a resumed transcript must rebuild every
+        # turn kind the live path already renders (#1459's acceptance bar
+        # explicitly names "user, assistant and tool-call turns").
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-replayed","title":"Read README.md","kind":"read","status":"completed"}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       fi
       ;;
     *'"method":"session/prompt"'*)
       id=$(extract_id "$line")
+      # #1449: when $ACP_FAKE_CAPTURE_PROMPT_TO names a file, the whole
+      # raw `session/prompt` request line is appended to it before any
+      # other handling — the client-side content-block shape (`resource_
+      # link` for the attached buffer / `@`-mention, plain `text` for
+      # everything else) is easiest to assert on from the Rust side by
+      # reading this file and running it through `serde_json`, rather than
+      # teaching this jq/python/node-free `/bin/sh` script to parse JSON
+      # itself. Append (not overwrite) so a test that sends more than one
+      # message in the same session can inspect each turn's params.
+      if [ -n "$ACP_FAKE_CAPTURE_PROMPT_TO" ]; then
+        printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_PROMPT_TO"
+      fi
       # #958 (ACP-7): $ACP_FAKE_AGENT_LABEL, if set, is folded into the
       # first message chunk so a test can run this exact same script as two
       # differently-configured `settings.acp_agents` registry entries and
@@ -272,9 +588,21 @@ while IFS= read -r line; do
       if [ -n "$ACP_FAKE_AGENT_LABEL" ]; then
         hello_text="Hello_${ACP_FAKE_AGENT_LABEL}"
       fi
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}\n'
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$hello_text"
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
+      # #1510: with $ACP_FAKE_MARKDOWN_REPLY set, both the thought chunk and
+      # the message chunk carry markdown source (a heading + bold text)
+      # instead of the plain greeting above — a test asserts the *rendered*
+      # form ("Heading", "bold" with no literal "#"/"**") reaches the
+      # painted surface, and that the thought's markdown never reaches it
+      # at all (thought turns collapse to a fixed one-line "Thinking..."
+      # summary regardless of content).
+      if [ -n "$ACP_FAKE_MARKDOWN_REPLY" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"# Pondering\\n**deeply**"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"# Heading\\n**bold** text"}}}}\n'
+      else
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$hello_text"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
+      fi
       if [ -n "$ACP_FAKE_NO_TOOL_REQUEST" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_PLAN" ]; then
@@ -313,6 +641,31 @@ while IFS= read -r line; do
         # Park: block until the client answers request 9002 out of band.
         read -r _reply
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_REQUEST_PERMISSION_DIFF" ]; then
+        # #1518: same as $ACP_FAKE_REQUEST_PERMISSION but the toolCall also
+        # carries a `diff` content block, so a test can assert the
+        # permission dialog previews the actual proposed change (not just
+        # title/kind/locations) before the human approves it.
+        # Two separate single-line runs (a pure deletion, then a pure
+        # addition several lines later) rather than one line replacing
+        # another — a same-position 1-line-for-1-line change classifies as
+        # quadraui's `DiffRowKind::Changed` (`quadraui::diff::compute_
+        # hunks`), whose *unified*-mode text (`unified_row_text`) shows
+        # only the new side, discarding the old — correct for the shared
+        # primitive's own side-by-side use, but not what this scripted
+        # fixture needs to exercise both an old (`-`) and a new (`+`) line
+        # unambiguously in the unified preview text a test asserts on.
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}],"content":[{"type":"diff","path":"src/main.rs","oldText":"keep1\\nold line\\nkeep2\\n","newText":"keep1\\nkeep2\\nnew line\\n"}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_REQUEST_PERMISSION_EXECUTE" ]; then
+        # #1518: an execute-kind tool call with `rawInput` but no `diff`
+        # content block — the dialog body must fall back to showing
+        # rawInput (the command about to run) since there's no diff to
+        # preview.
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Run tests","kind":"execute","rawInput":{"command":"cargo test --quiet"}},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_DIE_DURING_PERMISSION" ]; then
         printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
         exit 9
@@ -332,19 +685,99 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"read:%s"}}}}\n' "$content"
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_FS_WRITE_PATH" ]; then
-        write_content="${ACP_FAKE_FS_WRITE_CONTENT:-written by acp}"
-        printf '{"jsonrpc":"2.0","id":9011,"method":"fs/write_text_file","params":{"sessionId":"sess-1","path":"%s","content":"%s"}}\n' "$ACP_FAKE_FS_WRITE_PATH" "$write_content"
-        # Park: block until the client answers request 9011 out of band.
-        read -r fsreply
-        case "$fsreply" in
-          *'"error"'*)
-            message=$(printf '%s' "$fsreply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
-            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:error:%s"}}}}\n' "$message"
-            ;;
-          *)
-            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:ok"}}}}\n'
-            ;;
-        esac
+        # #1460: one write request/block/reply round trip, factored out so
+        # a turn that writes several files (ACP_FAKE_FS_WRITE_PATH2/3) can
+        # repeat it without duplicating the request/error/ok plumbing.
+        fake_write() {
+          write_path="$1"
+          write_content="$2"
+          write_id="$3"
+          printf '{"jsonrpc":"2.0","id":%s,"method":"fs/write_text_file","params":{"sessionId":"sess-1","path":"%s","content":"%s"}}\n' "$write_id" "$write_path" "$write_content"
+          # Park: block until the client answers this write request out of band.
+          read -r fsreply
+          case "$fsreply" in
+            *'"error"'*)
+              message=$(printf '%s' "$fsreply" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+              printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:error:%s"}}}}\n' "$message"
+              ;;
+            *)
+              printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"write:ok"}}}}\n'
+              ;;
+          esac
+        }
+        fake_write "$ACP_FAKE_FS_WRITE_PATH" "${ACP_FAKE_FS_WRITE_CONTENT:-written by acp}" 9011
+        if [ -n "$ACP_FAKE_FS_WRITE_PATH2" ]; then
+          fake_write "$ACP_FAKE_FS_WRITE_PATH2" "${ACP_FAKE_FS_WRITE_CONTENT2:-written by acp 2}" 9012
+        fi
+        if [ -n "$ACP_FAKE_FS_WRITE_PATH3" ]; then
+          fake_write "$ACP_FAKE_FS_WRITE_PATH3" "${ACP_FAKE_FS_WRITE_CONTENT3:-written by acp 3}" 9013
+        fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_REPLACE" ]; then
+        # #1519: a `tool_call` with one `content` text block and one
+        # `locations` entry, then a `tool_call_update` carrying a
+        # DIFFERENT content block and a DIFFERENT locations entry — the
+        # update must REPLACE both fields, not append to them.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit files","kind":"edit","status":"in_progress","locations":[{"path":"src/first.rs","line":1}],"content":[{"type":"content","content":{"type":"text","text":"first content"}}]}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","locations":[{"path":"src/second.rs","line":2}],"content":[{"type":"content","content":{"type":"text","text":"second content"}}]}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_CARD" ]; then
+        # #1511: a tool call carrying `rawInput`, then a `tool_call_update`
+        # adding `rawOutput`, with a SECOND thought+message pair emitted
+        # afterward — proving the card interleaves chronologically (between
+        # the first and second reply) rather than landing after the whole
+        # conversation.
+        tc_path="${ACP_FAKE_TOOL_CALL_PATH:-src/main.rs}"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit files","kind":"edit","status":"in_progress","locations":[{"path":"%s","line":3}],"rawInput":{"path":"%s","line":3}}}}\n' "$tc_path" "$tc_path"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","rawOutput":{"bytesWritten":42}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"more thinking"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Goodbye"}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_HANGS" ]; then
+        # #1519: announce an in-progress tool call, then never answer
+        # `session/prompt` at all — blocks reading lines until stdin
+        # closes (the client process being killed at test teardown),
+        # simulating a turn the human cancels mid-flight rather than one
+        # the agent ever finishes on its own.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Run the tests","kind":"execute","status":"in_progress"}}}\n'
+        while IFS= read -r _never; do :; done
+        exit 0
+      elif [ -n "$ACP_FAKE_UNKNOWN_REQUEST" ]; then
+        # #1519: a method this client has no handler for must be answered
+        # immediately with JSON-RPC `-32601`, never left parked — if it
+        # were, this `read` would block forever and neither the
+        # "ANSWERED1519" chunk nor the `end_turn` line below would ever
+        # be sent, hanging the whole turn. The distinct chunk (as opposed to
+        # reusing the unconditional "Hello world" emitted above, which
+        # paints before this request is even sent and so proves nothing
+        # about whether it was ever answered) is what a test actually waits
+        # on.
+        printf '{"jsonrpc":"2.0","id":9030,"method":"totally/unknown/method","params":{"sessionId":"sess-1"}}\n'
+        read -r _reply
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" ANSWERED1519"}}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_SESSION_TITLE" ]; then
+        # #1519: a `session_info_update` naming this session, sent after
+        # the usual message chunks — so a test can confirm `:AiSessions`'
+        # picker shows it instead of the first prompt.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"session_info_update","title":"%s"}}}\n' "$ACP_FAKE_SESSION_TITLE"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TERMINAL" ]; then
+        # #1522: the full client-served-terminal round trip against a real
+        # spawned process — see this file's top-of-file doc for the exact
+        # sequence. Every request below BLOCKS on its own `read` until the
+        # client answers it out of band, same pattern as the fs/* park/
+        # reply round trips above.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Run a command","kind":"execute","status":"pending"}}}\n'
+        printf '{"jsonrpc":"2.0","id":9040,"method":"terminal/create","params":{"sessionId":"sess-1","command":"echo","args":["acp-terminal-output"],"cwd":"/tmp"}}\n'
+        read -r create_reply
+        terminal_id=$(printf '%s' "$create_reply" | sed -n 's/.*"terminalId":"\([^"]*\)".*/\1/p')
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"in_progress","content":[{"type":"terminal","terminalId":"%s"}]}}}\n' "$terminal_id"
+        printf '{"jsonrpc":"2.0","id":9041,"method":"terminal/wait_for_exit","params":{"sessionId":"sess-1","terminalId":"%s"}}\n' "$terminal_id"
+        read -r _wait_reply
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed"}}}\n'
+        printf '{"jsonrpc":"2.0","id":9042,"method":"terminal/release","params":{"sessionId":"sess-1","terminalId":"%s"}}\n' "$terminal_id"
+        read -r _release_reply
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'
@@ -361,6 +794,13 @@ while IFS= read -r line; do
       mode_id=$(printf '%s' "$line" | sed -n 's/.*"modeId":"\([^"]*\)".*/\1/p')
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"current_mode_update","currentModeId":"%s"}}}\n' "$mode_id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      id=$(extract_id "$line")
+      config_option_id=$(printf '%s' "$line" | sed -n 's/.*"configOptionId":"\([^"]*\)".*/\1/p')
+      value_id=$(printf '%s' "$line" | sed -n 's/.*"valueId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"config_option_update","configOptionId":"%s","currentValueId":"%s"}}}\n' "$config_option_id" "$value_id"
       ;;
     *'"method":"authenticate"'*)
       id=$(extract_id "$line")

@@ -19,12 +19,13 @@ pub mod core;
 pub mod icons;
 
 // #657: promoted out of `src/main.rs` / `src/tui_bin.rs`, which used to
-// declare these as private `mod`s. No lint allows are re-stated here: each of
-// the three already carries the inner attributes it needs at the top of its
-// own file (`render.rs`'s `#![allow(dead_code)]`, `tui_main/mod.rs`'s
-// `#![allow(unused_assignments, ...)]`, `gtk/mod.rs`'s
-// `#![allow(deprecated)]`), and repeating them here trips clippy's
-// `duplicated_attributes`.
+// declare these as private `mod`s. No lint allows are re-stated here: each
+// needs its own inner attributes at the top of its own file only where it
+// still has dead code to silence (`render.rs`'s `#![allow(dead_code)]`,
+// `gtk/mod.rs`'s `#![allow(deprecated)]`) — repeating them here would trip
+// clippy's `duplicated_attributes`. `tui_main/mod.rs` carried its own
+// `#![allow(unused_assignments, dead_code, deprecated, ...)]` here too until
+// #1434 deleted the unreachable code it existed to silence.
 pub mod render;
 pub mod tui_main;
 
@@ -40,11 +41,6 @@ pub(crate) mod click;
 /// names so the rest of `crate::gtk` keeps resolving them unchanged.
 pub(crate) mod app_support;
 
-/// Backend-neutral theme CSS text generation shared by `crate::app` (#862).
-/// Split out of the formerly `gui`-gated `src/gtk/css.rs`, which re-exports
-/// `make_theme_css`/`STATIC_CSS` and keeps the GTK-only `load_css`.
-pub(crate) mod css;
-
 /// The GTK backend, behind the `gui` feature exactly as it was in the
 /// `vimcode` bin — so `--no-default-features` still builds on a machine with
 /// no GTK4 dev libs.
@@ -55,19 +51,28 @@ pub mod gtk;
 /// of `src/gtk/mod.rs` by #785 (stage 1 of #47) so a second native backend
 /// can reuse it instead of re-implementing ~6,900 lines of portable shell
 /// logic. #862 dropped the `gui` gate itself: the remaining platform-typed
-/// fields (`window`, `css_provider`) are now type-erased behind small local
-/// traits. A third, `settings_monitor` (a GTK-only `gio::FileMonitor` behind
-/// an opaque `Box<dyn Any>` drop-guard), was deleted outright by #949 rather
+/// field (`window`) was type-erased behind a small local trait until #1234
+/// deleted it outright once `quadraui::Backend::window()` shipped upstream.
+/// A second, `settings_monitor` (a GTK-only `gio::FileMonitor` behind an
+/// opaque `Box<dyn Any>` drop-guard), was deleted outright by #949 rather
 /// than type-erased — `Engine::check_settings_reload`'s portable mtime poll,
-/// already the sole reload mechanism on TUI, made it redundant. The
-/// `crate::gtk::{click, css, util}` reliance moved to the neutral
-/// `crate::click`/`crate::app_support`/`crate::css` above. What's left
-/// behind `#[cfg(feature = "gui")]` *inside* `src/app.rs` is the handful of
-/// items that are genuinely platform-bound: `App::new`/`App::assemble`'s
-/// display-dependent prologue, the `TextMetricsBackend`/window-handle/
-/// css-provider trait impls for the concrete GTK types, and a few inline
-/// `gtk4::Settings`/window-discovery call sites. See `src/app.rs`'s module
-/// doc for the full inventory.
+/// already the sole reload mechanism on TUI, made it redundant. A third,
+/// `css_provider` (a `PlatformCssProvider`-erased `gtk4::CssProvider` theming
+/// the native file dialog's fallback widgets), was deleted outright by #1498
+/// once JDonaghy/quadraui#1091 gave `GtkPlatformServices` its own equivalent
+/// stylesheet, reloaded on every `Backend::set_theme` call — see
+/// `src/gtk/util.rs`'s icon-theme search-path doc for what #1498 also moved
+/// there. The `crate::gtk::{click, util}` reliance moved to the neutral
+/// `crate::click`/`crate::app_support` above. `App::new`, the once-GTK-only
+/// constructor, is gone too: #1498 folded it into the shared
+/// `App::new_portable` every other GUI backend already used, once the
+/// `css_provider` deletion left the icon-theme search path as the only
+/// display-dependent step still standing — `crate::gtk::run` now calls that
+/// one step directly (`crate::gtk::util::add_icon_theme_search_path`)
+/// instead of `App::new` doing it inline. What's left behind
+/// `#[cfg(feature = "gui")]` *inside* `src/app.rs` is a few inline
+/// `gtk4::Settings`/window-discovery call sites.
+/// See `src/app.rs`'s module doc for the full inventory.
 pub mod app;
 
 /// The native macOS (AppKit) backend — a thin wrapper over

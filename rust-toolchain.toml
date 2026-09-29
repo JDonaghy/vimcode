@@ -1,0 +1,61 @@
+# The Rust toolchain this repo builds with (#639).
+#
+# WHY THIS FILE EXISTS
+#
+# `.github/workflows/ci.yml` gates on
+# `cargo clippy --no-default-features -- -D warnings`. Every Rust stable
+# release ships new clippy lints, so while CI installed
+# `dtolnay/rust-toolchain@stable` and this file did not exist, **a Rust
+# release could turn CI red with zero code changes** -- no commit, no PR,
+# nothing in the history explaining it.
+#
+# That is the same failure class this repo has already paid for twice:
+#   * #615 -- ambient `$HOME` leaking into `test_engine` via
+#     `SessionState::load()`. Three root causes were "verified" and pinned as
+#     fact before the real one was found, and rustc skew (1.97.1 vs 1.95.0)
+#     was one of the candidates chased.
+#   * #625/#638 -- the unpinned quadraui sibling path-dep silently restating
+#     six snapshot tests on every machine at once.
+# In every case the bug was a build input that moved without a commit.
+#
+# With this file, a toolchain bump is a deliberate, reviewable one-line diff,
+# exactly like the `quadraui` `rev` pin in Cargo.toml.
+#
+# SCOPE -- NARROWER THAN #638
+#
+# #638 is about the quadraui dependency, and the decision there is to
+# deliberately leave vimcode floating as the fleet canary. The toolchain is
+# different: there is no canary value in an unpinned compiler, only noise.
+#
+# HOW TO BUMP IT
+#
+#   rustup check                                  # what is stable today?
+#   rustup toolchain install <new> --profile minimal --component clippy,rustfmt
+#   # edit `channel` below, then:
+#   cargo fmt -- --check
+#   cargo clippy --no-default-features -- -D warnings
+#   cargo test
+#
+# Then update `RUST_TOOLCHAIN` in `.github/workflows/*.yml` to match --
+# `tests/toolchain_pin.rs` fails the build if you forget, so the two can never
+# drift apart silently. New clippy lints reported after a bump are real; fix
+# them rather than reverting the bump.
+#
+# WHAT THIS FILE DOES *NOT* COVER
+#
+# `rustup` is what reads this file, not `cargo` -- a `cargo` installed without
+# rustup ignores it completely. The Flatpak build (`flatpak/`,
+# org.freedesktop.Sdk.Extension.rust-stable) is exactly that case, so it keeps
+# building with whatever the SDK extension ships. That is the status quo, not a
+# regression: `dtolnay/rust-toolchain` never reached that build either.
+[toolchain]
+channel = "1.97.1"
+
+# `dtolnay/rust-toolchain` and `rustup`'s own toolchain-file install both use
+# `--profile minimal`, which does NOT include clippy or rustfmt. That was
+# invisible while CI asked for `stable`, because GitHub runners preinstall
+# stable with both already in it -- a pinned version is downloaded fresh, so
+# they must be requested explicitly or `cargo fmt` / `cargo clippy` do not
+# exist. `tests/toolchain_pin.rs` asserts both are listed here.
+components = ["clippy", "rustfmt"]
+profile = "minimal"

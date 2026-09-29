@@ -855,7 +855,11 @@ impl Engine {
     // =========================================================================
 
     /// Build a directory listing string for netrw.
-    pub(crate) fn netrw_build_listing(dir: &Path, show_hidden: bool) -> String {
+    ///
+    /// `exclude` is `Settings::explorer_exclude` — entries hidden regardless
+    /// of `show_hidden` (#1545), so the netrw listing doesn't start with a
+    /// `.git/` row now that `show_hidden_files` defaults on.
+    pub(crate) fn netrw_build_listing(dir: &Path, show_hidden: bool, exclude: &[String]) -> String {
         let mut lines = Vec::new();
         lines.push(format!("\" {}/", dir.display()));
         lines.push("../".to_string());
@@ -874,6 +878,9 @@ impl Engine {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !show_hidden && name.starts_with('.') {
+                continue;
+            }
+            if super::explorer_ops::explorer_is_excluded(&name, exclude) {
                 continue;
             }
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -929,7 +936,11 @@ impl Engine {
         }
 
         // Create netrw buffer
-        let listing = Self::netrw_build_listing(&dir, self.settings.show_hidden_files);
+        let listing = Self::netrw_build_listing(
+            &dir,
+            self.settings.show_hidden_files,
+            &self.settings.explorer_exclude,
+        );
         let buf_id = self.buffer_manager.create();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
             state.buffer.content = ropey::Rope::from_str(&listing);
@@ -973,7 +984,11 @@ impl Engine {
 
         if path.is_dir() {
             // Navigate into directory — reuse current buffer
-            let listing = Self::netrw_build_listing(&path, self.settings.show_hidden_files);
+            let listing = Self::netrw_build_listing(
+                &path,
+                self.settings.show_hidden_files,
+                &self.settings.explorer_exclude,
+            );
             let buf_id = self.active_buffer_id();
             if let Some(state) = self.buffer_manager.get_mut(buf_id) {
                 state.read_only = false; // temporarily allow write
@@ -1020,7 +1035,11 @@ impl Engine {
             Some(p) => p.to_path_buf(),
             None => return EngineAction::None, // already at root
         };
-        let listing = Self::netrw_build_listing(&parent, self.settings.show_hidden_files);
+        let listing = Self::netrw_build_listing(
+            &parent,
+            self.settings.show_hidden_files,
+            &self.settings.explorer_exclude,
+        );
         let buf_id = self.active_buffer_id();
         if let Some(state) = self.buffer_manager.get_mut(buf_id) {
             state.read_only = false;
@@ -1459,8 +1478,11 @@ impl Engine {
     }
 
     /// Jump to the next changed region below the cursor.
-    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
-    /// In two-window diff mode: uses `diff_results` for navigation.
+    /// When the buffer has outstanding in-buffer agent-review hunks
+    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// uses `git_diff` markers. On diff buffers: searches for `@@`
+    /// headers. In two-window diff mode: uses `diff_results` for
+    /// navigation.
     pub fn jump_next_hunk(&mut self) {
         if let Some((a, b)) = self.diff_window_pair {
             let active = self.active_window_id();
@@ -1474,7 +1496,28 @@ impl Engine {
         let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
         let has_git = git_diff.is_some_and(|d| !d.is_empty());
 
-        if has_git {
+        if self.has_inline_review_hunks(bid) {
+            // Outstanding agent hunks (#1517) take priority over the raw
+            // `git diff HEAD` markers: for any git-tracked file the agent
+            // just edited, `git_diff` is non-empty too (it's the union of
+            // *every* uncommitted turn's changes against HEAD), so an
+            // unconditional `if has_git` would own `]c`/`[c` and make the
+            // in-buffer review navigation unreachable in the ordinary case
+            // this feature targets. The in-buffer review hunks are scoped
+            // to the *current* outstanding checkpoint and are the more
+            // precise source of truth while a review is active, so once
+            // this buffer has any (`has_inline_review_hunks`), review
+            // navigation owns `]c`/`[c` for it exclusively — falling
+            // through to `has_git` here would silently mix two sources
+            // that can disagree about hunk boundaries.
+            if let Some(line) = self.next_inline_review_hunk_line(bid, cur) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                self.scroll_cursor_center();
+            } else {
+                self.message = "No more hunks".to_string();
+            }
+        } else if has_git {
             // Navigate using git_diff markers on real files.
             let gd = self.buffer_manager.get(bid).unwrap();
             let total = gd.git_diff.len();
@@ -1514,9 +1557,57 @@ impl Engine {
         }
     }
 
+    /// Whether `bid` has any outstanding in-buffer review hunks
+    /// (`Engine::acp_inline_review_hunks`) right now. `]c`/`[c`
+    /// (`jump_next_hunk`/`jump_prev_hunk`) gate on this *before* looking at
+    /// `git_diff` — see the comment in `jump_next_hunk` for why the two
+    /// sources can't just be tried in fallback order.
+    fn has_inline_review_hunks(&self, bid: BufferId) -> bool {
+        let Some(path) = self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        else {
+            return false;
+        };
+        !self
+            .acp_inline_review_hunks(&path.to_string_lossy())
+            .is_empty()
+    }
+
+    /// `]c`/`[c` fallback (#1517): the 0-based buffer line of the first
+    /// in-buffer-review hunk (`Engine::acp_inline_review_hunks`) whose
+    /// right-side start is strictly after/before `cur` — `None` when this
+    /// buffer has no file path, no outstanding hunks, or no hunk on the
+    /// requested side.
+    fn next_inline_review_hunk_line(&self, bid: BufferId, cur: usize) -> Option<usize> {
+        let path = self.buffer_manager.get(bid)?.file_path.clone()?;
+        let hunks = self.acp_inline_review_hunks(&path.to_string_lossy());
+        hunks
+            .iter()
+            .map(|h| h.right_start.saturating_sub(1))
+            .filter(|&start| start > cur)
+            .min()
+    }
+
+    /// The previous-direction twin of [`Self::next_inline_review_hunk_
+    /// line`].
+    fn prev_inline_review_hunk_line(&self, bid: BufferId, cur: usize) -> Option<usize> {
+        let path = self.buffer_manager.get(bid)?.file_path.clone()?;
+        let hunks = self.acp_inline_review_hunks(&path.to_string_lossy());
+        hunks
+            .iter()
+            .map(|h| h.right_start.saturating_sub(1))
+            .filter(|&start| start < cur)
+            .max()
+    }
+
     /// Jump to the previous changed region above the cursor.
-    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
-    /// In two-window diff mode: uses `diff_results` for navigation.
+    /// When the buffer has outstanding in-buffer agent-review hunks
+    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// uses `git_diff` markers. On diff buffers: searches for `@@`
+    /// headers. In two-window diff mode: uses `diff_results` for
+    /// navigation.
     pub fn jump_prev_hunk(&mut self) {
         if let Some((a, b)) = self.diff_window_pair {
             let active = self.active_window_id();
@@ -1530,7 +1621,18 @@ impl Engine {
         let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
         let has_git = git_diff.is_some_and(|d| !d.is_empty());
 
-        if has_git {
+        if self.has_inline_review_hunks(bid) {
+            // See the matching comment in `jump_next_hunk`: outstanding
+            // in-buffer review hunks own `]c`/`[c` exclusively rather than
+            // falling through to the raw `git_diff` markers.
+            if let Some(line) = self.prev_inline_review_hunk_line(bid, cur) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                self.scroll_cursor_center();
+            } else {
+                self.message = "No more hunks".to_string();
+            }
+        } else if has_git {
             let gd = self.buffer_manager.get(bid).unwrap();
             // Skip backwards past the current changed region.
             let mut i = cur.saturating_sub(1);
@@ -4119,4 +4221,76 @@ fn parse_undo_time_spec(spec: &str) -> Option<std::time::SystemTime> {
     let count: u64 = spec[..spec.len() - 1].parse().ok()?;
     let ago = std::time::Duration::from_secs(count * unit_secs);
     Some(std::time::SystemTime::now() - ago)
+}
+
+#[cfg(test)]
+mod netrw_build_listing_tests {
+    use super::Engine;
+
+    /// #1545: `netrw_build_listing`'s `exclude` parameter must hide
+    /// `.git`/etc. regardless of `show_hidden` — a user browsing a project
+    /// root with `:Explore` (netrw) now shows dotfiles by default, but the
+    /// listing must not lead with a `.git/` row. Unit-level coverage per
+    /// the reviewer's non-blocking note: this is a pure function, trivial
+    /// to test directly, and had no pre-existing test even before #1545.
+    #[test]
+    fn hides_excluded_entries_even_when_show_hidden_is_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_netrw_listing_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let listing = Engine::netrw_build_listing(&dir, true, &exclude);
+
+        assert!(
+            listing.contains(".dotfile"),
+            "dotfiles must show when show_hidden is true; got:\n{listing}"
+        );
+        assert!(
+            listing.contains("plain.txt"),
+            "ordinary files must always show; got:\n{listing}"
+        );
+        assert!(
+            !listing.lines().any(|l| l == ".git/"),
+            "'.git' must stay hidden via explorer_exclude even with \
+             show_hidden true; got:\n{listing}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `show_hidden`, ordinary dotfiles are still hidden by the
+    /// pre-existing `show_hidden` gate — `exclude` only ever narrows the
+    /// listing further, it never widens it.
+    #[test]
+    fn show_hidden_false_still_hides_ordinary_dotfiles() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_netrw_listing_nohidden_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let listing = Engine::netrw_build_listing(&dir, false, &exclude);
+
+        assert!(
+            !listing.contains(".dotfile"),
+            "dotfiles must stay hidden when show_hidden is false; got:\n{listing}"
+        );
+        assert!(
+            listing.contains("plain.txt"),
+            "ordinary files must always show; got:\n{listing}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

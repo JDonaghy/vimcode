@@ -197,17 +197,20 @@ fn required_contexts_match_ci_job_names() {
     let jobs = ci_job_names(&workflow);
 
     // Anti-vacuity: a parser that silently returned nothing would make the
-    // equality below pass against an empty config. CI has four lanes — the
+    // equality below pass against an empty config. CI has five lanes — the
     // two Linux ones from #645 (the `--no-default-features` lane and the GUI
     // lane), the native macOS lane added in #1042, which is the only one
-    // that compiles `src/macos/` at all, and the Windows `vcd.exe` build,
-    // the only one that compiles for Windows before a release does. All four
-    // are load bearing, so anything other than four named jobs means the
-    // scan drifted from the file it is meant to read.
+    // that compiles `src/macos/` at all, the Windows `vcd.exe` TUI build,
+    // and the Windows `vimcode.exe` GUI build added in #1554, which is the
+    // only lane that links quadraui's `win` backend (and so the only one
+    // that can catch a loader failure like the missing Common-Controls v6
+    // manifest) before a release does. All five are load bearing, so
+    // anything other than five named jobs means the scan drifted from the
+    // file it is meant to read.
     assert_eq!(
         jobs.len(),
-        4,
-        "expected 4 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
+        5,
+        "expected 5 jobs parsed from .github/workflows/ci.yml, got {jobs:?}"
     );
     assert!(
         jobs.iter().all(|n| !n.trim().is_empty()),

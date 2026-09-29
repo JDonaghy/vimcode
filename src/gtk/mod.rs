@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 pub(crate) mod backend;
 pub(crate) mod click;
-pub(crate) mod css;
 mod events;
 mod explorer;
 mod services;
@@ -24,8 +23,9 @@ use util::*;
 pub(crate) use crate::app::App;
 
 // #862: `is_ext_panel_id`, the UI-font helpers, the tab-bar pixel-geometry
-// types/functions, `StatusSegmentMap`, `compute_editor_window_rects` and the
-// h-scrollbar geometry/hit-test functions all moved to the backend-neutral
+// types/functions, `StatusSegmentMap` and the (since #1493, axis-
+// parameterised) scrollbar geometry/hit-test functions all moved to the
+// backend-neutral
 // `crate::app_support` and `crate::click` — none of them named a `gtk4`/
 // `pango`/`gio` type, so nesting them in `crate::gtk` (behind the `gui`
 // feature) only blocked `crate::app` from resolving them without GTK. These
@@ -36,7 +36,7 @@ pub(crate) use crate::app::App;
 #[allow(unused_imports)]
 pub(crate) use crate::app_support::*;
 #[allow(unused_imports)]
-pub(crate) use crate::click::{TabBarPixelHits, TabPixelHitMap};
+pub(crate) use crate::click::GroupTabBarLayoutMap;
 
 /// Entry point for GTK mode.
 ///
@@ -79,26 +79,35 @@ pub fn run(file_path: Option<PathBuf>) {
     unsafe {
         gtk4::glib::ffi::g_log_set_writer_func(Some(gtk_log_writer), std::ptr::null_mut(), None);
     }
-    // Initialize GTK before App::new() so that CssProvider, Display,
-    // and Settings calls inside App::new() find an initialized toolkit.
+    // Initialize GTK before add_icon_theme_search_path()/App::new_portable()
+    // so the Display/IconTheme calls below find an initialized toolkit.
     // Under the old Relm4 path this happened inside RelmApp::create_and_run();
     // with the ShellApp runner it happens inside gapp.run() which is called
-    // by run_with_shell() — too late for App::new().
+    // by run_with_shell() — too late for either of those.
     gtk4::init().expect("Failed to initialize GTK");
+    // #1498: the one GTK-only step `App::new` (now folded into the shared
+    // `App::new_portable` every other GUI backend already used — see that
+    // constructor's doc) can't do itself — quadraui has no portable
+    // icon-theme search-path surface. Must run after `gtk4::init()`, same as
+    // `App::new`'s old inline version needed.
+    util::add_icon_theme_search_path();
     // Create the App and run via the quadraui ShellApp runner.
     // The runner creates its own GTK Application + window; vimcode's engine
     // and event handling are wired in via impl ShellApp for App above.
     //
     // The concrete backend is chosen here, at the GTK entry point, and
-    // handed to `App::new` rather than `App` constructing one itself
-    // (#861) — this is the seam a future non-GTK wrapper (#859) would pass
-    // a different `TextMetricsBackend` impl through.
-    let text_metrics_backend: std::rc::Rc<
-        std::cell::RefCell<Box<dyn crate::app::TextMetricsBackend>>,
-    > = std::rc::Rc::new(std::cell::RefCell::new(
-        Box::new(backend::GtkBackend::new()),
-    ));
-    let vimcode_app = App::new(file_path, text_metrics_backend);
+    // handed to `App::new_portable` rather than `App` constructing one
+    // itself (#861) — this is the seam a future non-GTK wrapper (#859) would
+    // pass a different `quadraui::Backend` impl through.
+    let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(
+            Box::new(backend::GtkBackend::new()),
+        ));
+    let vimcode_app = App::new_portable(
+        file_path,
+        concrete_backend,
+        crate::render::UnitProfile::px(),
+    );
     let config = build_shell_config(&vimcode_app);
     quadraui::gtk::shell_runner::run_with_shell(vimcode_app, config);
 }
@@ -130,6 +139,16 @@ pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
         // a fresh string literal, so there's exactly one identity string.
         .with_app_id(util::APP_ID)
         .with_icon_name(util::APP_ID)
+        // #1531/quadraui#1142: `with_app_icon` is a no-op on GTK today
+        // (`ShellConfig::app_icon`'s own doc — GTK keeps using
+        // `icon_name`/the desktop-theme icon `util::install_icon_and_desktop`
+        // installs). Set anyway, alongside the other two identity builders
+        // above, so the three GUI backends build their `ShellConfig`
+        // identically and a future GTK consumer of this field needs no new
+        // call site.
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
 }
 
 // #731: the `native_scrollbar_placement_tests` module that used to live
@@ -186,9 +205,11 @@ mod editor_scrollbar_geometry_tests {
     //! hit-test helper that still applied one would disagree with what's
     //! actually painted: precisely the "hover and paint can disagree by
     //! construction" bug #1128 fixed. These tests pin the replacement
-    //! helpers (`editor_scrollbar_layout`/`h_scrollbar_thumb_geometry`)
+    //! helpers (`editor_scrollbar_layout`/`scrollbar_thumb_geometry`, the
+    //! latter axis-parameterised by #1493, replacing the former per-axis
+    //! `h_scrollbar_thumb_geometry`/`v_scrollbar_thumb_geometry` pair)
     //! against that reality instead.
-    use super::{editor_scrollbar_layout, h_scrollbar_thumb_geometry};
+    use super::{editor_scrollbar_layout, scrollbar_thumb_geometry, ScrollbarAxis};
     use crate::core::{Engine, WindowRect};
 
     /// A window whose longest line overflows a narrow viewport and whose
@@ -265,9 +286,15 @@ mod editor_scrollbar_geometry_tests {
              matching quadraui's paint"
         );
 
-        let (tx, ty, tw, th, ..) =
-            h_scrollbar_thumb_geometry(&e, wid, &rect, char_width, line_height)
-                .expect("thumb geometry must resolve alongside the track");
+        let (tx, ty, tw, th, ..) = scrollbar_thumb_geometry(
+            &e,
+            wid,
+            &rect,
+            char_width,
+            line_height,
+            ScrollbarAxis::Horizontal,
+        )
+        .expect("thumb geometry must resolve alongside the track");
         assert_eq!(tx, h_track.x as f64);
         assert_eq!(ty, h_track.y as f64);
         assert_eq!(tw, h_track.width as f64);
@@ -350,6 +377,33 @@ mod shell_config_identity_tests {
         let config = build_shell_config(&app);
         assert_eq!(config.app_id, util::APP_ID);
         assert_eq!(config.icon_name.as_deref(), Some(util::APP_ID));
+    }
+
+    /// #1531/quadraui#1142: same reasoning as the identity test above —
+    /// GTK ignores `ShellConfig::app_icon` at paint time (there is no
+    /// headless "Dock"/taskbar to render into and assert on; that's the
+    /// SMOKE_TESTS item), but a headless build *can* assert the bytes
+    /// actually reach the `ShellConfig` every GUI backend's runner is
+    /// handed, and that they decode as a real image rather than empty or
+    /// truncated bytes.
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let app = App::new_headless(engine);
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        // PNG decoding needs no `librsvg2-common` loader (unlike the SVG
+        // probe `host_has_svg_loader` above) — core `gdk-pixbuf` decodes PNG
+        // unconditionally, so this assertion runs on every host, CI included.
+        let decoded = gtk4::gdk_pixbuf::Pixbuf::from_read(std::io::Cursor::new(bytes))
+            .expect("app icon bytes must decode as an image");
+        assert!(decoded.width() > 0 && decoded.height() > 0);
     }
 
     #[test]

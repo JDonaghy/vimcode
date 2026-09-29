@@ -20,6 +20,24 @@
 //! No `#[cfg(feature = ...)]` gate: this doesn't touch GTK, TUI, or any
 //! optional dependency, so it runs in both the `--no-default-features` and
 //! default-features CI lanes for free.
+//!
+//! ## #1540: raw PUA literals bypass this gate entirely
+//!
+//! The check above only ever sees codepoints that go through `Icon::new(...)`
+//! in `src/icons.rs`. #1540 was a macOS status bar showing tofu for the
+//! sidebar/panel/menu toggles and the done-notification bell: those glyphs
+//! were `\u{f0616}`/`\u{f018d}`/`\u{f009e}` written directly as raw literals
+//! in `render.rs` (a couple as literal PUA *characters* in the source, not
+//! even `\u{...}` escapes), so `scripts/gen_icon_font.py` and the test above
+//! never knew the codepoints existed, and the bundled subset font never
+//! picked them up. `no_raw_pua_literals_outside_icons_rs` below closes that
+//! gap structurally: it scans every `.rs` file under `src/` (except
+//! `icons.rs` itself and the test-support exemptions documented on
+//! `is_exempt_path`) for any PUA character or `\u{...}` PUA escape, so a
+//! future icon literal added straight to `render.rs` (or anywhere else) fails
+//! the build immediately instead of silently shipping as tofu on whatever
+//! platform's system font doesn't happen to share the same PUA assignment a
+//! Nerd Font uses.
 
 use regex::Regex;
 
@@ -241,4 +259,133 @@ fn sanity_known_codepoints_are_parsed_from_icons_rs() {
         !wanted.contains(&0x2014),
         "WINDOW_MINIMIZE is plain Unicode, not a nerd codepoint"
     );
+}
+
+// ─── #1540: no raw PUA literal outside icons.rs ─────────────────────────────
+
+/// Same PUA ranges the #1540 bug used: BMP Private Use Area, plus the
+/// Supplementary Private Use Areas nerd-fonts' extended glyphs live in (see
+/// this file's module doc and `scripts/gen_icon_font.py`'s `NERD_RANGE_START`
+/// doc comment -- this check additionally covers U+F0000 and up, which that
+/// simpler `>= U+E000` threshold already includes).
+fn is_pua_codepoint(cp: u32) -> bool {
+    (0xE000..=0xF8FF).contains(&cp) || cp >= 0xF0000
+}
+
+/// Paths exempt from the "no raw PUA literal outside `icons.rs`" rule.
+/// These are test-support code where a PUA literal is legitimate *data*,
+/// not a new, unaudited UI icon:
+///
+/// - `src/harness/**`: fixtures that register plugin panels via
+///   `PanelRegistration`/`ExtPanelItem`, whose `icon` fields are
+///   provider-supplied at runtime -- inherently arbitrary data no
+///   `icons.rs` table could enumerate, not a vimcode-owned glyph.
+/// - `**/testing.rs` (e.g. `src/gtk/testing.rs`, the `GtkDriver` harness
+///   from #646) and `**/*_tests.rs`: `#[cfg(test)]`-only modules that
+///   sometimes assert against a *specific known* codepoint on purpose
+///   (including, in one regression test, a deliberately-deleted constant's
+///   old codepoint) -- the literal there is the point of the assertion.
+fn is_exempt_from_pua_scan(repo_relative_path: &str) -> bool {
+    let path = std::path::Path::new(repo_relative_path);
+    if path.components().any(|c| c.as_os_str() == "harness") {
+        return true;
+    }
+    match path.file_name().and_then(|f| f.to_str()) {
+        Some("testing.rs") => true,
+        Some(name) => name.ends_with("_tests.rs"),
+        None => false,
+    }
+}
+
+/// Recursively collect every `.rs` file under `dir`.
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir({}): {e}", dir.display()));
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|e| panic!("read_dir entry in {}: {e}", dir.display()));
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn no_raw_pua_literals_outside_icons_rs() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_root = manifest_dir.join("src");
+
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "found zero .rs files under src/ -- collect_rs_files almost \
+         certainly broke, not that src/ went empty"
+    );
+
+    // Mirrors `ICON_NEW_RE`'s escape shape, but unanchored (any `\u{...}`
+    // anywhere on a line, not just inside an `Icon::new(...)` call) since
+    // this check's whole point is catching PUA literals *outside* that call
+    // shape.
+    let escape_re = Regex::new(r"\\u\{([0-9a-fA-F]{4,6})\}").unwrap();
+
+    let mut violations: Vec<String> = Vec::new();
+    for path in &files {
+        let rel = path.strip_prefix(manifest_dir).unwrap_or(path);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "src/icons.rs" || is_exempt_from_pua_scan(&rel_str) {
+            continue;
+        }
+
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        for (line_no, line) in text.lines().enumerate() {
+            for ch in line.chars() {
+                if is_pua_codepoint(ch as u32) {
+                    violations.push(format!(
+                        "{rel_str}:{}: raw PUA character U+{:04X}",
+                        line_no + 1,
+                        ch as u32
+                    ));
+                }
+            }
+            for caps in escape_re.captures_iter(line) {
+                if let Ok(cp) = u32::from_str_radix(&caps[1], 16) {
+                    if is_pua_codepoint(cp) {
+                        violations.push(format!(
+                            "{rel_str}:{}: \\u{{...}} escape for U+{cp:04X}",
+                            line_no + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "found {} raw PUA literal(s) outside src/icons.rs (see #1540) -- \
+         move each one into an `Icon::new(...)` constant in src/icons.rs, \
+         reference it via `crate::icons::<NAME>`, and regenerate the \
+         bundled subset font with scripts/gen_icon_font.py:\n{}",
+        violations.len(),
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn pua_scan_exemptions_match_known_test_support_files() {
+    // Anchors `is_exempt_from_pua_scan` against the concrete files it exists
+    // to exempt, so a future refactor of the predicate can't silently widen
+    // (or narrow) it without a test noticing.
+    assert!(is_exempt_from_pua_scan("src/harness/plugin_panel.rs"));
+    assert!(is_exempt_from_pua_scan("src/harness/plugin_panel/tests.rs"));
+    assert!(is_exempt_from_pua_scan("src/gtk/testing.rs"));
+    assert!(is_exempt_from_pua_scan("src/tui_main/app_on_tui_tests.rs"));
+    assert!(!is_exempt_from_pua_scan("src/render.rs"));
+    assert!(!is_exempt_from_pua_scan("src/icons.rs"));
+    assert!(!is_exempt_from_pua_scan("src/core/lsp.rs"));
 }

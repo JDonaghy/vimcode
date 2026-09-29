@@ -13,7 +13,7 @@
 //! directory vimcode owns (`paths::managed_tools_dir()`) — see that
 //! module's doc comment for the on-disk layout.
 //!
-//! Three acquisition kinds, matching the design in #1345:
+//! Three archive-download acquisition kinds, matching the design in #1345:
 //! - `hashicorp-release`: `https://api.releases.hashicorp.com/v1/releases/<product>/<version>`
 //!   returns every build's URL plus a SHA256SUMS URL — this one kind covers
 //!   terraform-ls and every other HashiCorp-shipped tool.
@@ -27,6 +27,22 @@
 //! HTTP client crate; see the PR for the tradeoff. Archive unpacking is
 //! in-process (the `zip` and `tar`+`flate2` crates), never the `unzip`/`tar`
 //! binaries, so there is no `sh -c` anywhere in this module.
+//!
+//! Five more acquisition kinds (#1346) cover the package-manager ecosystems
+//! a language's LSP/DAP tooling is usually published to instead of a
+//! standalone release archive: `npm`, `pip`, `go`, `cargo`, `dotnet-tool`.
+//! Each installs into a **private prefix** under the same
+//! `paths::managed_tool_version_dir(tool, version)` directory the archive
+//! kinds unpack into — `npm install --prefix`, a fresh `python3 -m venv`,
+//! `GOBIN=<dir>/bin go install`, `cargo install --root`, and
+//! `dotnet tool install --tool-path` all support installing into an
+//! arbitrary directory the *caller* owns, which is exactly what replaces
+//! today's `npm install -g` / global `pip install` / `go install` (into
+//! `~/go/bin`) / `cargo install` (into `~/.cargo/bin`) shell strings — none
+//! of which need `sudo` or touch anything outside vimcode's own managed
+//! tools tree. See [`package_manager_argv`] for the exact argv built per
+//! kind and [`package_manager_binary_path`] for where the installed binary
+//! ends up, including the Windows `Scripts\`/`.exe` variants.
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -48,6 +64,16 @@ pub enum AcquireKind {
     GithubRelease,
     #[default]
     UrlTemplate,
+    /// `npm install --prefix <dir> <package>@<version>` (#1346).
+    Npm,
+    /// `python3 -m venv <dir>` then `<dir>/bin/pip install <package>` (#1346).
+    Pip,
+    /// `GOBIN=<dir>/bin go install <package>@<version>` (#1346).
+    Go,
+    /// `cargo install --root <dir> <package>` (#1346).
+    Cargo,
+    /// `dotnet tool install --tool-path <dir> <package>` (#1346).
+    DotnetTool,
 }
 
 /// Parsed `[lsp.acquire]` / `[dap.acquire]` manifest table. Absent from a
@@ -72,11 +98,23 @@ pub struct AcquireConfig {
     /// `"https://example.com/{version}/foo_{os}_{arch}.zip"`.
     #[serde(default)]
     pub url: String,
+    /// Package/module/crate name to install (`npm`, `pip`, `go`, `cargo`,
+    /// `dotnet-tool` only, #1346), e.g. `"pyright"` (npm),
+    /// `"python-lsp-server"` (pip), `"golang.org/x/tools/gopls"` (go),
+    /// `"ripgrep"` (cargo).
+    #[serde(default)]
+    pub package: String,
     /// Version to acquire, or `"latest"`. Defaults to `"latest"`.
     #[serde(default = "default_acquire_version")]
     pub version: String,
-    /// Path of the executable inside the downloaded archive, e.g.
-    /// `"terraform-ls"`. Defaults to the tool's own binary name when empty.
+    /// Path of the executable inside the downloaded archive
+    /// (`hashicorp-release`/`github-release`/`url-template`), e.g.
+    /// `"terraform-ls"`. For a package-manager kind (`npm`/`pip`/`go`/
+    /// `cargo`/`dotnet-tool`, #1346) this instead names the executable
+    /// the install produces inside its private prefix, e.g. the console
+    /// script `npm`/`pip` write out or the binary `go`/`cargo install`
+    /// build. Defaults to the tool's own binary name (the resolver's
+    /// lookup key passed to `acquire_and_install`) when empty.
     #[serde(default)]
     pub binary_path: String,
     /// Overrides the default OS-name mapping (keys: `"linux"`, `"macos"`,
@@ -104,6 +142,12 @@ pub enum Arch {
 }
 
 impl Arch {
+    /// Every architecture vimcode resolves acquisitions for, in a stable
+    /// order — mirrors `extensions::Platform::ALL`. Lets a single test (or
+    /// the #1347 registry liveness check) sweep every arch regardless of
+    /// which one the test binary happens to be compiled for.
+    pub const ALL: [Arch; 2] = [Arch::Amd64, Arch::Arm64];
+
     /// The architecture this binary was actually compiled for.
     pub fn host() -> Arch {
         #[cfg(target_arch = "aarch64")]
@@ -114,6 +158,15 @@ impl Arch {
         {
             Arch::Amd64
         }
+    }
+}
+
+impl std::fmt::Display for Arch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Arch::Amd64 => "amd64",
+            Arch::Arm64 => "arm64",
+        })
     }
 }
 
@@ -177,6 +230,231 @@ pub fn expand_template(template: &str, version: &str, os: &str, arch: &str) -> S
         .replace("{version}", version)
         .replace("{os}", os)
         .replace("{arch}", arch)
+}
+
+// ─── Package-manager acquisition (#1346) ───────────────────────────────────
+
+/// The runtime binary that must already be on PATH before `kind` can be
+/// used — `None` for the three archive-download kinds, which need nothing
+/// but `curl`. Returning the *name* rather than probing PATH here keeps
+/// this a pure function: the caller (`Engine::ext_install_from_registry`)
+/// decides how to probe (the shared `binary_on_path`, which also checks the
+/// vimcode-managed tools dir and the extra tool dirs, not just PATH) and
+/// what to do when it's missing — fall through to the visible-terminal
+/// tier with a dependency hint instead of failing silently, per #1346's
+/// acceptance criteria.
+pub fn package_manager_runtime(kind: AcquireKind) -> Option<&'static str> {
+    match kind {
+        AcquireKind::HashicorpRelease | AcquireKind::GithubRelease | AcquireKind::UrlTemplate => {
+            None
+        }
+        AcquireKind::Npm => Some("npm"),
+        // The venv step (`python3 -m venv`) is what actually needs probing —
+        // `pip` itself doesn't exist yet until the venv is created.
+        AcquireKind::Pip => Some("python3"),
+        AcquireKind::Go => Some("go"),
+        AcquireKind::Cargo => Some("cargo"),
+        AcquireKind::DotnetTool => Some("dotnet"),
+    }
+}
+
+/// Is `kind` one of the five package-manager kinds (#1346), as opposed to
+/// one of the three archive-download kinds from #1345?
+pub fn is_package_manager_kind(kind: AcquireKind) -> bool {
+    package_manager_runtime(kind).is_some()
+}
+
+/// One process to spawn as part of a package-manager install: argv (index 0
+/// is the program name, resolved the same way `git::hidden_command` and
+/// every other vimcode child-process spawn resolves a program name — via
+/// PATH, no shell) plus any extra environment variables that invocation
+/// needs (`go install` is the one kind that needs one: `GOBIN`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageManagerStep {
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+/// Build the argv (no shell string, ever — #1346 replaces the old
+/// `npm install -g …` / `pip install …` / `go install …` / `cargo install
+/// …` shell one-liners specifically because they need a shell or a global,
+/// often root-owned, prefix) for installing `cfg.package` via `kind` into
+/// the private prefix `dir` (always
+/// `paths::managed_tool_version_dir(tool_name, version)` in production —
+/// passed in explicitly here so this stays a pure, network-free function
+/// tests can drive directly against a throwaway path).
+///
+/// `platform` only matters for `pip`'s second step (the venv's `pip`
+/// lives at `<dir>/bin/pip` everywhere except `<dir>/Scripts/pip.exe` on
+/// Windows) — every other kind's argv is platform-independent.
+///
+/// A pure function of `(kind, cfg, dir, platform)` — no PATH probing, no
+/// process spawn, no network — so every kind's argv can be asserted for
+/// every platform in one test run regardless of what happens to be
+/// installed on (or what OS is running) the machine running the suite
+/// (mirrors `resolve_asset`'s `url-template` branch, the one archive kind
+/// #1345 could already test this way).
+pub fn package_manager_argv(
+    kind: AcquireKind,
+    cfg: &AcquireConfig,
+    dir: &Path,
+    platform: Platform,
+) -> Result<Vec<PackageManagerStep>, AcquireError> {
+    if cfg.package.is_empty() {
+        return Err(AcquireError::BadConfig(format!(
+            "{kind:?} requires `package`"
+        )));
+    }
+    let pinned_version = if cfg.version.is_empty() || cfg.version == "latest" {
+        None
+    } else {
+        Some(cfg.version.as_str())
+    };
+    let dir_s = dir.to_string_lossy().to_string();
+    match kind {
+        AcquireKind::HashicorpRelease | AcquireKind::GithubRelease | AcquireKind::UrlTemplate => {
+            Err(AcquireError::BadConfig(
+                "package_manager_argv called with an archive-download kind".to_string(),
+            ))
+        }
+        AcquireKind::Npm => {
+            let spec = match pinned_version {
+                Some(v) => format!("{}@{v}", cfg.package),
+                None => cfg.package.clone(),
+            };
+            Ok(vec![PackageManagerStep {
+                argv: vec![
+                    "npm".to_string(),
+                    "install".to_string(),
+                    "--prefix".to_string(),
+                    dir_s,
+                    spec,
+                ],
+                env: vec![],
+            }])
+        }
+        AcquireKind::Pip => {
+            let spec = match pinned_version {
+                Some(v) => format!("{}=={v}", cfg.package),
+                None => cfg.package.clone(),
+            };
+            let pip = venv_pip_path(dir, platform).to_string_lossy().to_string();
+            Ok(vec![
+                PackageManagerStep {
+                    argv: vec![
+                        "python3".to_string(),
+                        "-m".to_string(),
+                        "venv".to_string(),
+                        dir_s,
+                    ],
+                    env: vec![],
+                },
+                PackageManagerStep {
+                    argv: vec![pip, "install".to_string(), spec],
+                    env: vec![],
+                },
+            ])
+        }
+        AcquireKind::Go => {
+            let spec = format!("{}@{}", cfg.package, pinned_version.unwrap_or("latest"));
+            Ok(vec![PackageManagerStep {
+                argv: vec!["go".to_string(), "install".to_string(), spec],
+                env: vec![(
+                    "GOBIN".to_string(),
+                    dir.join("bin").to_string_lossy().to_string(),
+                )],
+            }])
+        }
+        AcquireKind::Cargo => {
+            let mut argv = vec![
+                "cargo".to_string(),
+                "install".to_string(),
+                "--root".to_string(),
+                dir_s,
+                cfg.package.clone(),
+            ];
+            if let Some(v) = pinned_version {
+                argv.push("--version".to_string());
+                argv.push(v.to_string());
+            }
+            Ok(vec![PackageManagerStep { argv, env: vec![] }])
+        }
+        AcquireKind::DotnetTool => {
+            let mut argv = vec![
+                "dotnet".to_string(),
+                "tool".to_string(),
+                "install".to_string(),
+                "--tool-path".to_string(),
+                dir_s,
+                cfg.package.clone(),
+            ];
+            if let Some(v) = pinned_version {
+                argv.push("--version".to_string());
+                argv.push(v.to_string());
+            }
+            Ok(vec![PackageManagerStep { argv, env: vec![] }])
+        }
+    }
+}
+
+/// Where `pip` lives inside a venv created at `dir`, per platform — the
+/// Windows `Scripts\` layout vs. everywhere else's `bin/`.
+fn venv_pip_path(dir: &Path, platform: Platform) -> PathBuf {
+    match platform {
+        Platform::Windows => dir.join("Scripts").join("pip.exe"),
+        Platform::Linux | Platform::MacOS => dir.join("bin").join("pip"),
+    }
+}
+
+/// Append `.exe` to `bin` on Windows (unless it already ends with one),
+/// leave it bare everywhere else — the same convention
+/// `paths::managed_tool_binary_path` already applies when it probes for a
+/// managed tool.
+fn exe_named(bin: &str, platform: Platform) -> String {
+    if platform == Platform::Windows && !bin.to_ascii_lowercase().ends_with(".exe") {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    }
+}
+
+/// Where a package-manager install of `kind` puts `bin` inside its private
+/// prefix `dir`, per platform (#1346 acceptance: "binary-path resolution
+/// per kind, including the Windows `Scripts\`/`.exe` variants"). A pure
+/// function — no filesystem access — so every kind × platform combination
+/// is assertable in one test run, the same reasoning `resolved_os`/
+/// `resolved_arch` above already applies to the archive kinds.
+pub fn package_manager_binary_path(
+    kind: AcquireKind,
+    dir: &Path,
+    bin: &str,
+    platform: Platform,
+) -> PathBuf {
+    match kind {
+        AcquireKind::HashicorpRelease | AcquireKind::GithubRelease | AcquireKind::UrlTemplate => {
+            dir.join(bin)
+        }
+        // `npm install --prefix <dir>` links executables into
+        // `<dir>/node_modules/.bin/`. npm's Windows shim for a binary is a
+        // `.cmd` file (not `.exe`), not just `<bin>.exe` with different
+        // content — name it explicitly rather than reusing `exe_named`.
+        AcquireKind::Npm => {
+            let name = if platform == Platform::Windows {
+                format!("{bin}.cmd")
+            } else {
+                bin.to_string()
+            };
+            dir.join("node_modules").join(".bin").join(name)
+        }
+        AcquireKind::Pip => match platform {
+            Platform::Windows => dir.join("Scripts").join(format!("{bin}.exe")),
+            Platform::Linux | Platform::MacOS => dir.join("bin").join(bin),
+        },
+        AcquireKind::Go | AcquireKind::Cargo => dir.join("bin").join(exe_named(bin, platform)),
+        // `dotnet tool install --tool-path <dir>` puts the launcher directly
+        // in `<dir>` — no nested `bin/`.
+        AcquireKind::DotnetTool => dir.join(exe_named(bin, platform)),
+    }
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -756,7 +1034,10 @@ fn resolve_url_template(
 
 /// Resolve `cfg` to a concrete downloadable asset for `platform`/`arch`.
 /// Hits the network for `hashicorp-release`/`github-release`; pure for
-/// `url-template`.
+/// `url-template`. Only meaningful for the three archive-download kinds —
+/// `acquire_and_install_for` routes every package-manager kind (#1346) to
+/// [`install_via_package_manager`] before this is ever called, so the
+/// fallback arm below should be unreachable in practice.
 pub fn resolve_asset(
     cfg: &AcquireConfig,
     platform: Platform,
@@ -766,6 +1047,14 @@ pub fn resolve_asset(
         AcquireKind::HashicorpRelease => resolve_hashicorp_release(cfg, platform, arch),
         AcquireKind::GithubRelease => resolve_github_release(cfg, platform, arch),
         AcquireKind::UrlTemplate => resolve_url_template(cfg, platform, arch),
+        AcquireKind::Npm
+        | AcquireKind::Pip
+        | AcquireKind::Go
+        | AcquireKind::Cargo
+        | AcquireKind::DotnetTool => Err(AcquireError::BadConfig(format!(
+            "{:?} is a package-manager kind, not an archive-download kind",
+            cfg.kind
+        ))),
     }
 }
 
@@ -795,6 +1084,9 @@ pub fn acquire_and_install_for(
     platform: Platform,
     arch: Arch,
 ) -> Result<PathBuf, AcquireError> {
+    if is_package_manager_kind(cfg.kind) {
+        return install_via_package_manager(tool_name, cfg, platform);
+    }
     let asset = resolve_asset(cfg, platform, arch)?;
     let binary_path = if cfg.binary_path.is_empty() {
         tool_name.to_string()
@@ -908,6 +1200,239 @@ fn install_resolved_asset(
 
     super::paths::set_managed_tool_current(tool_name, &asset.version)?;
     Ok(version_dir.join(&extracted_name))
+}
+
+/// Install `cfg` (one of the five #1346 package-manager kinds) for tool
+/// `tool_name` by spawning `package_manager_argv`'s steps directly — no
+/// shell, so there is nowhere for `cfg.package`/`cfg.version` (free-form
+/// text from a community-submitted registry manifest) to break out of the
+/// argument list the way it could if this built a `sh -c "npm install …"`
+/// string instead.
+///
+/// Installs into the **same** `paths::managed_tool_version_dir(tool_name,
+/// version)` the archive kinds unpack into (a private prefix vimcode owns,
+/// never a global `~/.cargo/bin`/`~/go/bin`/`npm -g` prefix that can need
+/// `sudo`), staged as a sibling directory first and atomically swapped in —
+/// mirroring `install_resolved_asset`'s staging/rename pattern exactly.
+///
+/// Unlike the archive kinds, a package-manager install has no upstream API
+/// to resolve `"latest"` to a concrete version number (`resolve_asset`
+/// deliberately requires a pin for `url-template` for the same reason).
+/// An unpinned `cfg.version` therefore installs into the literal `"latest"`
+/// version directory, which a later unpinned reinstall overwrites in place.
+fn install_via_package_manager(
+    tool_name: &str,
+    cfg: &AcquireConfig,
+    platform: Platform,
+) -> Result<PathBuf, AcquireError> {
+    if !is_safe_relative_path(tool_name) || tool_name.is_empty() {
+        return Err(AcquireError::PathTraversal(tool_name.to_string()));
+    }
+    let version = if cfg.version.is_empty() {
+        "latest".to_string()
+    } else {
+        cfg.version.clone()
+    };
+    if !is_safe_relative_path(&version) || version.is_empty() {
+        return Err(AcquireError::PathTraversal(version));
+    }
+    let bin_name = if cfg.binary_path.is_empty() {
+        tool_name.to_string()
+    } else {
+        cfg.binary_path.clone()
+    };
+    // `bin_name` (from the manifest's `binary_path`, free-form text from a
+    // community-submitted registry manifest) is joined onto `stage_dir`
+    // below, ultimately reaching `link_binary_into_prefix`'s
+    // `stage_dir.join(bin_name)` `link_path`, which that function
+    // `remove_file`s before creating a symlink in its place. Per the
+    // field's own doc comment above it names a single executable, never a
+    // nested path, so gate it with the *stricter* `is_safe_single_segment_
+    // name` (rejects `/`, `\`, and `..` outright) rather than
+    // `is_safe_relative_path` (only rejects `..`, and would let a manifest
+    // walk `link_path` outside `stage_dir` to delete-and-symlink an
+    // arbitrary file the vimcode process can reach, #1346 review).
+    if !is_safe_single_segment_name(&bin_name) {
+        return Err(AcquireError::PathTraversal(bin_name));
+    }
+
+    let tool_dir = super::paths::managed_tool_dir(tool_name);
+    std::fs::create_dir_all(&tool_dir)?;
+    let stage_dir = tool_dir.join(format!(
+        ".tmp-{version}-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    let cleanup_stage = |dir: &Path| {
+        let _ = std::fs::remove_dir_all(dir);
+    };
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let steps = match package_manager_argv(cfg.kind, cfg, &stage_dir, platform) {
+        Ok(steps) => steps,
+        Err(e) => {
+            cleanup_stage(&stage_dir);
+            return Err(e);
+        }
+    };
+    if let Err(e) = run_package_manager_steps(&steps) {
+        cleanup_stage(&stage_dir);
+        return Err(e);
+    }
+
+    let installed_bin = package_manager_binary_path(cfg.kind, &stage_dir, &bin_name, platform);
+    if !installed_bin.is_file() {
+        cleanup_stage(&stage_dir);
+        return Err(AcquireError::Archive(format!(
+            "expected {} to exist after install but it does not",
+            installed_bin.display()
+        )));
+    }
+
+    // `paths::managed_tool_binary_path` (the resolver every other acquired
+    // tool goes through) only looks for `<version_dir>/<bin>` (or, on
+    // Windows, `<version_dir>/<bin>.exe`) directly — it has no idea a
+    // package manager nested the real executable under `bin/` or
+    // `node_modules/.bin/`. Link (unix) or copy (Windows, where an
+    // unprivileged symlink needs Developer Mode) the installed binary up to
+    // that top-level name so discovery agrees with every archive-kind
+    // install, with no changes needed to that shared resolver.
+    let link_name = match link_binary_into_prefix(&installed_bin, &stage_dir, &bin_name, platform) {
+        Ok(name) => name,
+        Err(e) => {
+            cleanup_stage(&stage_dir);
+            return Err(e);
+        }
+    };
+
+    let version_dir = super::paths::managed_tool_version_dir(tool_name, &version);
+    if version_dir.exists() {
+        std::fs::remove_dir_all(&version_dir)?;
+    }
+    if let Err(e) = rename_or_copy(&stage_dir, &version_dir) {
+        cleanup_stage(&stage_dir);
+        return Err(e.into());
+    }
+
+    super::paths::set_managed_tool_current(tool_name, &version)?;
+    Ok(version_dir.join(link_name))
+}
+
+/// Spawn every step of a package-manager install in order (argv only, never
+/// a shell — see `package_manager_argv`'s doc comment), stopping at the
+/// first failure. Split out of `install_via_package_manager` so a test can
+/// drive it directly against a hand-built [`PackageManagerStep`] (e.g. one
+/// invoking the real `false`/`cmd /c exit 1` binary) without needing a real
+/// `npm`/`pip`/`go`/`cargo`/`dotnet` install to fail on cue.
+fn run_package_manager_steps(steps: &[PackageManagerStep]) -> Result<(), AcquireError> {
+    for step in steps {
+        let Some(program) = step.argv.first() else {
+            continue;
+        };
+        let mut command = crate::core::git::hidden_command(program);
+        command.args(&step.argv[1..]);
+        for (key, value) in &step.env {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .map_err(|e| AcquireError::Network(format!("failed to spawn {program}: {e}")))?;
+        if !output.status.success() {
+            return Err(AcquireError::Archive(format!(
+                "`{}` failed: {}",
+                step.argv.join(" "),
+                // #1346 acceptance: "on failure, surface the last lines of
+                // stderr in the notification" — never the whole, potentially
+                // huge, npm/cargo/dotnet build log.
+                tail_of(&String::from_utf8_lossy(&output.stderr), 20)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Last `n` non-empty lines of `text` — used to surface a package manager's
+/// own diagnostics (the acceptance criterion: "on failure, surface the
+/// last lines of stderr in the notification") without dumping a
+/// potentially huge npm/cargo/dotnet build log into the status line.
+fn tail_of(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
+/// Make the package-manager-installed binary at `installed_bin` (somewhere
+/// under `stage_dir`, per `package_manager_binary_path`) reachable at
+/// `stage_dir`'s top level under `bin_name` (plus a platform-appropriate
+/// extension), and return that top-level name. See
+/// `install_via_package_manager`'s doc comment for why this has to exist at
+/// all.
+///
+/// unix: a *relative* symlink — relative because `stage_dir` is renamed
+/// (not copied) into its final `version_dir` location on the common path,
+/// and an absolute symlink baked with the staging path would dangle the
+/// instant that rename happens. A relative link computed from two paths
+/// that are both still under `stage_dir` survives the rename unchanged.
+///
+/// Windows: a plain copy — creating a symlink there needs Developer Mode or
+/// admin rights, neither guaranteed, so this trades a few extra KB on disk
+/// (npm/pip console scripts; go/cargo/dotnet-tool binaries can be tens of
+/// MB, but those install directly to `bin/<name>.exe`/`<name>.exe`, exactly
+/// one physical copy either way) for working unprivileged.
+#[cfg(unix)]
+fn link_binary_into_prefix(
+    installed_bin: &Path,
+    stage_dir: &Path,
+    bin_name: &str,
+    _platform: Platform,
+) -> Result<String, AcquireError> {
+    let link_path = stage_dir.join(bin_name);
+    // `dotnet tool install --tool-path` already puts the launcher directly
+    // at the top level (see `package_manager_binary_path`'s `DotnetTool`
+    // arm) — nothing to link, and symlinking a path to itself would delete
+    // the just-installed binary via the `remove_file` below then create a
+    // symlink pointing at its own (now-missing) former self.
+    if installed_bin == link_path {
+        return Ok(bin_name.to_string());
+    }
+    let rel_target = installed_bin.strip_prefix(stage_dir).map_err(|_| {
+        AcquireError::Archive(format!(
+            "installed binary {} is not under its own staging prefix {}",
+            installed_bin.display(),
+            stage_dir.display()
+        ))
+    })?;
+    if link_path.symlink_metadata().is_ok() {
+        std::fs::remove_file(&link_path)?;
+    }
+    std::os::unix::fs::symlink(rel_target, &link_path)?;
+    Ok(bin_name.to_string())
+}
+
+#[cfg(not(unix))]
+fn link_binary_into_prefix(
+    installed_bin: &Path,
+    stage_dir: &Path,
+    bin_name: &str,
+    _platform: Platform,
+) -> Result<String, AcquireError> {
+    // Preserve `installed_bin`'s own extension rather than always forcing
+    // `.exe`: npm's Windows shim for a binary is a `.cmd` file, not a PE
+    // executable with a `.exe` name slapped on, and `CreateProcess` (what
+    // `std::process::Command` uses) needs the real extension to run it —
+    // `paths::managed_tool_binary_path`'s explicit `.exe` probe simply
+    // won't match an `.cmd` shim, so it falls back to its "sole file in the
+    // directory" scan, which still finds it as long as this is the only
+    // top-level file (true for every one of these kinds).
+    let name = match installed_bin.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{bin_name}.{ext}"),
+        None => bin_name.to_string(),
+    };
+    let link_path = stage_dir.join(&name);
+    if link_path != *installed_bin {
+        std::fs::copy(installed_bin, &link_path)?;
+    }
+    Ok(name)
 }
 
 /// Move `src` to `dst` via `rename`, falling back to a recursive copy +
@@ -1073,6 +1598,15 @@ binary_path = "example-dap"
         let cfg = AcquireConfig::default();
         assert_eq!(resolved_arch(&cfg, Arch::Amd64), "amd64");
         assert_eq!(resolved_arch(&cfg, Arch::Arm64), "arm64");
+    }
+
+    #[test]
+    fn arch_all_covers_both_variants_and_displays_lowercase() {
+        // #1347: the registry liveness check sweeps `Arch::ALL` the same way
+        // the #919 conformance gate sweeps `Platform::ALL`.
+        assert_eq!(Arch::ALL, [Arch::Amd64, Arch::Arm64]);
+        assert_eq!(Arch::Amd64.to_string(), "amd64");
+        assert_eq!(Arch::Arm64.to_string(), "arm64");
     }
 
     #[test]
@@ -1591,4 +2125,721 @@ cafebabe00000000000000000000000000000000000000000000000000000000  terraform-ls_0
     // `-sf`) aren't independently unit-testable without a real HTTP
     // redirect server; covered by inspection — see `download_asset`'s doc
     // comment for the GitHub redirect scenario this avoids.
+
+    // ── package-manager acquisition: argv construction (#1346) ─────────
+    //
+    // Pure, network-free, no process spawn — `package_manager_argv` is a
+    // function of `(kind, cfg, dir, platform)` alone, so every kind ×
+    // platform combination is assertable in one test run regardless of the
+    // suite's host OS or what's installed on it (same reasoning
+    // `full_url_resolution_across_all_platform_arch_combinations` already
+    // applies to the archive kinds above).
+
+    #[test]
+    fn package_manager_argv_requires_package() {
+        for kind in [
+            AcquireKind::Npm,
+            AcquireKind::Pip,
+            AcquireKind::Go,
+            AcquireKind::Cargo,
+            AcquireKind::DotnetTool,
+        ] {
+            let cfg = AcquireConfig {
+                kind,
+                ..Default::default()
+            };
+            let err =
+                package_manager_argv(kind, &cfg, Path::new("/tools/x/latest"), Platform::Linux)
+                    .unwrap_err();
+            assert!(
+                matches!(err, AcquireError::BadConfig(_)),
+                "{kind:?} with no `package` should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_argv_npm_install_prefix_unpinned() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Npm,
+            &cfg,
+            Path::new("/tools/pyright/latest"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].argv,
+            vec![
+                "npm",
+                "install",
+                "--prefix",
+                "/tools/pyright/latest",
+                "pyright"
+            ]
+        );
+        assert!(steps[0].env.is_empty());
+    }
+
+    #[test]
+    fn package_manager_argv_npm_install_prefix_pinned_version() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            version: "1.2.3".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Npm,
+            &cfg,
+            Path::new("/tools/pyright/1.2.3"),
+            Platform::MacOS,
+        )
+        .unwrap();
+        assert_eq!(
+            steps[0].argv,
+            vec![
+                "npm",
+                "install",
+                "--prefix",
+                "/tools/pyright/1.2.3",
+                "pyright@1.2.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_pip_venv_then_install_unix() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Pip,
+            package: "python-lsp-server".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Pip,
+            &cfg,
+            Path::new("/tools/pylsp/latest"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(
+            steps[0].argv,
+            vec!["python3", "-m", "venv", "/tools/pylsp/latest"]
+        );
+        assert_eq!(
+            steps[1].argv,
+            vec![
+                "/tools/pylsp/latest/bin/pip",
+                "install",
+                "python-lsp-server"
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_pip_venv_then_install_windows_uses_scripts_dir() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Pip,
+            package: "python-lsp-server".to_string(),
+            version: "1.9.0".to_string(),
+            ..Default::default()
+        };
+        // `Path::join` always uses `/` when this test itself runs on a
+        // non-Windows host (there is no simulated-Windows `Path`), so
+        // assert on the logical components rather than a literal
+        // backslash-separated string.
+        let dir = Path::new("/tools/pylsp/1.9.0");
+        let steps = package_manager_argv(AcquireKind::Pip, &cfg, dir, Platform::Windows).unwrap();
+        assert_eq!(
+            steps[1].argv[0],
+            dir.join("Scripts").join("pip.exe").to_string_lossy(),
+            "windows venvs put pip under Scripts\\, not bin/"
+        );
+        assert_eq!(steps[1].argv[2], "python-lsp-server==1.9.0");
+    }
+
+    #[test]
+    fn package_manager_argv_go_install_sets_gobin_env() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Go,
+            package: "golang.org/x/tools/gopls".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Go,
+            &cfg,
+            Path::new("/tools/gopls/latest"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].argv,
+            vec!["go", "install", "golang.org/x/tools/gopls@latest"]
+        );
+        assert_eq!(
+            steps[0].env,
+            vec![("GOBIN".to_string(), "/tools/gopls/latest/bin".to_string())]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_go_install_pins_version_in_module_spec() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Go,
+            package: "golang.org/x/tools/gopls".to_string(),
+            version: "v0.16.1".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Go,
+            &cfg,
+            Path::new("/tools/gopls/v0.16.1"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(steps[0].argv[2], "golang.org/x/tools/gopls@v0.16.1");
+    }
+
+    #[test]
+    fn package_manager_argv_cargo_install_root_unpinned() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Cargo,
+            package: "ripgrep".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Cargo,
+            &cfg,
+            Path::new("/tools/rg/latest"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(
+            steps[0].argv,
+            vec!["cargo", "install", "--root", "/tools/rg/latest", "ripgrep"]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_cargo_install_root_pinned_version() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Cargo,
+            package: "ripgrep".to_string(),
+            version: "14.1.0".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::Cargo,
+            &cfg,
+            Path::new("/tools/rg/14.1.0"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(
+            steps[0].argv,
+            vec![
+                "cargo",
+                "install",
+                "--root",
+                "/tools/rg/14.1.0",
+                "ripgrep",
+                "--version",
+                "14.1.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_dotnet_tool_install_tool_path() {
+        let cfg = AcquireConfig {
+            kind: AcquireKind::DotnetTool,
+            package: "csharprepl".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        };
+        let steps = package_manager_argv(
+            AcquireKind::DotnetTool,
+            &cfg,
+            Path::new("/tools/csharprepl/1.0.0"),
+            Platform::Linux,
+        )
+        .unwrap();
+        assert_eq!(
+            steps[0].argv,
+            vec![
+                "dotnet",
+                "tool",
+                "install",
+                "--tool-path",
+                "/tools/csharprepl/1.0.0",
+                "csharprepl",
+                "--version",
+                "1.0.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn package_manager_argv_rejects_archive_download_kinds() {
+        for kind in [
+            AcquireKind::HashicorpRelease,
+            AcquireKind::GithubRelease,
+            AcquireKind::UrlTemplate,
+        ] {
+            let cfg = AcquireConfig {
+                kind,
+                package: "irrelevant".to_string(),
+                ..Default::default()
+            };
+            let err =
+                package_manager_argv(kind, &cfg, Path::new("/tools/x/latest"), Platform::Linux)
+                    .unwrap_err();
+            assert!(matches!(err, AcquireError::BadConfig(_)));
+        }
+    }
+
+    // ── package-manager acquisition: runtime dependency (#1346) ─────────
+
+    #[test]
+    fn package_manager_runtime_maps_each_kind_to_its_runtime_binary() {
+        assert_eq!(package_manager_runtime(AcquireKind::Npm), Some("npm"));
+        assert_eq!(package_manager_runtime(AcquireKind::Pip), Some("python3"));
+        assert_eq!(package_manager_runtime(AcquireKind::Go), Some("go"));
+        assert_eq!(package_manager_runtime(AcquireKind::Cargo), Some("cargo"));
+        assert_eq!(
+            package_manager_runtime(AcquireKind::DotnetTool),
+            Some("dotnet")
+        );
+        assert_eq!(package_manager_runtime(AcquireKind::HashicorpRelease), None);
+        assert_eq!(package_manager_runtime(AcquireKind::GithubRelease), None);
+        assert_eq!(package_manager_runtime(AcquireKind::UrlTemplate), None);
+    }
+
+    #[test]
+    fn is_package_manager_kind_matches_runtime_presence() {
+        for kind in [
+            AcquireKind::Npm,
+            AcquireKind::Pip,
+            AcquireKind::Go,
+            AcquireKind::Cargo,
+            AcquireKind::DotnetTool,
+        ] {
+            assert!(
+                is_package_manager_kind(kind),
+                "{kind:?} should be a package-manager kind"
+            );
+        }
+        for kind in [
+            AcquireKind::HashicorpRelease,
+            AcquireKind::GithubRelease,
+            AcquireKind::UrlTemplate,
+        ] {
+            assert!(
+                !is_package_manager_kind(kind),
+                "{kind:?} should not be a package-manager kind"
+            );
+        }
+    }
+
+    // ── package-manager acquisition: binary-path resolution (#1346) ─────
+    //
+    // Pure, no filesystem access — `package_manager_binary_path` is a
+    // function of `(kind, dir, bin, platform)` alone, including the
+    // Windows `Scripts\`/`.exe` variants the #1346 acceptance criteria
+    // call out explicitly.
+
+    #[test]
+    fn package_manager_binary_path_npm_unix_and_windows() {
+        let dir = Path::new("/tools/pyright-langserver/latest");
+        assert_eq!(
+            package_manager_binary_path(
+                AcquireKind::Npm,
+                dir,
+                "pyright-langserver",
+                Platform::Linux
+            ),
+            dir.join("node_modules")
+                .join(".bin")
+                .join("pyright-langserver")
+        );
+        assert_eq!(
+            package_manager_binary_path(
+                AcquireKind::Npm,
+                dir,
+                "pyright-langserver",
+                Platform::MacOS
+            ),
+            dir.join("node_modules")
+                .join(".bin")
+                .join("pyright-langserver")
+        );
+        assert_eq!(
+            package_manager_binary_path(
+                AcquireKind::Npm,
+                dir,
+                "pyright-langserver",
+                Platform::Windows
+            ),
+            dir.join("node_modules")
+                .join(".bin")
+                .join("pyright-langserver.cmd"),
+            "npm's windows shim is a .cmd file, not a bare .exe"
+        );
+    }
+
+    #[test]
+    fn package_manager_binary_path_pip_unix_and_windows() {
+        let dir = Path::new("/tools/pylsp/latest");
+        assert_eq!(
+            package_manager_binary_path(AcquireKind::Pip, dir, "pylsp", Platform::Linux),
+            dir.join("bin").join("pylsp")
+        );
+        assert_eq!(
+            package_manager_binary_path(AcquireKind::Pip, dir, "pylsp", Platform::MacOS),
+            dir.join("bin").join("pylsp")
+        );
+        assert_eq!(
+            package_manager_binary_path(AcquireKind::Pip, dir, "pylsp", Platform::Windows),
+            dir.join("Scripts").join("pylsp.exe"),
+            "windows venvs put console scripts under Scripts\\ with a .exe extension"
+        );
+    }
+
+    #[test]
+    fn package_manager_binary_path_go_and_cargo_unix_and_windows() {
+        let dir = Path::new("/tools/gopls/latest");
+        for kind in [AcquireKind::Go, AcquireKind::Cargo] {
+            assert_eq!(
+                package_manager_binary_path(kind, dir, "gopls", Platform::Linux),
+                dir.join("bin").join("gopls")
+            );
+            assert_eq!(
+                package_manager_binary_path(kind, dir, "gopls", Platform::Windows),
+                dir.join("bin").join("gopls.exe")
+            );
+        }
+    }
+
+    #[test]
+    fn package_manager_binary_path_dotnet_tool_unix_and_windows() {
+        let dir = Path::new("/tools/csharprepl/latest");
+        assert_eq!(
+            package_manager_binary_path(
+                AcquireKind::DotnetTool,
+                dir,
+                "csharprepl",
+                Platform::Linux
+            ),
+            dir.join("csharprepl"),
+            "dotnet tool install --tool-path puts the launcher directly in <dir>, no bin/"
+        );
+        assert_eq!(
+            package_manager_binary_path(
+                AcquireKind::DotnetTool,
+                dir,
+                "csharprepl",
+                Platform::Windows
+            ),
+            dir.join("csharprepl.exe")
+        );
+    }
+
+    // ── package-manager acquisition: install orchestration (#1346) ──────
+
+    #[test]
+    #[cfg(unix)]
+    fn link_binary_into_prefix_creates_a_relative_symlink_that_survives_rename() {
+        // The correctness property the doc comment on `link_binary_into_prefix`
+        // calls out: an *absolute* symlink baked with the staging path would
+        // dangle the instant `install_via_package_manager`'s `rename_or_copy`
+        // moves the whole staged prefix into its final `version_dir` location.
+        // Reproduce that move here and confirm the link still resolves.
+        let root = std::env::temp_dir().join(format!(
+            "vimcode_test_link_survives_rename_{}",
+            unique_suffix()
+        ));
+        let stage_dir = root.join("stage");
+        std::fs::create_dir_all(stage_dir.join("bin")).unwrap();
+        std::fs::write(stage_dir.join("bin").join("gopls"), b"#!fake-gopls").unwrap();
+        let installed_bin = stage_dir.join("bin").join("gopls");
+
+        let link_name =
+            link_binary_into_prefix(&installed_bin, &stage_dir, "gopls", Platform::Linux).unwrap();
+        assert_eq!(link_name, "gopls");
+        assert_eq!(
+            std::fs::read(stage_dir.join("gopls")).unwrap(),
+            b"#!fake-gopls"
+        );
+
+        // Rename the whole staged prefix, as `install_via_package_manager`'s
+        // `rename_or_copy` does on the common (same-filesystem) path.
+        let version_dir = root.join("version");
+        std::fs::rename(&stage_dir, &version_dir).unwrap();
+        assert_eq!(
+            std::fs::read(version_dir.join("gopls")).unwrap(),
+            b"#!fake-gopls",
+            "a relative symlink must still resolve after its containing \
+             directory is renamed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn link_binary_into_prefix_is_a_noop_for_dotnet_tool_top_level_binary() {
+        // `DotnetTool`'s `package_manager_binary_path` already returns a
+        // top-level path — linking it to itself must not delete it (see the
+        // doc comment on the `installed_bin == link_path` guard).
+        let root =
+            std::env::temp_dir().join(format!("vimcode_test_link_dotnet_noop_{}", unique_suffix()));
+        std::fs::create_dir_all(&root).unwrap();
+        let installed_bin = root.join("csharprepl");
+        std::fs::write(&installed_bin, b"#!fake-csharprepl").unwrap();
+
+        let link_name =
+            link_binary_into_prefix(&installed_bin, &root, "csharprepl", Platform::Linux).unwrap();
+        assert_eq!(link_name, "csharprepl");
+        assert_eq!(
+            std::fs::read(root.join("csharprepl")).unwrap(),
+            b"#!fake-csharprepl",
+            "the installed binary must survive a would-be self-link"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn install_via_package_manager_rejects_traversal_in_tool_name() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("pkgmgr_traversal_tool_name");
+
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            ..Default::default()
+        };
+        let err = install_via_package_manager("../../etc", &cfg, Platform::Linux).unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn install_via_package_manager_rejects_traversal_in_version() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("pkgmgr_traversal_version");
+
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            version: "../../../etc".to_string(),
+            ..Default::default()
+        };
+        let err =
+            install_via_package_manager("pyright-langserver", &cfg, Platform::Linux).unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn install_via_package_manager_rejects_traversal_in_binary_path() {
+        // #1346 review: a community-submitted manifest's `binary_path` was
+        // joined onto `stage_dir` (via `package_manager_binary_path` and
+        // then `link_binary_into_prefix`'s `stage_dir.join(bin_name)`) with
+        // no traversal guard at all — a `binary_path` like
+        // `"../../../../../../.ssh/authorized_keys"` made
+        // `link_binary_into_prefix` `remove_file` + symlink an arbitrary
+        // path outside `stage_dir`. Must be rejected before any filesystem
+        // mutation happens, mirroring the sibling `tool_name`/`version`
+        // traversal tests above.
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("pkgmgr_traversal_binary_path");
+
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            binary_path: "../../../../../../.ssh/authorized_keys".to_string(),
+            ..Default::default()
+        };
+        let err =
+            install_via_package_manager("pyright-langserver", &cfg, Platform::Linux).unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+
+        // A bare `/`-separated path with no `..` component would pass the
+        // looser `is_safe_relative_path` check that guards `tool_name`/
+        // `version` above — it must still be rejected here, since
+        // `binary_path` for a package-manager kind names a single
+        // executable, never a nested path (see the field's own doc
+        // comment).
+        let cfg_nested = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "pyright".to_string(),
+            binary_path: "some/nested/pyright".to_string(),
+            ..Default::default()
+        };
+        let err = install_via_package_manager("pyright-langserver", &cfg_nested, Platform::Linux)
+            .unwrap_err();
+        assert!(matches!(err, AcquireError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn tail_of_keeps_only_the_last_n_non_empty_lines() {
+        let text = "line1\n\nline2\nline3\nline4\n";
+        assert_eq!(tail_of(text, 2), "line3\nline4");
+        assert_eq!(tail_of(text, 10), "line1\nline2\nline3\nline4");
+        assert_eq!(tail_of("", 5), "");
+    }
+
+    /// #1346 acceptance criterion: "on failure, surface the last lines of
+    /// stderr in the notification". Drives a real, deterministically-failing
+    /// subprocess (the actual `sh` binary, not a mocked `Command`) so the
+    /// spawn → non-zero exit → stderr-capture path in
+    /// `run_package_manager_steps` is exercised end-to-end, with no
+    /// dependency on `npm`/`pip`/`go`/`cargo`/`dotnet` actually being
+    /// installed (or reachable over the network) on the machine running the
+    /// suite.
+    #[test]
+    #[cfg(unix)]
+    fn run_package_manager_steps_surfaces_stderr_tail_on_failure() {
+        let steps = vec![PackageManagerStep {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo boom-1346 >&2; exit 7".to_string(),
+            ],
+            env: vec![],
+        }];
+        let err = run_package_manager_steps(&steps).unwrap_err();
+        match err {
+            AcquireError::Archive(msg) => {
+                assert!(
+                    msg.contains("boom-1346"),
+                    "failure message should carry the failing step's stderr; got: {msg}"
+                );
+            }
+            other => panic!("expected an Archive error carrying stderr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_package_manager_steps_stops_at_the_first_failing_step() {
+        // The second step must never run once the first one fails — a
+        // half-applied install (e.g. a venv created but never populated)
+        // should never be mistaken for a complete one.
+        let sentinel = std::env::temp_dir().join(format!(
+            "vimcode_test_pkgmgr_steps_sentinel_{}",
+            unique_suffix()
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+        let steps = vec![
+            PackageManagerStep {
+                argv: vec!["sh".to_string(), "-c".to_string(), "exit 1".to_string()],
+                env: vec![],
+            },
+            PackageManagerStep {
+                argv: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("touch {}", sentinel.display()),
+                ],
+                env: vec![],
+            },
+        ];
+        assert!(run_package_manager_steps(&steps).is_err());
+        assert!(
+            !sentinel.exists(),
+            "the second step must never run once the first one failed"
+        );
+    }
+
+    #[test]
+    fn acquire_and_install_for_routes_package_manager_kinds_around_resolve_asset() {
+        // `resolve_asset` (the archive-kind resolver) must never be reached
+        // for a package-manager kind — a `BadConfig` from it would be a
+        // confusing "no release asset matches" message for something that
+        // was never trying to download a release archive at all.
+        for kind in [
+            AcquireKind::Npm,
+            AcquireKind::Pip,
+            AcquireKind::Go,
+            AcquireKind::Cargo,
+            AcquireKind::DotnetTool,
+        ] {
+            let cfg = AcquireConfig {
+                kind,
+                package: "irrelevant".to_string(),
+                ..Default::default()
+            };
+            let err = resolve_asset(&cfg, Platform::Linux, Arch::Amd64).unwrap_err();
+            assert!(
+                matches!(err, AcquireError::BadConfig(_)),
+                "{kind:?} routed into resolve_asset instead of being dispatched around it"
+            );
+        }
+    }
+
+    // ── package-manager acquisition: live smoke (operator-run only) ─────
+    //
+    // Real network + real `npm`/`python3` on PATH — never run in CI. Verify
+    // manually with:
+    //   cargo test --lib tool_acquire::tests::live_npm_acquire -- --ignored
+    //   cargo test --lib tool_acquire::tests::live_pip_acquire -- --ignored
+
+    #[test]
+    #[ignore]
+    fn live_npm_acquire_installs_a_real_package_with_a_bin() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("live_npm");
+
+        // `cowsay` is a small, stable npm package that ships a `bin` entry
+        // named `cowsay` — exercises the full path: `npm install --prefix`,
+        // `package_manager_binary_path`'s `node_modules/.bin` lookup, the
+        // relative-symlink-into-the-staging-prefix step, and the atomic
+        // rename into `managed_tool_version_dir`.
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Npm,
+            package: "cowsay".to_string(),
+            binary_path: "cowsay".to_string(),
+            ..Default::default()
+        };
+        let result =
+            install_via_package_manager("vimcode-live-smoke-cowsay", &cfg, Platform::host());
+        let path = result.expect("npm acquire of cowsay should succeed");
+        assert!(
+            path.is_file(),
+            "resolved path {} should be a real, executable file",
+            path.display()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn live_pip_acquire_installs_a_real_package_with_a_console_script() {
+        let _lock = DATA_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = DataHomeGuard::new("live_pip");
+
+        // `pycowsay` ships a `pycowsay` console script — exercises the venv
+        // creation, `pip install`, `bin/`/`Scripts\` binary-path resolution,
+        // and the same link/rename plumbing as the npm smoke test above.
+        let cfg = AcquireConfig {
+            kind: AcquireKind::Pip,
+            package: "pycowsay".to_string(),
+            binary_path: "pycowsay".to_string(),
+            ..Default::default()
+        };
+        let result =
+            install_via_package_manager("vimcode-live-smoke-pycowsay", &cfg, Platform::host());
+        let path = result.expect("pip acquire of pycowsay should succeed");
+        assert!(
+            path.is_file(),
+            "resolved path {} should be a real, executable file",
+            path.display()
+        );
+    }
 }

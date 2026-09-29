@@ -71,25 +71,348 @@
 //! issue's "Machine" section and `Cargo.toml`'s `win` feature comment for
 //! why `mlua`'s vendored Lua C build is the thing that actually requires
 //! the cross C toolchain, not anything in this file.
+//!
+//! # #1558: activity-bar / tab-bar Nerd Font glyphs are a quadraui gap, not
+//! # a vimcode-side one
+//!
+//! vimcode#1558 reports activity-bar icons painting as ASCII placeholder
+//! characters and tab-bar file icons painting as a generic glyph on
+//! Win-GUI, despite Nerd Font Icons being on. Investigated (root cause
+//! confirmed for the activity-bar half, hypothesised for the tab-bar half)
+//! and found to be entirely inside `quadraui::win::activity_bar`/
+//! `quadraui::win::text` — see `docs/PENDING_QUADRAUI_ISSUES.md`'s two new
+//! entries for the full analysis. Nothing in this file or `backend.rs`
+//! changes: `App::setup` already calls `render::register_nerd_font_fallback`
+//! identically for every backend (this module has no special-cased font
+//! registration to add), and per the Platform-Neutrality Rule a Win-GUI-only
+//! icon-selection fix does not belong in a vimcode backend wrapper. Leave
+//! #1558 open until the quadraui issues are filed and land.
+//!
+//! **Real-hardware verification was attempted on dell64** per #1558's own
+//! "Verify on real Windows" section (which correctly notes a Windows host
+//! *does* exist in this fleet). What was actually run, in order:
+//! 1. `cargo xwin build --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --bin vimcode` — succeeded, real
+//!    PE32+ exe.
+//! 2. The resulting `vimcode.exe` launched **directly** via WSL interop
+//!    (`"$EXE" --version`, not wine) — succeeded, printed the real version
+//!    banner including the quadraui rev, and (launched with a file argument)
+//!    created a real `HWND` on dell64's actual Windows desktop (confirmed
+//!    via `Get-Process | Select MainWindowHandle` from PowerShell and a
+//!    `PrintWindow` capture that shows the real DWM-drawn titlebar chrome
+//!    with the app's own taskbar icon rendering correctly).
+//! 3. `cargo xwin test --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --lib --no-run`, then the printed
+//!    `vimcode_core-*.exe` run directly (the recipe #1558 gives for the
+//!    `win_driver_tests` module below) — this is where verification stalled,
+//!    for two independent, dell64-specific reasons, neither of which is "no
+//!    Windows host":
+//!    - The lib test binary as built on this branch didn't even compile at
+//!      first: `poll_until_auth_choice_dialog` in
+//!      `src/core/engine/acp_ops.rs` was missing the `#[cfg(unix)]` its sole
+//!      callers and its own `poll_acp_until` helper already carry — a
+//!      pre-existing bug unrelated to #1558, fixed alongside this commit.
+//!    - Once compiling, the resulting `vimcode_core-*.exe` — unlike
+//!      `vimcode.exe` above — exits immediately on dell64 with
+//!      `STATUS_ENTRYPOINT_NOT_FOUND` (confirmed via
+//!      `Start-Process -PassThru`'s real `ExitCode`, `-1073741511` /
+//!      `0xC0000139`) before printing anything, even `--version`/`--help`.
+//!      A from-scratch minimal `cargo xwin test --no-run` crate (a single
+//!      `#[test] fn it_works()`) runs fine directly via the same WSL interop
+//!      path on the same host, so this is not a generic
+//!      "WSL can't run cross-built test binaries" limitation — it is
+//!      specific to vimcode's own `--lib` test binary (44 MB, statically
+//!      links `mlua`'s vendored Lua C build, tree-sitter grammars, and
+//!      every `#[cfg(test)]` module in the crate) and needs its own
+//!      follow-up investigation on real hardware, separate from #1558.
+//!    - Pixel-level confirmation via screenshot was also attempted directly
+//!      against the running `vimcode.exe` GUI window (both `BitBlt`-based
+//!      `Graphics.CopyFromScreen` and `PrintWindow` with
+//!      `PW_RENDERFULLCONTENT`), but dell64's interactive console session
+//!      (session 1, confirmed active and holding a real `\\.\DISPLAY1`) was
+//!      locked at the OS level during this session (`Get-Process -Name
+//!      logonui` returned a running process, the definitive signal) —
+//!      Windows blocks GDI screen/window-content capture on a locked
+//!      session regardless of what's actually painted underneath, which is
+//!      why `CopyFromScreen` came back solid black and `PrintWindow` only
+//!      returned the DWM-drawn titlebar chrome, not the Direct2D-painted
+//!      client area. This is an OS security restriction independent of
+//!      vimcode/quadraui rendering correctness, not evidence either way for
+//!      the reported bug.
+//!
+//! Net: the activity-bar root cause above is confirmed by source inspection
+//! (cross-referenced against the exact pinned quadraui rev) and independently
+//! corroborated by dell64 successfully building and directly launching the
+//! real `vimcode.exe`; the acceptance bar's "Windows test asserts a real
+//! font face" criterion remains genuinely blocked on dell64 by the two
+//! dell64-local issues above (test-binary loader crash; locked interactive
+//! session blocking screen capture), not by absence of a Windows host.
+//!
+//! # #1561: left-edge desktop strip — no quadraui source-level defect found;
+//! # live pixel verification stayed blocked, and a new dell64-local wrinkle
+//! # surfaced along the way
+//!
+//! vimcode#1561 reports a thin (~6px) strip along the window's left edge
+//! showing the desktop through it. The two hypotheses the issue text names
+//! ("non-client insets subtracted twice, or physical vs. logical pixels")
+//! were checked directly against `quadraui::win::backend::WinBackend`
+//! (pinned rev `9f8766d3`), `attach_surface` and `resize_surface`
+//! specifically:
+//!
+//! ```text
+//! let mut rect = RECT::default();
+//! GetClientRect(hwnd, &mut rect)?;
+//! let width = (rect.right - rect.left).max(1) as u32;
+//! let height = (rect.bottom - rect.top).max(1) as u32;
+//! // ... single D2D_SIZE_U { width, height } fed straight to
+//! // CreateHwndRenderTarget; resize_surface's WM_SIZE-driven `Resize`
+//! // call is the same single width/height pair, no per-edge split.
+//! ```
+//!
+//! Both call sites derive the render target's pixel size from one
+//! un-split `GetClientRect`/`WM_SIZE` pair — there is no separate
+//! left/right/top/bottom computation anywhere in `win::backend`/`win::run`
+//! for either to double-subtract, and no DIP↔physical conversion happens
+//! on the render-target size itself (`dpi_scale` only scales
+//! `Viewport`/hit-testing, never the `D2D_SIZE_U` passed to
+//! `CreateHwndRenderTarget`/`Resize`). So neither hypothesised bug shape
+//! exists in the source as pinned.
+//!
+//! **Real-hardware verification was attempted on dell64** (this fleet's
+//! real Windows 11 host) per this issue's own "Verify on real Windows"
+//! section, going one step further than #1558/#1559's attempts:
+//! 1. `cargo xwin build --release --target x86_64-pc-windows-msvc
+//!    --no-default-features --features win --bin vimcode` succeeded, and
+//!    the resulting `vimcode.exe` was launched **directly** (WSL2 interop,
+//!    not wine) against a real `HWND` on dell64's desktop, confirmed via
+//!    `Get-Process -PassThru`'s real `MainWindowHandle`.
+//! 2. dell64's interactive session was, again, independently confirmed
+//!    locked (`Get-Process -Name logonui` running in the same session
+//!    `query session` reports as the active console session;
+//!    `GetForegroundWindow()` returns `NULL`) — the same blocker
+//!    #1558/#1559 hit, not "no Windows host in this fleet".
+//!    `Graphics.CopyFromScreen` against the live window rect came back
+//!    solid black, exactly as those two issues' docs already record.
+//! 3. **New this session:** `PrintWindow` with `PW_RENDERFULLCONTENT`
+//!    (the workaround #1558 tried and found returned only DWM chrome) was
+//!    retried and this time *did* return real client-area pixels — but
+//!    cross-checking `GetWindowRect`/`GetClientRect`/
+//!    `DWMWA_EXTENDED_FRAME_BOUNDS` against the captured bitmap showed:
+//!    - The gap between `GetWindowRect` and the first painted (non-black)
+//!      column/row was **identical (8 physical px) on the left, right,
+//!      and bottom edges** of a freshly-launched, untouched window — i.e.
+//!      symmetric, not left-specific — and matches Windows' own
+//!      documented invisible `WS_THICKFRAME` resize-border hit-test
+//!      margin present on every classic-style top-level window, which
+//!      `DWMWA_EXTENDED_FRAME_BOUNDS` (the actually-visible, DWM-composited
+//!      frame) already excludes: the painted content's on-screen position
+//!      lined up with `DWMWA_EXTENDED_FRAME_BOUNDS`'s edges to within 1px
+//!      on every side. Nothing about that measurement points at a
+//!      left-specific defect, in the source or on the glass.
+//!    - Repeating the capture after `SW_MAXIMIZE`, then again after an
+//!      external `SetWindowPos` to a new size (`GetClientRect` itself
+//!      *did* update both times, proving Windows genuinely resized the
+//!      window), and again after an explicit `InvalidateRect` +
+//!      `UpdateWindow`, kept returning the **same painted content pinned
+//!      at its original launch size** in the corner of the new, larger
+//!      capture, never stretching to fill it. That is inconsistent with
+//!      live re-rendering and far more consistent with a locked/secure-
+//!      desktop session suspending real composition for a fully-occluded
+//!      window — `PrintWindow(PW_RENDERFULLCONTENT)` reads from DWM's own
+//!      redirection surface, and Microsoft does not document that surface
+//!      as guaranteed-fresh for an occluded window. In other words: this
+//!      workaround's pixel data cannot be trusted as "what a user would
+//!      actually see" while dell64's session stays locked, so it can
+//!      neither confirm nor rule out #1561's reported strip.
+//!
+//! **Net:** no left-specific defect exists in `win::backend`'s sizing
+//! arithmetic as pinned, and no quadraui-side fix is proposed here — filing
+//! a `docs/PENDING_QUADRAUI_ISSUES.md` entry needs a concrete ask, and
+//! "the render-target sizing already looks correct" isn't one. What #1561
+//! actually needs next is a **live, unlocked** dell64 session (or another
+//! Windows host) at both 100% and 150% scaling, so a real DWM-composited
+//! screenshot — not `PrintWindow`'s possibly-stale redirection-surface
+//! read — can confirm whether the strip is real, and if so, isolate which
+//! of `win::run`'s window-class/style choices (not sizing arithmetic, which
+//! this session already cleared) produces it. Leave #1561 open.
+//!
+//! # #1562: Win-GUI chrome parity with macOS (font / title bar / status
+//! # segments) — two of three items already resolved, the third is a real,
+//! # substantial quadraui gap
+//!
+//! vimcode#1562 asks for three separate things. Investigated each against
+//! the pinned quadraui rev (`9f8766d3`, unchanged from the `a58e5bec` pin
+//! the issue's own real-hardware observation names — `a58e5bec` is 12
+//! commits *behind* `9f8766d3` in quadraui's history, so nothing relevant
+//! moved between the observation and this pin).
+//!
+//! **Item 1 (UI font resolves to a real Windows face, not literal
+//! `"Monospace"`) — already fixed upstream, nothing to do here.**
+//! `quadraui::win::backend::parse_ui_font_desc` and `WinBackend::
+//! set_editor_font`/`set_ui_font` already resolve the fontconfig/Pango
+//! generic alias via `GenericFamily::parse`: `Monospace` →
+//! `DEFAULT_EDITOR_FONT_FAMILY` (`"Consolas"`), `SansSerif`/`SystemUi` →
+//! `DEFAULT_UI_FONT_FAMILY` (`"Segoe UI"`) — confirmed present verbatim at
+//! *both* `a58e5bec` and the current `9f8766d3` pin, so this was already
+//! true at the moment the issue's Windows/macOS comparison was made, not
+//! something this session's pin bump fixed. `App::sync_per_frame_backend_
+//! state` (`src/app.rs`) calls `backend.set_ui_font(&UI_FONT())` and
+//! `backend.set_editor_font(...)` unconditionally for every GUI backend —
+//! no per-backend vimcode wiring gap either. The Settings sidebar showing
+//! **Font Family: `Monospace`** is the intended, platform-neutral sentinel
+//! value (`core::settings::default_font_family`'s own #1129/#1542 doc): it
+//! displays the *raw stored setting*, not the backend-resolved face, and
+//! macOS shows the identical literal string for the identical reason (its
+//! own `font_family` default is the same shared `"Monospace"`) — this is
+//! not Windows-specific behaviour and not a defect.
+//!
+//! **Item 3 (status-line segments: branch, encoding, line endings,
+//! indentation, language, LSP) — already shared code, no per-backend
+//! drop found.** `WinBackend::draw_status_bar_interactive` and
+//! `MacBackend`'s equivalent both route through the *identical*
+//! `quadraui::primitives::status_bar::native_surface_paint::paint`
+//! rasteriser (the "NativeSurface Phase 4" migration folded status-bar
+//! painting into one shared function for every `px()` backend), and
+//! vimcode's own segment list (`render.rs`'s `StatusSegment` construction)
+//! is already fully backend-neutral, with the same width-based
+//! priority-drop (#164) on every backend. No source-level defect found
+//! that would drop segments on Windows specifically; the narrower set
+//! observed during the 2026-09-27 side-by-side is more likely a
+//! window-width/DPI difference between the two compared windows than a
+//! code path. Needs a real-hardware re-comparison at matched window widths
+//! to confirm one way or the other, not a code change — left open pending
+//! that, not closed.
+//!
+//! **Item 2 (custom title bar + command centre) — a real, confirmed
+//! quadraui-side gap.** vimcode's own title-bar band and command centre
+//! (`App::render_content`'s `FrameOp::CommandCenter` rung, `render::
+//! build_command_center_view`/`paint_command_center_rung`) are fully
+//! backend-neutral and gated only on the reserved band existing
+//! (`RenderPresence::command_center`, `render.rs`) — not on which backend
+//! is running — so the search box and its back/forward buttons *would*
+//! already paint on Windows once the band is reliably live. What actually
+//! blocks that:
+//!
+//! - `App::render_content`'s menu-bar-visibility decision is a three-way
+//!   branch on `backend.backend_caps()`: `native_menu` (real OS menu bar,
+//!   macOS) / `window_chrome` (drawn row pinned always-visible, doubling
+//!   as the client-side titlebar — GTK today) / neither (fully toggleable,
+//!   the TUI `cell`-profile posture, starting hidden outside vscode-mode).
+//!   `quadraui::win::backend::WinBackend::backend_caps()` declares neither
+//!   flag — confirmed by reading its struct literal at the pinned rev — so
+//!   Win-GUI silently falls into the third, TUI-shaped arm, even though
+//!   `App::render_content`'s own comment already names this gap ("GTK's
+//!   (and any future Win-GUI's) drawn menu bar doubles as the client-side
+//!   titlebar"). The practical effect: the band (and everything painted
+//!   into it, menu row and command centre alike) starts hidden/toggleable
+//!   rather than pinned visible, unlike GTK.
+//! - `quadraui::win::run` (`win/run.rs`) creates its top-level window with
+//!   plain `WS_OVERLAPPEDWINDOW` — the real Win32 caption, native
+//!   min/max/close and resize border — with no `WM_NCCALCSIZE`/
+//!   `WM_NCHITTEST` client-area extension the way a modern custom-caption
+//!   Windows app needs to fold its own drawn band into that caption
+//!   instead of stacking a second row underneath it. So even once the cap
+//!   above is fixed, today's Windows chrome would still be a real native
+//!   caption *plus* a separate drawn band underneath it, not the single
+//!   "custom-drawn caption with native min/max/close" #1562 asks for.
+//!
+//! Both halves are quadraui infrastructure (`WinBackend::backend_caps`,
+//! `win::run`'s window style/message handling), not a `src/win/` wrapper
+//! decision — per the Platform-Neutrality Rule this is not a fix to
+//! attempt here. Drafted as a pending quadraui issue in
+//! `docs/PENDING_QUADRAUI_ISSUES.md` (new entry) rather than built in this
+//! crate.
+//!
+//! **Update (#1614):** the title-bar/command-centre fix landed upstream as
+//! quadraui#1199 (`WinBackend::backend_caps()` declares `window_chrome:
+//! true`, `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`),
+//! and `App::render_content`'s existing three-way branch needed no change
+//! to pick it up, confirming the analysis above. **The pin was not
+//! bumped**, though: the quadraui rev containing #1199 also contains
+//! #1200 (native menu bar), and real-hardware verification on dell64 found
+//! #1200 crashes `vimcode.exe` on every startup before any window shows
+//! (`RefCell already borrowed` panic inside `win::run`'s `wndproc`,
+//! reentered synchronously from `SetMenu`). Full repro and a fix sketch
+//! are drafted as a new `docs/PENDING_QUADRAUI_ISSUES.md` entry. Leave
+//! this item of #1562 open behind that regression, not behind the
+//! original `window_chrome` gap — the status-segment item still separately
+//! needs its own real-hardware re-check once Win-GUI can start again.
+//!
+//! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
+//! # gap #1562 found, but the narrower `native_menu` half of it
+//!
+//! vimcode#1582 reports `vimcode.exe` shows **no menu bar at all** on a
+//! fresh launch — nothing discoverable to reach File/Edit/View/etc. without
+//! already knowing a keybinding. This is the identical root cause the
+//! `#1562` section above already found and documented (`App::setup`'s
+//! three-way branch on `backend.backend_caps()` falls into the fully-hidden
+//! `cell`/TUI arm because `WinBackend::backend_caps()` sets neither
+//! `native_menu` nor `window_chrome`), so nothing new needed re-deriving —
+//! see that section for the full read-through of `App::setup`'s branch.
+//!
+//! What #1582 changes is *which half* of the fix to pursue. `#1562`'s own
+//! ask (drafted in `docs/PENDING_QUADRAUI_ISSUES.md`) needs the
+//! `window_chrome` path — a drawn row that doubles as the client-side
+//! titlebar — which is gated on `win::run` first growing
+//! `WM_NCCALCSIZE`/`WM_NCHITTEST` custom-caption handling (declaring the cap
+//! before that lands would just stack a second drawn row under the real
+//! native caption). #1582 only asks for a menu bar being *present and
+//! clickable*, which the *other* named path — `native_menu`, the same one
+//! macOS already uses — satisfies with no window-style change at all: a
+//! real Win32 `HMENU` attached via `SetMenu` sits underneath the existing
+//! native caption the ordinary way any classic Win32 app's menu does, the
+//! same shape `crate::event::UiEvent::MenuActivated`'s own doc comment
+//! already earmarks for it ("future Win32 `SetMenu`", `quadraui/src/
+//! event.rs`). `App::setup`'s `native_menu` arm (`src/app.rs` L8493–8526)
+//! already builds the `MenuBar` from the same platform-neutral `MenuDef`s
+//! every backend shares and calls `Backend::install_menu_bar` unconditionally
+//! for any backend declaring the cap, and `App::handle_event` already
+//! matches `UiEvent::MenuActivated` with no backend-specific branch
+//! (`src/app.rs` L7808) — both proven live today by macOS, so **no
+//! vimcode-side change is needed** once `WinBackend` implements
+//! `install_menu_bar` and declares `native_menu: true`. Both are entirely
+//! inside `quadraui::win` (`win/backend.rs`'s trait impl, `win/run.rs`'s
+//! `wndproc` gaining a `WM_COMMAND` arm) — per the Platform-Neutrality Rule
+//! this is not a fix to attempt in this crate. Drafted as a new pending
+//! quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`, explicitly scoped
+//! to the `native_menu` path so it does not duplicate or conflict with
+//! `#1562`'s separate `window_chrome` entry — either can land
+//! independently, and #1582 needs only this one.
+//!
+//! **Update (#1614):** `WinBackend::install_menu_bar`/`native_menu: true`
+//! landed upstream as quadraui#1200, and confirmed the prediction above —
+//! `App::setup`'s existing `native_menu` arm and `App::handle_event`'s
+//! existing `MenuActivated` match need no vimcode-side change. But
+//! real-hardware verification on dell64 found #1200 itself is broken:
+//! `install_menu_bar_now`'s `SetMenu` call re-enters `win::run`'s
+//! `wndproc` with a nested `WM_SIZE` while the outer call already holds
+//! `ws.state.borrow_mut()`, panicking (`RefCell already borrowed`) and
+//! aborting the process — 100% reproducible, every launch, confirmed at
+//! both `cc2b80d` and `928f2b5`. Isolated to #1200 specifically (the
+//! immediately-prior pin, `db92e46`, launches cleanly; adding #1199's
+//! `window_chrome` on top makes no difference to the crash). **The pin
+//! was not bumped.** Full repro, isolation table and a fix sketch are in
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — file that on quadraui
+//! and get a fix merged before #1582 can be verified, let alone closed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 pub(crate) mod backend;
 
-use crate::app::{App, TextMetricsBackend};
+use crate::app::App;
 
 /// Entry point for the native Win-GUI, mirroring `crate::gtk::run` /
 /// `crate::macos::run`.
 ///
 /// Panic hook + swap flush, choose the backend, construct the shared
-/// [`App`], derive its [`quadraui::ShellConfig`] via the same
-/// `App::shell_config()` the macOS entry point calls (#866 — no
-/// per-backend copy of that logic here, see `crate::gtk::build_shell_config`'s
-/// doc comment), hand both to the runner. Nothing else — no `gtk4::init`
-/// equivalent, because `quadraui::win::run`'s Win32 bootstrap
-/// (`RegisterClassExW`/`CreateWindowExW`/the message loop) does its own
-/// setup inside `run_with_shell`.
+/// [`App`], derive its [`quadraui::ShellConfig`] via [`build_shell_config`]
+/// (#866 — no per-backend copy of the panel/title-bar/sidebar-clamp logic
+/// here, see `crate::gtk::build_shell_config`'s doc comment for why that
+/// lives once, in `App::shell_config`, instead), hand both to the runner.
+/// Nothing else — no `gtk4::init` equivalent, because `quadraui::win::run`'s
+/// Win32 bootstrap (`RegisterClassExW`/`CreateWindowExW`/the message loop)
+/// does its own setup inside `run_with_shell`.
 pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The same panic hook `crate::gtk::run` / `crate::macos::run` install:
     // flush every dirty buffer to its swap file, then write a crash log.
@@ -98,33 +421,92 @@ pub fn run(file_path: Option<PathBuf>) -> ExitCode {
     // The concrete backend is chosen here, at the entry point, and handed to
     // `App` — the seam #861 opened and `src/gtk/mod.rs::run` names in its
     // own comment as the one "a future non-GTK wrapper (#859) would pass a
-    // different `TextMetricsBackend` impl through". This is that wrapper's
+    // different `quadraui::Backend` impl through". This is that wrapper's
     // Win-GUI sibling.
-    let text_metrics_backend: std::rc::Rc<std::cell::RefCell<Box<dyn TextMetricsBackend>>> =
+    let concrete_backend: std::rc::Rc<std::cell::RefCell<Box<dyn quadraui::Backend>>> =
         std::rc::Rc::new(std::cell::RefCell::new(
             Box::new(backend::WinBackend::new()),
         ));
 
-    let app = App::new_portable(file_path, text_metrics_backend);
-    let config = app.shell_config();
+    let app = App::new_portable(
+        file_path,
+        concrete_backend,
+        crate::render::UnitProfile::px(),
+    );
+    let config = build_shell_config(&app);
     quadraui::win::shell_runner::run_with_shell(app, config)
 }
 
-// ── #969: `TextMetricsBackend` conformance (`WinBackend`) ──────────────────
+/// Derive the runner's [`quadraui::ShellConfig`] from an [`App`]'s engine
+/// state — the Win-GUI twin of `crate::gtk::build_shell_config` /
+/// `crate::macos::build_shell_config`.
+///
+/// Adds only [`quadraui::ShellConfig::with_app_icon`] on top of
+/// `app.shell_config()`: #1531/quadraui#1142's titlebar/taskbar icon.
+/// `WM_SETICON` (`ICON_BIG`/`ICON_SMALL`) needs a decodable image handed in
+/// explicitly — Win-GUI has no manifest icon resource here to fall back to.
+/// Split out (rather than inlined in [`run`]) so a headless test can assert
+/// the bytes reach `ShellConfig` without needing a live Win32 message loop.
+pub(crate) fn build_shell_config(app: &App) -> quadraui::ShellConfig {
+    app.shell_config()
+        .with_app_icon(quadraui::ImageSource::Bytes(
+            crate::app_support::APP_ICON_PNG.to_vec(),
+        ))
+}
+
+/// #1531/quadraui#1142: same reasoning as `crate::gtk`'s
+/// `shell_config_identity_tests` / `crate::macos`'s
+/// `shell_config_identity_tests` — no headless taskbar to render into and
+/// assert on (that's the SMOKE_TESTS item, run on real Windows hardware),
+/// but a headless build *can* assert the bytes reach the `ShellConfig` the
+/// real `run` hands `run_with_shell`, and that they decode as a real image.
+/// Runs on an ordinary Linux host under `cargo test --features win`, per
+/// this module's own "Why `feature = "win"` alone" doc — `build_shell_config`
+/// touches no WinAPI, only `quadraui::ShellConfig`.
+#[cfg(all(test, feature = "win"))]
+mod shell_config_identity_tests {
+    use super::{build_shell_config, App};
+    use crate::core::Engine;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_icon_reaches_shell_config_as_a_decodable_image() {
+        let engine = Rc::new(RefCell::new(Engine::new_for_test()));
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let app = App::new_headless_with_backend(engine, backend, crate::render::UnitProfile::px());
+        let config = build_shell_config(&app);
+        let quadraui::ImageSource::Bytes(bytes) = config
+            .app_icon
+            .expect("build_shell_config sets an app icon")
+        else {
+            panic!("app icon should be embedded bytes, not a path");
+        };
+        assert!(!bytes.is_empty());
+        assert!(
+            image::load_from_memory(&bytes).is_ok(),
+            "app icon bytes must decode as an image"
+        );
+    }
+}
+
+// ── #969: `quadraui::Backend` metric-setter conformance (`WinBackend`) ─────
 //
 // Unlike `win_driver_tests` below, this needs no `WinDriver`/
 // `quadraui::win::testing` at all — only `WinBackend::new()` plus the two
-// `TextMetricsBackend` setters and the `quadraui::Backend` getters they
-// feed, none of which are `target_os`-gated (see this module's own "Why
+// `set_current_line_height`/`set_current_char_width` setters
+// (JDonaghy/quadraui#1086) and the `quadraui::Backend` getters they feed,
+// none of which are `target_os`-gated (see this module's own "Why
 // `feature = "win"` alone" doc above — `current_line_height`/
 // `current_char_width` and their setters/getters are plain fields, not
 // WinAPI calls). So this runs on an ordinary Linux host under `cargo test
 // --features win`, with no Windows target and no cross toolchain — closing
-// the same gap #967 found on macOS (a `TextMetricsBackend` impl whose
-// metric setters silently no-op, disabling the #540/#819 click drift
-// guard) for this backend too, and doing it without needing Windows
-// hardware to run at all. See `crate::harness::assert_text_metrics_backend_applies_metrics`'s
-// doc for the full mechanism.
+// the same gap #967 found on macOS (a metric-setter override that silently
+// no-ops, disabling the #540/#819 click drift guard) for this backend too,
+// and doing it without needing Windows hardware to run at all. See
+// `crate::harness::assert_text_metrics_backend_applies_metrics`'s doc for
+// the full mechanism.
 #[cfg(all(test, feature = "win"))]
 mod win_backend_conformance {
     #[test]
@@ -177,12 +559,23 @@ mod win_backend_conformance {
 // exactly, `MacDriver`/`MacBackend` swapped for `WinDriver`/`WinBackend` — see
 // that module for the scenarios' own doc comments (RED-verification notes,
 // why scenario 3 clicks outside the popup rather than a specific row, …).
-// RED-verification itself could not be run against `WinDriver` for the same
-// reason actually *running* these needs real Windows: there is no Windows
-// host in this fleet. GTK and macOS were both RED-verified on real hardware
-// (a Linux lane and an `aarch64-apple-darwin` Mac mini respectively) against
-// the identical vimcode-side mutation — see `src/macos/mod.rs`'s copy of
-// this scenario for that note.
+// RED-verification itself could not be run against `WinDriver`, but **not**
+// for "no Windows host in this fleet" (dell64 runs a real Windows 11 desktop
+// under WSL2 interop and is this repo's designated Windows machine — see
+// #1558's "Verify on real Windows" section, which named and corrected this
+// exact stale claim). `cargo xwin build --bin vimcode` and direct (non-wine)
+// execution of the result both work fine on dell64 today. The blocker is
+// narrower: as of #1558's investigation, the `cargo xwin test --lib --no-run`
+// product crashes at Windows DLL-load time on dell64
+// (`STATUS_ENTRYPOINT_NOT_FOUND`, reproduced and isolated to vimcode's own
+// test binary — see `src/win/mod.rs`'s top-of-file `#1558` doc section for
+// the full repro) before any `#[test]` in this module gets to run, and
+// dell64's interactive session was independently locked (blocking pixel-level
+// GUI capture) during that same investigation. GTK and macOS were both
+// RED-verified on real hardware (a Linux lane and an `aarch64-apple-darwin`
+// Mac mini respectively) against the identical vimcode-side mutation — see
+// `src/macos/mod.rs`'s copy of this scenario for that note. Win-GUI needs the
+// test-binary crash above fixed first.
 #[cfg(all(test, feature = "win"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {
@@ -192,7 +585,6 @@ mod win_driver_tests {
 
     use quadraui::win::testing::driver_with_shell;
 
-    use crate::app::TextMetricsBackend;
     use crate::core::Engine;
     use crate::harness::ConformanceHarness;
 
@@ -210,9 +602,13 @@ mod win_driver_tests {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
-        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new(driver, engine, paint, cwd)
     }
@@ -226,9 +622,13 @@ mod win_driver_tests {
         let paint = crate::test_paint::PaintGuard::acquire();
         let cwd = crate::test_cwd::CwdReadGuard::acquire();
         let engine = Rc::new(RefCell::new(engine));
-        let backend: Rc<RefCell<Box<dyn TextMetricsBackend>>> =
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
             Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
-        let (app, config) = crate::harness::build_app_and_config(Rc::clone(&engine), backend);
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
         crate::harness::install_folder_picker(&app, dir);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new(driver, engine, paint, cwd)

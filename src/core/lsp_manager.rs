@@ -663,6 +663,17 @@ impl LspManager {
     /// (#450, enriched with title/message/percentage in #221).
     /// Duplicate begin for the same token replaces the existing entry —
     /// servers shouldn't do this, but be defensive.
+    ///
+    /// Returns `true` if this actually changed the tracked snapshot (a new
+    /// token, or a duplicate begin whose payload differs from what was
+    /// already stored) — `false` for a byte-identical duplicate begin.
+    /// #1583: the caller (`Engine::poll_lsp`) uses this to decide whether a
+    /// redraw is warranted; unconditionally redrawing on every `$/progress`
+    /// notification — including ones a chatty server repeats with identical
+    /// payloads — forced a full repaint far more often than the on-screen
+    /// status segment (the only thing this data feeds) ever actually
+    /// changed.
+    #[must_use]
     pub fn work_progress_begin(
         &mut self,
         server_id: LspServerId,
@@ -670,7 +681,7 @@ impl LspManager {
         title: Option<String>,
         message: Option<String>,
         percentage: Option<u32>,
-    ) {
+    ) -> bool {
         let progress = LspProgress {
             title: title.unwrap_or_default(),
             message,
@@ -678,39 +689,62 @@ impl LspManager {
         };
         let list = self.progress_data.entry(server_id).or_default();
         if let Some(slot) = list.iter_mut().find(|(t, _)| *t == token) {
+            if slot.1 == progress {
+                return false;
+            }
             slot.1 = progress;
         } else {
             list.push((token, progress));
         }
+        true
     }
 
     /// Update an in-flight work item's message/percentage from a
     /// `$/progress` "report" notification (#221). Silently ignored if
     /// the token isn't tracked.
+    ///
+    /// Returns `true` only if the stored message or percentage actually
+    /// changed value (#1583 — see [`Self::work_progress_begin`]'s doc for
+    /// why this matters: a server that re-reports the same message/
+    /// percentage repeatedly — or reports on a token this manager never
+    /// tracked — must not force a redraw the on-screen status text can't
+    /// show any change for).
+    #[must_use]
     pub fn work_progress_report(
         &mut self,
         server_id: LspServerId,
         token: &str,
         message: Option<String>,
         percentage: Option<u32>,
-    ) {
-        if let Some(list) = self.progress_data.get_mut(&server_id) {
-            if let Some(slot) = list.iter_mut().find(|(t, _)| t == token) {
-                if message.is_some() {
-                    slot.1.message = message;
-                }
-                if percentage.is_some() {
-                    slot.1.percentage = percentage;
-                }
-            }
+    ) -> bool {
+        let Some(list) = self.progress_data.get_mut(&server_id) else {
+            return false;
+        };
+        let Some(slot) = list.iter_mut().find(|(t, _)| t == token) else {
+            return false;
+        };
+        let mut changed = false;
+        if message.is_some() && slot.1.message != message {
+            slot.1.message = message;
+            changed = true;
         }
+        if percentage.is_some() && slot.1.percentage != percentage {
+            slot.1.percentage = percentage;
+            changed = true;
+        }
+        changed
     }
 
     /// Record that a `$/progress` work item has ended on a server (#450).
     /// Only updates the cooldown timestamp if we actually had this token
     /// tracked — a stray `end` for an unknown token (race / bug on the
     /// server side) shouldn't extend the dim state.
-    pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) {
+    ///
+    /// Returns `true` if a tracked token was actually removed (#1583 — a
+    /// stray `end` for a token already gone is a genuine no-op, not just a
+    /// cooldown-timestamp no-op, and must not force a redraw either).
+    #[must_use]
+    pub fn work_progress_end(&mut self, server_id: LspServerId, token: &str) -> bool {
         let removed = self
             .progress_data
             .get_mut(&server_id)
@@ -724,6 +758,7 @@ impl LspManager {
             self.last_progress_end
                 .insert(server_id, std::time::Instant::now());
         }
+        removed
     }
 
     /// True if the given server has any open `$/progress` work item OR
@@ -1041,20 +1076,17 @@ impl LspManager {
             ));
 
             // Run via shell so npm/pip/dotnet etc. resolve from user PATH.
-            // `shell_command()` (quadraui#970) picks `sh -c` vs `cmd /C` —
-            // this used to be a hand-rolled cfg split duplicating that same
-            // decision; #948 collapsed it into the shared seam. The only
-            // platform-specific bit left is hiding the console window on
-            // Windows, which has no portable equivalent.
+            // `shell_cmd()` (#1492, built on quadraui#970's `shell_command()`)
+            // picks `sh -c` vs `cmd /C` and hides the console window on
+            // Windows — the single construction point every shell spawn
+            // site now goes through, so this call site can't drift from
+            // the others.
             //
             // #948 review (non-blocking): no dedicated regression test for
-            // this call site — same identical `shell_command()` pattern
+            // this call site — same identical `shell_cmd()` pattern
             // already covered by `:!`'s tests, so a future divergence here
             // wouldn't be caught by this PR's tests.
-            let (shell, flag) = crate::core::terminal::shell_command();
-            let mut command = crate::core::git::hidden_command(&shell);
-            command.args([&flag, &install_cmd]);
-            let result = command.output();
+            let result = crate::core::terminal::shell_cmd(&install_cmd).output();
 
             match result {
                 Ok(out) => {
@@ -1101,6 +1133,21 @@ impl LspManager {
                 }
             }
         });
+    }
+
+    /// Test-only event injection (#1583): pushes a synthetic [`LspEvent`]
+    /// through the exact channel a real spawned server would use, so a
+    /// driver-tier test can exercise `Engine::poll_lsp`'s redraw decision
+    /// against real event plumbing (`poll_events` → the event match in
+    /// `Engine::poll_lsp`) instead of calling e.g. `work_progress_report`
+    /// directly — which would bypass `poll_lsp` (and its redraw-worthiness
+    /// decision) entirely. See
+    /// `tui_main::app_on_tui_tests`'s `idle_ticks_with_repeated_lsp_progress_*`
+    /// tests, which use this to prove a chatty server that repeats an
+    /// identical `$/progress` payload no longer forces a redraw every time.
+    #[cfg(test)]
+    pub(crate) fn test_send_event(&self, event: LspEvent) {
+        let _ = self.event_tx.send(event);
     }
 
     /// Non-blocking poll for events from all running servers.
@@ -1602,7 +1649,7 @@ mod tests {
         let sid: LspServerId = 0;
         assert!(!mgr.is_indexing(sid), "no progress → not indexing");
 
-        mgr.work_progress_begin(sid, "rustAnalyzer/Indexing".to_string(), None, None, None);
+        let _ = mgr.work_progress_begin(sid, "rustAnalyzer/Indexing".to_string(), None, None, None);
         assert!(mgr.is_indexing(sid), "begin → indexing");
     }
 
@@ -1613,8 +1660,8 @@ mod tests {
         // rust-analyzer's Fetching → gap → Indexing).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(sid, "t1".to_string(), None, None, None);
-        mgr.work_progress_end(sid, "t1");
+        let _ = mgr.work_progress_begin(sid, "t1".to_string(), None, None, None);
+        let _ = mgr.work_progress_end(sid, "t1");
         assert!(
             mgr.is_indexing(sid),
             "still indexing within cooldown after last end"
@@ -1634,11 +1681,11 @@ mod tests {
         // works directly (cooldown is irrelevant while a token is open).
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(sid, "Indexing".to_string(), None, None, None);
-        mgr.work_progress_begin(sid, "Roots Scanned".to_string(), None, None, None);
+        let _ = mgr.work_progress_begin(sid, "Indexing".to_string(), None, None, None);
+        let _ = mgr.work_progress_begin(sid, "Roots Scanned".to_string(), None, None, None);
         assert!(mgr.is_indexing(sid));
 
-        mgr.work_progress_end(sid, "Indexing");
+        let _ = mgr.work_progress_end(sid, "Indexing");
         assert!(
             mgr.is_indexing(sid),
             "still indexing while one token remains open"
@@ -1653,7 +1700,7 @@ mod tests {
         // not crash AND must not extend the dim state via the cooldown.
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_end(sid, "never-began"); // no panic
+        let _ = mgr.work_progress_end(sid, "never-began"); // no panic
         assert!(
             !mgr.is_indexing(sid),
             "stray end (no matching begin) must not flip state"
@@ -1675,7 +1722,7 @@ mod tests {
     fn current_progress_returns_begin_payload() {
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(
+        let _ = mgr.work_progress_begin(
             sid,
             "rustAnalyzer/Indexing".to_string(),
             Some("Indexing".to_string()),
@@ -1696,9 +1743,9 @@ mod tests {
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         let tok = "tok".to_string();
-        mgr.work_progress_begin(sid, tok.clone(), Some("Indexing".to_string()), None, None);
-        mgr.work_progress_report(sid, &tok, Some("1/320".to_string()), Some(0));
-        mgr.work_progress_report(sid, &tok, Some("319/320".to_string()), Some(99));
+        let _ = mgr.work_progress_begin(sid, tok.clone(), Some("Indexing".to_string()), None, None);
+        let _ = mgr.work_progress_report(sid, &tok, Some("1/320".to_string()), Some(0));
+        let _ = mgr.work_progress_report(sid, &tok, Some("319/320".to_string()), Some(99));
         let p = mgr.current_progress(sid).expect("progress exists");
         assert_eq!(p.title, "Indexing");
         assert_eq!(p.message.as_deref(), Some("319/320"));
@@ -1710,8 +1757,102 @@ mod tests {
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
         // No begin for "ghost" — report must not create an entry.
-        mgr.work_progress_report(sid, "ghost", Some("x".into()), Some(50));
+        let _ = mgr.work_progress_report(sid, "ghost", Some("x".into()), Some(50));
         assert!(mgr.current_progress(sid).is_none());
+    }
+
+    // ─── #1583: idempotent progress must not report "changed" ─────────────
+    //
+    // A chatty server (or one confused about a workspace root, as rust-
+    // analyzer can be for a file outside any Cargo project) resends the
+    // exact same $/progress payload repeatedly. `Engine::poll_lsp` uses
+    // these `bool` returns to decide whether a redraw is warranted — before
+    // this fix they didn't exist at all, and every notification forced one
+    // regardless of whether the stored snapshot (the only thing a redraw
+    // could possibly repaint differently) changed.
+
+    #[test]
+    fn work_progress_begin_reports_changed_only_on_first_call() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        assert!(
+            mgr.work_progress_begin(
+                sid,
+                "tok".to_string(),
+                Some("Indexing".to_string()),
+                None,
+                None
+            ),
+            "first begin for a token is always a change"
+        );
+        assert!(
+            !mgr.work_progress_begin(
+                sid,
+                "tok".to_string(),
+                Some("Indexing".to_string()),
+                None,
+                None
+            ),
+            "a byte-identical duplicate begin changes nothing"
+        );
+        assert!(
+            mgr.work_progress_begin(
+                sid,
+                "tok".to_string(),
+                Some("Indexing".to_string()),
+                Some("1/10".to_string()),
+                None
+            ),
+            "a begin with a genuinely different payload IS a change"
+        );
+    }
+
+    #[test]
+    fn work_progress_report_reports_changed_only_when_values_differ() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        let tok = "tok".to_string();
+        let _ = mgr.work_progress_begin(sid, tok.clone(), Some("Indexing".to_string()), None, None);
+
+        assert!(
+            mgr.work_progress_report(sid, &tok, Some("1/320".to_string()), Some(0)),
+            "first report with real values is a change"
+        );
+        assert!(
+            !mgr.work_progress_report(sid, &tok, Some("1/320".to_string()), Some(0)),
+            "an identical repeat of the same message+percentage is not a change"
+        );
+        assert!(
+            mgr.work_progress_report(sid, &tok, Some("2/320".to_string()), Some(0)),
+            "message changing alone is a change"
+        );
+        assert!(
+            mgr.work_progress_report(sid, &tok, Some("2/320".to_string()), Some(1)),
+            "percentage changing alone is a change"
+        );
+        assert!(
+            !mgr.work_progress_report(sid, "ghost", Some("x".into()), Some(50)),
+            "a report for an untracked token is not a change"
+        );
+    }
+
+    #[test]
+    fn work_progress_end_reports_changed_only_when_a_token_was_actually_removed() {
+        let mut mgr = LspManager::new(PathBuf::from("."), &[]);
+        let sid: LspServerId = 0;
+        let _ = mgr.work_progress_begin(sid, "tok".to_string(), None, None, None);
+        assert!(
+            mgr.work_progress_end(sid, "tok"),
+            "ending a tracked token is a change"
+        );
+        assert!(
+            !mgr.work_progress_end(sid, "tok"),
+            "ending it again (already gone) is not a change"
+        );
+        assert!(
+            !mgr.work_progress_end(sid, "never-began"),
+            "ending a token that was never tracked is not a change"
+        );
     }
 
     #[test]
@@ -1720,13 +1861,13 @@ mod tests {
         // phases) the indicator surfaces the latest one.
         let mut mgr = LspManager::new(PathBuf::from("."), &[]);
         let sid: LspServerId = 0;
-        mgr.work_progress_begin(sid, "a".into(), Some("Fetching".into()), None, None);
-        mgr.work_progress_begin(sid, "b".into(), Some("Indexing".into()), None, None);
+        let _ = mgr.work_progress_begin(sid, "a".into(), Some("Fetching".into()), None, None);
+        let _ = mgr.work_progress_begin(sid, "b".into(), Some("Indexing".into()), None, None);
         let p = mgr.current_progress(sid).expect("progress exists");
         assert_eq!(p.title, "Indexing");
 
         // After the most recent ends, fall back to the older still-open one.
-        mgr.work_progress_end(sid, "b");
+        let _ = mgr.work_progress_end(sid, "b");
         let p = mgr.current_progress(sid).expect("progress exists");
         assert_eq!(p.title, "Fetching");
     }

@@ -7,30 +7,36 @@
 //! **Critical:** No GTK, Cairo, Pango, or Relm4 dependencies are allowed here.
 //! All types must be plain Rust structs with no platform coupling.
 
-// Many public fields and methods are part of the rendering API consumed by the
-// Cairo backend and reserved for the future TUI backend; dead_code warnings
-// are expected for unused-in-this-binary items.
-//
 // #937's mandatory quadraui pin bump (dbb3023 -> 68f0ef9, needed for
 // `register_font_from_memory`/`set_nerd_font_fallback`) newly deprecated
 // `Backend::draw_status_bar`/`draw_toolbar`/`draw_sidebar_panel` (quadraui#819)
-// and `TabBarHits`/`SyntaxSpan` (quadraui#822/#823) that this file still uses.
-// Migrating every call site to the `_interactive` hover/pressed API and the
-// new `TabBarLayout`/`MinimapSpan` shapes is an unrelated, cross-backend
-// refactor, not part of #937's nerd-font fix; tracked for follow-up instead
-// of bundled in here.
-#![allow(dead_code, deprecated)]
+// and the tab-bar hit struct plus a syntax-highlight span shape (quadraui#822/
+// #823) that this file used. #1490 migrated every `draw_status_bar` call site
+// to `draw_status_bar_interactive`; #1491 migrated every tab-bar paint/measure
+// call site off the now-removed deprecated struct onto `TabBarLayout`.
+// `draw_toolbar`/`draw_sidebar_panel`/the syntax-span shape are still
+// deprecated and still used here — migrating those to the `_interactive`
+// hover/pressed API and its `MinimapSpan`-shaped replacement is unrelated,
+// cross-backend follow-up work, silenced with a narrow `allow` at each
+// remaining call site instead of a file-level one.
+//
+// `dead_code` dropped by #1489: the ~600 lines it was silently covering
+// (two whole dead data pipelines plus five dead helpers) are gone; any new
+// dead code in this file is a real warning again.
 
 use crate::core::buffer::Buffer;
-use crate::core::dap::DapVariable;
 use crate::core::engine::sidebar::{
-    PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT, PANEL_SEARCH, PANEL_SETTINGS,
+    HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
+    PANEL_SEARCH, PANEL_SETTINGS,
 };
-use crate::core::engine::{AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc, SearchDirection};
+use crate::core::engine::{
+    compute_word_wrap_segments, AlignedDiffEntry, DiffLine, Engine, PanelChromeDesc,
+    SearchDirection,
+};
 pub use crate::core::engine::{BottomPanelKind, DebugSidebarSection};
 use crate::core::lsp::SignatureHelpData;
 use crate::core::project_search::QuickfixList;
-use crate::core::settings::{LineNumberMode, Settings};
+use crate::core::settings::{FoldControlsMode, LineNumberMode, Settings};
 use crate::core::view::View;
 use crate::core::window::{GroupDivider, GroupId, SplitDirection, WindowDivider};
 use crate::core::{Cursor, GitLineStatus, Mode, WindowId, WindowRect};
@@ -128,8 +134,19 @@ fn hex(s: &str) -> Color {
 /// `quadraui::Color::from_hex`: that upstream function requires the
 /// leading `#` and doesn't accept 3-digit shorthand, both of which
 /// vimcode's settings / custom-theme-file parsing relies on.
+///
+/// #1494: `s.len()` counts bytes, not chars, and the slices below
+/// (`&s[0..2]`, etc.) are byte-index slices — both fine for a genuine hex
+/// string (ASCII-only by definition), but a non-ASCII 6-or-8-byte theme
+/// colour string (e.g. from a corrupt/hostile theme file) used to match
+/// the `6 | 8` arm on byte length alone and then panic slicing mid
+/// UTF-8-char-boundary. Guard on `is_ascii()` first so non-ASCII input
+/// takes the `_ => None` fallback instead.
 fn try_from_hex(s: &str) -> Option<Color> {
     let s = s.trim_start_matches('#');
+    if !s.is_ascii() {
+        return None;
+    }
     let (r, g, b) = match s.len() {
         6 | 8 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -154,6 +171,9 @@ fn try_from_hex(s: &str) -> Option<Color> {
 /// so both share the same `#`-optional / 3-digit-shorthand fallback.
 fn try_from_hex_over(s: &str, bg: Color) -> Option<Color> {
     let s = s.trim_start_matches('#');
+    if !s.is_ascii() {
+        return None;
+    }
     match s.len() {
         8 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -169,56 +189,6 @@ fn try_from_hex_over(s: &str, bg: Color) -> Option<Color> {
         }
         _ => try_from_hex(s),
     }
-}
-
-/// Strip `//` and `/* */` comments from JSON-with-comments (JSONC), as used
-/// by VSCode theme files. Preserves newlines so error positions stay valid.
-fn strip_json_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if bytes[i] == b'"' {
-            // String literal — copy verbatim until closing quote
-            out.push('"');
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\\' && i + 1 < len {
-                    out.push(bytes[i] as char);
-                    out.push(bytes[i + 1] as char);
-                    i += 2;
-                } else if bytes[i] == b'"' {
-                    out.push('"');
-                    i += 1;
-                    break;
-                } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
-                }
-            }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-            // Line comment — skip until newline
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            // Block comment — skip until */
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                if bytes[i] == b'\n' {
-                    out.push('\n');
-                }
-                i += 1;
-            }
-            i += 2; // skip */
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
 }
 
 // ─── Style / StyledSpan ──────────────────────────────────────────────────────
@@ -654,18 +624,25 @@ fn tab_bar_hit_target(hit: quadraui::TabBarHit) -> Option<crate::core::engine::T
     }
 }
 
-/// Resolve a column position (in char cells, relative to the tab bar left
-/// edge) to a `TabBarClickTarget` by hit-testing the `TabBarLayout` paint
-/// already produced — per `feedback_cache_paint_layout`, this reads what
-/// paint produced instead of re-deriving geometry in the click handler.
-/// Row is fixed at `0.0`: every hit region in a `TabBarLayout` spans the
-/// bar's single row (`bar_height = 1.0` at construction), so a column-only
-/// probe lands inside every region's `y` range.
+/// Resolve an x position (relative to the tab bar's left edge, in the
+/// layout's own unit — char cells for the TUI char-cell layout, pixels for a
+/// pixel-accurate GTK paint) to a `TabBarClickTarget` by hit-testing the
+/// `TabBarLayout` paint already produced — per `feedback_cache_paint_layout`,
+/// this reads what paint produced instead of re-deriving geometry in the
+/// click handler. Row is fixed at `0.0`: every hit region in a `TabBarLayout`
+/// spans the bar's single row, so an x-only probe lands inside every
+/// region's `y` range regardless of the layout's `bar_height`.
+///
+/// One function for both the TUI char-cell path (`x` is a whole column,
+/// e.g. `col as f32`) and GTK's pixel-accurate path (#1491 migrated GTK's
+/// own tab-bar click resolution off the deprecated `TabBarHits` onto this
+/// same call, so both backends now share it rather than GTK hand-rolling a
+/// parallel pixel hit-test).
 pub fn resolve_tab_bar_click(
     layout: &quadraui::TabBarLayout,
-    col: u16,
+    x: f32,
 ) -> Option<crate::core::engine::TabBarClickTarget> {
-    tab_bar_hit_target(layout.hit_test(col as f32, 0.0))
+    tab_bar_hit_target(layout.hit_test(x, 0.0))
 }
 
 /// An empty `TabBarLayout` — no tabs, no hit regions — for contexts where no
@@ -1664,35 +1641,6 @@ pub struct PopupAnchor {
     pub viewport: quadraui::Rect,
 }
 
-/// Convert a character-index column to a tab-expanded display column.
-///
-/// Moved here from `tui_main::render_impl` (#1237) so both backends' popup-
-/// anchor math can share it: TUI already expanded tabs before placing the
-/// completion popup, but GTK's equivalent (`App::paint_editor_popups_rung`)
-/// used the raw character column as if it were a display column, which
-/// drifted the popup left of the cursor on tab-indented lines, proportional
-/// to the tab count preceding it. `RenderedWindow::scroll_left` is itself
-/// already in display columns (see `display_col_to_buffer_col`'s doc), so
-/// this must run before any `scroll_left` subtraction, not after.
-pub fn char_col_to_visual(raw_text: &str, char_col: usize, tabstop: usize) -> usize {
-    let tabstop = tabstop.max(1);
-    let mut vis = 0usize;
-    for (i, ch) in raw_text.chars().enumerate() {
-        if ch == '\n' || ch == '\r' {
-            break;
-        }
-        if i >= char_col {
-            break;
-        }
-        if ch == '\t' {
-            vis = ((vis / tabstop) + 1) * tabstop;
-        } else {
-            vis += 1;
-        }
-    }
-    vis
-}
-
 /// Resolved `(x, y)` anchor points for each of the five editor-anchored
 /// popups, in the caller's unit scale (`cw`/`lh`: `1.0`/`1.0` for TUI's
 /// cell-native space, the actual pixel char-width/line-height for GTK).
@@ -1727,7 +1675,8 @@ pub struct EditorPopupPoints {
 /// (`App::paint_editor_popups_rung`) as of #1237 — before that each backend
 /// re-derived every one of these five anchor points itself (gutter width,
 /// scroll offset, tab-aware column resolution), and only TUI's completion
-/// anchor happened to call [`char_col_to_visual`] first; the other four
+/// anchor happened to call [`quadraui::text_util::char_col_to_visual`]
+/// first; the other four
 /// anchors on *both* backends, and GTK's completion anchor specifically,
 /// used the raw character column as a display column outright.
 pub fn editor_popup_anchors(
@@ -1753,8 +1702,8 @@ pub fn editor_popup_anchors(
             .get(view_row)
             .map(|l| l.raw_text.as_str())
             .unwrap_or("");
-        let vis_col =
-            char_col_to_visual(raw, char_col, win.tabstop).saturating_sub(scroll_left) as f32;
+        let vis_col = quadraui::text_util::char_col_to_visual(raw, char_col, win.tabstop)
+            .saturating_sub(scroll_left) as f32;
         let x = win_x + win.gutter_char_width as f32 * cw + vis_col * cw;
         let y = win_y + view_row as f32 * lh;
         Some((x, y))
@@ -2223,7 +2172,7 @@ pub fn tab_switcher_to_quadraui_list_view(
 // ─── TabSwitcherGeometry ──────────────────────────────────────────────────
 //
 // #733 slice 1: the tab-switcher popup rect used to be computed twice — in
-// `TuiShellApp::render_content` (cell units, percent-of-columns) and in
+// the pre-#1434 TUI shell's `render_content` (cell units, percent-of-columns) and in
 // `src/gtk/mod.rs::render_content` (pixel units, clamp(350, 600)) — and the
 // GTK copy was *also* the only one fed to a click handler, which is why TUI
 // had no tab-switcher rung at all. One `compute`, two sizing constants,
@@ -3118,7 +3067,7 @@ pub fn apply_picker_row_click(engine: &mut Engine, idx: usize) {
 // through terminal-flavoured renaming it has no ambiguity to resolve.
 //
 // `keyboard_enhanced` is TUI's kitty-protocol / `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
-// flag (`TuiShellApp::setup`, `supports_keyboard_enhancement`). With it off, a
+// flag (the pre-#1434 TUI shell's `setup`, `supports_keyboard_enhancement`). With it off, a
 // handful of Ctrl+symbol chords arrive from the terminal as byte sequences
 // crossterm cannot distinguish from `Ctrl+<digit>` (Ctrl+\ arrives identically
 // to Ctrl+4, Ctrl+/ to Ctrl+7, Ctrl+Shift+[ to Ctrl+3, Ctrl+Shift+] to
@@ -3788,6 +3737,81 @@ pub fn route_focus_key(engine: &Engine, sidebar_band_focused: bool) -> FocusKeyR
     FocusKeyRoute::Explorer
 }
 
+/// Outcome of feeding a keystroke to [`route_sidebar_chord_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarChordAction {
+    /// Ctrl-W armed the latch (`Engine::sidebar_ctrl_w_pending`); nothing
+    /// else to do for this keypress but redraw.
+    Armed,
+    /// The chord's follow-up key moved focus out of the sidebar band —
+    /// `h`/`Left` to the activity bar toolbar, `l`/`Right` to the editor.
+    /// `Engine::clear_sidebar_focus` (and, for `h`/`Left`,
+    /// `Engine::activity_bar_focus_in_at`) already ran; the caller only
+    /// needs to clear its own "sidebar band holds the keyboard" latch, if it
+    /// keeps one (TUI's `TuiSidebar::has_focus` does; GTK has none).
+    FocusOut,
+    /// The chord's follow-up key was consumed but wasn't a recognised
+    /// direction — ignored, like an unmapped Ctrl-W combo in Vim's own
+    /// window commands.
+    Consumed,
+}
+
+/// Ctrl-W sidebar chord: arm on `Ctrl-W`, then on the very next keypress
+/// navigate `h`/`Left` to the activity bar toolbar or `l`/`Right` to the
+/// editor, consuming any other follow-up. `None` means the key was neither
+/// the arming chord nor a pending follow-up — the caller's own ladder
+/// continues unclaimed.
+///
+/// A Vim chord, so — like [`route_debug_fkey`] and the other shared rungs in
+/// this file — it stays a plain key-name match rather than a declared
+/// accelerator. Only meaningful while some sidebar panel (not the activity
+/// bar itself) holds focus; both callers only reach this after their own
+/// focus-owner routing has already claimed the key for such a panel, so
+/// there is no separate "is the sidebar band focused" gate here.
+///
+/// Promoted out of TUI-only `TuiSidebar::pending_ctrl_w` (#1419, closing
+/// #406): GTK kept no per-keypress chord latch of its own to hang that field
+/// on, so Ctrl-W h/l silently did nothing there. `Engine::sidebar_ctrl_w_pending`
+/// is the shared latch both backends now read and write through this
+/// function, so GTK gets the same navigation TUI already had.
+///
+/// `key_name`/`unicode` are [`engine_key_from_ui`]'s own output: a plain
+/// letter like `h`/`l`/`w` arrives as `unicode`, with `key_name` empty
+/// (`engine_key_from_ui` only fills `key_name` for `Ctrl`-held or named
+/// keys), while `Left`/`Right` arrive as `key_name` with `unicode: None` —
+/// so both must be checked, matching every other rung in this file
+/// ([`dispatch_sidebar_panel_key`], [`route_terminal_key`], …).
+pub fn route_sidebar_chord_key(
+    engine: &mut Engine,
+    key_name: &str,
+    unicode: Option<char>,
+    ctrl: bool,
+) -> Option<SidebarChordAction> {
+    if ctrl && key_name.eq_ignore_ascii_case("w") {
+        engine.sidebar_ctrl_w_pending = true;
+        return Some(SidebarChordAction::Armed);
+    }
+    if !engine.sidebar_ctrl_w_pending {
+        return None;
+    }
+    engine.sidebar_ctrl_w_pending = false;
+    let to_toolbar = key_name == "Left" || unicode == Some('h');
+    let to_editor = key_name == "Right" || unicode == Some('l');
+    Some(if to_toolbar {
+        // Panel -> activity bar toolbar.
+        let idx = engine.activity_bar_toolbar_idx_for_active_panel();
+        engine.clear_sidebar_focus();
+        engine.activity_bar_focus_in_at(idx);
+        SidebarChordAction::FocusOut
+    } else if to_editor {
+        // Panel -> editor.
+        engine.clear_sidebar_focus();
+        SidebarChordAction::FocusOut
+    } else {
+        SidebarChordAction::Consumed // Unknown Ctrl-W combo: ignore.
+    })
+}
+
 /// What a key does once [`FocusKeyRoute::ActivityBar`] has claimed it.
 ///
 /// The activity bar's key table was the one part of that arm both backends
@@ -3810,9 +3834,9 @@ pub enum ActivityBarKeyAction {
     Ignore,
 }
 
-/// Map an engine-space key name (GTK's `map_gtk_key_name` output, TUI's
-/// `tui_key_to_engine_name` output or a bare character) to its activity-bar
-/// action. `ctrl` suppresses activation and focus-out, matching GTK.
+/// Map an engine-space key name (both backends' `engine_key_from_ui` output,
+/// or a bare character) to its activity-bar action. `ctrl` suppresses
+/// activation and focus-out, matching GTK.
 pub fn activity_bar_key_action(key: &str, ctrl: bool) -> ActivityBarKeyAction {
     match key {
         "j" | "Down" => ActivityBarKeyAction::MoveDown,
@@ -4066,13 +4090,13 @@ pub const ALT_SIDEBAR_WIDTH_MAX: u16 = 150;
 /// width, clamped to [`ALT_SIDEBAR_WIDTH_MIN`]..=[`ALT_SIDEBAR_WIDTH_MAX`].
 ///
 /// The width itself cannot live in the resolver: TUI's authoritative copy is
-/// `TuiShellApp::sidebar_width` (which its end-of-dispatch sync pushes into the
+/// the pre-#1434 TUI shell's `sidebar_width` (which its end-of-dispatch sync pushes into the
 /// runner's `AppShell`), while GTK's is the runner `AppShell` itself, reached
 /// through `ShellContext::shell_mut`. The *clamp* is shared so the two cannot
 /// drift apart — which is the only part a user can observe.
 ///
 /// Both backends additionally configure their `AppShell` with these same two
-/// bounds (`TuiShellApp::shell_config`, `gtk::build_shell_config`), so
+/// bounds (the pre-#1434 TUI shell's `shell_config`, `gtk::build_shell_config`), so
 /// `AppShell::set_sidebar_width`'s own internal clamp cannot narrow the rung's
 /// range on one backend and not the other. That was live on GTK before #759:
 /// quadraui's generic default is `8.0..=50.0`, which TUI had already overridden
@@ -4311,7 +4335,7 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 // ─── Closing rungs (#762 / #734 slice 7) ────────────────────────────────────
 //
 // Slices 1–6 lifted the ladder's big tiers into this module. What was left
-// behind in the two surviving entry points — `TuiShellApp`'s
+// behind in the two surviving entry points — the pre-#1434 TUI shell's
 // `handle_key_pressed` and `App::handle_key_press` — was the residue: five
 // small tiers that each backend still stated for itself, three of them only
 // on one backend and therefore silently missing on the other. They are stated
@@ -4367,9 +4391,10 @@ pub fn route_ctrl_shift_v_paste(engine: &mut Engine, key_name: &str, ctrl: bool)
 ///
 /// `sc_unicode` exists because the source-control panel's key table reads
 /// printables that its siblings read as named keys (`?`, `/`), so a backend
-/// whose translation layer distinguishes the two — GTK's
-/// `map_gtk_key_with_unicode` vs `map_gtk_key_name` — has a second spelling to
-/// hand over. Backends with one spelling pass `unicode` twice.
+/// whose translation layer distinguishes the two has a second spelling to
+/// hand over. #1422 deleted GTK's own such layer (`map_gtk_key_with_unicode`
+/// vs `map_gtk_key_name`) once its spelling turned out identical to
+/// `unicode`'s — both backends now pass `unicode` twice.
 pub fn dispatch_sidebar_panel_key(
     engine: &mut Engine,
     route: FocusKeyRoute,
@@ -4425,7 +4450,7 @@ pub fn dispatch_sidebar_panel_key(
 ///
 /// #1243: TUI now honours the *full* semantics via
 /// `quadraui::Backend::request_full_repaint` (quadraui#1037) —
-/// `TuiShellApp::handle_key_pressed` calls it on this chord before returning
+/// the pre-#1434 TUI shell's `handle_key_pressed` calls it on this chord before returning
 /// `Reaction::Redraw`, and `tui::run::run_inner`'s frame loop clears
 /// `ratatui::Terminal`'s previous-frame buffer the next time it paints. GTK's
 /// `DrawingArea` repaints in full every frame via Cairo (no incremental diff
@@ -4434,7 +4459,7 @@ pub fn dispatch_sidebar_panel_key(
 /// `Backend::request_full_repaint`'s own doc for why that default is
 /// correct rather than a gap. The same hook also covers the
 /// popup-disappearance clear this comment used to point at —
-/// `TuiShellApp::render_content`'s `had_popup_overlay` transition check.
+/// the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay` transition check.
 ///
 /// **#1393 (quadraui#1060 consume side): the Ctrl+L call site now has a
 /// driver test that proves the repaint itself**, not just the decision
@@ -4473,7 +4498,7 @@ pub fn is_force_redraw_key(
 
 /// Did an editor-anchored popup (the completions/hover-doc picker or the
 /// modal folder picker) that was visible last frame close this frame?
-/// (#1243, TUI-only — `TuiShellApp::render_content`'s `had_popup_overlay`.)
+/// (#1243, TUI-only — the pre-#1434 TUI shell's `render_content`'s `had_popup_overlay`.)
 ///
 /// The transition that must call `quadraui::Backend::request_full_repaint`
 /// (quadraui#1037): a popup staying open, staying closed, or newly opening
@@ -4755,7 +4780,7 @@ pub enum CmdSelKeyRoute {
 /// That one-column skew is the whole reason this is worth stating once.
 ///
 /// Both backends populate `sel` from `Engine::cmd_sel` (#816): TUI's
-/// `TuiShellApp::handle_mouse_event` (#602) and GTK's press/drag handlers
+/// the pre-#1434 TUI shell's `handle_mouse_event` (#602) and GTK's press/drag handlers
 /// (`handle_mouse_click_msg` / `handle_mouse_drag_msg`, driven through
 /// `quadraui::CommandLineLayout::hit_test`) both arm the same engine-level
 /// field, and `CommandLineState::command_line_selecting` mirrors
@@ -4804,7 +4829,9 @@ pub fn route_cmdline_selection_key(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PostKeyEpilogue {
     /// Ctrl-W h/l overflowed left with a sidebar panel visible — give the
-    /// sidebar band the keyboard.
+    /// sidebar band the keyboard. Also set when a panel reveal from inside
+    /// `Engine::handle_key` asked for the keyboard via
+    /// `Engine::sidebar_focus_requested` (#1450).
     pub focus_sidebar: bool,
     /// Ctrl-W h/l overflowed left with **no** sidebar panel visible — put the
     /// cursor on the activity bar toolbar instead. GTK never did this: its
@@ -4851,6 +4878,15 @@ pub fn post_key_epilogue(
     quickfix_scroll_top: Option<&mut usize>,
 ) -> PostKeyEpilogue {
     let mut out = PostKeyEpilogue::default();
+
+    // #1450: a programmatic panel reveal from inside `Engine::handle_key`
+    // (Visual `<leader>ai`, `:{range}AI` with no message) asked for the
+    // keyboard. One-shot — taken here so the *next* keypress routes normally
+    // again. Shared, so TUI's cached `sidebar.has_focus` and GTK's
+    // re-sync both go through the one field they already honour.
+    if std::mem::take(&mut engine.sidebar_focus_requested) {
+        out.focus_sidebar = true;
+    }
 
     // Ctrl-W h/l overflow: move focus to the sidebar, or — when no panel is
     // visible to receive it — to the activity bar.
@@ -4922,10 +4958,12 @@ pub fn post_key_epilogue(
 /// yank/delete (which only ever touches `"`, never `+`) could clobber the
 /// clipboard mirror of an earlier explicit `+` write instead of leaving it
 /// alone (see the `..._1239` tests in `gtk/testing.rs` and
-/// `tui_main/shell_app.rs` for the exact repro). Both now call this one
-/// function; each backend's own name survives only as a thin wrapper (GTK:
-/// `App::sync_plus_register_to_clipboard`; TUI: `sync_tui_clipboard`) so
-/// their existing call sites don't need to change. (The issue that raised
+/// `tui_main/shell_app.rs` for the exact repro — the latter deleted by
+/// #1434). Both called this one function; GTK's own name survives as a
+/// thin wrapper (`App::sync_plus_register_to_clipboard`) so its existing
+/// call sites don't need to change — TUI's `sync_tui_clipboard` wrapper
+/// was deleted along with the rest of the pre-#1434 TUI shell, its callers
+/// now going through `App`. (The issue that raised
 /// this bug illustrated the explicit-write case as `:let @+='...'` — that
 /// ex command isn't actually implemented in vimcode, `VIM_COMPATIBILITY.md`
 /// marks `:let` N/A; every real write path to `+`, from `"+yy` to the Lua
@@ -4964,15 +5002,15 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 
 // ─── Panel-accelerator dispatch rung (#761 / #734 slice 6) ──────────────────
 //
-// Both backends register the same 14-entry `panel_keys` accelerator set
+// Both backends register the same 15-entry (#1577 added `focus_notifications`) `panel_keys` accelerator set
 // (`register_panel_accelerators` in `gtk/mod.rs` / `tui_main/mod.rs`) and,
 // until now, each restated its own ~100-line `match id { ... }` translating
 // a fired accelerator into the engine call it makes. `PanelAccelerator`
-// states the 14-entry id table once; [`dispatch_panel_accelerator`] states
+// states the 15-entry id table once; [`dispatch_panel_accelerator`] states
 // the nine actions that are pure `Engine` mutations once too.
 //
 // The other five (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
-// `OpenTerminal`, `TerminalToggleMax`) go through [`PanelAcceleratorHost`]
+// `OpenTerminal`, `TerminalToggleMax`) queue onto `App`'s `DeferredQueue`
 // instead of being inlined here, because their effect genuinely depends on
 // state this module has no business owning:
 //
@@ -4994,20 +5032,22 @@ pub fn sync_register_to_clipboard(engine: &mut Engine, last: &mut Option<String>
 //   state — collapsing them into one body would be papering over a real
 //   platform difference, not deleting duplication.
 //
-// A `host: &mut impl PanelAcceleratorHost` argument is the shared function's
-// seam for that residue — each backend supplies a thumbnail struct (`GtkAccelHost`
-// / `TuiAccelHost`, defined next to their call sites) implementing the five
-// hook methods, so the dispatcher itself never needs to know which backend is
-// calling it.
+// #1499: this used to take a `host: &mut impl PanelAcceleratorHost` argument
+// — each backend supplied a thumbnail struct (`GtkAccelHost` / `TuiAccelHost`,
+// defined next to their call sites) implementing the five hook methods, so
+// the dispatcher itself never needed to know which backend was calling it.
+// With the TUI backend gone, `App` is the only implementation left, so
+// [`dispatch_panel_accelerator`] takes `app: &App` directly and queues onto
+// its `DeferredQueue` inline instead of through a trait object.
 //
-// #823 item 1: the *registration* half (the 14-entry `(id, binding)` table
+// #823 item 1: the *registration* half (the 15-entry `(id, binding)` table
 // and the loop that (un)registers each one) was, until now, a byte-identical
 // 44-line function pasted into `app.rs` and `tui_main/mod.rs`. It has no
 // backend-specific step at all — every call goes through the trait object
-// `&mut dyn quadraui::Backend` — so unlike the five [`PanelAcceleratorHost`]
-// actions above, it needed no host seam to collapse: [`register_panel_accelerators`]
-// below is the whole function, called verbatim from both `App::setup` and
-// `tui_main`'s startup path.
+// `&mut dyn quadraui::Backend` — so unlike the five deferred-queue actions
+// above, it needed no per-backend seam to collapse:
+// [`register_panel_accelerators`] below is the whole function, called
+// verbatim from both `App::setup` and `tui_main`'s startup path.
 
 /// Register the panel-keys accelerator set on the backend. Re-runs on each
 /// settings reload so live rebinding takes effect.
@@ -5018,7 +5058,7 @@ pub fn register_panel_accelerators(
     backend: &mut dyn quadraui::Backend,
     pk: &crate::core::settings::PanelKeys,
 ) {
-    let entries: [(&str, &str); 14] = [
+    let entries: [(&str, &str); 15] = [
         (ACC_TOGGLE_SIDEBAR, &pk.toggle_sidebar),
         (ACC_FOCUS_EXPLORER, &pk.focus_explorer),
         (ACC_FOCUS_SEARCH, &pk.focus_search),
@@ -5033,6 +5073,7 @@ pub fn register_panel_accelerators(
         (ACC_SPLIT_EDITOR_DOWN, &pk.split_editor_down),
         (ACC_NAV_BACK, &pk.nav_back),
         (ACC_NAV_FORWARD, &pk.nav_forward),
+        (ACC_FOCUS_NOTIFICATIONS, &pk.focus_notifications),
     ];
     for (id, binding) in entries {
         let acc_id = quadraui::AcceleratorId::new(id);
@@ -5052,7 +5093,7 @@ pub fn register_panel_accelerators(
     }
 }
 
-/// The 14 panel-key accelerator actions, shared by both backends' registries.
+/// The 15 panel-key accelerator actions, shared by both backends' registries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelAccelerator {
     ToggleSidebar,
@@ -5069,6 +5110,9 @@ pub enum PanelAccelerator {
     SplitEditorDown,
     NavBack,
     NavForward,
+    /// Give the toast/notification stack keyboard focus (#1577). Same
+    /// effect as `:Notifications` — see `Engine::focus_toast_stack`.
+    FocusNotifications,
 }
 
 pub const ACC_TOGGLE_SIDEBAR: &str = "panel.toggle_sidebar";
@@ -5087,6 +5131,7 @@ pub const ACC_SPLIT_EDITOR_RIGHT: &str = "panel.split_editor_right";
 pub const ACC_SPLIT_EDITOR_DOWN: &str = "panel.split_editor_down";
 pub const ACC_NAV_BACK: &str = "panel.nav_back";
 pub const ACC_NAV_FORWARD: &str = "panel.nav_forward";
+pub const ACC_FOCUS_NOTIFICATIONS: &str = "panel.focus_notifications";
 
 impl PanelAccelerator {
     /// Resolve a registered accelerator id to the action it represents.
@@ -5108,39 +5153,41 @@ impl PanelAccelerator {
             ACC_SPLIT_EDITOR_DOWN => Self::SplitEditorDown,
             ACC_NAV_BACK => Self::NavBack,
             ACC_NAV_FORWARD => Self::NavForward,
+            ACC_FOCUS_NOTIFICATIONS => Self::FocusNotifications,
             _ => return None,
         })
     }
-}
-
-/// Backend hook for the five panel-accelerator actions whose effect needs
-/// state `Engine` doesn't own — see the rung's header comment above for why
-/// GTK and TUI each need their own five-method impl rather than one shared
-/// body.
-pub trait PanelAcceleratorHost {
-    fn toggle_sidebar(&mut self, engine: &mut Engine);
-    fn focus_explorer(&mut self, engine: &mut Engine);
-    fn focus_search(&mut self, engine: &mut Engine);
-    fn open_terminal(&mut self, engine: &mut Engine);
-    fn terminal_toggle_max(&mut self, engine: &mut Engine);
 }
 
 /// Resolve `id` and apply the corresponding panel-accelerator action.
 /// Returns the resolved [`PanelAccelerator`] (so callers can layer their own
 /// residual bookkeeping — e.g. GTK's per-action `DeferredAction::Resize`) or
 /// `None` if `id` isn't a registered panel accelerator.
-pub fn dispatch_panel_accelerator(
+///
+/// Five actions (`ToggleSidebar`, `FocusExplorer`, `FocusSearch`,
+/// `OpenTerminal`, `TerminalToggleMax`) queue onto `app`'s `DeferredQueue`
+/// instead of mutating `engine` directly — `App`'s own `UiEvent::Accelerator`
+/// arm has no engine-mutation seam of its own for these
+/// (`toggle_sidebar_panel`/`toggle_focus_explorer`/`toggle_focus_search`/
+/// `toggle_terminal`/`toggle_terminal_maximize` are `&mut App` methods that
+/// also re-sync GTK widgets), so `tick()` (which does have `&mut App`) runs
+/// the real method next frame instead — see [`crate::app::DeferredQueue`]'s
+/// own doc comment.
+pub(crate) fn dispatch_panel_accelerator(
     id: &str,
     engine: &mut Engine,
-    host: &mut impl PanelAcceleratorHost,
+    app: &crate::app::App,
 ) -> Option<PanelAccelerator> {
+    use crate::app::DeferredAction;
     let action = PanelAccelerator::from_id(id)?;
     match action {
-        PanelAccelerator::ToggleSidebar => host.toggle_sidebar(engine),
-        PanelAccelerator::FocusExplorer => host.focus_explorer(engine),
-        PanelAccelerator::FocusSearch => host.focus_search(engine),
-        PanelAccelerator::OpenTerminal => host.open_terminal(engine),
-        PanelAccelerator::TerminalToggleMax => host.terminal_toggle_max(engine),
+        PanelAccelerator::ToggleSidebar => app.deferred.send(DeferredAction::ToggleSidebar),
+        PanelAccelerator::FocusExplorer => app.deferred.send(DeferredAction::ToggleFocusExplorer),
+        PanelAccelerator::FocusSearch => app.deferred.send(DeferredAction::ToggleFocusSearch),
+        PanelAccelerator::OpenTerminal => app.deferred.send(DeferredAction::ToggleTerminal),
+        PanelAccelerator::TerminalToggleMax => {
+            app.deferred.send(DeferredAction::ToggleTerminalMaximize)
+        }
         PanelAccelerator::FuzzyFinder => {
             engine.open_picker(crate::core::engine::PickerSource::Files)
         }
@@ -5156,6 +5203,9 @@ pub fn dispatch_panel_accelerator(
         PanelAccelerator::SplitEditorDown => engine.open_editor_group(SplitDirection::Horizontal),
         PanelAccelerator::NavBack => engine.tab_nav_back(),
         PanelAccelerator::NavForward => engine.tab_nav_forward(),
+        PanelAccelerator::FocusNotifications => {
+            engine.focus_toast_stack();
+        }
     }
     Some(action)
 }
@@ -5184,60 +5234,65 @@ pub fn dispatch_panel_accelerator(
 // function from GTK's, so the two could still drift independently even
 // though neither, on its own, had a reachability gap today.
 //
-// [`apply_engine_action`] is the one function both now call: an exhaustive
-// match (no `_ =>` arm — a new `EngineAction` variant fails to compile here
-// until every caller decides what it means), with a `host: &mut impl
-// EngineActionHost` seam for the effects each backend must supply itself —
-// follows [`dispatch_panel_accelerator`]'s shape above, not a new one.
-pub trait EngineActionHost {
-    /// Open a new terminal tab (needs the live pane's column/row count).
-    fn open_terminal(&mut self, engine: &mut Engine);
-    /// Toggle terminal-panel maximize (needs the live viewport's row count).
-    fn toggle_terminal_maximize(&mut self, engine: &mut Engine);
-    /// Run `cmd` in a new terminal tab (extension-install flow).
-    fn run_in_terminal(&mut self, engine: &mut Engine, cmd: String);
-    /// Show the "Open Folder" dialog/picker.
-    fn open_folder_dialog(&mut self, engine: &mut Engine);
-    /// Finish an "Open Workspace" action already run inside the engine.
-    fn open_workspace_dialog(&mut self, engine: &mut Engine);
-    /// Show the "Save Workspace As" dialog.
-    fn save_workspace_as_dialog(&mut self, engine: &mut Engine);
-    /// Show the "Open Recent" workspace picker.
-    fn open_recent_dialog(&mut self, engine: &mut Engine);
-    /// Re-sync/redraw after the engine toggled sidebar visibility internally.
-    fn sidebar_toggled(&mut self, engine: &mut Engine);
-    /// Show the "unsaved changes" quit-confirmation UI.
-    fn quit_with_unsaved(&mut self, engine: &mut Engine);
-    /// Save session state and request a clean shutdown.
-    fn quit(&mut self, engine: &mut Engine);
-    /// Save session state and exit the process with a non-zero code
-    /// (`:cquit`). Never returns.
-    fn quit_with_error(&mut self, engine: &mut Engine) -> !;
-}
+// #1499: [`apply_engine_action`] used to take a `host: &mut impl
+// EngineActionHost` seam — a per-backend struct implementing eleven hook
+// methods — for the dozen or so effects `Engine` cannot finish alone. With
+// the TUI backend gone, `App` is the only implementation left, so those
+// eleven hooks are inlined directly into the match arms below, reading/
+// mutating `engine` and `app`'s fields exactly as `GtkEngineActionHost` (the
+// old per-backend host struct) used to. `open_terminal`/`open_workspace_dialog`
+// used to be `App::new_terminal_tab`/`App::open_workspace_dialog` verbatim,
+// until #1063 left both with no other caller (menu, key and macro dispatch
+// all go through here now) and deleted them rather than ship dead code —
+// this fold does not resurrect them.
 
 /// Apply the [`crate::core::engine::EngineAction`] produced by
 /// `Engine::dispatch_menu_action` (a fired `MenuEvent::Activated`). Returns
 /// `true` when the action means the caller should exit — `Quit`/`SaveQuit`;
 /// `QuitWithError` never returns at all.
 ///
-/// `OpenFile`/`OpenUrl`/`None`/`Error` need no backend help — `Engine`
-/// already did (or need do) everything for those — so they're handled
-/// inline rather than through `host`.
-pub fn apply_engine_action(
+/// `OpenFile`/`OpenUrl`/`None`/`Error` need no `app` help — `Engine` already
+/// did (or need do) everything for those — so they're handled inline without
+/// touching `app` at all.
+///
+/// Most arms below read/mutate the `engine: &mut Engine` parameter directly
+/// rather than going through `app.engine.borrow()/borrow_mut()`: `engine` is
+/// already a live `RefMut` borrow of that same `Rc<RefCell<Engine>>` at every
+/// call site, so a second, independent `app.engine.borrow_mut()` from in here
+/// would double-borrow the same `RefCell` and panic at runtime.
+pub(crate) fn apply_engine_action(
     action: crate::core::engine::EngineAction,
     engine: &mut Engine,
-    host: &mut impl EngineActionHost,
+    app: &mut crate::app::App,
 ) -> bool {
     use crate::core::engine::{EngineAction, PendingPlatformAction};
     match action {
         EngineAction::None | EngineAction::Error => false,
         EngineAction::Quit | EngineAction::SaveQuit => {
-            host.quit(engine);
+            app.quit_and_save_session(engine);
             true
         }
-        EngineAction::QuitWithError => host.quit_with_error(engine),
+        // Matches the former inline `EngineAction::QuitWithError` arm in
+        // `App::dispatch_engine_action` exactly — no `save_session_state`
+        // (unlike `Quit`/`SaveQuit` above). This asymmetry is GTK-specific,
+        // not something `tui_main::handle_action` itself used to do: the
+        // pre-#1434 TUI shell's `Quit`/`SaveQuit` and `QuitWithError` arms
+        // both called `save_session`, i.e. TUI treated the two variants
+        // *symmetrically*. The divergence was cross-backend (GTK skipped the
+        // save on `QuitWithError`, TUI didn't); preserved here exactly as it
+        // behaved pre-#1063 rather than changed as a side effect of this fold.
+        EngineAction::QuitWithError => {
+            engine.cleanup_all_swaps();
+            engine.lsp_shutdown();
+            std::process::exit(1);
+        }
         EngineAction::QuitWithUnsaved => {
-            host.quit_with_unsaved(engine);
+            if !engine.has_any_unsaved() {
+                app.quit_and_save_session(engine);
+            } else {
+                engine.show_quit_confirm();
+                app.draw_needed.set(true);
+            }
             false
         }
         EngineAction::OpenFile(path) => {
@@ -5247,42 +5302,83 @@ pub fn apply_engine_action(
             false
         }
         EngineAction::OpenTerminal => {
-            host.open_terminal(engine);
+            let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_new_tab(cols, rows);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::ToggleTerminalMaximize => {
-            host.toggle_terminal_maximize(engine);
+            let ctx = crate::core::engine::UiEventContext {
+                terminal_cols: app.terminal_panel_cols(app.painted_editor_content_width()),
+                terminal_max_rows: app.terminal_maximize_target_rows(engine),
+            };
+            engine.handle_ui_event(
+                crate::core::engine::UiEvent::Accelerator(
+                    crate::core::engine::AcceleratorId::new("terminal.toggle_maximize"),
+                    quadraui::Modifiers::default(),
+                ),
+                ctx,
+            );
+            app.draw_needed.set(true);
             false
         }
         EngineAction::RunInTerminal(cmd) => {
-            host.run_in_terminal(engine, cmd);
+            let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+            let rows = engine.session.terminal_panel_rows;
+            engine.terminal_run_command(&cmd, cols, rows);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::OpenFolderDialog => {
-            host.open_folder_dialog(engine);
+            let controller = quadraui::FolderPickerController::new(
+                engine.cwd.clone(),
+                vec![".vimcode-workspace".to_string()],
+                engine.settings.show_hidden_files,
+            );
+            *app.folder_picker.borrow_mut() = Some(controller);
+            app.draw_needed.set(true);
             false
         }
+        // Inlines the `refresh_file_tree` / `refresh_explorer` /
+        // `reveal_path_in_explorer` chain the deleted `App::open_workspace_dialog`
+        // called — `queue_explorer_draw` (that chain's last step) is a
+        // documented no-op under the `ShellApp` runner, so dropping it
+        // changes nothing.
         EngineAction::OpenWorkspaceDialog => {
-            host.open_workspace_dialog(engine);
+            engine.explorer_rebuild_rows();
+            if let Some(path) = engine.file_path().cloned() {
+                engine.explorer_reveal_path(&path);
+            }
+            app.draw_needed.set(true);
             false
         }
+        // Touches no engine state, so this calls `App::save_workspace_as_dialog`
+        // straight through rather than inlining it.
         EngineAction::SaveWorkspaceAsDialog => {
-            host.save_workspace_as_dialog(engine);
+            app.save_workspace_as_dialog();
             false
         }
         EngineAction::OpenRecentDialog => {
-            host.open_recent_dialog(engine);
+            if engine.session.recent_workspaces.is_empty() {
+                engine.message = "No recent workspaces".to_string();
+            } else {
+                engine.open_picker(crate::core::engine::PickerSource::RecentWorkspaces);
+            }
+            app.draw_needed.set(true);
             false
         }
+        // A redraw trigger only under the `ShellApp` runner (see
+        // `App::sync_sidebar_from_engine`'s own doc comment, the method this
+        // arm used to call).
         EngineAction::ToggleSidebar => {
-            host.sidebar_toggled(engine);
+            app.draw_needed.set(true);
             false
         }
         EngineAction::OpenUrl(url) => {
             // #1134: queue rather than shell out here — `apply_engine_action`
-            // is shared by both backends via `EngineActionHost` and has no
-            // `backend` handle of its own. `App::tick_dispatch` (GTK) /
-            // `TuiShellApp::tick` (TUI) drain `pending_platform_actions`
+            // has no `backend` handle of its own. `App::tick_dispatch` (GTK) /
+            // the pre-#1434 TUI shell's `tick` (TUI) drain `pending_platform_actions`
             // through `PlatformServices` (`is_safe_url` was already applied
             // by whichever engine path produced this `EngineAction`).
             engine
@@ -5324,20 +5420,23 @@ pub fn apply_engine_action(
 // agreed on that subset before this issue, so it is not a divergence this
 // rung needs to resolve, only preserve.
 //
-// `host: &mut impl ExplorerContextHost` covers the one action that
-// genuinely needs backend-specific plumbing: `"open_terminal"` needs the
-// live terminal pane's column count, which only each backend's own runner
-// has in scope. Every other action is a plain `Engine` call with no
-// backend seam — including the caller's own post-action redraw/refresh
-// bookkeeping (`explorer_needs_refresh`, `draw_needed`), which stays at
-// each call site exactly as before since it is generic "something changed"
-// plumbing already shared across far more than context-menu actions, not
-// specific to this rung.
-pub trait ExplorerContextHost {
-    /// Open a new terminal tab rooted at `dir` (needs the live pane's
-    /// column count, which only the backend's own runner has in scope).
-    fn open_terminal_at(&mut self, engine: &mut Engine, dir: std::path::PathBuf);
-}
+// `open_terminal_at` covers the one action that genuinely needs
+// backend-specific plumbing: `"open_terminal"` needs the live terminal
+// pane's column count, which only each backend's own runner has in scope.
+// Every other action is a plain `Engine` call with no backend seam —
+// including the caller's own post-action redraw/refresh bookkeeping
+// (`explorer_needs_refresh`, `draw_needed`), which stays at each call site
+// exactly as before since it is generic "something changed" plumbing
+// already shared across far more than context-menu actions, not specific to
+// this rung.
+//
+// #1499: this used to be a `host: &mut impl ExplorerContextHost` one-method
+// trait, so a second backend (the pre-#1434 TUI shell) could supply its own
+// terminal-opening plumbing. With that backend gone, `open_terminal_at`
+// (a plain `FnMut`) is enough: `App` passes a closure over its own `&mut
+// self`; the test-only caller in `core::engine::picker` passes a no-op —
+// no trait, no per-backend struct, and no dependency from `core`'s test code
+// onto `crate::app::App`.
 
 /// Resolve the "open_terminal"/"find_in_folder" target directory: `target`
 /// itself when it is already a directory, its parent otherwise (falling
@@ -5363,12 +5462,16 @@ fn explorer_ctx_action_dir(
 /// `select_for_diff`/`diff_with_selected` are engine-owned — already fully
 /// handled inside `context_menu_confirm` itself — so they (and any other
 /// unrecognised action) are a deliberate no-op here.
+///
+/// `open_terminal_at` opens a new terminal tab rooted at the given directory
+/// — needs the live pane's column count, which only the caller's own runner
+/// has in scope, so it's the caller's job, not this function's.
 pub fn apply_explorer_context_action(
     engine: &mut Engine,
     action: &str,
     target: &std::path::Path,
     is_dir: bool,
-    host: &mut impl ExplorerContextHost,
+    open_terminal_at: &mut dyn FnMut(&mut Engine, std::path::PathBuf),
 ) {
     match action {
         "new_file" | "new_folder" | "rename" => {
@@ -5385,7 +5488,7 @@ pub fn apply_explorer_context_action(
         }
         "open_terminal" => {
             let dir = explorer_ctx_action_dir(engine, target, is_dir);
-            host.open_terminal_at(engine, dir);
+            open_terminal_at(engine, dir);
         }
         "find_in_folder" => {
             let dir = explorer_ctx_action_dir(engine, target, is_dir);
@@ -5407,7 +5510,7 @@ pub fn apply_explorer_context_action(
 // `show_file_save_dialog`, a nested draw-and-read loop over
 // `FilePickerController` — so TUI can call it too.
 //
-// TUI doesn't need GTK's `tick()` deferral: `TuiShellApp::handle` already has
+// TUI doesn't need GTK's `tick()` deferral: the pre-#1434 TUI shell's `handle` already has
 // `backend: &mut dyn quadraui::Backend` in scope at both call sites that can
 // open one of these dialogs (the `open_file_dialog` menu action, and
 // `EngineAction::SaveWorkspaceAsDialog` via `TuiEngineActionHost`, which now
@@ -5474,51 +5577,31 @@ pub fn run_save_workspace_as_dialog(engine: &mut Engine, backend: &mut dyn quadr
 // `PanelChanged { hamburger }` returned early, before any shadow-sync
 // statement ran, because the sync was spelled out fresh at each call site
 // instead of owned by one function every call site is required to reach.
-// [`sync_shell_event_shadow`] is that one function. Both `App::on_shell_event`
-// (GTK) and `TuiShellApp::on_shell_event` (TUI) now call it unconditionally,
-// as the first thing they do, before any of their own id-specific branching —
-// so the shadow mutation itself can no longer be skipped by an early
-// `return` reached before it. The only door left for a backend to exclude an
-// id from the shadow sync is [`ShellShadowSyncHost::panel_absent_from_shadow`],
-// a declarative predicate with no side effects of its own, answered inside
-// this function rather than around it.
-
-/// Host hook for [`sync_shell_event_shadow`] — same shape as
-/// [`PanelAcceleratorHost`] and for the same reason: the sync itself is one
-/// shared body, but *which* panel ids even have a shadow `PanelDefinition`
-/// to sync differs per backend.
-pub trait ShellShadowSyncHost {
-    /// True when `panel_id` has no matching `PanelDefinition` in the shadow
-    /// `engine.app_shell`, so a `PanelChanged` for it must skip the generic
-    /// sync below rather than call `show_panel` on an id the shadow doesn't
-    /// know (a silent no-op) or clobber state a different subsystem owns.
-    ///
-    /// `ext:`-prefixed plugin panels qualify on *both* backends —
-    /// `render::apply_activity_panel_switch`'s `ext:` branch already handles
-    /// them through `engine.ext_panel_active`, not a shadow
-    /// `PanelDefinition` — so [`sync_shell_event_shadow`] checks that case
-    /// itself rather than asking the host. TUI's hamburger id is the one
-    /// case that genuinely needs a host answer: the shadow `AppShell`
-    /// (built in `Engine::new` from only the real content panels) has no
-    /// hamburger `PanelDefinition` at all, for reasons specific enough to
-    /// TUI that GTK's impl is simply `false`.
-    fn panel_absent_from_shadow(&self, panel_id: &quadraui::WidgetId) -> bool;
-}
+// [`sync_shell_event_shadow`] is that one function. `App::on_shell_event`
+// calls it unconditionally, as the first thing it does, before any of its
+// own id-specific branching — so the shadow mutation itself can no longer be
+// skipped by an early `return` reached before it.
+//
+// #1499: this used to take a `host: &impl ShellShadowSyncHost` with one
+// hook, `panel_absent_from_shadow`, so a second backend (the pre-#1434 TUI
+// shell) could answer it differently. With that backend gone, `App`'s own
+// answer is the only one left, so the predicate is inlined below instead of
+// asked through a trait: the shadow `engine.app_shell` never gets a
+// `PanelDefinition` for the hamburger panel (`App::shell_config` only
+// registers it in the runner's own `AppShell`, on the `cell` profile, and
+// even there it's runner-only — see
+// [`reclaim_hamburger_sidebar_reservation`]'s doc), so a `PanelChanged` for
+// it must always skip the generic sync below.
 
 /// Mirror a runner-decided [`quadraui::AppShellEvent`] onto the shadow
-/// `engine.app_shell` (#1062). Shared by `App::on_shell_event` (GTK) and
-/// `TuiShellApp::on_shell_event` (TUI) — call this first, unconditionally,
-/// before any of the event's other id-specific handling; see the rung's
-/// header comment above for why the call must come first.
-pub fn sync_shell_event_shadow(
-    event: &quadraui::AppShellEvent,
-    engine: &mut Engine,
-    host: &impl ShellShadowSyncHost,
-) {
+/// `engine.app_shell` (#1062). Called by `App::on_shell_event` first,
+/// unconditionally, before any of the event's other id-specific handling —
+/// see the rung's header comment above for why the call must come first.
+pub fn sync_shell_event_shadow(event: &quadraui::AppShellEvent, engine: &mut Engine) {
     match event {
         quadraui::AppShellEvent::PanelChanged { panel_id } => {
             if crate::app_support::is_ext_panel_id(panel_id.as_str())
-                || host.panel_absent_from_shadow(panel_id)
+                || panel_id.as_str() == crate::core::engine::sidebar::HAMBURGER_PANEL_ID
             {
                 return;
             }
@@ -5538,9 +5621,383 @@ pub fn sync_shell_event_shadow(
     }
 }
 
+// ─── Shared menu-bar reveal/hide routing (#1427) ────────────────────────────
+//
+// A backend whose menu bar can be fully hidden (`Engine::menu_bar_toggleable`
+// — pre-#1427 only the pre-#1434 TUI shell's `setup` ever set this; now also `App::setup`
+// on any backend whose `BackendCaps::window_chrome` is `false`, i.e. no real
+// window chrome to double as the titlebar the way GTK's does — #901/#552)
+// needs three pieces of behaviour a permanently-visible menu bar
+// (GTK/macOS/Win) never does: an Alt+<letter> shim so a hidden bar's
+// accelerators still work (#318), a one-shot guard that hides the bar again
+// on the stale click a hamburger reveal leaves behind (#988/#1029), and a
+// hamburger `PanelDefinition` click that reveals the bar instead of
+// switching the (nonexistent) "Menu" sidebar panel. All five functions below
+// were the pre-#1434 TUI shell's private methods before #1427; they are pure
+// `&mut Engine` (plus, where a hit-test needs one, `&dyn Backend`/
+// `&ShellContext`) so both `App` and the pre-#1434 TUI shell can call the same body.
+// Every one is a documented no-op on a backend that never sets
+// `menu_bar_toggleable`/never registers the hamburger panel (GTK/macOS/Win
+// today) — see each function's own doc — so callers wire them in
+// unconditionally rather than branching on `BackendCaps` themselves.
+
+/// #1029: one-shot spend of [`Engine::hamburger_stale_click_guard`] for
+/// `event`, on the *direct-dispatch* path (`ShellApp::handle`/
+/// `handle_dispatch`) — call at the very top, before any early exit, so the
+/// guard is spent for exactly one event no matter which arm of the caller's
+/// own dispatch that event ends up in. Returns `true` only for the one
+/// `MouseDown` this guard exists to catch (the caller's own corner-position
+/// check, [`route_menu_bar_reveal`], decides whether it actually landed on
+/// the stale corner). See [`Engine::hamburger_stale_click_guard`]'s own doc
+/// for the full one-shot lifecycle and why pointer/window plumbing
+/// (`MouseMoved`/`MouseUp`/focus/resize/DPI) leaves the guard armed instead
+/// of spending it.
+pub fn consume_hamburger_stale_click_guard(engine: &mut Engine, event: &quadraui::UiEvent) -> bool {
+    if !engine.hamburger_stale_click_guard {
+        return false;
+    }
+    match event {
+        quadraui::UiEvent::MouseDown { .. } => {
+            engine.hamburger_stale_click_guard = false;
+            true
+        }
+        quadraui::UiEvent::MouseUp { .. }
+        | quadraui::UiEvent::MouseMoved { .. }
+        | quadraui::UiEvent::MouseEntered { .. }
+        | quadraui::UiEvent::MouseLeft { .. }
+        | quadraui::UiEvent::WindowResized { .. }
+        | quadraui::UiEvent::WindowFocused(_)
+        | quadraui::UiEvent::DpiChanged(_)
+        | quadraui::UiEvent::WindowStateChanged { .. } => false,
+        _ => {
+            engine.hamburger_stale_click_guard = false;
+            false
+        }
+    }
+}
+
+/// #1029: spend [`Engine::hamburger_stale_click_guard`] on the
+/// *shell-consumed* path — the half [`consume_hamburger_stale_click_guard`]
+/// can never see, because `ShellAdapter` hit-tests the activity bar itself
+/// and reports a real panel click as a semantic `AppShellEvent` without ever
+/// falling through to `ShellApp::handle`. Call from every `on_shell_event`/
+/// `on_shell_event_ctx` arm that represents genuine user input (a real panel
+/// icon, a divider drag, a bottom item) — every one of those is exactly as
+/// much "the user moved on" as a keystroke is, so the guard has to die there
+/// too, or a `File` click arriving afterwards is misread as the stale corner.
+/// Not called for the hamburger's own reveal (that arm *arms* the guard) nor
+/// for a suppressed `take_requested_panel` echo (the app reconciling itself,
+/// not user input).
+pub fn disarm_hamburger_stale_click_guard(engine: &mut Engine) {
+    engine.hamburger_stale_click_guard = false;
+}
+
+/// #318/#1029: the Alt+<letter> reveal shim plus the stale-hamburger-corner
+/// hide. Takes `stale_hamburger_corner_click` — the result of
+/// [`consume_hamburger_stale_click_guard`] — as a parameter rather than
+/// calling it internally, because that consume has to happen at the very
+/// top of `handle`/`handle_dispatch`, before *any* early exit (including
+/// ones this function's caller can't see, e.g. the pre-#1434 TUI shell's `handle`'s
+/// panel-accelerator dispatch), while this function itself is called later,
+/// immediately before the caller's own `MenuSystem` intercept — see
+/// `consume_hamburger_stale_click_guard`'s own doc for why the two calls
+/// can't be merged into one without narrowing that guarantee.
+///
+/// 1. **Alt+<letter> shim** — when the bar is hidden, Alt+<letter> must
+///    still reveal *and* activate the matching menu (otherwise the bare
+///    letter falls through to `Engine::handle_key`, which ignores Alt, and
+///    triggers a Vim motion instead — Alt+T → t-motion). Sets
+///    `engine.menu_bar_visible = true` and lets the event keep flowing: the
+///    caller's own `MenuSystem` intercept, called immediately after this
+///    returns `None`, is what actually opens the menu using the
+///    just-flipped flag.
+/// 2. **Stale hamburger-corner click** — revealing the bar shifts the whole
+///    activity bar (hamburger included) down one row; a second click at the
+///    *exact screen position* that revealed it (muscle memory) lands one row
+///    too high, on the title-bar band, where it would otherwise open
+///    whatever menu happens to paint at that column (`File`, at the default
+///    sidebar width — the #988 symptom). Recognised structurally (a
+///    `MouseDown` inside the title-bar band whose column still falls within
+///    the activity bar's own width) and bounded to the one click immediately
+///    following a reveal by `stale_hamburger_corner_click`'s one-shot
+///    source, so a later, deliberate click on `File` falls through to the
+///    caller's `MenuSystem` intercept like any other menu click.
+///
+/// Returns `Some(Reaction::Redraw)` only for case 2 — the caller must return
+/// immediately, without running its own dispatch for this event. `None`
+/// means "not consumed" (including case 1's reveal — see above).
+///
+/// A no-op on a backend that never sets `menu_bar_toggleable` (so
+/// `menu_bar_visible` is always already `true` — GTK/macOS/Win): the shim's
+/// `!menu_bar_visible` gate never opens, and the guard this reads is only
+/// ever armed by a hamburger panel click, which those backends never
+/// register (`App::shell_config`'s `px` profile has no hamburger
+/// `PanelDefinition` — see that method's own doc).
+pub fn route_menu_bar_reveal(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    stale_hamburger_corner_click: bool,
+    backend: &mut dyn quadraui::Backend,
+    ctx: &quadraui::ShellContext<'_>,
+) -> Option<quadraui::Reaction> {
+    if !engine.menu_bar_visible {
+        if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+            if modifiers.alt {
+                if let quadraui::Key::Char(c) = key {
+                    let bar = engine.menu_system.borrow().menu_bar();
+                    if bar.find_alt_target(*c).is_some() {
+                        engine.menu_bar_visible = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if stale_hamburger_corner_click && engine.menu_bar_visible {
+        if let quadraui::UiEvent::MouseDown { position, .. } = event {
+            let viewport = backend.viewport();
+            let area = quadraui::Rect::new(0.0, 0.0, viewport.width, viewport.height);
+            let layout = ctx.shell().layout(area, backend.line_height());
+            let ab = layout.activity_bar_bounds;
+            let in_hamburger_corner = ctx.in_title_bar(position.x, position.y)
+                && position.x >= ab.x
+                && position.x < ab.x + ab.width;
+            if in_hamburger_corner {
+                engine.menu_bar_visible = false;
+                ctx.shell_mut().hide_sidebar();
+                ctx.shell_mut().set_title_bar_visible(false);
+                return Some(quadraui::Reaction::Redraw);
+            }
+        }
+    }
+
+    None
+}
+
+/// #695/#1029: resolve the rect [`quadraui::MenuSystem::handle`]/`::render`
+/// should hit-test/paint against for a toggleable-menu-bar backend, given
+/// this frame's cached title-bar-band rect (`App::menu_items_rect`/
+/// `Engine::menu_bar_rect`, both written once per paint).
+///
+/// [`route_menu_bar_reveal`]'s Alt+<letter> shim can flip `menu_bar_visible`
+/// from `false` to `true` and the caller's `MenuSystem` intercept can fire
+/// in that *same* dispatch — before `render_content` ever runs again to
+/// refresh the cache, so it can still hold the empty/never-painted rect
+/// from the last frame the bar was hidden. Handing `MenuSystem::handle` that
+/// rect makes it lay out zero visible items and then index into that empty
+/// list assuming at least one fits — a panic, not a no-op. Falls back to a
+/// full-viewport-width, one-row rect (matching every toggleable profile's
+/// `title_bar_height_lh == 1.0`) for exactly that one just-revealed-but-not-
+/// yet-painted frame; checks both `width` and `height` against the cached
+/// rect, not `height` alone, so a viewport whose computed width collapses to
+/// zero can't sneak a real-but-zero-width rect past this guard either.
+///
+/// `toggleable` gates the whole fallback: `false` (GTK/macOS/Win, whose
+/// `menu_bar_visible` is pinned before this can ever matter) always returns
+/// `cached` unchanged, byte-for-byte the pre-#1427 behaviour on those
+/// backends.
+pub fn menu_bar_intercept_rect(
+    toggleable: bool,
+    cached: quadraui::Rect,
+    viewport_width: f32,
+) -> quadraui::Rect {
+    if !toggleable || (cached.width >= 1.0 && cached.height >= 1.0) {
+        cached
+    } else {
+        quadraui::Rect::new(0.0, 0.0, viewport_width, 1.0)
+    }
+}
+
+/// #635 (Stage 6b item A): keep the runner's `AppShell` title-bar row
+/// reservation in sync with `engine.menu_bar_visible` — that flag can flip
+/// via [`route_menu_bar_reveal`] above, `render::dispatch_panel_accelerator`,
+/// `:set menu`, or (for the hamburger specifically) [`route_hamburger_panel_
+/// changed`]/[`route_hamburger_sidebar_hidden`] below, and none of those
+/// touch the runner's own `AppShell` on their own — only
+/// `AppShell::set_title_bar_visible` does. Call unconditionally on the way
+/// out of every dispatch (`handle`/`handle_dispatch`'s tail,
+/// `on_shell_event_ctx`'s tail) rather than only from the specific arms that
+/// change the flag, per `AppShell::set_title_bar_visible`'s own doc
+/// (quadraui#532): "toggling this and calling [layout/render] next is
+/// sufficient". A no-op whenever the flag hasn't changed since the last
+/// call.
+pub fn sync_menu_bar_title_row(ctx: &quadraui::ShellContext<'_>, engine: &Engine) {
+    ctx.shell_mut()
+        .set_title_bar_visible(engine.menu_bar_visible);
+}
+
+/// #1029: the hamburger's own `AppShellEvent::PanelChanged` — reveals the
+/// menu bar and, on a genuine reveal (the `false -> true` transition, not a
+/// `take_requested_panel` echo of an already-open bar), arms the stale-click
+/// guard [`route_menu_bar_reveal`] later reads. Returns `true` when
+/// `panel_id` names the hamburger, in which case the caller must skip its
+/// own generic `PanelChanged` handling for this event (there is no shadow
+/// `PanelDefinition` for the hamburger to switch to — see
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm).
+pub fn route_hamburger_panel_changed(engine: &mut Engine, panel_id: &quadraui::WidgetId) -> bool {
+    if panel_id.as_str() != HAMBURGER_PANEL_ID {
+        return false;
+    }
+    let just_revealed = !engine.menu_bar_visible;
+    engine.menu_bar_visible = true;
+    if just_revealed {
+        engine.hamburger_stale_click_guard = true;
+    }
+    true
+}
+
+/// #1029 (defect 2 of #988): the hamburger's own second click — reported as
+/// `AppShellEvent::SidebarHidden` for whichever panel the runner's `AppShell`
+/// currently has active — hides the menu bar again. Only `ctx.shell()`, the
+/// *runner's* own state, can tell "this `SidebarHidden` is the hamburger
+/// closing" apart from a real panel's own second click (the shadow
+/// `engine.app_shell` has no hamburger entry to check against), so the
+/// caller must guard this call itself:
+/// `ctx.shell().active_panel_id() == Some(HAMBURGER_PANEL_ID)`, checked
+/// *before* delegating to its own generic `SidebarHidden` handling (none of
+/// that generic handling applies here — the reveal never touched the shadow
+/// sidebar in the first place).
+pub fn route_hamburger_sidebar_hidden(engine: &mut Engine, ctx: &quadraui::ShellContext<'_>) {
+    disarm_hamburger_stale_click_guard(engine);
+    engine.menu_bar_visible = false;
+    ctx.shell_mut().set_title_bar_visible(false);
+}
+
+/// #1029: correct a frame's [`quadraui::AppShellLayout`] for the hamburger's
+/// own phantom sidebar reservation. The hamburger is a top-row
+/// `PanelDefinition` in the *runner's* `AppShell` (so a click on it produces
+/// a real `PanelChanged`/hit-testable activity-bar icon) but has no matching
+/// entry in the shadow `engine.app_shell` (see
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm) — so while the
+/// hamburger is the runner's active panel, `AppShellLayout` still reserves a
+/// sidebar column for it even though nothing real is behind it. Left alone,
+/// `render_content` would paint that reservation as an empty sidebar band
+/// (or worse, stale content from whatever panel was active before).
+///
+/// A no-op — returns `layout.clone()` unchanged — unless all three hold:
+/// `engine.menu_bar_toggleable` (only ever `true` alongside a runner that
+/// can register the hamburger panel at all), `engine.menu_bar_visible`
+/// (there is a reservation to reclaim only while the bar — and therefore the
+/// hamburger's reveal — is showing), and the shadow's own sidebar is hidden
+/// (`!engine.app_shell.sidebar_visible()` — if a *real* panel is genuinely
+/// visible, e.g. the very first frame before any dispatch has run the
+/// sidebar-visibility sync yet, this must not blank out its real content).
+/// Reclaims the sidebar + divider width back onto `main_content_bounds`,
+/// mirroring `AppShellLayout`'s own `!sidebar_visible` branch.
+pub fn reclaim_hamburger_sidebar_reservation(
+    engine: &Engine,
+    layout: &quadraui::AppShellLayout,
+) -> quadraui::AppShellLayout {
+    if !engine.menu_bar_toggleable
+        || !engine.menu_bar_visible
+        || engine.app_shell.sidebar_visible()
+        || layout.sidebar_content_bounds.is_none()
+    {
+        return layout.clone();
+    }
+    let ab = layout.activity_bar_bounds;
+    let main = layout.main_content_bounds;
+    let reclaimed_main = quadraui::Rect::new(
+        ab.x + ab.width,
+        main.y,
+        (layout.window_bounds.x + layout.window_bounds.width - (ab.x + ab.width)).max(0.0),
+        main.height,
+    );
+    quadraui::AppShellLayout {
+        sidebar_header_bounds: None,
+        sidebar_content_bounds: None,
+        divider_bounds: None,
+        main_content_bounds: reclaimed_main,
+        ..layout.clone()
+    }
+}
+
+/// #634 smoke retry (widened #1427): keep the runner `AppShell`'s sidebar
+/// *visibility* in sync with the shadow `engine.app_shell`'s. Every keyboard
+/// path (Ctrl+B-style toggles, `toggle_sidebar_panel` via panel
+/// accelerators, autohide, Ctrl+W overflow) mutates the shadow, while the
+/// *runner's* own `AppShell` owns whether `sidebar_content_bounds` exists at
+/// all in the painted layout — so this has to be pushed through explicitly.
+/// The active-*panel* half of this sync lives in `ShellApp::
+/// take_requested_panel` (also covers tick-driven switches, which never
+/// reach here); this is the visibility half, with no adapter hook of its
+/// own, so callers push it unconditionally and idempotently on the way out
+/// of every dispatch.
+///
+/// #1029 (defect 2 of #988, widened #1427): the hamburger is special-cased
+/// out of this sync entirely while it's the reveal actually in effect. The
+/// shadow has no hamburger `PanelDefinition` at all (see
+/// [`sync_shell_event_shadow`]'s `PanelChanged` arm), so
+/// `shadow_visible` can never reflect a hamburger reveal — it's always
+/// whatever the last *real* panel click left behind. Without the
+/// `runner_shows_hamburger` guard, the very next dispatch after a hamburger
+/// click (a `WindowFocused` pump, or any other unrelated keypress) would
+/// read that stale `false` and force-hide the runner's own sidebar in
+/// response — leaving `active_panel == Some(hamburger)` but
+/// `sidebar_visible == false` by the time a second click lands. That
+/// permanently blocks `AppShell::handle_activity_click`'s "already active +
+/// visible → hide" branch for the hamburger: every click, first or Nth,
+/// resolves as a fresh `PanelChanged` reveal, never a `SidebarHidden` — the
+/// second click that's supposed to hide the menu bar again does nothing
+/// (#988).
+///
+/// Gated on `engine.menu_bar_visible` too, not just "is the runner showing
+/// the hamburger" — `AppShell::new` defaults `active_panel` to index 0,
+/// which the hamburger occupies (`App::shell_config`'s `cell`-profile
+/// branch / the pre-#1434 TUI shell's `build_shell_config` both put it first), so a
+/// *fresh* runner starts "showing the hamburger" before any click ever
+/// happens. `menu_bar_visible` is what distinguishes an actual, user-driven
+/// reveal from that construction-time default — without it, this guard
+/// would also suppress the very first dispatch's correction of
+/// `AppShell::new`'s own `sidebar_visible: true` default, leaving a phantom
+/// "Menu" sidebar pane reserved forever (and, on the toggleable-menu-bar
+/// profile specifically, permanently blocking the very first hamburger
+/// click from ever registering as a reveal in the first place — the
+/// runner's own construction-time default already reads "active +
+/// visible", so without this correction running once, unconditionally,
+/// before the first real click, that click would resolve as the toggle-hide
+/// branch instead).
+pub fn sync_runner_sidebar_visibility(engine: &Engine, ctx: &quadraui::ShellContext<'_>) {
+    let shadow_visible = engine.app_shell.sidebar_visible();
+    let runner_visible = ctx.shell().sidebar_visible();
+    let runner_shows_hamburger = engine.menu_bar_visible
+        && ctx
+            .shell()
+            .active_panel_id()
+            .map(quadraui::WidgetId::as_str)
+            == Some(HAMBURGER_PANEL_ID);
+    if runner_visible != shadow_visible && !runner_shows_hamburger {
+        if shadow_visible {
+            // #557: while a plugin panel is open the shadow's active-panel
+            // id still names the built-in that preceded it (extension
+            // panels never touch it), so reveal *that* panel and the
+            // runner's highlight jumps off the extension icon — same
+            // reason `ShellApp::take_requested_panel` prefers
+            // `ext_panel_active`.
+            let id = engine
+                .ext_panel_active
+                .as_deref()
+                .map(|n| quadraui::WidgetId::new(crate::core::engine::sidebar::ext_panel_id(n)))
+                .or_else(|| engine.app_shell.active_panel_id().cloned());
+            if let Some(id) = id {
+                ctx.shell_mut().show_panel(&id);
+            }
+            // `AppShell::show_panel` only searches its top `panels` list —
+            // the Settings cog is a bottom item, so the call above can
+            // no-op. Force visibility alone in that case; the runner's
+            // active-panel index (header title) is untouched.
+            if !ctx.shell().sidebar_visible() {
+                ctx.shell_mut().toggle_sidebar();
+            }
+        } else {
+            ctx.shell_mut().hide_sidebar();
+        }
+    }
+}
+
 // ─── Shared tick-chore rung (#1248) ──────────────────────────────────────────
 //
-// `App::handle_poll_tick`/`tick_dispatch` (GTK) and `TuiShellApp::tick` (TUI)
+// `App::handle_poll_tick`/`tick_dispatch` (GTK) and the pre-#1434 TUI shell's `tick` (TUI)
 // each ran the *same* dozen-item background chore list every frame, written
 // out twice: sync each window's viewport from the last paint, re-check
 // tab-bar scroll offsets against what that paint measured, clear an expired
@@ -5556,100 +6013,25 @@ pub fn sync_shell_event_shadow(
 // field names), how quitting actually ends the process (GTK sets a
 // `Cell<bool>` the runner polls next frame; TUI returns `Reaction::Exit`
 // directly), whether a terminal command needs a live `backend` handle for
-// sizing — live behind [`TickHost`], following [`PanelAcceleratorHost`] /
-// [`EngineActionHost`]'s established shape (a small per-backend host struct
-// holding `&mut App`/its own fields plus `backend`, constructed fresh at each
-// call site) rather than a new one. [`TickHost::tab_switcher_gate`] is the
-// one TUI-only hook with a default: TUI skips the rest of the chore list
-// entirely while the tab-switcher popup is mid-cycle (`event_loop`'s legacy
-// behavior, preserved as-is); GTK has no such popup, so the default no-op
-// (`None`) applies.
-
-/// Host hook for [`run_shared_tick_chores`] — see the rung's header comment
-/// above for why these, and only these, differ per backend.
-pub trait TickHost {
-    /// Run `f` against the `ScreenLayout` the last paint produced, if any.
-    fn with_last_layout(&self, f: &mut dyn FnMut(&ScreenLayout));
-
-    /// The per-group tab-bar widths this frame's `TabBars` rung painted
-    /// (#1165) — a clone, since both backends clear the real field at the
-    /// *start* of the next paint, not here.
-    fn tab_visible_counts(&self) -> Vec<(GroupId, usize)>;
-
-    /// The yank-highlight clear deadline armed by `run_post_key_epilogue`
-    /// (#813).
-    fn yank_highlight_deadline(&self) -> Option<std::time::Instant>;
-
-    /// Clear the armed yank highlight — both the engine-side highlight state
-    /// and this host's own deadline field.
-    fn clear_yank_highlight_deadline(&mut self, engine: &mut Engine);
-
-    /// TUI-only: while the tab-switcher popup is mid-cycle, run *only* its
-    /// own 500ms auto-confirm timer and skip every other chore below this
-    /// point in the list — `Some(needs_redraw)` short-circuits
-    /// [`run_shared_tick_chores`] with that verdict. `None` (GTK's default,
-    /// and TUI's own answer whenever the popup isn't open) means "no gate,
-    /// keep going."
-    fn tab_switcher_gate(&mut self, engine: &mut Engine) -> Option<bool> {
-        let _ = engine;
-        None
-    }
-
-    /// Extra work when `Engine::poll_idle` reports dirty state (LSP/DAP/
-    /// search finished something this tick) — GTK re-syncs sidebar widgets
-    /// from `engine.app_shell`; TUI needs nothing extra here (its sidebar
-    /// repaints from engine state every frame regardless).
-    fn on_idle_dirty(&mut self, engine: &mut Engine) {
-        let _ = engine;
-    }
-
-    /// True once >= 2s has elapsed since the last periodic sidebar/SC
-    /// refresh, resetting the timer as a side effect when it has. Each
-    /// backend owns its own `Instant`/`Cell<Instant>` field (different
-    /// storage shapes), so the elapsed check can't live in `Engine` itself.
-    fn sidebar_refresh_due(&mut self) -> bool;
-
-    /// TUI-only: rebuild the explorer row cache on the same 2s tick,
-    /// regardless of which panel is active (mirrors the legacy `event_loop`
-    /// behavior). No-op on GTK, which refreshes the file tree from
-    /// `Engine::explorer_needs_refresh` instead.
-    fn on_sidebar_refresh_tick(&mut self, engine: &mut Engine) {
-        let _ = engine;
-    }
-
-    /// Run a queued terminal command in a freshly-sized pane — needs a live
-    /// column/row count only available per-backend.
-    fn run_terminal_command(&mut self, engine: &mut Engine, cmd: String);
-
-    /// Give a just-revealed extension panel focus, in whatever backend-local
-    /// sidebar-focus state each backend tracks.
-    fn ext_panel_focus(&mut self, engine: &mut Engine, panel_name: String);
-
-    /// Finish the format-on-save-then-quit flow (`:wq`/`:x` deferred
-    /// quit) — each backend's own session-save + shutdown/exit sequence.
-    fn quit_after_format_save(&mut self, engine: &mut Engine);
-
-    /// Carry out one queued platform action (open URL / reveal in file
-    /// manager) via this host's own `backend` handle.
-    fn run_platform_action(
-        &mut self,
-        engine: &mut Engine,
-        action: crate::core::engine::PendingPlatformAction,
-    );
-
-    /// Sync the OS window title/chrome from `engine`'s state — [`window_title`]
-    /// supplies the shared string both backends format identically; each
-    /// decides when/whether to apply it (TUI gates on its own `live` field —
-    /// no real terminal under the test driver — and GTK additionally caches
-    /// the window bounds for session-restore).
-    fn sync_window_title(&mut self, engine: &Engine);
-}
+// sizing — used to live behind a `host: &mut impl TickHost` seam, following
+// [`PanelAcceleratorHost`]/[`EngineActionHost`]'s established shape (#1499: a
+// small per-backend host struct holding `&mut App`/its own fields plus
+// `backend`, constructed fresh at each call site). With the TUI backend
+// gone, `App` is the only implementation left, so [`run_shared_tick_chores`]
+// takes `app: &mut App` and `backend: &mut dyn quadraui::Backend` directly
+// and inlines what used to be `GtkTickHost`'s method bodies. The two
+// TUI-only hooks the old trait gave a no-op default for on GTK —
+// `tab_switcher_gate` (skip the rest of the chore list while TUI's
+// tab-switcher popup is mid-cycle) and `on_sidebar_refresh_tick` (rebuild
+// TUI's explorer row cache on the periodic sidebar tick) — are simply gone
+// below rather than inlined as always-no-op calls: `App` never overrode
+// either, so dropping them changes nothing observable.
 
 /// The OS/taskbar window title vimcode uses everywhere — `"VimCode —
 /// <buffer name>"`, or the bare app name with none open. Used to be
 /// formatted identically, and independently, in `App::handle_poll_tick` and
-/// `TuiShellApp::tick`; now the one string both [`TickHost::sync_window_title`]
-/// impls format (#1248).
+/// the pre-#1434 TUI shell's `tick`; now the one string
+/// [`run_shared_tick_chores`]'s window-title chore formats (#1248).
 pub fn window_title(engine: &Engine) -> String {
     engine
         .active_buffer_name()
@@ -5659,7 +6041,7 @@ pub fn window_title(engine: &Engine) -> String {
 
 /// Carry out a queued [`crate::core::engine::PendingPlatformAction`] (open
 /// URL / reveal in file manager) via `backend`'s `PlatformServices`. Was
-/// `App::run_pending_platform_action` / `TuiShellApp::run_pending_platform_action`
+/// `App::run_pending_platform_action` / the pre-#1434 TUI shell's `run_pending_platform_action`
 /// — two copies differing only in how each reaches its `Engine` (#1248).
 pub fn run_pending_platform_action(
     engine: &mut Engine,
@@ -5681,17 +6063,49 @@ pub fn run_pending_platform_action(
     }
 }
 
-/// Run the tick-time background chore list both backends share (#1248) —
-/// see the rung's header comment above for the full list and why the
-/// backend-specific bits live behind `host` instead of here. Returns `true`
-/// when anything changed this tick that warrants a redraw.
-pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> bool {
+/// Editor mode → hardware caret shape (#1109, moved here from
+/// the pre-#1434 TUI shell's `caret_shape_for_mode` by #1428 so `App` can share it):
+/// block for Normal/Visual, bar for Insert, underline for a pending
+/// replace-char (`r`) command — the same three-way mapping the old
+/// hand-rolled crossterm cursor-style write used, now feeding
+/// `Backend::set_caret_shape` (quadraui#1015) instead.
+///
+/// `sidebar_has_focus` is the caller's own "is a sidebar panel, not the
+/// editor, holding keyboard focus" answer — the pre-#1434 TUI shell passes
+/// `self.sidebar.has_focus`, `App` passes `engine.sidebar_has_focus()` (see
+/// each caller). Pure function, deliberately separate from either caller's
+/// `self.live`/no-op-by-default write gate right after it — see
+/// `Backend::set_caret_shape`'s own doc for why the write itself is
+/// unobservable from a `TestBackend`-driven test (a real terminal write,
+/// no test-mode guard of its own) while this *decision* is.
+pub fn caret_shape_for_mode(
+    engine: &Engine,
+    sidebar_has_focus: bool,
+) -> quadraui::EditorCursorShape {
+    if !sidebar_has_focus && engine.pending_key == Some('r') {
+        quadraui::EditorCursorShape::Underline
+    } else if !sidebar_has_focus && engine.mode == Mode::Insert {
+        quadraui::EditorCursorShape::Bar
+    } else {
+        quadraui::EditorCursorShape::Block
+    }
+}
+
+/// Run the tick-time background chore list `App::handle_poll_tick` shares
+/// with the pre-#1434 TUI shell's `tick` (#1248) — see the rung's header
+/// comment above for the full list. Returns `true` when anything changed
+/// this tick that warrants a redraw.
+pub(crate) fn run_shared_tick_chores(
+    engine: &mut Engine,
+    app: &mut crate::app::App,
+    backend: &mut dyn quadraui::Backend,
+) -> bool {
     let mut needs_redraw = false;
 
     // Exact per-window viewport dimensions from the last paint, so
     // `ensure_cursor_visible` uses real geometry rather than a whole-screen
     // approximation that can't see splits.
-    host.with_last_layout(&mut |layout| {
+    if let Some(layout) = app.cached_screen_layout.borrow().as_ref() {
         for rw in &layout.windows {
             engine.set_viewport_for_window(
                 rw.window_id,
@@ -5699,36 +6113,71 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
                 rw.text_viewport_cols.max(1),
             );
         }
-    });
+    }
 
     // Re-check every group's active tab is still on-screen against the
     // widths this frame's `TabBars` rung actually painted (#1165).
-    let counts = host.tab_visible_counts();
+    let counts = app.tab_visible_counts.borrow().clone();
     if !counts.is_empty() && engine.post_draw_apply_widths(&counts) {
         needs_redraw = true;
     }
 
     // Sync the OS window title before any chore below could plausibly change
-    // the active buffer name (mirrors the legacy TUI ordering).
-    host.sync_window_title(engine);
-
-    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
-    if let Some(deadline) = host.yank_highlight_deadline() {
-        if std::time::Instant::now() >= deadline {
-            host.clear_yank_highlight_deadline(engine);
-            needs_redraw = true;
+    // the active buffer name (mirrors the legacy TUI ordering). Routed
+    // through `Backend::window()` (quadraui#950, #1124) rather than the old
+    // GTK-only `self.window`/`PlatformWindowHandle` title setter (deleted
+    // #1234) — that seam was `None` on macOS/Win-GUI, so this used to be a
+    // silent no-op there; `WindowControl` is backed on every windowed
+    // backend.
+    let win_title = window_title(engine);
+    if let Some(w) = backend.window() {
+        let _ = w.set_title(&win_title);
+        // Refresh the session-restore maximized cache (#1529) unconditionally
+        // — unlike size/position below, this is exactly the one moment those
+        // freeze, so it must always be current.
+        let maximized = w.is_maximized();
+        if let Ok(m) = maximized {
+            app.cached_window_maximized.set(m);
+        }
+        // Refresh the session-restore size/position cache (#1234, extended
+        // #1529 for position) — see `App::cached_window_width`'s doc for why
+        // this is cached here rather than read live from
+        // `App::save_session_and_exit`, and why it's gated on
+        // `!is_maximized()`.
+        if matches!(maximized, Ok(false)) {
+            if let Ok(bounds) = w.bounds() {
+                app.cached_window_width.set(bounds.width.round() as i32);
+                app.cached_window_height.set(bounds.height.round() as i32);
+                // `WindowControl::bounds`'s own doc: GTK/Wayland always
+                // reports `x: 0.0, y: 0.0` here, meaning "unknown", not "at
+                // the screen origin" — skip caching that sentinel rather than
+                // saving a fake position a `set_bounds`-capable backend
+                // could later misapply; see `App::cached_window_x`/`y`'s own
+                // doc for the #1529 review finding this closes.
+                if bounds.x != 0.0 || bounds.y != 0.0 {
+                    app.cached_window_x.set(Some(bounds.x.round() as i32));
+                    app.cached_window_y.set(Some(bounds.y.round() as i32));
+                }
+            }
         }
     }
 
-    // TUI-only early exit — see `TickHost::tab_switcher_gate`'s doc.
-    if let Some(redraw) = host.tab_switcher_gate(engine) {
-        return needs_redraw || redraw;
+    // Poll the yank-highlight deadline armed by `run_post_key_epilogue` (#813).
+    if let Some(deadline) = app.yank_hl_deadline.get() {
+        if std::time::Instant::now() >= deadline {
+            engine.clear_yank_highlight();
+            app.yank_hl_deadline.set(None);
+            needs_redraw = true;
+        }
     }
 
     // Periodic background work: LSP, DAP, git, search, etc.
     if engine.poll_idle() {
         needs_redraw = true;
-        host.on_idle_dirty(engine);
+        // A redraw trigger only under the `ShellApp` runner (see
+        // `App::sync_sidebar_from_engine`'s own doc comment, the method this
+        // used to call).
+        app.draw_needed.set(true);
     }
 
     // Auto-refresh source control periodically, gated on sidebar visibility
@@ -5737,8 +6186,17 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     // extension panel shown over Git/Explorer doesn't spuriously re-trigger
     // this (mirrors the legacy GTK gate exactly; TUI's own prior gate missed
     // the ext-panel-priority case `sidebar_owner` already handles).
-    if engine.app_shell.sidebar_visible() && host.sidebar_refresh_due() {
-        host.on_sidebar_refresh_tick(engine);
+    //
+    // The elapsed check only resets `last_sc_refresh` while the sidebar is
+    // actually visible — matching the old `host.sidebar_refresh_due()`
+    // hook's short-circuited-`&&` evaluation exactly: while the sidebar is
+    // hidden, the 2s timer is never reset, so it fires once (and resets)
+    // the first tick after the sidebar is shown again, no matter how long
+    // it was hidden for.
+    if engine.app_shell.sidebar_visible()
+        && app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
+    {
+        app.last_sc_refresh = std::time::Instant::now();
         if matches!(
             sidebar_owner(engine),
             SidebarOwner::Git | SidebarOwner::Explorer
@@ -5754,18 +6212,25 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     // Format-on-save + :wq/:x deferred quit.
     if engine.format_save_quit_ready {
         engine.format_save_quit_ready = false;
-        host.quit_after_format_save(engine);
+        app.quit_and_save_session(engine);
     }
 
     // Run a pending terminal command (needs a live column/row count).
     if let Some(cmd) = engine.pending_terminal_command.take() {
-        host.run_terminal_command(engine, cmd);
+        let cols = app.terminal_panel_cols(app.painted_editor_content_width());
+        let rows = engine.session.terminal_panel_rows;
+        engine.terminal_run_command(&cmd, cols, rows);
         needs_redraw = true;
     }
 
     // Focus a panel revealed by plugin logic this frame.
     if let Some(panel_name) = engine.ext_panel_focus_pending.take() {
-        host.ext_panel_focus(engine, panel_name);
+        if !engine.app_shell.sidebar_visible() {
+            engine.app_shell.toggle_sidebar();
+        }
+        engine.ext_panel_has_focus = true;
+        engine.ext_panel_active = Some(panel_name);
+        app.sync_sidebar_widgets();
         needs_redraw = true;
     }
 
@@ -5775,7 +6240,7 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
     let actions = std::mem::take(&mut engine.pending_platform_actions);
     if !actions.is_empty() {
         for action in actions {
-            host.run_platform_action(engine, action);
+            run_pending_platform_action(engine, action, backend);
         }
         needs_redraw = true;
     }
@@ -5792,7 +6257,7 @@ pub fn run_shared_tick_chores(engine: &mut Engine, host: &mut impl TickHost) -> 
 //
 // Same story as slice 1, one rung down. The geometry was already shared
 // (`resolve_breadcrumb_click`, `resolve_tab_bar_click`,
-// `compute_status_hit_regions`, `status_bar_zone_hit_test`) and the actions
+// `status_bar_zone_hit_test`) and the actions
 // were already shared (`Engine::handle_breadcrumb_click`,
 // `handle_tab_bar_click`, `handle_status_action`) — what was still transcribed
 // twice was the **router that sequences them**, and, as always when a sequence
@@ -6129,6 +6594,60 @@ pub fn apply_status_action(
         }
         other => other,
     }
+}
+
+/// Resolve a Command Center click, ignoring any part of the cached layout
+/// that falls **outside the band the Command Center was painted into**.
+///
+/// `quadraui::CommandCenter::layout` centres its content in `bounds` via
+/// `bounds.x + (bounds.width - content_width).max(0.0) / 2.0` — that
+/// `.max(0.0)` clamps the *centring offset*, not the content, so when the
+/// band is narrower than the content's minimum width the whole group is
+/// left-aligned at `bounds.x` and simply **overflows the right edge**. On
+/// every pixel backend that minimum is fixed at
+/// `2 * ARROW_WIDTH_PX + 2 * GAP_PX + SEARCH_MIN_WIDTH_PX` = 344px
+/// (`quadraui::CommandCenterMeasure`), so any title-bar band narrower than
+/// that overflows — and the overflowing `SearchBox` rect is still recorded
+/// as a hit region.
+///
+/// Whatever sits to the Command Center's right therefore loses its clicks
+/// to the search box. On GTK that is the inline minimize/maximize/close
+/// buttons (`measure_title_bar_bands`' `controls` band, which starts exactly
+/// where `command_center` ends): the button paints, the press lands on the
+/// search box instead, and `StatusBarInteraction` never arms — so the
+/// release is a no-op and the window never minimizes.
+///
+/// How far the overflow reaches depends on `menu_end`, i.e. on the
+/// *measured* width of the menu labels, i.e. on which UI font resolved from
+/// `UI_FONT_FAMILY` — which is why this reproduces at 800x600 on a bare CI
+/// runner (no Cantarell/Ubuntu installed, so the wider DejaVu Sans fallback
+/// wins) and not on a GNOME desktop, and why the `#1530` titlebar tests were
+/// green locally and red in CI. The underlying overlap is font-independent
+/// though: it bites at *every* window width below roughly 815px on either
+/// font.
+///
+/// A widget must not be clickable outside the region it was allotted, so
+/// this clamps to `layout.bounds` before consulting `hit_test`. Shared here
+/// rather than in a backend so every backend that routes a Command Center
+/// click gets the same arbitration (Platform-Neutrality Rule).
+///
+/// Note this fixes the *click* half only. The paint still overflows — the
+/// search box's rounded border draws over the window-control glyphs on a
+/// narrow band, because `CommandCenter::layout` hands the backend
+/// out-of-bounds rects and neither `gtk::draw_command_center` nor its
+/// mac/win twins clip to `bounds`. That is a quadraui-side gap (the
+/// primitive should shrink the search box to fit, or clip), not something
+/// vimcode can fix without per-backend code.
+pub fn command_center_hit_in_band(
+    layout: &quadraui::CommandCenterLayout,
+    x: f32,
+    y: f32,
+) -> Option<quadraui::CommandCenterHit> {
+    let b = layout.bounds;
+    if x < b.x || x >= b.x + b.width || y < b.y || y >= b.y + b.height {
+        return None;
+    }
+    Some(layout.hit_test(x, y))
 }
 
 /// Apply a resolved [`quadraui::CommandCenterHit`]. Returns `true` when the
@@ -6906,8 +7425,15 @@ pub enum MouseDragRoute {
     /// The sidebar separator is being dragged to resize the sidebar.
     SidebarResize,
     /// The sidebar body owns the gesture: the search / settings form
-    /// controllers' own drag handling, or an explorer drag-and-drop in flight.
+    /// controllers' own drag handling.
     SidebarBody,
+    /// An explorer drag-and-drop is in flight (#1429) — a file/folder row
+    /// was picked up and the gesture tracks the row under the pointer until
+    /// release, wherever the pointer strays. See [`apply_explorer_drag_move`]
+    /// for the apply and [`apply_explorer_drop`] for the release. Split out
+    /// of [`Self::SidebarBody`] (which used to carry this too) so the two
+    /// gestures are independently testable and neither can shadow the other.
+    ExplorerDnd,
     /// The tab drag machine ([`TabDragState`]) is armed or already tracking.
     TabDrag,
     /// Command-line / message-line text selection.
@@ -6981,15 +7507,12 @@ pub struct MouseDragState<'a> {
     pub modal_hit: bool,
     /// The sidebar separator is being dragged.
     pub sidebar_resizing: bool,
-    /// An explorer drag-and-drop is in flight. Armed rather than geometric:
-    /// once a row is picked up the gesture belongs to the tree even while the
-    /// pointer is outside the sidebar (that is how "dragged away, no target"
-    /// is expressed), so a geometric test alone would hand the move to the
-    /// editor the moment the user left the panel.
-    pub sidebar_dnd: bool,
     /// The sidebar body's painted bounds, when that body wants drag events
-    /// (search / settings form controllers, or an explorer DnD in flight).
-    /// `None` when the sidebar is hidden or its panel has no drag behaviour.
+    /// (the search / settings form controllers). `None` when the sidebar is
+    /// hidden or its panel has no drag behaviour. Explorer DnD used to be
+    /// folded in here too (armed rather than geometric) — see
+    /// [`Self::explorer_dnd_active`], which replaced it (#1429) so the two
+    /// gestures route to distinct [`MouseDragRoute`] variants.
     pub sidebar_body: Option<quadraui::Rect>,
     /// [`TabDragState`] is armed or dragging.
     pub tab_dragging: bool,
@@ -7001,11 +7524,20 @@ pub struct MouseDragState<'a> {
     pub terminal_split_dragging: bool,
     /// The bottom panel is being resized.
     pub terminal_panel_resizing: bool,
+    /// An explorer drag-and-drop is in flight (#1429). Armed rather than
+    /// geometric, for the same reason [`Self::tab_dragging`]/
+    /// `text_selection_active` are: once a row has been picked up the
+    /// gesture belongs to the tree even while the pointer is outside the
+    /// sidebar (dragged away, no target yet), so a geometric test alone
+    /// would hand the move to the editor the moment the pointer left the
+    /// panel. Callers compute this as
+    /// `explorer_drag_src.is_some() || explorer_drag_active.is_some()`.
+    pub explorer_dnd_active: bool,
     /// `Engine::mouse_drag_active` — a previous move in this same gesture
     /// already extended the editor's visual selection.
     ///
-    /// Armed rather than geometric, for the same reason `sidebar_dnd` is:
-    /// once a selection has started extending, a later move that strays over
+    /// Armed rather than geometric, for the same reason `explorer_dnd_active`
+    /// is: once a selection has started extending, a later move that strays over
     /// the minimap strip or the terminal-panel rect must not get stolen by
     /// that geometry — it must keep extending the selection, exactly like
     /// dragging a native text selection past a window's edge. Set from the
@@ -7035,13 +7567,13 @@ impl Default for MouseDragState<'_> {
             hover_popup_selecting: false,
             modal_hit: false,
             sidebar_resizing: false,
-            sidebar_dnd: false,
             sidebar_body: None,
             tab_dragging: false,
             command_line_selecting: false,
             divider_grabbed: false,
             terminal_split_dragging: false,
             terminal_panel_resizing: false,
+            explorer_dnd_active: false,
             text_selection_active: false,
             in_terminal_content: false,
             // Cell metrics default to the TUI's whole-cell grid; GTK always
@@ -7076,8 +7608,8 @@ pub fn route_mouse_drag(state: &MouseDragState<'_>, x: f64, y: f64) -> MouseDrag
     if state.sidebar_resizing {
         return MouseDragRoute::SidebarResize;
     }
-    if state.sidebar_dnd {
-        return MouseDragRoute::SidebarBody;
+    if state.explorer_dnd_active {
+        return MouseDragRoute::ExplorerDnd;
     }
     if state.tab_dragging {
         return MouseDragRoute::TabDrag;
@@ -7896,6 +8428,32 @@ pub fn route_ext_panel_click(engine: &mut Engine, pos: quadraui::Point, is_doubl
     }
 }
 
+/// Update [`Engine::gutter_hover_window`] from the pointer position against
+/// the last-painted `ScreenLayout` (#1544's `fold_controls = "mouseover"`).
+///
+/// Routes through the exact same [`find_window_at`] + [`window_zone_hit_test`]
+/// pair every pixel→click-target resolver in `src/click.rs` already uses, so
+/// a gutter-hover decision can never drift from what a real click at the
+/// same point would resolve to. Both backends call this from the same
+/// shared `MouseMoved` arm in `App::handle_dispatch` — no per-backend hover
+/// geometry.
+pub fn route_gutter_hover(
+    engine: &mut Engine,
+    layout: &ScreenLayout,
+    x: f64,
+    y: f64,
+    line_height: f64,
+    char_width: f64,
+) {
+    engine.gutter_hover_window = find_window_at(layout, x, y).and_then(|idx| {
+        let rw = &layout.windows[idx];
+        let rel_x = x - rw.rect.x;
+        let rel_y = y - rw.rect.y;
+        let hit = window_zone_hit_test(rw, rel_x, rel_y, line_height, char_width);
+        matches!(hit, WindowZone::Gutter { .. }).then_some(rw.window_id)
+    });
+}
+
 /// Hover feedback for the sidebar — the Source Control toolbar buttons and
 /// section rows, and plugin ext-panel rows.
 ///
@@ -8063,6 +8621,163 @@ pub fn route_explorer_tree_event(
     Some(tree_event)
 }
 
+// ─── Explorer drag-and-drop (#1429) ────────────────────────────────────────
+//
+// TUI has carried this since before `App` existed (`explorer_drag_src`/
+// `explorer_drag_active` in `tui_main/shell_app.rs`, applied by hand-rolled
+// row arithmetic in `tui_main/mouse.rs`); GTK/`App` never got a twin, which
+// would have silently dropped the feature the day TUI cuts over onto `App`
+// (the epic this issue is part of). The three functions below are that
+// twin, shared: both backends keep their own two `Option` fields (they are
+// plain row indices, not GTK/TUI structures) and call these to update them.
+
+/// Row index under `(x, y)` inside the explorer tree's own painted `rect`,
+/// in the caller's native unit (`row_height` is `1.0` cell on TUI, the
+/// measured line height in pixels on GTK — the same first element of the
+/// `metrics` tuple [`route_explorer_tree_event`]'s callers already re-apply
+/// before dispatch). `None` when the point is outside `rect`'s columns, above
+/// its first row, or past the last populated row — "no row here", used by
+/// both the drag-and-drop rung below and the empty-space right-click
+/// fallback ([`route_tree_empty_space_context_menu`]) to tell "over a real
+/// row" (owned by [`route_explorer_tree_event`]) from "over empty tree
+/// space".
+pub fn explorer_row_at(
+    engine: &Engine,
+    rect: quadraui::Rect,
+    row_height: f64,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return None;
+    }
+    if x < rect.x as f64 || x >= (rect.x + rect.width) as f64 {
+        return None;
+    }
+    let rel_y = y - rect.y as f64;
+    if rel_y < 0.0 {
+        return None;
+    }
+    let row_height = row_height.max(1.0);
+    let row_in_view = (rel_y / row_height) as usize;
+    let idx = row_in_view + engine.explorer_tree.borrow().scroll_offset();
+    if idx < engine.explorer_rows.len() {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
+/// Apply one [`MouseDragRoute::ExplorerDnd`] move: promote a pending
+/// `explorer_drag_src` into an active `(src, target)` pair once the pointer
+/// has moved off the source row, slide the target row while it stays over
+/// the tree, or clear the target (keeping the drag itself armed) once the
+/// pointer strays outside `rect` — mirrors what `tui_main::mouse`'s
+/// hand-rolled version used to do inline, now shared so `App` gets the same
+/// behaviour without re-deriving it.
+pub fn apply_explorer_drag_move(
+    engine: &Engine,
+    rect: quadraui::Rect,
+    row_height: f64,
+    x: f64,
+    y: f64,
+    explorer_drag_src: &mut Option<usize>,
+    explorer_drag_active: &mut Option<(usize, Option<usize>)>,
+) {
+    match explorer_row_at(engine, rect, row_height, x, y) {
+        Some(idx) => {
+            if let Some(src_row) = *explorer_drag_src {
+                // Only activate the drag once the target differs from the
+                // source — a press-then-tiny-jitter must not fire a move.
+                if idx != src_row {
+                    *explorer_drag_active = Some((src_row, Some(idx)));
+                    *explorer_drag_src = None;
+                }
+            } else if let Some((src, _)) = explorer_drag_active {
+                *explorer_drag_active = Some((*src, Some(idx)));
+            }
+        }
+        None => {
+            if let Some((src, _)) = explorer_drag_active {
+                // Dragged outside the tree (or over empty space below the
+                // last row) — clear the target but keep the drag active.
+                *explorer_drag_active = Some((*src, None));
+            }
+        }
+    }
+}
+
+/// Apply an explorer drag-and-drop release: move `src_row` into
+/// `target_row`'s directory (or `target_row`'s own parent, if it is a file)
+/// via [`Engine::confirm_move_file`]. A no-op if either index is out of
+/// range (the tree can shrink mid-drag, e.g. a watcher-driven refresh) or
+/// `target_row` is `None` (dropped outside the tree).
+pub fn apply_explorer_drop(engine: &mut Engine, src_row: usize, target_row: Option<usize>) {
+    let Some(target_row) = target_row else {
+        return;
+    };
+    if src_row >= engine.explorer_rows.len() || target_row >= engine.explorer_rows.len() {
+        return;
+    }
+    let src_path = engine.explorer_rows[src_row].path.clone();
+    let target = &engine.explorer_rows[target_row];
+    let dest_dir = if target.is_dir {
+        target.path.clone()
+    } else {
+        target
+            .path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    engine.confirm_move_file(&src_path, &dest_dir);
+}
+
+/// Right-click fallback for empty tree space below the explorer's last row
+/// (#1429). Temporary shared workaround for quadraui#1045 item 4 (upstream:
+/// `TreeController::right_click` resolving a `TreeViewHit::Empty` to a
+/// container-level `ContextMenuRequested` instead of plain `Consumed`) —
+/// delete this function and its two call sites (`tui_main::mouse`,
+/// `App::explorer_ui_event`) once that lands, per this repo's
+/// Platform-Neutrality Rule (shared code now, not per-backend, but still a
+/// stopgap for a gap that belongs upstream).
+///
+/// #1025 intentionally dropped the pre-existing "right-click below the last
+/// row opens the root folder's context menu" fallback when it moved the
+/// row/chevron case onto `route_explorer_tree_event` (which only resolves
+/// `Row`/`Chevron` hits — an `Empty` hit reaches here instead, on both
+/// backends alike, restoring the fallback without re-diverging them).
+///
+/// `rect`/`metrics`/`pos` share `route_explorer_tree_event`'s own contract:
+/// `rect` is the tree's last painted rect, `metrics` is `(line_height,
+/// char_width)` in the caller's native unit, `pos` is in that same space.
+/// Returns `true` if the fallback fired (opened the cwd/root context menu);
+/// `false` for a hit that either missed `rect` entirely or landed on a real
+/// row (`route_explorer_tree_event` already owns that case).
+pub fn route_tree_empty_space_context_menu(
+    engine: &mut Engine,
+    rect: quadraui::Rect,
+    metrics: (f64, f64),
+    pos: quadraui::Point,
+) -> bool {
+    let (lh, cw) = metrics;
+    if explorer_row_at(engine, rect, lh, pos.x as f64, pos.y as f64).is_some() {
+        return false;
+    }
+    let inside = pos.x >= rect.x
+        && pos.x < rect.x + rect.width
+        && pos.y >= rect.y
+        && pos.y < rect.y + rect.height;
+    if !inside {
+        return false;
+    }
+    let cx = (pos.x / (cw.max(1.0) as f32)) as u16;
+    let cy = (pos.y / (lh.max(1.0) as f32)) as u16;
+    let root = engine.cwd.clone();
+    engine.open_explorer_context_menu(root, true, cx, cy);
+    true
+}
+
 /// Dispatch a mouse/scroll event to the debug ("run and debug") sidebar's
 /// *body* — everything below its title + action-button chrome — through the
 /// shared `SidebarSystem` widget. The chrome band itself is
@@ -8202,7 +8917,75 @@ pub fn route_ai_chat_event(
     if rect.width <= 0.0 || rect.height <= 0.0 {
         return engine.ai_has_focus;
     }
-    populate_ai_chat_controller(engine, theme);
+    populate_ai_chat_controller(engine, theme, backend);
+
+    // #1511: plain `Enter` while a transcript turn (not the input) has
+    // keyboard focus is the "keyboard toggle without a mouse" the issue
+    // asks for — `quadraui::ChatController::handle` already implements
+    // exactly this gesture (see its module doc's Enter arm), but it acts on
+    // its own *internal* `turn_collapsed` map, which `populate_ai_chat_
+    // controller` overwrites from `AcpSession::thought_expanded`/
+    // `tool_call_expanded` every frame (that function's doc explains why
+    // those two, not `ChatController`'s own map, are the source of truth).
+    // Left alone, an internal-only toggle would be invisible: the very next
+    // frame's populate call stomps it straight back to whatever the
+    // vimcode-side maps say. Intercepted here, ahead of `ChatController::
+    // handle`, with the identical guard `ChatController` itself uses, so
+    // `Engine::ai_chat_toggle_turn` flips the persistent state instead.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        if matches!(key, quadraui::Key::Named(quadraui::NamedKey::Enter)) && !modifiers.ctrl {
+            let focused = {
+                let chat = engine.ai_chat.borrow();
+                (!chat.input_has_focus())
+                    .then(|| chat.focused_turn())
+                    .flatten()
+            };
+            if let Some(turn_idx) = focused {
+                engine.ai_chat_toggle_turn(turn_idx);
+                return engine.ai_has_focus;
+            }
+        }
+    }
+
+    // #1507: the `<leader>ai` focus-toggle gesture (see
+    // `Engine::ai_leader_toggle_key`'s doc for why this has to be
+    // intercepted here, ahead of the ordinary `ChatController::handle`
+    // call, rather than reusing `Engine::handle_leader_key`). Checked before
+    // the completion-popup intercepts below: `ai_leader_toggle_key` only
+    // ever engages while the input is empty, which is also the one state a
+    // completion popup can never be open in, so the two can't race.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        let no_modifiers = !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.cmd;
+        match key {
+            quadraui::Key::Char(ch) if no_modifiers => {
+                if engine.ai_leader_toggle_key(*ch) {
+                    return engine.ai_has_focus;
+                }
+                // A mismatched plain char already had any pending prefix
+                // replayed by `ai_leader_toggle_key` itself — nothing more
+                // to do here.
+            }
+            // Every other key shape (a modified `Char` — e.g. Shift held for
+            // a capital letter — or any `Named` key: Enter, Tab, Backspace,
+            // arrows, Escape, …) can never be part of the `<leader>ai`
+            // gesture and so never reaches `ai_leader_toggle_key` at all. If
+            // a partial match is still buffered when one of these arrives,
+            // it must be resolved right here or it dangles silently (#1507
+            // review) — replayed into the input for an ordinary interrupting
+            // key, or discarded for `Escape`, which is about to end the
+            // session via `Cancelled` below (see `dispatch_ai_chat_event`'s
+            // `Cancelled` arm for why that one path discards instead of
+            // replaying).
+            _ if !engine.ai_leader_toggle_pending.is_empty() => {
+                if matches!(key, quadraui::Key::Named(quadraui::NamedKey::Escape)) {
+                    engine.ai_leader_toggle_pending.clear();
+                } else {
+                    engine.ai_leader_toggle_flush();
+                }
+            }
+            _ => {}
+        }
+    }
 
     // #956 (ACP-5): while the slash-command completion popup is showing,
     // steal Tab (cycle selection) and Enter (accept) before handing the
@@ -8222,6 +9005,23 @@ pub fn route_ai_chat_event(
                 }
                 quadraui::Key::Named(quadraui::NamedKey::Enter) => {
                     engine.ai_command_accept_selected();
+                    return engine.ai_has_focus;
+                }
+                _ => {}
+            }
+        // #1449: same intercept, for the `@`-mention popup — mutually
+        // exclusive with the slash-command one above (a slash command only
+        // ever occupies the *whole* input, a mention only the trailing
+        // word, so `ai_command_completions` being `Some` already claims
+        // this key).
+        } else if no_modifiers && engine.ai_mention_completions().is_some() {
+            match key {
+                quadraui::Key::Named(quadraui::NamedKey::Tab) => {
+                    engine.ai_mention_completion_cycle();
+                    return engine.ai_has_focus;
+                }
+                quadraui::Key::Named(quadraui::NamedKey::Enter) => {
+                    engine.ai_mention_accept_selected();
                     return engine.ai_has_focus;
                 }
                 _ => {}
@@ -8315,9 +9115,14 @@ pub enum EditorOp {
     /// boundaries — `ScreenLayout::group_dividers`), as opposed to the
     /// within-group `:split` lines the [`Self::Windows`] rung draws.
     ///
-    /// Composed *after* the tab bars on purpose: a group boundary is the
-    /// outermost structure in the editor column and must stay visible where
-    /// it runs alongside a neighbouring group's tab row.
+    /// Composed *after* the tab bars on purpose: a side-by-side (`Ctrl+W v`)
+    /// group boundary is the outermost structure in the editor column and
+    /// must stay visible where it runs *alongside* a neighbouring group's
+    /// tab row. A stacked (`Ctrl+W s`) boundary runs *through* one instead —
+    /// this rung's body ([`painted_group_dividers`]) never paints that
+    /// direction at all, relying on the lower group's own tab row to read as
+    /// the separator (#1586) — so composition order is moot for it either
+    /// way.
     GroupDividers,
     /// The tab-drag drop feedback: drop-zone highlight, insertion bar and the
     /// dragged tab's ghost.
@@ -8381,7 +9186,7 @@ fn breadcrumb_is_drawn(bc: &BreadcrumbBar) -> bool {
 ///
 /// `drag_active` is the one input that is not derivable from `screen`: the
 /// drag lives in each backend's own `render::TabDragState` (GTK's
-/// `App::tab_drag`, TUI's `TuiShellApp::tab_drag`), not in `ScreenLayout`.
+/// `App::tab_drag`, TUI's the pre-#1434 TUI shell's `tab_drag`), not in `ScreenLayout`.
 /// Both pass `tab_drag.source().is_some()`.
 pub fn compose_editor_band(
     engine: &Engine,
@@ -8408,8 +9213,15 @@ pub fn compose_editor_band(
             }
             // Naturally empty with a single group — `GroupLayout::Leaf
             // ::dividers()` returns `vec![]` — so this needs no
-            // `editor_group_split.is_some()` gate (#551).
-            EditorOp::GroupDividers => !screen.group_dividers.is_empty(),
+            // `editor_group_split.is_some()` gate (#551). Gated on the
+            // *painted* set (#1586's `painted_group_dividers`), not the raw
+            // one: a frame whose only group divider is a stacked one (never
+            // painted, see that fn's doc) composes no line at all, so this
+            // rung isn't live for it either — keeps this filter and
+            // [`paint_editor_band_rungs`]'s body from being able to
+            // disagree about what "live" means for this op, the same
+            // invariant [`tab_bar_is_drawn`] states for `TabBars`.
+            EditorOp::GroupDividers => !painted_group_dividers(&screen.group_dividers).is_empty(),
             EditorOp::TabDragOverlay => drag_active,
             EditorOp::TabTooltip => screen.tab_tooltip.is_some(),
         })
@@ -8479,7 +9291,7 @@ pub struct EditorBandUnits {
 }
 
 impl EditorBandUnits {
-    /// One terminal cell — what `TuiShellApp::paint_editor_band` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `paint_editor_band` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         tab_row_h: 1.0,
@@ -8497,130 +9309,106 @@ impl EditorBandUnits {
     }
 }
 
-/// Host hook for [`paint_editor_band_rungs`] — the four [`EditorOp`] rungs
-/// whose paint body still differs enough per backend that the shared walk
-/// cannot inline them directly. `Minimap`, `Breadcrumbs` and `TabTooltip`
-/// need no hook at all: their bodies are already byte-identical between GTK
-/// and TUI (see [`paint_editor_band_rungs`]'s match arms), which is exactly
-/// what made them safe to inline into the shared walk instead of leaving
-/// them here as a fifth/sixth/seventh trivial forwarding method.
-///
-/// `'screen` ties every method's `screen` parameter to the *same*
-/// `ScreenLayout` borrow for the whole walk, so a host (GTK's) that needs to
-/// carry a `&'screen quadraui::TabBar` past the `TabBars` call — for the
-/// `FrameHitMap` it builds after the walk returns — can store it in its own
-/// fields without a lifetime mismatch.
-pub trait EditorBandHost<'screen> {
-    /// [`EditorOp::Windows`]: every editor window's text, gutter, per-window
-    /// status line and the `:split`/`:vsplit` divider lines within each
-    /// group.
-    ///
-    /// Genuinely per-backend: GTK accumulates each window's owned
-    /// `quadraui::Editor` into its own `FrameHitMap` (#449) so later click
-    /// routing hit-tests the exact objects just painted, never a second copy
-    /// that could drift; TUI carries no such map (its hit-testing recomputes
-    /// geometry from `ScreenLayout` directly) but instead wants an optional
-    /// raw `ratatui::Frame` for cursor placement that this trait's `&mut dyn
-    /// Backend`-only signature has no room for (see `render_window`'s own
-    /// doc comment for why `frame: Option<&mut Frame>` exists there).
-    fn paint_windows(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::TabBars`]: one tab bar per editor group.
-    ///
-    /// Genuinely per-backend: GTK recovers the rasteriser's exact *pixel* hit
-    /// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
-    /// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution
-    /// (#515, #703, #764); TUI's hit-testing works in whole cells and needs
-    /// none of that bookkeeping.
-    fn paint_tab_bars(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::GroupDividers`]: the between-*group* `Ctrl+W v`/`Ctrl+W s`
-    /// boundary lines.
-    ///
-    /// Genuinely per-backend: GTK rasterises through quadraui's `Split`
-    /// primitive ([`draw_dividers_as_splits`]); TUI rasterises cell-by-cell
-    /// instead, because it alone carries the #481 guard that suppresses a
-    /// divider column immediately beside a neighbouring window's scrollbar —
-    /// a coalescence problem that exists only in a character grid. See
-    /// [`draw_dividers_as_splits`]'s own doc comment for the full story.
-    fn paint_group_dividers(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-
-    /// [`EditorOp::TabDragOverlay`]: the tab-drag drop-zone highlight,
-    /// insertion bar and dragged-tab ghost.
-    ///
-    /// Genuinely per-backend: GTK's drop geometry is cached every frame
-    /// (`cache_tab_drop_geometry`) so the drag hit-test has it whether or not
-    /// this rung ran that frame; TUI recomputes it inline and additionally
-    /// paints the dragged buffer's name at the ghost position — the decision
-    /// [`paint_tab_drop_overlay`]'s own doc comment already records GTK
-    /// leaves to quadraui's rasteriser instead.
-    fn paint_tab_drag_overlay(
-        &mut self,
-        backend: &mut dyn quadraui::Backend,
-        engine: &Engine,
-        screen: &'screen ScreenLayout,
-        theme: &Theme,
-    );
-}
+// #1499: [`paint_editor_band_rungs`]'s four "genuinely per-backend" rungs —
+// `Windows`, `TabBars`, `GroupDividers`, `TabDragOverlay` — used to live
+// behind a `host: &mut impl EditorBandHost<'screen>` trait, implemented once
+// per backend (`GtkEditorBandHost` in `app.rs`, a TUI twin before #1434).
+// With only `App` left, the function takes `app: &App` plus the
+// `window_editors`/`hit_bars` accumulators directly instead — see its own
+// doc below.
+//
+// `Minimap`, `Breadcrumbs` and `TabTooltip` need no `app` at all: their
+// bodies were already byte-identical between GTK and TUI, which is exactly
+// what made them safe to inline into the shared walk directly rather than
+// leaving them as a fifth/sixth/seventh trivial forwarding method.
+//
+// [`EditorOp::Windows`] (every editor window's text, gutter, per-window
+// status line and the `:split`/`:vsplit` divider lines within each group)
+// accumulates each window's owned `quadraui::Editor` into `window_editors` so
+// `App`'s own `FrameHitMap` (#449) hit-tests the exact objects just painted,
+// never a second copy that could drift. [`EditorOp::TabBars`] (one tab bar
+// per editor group) similarly recovers the rasteriser's exact *pixel* hit
+// geometry (`cached_tab_pixel_hits`/`cached_tab_close_abs`/
+// `cached_tab_slots_abs`) for pixel-accurate click/hover resolution (#515,
+// #703, #764) into `hit_bars`. [`EditorOp::GroupDividers`] (the
+// between-*group* `Ctrl+W v`/`Ctrl+W s` boundary lines) and
+// [`EditorOp::TabDragOverlay`] (the tab-drag drop-zone highlight, insertion
+// bar and dragged-tab ghost) need no accumulator at all.
 
 /// The shared **editor band** walk (#1251): the single ordered loop both
-/// `TuiShellApp::paint_editor_band` and `App::compose_editor_band_rungs` run
+/// the pre-#1434 TUI shell's `paint_editor_band` and `App::compose_editor_band_rungs` run
 /// over [`compose_editor_band`], replacing what used to be two hand-written
 /// copies of the same seven-armed `match`. `Minimap`, `Breadcrumbs` and
 /// `TabTooltip` paint identically on both backends (modulo `units`) and are
-/// inlined here directly; the four rungs that still need a per-backend body
-/// go through `host` — see [`EditorBandHost`]'s own doc for exactly which
-/// parts of each and why.
+/// inlined here directly.
 ///
 /// `band` is the editor column's bounds in the caller's units (only `x`, `y`
 /// and `width` are read, by the `TabTooltip` rung); `units` carries the
-/// metrics and tab-row height the same rung needs. Returns the rungs actually
-/// composed, in order, for the caller to stash and validate with
+/// metrics and tab-row height the same rung needs, and `tab_bar_h` (not part
+/// of `units` — only the `TabBars`/`TabDragOverlay` rungs need it) is the
+/// tab strip's own painted row height. `window_editors`/`hit_bars` accumulate
+/// across the `Windows`/`TabBars` calls — the caller destructures them back
+/// out once this returns, to build its `FrameHitMap`. Returns the rungs
+/// actually composed, in order, for the caller to stash and validate with
 /// [`check_editor_band_order`] — callers do that themselves (rather than this
 /// function doing it) so the assertion message keeps each backend's own
 /// "TUI "/"GTK " prefix, unchanged from before this convergence.
 #[allow(clippy::too_many_arguments)]
-pub fn paint_editor_band_rungs<'screen>(
+pub(crate) fn paint_editor_band_rungs<'screen>(
     backend: &mut dyn quadraui::Backend,
     engine: &Engine,
     screen: &'screen ScreenLayout,
     theme: &Theme,
     band: quadraui::Rect,
     units: EditorBandUnits,
+    tab_bar_h: f64,
     drag_active: bool,
-    host: &mut impl EditorBandHost<'screen>,
+    app: &crate::app::App,
+    window_editors: &mut Vec<quadraui::Editor>,
+    hit_bars: &mut Vec<(GroupId, quadraui::Rect, &'screen quadraui::TabBar)>,
 ) -> Vec<EditorOp> {
     let mut composed = Vec::new();
     for op in compose_editor_band(engine, screen, drag_active, engine.terminal_maximized) {
         match op {
-            EditorOp::Windows => host.paint_windows(backend, engine, screen, theme),
+            EditorOp::Windows => app.paint_editor_windows_rung(
+                backend,
+                screen,
+                units.metrics.line_height as f64,
+                window_editors,
+            ),
             // #35/#722: minimap strips on every window's right edge (one
             // entry per `WindowId` in `screen.minimap`, not just the active
             // window's) — one call, the rasteriser is quadraui's.
             EditorOp::Minimap => draw_minimap_strip(backend, screen),
-            EditorOp::TabBars => host.paint_tab_bars(backend, engine, screen, theme),
+            EditorOp::TabBars => app.paint_tab_bars_rung(
+                backend,
+                engine,
+                screen,
+                units.tab_row_h as f64,
+                tab_bar_h,
+                hit_bars,
+            ),
             EditorOp::Breadcrumbs => {
                 paint_breadcrumb_bars(backend, screen, engine.terminal_maximized)
             }
-            EditorOp::GroupDividers => host.paint_group_dividers(backend, screen, theme),
-            EditorOp::TabDragOverlay => host.paint_tab_drag_overlay(backend, engine, screen, theme),
+            EditorOp::GroupDividers => {
+                let painted = painted_group_dividers(&screen.group_dividers);
+                draw_dividers_as_splits(backend, &painted, |div| {
+                    quadraui::WidgetId::new(format!("gdiv:{}", div.split_index))
+                })
+            }
+            EditorOp::TabDragOverlay => {
+                app.cache_tab_drop_geometry(screen, engine, tab_bar_h);
+                let ctx = app.cached_drop_ctx.borrow();
+                let (mx, my) = app.mouse_pos_cell.get();
+                paint_tab_drop_overlay(
+                    backend,
+                    &ctx,
+                    (mx as f32, my as f32),
+                    2.0,
+                    units.metrics.line_height,
+                );
+            }
             // Positioned one *tab row* below the top of the editor column —
             // `units.tab_row_h`, not `units.metrics.line_height` — mirroring
             // GTK's `tab_row_h` / TUI's always-one-cell tab strip; see
@@ -8673,7 +9461,7 @@ pub fn paint_editor_band_rungs<'screen>(
 //     [`BottomOp::PanelHover`] is now composed (or not) at the top level where
 //     the absent branch is reachable.
 //   * **TUI's debug toolbar had the mirror-image bug.** Its rung had no `else`
-//     at all, so `TuiShellApp::debug_toolbar_rect` kept its last value when
+//     at all, so the pre-#1434 TUI shell's `debug_toolbar_rect` kept its last value when
 //     the toolbar hid — while GTK's `else` zeroed the equivalent two caches.
 //     Two backends, two different halves of the same cache-clearing rule.
 //   * **the separated status line was composed in two different places.** TUI
@@ -8695,7 +9483,7 @@ pub fn paint_editor_band_rungs<'screen>(
 // a `BottomPanelController` — and `AppShellLayout::bottom_panel_bounds` with
 // it — but it models a single generic drawer, not vimcode's stack of five
 // independently-gated bands with a hover popup overhanging them; it is `None`
-// for `TuiShellApp` and unwired on GTK for exactly that reason (see
+// for the pre-#1434 TUI shell and unwired on GTK for exactly that reason (see
 // `bottom_chrome_rects_for_shell_content`'s doc comment). What vimcode stacks
 // below its editor column, and in what order, is vimcode's own app-level
 // composition. The *rasterisers* underneath every rung are already quadraui's
@@ -8708,7 +9496,7 @@ pub fn paint_editor_band_rungs<'screen>(
 // filed against a grep that read "0 uses in `src/app.rs`" as an unstarted
 // adoption. It isn't: both backends' zero call sites are deliberate (this
 // paragraph, `bottom_chrome_rects_for_shell_content`'s doc comment in
-// `tui_main/render_impl.rs`, and `TuiShellApp::render_content`'s own note by
+// `tui_main/render_impl.rs`, and the pre-#1434 TUI shell's `render_content`'s own note by
 // `BottomChromeRects`'s construction all record the same verdict), and the
 // "3 mentions in the TUI" #820 read as partial progress are those three
 // rejection notes, not partial implementation. The blocker restated: `AppShell`
@@ -8719,14 +9507,13 @@ pub fn paint_editor_band_rungs<'screen>(
 // more than one independently-gated bottom band, which does not exist
 // upstream today.
 //
-// **Per CLAUDE.md's Platform-Neutrality Rule, this gap must be filed on
-// `JDonaghy/quadraui`, not worked around here — that filing is drafted and
-// ready to submit** (see `docs/PENDING_QUADRAUI_ISSUES.md`, "multi-band
-// bottom chrome"), pending a session with `gh` access (this repo's worker
-// sessions are `git`-only; issue filing is a coordinator action). **#820 must
-// stay open behind that filing, not close on this investigation alone** —
-// this is a rejection with a drafted-but-unfiled blocker, not a resolved
-// question.
+// **That upstream gap has since shipped.** quadraui#997 (`d1b1931`) added N
+// independently-gated stacked bottom bands, and vimcode's pinned rev carries
+// it (the "multi-band bottom chrome" draft in
+// `docs/PENDING_QUADRAUI_ISSUES.md` was struck 2026-09-22, #1259). The
+// "does not exist upstream" blocker above is therefore historical: moving this
+// band onto the shipped API is now an adoption question for vimcode, not a
+// missing quadraui capability.
 
 /// One rung of the shared **bottom band** — the stack of chrome vimcode carves
 /// out of the bottom of `AppShellLayout::main_content_bounds`.
@@ -8904,7 +9691,7 @@ pub(crate) fn bottom_band_fixture(panel_hover: bool) -> Vec<BottomOp> {
 /// its one header row).
 ///
 /// GTK recomputes this statelessly every frame — it has no persistent
-/// `quickfix_scroll_top` to advance from key events, the way `TuiShellApp`
+/// `quickfix_scroll_top` to advance from key events, the way the pre-#1434 TUI shell
 /// does — so it lived inline in `render_content` as eight lines of arithmetic.
 /// Shared here so the two backends cannot disagree about what "keep the
 /// selection visible" means.
@@ -8921,7 +9708,7 @@ pub fn quickfix_scroll_top(qf: &QuickfixPanel, visible_rows: usize) -> usize {
 /// One `quickfix_to_list_view` adapter call and one `Backend::draw_list`; the
 /// only thing the two call sites ever differed on was where `scroll_offset`
 /// came from, which stays the caller's (GTK recomputes it via
-/// [`quickfix_scroll_top`], TUI carries `TuiShellApp::quickfix_scroll_top`
+/// [`quickfix_scroll_top`], TUI carries the pre-#1434 TUI shell's `quickfix_scroll_top`
 /// across frames so `:cnext` can advance it).
 pub fn paint_quickfix_rung(
     b: &mut dyn quadraui::Backend,
@@ -8951,7 +9738,7 @@ pub fn paint_separated_status_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     let bar = window_status_line_to_status_bar(status, quadraui::WidgetId::new("status:separated"));
-    let _ = b.draw_status_bar(rect, &bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, &bar)
 }
 
@@ -8976,7 +9763,7 @@ pub struct BottomPanelUnits {
 }
 
 impl BottomPanelUnits {
-    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `render_content` composes in.
     pub const CELL: Self = Self {
         metrics: FrameMetrics::CELL,
         terminal_scrollbar: None,
@@ -9027,12 +9814,17 @@ pub fn paint_bottom_panel_rung(
         engine.terminal_open,
         !screen.bottom_tabs.output_lines.is_empty(),
     );
-    let hits = b.draw_tab_bar(
+    let layout = b.draw_tab_bar_layout(
         quadraui::Rect::new(rect.x, rect.y, rect.width, lh),
         &tab_bar,
         None,
     );
-    engine.bottom_tab_bar_hits.replace(Some(hits));
+    engine
+        .bottom_tab_bar_hits
+        .replace(Some(crate::core::engine::BottomTabStripHits {
+            layout,
+            origin_x: rect.x as f64,
+        }));
 
     // Rows 2..: the active panel's own toolbar row and body.
     let content_y = rect.y + 2.0 * lh;
@@ -9045,7 +9837,11 @@ pub fn paint_bottom_panel_rung(
             let toolbar_rect = quadraui::Rect::new(rect.x, rect.y + lh, rect.width, lh);
             let toolbar_hits = match build_terminal_toolbar(term, theme) {
                 TerminalToolbar::FindBar(bar) => {
-                    let _ = b.draw_status_bar(toolbar_rect, &bar, None, None);
+                    let _ = b.draw_status_bar_interactive(
+                        toolbar_rect,
+                        &bar,
+                        &quadraui::InteractionState::new(),
+                    );
                     // No raw `pango::Layout` is reachable from a `&mut dyn
                     // Backend`-only signature (the #669 gap), so segment widths
                     // are approximated by char count * `cw` rather than exact
@@ -9063,11 +9859,10 @@ pub fn paint_bottom_panel_rung(
                     }
                 }
                 TerminalToolbar::TabStrip(bar) => {
-                    crate::core::engine::TerminalToolbarHits::TabStrip(b.draw_tab_bar(
-                        toolbar_rect,
-                        &bar,
-                        None,
-                    ))
+                    crate::core::engine::TerminalToolbarHits::TabStrip {
+                        layout: b.draw_tab_bar_layout(toolbar_rect, &bar, None),
+                        origin_x: toolbar_rect.x as f64,
+                    }
                 }
             };
             engine.terminal_toolbar_hits.replace(Some(toolbar_hits));
@@ -9097,7 +9892,11 @@ pub fn paint_bottom_panel_rung(
                 for i in 0..visible_rows {
                     let row =
                         quadraui::Rect::new(rect.x, content_y + i as f32 * lh, rect.width, lh);
-                    let _ = b.draw_status_bar(row, &bg_bar, None, None);
+                    let _ = b.draw_status_bar_interactive(
+                        row,
+                        &bg_bar,
+                        &quadraui::InteractionState::new(),
+                    );
                 }
             }
 
@@ -9221,20 +10020,25 @@ pub fn paint_bottom_panel_rung(
 
 /// One tab bar as [`paint_tab_bars`] left it.
 ///
-/// `hits` is the geometry the rasteriser *actually resolved while painting*,
-/// not a second no-paint measurement of the same bar. That distinction is the
-/// #654/#703 desync in structural form: GTK used to paint with
-/// `draw_tab_bar_icons` and then re-measure with `tab_bar_layout_icons`, two
-/// calls that agree only as long as nobody changes the font, the icon sidecar
-/// or the chrome between them. `Backend::draw_tab_bar_icons` already returns
-/// the same `TabBarHits` type, so the paint's own answer is both cheaper and
-/// impossible to desync.
+/// `layout` is the geometry the rasteriser *actually resolved while
+/// painting*, not a second no-paint measurement of the same bar. That
+/// distinction is the #654/#703 desync in structural form: GTK used to paint
+/// with `draw_tab_bar_icons` and then re-measure with `tab_bar_layout_icons`,
+/// two calls that agree only as long as nobody changes the font, the icon
+/// sidecar or the chrome between them. `Backend::draw_tab_bar_icons_layout`
+/// already returns the same `TabBarLayout` type, so the paint's own answer
+/// is both cheaper and impossible to desync.
+///
+/// `layout`'s own geometry (`visible_tabs`/`visible_segments`/`hit_regions`)
+/// is bar-**relative** (see that type's doc) — callers needing absolute
+/// screen coordinates add `rect`'s own origin back in (#1491; see
+/// `click::GroupTabBarLayoutMap`).
 pub struct PaintedTabBar<'a> {
     pub group_id: GroupId,
     /// The rect the bar was painted into, in the caller's units.
     pub rect: quadraui::Rect,
     pub bar: &'a quadraui::TabBar,
-    pub hits: quadraui::TabBarHits,
+    pub layout: quadraui::TabBarLayout,
 }
 
 /// Paint every editor group's tab bar — the [`EditorOp::TabBars`] rung's whole
@@ -9246,9 +10050,10 @@ pub struct PaintedTabBar<'a> {
 /// is over, so the rasteriser can tint it; TUI passes `None` (it has no
 /// close-glyph hover state).
 ///
-/// Returns one [`PaintedTabBar`] per bar, in paint order. TUI reads
-/// `hits.available_cols` for `set_tab_visible_count`; GTK reads the full
-/// `hits` for its pixel hit maps and re-pushes `rect`/`bar` into the separate
+/// Returns one [`PaintedTabBar`] per bar, in paint order. Both backends cache
+/// `rect`/`layout` per group (`click::GroupTabBarLayoutMap`) for hit-testing
+/// and the tab-drop/visible-column engine feedback that used to read
+/// `TabBarHits`; GTK also re-pushes `rect`/`bar` into the separate
 /// `ScreenLayout` it builds a `FrameHitMap` from.
 pub fn paint_tab_bars<'a>(
     backend: &mut dyn quadraui::Backend,
@@ -9262,16 +10067,17 @@ pub fn paint_tab_bars<'a>(
         .into_iter()
         .map(|target| {
             let hover = hovered_close.and_then(|(gid, i)| (gid == target.group_id).then_some(i));
-            // #703: `draw_tab_bar_icons` with an empty sidecar is
-            // byte-identical to `draw_tab_bar` (quadraui's `draw_tab_bar`
-            // literally forwards to it with `&[]`), so the Nerd-Fonts-off
-            // path keeps today's geometry exactly.
-            let hits = backend.draw_tab_bar_icons(target.rect, target.bar, target.icons, hover);
+            // #703: `draw_tab_bar_icons_layout` with an empty sidecar is
+            // byte-identical to `draw_tab_bar_layout` (quadraui's
+            // `draw_tab_bar_layout` literally forwards to it with `&[]`), so
+            // the Nerd-Fonts-off path keeps today's geometry exactly.
+            let layout =
+                backend.draw_tab_bar_icons_layout(target.rect, target.bar, target.icons, hover);
             PaintedTabBar {
                 group_id: target.group_id,
                 rect: target.rect,
                 bar: target.bar,
-                hits,
+                layout,
             }
         })
         .collect()
@@ -9292,7 +10098,8 @@ pub fn paint_breadcrumb_bars(
     terminal_maximized: bool,
 ) {
     for t in breadcrumb_draw_targets(screen, terminal_maximized) {
-        let layout = backend.draw_status_bar(t.rect, t.bar, None, None);
+        let layout =
+            backend.draw_status_bar_interactive(t.rect, t.bar, &quadraui::InteractionState::new());
         *t.draw_layout.borrow_mut() = Some(layout);
     }
 }
@@ -9322,6 +10129,85 @@ pub fn draw_dividers_as_splits<D: DividerGeometry>(
         let (split, rect) = divider_to_split(div, id_for(div));
         backend.draw_split(rect, &split);
     }
+}
+
+/// Which of `screen.group_dividers` [`EditorOp::GroupDividers`] actually
+/// paints a line for (#1586).
+///
+/// A **stacked** (`SplitDirection::Horizontal` in vimcode's own naming —
+/// top/bottom) group divider's `position` sits exactly where
+/// `GroupLayout::calculate_group_rects` starts reserving `tab_bar_height`
+/// for the *lower* group's own tab row (`GroupLayout::dividers`/
+/// `calculate_group_rects` share one `quadraui::SplitTree::layout` pass, so
+/// the two can never disagree about where that boundary is). Painting a real
+/// divider line there — any thickness a backend chooses, TUI's 1-cell-thick
+/// renderer or a GTK/macOS/Win rasteriser's own independently-derived pixel
+/// width — necessarily overwrites part of that row: TUI's whole 1-cell-tall
+/// bar (#1586's reported symptom: "no tab row at all, just a divider line,
+/// then breadcrumbs"), or a GTK/macOS line through the tab labels.
+///
+/// The fix is not to reserve extra space for the divider (the "Wanted"
+/// option this issue's body rejected): a backend's real divider-line
+/// thickness is picked entirely inside that backend's own `Split::layout`
+/// (e.g. quadraui's `pixel::DIVIDER` on GTK/macOS/Win), independent of
+/// whatever thickness vimcode's own core layer might reserve — so a fixed
+/// "reserve N logical units" number picked in `core::window` can never be
+/// guaranteed to cover what each backend actually paints. Instead, a
+/// stacked group divider is simply never painted: the lower group's own tab
+/// row is *already* a full-width, differently-styled band immediately below
+/// the boundary, so it already reads as the separator with nothing extra —
+/// exactly the affordance TUI's own hit-test tolerance already assumed
+/// (`DividerMetrics::group_horizontal`'s `(0.0, tab_bar_rows)` band reaches
+/// across the whole tab-bar block precisely because "there is no separate
+/// glyph to aim at" was already the intended design for this direction, see
+/// `DividerState::on_tab_bar`'s doc).
+///
+/// Side-by-side (`Vertical`) group dividers are untouched — they run
+/// *alongside* a tab row, not *through* one, so nothing here changes for
+/// them (#1586's explicit "keep the side-by-side case exactly as it is
+/// today").
+///
+/// `screen.group_dividers` itself is **not** filtered — only this paint-time
+/// view is. Hit-testing/drag (`route_divider_grab`/`apply_divider_drag`/
+/// `divider_ratio_from_pos`) still sees every divider, stacked or not, and
+/// resizing a stacked split by dragging its (now invisible, tab-row-shaped)
+/// boundary is unaffected.
+///
+/// ## #1586's macOS-GUI symptoms — which of them this fixes
+///
+/// The original report described *three* things wrong with the bottom
+/// group's tab row on macOS/GTK, not just one. This filter's single root
+/// cause — `draw_split` filling `theme.separator` as one *uniform* rect the
+/// full width of the row (`quadraui::primitives::split::
+/// native_surface_paint::paint`) — fully accounts for the first two:
+///
+/// - *"a horizontal line runs through the tab labels"* — the fill, wherever
+///   it lands over a low-contrast (inactive) tab's own background.
+/// - *"a dark block covers the first (active) tab"* — the exact same fill,
+///   at the exact same y, reads as a solid block rather than a thin line
+///   specifically where it happens to land over the *active* tab's own
+///   (higher-contrast, highlighted) background — no second mechanism
+///   needed, confirmed by reading `native_surface_paint::paint`: it issues
+///   one `surface_fill_rect` call over `layout.divider_bounds`, not two, and
+///   nothing there special-cases a tab's active state.
+///
+/// It does **not** explain the third: *"the top-left group's first tab...
+/// looks double-painted, with its label drawn over itself"* — an unrelated
+/// group, not adjacent to the stacked boundary at all. Traced and ruled
+/// out as sharing this cause: `divider_to_split`'s emitted `Rect` is
+/// confined to its own divider's `axis_start`/`cross_start` box (see its
+/// own tests, `divider_to_split_horizontal_maps_direction_ratio_and_bounds`
+/// et al. — the rect never reaches `y = 0`), so nothing this filter touches
+/// can reach the top-left group's own tab row under any input. Left
+/// unfixed and unexplained by this change; needs its own macOS-side
+/// reproduction (a screenshot/screen-recording artifact is also plausible
+/// and hasn't been ruled out) before a cause can be assigned.
+pub fn painted_group_dividers(dividers: &[GroupDivider]) -> Vec<GroupDivider> {
+    dividers
+        .iter()
+        .filter(|d| d.direction == SplitDirection::Vertical)
+        .cloned()
+        .collect()
 }
 
 /// Paint the tab-drag drop feedback — the [`EditorOp::TabDragOverlay`] rung's
@@ -9385,13 +10271,14 @@ pub fn paint_tab_drop_overlay(
 //   * the **activity bar** and the **sidebar separator**. On both live paths
 //     `AppShell::render` (quadraui `compose::app_shell`) paints these *before*
 //     `render_content` is entered, out of the same `AppShellLayout` vimcode
-//     consumes verbatim. The only vimcode code that still paints them itself is
-//     the **test-only** `tui_main::render_impl::draw_frame` (raw
+//     consumes verbatim. The only vimcode code that once painted them itself
+//     was the test-only `tui_main::render_impl::draw_frame` (raw
 //     `frame.buffer_mut()` — `panels::render_activity_bar` and the `set_cell`
-//     separator column); it has had no production caller since the `TuiShellApp`
-//     cutover. So the "check quadraui first" verdict for these two rungs is
-//     *quadraui already owns them, and vimcode has already adopted it* — there
-//     is nothing to compose and no adoption issue to file.
+//     separator column), which had no production caller since the pre-#1434
+//     TUI shell cutover and was deleted outright by #1434. So the "check
+//     quadraui first" verdict for these two rungs is *quadraui already owns
+//     them, and vimcode has already adopted it* — there is nothing to
+//     compose and no adoption issue to file.
 //   * the **debug toolbar**, **quickfix panel** and **bottom panel**. These are
 //     vimcode's own stacked bottom chrome, which `AppShellLayout` has no concept
 //     of (its `bottom_panel_bounds` is a single generic drawer, and is `None` for
@@ -9423,7 +10310,7 @@ pub struct FrameMetrics {
 }
 
 impl FrameMetrics {
-    /// One terminal cell — what `TuiShellApp::render_content` composes in.
+    /// One terminal cell — what the pre-#1434 TUI shell's `render_content` composes in.
     pub const CELL: Self = Self {
         line_height: 1.0,
         char_width: 1.0,
@@ -9816,7 +10703,7 @@ pub fn paint_wildmenu_rung(
     rect: quadraui::Rect,
 ) {
     let bar = wildmenu_to_status_bar(wm, theme);
-    let _ = b.draw_status_bar(rect, &bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
 }
 
 /// The [`FrameOp::StatusBar`] (global status line) rung's whole body on both
@@ -9834,7 +10721,7 @@ pub fn paint_global_status_bar_rung(
     rect: quadraui::Rect,
 ) -> quadraui::StatusBarLayout {
     engine.global_status_rect.set(rect);
-    let _ = b.draw_status_bar(rect, bar, None, None);
+    let _ = b.draw_status_bar_interactive(rect, bar, &quadraui::InteractionState::new());
     b.status_bar_layout(rect, bar)
 }
 
@@ -9855,7 +10742,7 @@ pub fn paint_find_replace_rung(
 ///
 /// Building the `quadraui::CommandCenter` descriptor itself (the title
 /// string in particular — GTK derives it from `engine.cwd`, TUI from
-/// `TuiShellApp::window_title_stem`) stays at the call site; this is only
+/// the pre-#1434 TUI shell's `window_title_stem`) stays at the call site; this is only
 /// the paint + cache-set once that descriptor and its rect exist.
 pub fn paint_command_center_rung(
     b: &mut dyn quadraui::Backend,
@@ -9886,35 +10773,97 @@ pub fn paint_picker_rung(
     rect
 }
 
-/// Should [`paint_context_menu_rung`] hand the context menu off to
-/// [`quadraui::Backend::show_context_menu`] (a native OS popup) instead of
-/// painting `ContextMenuPanel` in-window (#902)?
-///
-/// `style` is the user's `menu_style` setting
-/// ([`crate::core::settings::MenuStyle`]); `caps` is the backend's own
-/// advertised capabilities. `Native`/`Inherit` are only honoured when the
-/// backend actually declares `native_menu` — a backend that can't show one
-/// (GTK, TUI: `native_menu: false`) must still fall back to the in-window
-/// path rather than silently drawing nothing, matching #901's identical
-/// capability gate for the menu bar. `Custom` always draws in-window,
-/// regardless of capability.
-///
-/// `Inherit` (the default, matching VS Code's `window.menuStyle`) has no
-/// `titleBarStyle` counterpart in vimcode yet, so until one exists it
-/// resolves the same as `Native` — see [`crate::core::settings::MenuStyle`]'s
-/// doc comment.
-pub fn context_menu_should_be_native(
-    style: crate::core::settings::MenuStyle,
-    caps: quadraui::BackendCaps,
-) -> bool {
+/// Map vimcode's own [`crate::core::settings::MenuStyle`] onto
+/// [`quadraui::MenuStyle`] (quadraui#1187, #1580). The two enums are
+/// deliberately defined with the same three variants (`Auto`/`Native`/
+/// `Custom`) so this is a straight 1:1 translation with no capability
+/// logic of its own — [`quadraui::Backend::effective_menu_style`] (built
+/// from [`quadraui::MenuStyle::resolve`] against
+/// [`quadraui::BackendCaps::native_menu`]) does that, and is what callers
+/// should consult instead of re-deriving a native/custom decision here.
+pub fn to_quadraui_menu_style(style: crate::core::settings::MenuStyle) -> quadraui::MenuStyle {
     use crate::core::settings::MenuStyle;
     match style {
-        MenuStyle::Native | MenuStyle::Inherit => caps.native_menu,
-        MenuStyle::Custom => false,
+        MenuStyle::Auto => quadraui::MenuStyle::Auto,
+        MenuStyle::Native => quadraui::MenuStyle::Native,
+        MenuStyle::Custom => quadraui::MenuStyle::Custom,
     }
 }
 
-/// The [`FrameOp::ContextMenu`] rung's whole body on both backends.
+/// Build the render-side [`ContextMenuPanel`] from the engine's own
+/// [`crate::core::engine::ContextMenuState`] — the same conversion the
+/// `ScreenLayout` builder uses every frame, factored out so
+/// [`show_context_menu_now`]'s event-handler-time caller can build the
+/// identical value without waiting for a render pass (#1580).
+pub fn context_menu_state_to_panel(cm: &crate::core::engine::ContextMenuState) -> ContextMenuPanel {
+    ContextMenuPanel {
+        items: cm
+            .items
+            .iter()
+            .map(|item| ContextMenuRenderItem {
+                label: item.label.clone(),
+                shortcut: item.shortcut.clone(),
+                separator_after: item.separator_after,
+                enabled: item.enabled,
+            })
+            .collect(),
+        selected_idx: cm.selected,
+        screen_col: cm.screen_x,
+        screen_row: cm.screen_y,
+        trigger_height: cm.trigger_height,
+    }
+}
+
+/// Show `panel` as a native OS context-menu popup right now, through
+/// quadraui's single-call [`quadraui::ContextMenuController::open`]
+/// (quadraui#1187, #1580) — the event-handler-time counterpart to
+/// [`paint_context_menu_rung`]'s render-time `Custom` half.
+///
+/// Callers **must** invoke this from event-handling code (typically right
+/// after `Engine::open_*_context_menu`), never from `render_content`'s
+/// paint rung: on the `Native` resolution, `ContextMenuController::open`
+/// calls `Backend::show_context_menu`, which blocks on AppKit's modal
+/// popup loop — running that from inside a paint closure re-enters
+/// painting while the closure still holds borrows it needs to finish its
+/// own frame. That re-entrancy was the macOS right-click bug this
+/// function's introduction fixed (a queued
+/// `UiEvent::ContextMenuItemActivated` that only got handled on the
+/// *next* repaint, when it was handled at all; see `App::handle`'s
+/// `open_context_menu_now_if_native`, the only call site, which already
+/// confirms `effective_menu_style()` is `Native` before calling this, so
+/// the controller's own resolve here is a second, harmless check rather
+/// than the deciding one).
+///
+/// A fresh, throwaway [`quadraui::ContextMenuController`] is correct here
+/// rather than a field kept on `App`: its `Native` branch (`self.close`,
+/// then `backend.show_context_menu`) never touches the controller's own
+/// `open` state, so there is nothing to leak when this transient instance
+/// is dropped at the end of the call. A persistent controller would only
+/// matter for driving the `Custom` branch too, which vimcode does not
+/// route through this controller — see [`paint_context_menu_rung`]'s doc
+/// for the capability gap (no `MouseMove` hover) that keeps the in-window
+/// path on vimcode's own state for now.
+///
+/// Uses the same `ContextMenu`/`WidgetId`s [`paint_context_menu_rung`]'s
+/// in-window path does, so `UiEvent::ContextMenuItemActivated` resolves
+/// through the exact same `context_menu_hit_to_idx` conversion either
+/// path takes.
+pub fn show_context_menu_now(
+    b: &mut dyn quadraui::Backend,
+    panel: &ContextMenuPanel,
+    char_width: f64,
+    line_height: f64,
+) {
+    let menu = context_menu_panel_to_quadraui_context_menu(panel);
+    let anchor = context_menu_anchor_point(panel, char_width, line_height);
+    quadraui::ContextMenuController::new().open(menu, anchor, b);
+}
+
+/// The [`FrameOp::ContextMenu`] rung's whole body on both backends —
+/// the in-window (`Custom`-resolved) painted path only (#1580). Callers
+/// must check `backend.effective_menu_style()` themselves and skip this
+/// entirely when it resolves `Native` — see [`show_context_menu_now`] for
+/// that half, which runs at event-handler time instead.
 ///
 /// `viewport`/`char_width`/`line_height`/`border_chrome_inset` are exactly
 /// [`context_menu_generic_layout`]'s parameters — see its doc comment for why
@@ -9923,16 +10872,26 @@ pub fn context_menu_should_be_native(
 /// (to make room for that border) is genuinely per-backend geometry prep and
 /// stays at the call site, not here.
 ///
-/// `native`, resolved by the caller via [`context_menu_should_be_native`],
-/// picks the rung's whole body: `true` calls
-/// [`quadraui::Backend::show_context_menu`] with the same `ContextMenu`
-/// [`context_menu_panel_to_quadraui_context_menu`] would otherwise hand
-/// `draw_context_menu` — same `WidgetId`s, so
-/// `UiEvent::ContextMenuItemActivated` resolves through the exact
-/// `context_menu_hit_to_idx` conversion the in-window hit-test already uses
-/// (#902) — and returns `None`: nothing was painted in-window, so the
-/// caller must not cache a layout or record the rung as painted. `false`
-/// is the pre-#902 body unchanged.
+/// # Why this stays vimcode's own state instead of
+/// `quadraui::ContextMenuController::handle`/`render` (#1187, #1580)
+///
+/// [`quadraui::ContextMenuController`] is the "one call" entry point
+/// #1580 asks vimcode to adopt for the whole `ContextMenu` life cycle, and
+/// [`show_context_menu_now`] above does adopt it for the `Native` half.
+/// The `Custom` half is not switched over yet: `ContextMenuController::
+/// handle`'s `v1` scope (its own module doc, `quadraui/src/compose/
+/// context_menu_controller.rs`) matches only `KeyPressed(Escape/Down/Up/
+/// Enter)` and `MouseDown` — there is no `MouseMove` arm — so it cannot
+/// host vimcode's own tested hover-follows-pointer behaviour
+/// (`context_menu_hover_moves_the_highlight_via_gtk_driver`, #373/#751):
+/// the highlighted row must move as the mouse moves over it, before any
+/// click. Routing the `Custom` path through the controller today would
+/// regress that test, not just relocate its logic. Once quadraui grows a
+/// `MouseMove` hover arm for `ContextMenuController::handle` (tracked as a
+/// follow-up quadraui issue), this rung, `route_modal_overlay_click`'s
+/// `ContextMenu` arm, `App::context_menu_layout`, and `ContextMenuState`'s
+/// screen-position bookkeeping can all fold into the controller the same
+/// way [`show_context_menu_now`] already did for `Native`.
 pub fn paint_context_menu_rung(
     b: &mut dyn quadraui::Backend,
     panel: &ContextMenuPanel,
@@ -9940,36 +10899,7 @@ pub fn paint_context_menu_rung(
     char_width: f64,
     line_height: f64,
     border_chrome_inset: f64,
-    native: bool,
-) -> Option<quadraui::ContextMenuLayout> {
-    if native {
-        let menu = context_menu_panel_to_quadraui_context_menu(panel);
-        let anchor = context_menu_anchor_point(panel, char_width, line_height);
-        // `MacBackend::show_context_menu` (quadraui's only in-tree
-        // implementation) asserts it is called on the real AppKit main
-        // thread and panics otherwise — the same documented quadraui
-        // limitation #901's `install_menu_bar` call hits, and the same
-        // `catch_unwind` treatment: every real invocation of this rung is
-        // on the main thread (`quadraui::macos::shell_runner`'s only entry
-        // point), so this never fires outside a test harness — but
-        // `quadraui::macos::testing::driver_with_shell` necessarily calls
-        // `render_content` from a spawned `#[test]` thread, same as every
-        // other Rust test. Catching it here keeps a headless paint pass
-        // from taking the whole test process down over a call this rung
-        // doesn't otherwise depend on.
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            b.show_context_menu(&menu, anchor);
-        }))
-        .is_err()
-        {
-            eprintln!(
-                "vimcode: Backend::show_context_menu panicked (quadraui \
-                 main-thread assertion, see vimcode#902) -- the native \
-                 context menu may be missing"
-            );
-        }
-        return None;
-    }
+) -> quadraui::ContextMenuLayout {
     let (menu, layout) = context_menu_generic_layout(
         panel,
         viewport,
@@ -9978,7 +10908,7 @@ pub fn paint_context_menu_rung(
         border_chrome_inset,
     );
     let _ = b.draw_context_menu(&menu, &layout);
-    Some(layout)
+    layout
 }
 
 /// The [`FrameOp::Dialog`] rung's whole body on both backends.
@@ -10001,10 +10931,10 @@ pub fn paint_dialog_rung(
 pub fn paint_toast_stack_rung(
     b: &mut dyn quadraui::Backend,
     engine: &Engine,
-    stack: &quadraui::ToastStack,
+    stack: &quadraui::ToastOverlay,
     viewport: quadraui::Rect,
 ) {
-    let layout = b.draw_toast_stack(viewport, stack);
+    let layout = b.draw_toast_overlay(viewport, stack);
     engine.toast_layout.replace(Some(layout));
 }
 
@@ -10087,19 +11017,6 @@ pub fn reconcile_change_review_modal_stack(
     }
 }
 
-/// Does the backend's `quadraui::ModalStack` currently hold the
-/// change-review surface's entry? Test-facing: the regression guard for
-/// "the overlay closed but its full-viewport entry stayed registered and
-/// ate every later chrome click" (#955 review) asserts on this directly,
-/// since the symptom is otherwise only observable several clicks later.
-pub fn change_review_modal_registered(b: &mut dyn quadraui::Backend) -> bool {
-    let stack_rc = b.modal_stack_handle();
-    let stack = stack_rc.borrow();
-    let id = change_review_modal_id();
-    let registered = stack.iter_top_down().any(|e| e.id == id);
-    registered
-}
-
 /// The change-review surface's whole paint body (#955, shared with #525):
 /// a full-viewport `quadraui::DiffView` for the currently-shown entry,
 /// plus a one-row status footer ("file i of n", the entry's path, and key
@@ -10154,13 +11071,40 @@ pub fn paint_change_review_rung(
         crate::core::review::ChangeDecision::Accepted => "accepted",
         crate::core::review::ChangeDecision::Rejected => "rejected",
     };
-    let msg = format!(
-        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
-         ]/[=hunk n/p=file Esc=close ",
-        review.current + 1,
-        review.entries.len(),
-        entry.change.path,
-    );
+    // #1516: a turn review's `a`/`r` act on the hunk under the cursor
+    // ("a"/"r"), not the whole file — `A`/`R` (file) and `ga`/`gr` (every
+    // file) cover the old whole-file scope instead. A branch/proposal
+    // review keeps the pre-#1516 whole-file-only legend, since its `a`/`r`
+    // still mean exactly that (`Engine::handle_change_review_key`'s own
+    // doc has the full truth table).
+    let edited_by_you = if engine.turn_review_checkpoint_id.is_some() {
+        " \u{b7} edited by you"
+    } else {
+        ""
+    };
+    let msg = if engine.turn_review_checkpoint_id.is_some() {
+        format!(
+            " Change {}/{} ({decision}){} \u{b7} {} \u{b7} a=keep-hunk r=revert-hunk \
+             A=keep-file R=revert-file ga/gr=all c=comment d=del-comment ]/[=hunk n/p=file \
+             Esc=close ",
+            review.current + 1,
+            review.entries.len(),
+            if engine.current_turn_hunk_edited_by_human() {
+                edited_by_you
+            } else {
+                ""
+            },
+            entry.change.path,
+        )
+    } else {
+        format!(
+            " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
+             ]/[=hunk n/p=file Esc=close ",
+            review.current + 1,
+            review.entries.len(),
+            entry.change.path,
+        )
+    };
     // Provenance (#528): a git-branch-fed review (`Engine::
     // open_branch_review`) is showing the human a diff *of a real branch
     // checked out right here* — the footgun the issue calls out is a human
@@ -10238,7 +11182,7 @@ fn branch_review_provenance_segment(
 /// cursor at the `bounds.x` it was handed — so adding the band's own `x` back
 /// on double-counts it, which is the bug quadraui hit and fixed internally
 /// (quadraui#494). This existed as three separate hand-written copies of the
-/// same `visible_items.last()` fold (GTK, `TuiShellApp`, `draw_frame`), each
+/// same `visible_items.last()` fold (GTK, the pre-#1434 TUI shell, `draw_frame`), each
 /// carrying its own transcription of that warning; #763 states it once.
 ///
 /// `fallback_x` is what an item-less bar returns: the leading edge the items
@@ -10251,6 +11195,47 @@ pub fn menu_bar_items_end(layout: &quadraui::MenuBarLayout, fallback_x: f32) -> 
         .map(|vi| vi.bounds.x + vi.bounds.width)
         .unwrap_or(fallback_x)
 }
+
+/// The min-gap [`measure_title_bar_bands`] reserves between the Command
+/// Center and the inline window-control buttons (#1530), matching every
+/// quadraui backend that supplies a `controls_bar`'s own `StatusBar::layout`
+/// min-gap (`quadraui::gtk::MIN_GAP_PX`, `quadraui::win::MIN_GAP_DIP` — both
+/// `16.0` at the pinned rev). See that function's doc for why a *second*
+/// copy of this number has to live here rather than importing the `gtk`
+/// one.
+const TITLE_BAR_CONTROLS_MIN_GAP_PX: f32 = 16.0;
+
+/// Total slack [`measure_title_bar_bands`] reserves to the *left* of the
+/// window-control buttons' measured leading edge, so that repainting them
+/// inside the narrowed `controls` rect doesn't re-trigger
+/// `StatusBar::layout_padded`'s priority-drop and silently lose minimize
+/// (#1530).
+///
+/// Derivation — with `E` = [`quadraui::primitives::status_bar::PIXEL_EDGE_INSET`],
+/// `G` = [`TITLE_BAR_CONTROLS_MIN_GAP_PX`] and `T` the buttons' total
+/// padded width:
+///
+/// * The wide-band measurement puts the leftmost button at `W - E - T`, i.e.
+///   it accounts for exactly **one** trailing edge inset.
+/// * The repaint at `bar_width = B` keeps every button only while
+///   `B - left_w - G - E >= T`. `window_controls_status_bar` has no left
+///   segments, but `layout_padded` still starts its left cursor at `E` and
+///   reports `left_w = E` — so the repaint needs `B >= T + 2E + G`, i.e.
+///   `E + G` more than the measurement reserved.
+/// * One further `E` on top of that minimum keeps the comparison off the
+///   knife edge: `B` is derived by subtracting from the band's absolute
+///   `W` (hundreds of px), where f32 has ~1e-4 resolution, and an exact-fit
+///   `B` can round a hair *under* `T + 2E + G` and drop minimize anyway.
+///   The cost is 10px of Command Center width; the benefit is that the fit
+///   no longer depends on `W`'s rounding.
+///
+/// `PIXEL_EDGE_INSET` lives in `quadraui::primitives`, which is not feature
+/// gated, so unlike `quadraui::gtk::MIN_GAP_PX` it can be imported here
+/// rather than restated (quadraui#1155 added it; before that rev pixel
+/// backends called plain `StatusBar::layout`, i.e. `E == 0`, and `G` alone
+/// was enough).
+const TITLE_BAR_CONTROLS_SLACK_PX: f32 =
+    TITLE_BAR_CONTROLS_MIN_GAP_PX + 2.0 * quadraui::primitives::status_bar::PIXEL_EDGE_INSET;
 
 /// How the title-bar band divides up to the right of the last menu label.
 ///
@@ -10312,6 +11297,24 @@ pub fn measure_title_bar_bands(
                 .fold(f32::INFINITY, f32::min)
         })
         .filter(|s| s.is_finite())
+        // #1530: the value above is measured against the *wide* `full` band,
+        // where `StatusBar::layout_padded`'s `bar_width - left_w - min_gap
+        // - edge_inset` never goes negative and all three buttons come back
+        // — but `controls` below is narrowed to (nearly) that painted width,
+        // and it is *that* narrower rect `paint_title_bar_band` hands to
+        // `Backend::draw_status_bar_interactive` for the actual paint.
+        // `window_controls_status_bar` has no left segments, so re-laying-out
+        // at a `bar_width` that only covers the buttons makes the identical
+        // subtraction go negative and silently drops the front (lowest-
+        // priority) segment — minimize — even though it fit a moment ago.
+        // [`TITLE_BAR_CONTROLS_SLACK_PX`] is the slack that keeps the repaint
+        // from re-triggering that drop; its doc derives the number. Every
+        // backend that supplies a `controls_bar` (GTK, Win-GUI) reserves the
+        // same 16px/16dip min-gap convention (`quadraui::gtk::MIN_GAP_PX`,
+        // `quadraui::win::MIN_GAP_DIP`) — restated as a plain constant, not
+        // imported, so this stays buildable without the `gui` feature
+        // (`quadraui::gtk` is gated on `quadraui/gtk`, `render.rs` is not).
+        .map(|s| (s - TITLE_BAR_CONTROLS_SLACK_PX).max(0.0))
         .unwrap_or(full.width);
     let controls = quadraui::Rect::new(
         full.x + controls_start,
@@ -10440,7 +11443,7 @@ pub fn command_line_view(command: &CommandLineData) -> quadraui::CommandLine {
 /// backends drive an equivalent engine state and assert their recorded
 /// `composed_frame` equals *this* value, so the two sequences are equal to each
 /// other by construction. A single test cannot drive both backends (the GTK
-/// `App` lives in the `vimcode` bin target, `TuiShellApp` in `vcd`), so "both
+/// `App` lives in the `vimcode` bin target, the pre-#1434 TUI shell in `vcd`), so "both
 /// backends emit the same `FrameOp` sequence for a given `ScreenLayout`" is
 /// expressed as two tests sharing one expected value — a single `#[cfg(test)]`
 /// fn compiled into both bin targets, so the compiler keeps them in step
@@ -10539,16 +11542,6 @@ fn quickfix_list_to_panel(list: &QuickfixList, title: &'static str) -> QuickfixP
     }
 }
 
-/// A single item rendered in the debug sidebar. Used by win-gui;
-/// TUI/GTK use `SidebarSystem` with `TreeRow` directly via
-/// `populate_dap_sidebar_system()`.
-#[derive(Debug, Clone)]
-pub struct DebugSidebarItem {
-    pub text: String,
-    pub indent: u8,
-    pub is_selected: bool,
-}
-
 // ─── SourceControlData ────────────────────────────────────────────────────────
 
 /// A single file-change item in the Source Control panel.
@@ -10639,48 +11632,12 @@ pub struct BranchPickerData {
     pub create_input: String,
 }
 
-// ─── ExtSidebarData ───────────────────────────────────────────────────────────
-
-/// A single extension item in the Extensions sidebar.
-#[derive(Debug, Clone)]
-pub struct ExtSidebarItem {
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    /// LSP binary name (empty string if none).
-    pub lsp_binary: String,
-    /// DAP adapter name (empty string if none).
-    pub dap_adapter: String,
-    /// Number of bundled Lua scripts.
-    pub script_count: usize,
-    pub installed: bool,
-    /// True when a newer version is available in the registry.
-    pub update_available: bool,
-}
-
-/// Rendering data for the Extensions sidebar panel.
-#[derive(Debug, Clone)]
-pub struct ExtSidebarData {
-    /// Installed extensions (filtered by query).
-    pub items_installed: Vec<ExtSidebarItem>,
-    /// Available (not yet installed) extensions (filtered by query).
-    pub items_available: Vec<ExtSidebarItem>,
-    /// Whether each section is expanded: [installed, available].
-    pub sections_expanded: [bool; 2],
-    /// Flat selection index (installed items first, then available).
-    pub selected: usize,
-    /// Whether the panel currently has keyboard focus.
-    pub has_focus: bool,
-    /// Current search query string.
-    pub query: String,
-    /// Whether the search input is in active edit mode.
-    pub input_active: bool,
-    /// True while a background registry fetch is in-flight.
-    pub fetching: bool,
-    /// Vertical scroll offset of the panel content in main-axis units
-    /// (cells / pixels). Drives `MultiSectionView::panel_scroll` (#293).
-    pub panel_scroll: f32,
-}
+// #1489: `ExtSidebarItem`/`ExtSidebarData`, `ext_sidebar_to_multi_section_view`
+// and `build_ext_sidebar_data` used to live here as a second, entirely dead
+// data pipeline for the Extensions sidebar — nothing ever read
+// `ScreenLayout.ext_sidebar` (removed alongside them). The live path is
+// `Engine::populate_ext_sidebar_system` (`core/engine/ext_panel.rs`), which
+// paints straight into `engine.ext_sidebar_system` (`quadraui::SidebarSystem`).
 
 // ─── BoardData ─────────────────────────────────────────────────────────────────
 
@@ -11032,23 +11989,18 @@ pub fn panel_hover_popup_paint(
 // SettingType, SettingDef, and SETTING_DEFS are defined in settings.rs and
 // re-exported at the top of this file for backward compatibility.
 
-/// Always present in `ScreenLayout`; each section may be empty.
+/// Always present in `ScreenLayout`. Only the chrome-level fields that
+/// `debug_sidebar_chrome` and the bottom-panel Debug Output tab actually
+/// read survive here; the item lists (variables/watch/frames/breakpoints)
+/// were a dead second pipeline — the live rows come from
+/// `build_dap_{var,watch,stack,bp}_rows` → `populate_dap_sidebar_system`
+/// (#1489).
 #[derive(Debug, Clone)]
 pub struct DebugSidebarData {
     pub session_active: bool,
     pub stopped: bool,
-    pub variables: Vec<DebugSidebarItem>,
-    pub watch: Vec<DebugSidebarItem>,
-    pub frames: Vec<DebugSidebarItem>,
-    pub breakpoints: Vec<DebugSidebarItem>,
-    pub active_section: DebugSidebarSection,
-    pub sidebar_selected: usize,
-    pub has_focus: bool,
     pub launch_config_name: Option<String>,
     pub debug_output_lines: Vec<String>,
-    pub eval_result: Option<String>,
-    pub scroll_offsets: [usize; 4],
-    pub section_heights: [u16; 4],
 }
 
 /// The two bottom panel tabs: Terminal and Debug Output.
@@ -11357,6 +12309,10 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     let pressed = engine
         .debug_button_pressed
         .and_then(Engine::debug_button_id);
+    // `draw_toolbar` (quadraui#819) is deprecated in favour of an
+    // `_interactive`-style hover/pressed API this call doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
     engine.debug_toolbar_layout.replace(Some(layout));
 }
@@ -11445,6 +12401,63 @@ fn debug_sidebar_status_bars(
 pub const WINDOW_MINIMIZE_ACTION: &str = "window:minimize";
 pub const WINDOW_MAXIMIZE_ACTION: &str = "window:maximize";
 pub const WINDOW_CLOSE_ACTION: &str = "window:close";
+
+/// Width, in pixels, of the outer-window resize grip passed to
+/// [`quadraui::AppShell::window_edge`] (#1528).
+///
+/// The grip used to be `backend.line_height()` — 16-22px, the full height of
+/// the title bar and command-line rows. That made the grip band as tall as
+/// those rows, so it always ran *underneath* them: the top-row title-bar drag
+/// check and the bottom-row command-line click always resolved first, and
+/// North/South resize was dead everywhere except the corners the title bar
+/// or command line didn't cover. The same oversized band on the East edge
+/// also swallowed the vertical scrollbar and the minimap's rightmost column
+/// with a single editor group, where both sit within that many pixels of the
+/// window's true right edge.
+///
+/// A few pixels — VS Code/Electron frameless windows use a comparable
+/// margin — is still comfortably grabbable with a mouse, is thinner than one
+/// scrollbar/minimap gutter (`app_support::scrollbar_thumb_geometry`'s
+/// track, `render::minimap`'s gutter offset), and is thin enough to sit
+/// *inside* the title bar and command-line rows instead of spanning them, so
+/// the edge grip can win only in that sliver and fall through to the
+/// row/scrollbar/minimap hit-test everywhere else in the row.
+///
+/// Caveat (#1528 acceptance criteria, stated explicitly so a reader of
+/// `window_resize_grip_stays_inside_the_scrollbar_gutter` below doesn't read
+/// it as proving *zero* overlap): the acceptance bar is "a press in the
+/// outermost ~4 px still resizes (E)", i.e. some overlap with the
+/// scrollbar/minimap gutter's own outermost pixels is expected and accepted
+/// — the fix's job is shrinking that overlap from a full row-height band down
+/// to this margin, not eliminating it.
+pub const WINDOW_RESIZE_GRIP_PX: f32 = 4.0;
+
+/// Does an outer-window resize press at `edge` land inside the band the
+/// change-review surface's own first row occupies (#1528 review of #955)?
+///
+/// The change-review surface is genuinely full-viewport, and its first diff
+/// row paints underneath the (visually hidden but still logically live) CSD
+/// title bar — i.e. it only ever overlaps the *top* of the window, never the
+/// bottom/left/right edges or the corners that don't touch North. So a press
+/// in the resize grip should still be allowed to arm a resize everywhere
+/// *except* where it would otherwise be reinterpreted as a click on that
+/// first diff row: `North`, and the two corners that include it
+/// (`NorthEast`/`NorthWest`).
+///
+/// Extracted to a pure function (rather than left as an inline `matches!` at
+/// the one call site in `App::handle`) so the *decision* — which edges a
+/// change-review surface may steal from resize — is unit-testable on its
+/// own, independent of `quadraui::gtk::testing::GtkDriver`'s inability to
+/// arm a real resize headlessly (no `gtk4::Window`, no captured GDK press —
+/// see `src/gtk/testing.rs`'s module doc "No window").
+pub fn resize_edge_overlaps_change_review_band(edge: quadraui::ResizeEdge) -> bool {
+    matches!(
+        edge,
+        quadraui::ResizeEdge::North
+            | quadraui::ResizeEdge::NorthEast
+            | quadraui::ResizeEdge::NorthWest
+    )
+}
 
 /// Build the inline minimize/maximize/close window-control buttons for the
 /// GTK client-side titlebar (#552).
@@ -12297,10 +13310,8 @@ pub struct ScreenLayout {
     /// backends walk, so "populated but never composed" is a compile error
     /// here rather than something a `grep` has to notice.
     pub group_dividers: Vec<GroupDivider>,
-    /// Extensions sidebar data — `Some` when the Extensions panel is the active sidebar panel.
-    pub ext_sidebar: Option<ExtSidebarData>,
     /// Board panel data (#521) — always `Some` so backends can check
-    /// `has_focus`, mirroring [`ExtSidebarData`]'s own doc.
+    /// `has_focus`.
     pub board: Option<BoardData>,
     /// Extension-provided panel data — `Some` when an extension panel is the active sidebar panel.
     pub ext_panel: Option<ExtPanelData>,
@@ -12690,6 +13701,10 @@ pub struct RenderedMinimap {
     /// (rather than one `RenderedMinimap::raw_spans` living beside an
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
+    // `SyntaxSpan` (quadraui#822) is deprecated in favour of a
+    // `MinimapSpan`-shaped replacement this field doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
     /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
     /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
@@ -12709,6 +13724,14 @@ pub struct RenderedMinimap {
     /// paint can only ever cost the recompute this issue exists to skip —
     /// never a dropped or misrouted click.
     pub resolved_layout: std::cell::RefCell<Option<quadraui::MinimapLayout>>,
+    /// The [`quadraui::MinimapScale`] this strip's `lines`/`window_len`
+    /// were sized against (`Settings::resolved_minimap_scale`, issue
+    /// #1532) — [`draw_minimap_strip`] pushes this onto the live backend
+    /// via `Backend::set_minimap_scale` immediately before painting, so
+    /// the row pitch quadraui actually rasterises at can never drift from
+    /// the one this strip's own sampling math (`build_minimap_data`'s
+    /// `effective_row_pitch_px`) assumed.
+    pub minimap_scale: quadraui::MinimapScale,
 }
 
 /// Width the minimap reserves alongside the editor, in the caller's units.
@@ -12856,8 +13879,17 @@ pub fn build_minimap_data(
     // since `MINIMAP_LINES_PER_ROW` (4) is larger than `1.0 /
     // ROW_PITCH_PX` (0.5) — so this candidate can only ever win on GTK's
     // own numbers, never accidentally overriding TUI's.
-    let gtk_row_capacity =
-        (rect.height / quadraui::primitives::minimap::ROW_PITCH_PX).floor() as usize;
+    //
+    // #1532: `resolved_minimap_scale` (quadraui#1143) resolves to
+    // `MinimapScale::One` — whose `row_pitch_px()` is exactly the old
+    // hardcoded `ROW_PITCH_PX` constant this replaced — everywhere except
+    // a pixel (GUI) backend that has both `minimap_render_characters` on
+    // and a `minimap_scale >= 2`; TUI always takes the `One` branch (see
+    // that method's own doc comment), so every claim this comment block
+    // makes about "GTK's real requirement" below is unaffected there.
+    let minimap_scale = engine.settings.resolved_minimap_scale();
+    let effective_row_pitch_px = minimap_scale.row_pitch_px();
+    let gtk_row_capacity = (rect.height / effective_row_pitch_px).floor() as usize;
     let target_lines = display_rows
         .saturating_mul(MINIMAP_LINES_PER_ROW)
         .max(gtk_row_capacity)
@@ -12907,9 +13939,30 @@ pub fn build_minimap_data(
     let desired_window_lines = editor_visible_rows
         .max(1)
         .saturating_mul(MINIMAP_VIEWPORT_MULTIPLE);
-    let k = desired_window_lines
-        .div_ceil(target_lines.max(1))
-        .clamp(1, MINIMAP_MAX_COMPRESSION);
+    // #1532: in character-render mode (`minimap_scale` resolved to
+    // `MinimapScale::Two`, above) every block must stay exactly one real
+    // buffer line wide — a `k > 1` block would hand `sample_blocks` more
+    // than one line to aggregate, and it has no font to render a
+    // multi-line aggregate as real glyphs with, so it falls back to a
+    // dither-text placeholder (`'x'`-filled) that paints as a uniform
+    // block under the glyph atlas exactly like the density-dot path this
+    // issue exists to move away from. Forcing `k == 1` here — instead of
+    // letting the `div_ceil` below pick whatever compression the strip's
+    // geometry would otherwise ask for — makes `window_len ==
+    // target_lines` (below), so `block_bounds` always takes its
+    // "never upscales" branch and every sampled row is a real, single
+    // buffer line's own text. `target_lines` itself already shrank to
+    // match (`effective_row_pitch_px` above), so the window still slides
+    // (`window_start_line` below) — it just now covers however many
+    // viewports the strip's real height affords at the taller
+    // VS-Code-parity row pitch, rather than a fixed 9.
+    let k = if minimap_scale != quadraui::MinimapScale::One {
+        1
+    } else {
+        desired_window_lines
+            .div_ceil(target_lines.max(1))
+            .clamp(1, MINIMAP_MAX_COMPRESSION)
+    };
     // #1247 (quadraui#1044): the window's *sizing* (`window_len`, via `k`
     // above) stays host-side — it depends on this strip's own geometry
     // (`target_lines`/`editor_visible_rows`), which quadraui has no way to
@@ -13020,6 +14073,9 @@ pub fn build_minimap_data(
     if bounds.len() < 2 {
         return None;
     }
+    // `SyntaxSpan` (quadraui#822) is deprecated — unrelated to #1491's
+    // tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
     for r in 0..bounds.len() - 1 {
         let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
@@ -13079,6 +14135,7 @@ pub fn build_minimap_data(
                     continue;
                 }
                 let c = theme.scope_color(scope);
+                #[allow(deprecated)] // `SyntaxSpan` (quadraui#822); see module doc
                 raw_spans.push(quadraui::SyntaxSpan {
                     line_idx: r,
                     start_col,
@@ -13164,6 +14221,7 @@ pub fn build_minimap_data(
         },
         raw_syntax_spans,
         resolved_layout: std::cell::RefCell::new(None),
+        minimap_scale,
     })
 }
 
@@ -13223,6 +14281,14 @@ pub fn build_minimap_data(
 /// [`minimap_reserved_width`] — the same call that reserved it here.
 pub fn draw_minimap_strip(backend: &mut dyn quadraui::Backend, screen: &ScreenLayout) {
     for mm in &screen.minimap {
+        // #1532: keep the live backend's `MinimapScale` in sync with the
+        // one `build_minimap_data` already sized this strip's `lines`/
+        // `window_len` against (`mm.minimap_scale`) — a backend that never
+        // overrides `Backend::minimap_scale`/`set_minimap_scale` (TUI) no-ops
+        // here, per that trait method's own doc comment, so this stays
+        // exactly as safe to call unconditionally as every other
+        // `Backend::draw_*` call in this file.
+        backend.set_minimap_scale(mm.minimap_scale);
         let rect = minimap_strip_rect(mm);
         // No-paint probe: `mm.minimap.syntax_spans` is still empty
         // here, which is fine — `minimap_layout` (both backends' own
@@ -14334,6 +15400,10 @@ pub struct Theme {
     // Activity bar
     /// Foreground for activity bar icons.
     pub activity_bar_fg: Color,
+    /// Colour of the 2px left-edge accent line on the active activity-bar
+    /// item (`quadraui::ActivityBar::active_accent`, #658). Mirrors VS
+    /// Code's `activityBar.activeBorder`.
+    pub activity_active_accent: Color,
 }
 
 impl Theme {
@@ -14527,6 +15597,7 @@ impl Theme {
             scrollbar_track: hex("#1a1a1a"),
             terminal_bg: hex("#1e1e1e"),
             activity_bar_fg: hex("#c8c8d2"),
+            activity_active_accent: hex("#c8c8d2"),
         }
     }
 
@@ -14677,6 +15748,7 @@ impl Theme {
             scrollbar_track: hex("#282828"),
             terminal_bg: hex("#282828"),
             activity_bar_fg: hex("#bdae93"),
+            activity_active_accent: hex("#bdae93"),
         }
     }
 
@@ -14827,6 +15899,7 @@ impl Theme {
             scrollbar_track: hex("#1a1b26"),
             terminal_bg: hex("#1a1b26"),
             activity_bar_fg: hex("#a9b1d6"),
+            activity_active_accent: hex("#a9b1d6"),
         }
     }
 
@@ -14977,6 +16050,7 @@ impl Theme {
             scrollbar_track: hex("#002b36"),
             terminal_bg: hex("#002b36"),
             activity_bar_fg: hex("#93a1a1"),
+            activity_active_accent: hex("#93a1a1"),
         }
     }
 
@@ -15127,6 +16201,7 @@ impl Theme {
             scrollbar_track: hex("#1e1e1e"),
             terminal_bg: hex("#1e1e1e"),
             activity_bar_fg: hex("#c8c8d2"),
+            activity_active_accent: hex("#c8c8d2"),
         }
     }
 
@@ -15276,6 +16351,7 @@ impl Theme {
             scrollbar_track: hex("#f3f3f3"),
             terminal_bg: hex("#ffffff"),
             activity_bar_fg: hex("#646e6e"),
+            activity_active_accent: hex("#646e6e"),
         }
     }
 
@@ -15367,14 +16443,16 @@ impl Theme {
     /// back onto this struct would silently change which VS Code JSON key
     /// feeds which vimcode field — exactly what "assert rendered chrome
     /// colours match before and after" (#829's acceptance bar) exists to
-    /// catch. `strip_json_comments` and this `colors`-object walk stay
-    /// local for that reason; only the `Color` type itself (this file's
-    /// former `Color` struct, `to_q_color` / `to_quadraui_color`
-    /// conversions) was adopted from quadraui, per #829.
+    /// catch. This `colors`-object walk stays local for that reason;
+    /// only the `Color` type itself (this file's former `Color` struct,
+    /// `to_q_color` / `to_quadraui_color` conversions) was adopted from
+    /// quadraui, per #829. `strip_json_comments` itself has no
+    /// theme-specific semantics — it moved to `quadraui::text_util` in
+    /// #1494.
     pub fn from_vscode_json(path: &std::path::Path) -> Option<Self> {
         let data = std::fs::read_to_string(path).ok()?;
         // VSCode themes often have comments — strip them
-        let data = strip_json_comments(&data);
+        let data = quadraui::text_util::strip_json_comments(&data);
         let val: serde_json::Value = serde_json::from_str(&data).ok()?;
         let colors = val.get("colors");
         let token_colors = val.get("tokenColors");
@@ -15515,6 +16593,15 @@ impl Theme {
         }
         if let Some(c) = color("activityBar.foreground") {
             theme.activity_bar_fg = c;
+        }
+        // VS Code's own default for `activityBar.activeBorder` is
+        // `activityBar.foreground` (see `ACTIVITY_BAR_ACTIVE_BORDER` in
+        // VS Code's `colorRegistry`) — only fall back when the imported
+        // theme doesn't override it explicitly.
+        if let Some(c) =
+            color("activityBar.activeBorder").or_else(|| color("activityBar.foreground"))
+        {
+            theme.activity_active_accent = c;
         }
 
         // ── Breadcrumbs ──────────────────────────────────────────────────
@@ -16251,216 +17338,12 @@ pub fn build_screen_layout_with_breadcrumb_row(
         session_active: engine.dap_session_active,
     });
 
-    // Build the debug sidebar data (always present).
+    // Build the debug sidebar data (always present). The item lists
+    // themselves (variables/watch/frames/breakpoints) are painted by
+    // `populate_dap_sidebar_system`'s `build_dap_*_rows` helpers directly
+    // into `engine.dap_sidebar_system`, not through this struct (#1489) —
+    // only the chrome fields and the Debug Output tab's lines live here.
     let debug_sidebar = {
-        let selected = engine.dap_sidebar_selected;
-        let active_section = engine.dap_sidebar_section;
-
-        // Variables section: flat tree with ▶/▼ prefixes, recursive expansion.
-        let mut var_items: Vec<DebugSidebarItem> = Vec::new();
-        let mut flat_idx = 0usize;
-        #[allow(clippy::too_many_arguments)]
-        fn build_var_tree(
-            items: &mut Vec<DebugSidebarItem>,
-            vars: &[DapVariable],
-            depth: u8,
-            flat_idx: &mut usize,
-            expanded: &std::collections::HashSet<u64>,
-            children_map: &std::collections::HashMap<u64, Vec<DapVariable>>,
-            active_section: &DebugSidebarSection,
-            selected: usize,
-        ) {
-            for v in vars {
-                let prefix = if v.var_ref > 0 {
-                    if expanded.contains(&v.var_ref) {
-                        icons::EXPAND_DOWN.nerd
-                    } else {
-                        icons::COLLAPSE_RIGHT.nerd
-                    }
-                } else {
-                    "  "
-                };
-                items.push(DebugSidebarItem {
-                    text: if v.value.is_empty() {
-                        format!("{}{}", prefix, v.name)
-                    } else {
-                        format!("{}{} = {}", prefix, v.name, v.value)
-                    },
-                    indent: depth,
-                    is_selected: *active_section == DebugSidebarSection::Variables
-                        && *flat_idx == selected,
-                });
-                *flat_idx += 1;
-                if v.var_ref > 0 && expanded.contains(&v.var_ref) {
-                    if let Some(child_vars) = children_map.get(&v.var_ref) {
-                        build_var_tree(
-                            items,
-                            child_vars,
-                            depth + 1,
-                            flat_idx,
-                            expanded,
-                            children_map,
-                            active_section,
-                            selected,
-                        );
-                    }
-                }
-            }
-        }
-        if engine.dap_primary_scope_ref > 0 {
-            // Primary scope header (e.g. "▼ Locals").
-            let expanded = engine
-                .dap_expanded_vars
-                .contains(&engine.dap_primary_scope_ref);
-            let prefix = if expanded {
-                icons::EXPAND_DOWN.nerd
-            } else {
-                icons::COLLAPSE_RIGHT.nerd
-            };
-            var_items.push(DebugSidebarItem {
-                text: format!("{prefix}{}", engine.dap_primary_scope_name),
-                indent: 0,
-                is_selected: active_section == DebugSidebarSection::Variables
-                    && flat_idx == selected,
-            });
-            flat_idx += 1;
-            if expanded {
-                build_var_tree(
-                    &mut var_items,
-                    &engine.dap_variables,
-                    1,
-                    &mut flat_idx,
-                    &engine.dap_expanded_vars,
-                    &engine.dap_child_variables,
-                    &active_section,
-                    selected,
-                );
-            }
-        } else {
-            // No scope info (e.g. tests): show variables at root level.
-            build_var_tree(
-                &mut var_items,
-                &engine.dap_variables,
-                0,
-                &mut flat_idx,
-                &engine.dap_expanded_vars,
-                &engine.dap_child_variables,
-                &active_section,
-                selected,
-            );
-        }
-
-        // Additional scope groups (e.g. "Statics", "Registers") as expandable headers.
-        for (scope_name, var_ref) in &engine.dap_scope_groups {
-            let expanded = engine.dap_expanded_vars.contains(var_ref);
-            let prefix = if expanded {
-                icons::EXPAND_DOWN.nerd
-            } else {
-                icons::COLLAPSE_RIGHT.nerd
-            };
-            var_items.push(DebugSidebarItem {
-                text: format!("{prefix}{scope_name}"),
-                indent: 0,
-                is_selected: active_section == DebugSidebarSection::Variables
-                    && flat_idx == selected,
-            });
-            flat_idx += 1;
-            if expanded {
-                if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
-                    build_var_tree(
-                        &mut var_items,
-                        child_vars,
-                        1,
-                        &mut flat_idx,
-                        &engine.dap_expanded_vars,
-                        &engine.dap_child_variables,
-                        &active_section,
-                        selected,
-                    );
-                }
-            }
-        }
-
-        // Watch section: expressions with their evaluated values.
-        let watch_items: Vec<DebugSidebarItem> = engine
-            .dap_watch_expressions
-            .iter()
-            .zip(engine.dap_watch_values.iter())
-            .enumerate()
-            .map(|(i, (expr, val))| {
-                let val_str = val.as_deref().unwrap_or(if engine.dap_session_active {
-                    "…"
-                } else {
-                    "(not running)"
-                });
-                DebugSidebarItem {
-                    text: format!("{expr} = {val_str}"),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::Watch && i == selected,
-                }
-            })
-            .collect();
-
-        // Call Stack section.
-        let frame_items: Vec<DebugSidebarItem> = engine
-            .dap_stack_frames
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let src = f
-                    .source
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?");
-                let prefix = if i == engine.dap_active_frame {
-                    icons::COLLAPSE_RIGHT.nerd
-                } else {
-                    "  "
-                };
-                DebugSidebarItem {
-                    text: format!("{}{} ({}:{})", prefix, f.name, src, f.line),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::CallStack && i == selected,
-                }
-            })
-            .collect();
-
-        // Breakpoints section: all breakpoints across all files.
-        let mut bp_items: Vec<DebugSidebarItem> = Vec::new();
-        let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
-        sorted_bp.sort_by_key(|(path, _)| path.as_str());
-        let mut bp_global_idx = 0usize;
-        for (path, bps) in &sorted_bp {
-            let file_name = std::path::Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(path);
-            for bp in *bps {
-                let suffix = if let Some(cond) = &bp.condition {
-                    format!(" [if {cond}]")
-                } else if let Some(hc) = &bp.hit_condition {
-                    format!(" [hits {hc}]")
-                } else if let Some(msg) = &bp.log_message {
-                    format!(" [log: {msg}]")
-                } else {
-                    String::new()
-                };
-                let symbol = if bp.condition.is_some() || bp.hit_condition.is_some() {
-                    "\u{25c6}" // ◆ conditional
-                } else {
-                    icons::DBG_BREAKPOINTS.nerd
-                };
-                bp_items.push(DebugSidebarItem {
-                    text: format!("{} {}:{}{}", symbol, file_name, bp.line, suffix),
-                    indent: 0,
-                    is_selected: active_section == DebugSidebarSection::Breakpoints
-                        && bp_global_idx == selected,
-                });
-                bp_global_idx += 1;
-            }
-        }
-
         // Output lines for the Debug Output tab (up to 200, oldest-first).
         let debug_output_lines: Vec<String> = engine
             .dap_output_lines
@@ -16481,18 +17364,8 @@ pub fn build_screen_layout_with_breadcrumb_row(
         DebugSidebarData {
             session_active: engine.dap_session_active,
             stopped: engine.dap_stopped_thread.is_some(),
-            variables: var_items,
-            watch: watch_items,
-            frames: frame_items,
-            breakpoints: bp_items,
-            active_section,
-            sidebar_selected: selected,
-            has_focus: engine.dap_sidebar_has_focus,
             launch_config_name,
             debug_output_lines,
-            eval_result: engine.dap_eval_result.clone(),
-            scroll_offsets: engine.dap_sidebar_scroll,
-            section_heights: engine.dap_sidebar_section_heights,
         }
     };
 
@@ -16665,7 +17538,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         num_groups: n,
     });
 
-    let ext_sidebar = build_ext_sidebar_data(engine);
     let board = build_board_data(engine);
 
     // Build breadcrumbs for each editor group
@@ -16800,7 +17672,6 @@ pub fn build_screen_layout_with_breadcrumb_row(
         group_dividers,
         window_dividers,
         minimap,
-        ext_sidebar,
         board,
         ext_panel: build_ext_panel_data(engine),
         breadcrumbs,
@@ -16856,22 +17727,10 @@ pub fn build_screen_layout_with_breadcrumb_row(
             }),
             vertical_buttons: d.tag == "code_actions",
         }),
-        context_menu: engine.context_menu.as_ref().map(|cm| ContextMenuPanel {
-            items: cm
-                .items
-                .iter()
-                .map(|item| ContextMenuRenderItem {
-                    label: item.label.clone(),
-                    shortcut: item.shortcut.clone(),
-                    separator_after: item.separator_after,
-                    enabled: item.enabled,
-                })
-                .collect(),
-            selected_idx: cm.selected,
-            screen_col: cm.screen_x,
-            screen_row: cm.screen_y,
-            trigger_height: cm.trigger_height,
-        }),
+        context_menu: engine
+            .context_menu
+            .as_ref()
+            .map(context_menu_state_to_panel),
         find_replace: if engine.find_replace_open {
             let match_info = if engine.search_matches.is_empty() {
                 if engine.find_replace_query.is_empty() {
@@ -17143,6 +18002,10 @@ pub fn draw_sc_sidebar_panel(
     let panel = sc_sidebar_panel(sc);
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
+    // `draw_sidebar_panel` (quadraui#819) is deprecated in favour of an
+    // `_interactive`-style hover/pressed API this call doesn't use yet —
+    // unrelated to #1491's tab-bar migration; see this file's module doc.
+    #[allow(deprecated)]
     let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
     engine.sc_panel_layout.replace(Some(layout));
 }
@@ -17151,13 +18014,14 @@ pub fn draw_sc_sidebar_panel(
 /// counts when present. Shared by both backends so the header text can't
 /// drift between TUI and GTK renderers (#480).
 pub fn sc_header_text(sc: &SourceControlData) -> String {
+    let branch_icon = crate::icons::GIT_BRANCH.nerd;
     if sc.ahead > 0 || sc.behind > 0 {
         format!(
-            "  \u{e702} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
+            "  {branch_icon} SOURCE CONTROL  {}  \u{2191}{} \u{2193}{}",
             sc.branch, sc.ahead, sc.behind
         )
     } else {
-        format!("  \u{e702} SOURCE CONTROL  {}", sc.branch)
+        format!("  {branch_icon} SOURCE CONTROL  {}", sc.branch)
     }
 }
 
@@ -17694,6 +18558,25 @@ pub fn gui_sidebar_system_metrics(line_height: f32) -> quadraui::MsvLayoutMetric
     }
 }
 
+/// A plain leaf `TreeRow`: no icon, no badge, not expandable, no inline
+/// edit overlay, `Decoration::Normal` — just a `path`, `indent`, and
+/// rendered `text`. Shared shape for the many sidebar-panel builders below
+/// that previously each wrote out the full `TreeRow { … }` literal with
+/// these same five fields fixed and only `path`/`indent`/`text` varying
+/// (#1496).
+fn plain_tree_row(path: Vec<u16>, indent: u16, text: quadraui::StyledText) -> quadraui::TreeRow {
+    quadraui::TreeRow {
+        path,
+        indent,
+        icon: None,
+        text,
+        badge: None,
+        is_expanded: None,
+        decoration: quadraui::Decoration::Normal,
+        edit: None,
+    }
+}
+
 /// Populate the `SidebarSystem` on `engine.sc_sidebar_system` with current
 /// row data for all 5 SC sections. Call once per frame before
 /// `sidebar_system.render()` or `.handle_cached()`.
@@ -17738,21 +18621,16 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             '!' => del_fg,
             _ => mod_fg,
         };
-        TreeRow {
-            path: vec![i as u16],
-            indent: 0,
-            icon: None,
-            text: StyledText {
+        plain_tree_row(
+            vec![i as u16],
+            0,
+            StyledText {
                 spans: vec![
                     StyledSpan::with_fg(ch.to_string(), color),
                     StyledSpan::plain(format!(" {}", f.path)),
                 ],
             },
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        }
+        )
     };
 
     let merge_rows: Vec<TreeRow> = merge
@@ -17782,16 +18660,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
             let branch = wt.branch.as_deref().unwrap_or("HEAD");
             let main_marker = if wt.is_main { " [main]" } else { "" };
             let text = format!("{}{} {}{}", check, branch, wt.path.display(), main_marker);
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(text),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(vec![i as u16], 0, StyledText::plain(text))
         })
         .collect();
 
@@ -17850,7 +18719,7 @@ pub fn populate_sc_sidebar_system(engine: &Engine, theme: &Theme) {
 /// data. Section 0 is the Form (query/replace/toggles/buttons/status);
 /// Section 1 is the TreeView (results grouped by file). Call once per
 /// frame before `sidebar.render()`.
-pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
+pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path, theme: &Theme) {
     use quadraui::primitives::form::{ButtonRowItem, FieldKind, ToggleGroupItem};
     use quadraui::{Badge, Decoration, Form, FormField, StyledSpan, StyledText, TreeRow, WidgetId};
 
@@ -18019,15 +18888,18 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
         let expanded = !collapsed.contains(&file_idx);
         if expanded {
             let line_prefix = format!("{:>4}: ", m.line + 1);
-            tree_rows.push(TreeRow {
-                path: vec![file_idx as u16, match_within_file as u16],
-                indent: 1,
-                icon: None,
-                text: StyledText {
+            tree_rows.push(plain_tree_row(
+                vec![file_idx as u16, match_within_file as u16],
+                1,
+                StyledText {
                     spans: vec![
                         StyledSpan {
                             text: line_prefix,
-                            fg: Some(quadraui::Color::rgb(100, 100, 100)),
+                            // #1574: was a hard-coded `rgb(100, 100, 100)`
+                            // literal — unreadable on light colourschemes.
+                            // Use the same muted tone the gutter's own line
+                            // numbers paint with.
+                            fg: Some(theme.line_number_fg),
                             bg: None,
                             bold: false,
                             italic: false,
@@ -18036,11 +18908,7 @@ pub fn populate_search_sidebar_system(engine: &Engine, root: &std::path::Path) {
                         StyledSpan::plain(m.line_text.trim().to_string()),
                     ],
                 },
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            ));
         }
         match_within_file += 1;
         file_match_count += 1;
@@ -18184,7 +19052,7 @@ fn empty_placeholder_row(session_active: bool) -> quadraui::TreeRow {
 }
 
 fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::{StyledText, TreeRow};
 
     let mut rows: Vec<TreeRow> = Vec::new();
     let mut flat_idx: u16 = 0;
@@ -18212,16 +19080,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
             } else {
                 format!("{}{} = {}", prefix, v.name, v.value)
             };
-            rows.push(TreeRow {
-                path: vec![*flat_idx],
-                indent: depth,
-                icon: None,
-                text: StyledText::plain(text),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            rows.push(plain_tree_row(
+                vec![*flat_idx],
+                depth,
+                StyledText::plain(text),
+            ));
             *flat_idx += 1;
             if v.var_ref > 0 && expanded.contains(&v.var_ref) {
                 if let Some(child_vars) = children_map.get(&v.var_ref) {
@@ -18247,16 +19110,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
         } else {
             icons::COLLAPSE_RIGHT.nerd
         };
-        rows.push(TreeRow {
-            path: vec![flat_idx],
-            indent: 0,
-            icon: None,
-            text: StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        });
+        rows.push(plain_tree_row(
+            vec![flat_idx],
+            0,
+            StyledText::plain(format!("{prefix}{}", engine.dap_primary_scope_name)),
+        ));
         flat_idx += 1;
         if expanded {
             push_var_tree(
@@ -18286,16 +19144,11 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
         } else {
             icons::COLLAPSE_RIGHT.nerd
         };
-        rows.push(TreeRow {
-            path: vec![flat_idx],
-            indent: 0,
-            icon: None,
-            text: StyledText::plain(format!("{prefix}{scope_name}")),
-            badge: None,
-            is_expanded: None,
-            decoration: Decoration::Normal,
-            edit: None,
-        });
+        rows.push(plain_tree_row(
+            vec![flat_idx],
+            0,
+            StyledText::plain(format!("{prefix}{scope_name}")),
+        ));
         flat_idx += 1;
         if expanded {
             if let Some(child_vars) = engine.dap_child_variables.get(var_ref) {
@@ -18319,7 +19172,7 @@ fn build_dap_var_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tr
 }
 
 fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     if engine.dap_watch_expressions.is_empty() {
         return vec![empty_placeholder_row(session_active)];
@@ -18336,22 +19189,17 @@ fn build_dap_watch_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
             } else {
                 "(not running)"
             });
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{expr} = {val_str}")),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(
+                vec![i as u16],
+                0,
+                StyledText::plain(format!("{expr} = {val_str}")),
+            )
         })
         .collect()
 }
 
 fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     if engine.dap_stack_frames.is_empty() {
         return vec![empty_placeholder_row(session_active)];
@@ -18373,22 +19221,17 @@ fn build_dap_stack_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::
             } else {
                 "  "
             };
-            TreeRow {
-                path: vec![i as u16],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            }
+            plain_tree_row(
+                vec![i as u16],
+                0,
+                StyledText::plain(format!("{}{} ({}:{})", prefix, f.name, src, f.line)),
+            )
         })
         .collect()
 }
 
 fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::TreeRow> {
-    use quadraui::{Decoration, StyledText, TreeRow};
+    use quadraui::StyledText;
 
     let mut sorted_bp: Vec<_> = engine.dap_breakpoints.iter().collect();
     sorted_bp.sort_by_key(|(path, _)| path.as_str());
@@ -18415,16 +19258,11 @@ fn build_dap_bp_rows(engine: &Engine, session_active: bool) -> Vec<quadraui::Tre
             } else {
                 icons::DBG_BREAKPOINTS.nerd
             };
-            rows.push(TreeRow {
-                path: vec![flat_idx],
-                indent: 0,
-                icon: None,
-                text: StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
-                badge: None,
-                is_expanded: None,
-                decoration: Decoration::Normal,
-                edit: None,
-            });
+            rows.push(plain_tree_row(
+                vec![flat_idx],
+                0,
+                StyledText::plain(format!("{} {}:{}{}", symbol, file_name, bp.line, suffix)),
+            ));
             flat_idx += 1;
         }
     }
@@ -18522,7 +19360,7 @@ pub fn build_activity_bar(
         (PANEL_BOARD, icons::BOARD.s(), "Board", "activity:board"),
     ];
 
-    // #635 (Stage 6b): `tui_main::shell_app::TuiShellApp::shell_config` derives
+    // #635 (Stage 6b): the pre-#1434 TUI shell's own `build_shell_config` derived
     // its own middle-panel `PanelDefinition` order from
     // `sidebar::FIXED_ACTIVITY_PANEL_IDS` rather than re-reading this array (it
     // can't — `fixed` is a local, and the two arrays carry different metadata
@@ -18574,9 +19412,9 @@ pub fn build_activity_bar(
         top_items: top,
         bottom_items: bottom,
         active_accent: Some(quadraui::Color::rgb(
-            theme.cursor.r,
-            theme.cursor.g,
-            theme.cursor.b,
+            theme.activity_active_accent.r,
+            theme.activity_active_accent.g,
+            theme.activity_active_accent.b,
         )),
         selection_bg: Some(quadraui::Color::rgb(
             theme.cursor.r,
@@ -18832,215 +19670,6 @@ pub struct ExtPanelTreeBody(pub quadraui::TreeView);
 impl quadraui::BackendWidget for ExtPanelTreeBody {
     fn render(&self, backend: &mut dyn quadraui::Backend, rect: quadraui::Rect) {
         backend.draw_tree(rect, &self.0);
-    }
-}
-
-/// Adapt the engine-side `ExtSidebarData` into a `quadraui::MultiSectionView`
-/// (#293).
-///
-/// Two sections — `"installed"` and `"available"` — each carries its own
-/// `TreeView` body of item rows only (the section title is rendered as
-/// the section header, not as a tree-row). Both sections size as
-/// `EqualShare` and scroll independently (`ScrollMode::PerSection`).
-///
-/// Selection mapping: `ExtSidebarData.selected` is a flat index across
-/// installed-then-available items. Within a section, each TreeView's
-/// `selected_path` is `vec![item_idx as u16]` for that section's items.
-///
-/// Empty-state rows (`(none installed)` / `(all installed)` /
-/// `Fetching registry…`) appear as `Decoration::Muted` rows in the
-/// section's tree, intentionally not in the selection mapping.
-pub fn ext_sidebar_to_multi_section_view(ext: &ExtSidebarData) -> quadraui::MultiSectionView {
-    use quadraui::{
-        Badge, Decoration, EmptyBody, MsvAxis, MultiSectionView, ScrollMode, Section, SectionBody,
-        SectionHeader, SectionSize, SelectionMode, StyledText, TreeRow, TreeStyle, TreeView,
-        WidgetId,
-    };
-
-    let installed_count = ext.items_installed.len();
-    let available_count = ext.items_available.len();
-
-    let (sel_section, sel_item) = if ext.selected < installed_count {
-        (0u16, ext.selected)
-    } else {
-        (1u16, ext.selected.saturating_sub(installed_count))
-    };
-
-    // ── Build INSTALLED tree ─────────────────────────────────────────
-    let installed_rows: Vec<TreeRow> = if installed_count == 0 {
-        Vec::new()
-    } else {
-        ext.items_installed
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_sel = ext.has_focus && sel_section == 0 && sel_item == i;
-                let label = if item.update_available {
-                    format!("\u{25cf} {} \u{2191}", item.display_name)
-                } else {
-                    format!("\u{25cf} {}", item.display_name)
-                };
-                let badge = if is_sel {
-                    let hint = if item.update_available {
-                        "[u]update"
-                    } else {
-                        "[d]remove"
-                    };
-                    Some(Badge::plain(hint.to_string()))
-                } else {
-                    None
-                };
-                TreeRow {
-                    path: vec![i as u16],
-                    indent: 0,
-                    icon: None,
-                    text: StyledText::plain(label),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                }
-            })
-            .collect()
-    };
-
-    let installed_selected_path = if ext.has_focus && sel_section == 0 && sel_item < installed_count
-    {
-        Some(vec![sel_item as u16])
-    } else {
-        None
-    };
-
-    let installed_body = if installed_rows.is_empty() {
-        SectionBody::Empty(EmptyBody {
-            icon: None,
-            text: StyledText::plain("(none installed)".to_string()),
-            hint: None,
-            action: None,
-        })
-    } else {
-        SectionBody::Tree(TreeView {
-            id: WidgetId::new("ext-sidebar-installed-tree"),
-            rows: installed_rows,
-            selection_mode: SelectionMode::Single,
-            selected_path: installed_selected_path,
-            scroll_offset: 0,
-            style: TreeStyle::default(),
-            has_focus: ext.has_focus && sel_section == 0,
-        })
-    };
-
-    // ── Build AVAILABLE tree ─────────────────────────────────────────
-    let available_rows: Vec<TreeRow> = if available_count == 0 {
-        Vec::new()
-    } else {
-        ext.items_available
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let is_sel = ext.has_focus && sel_section == 1 && sel_item == i;
-                let badge = if is_sel {
-                    Some(Badge::plain("[i]install".to_string()))
-                } else {
-                    None
-                };
-                TreeRow {
-                    path: vec![i as u16],
-                    indent: 0,
-                    icon: None,
-                    text: StyledText::plain(format!("\u{25cb} {}", item.display_name)),
-                    badge,
-                    is_expanded: None,
-                    decoration: Decoration::Normal,
-                    edit: None,
-                }
-            })
-            .collect()
-    };
-
-    let available_selected_path = if ext.has_focus && sel_section == 1 && sel_item < available_count
-    {
-        Some(vec![sel_item as u16])
-    } else {
-        None
-    };
-
-    let available_body = if available_rows.is_empty() {
-        let msg = if ext.fetching {
-            "Fetching registry\u{2026}"
-        } else {
-            "(all installed)"
-        };
-        SectionBody::Empty(EmptyBody {
-            icon: None,
-            text: StyledText::plain(msg.to_string()),
-            hint: None,
-            action: None,
-        })
-    } else {
-        SectionBody::Tree(TreeView {
-            id: WidgetId::new("ext-sidebar-available-tree"),
-            rows: available_rows,
-            selection_mode: SelectionMode::Single,
-            selected_path: available_selected_path,
-            scroll_offset: 0,
-            style: TreeStyle::default(),
-            has_focus: ext.has_focus && sel_section == 1,
-        })
-    };
-
-    let installed_section = Section {
-        id: "installed".to_string(),
-        header: SectionHeader {
-            icon: None,
-            title: StyledText::plain("INSTALLED".to_string()),
-            badge: Some(StyledText::plain(format!("({installed_count})"))),
-            actions: Vec::new(),
-            show_chevron: true,
-        },
-        body: installed_body,
-        aux: None,
-        size: SectionSize::EqualShare,
-        collapsed: !ext.sections_expanded[0],
-        min_size: None,
-        max_size: None,
-    };
-
-    let available_section = Section {
-        id: "available".to_string(),
-        header: SectionHeader {
-            icon: None,
-            title: StyledText::plain("AVAILABLE".to_string()),
-            badge: Some(StyledText::plain(format!("({available_count})"))),
-            actions: Vec::new(),
-            show_chevron: true,
-        },
-        body: available_body,
-        aux: None,
-        size: SectionSize::EqualShare,
-        collapsed: !ext.sections_expanded[1],
-        min_size: None,
-        max_size: None,
-    };
-
-    MultiSectionView {
-        id: WidgetId::new("ext-sidebar-msv"),
-        sections: vec![installed_section, available_section],
-        active_section: Some(sel_section as usize),
-        axis: MsvAxis::Vertical,
-        allow_resize: false,
-        allow_collapse: true,
-        // WholePanel mode: sections size to their own content height
-        // and stack at deterministic positions. The panel scrolls as a
-        // unit when total content exceeds the visible body area (matches
-        // VSCode Extensions panel UX: INSTALLED grows with item count,
-        // AVAILABLE flows below it). Critical for click hit-testing —
-        // section boundaries don't depend on the bounds.height the
-        // backend passes, so paint and click see the same layout
-        // regardless of which area each measures.
-        scroll_mode: ScrollMode::WholePanel,
-        has_focus: ext.has_focus,
-        panel_scroll: ext.panel_scroll,
     }
 }
 
@@ -19438,67 +20067,6 @@ pub fn quickfix_to_list_view(qf: &QuickfixPanel) -> quadraui::ListView {
     }
 }
 
-fn build_ext_sidebar_data(engine: &Engine) -> Option<ExtSidebarData> {
-    // Always build so backends can check ext_sidebar_has_focus.
-    let manifest_to_item = |m: &crate::core::extensions::ExtensionManifest,
-                            installed: bool,
-                            has_update: bool|
-     -> ExtSidebarItem {
-        ExtSidebarItem {
-            name: m.name.clone(),
-            display_name: if m.display_name.is_empty() {
-                m.name.clone()
-            } else {
-                m.display_name.clone()
-            },
-            description: m.description.clone(),
-            lsp_binary: m.lsp.binary.clone(),
-            dap_adapter: m.dap.adapter.clone(),
-            script_count: m.scripts.len(),
-            installed,
-            update_available: has_update,
-        }
-    };
-
-    let items_installed: Vec<ExtSidebarItem> = engine
-        .ext_available_manifests()
-        .iter()
-        .filter(|m| engine.extension_state.is_installed(&m.name))
-        .filter(|m| {
-            let q = engine.ext_sidebar_query.to_lowercase();
-            q.is_empty()
-                || m.name.to_lowercase().contains(&q)
-                || m.display_name.to_lowercase().contains(&q)
-        })
-        .map(|m| manifest_to_item(m, true, engine.ext_has_update(&m.name)))
-        .collect();
-
-    let items_available: Vec<ExtSidebarItem> = engine
-        .ext_available_manifests()
-        .iter()
-        .filter(|m| !engine.extension_state.is_installed(&m.name))
-        .filter(|m| {
-            let q = engine.ext_sidebar_query.to_lowercase();
-            q.is_empty()
-                || m.name.to_lowercase().contains(&q)
-                || m.display_name.to_lowercase().contains(&q)
-        })
-        .map(|m| manifest_to_item(m, false, false))
-        .collect();
-
-    Some(ExtSidebarData {
-        items_installed,
-        items_available,
-        sections_expanded: engine.ext_sidebar_sections_expanded,
-        selected: engine.ext_sidebar_selected,
-        has_focus: engine.ext_sidebar_has_focus,
-        query: engine.ext_sidebar_query.clone(),
-        input_active: engine.ext_sidebar_input_active,
-        fetching: engine.ext_registry_fetching,
-        panel_scroll: engine.ext_sidebar_panel_scroll,
-    })
-}
-
 /// Build [`BoardData`] from engine state (#521). Always builds so backends
 /// can check `has_focus` even when there's nothing to paint yet.
 fn build_board_data(engine: &Engine) -> Option<BoardData> {
@@ -19590,20 +20158,152 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
     })
 }
 
+/// True if `span` asks for any per-span presentation of its own — a
+/// foreground/background colour, bold, italic, or underline — as opposed to
+/// inheriting the row's role colour like ordinary body text does. Used by
+/// [`markdown_turn_styled_cached`] to decide whether a rendered message has
+/// anything worth handing to quadraui's styled (char-wrapped) transcript
+/// path at all; see that function's doc.
+fn span_carries_styling(span: &quadraui::StyledSpan) -> bool {
+    span.fg.is_some() || span.bg.is_some() || span.bold || span.italic || span.underline
+}
+
+/// Render `content` as markdown into a single joined [`quadraui::StyledText`]
+/// (`\n`-separated spans, one per source line, matching
+/// [`quadraui::ChatController::push_turn_markdown`]'s own join) plus its
+/// per-line heading scales, reusing `cache[idx]` when `content`'s length is
+/// unchanged since the last call — see [`AcpSession::markdown_turn_cache`]'s
+/// doc for why length is a sufficient staleness check here. Written as a
+/// free function (rather than calling `push_turn_markdown` itself) because
+/// [`populate_ai_chat_controller`] builds a whole `Vec<ChatTurn>` to hand to
+/// `set_transcript` in one shot, not one turn at a time onto the live
+/// controller.
+///
+/// # Plain content keeps the word-wrapped flat path
+///
+/// When the render comes back with *nothing to style* — every line at
+/// scale `1.0` and every span carrying no fg/bg/bold/italic/underline,
+/// i.e. the message contained no markdown at all — this returns the
+/// rendered text as a single unstyled span and an **empty** `line_scales`.
+/// That is not a micro-optimisation: `ChatController::
+/// build_transcript_rows` picks its wrap policy off exactly that field —
+/// turns with per-line scales wrap with `WrapPolicy::Char` (mid-word, at
+/// the display-width budget), turns without them go down the flat path and
+/// word-wrap via `text_util::word_wrap`. Handing quadraui styled rows for
+/// a message that has no styling would therefore turn *every* plain agent
+/// reply in a narrow AI panel into mid-word breaks (`"Hello world ANSWE"`
+/// / `"RED1519"`) for zero rendering gain. Messages that genuinely carry
+/// markdown still take the styled/char-wrapped path — word-wrapping those
+/// is a quadraui-side follow-up (`ChatController`'s own doc flags the
+/// policy switch at that call site as quadraui#821), not something vimcode
+/// may fix with per-backend code here.
+fn markdown_turn_styled_cached(
+    cache: &std::cell::RefCell<
+        std::collections::HashMap<usize, crate::core::acp_session::MarkdownTurnCacheEntry>,
+    >,
+    idx: usize,
+    content: &str,
+    theme: &quadraui::Theme,
+) -> (quadraui::StyledText, Vec<f32>) {
+    if let Some((cached_len, text, line_scales)) = cache.borrow().get(&idx) {
+        if *cached_len == content.len() {
+            return (text.clone(), line_scales.clone());
+        }
+    }
+    let rendered = quadraui::render_markdown_to_styled(content, theme);
+    let has_styling = rendered
+        .line_scales
+        .iter()
+        .any(|s| (*s - 1.0).abs() > f32::EPSILON)
+        || rendered
+            .lines
+            .iter()
+            .any(|line| line.spans.iter().any(span_carries_styling));
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    for (i, line) in rendered.lines.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(quadraui::StyledSpan::plain("\n"));
+        }
+        spans.extend(line.spans);
+    }
+    let text = quadraui::StyledText { spans };
+    // See this function's "Plain content keeps the word-wrapped flat path"
+    // doc section: empty `line_scales` is what selects word wrapping.
+    let line_scales = if has_styling {
+        rendered.line_scales
+    } else {
+        Vec::new()
+    };
+    cache
+        .borrow_mut()
+        .insert(idx, (content.len(), text.clone(), line_scales.clone()));
+    (text, line_scales)
+}
+
+/// True if `ai_messages[idx]` (an `"assistant-thought"`-role turn) is
+/// genuine agent reasoning (`AcpChunkKind::Thought`, streamed by
+/// `Engine::acp_append_chunk`) rather than one of the one-shot system/error
+/// notices *also* pushed under that same role string — agent-failed-to-
+/// start, protocol-version-mismatch, turn-stopped-early, cancelled-by-user
+/// (see `AiMessage`'s own doc on this pre-existing role conflation, and
+/// `Engine::acp_cancel_turn`/`poll_acp`'s various pushes).
+///
+/// Genuine thought chunks are always followed, **within the same turn**, by
+/// a real `"assistant"`-role reply; every notice case above is pushed as
+/// (and then stays) the *last message of its turn* — nothing about a
+/// terminal/error condition produces a further assistant reply before the
+/// conversation's next user prompt. Crucially, this only scans forward
+/// *up to the next `"user"`-role message* (exclusive) rather than the rest
+/// of `ai_messages` — every real prompt turn starts with a fresh `"user"`
+/// push (see `poll_acp`'s `SessionCreated`/`RequestFailed` arms and
+/// `ai_send_message_via_acp`), so a later, unrelated turn's assistant reply
+/// can never be mistaken for this turn's own reply. Review regression
+/// (#1510): the previous "scan to the end of `ai_messages`" version let a
+/// turn cancelled/stopped/failed mid-conversation get permanently
+/// re-collapsed into "Thinking…" the moment the *next* prompt in the same
+/// session got a normal reply — `Engine::acp_cancel_turn`/`PromptStopped`
+/// (non-`end_turn`)/`RequestFailed` none tear down the session, so the
+/// conversation carries on and that later reply used to satisfy the old,
+/// unscoped "any later assistant message" check.
+///
+/// A thought chunk still streaming in with no reply yet (the brief window
+/// between `agent_thought_chunk` and the first `agent_message_chunk`) reads
+/// as `false` here too — shown in full rather than collapsed for that one
+/// frame or two, self-correcting the moment the reply arrives within the
+/// same turn. That false-negative is a far safer failure mode than the
+/// reverse: permanently hiding a cancellation/error notice behind a
+/// "Thinking..." summary.
+pub(crate) fn is_genuine_thought_chunk(
+    ai_messages: &[crate::core::ai::AiMessage],
+    idx: usize,
+) -> bool {
+    let turn_end = ai_messages[idx + 1..]
+        .iter()
+        .position(|m| m.role == "user")
+        .map(|offset| idx + 1 + offset)
+        .unwrap_or(ai_messages.len());
+    ai_messages[idx + 1..turn_end]
+        .iter()
+        .any(|m| m.role == "assistant")
+}
+
 /// Populate `engine.ai_chat` (a [`quadraui::ChatController`]) with the
 /// current conversation and busy state for the next `render()`/`handle()`
 /// pass — the AI-panel twin of [`populate_explorer_tree_controller`]. Call
 /// once before either (both [`route_ai_chat_event`] and the two backends'
 /// `PANEL_AI` render arms do).
 ///
-/// `engine.ai_messages` stays the business-logic source of truth (what
+/// `engine.acp().ai_messages` stays the business-logic source of truth (what
 /// `crate::core::ai::send_chat` actually sends); this rebuilds the
 /// controller's own `Vec<ChatTurn>` mirror from it on every call, matching
 /// [`quadraui::ChatController::set_transcript`]'s "replace, don't
 /// accumulate" contract so streamed/cleared history never double-renders.
-pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
+pub fn populate_ai_chat_controller(
+    engine: &Engine,
+    theme: &Theme,
+    backend: &dyn quadraui::Backend,
+) {
     let user_fg = theme.keyword;
-    let asst_fg = theme.string_lit;
     // ACP-1 (#952): agent "thought" chunks (`session/update`'s
     // `agent_thought_chunk`, role "assistant-thought" — see
     // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
@@ -19613,103 +20313,716 @@ pub fn populate_ai_chat_controller(engine: &Engine, theme: &Theme) {
     // distinct from message chunks, not merely a different tint on the same
     // "AI" label.
     let thought_fg = theme.comment;
-    let mut turns: Vec<quadraui::ChatTurn> = engine
-        .ai_messages
-        .iter()
-        .map(|m| {
-            let (role, fg) = match m.role.as_str() {
-                "user" => (quadraui::ChatRole::User, user_fg),
-                "assistant-thought" => (quadraui::ChatRole::System, thought_fg),
-                _ => (quadraui::ChatRole::Assistant, asst_fg),
-            };
-            quadraui::ChatTurn {
-                role,
-                text: quadraui::StyledText::colored(m.content.clone(), fg),
+    // #1510: assistant/thought turns render as markdown
+    // (`render_markdown_to_styled`) so fences, headings, lists, and inline
+    // code paint as such instead of raw source text; user turns stay plain
+    // (`StyledText::colored`) since a user's own words are never markdown
+    // *content* to re-render, just text they typed. The per-role colour
+    // that used to tint the whole message body is no longer the mechanism
+    // that keeps thought turns visually distinct from assistant turns —
+    // `ChatRole::System` (vs `Assistant`) already earns that on its own via
+    // `ChatController::build_transcript_rows`'s role-header label/colour
+    // (see the comment above), and thought turns additionally collapse to a
+    // one-line summary below.
+    let q_theme = to_quadraui_theme(theme);
+    let acp = engine.acp();
+    let ai_messages = &acp.ai_messages;
+
+    // #1511: tool calls interleave chronologically instead of all landing
+    // after the whole conversation (the pre-#1511 behaviour, and this
+    // issue's core complaint — see `AcpSession::tool_call_anchor`'s doc).
+    // Bucket every call by its recorded anchor once, up front, so the
+    // per-index interleave loop below is a plain lookup rather than an
+    // O(messages × tool_calls) scan. `anchor` ranges `0..=ai_messages.len()`
+    // by construction (`Engine::acp_upsert_tool_call` stamps it from
+    // `ai_messages.len()` at the moment the call first appeared), so a
+    // `Vec` indexed directly by anchor needs no `HashMap` at all.
+    let mut tool_calls_by_anchor: Vec<Vec<&crate::core::acp::AcpToolCall>> =
+        vec![Vec::new(); ai_messages.len() + 1];
+    for call in &acp.tool_calls {
+        let anchor = acp
+            .tool_call_anchor
+            .get(&call.id)
+            .copied()
+            .unwrap_or(ai_messages.len())
+            .min(ai_messages.len());
+        tool_calls_by_anchor[anchor].push(call);
+    }
+
+    let mut turns: Vec<quadraui::ChatTurn> = Vec::new();
+    let mut kinds: Vec<crate::core::acp_session::TranscriptTurnKind> = Vec::new();
+
+    // #955 (ACP-4) / #1511: one card per tool call — collapsed by default
+    // (`turn_summary_line` below is `tool_call_title_line`'s single-line
+    // `{glyph} {kind}: {title}`), expanded on demand into the full body
+    // `tool_call_expanded_text` builds (locations, content blocks,
+    // rawInput/rawOutput). `set_turn_collapsed`/`set_turn_summary` calls
+    // for these land after `set_transcript` below, once `kinds` (built
+    // here) is known to line up with the transcript it describes.
+    let push_tool_calls_at =
+        |anchor: usize,
+         turns: &mut Vec<quadraui::ChatTurn>,
+         kinds: &mut Vec<crate::core::acp_session::TranscriptTurnKind>| {
+            for call in &tool_calls_by_anchor[anchor] {
+                let expanded = acp.tool_call_expanded.contains(&call.id);
+                // Deliberately plain (`StyledText::colored`), never markdown
+                // — unlike assistant/thought turns (#1510). Routing this
+                // through `render_markdown_to_styled` would flip the whole
+                // card onto quadraui's char-wrapped `WrapPolicy::Char` path
+                // the moment *any* line in it carries styling (the fenced
+                // ```json``` blocks always do), which would mid-word-break
+                // the plain `-> path:line` header/location lines too —
+                // exactly the "Hello world ANSWE"/"RED1519" failure mode
+                // `markdown_turn_styled_cached`'s own doc warns about,
+                // just triggered by this card's own content instead of an
+                // unrelated later message. Plain text keeps the whole card
+                // on the word-wrapped flat path, same as before #1511.
+                let text = if expanded {
+                    quadraui::StyledText::colored(
+                        crate::core::acp::tool_call_expanded_text(call, |terminal_id| {
+                            acp.acp_terminals
+                                .get(terminal_id)
+                                .map(|record| record.view())
+                        }),
+                        thought_fg,
+                    )
+                } else {
+                    // Collapsed cards render through `turn_summary_line`
+                    // instead (a single `MessageRow`, set below) — this
+                    // `ChatTurn::text` value is never painted while
+                    // collapsed, so an empty placeholder is fine here.
+                    quadraui::StyledText::plain("")
+                };
+                turns.push(quadraui::ChatTurn {
+                    role: quadraui::ChatRole::System,
+                    text,
+                    timestamp_unix: None,
+                    line_scales: Vec::new(),
+                });
+                kinds.push(crate::core::acp_session::TranscriptTurnKind::ToolCall(
+                    call.id.clone(),
+                ));
+            }
+        };
+
+    for (idx, m) in ai_messages.iter().enumerate() {
+        push_tool_calls_at(idx, &mut turns, &mut kinds);
+        let chat_turn = match m.role.as_str() {
+            "user" => quadraui::ChatTurn {
+                role: quadraui::ChatRole::User,
+                text: quadraui::StyledText::colored(m.content.clone(), user_fg),
                 timestamp_unix: None,
                 line_scales: Vec::new(),
+            },
+            // #1512: a message submitted while a turn was already in
+            // flight — queued rather than dropped (`Engine::
+            // ai_queue_message`). Dimmed (`thought_fg`, the same tone
+            // `assistant-thought` turns use) and literally prefixed
+            // `"(queued) "` on the painted text, not just a colour: a
+            // colour alone isn't something a black-box test (or a
+            // low-color terminal) can reliably read back, unlike a
+            // substring. Flips back to plain `"user"` the moment it's
+            // actually sent (`Engine::ai_dispatch_queued_message`), or
+            // gets a `" (discarded)"` suffix if dropped instead
+            // (`Engine::ai_discard_queued_message`) while staying on this
+            // same dimmed role — it never became a real turn either way.
+            "user-queued" => quadraui::ChatTurn {
+                role: quadraui::ChatRole::User,
+                text: quadraui::StyledText::colored(format!("(queued) {}", m.content), thought_fg),
+                timestamp_unix: None,
+                line_scales: Vec::new(),
+            },
+            "assistant-thought" => {
+                let (text, line_scales) = markdown_turn_styled_cached(
+                    &acp.markdown_turn_cache,
+                    idx,
+                    &m.content,
+                    &q_theme,
+                );
+                quadraui::ChatTurn {
+                    role: quadraui::ChatRole::System,
+                    text,
+                    timestamp_unix: None,
+                    line_scales,
+                }
             }
-        })
-        .collect();
-
-    // #955 (ACP-4): tool calls, rendered as one collapsed one-line summary
-    // turn per call, appended *after* the real conversation — same
-    // "synthetic turn, never mixed into `ai_messages`" treatment #956 gave
-    // the plan checklist below. `tool_call_summary_line` already bakes in
-    // the status glyph, so a `tool_call_update`'s `pending -> in_progress
-    // -> completed | failed` transition is visible here without any
-    // expand/collapse state to track — every call always renders its
-    // current status, every frame.
-    for call in &engine.acp_tool_calls {
-        turns.push(quadraui::ChatTurn {
-            role: quadraui::ChatRole::System,
-            text: quadraui::StyledText::colored(
-                crate::core::acp::tool_call_summary_line(call),
-                thought_fg,
-            ),
-            timestamp_unix: None,
-            line_scales: Vec::new(),
-        });
+            _ => {
+                let (text, line_scales) = markdown_turn_styled_cached(
+                    &acp.markdown_turn_cache,
+                    idx,
+                    &m.content,
+                    &q_theme,
+                );
+                quadraui::ChatTurn {
+                    role: quadraui::ChatRole::Assistant,
+                    text,
+                    timestamp_unix: None,
+                    line_scales,
+                }
+            }
+        };
+        turns.push(chat_turn);
+        kinds.push(crate::core::acp_session::TranscriptTurnKind::Message(idx));
     }
+    // Trailing tool calls anchored at `ai_messages.len()` — issued after the
+    // most recent message currently in the transcript (the common case
+    // while a turn is still streaming: message chunks lag the tool calls
+    // that triggered them).
+    push_tool_calls_at(ai_messages.len(), &mut turns, &mut kinds);
 
-    // #956 (ACP-5): the agent's current plan, rendered as one synthetic
-    // checklist turn appended *after* the real conversation — never mixed
-    // into `engine.ai_messages` itself. `engine.acp_plan` already holds
-    // only the latest `plan` update (a full replacement, not a delta — see
-    // that field's doc), so this turn is rebuilt fresh from it every call:
-    // two successive `plan` updates leave exactly one checklist rendered,
-    // reflecting the second, by construction (there is only ever one
-    // `acp_plan` value to read). Appending at the end rather than inline
-    // where the update actually streamed keeps "current plan state" always
-    // visible without scrolling (`ChatController` stays stuck-to-bottom),
-    // at the deliberate cost of it not being in strict chronological order
-    // with any later message chunks in the same turn.
-    if !engine.acp_plan.is_empty() {
-        turns.push(quadraui::ChatTurn {
-            role: quadraui::ChatRole::System,
-            text: quadraui::StyledText::colored(
-                crate::core::acp::plan_to_checklist_text(&engine.acp_plan),
-                thought_fg,
-            ),
-            timestamp_unix: None,
-            line_scales: Vec::new(),
-        });
-    }
+    // #956/#1513: the agent's current plan no longer appends as a synthetic
+    // trailing transcript turn — see `ai_plan_multi_section_view`'s doc for
+    // why (streaming text used to push it around and scroll it away, #1513's
+    // whole complaint). It paints as its own pinned block above the
+    // transcript instead; `ai_messages`/`turns`/`kinds` here are untouched
+    // by `engine.acp().plan`.
+    *acp.transcript_turn_kinds.borrow_mut() = kinds;
 
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
-    chat.set_busy(engine.ai_streaming);
+    // #1510/#1511: thought turns and tool-call cards each collapse to a
+    // one-line summary by default; a user click/`Tab`+`Enter` toggle
+    // (`Engine::dispatch_ai_chat_event`'s `TurnClicked`/`KeyPressed` arms)
+    // records the override in `AcpSession::thought_expanded`/
+    // `tool_call_expanded`, keyed by `ai_messages` index / tool-call id
+    // respectively rather than transcript index — the interleave above
+    // means a card's transcript index can move frame to frame as earlier
+    // tool calls upsert or new messages stream in ahead of it, but its
+    // `ai_messages` index / call id never does.
+    //
+    // Written for every index in the *current* transcript on every frame,
+    // the "stays collapsed"/`None` case included, because `ChatController`
+    // keeps collapsed/summary state in its own maps **keyed by transcript
+    // index**, and `set_transcript` deliberately does not clear them (see
+    // its doc). Only setting the "expanded" case would therefore leak a
+    // previous conversation's collapse onto whatever later lands at the
+    // same index: after `:AiClear` + `:AiSessions` resume, index 1 was a
+    // thought turn before the clear and the replayed *assistant* reply
+    // after it, so the reply painted as a collapsed "Thinking…" card with
+    // its text nowhere on screen — the bug
+    // `ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
+    // transcript` catches.
+    for (turn_idx, kind) in acp.transcript_turn_kinds.borrow().iter().enumerate() {
+        use crate::core::acp_session::TranscriptTurnKind;
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                // Gated on `is_genuine_thought_chunk`, not just `role ==
+                // "assistant-thought"`: that role string is pre-existing
+                // shorthand ACP-1 reused for two different things (see
+                // `AiMessage`'s own doc) — real `agent_thought_chunk`
+                // reasoning, *and* one-shot system/error notices
+                // (`Engine::acp_cancel_turn`'s `"[cancelled by user]"`,
+                // `poll_acp`'s failed-request/protocol-mismatch warnings,
+                // ...). Collapsing those into "Thinking..." would hide the
+                // one thing the user most needs to see right after the
+                // turn ended abnormally.
+                let is_thought = ai_messages.get(*idx).is_some_and(|m| {
+                    m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, *idx)
+                });
+                let collapsed = is_thought && !acp.thought_expanded.contains(idx);
+                chat.set_turn_collapsed(turn_idx, collapsed);
+                chat.set_turn_summary(turn_idx, collapsed.then(|| "Thinking\u{2026}".to_string()));
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                let call = acp.tool_calls.iter().find(|c| &c.id == id);
+                let collapsed = !acp.tool_call_expanded.contains(id);
+                chat.set_turn_collapsed(turn_idx, collapsed);
+                chat.set_turn_summary(
+                    turn_idx,
+                    collapsed
+                        .then(|| call.map(crate::core::acp::tool_call_title_line))
+                        .flatten(),
+                );
+            }
+        }
+    }
+    chat.set_busy(engine.acp().ai_streaming);
+    // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
+    // `ChatController` every call — cheap enough to set unconditionally
+    // (`ChatController::set_submit_on_enter` is a plain field write) and
+    // this is the one place both backends already funnel through before
+    // every `render()`/`handle()` pass, so a `:set` toggle takes effect on
+    // the very next frame without either backend needing its own wiring.
+    chat.set_submit_on_enter(engine.settings.ai_chat_submit_on_enter);
+    // #1508: advance the status-strip's `Spinner` primitive to the frame
+    // `Engine::tick_ai_spinner` last stamped (`poll_idle`, ≥4 Hz while busy
+    // — see `App::tick_dispatch`'s `request_frame_in` re-arm). Harmless to
+    // call every frame regardless of `busy`: `ChatController::render` only
+    // ever paints the glyph when `self.busy` is also true (see
+    // `set_busy`'s own doc), so this can't animate a frozen/idle panel.
+    chat.set_spinner_frame(engine.ai_spinner_frame);
     let header_fg = theme.status_fg;
-    let mut header = if engine.ai_streaming {
-        " \u{f0e5} AI ASSISTANT  (thinking\u{2026})".to_string()
+    let ai_chat_icon = crate::icons::AI_CHAT.nerd;
+    let mut header = if engine.acp().ai_streaming {
+        format!(
+            " {ai_chat_icon} AI ASSISTANT  {}",
+            ai_busy_status_text(engine)
+        )
     } else {
-        " \u{f0e5} AI ASSISTANT".to_string()
+        format!(" {ai_chat_icon} AI ASSISTANT")
     };
+    // #1463: the session tab strip. Folded into this same always-repainted
+    // header line — exactly like the mode/usage suffix below — rather than
+    // a bespoke widget in either backend, per the Platform-Neutrality Rule:
+    // both backends already paint this one string with zero backend-
+    // specific code, so a second session is "more text in the string
+    // that's already shared", not new GTK/TUI paint logic. Only shown once
+    // a second tab actually exists — the common single-session case looks
+    // exactly as it did before #1463. The active tab is marked `*`; a tab
+    // with a `session/request_permission` parked while backgrounded (see
+    // `Engine::acp_handle_permission_request`'s doc) is marked `!` — the
+    // badge #1463 asks for, painted, not just an engine flag (`Engine::
+    // acp_session_tabs` is the one source both this and the flag read).
+    let tabs = engine.acp_session_tabs();
+    if tabs.len() > 1 {
+        let strip: Vec<String> = tabs
+            .iter()
+            .map(|(_, label, is_active, badged)| {
+                let mark = if *is_active { "*" } else { "" };
+                let badge = if *badged { "!" } else { "" };
+                format!("{mark}{label}{badge}")
+            })
+            .collect();
+        header.push_str(&format!("  [{}]", strip.join(" | ")));
+    }
+    // #1513: "Plan n/m" progress folds into this same always-repainted
+    // header line — the pinned plan block below (`ai_plan_multi_section_
+    // view`) carries the full checklist, but a quick "how far along" glance
+    // shouldn't require expanding it, same reasoning as every other chip/
+    // suffix on this line.
+    if !acp.plan.is_empty() {
+        let total = acp.plan.len();
+        let done = acp
+            .plan
+            .iter()
+            .filter(|e| e.status == crate::core::acp::AcpPlanEntryStatus::Completed)
+            .count();
+        header.push_str(&format!("  \u{b7} Plan {done}/{total}"));
+    }
     // #956 (ACP-5): current mode + usage telemetry both fold into this one
     // existing status line rather than a new widget — "unobtrusive status
     // indicator" per the issue, and by construction can't steal focus or
     // churn layout since the header is already repainted every frame at a
     // fixed position.
-    if let Some(mode_id) = engine.acp_current_mode_id.as_deref() {
+    // #1520: `configOptions`' `category: "model"` entry is ACP v1's only
+    // model picker (no dedicated `session/set_mode`-style method for a
+    // model) — prefer showing it here over the older `modes` segment
+    // below when both are present, rather than showing both for the same
+    // underlying "what is this agent currently set to" question.
+    if let Some(model_option) = engine
+        .acp()
+        .config_options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("model"))
+    {
+        header.push_str(&format!(
+            "  \u{b7} model: {}",
+            model_option.current_value_label()
+        ));
+    } else if let Some(mode_id) = engine.acp().current_mode_id.as_deref() {
         let mode_label = engine
-            .acp_modes
+            .acp()
+            .modes
             .iter()
             .find(|m| m.id == mode_id)
             .map(|m| m.name.as_str())
             .unwrap_or(mode_id);
         header.push_str(&format!("  \u{b7} mode: {mode_label}"));
     }
-    if let Some(usage) = &engine.acp_usage {
+    if let Some(usage) = &engine.acp().usage {
         let summary = crate::core::acp::format_usage_summary(usage);
         if !summary.is_empty() {
             header.push_str(&format!("  \u{b7} {summary}"));
         }
     }
+    // #1450 point 4: a staged Visual-selection/`:{range}AI` attachment's
+    // `⧉`-chip rides on this same always-repainted, focus-safe status line
+    // — visible until it's sent (or removed with Ctrl+R,
+    // `Engine::dispatch_ai_chat_event`) — rather than a new widget, same
+    // reasoning as the mode/usage lines above it.
+    if let Some(attachment) = &engine.acp_pending_attachment {
+        header.push_str(&format!(
+            "  \u{b7} {}",
+            attachment.chip(&engine.acp_workspace_cwd())
+        ));
+    }
+    // #1464: every manually attached file/image gets its own chip on this
+    // same always-repainted, focus-safe status line — same reasoning as
+    // the range attachment's chip immediately above, extended to a list
+    // since more than one file can be attached at once.
+    for attachment in &engine.acp_manual_attachments {
+        header.push_str(&format!("  \u{b7} {}", attachment.chip()));
+    }
+    // #1513: every staged `@symbol` mention gets its own chip on this same
+    // always-repainted, focus-safe status line — same reasoning as the
+    // manual-attachment chips immediately above.
+    for symbol in &engine.acp_pending_symbol_mentions {
+        header.push_str(&format!(
+            "  \u{b7} {}",
+            symbol.chip(&engine.acp_workspace_cwd())
+        ));
+    }
+    // #1512: "queued (1)" while a message submitted mid-turn is waiting to
+    // be sent (`AcpSession::queued_prompt`) — same always-repainted,
+    // focus-safe status line as every other chip/suffix here. Only ever
+    // one slot (`Engine::ai_queue_message` replaces rather than stacks),
+    // so the count is always literally `1` while this segment shows at
+    // all.
+    if engine.acp().queued_prompt.is_some() {
+        header.push_str("  \u{b7} queued (1)");
+    }
+    // #1515: `badge` mode's "Edited N files · +a -r" segment — the
+    // replacement for the pre-#1515 always-auto-open full-viewport turn
+    // review (`acp_review_on_turn_end` setting, `Engine::acp_end_turn`).
+    // Folds into this same always-repainted, focus-safe status line, same
+    // reasoning as every other chip/suffix above it. `:AiReview`
+    // (`Engine::cmd_ai_review`) opens the same modal this segment
+    // summarises.
+    if engine.settings.acp_review_on_turn_end == crate::core::settings::AcpReviewOnTurnEnd::Badge {
+        if let Some((files, added, removed)) = engine.acp_turn_review_badge() {
+            header.push_str(&format!(
+                "  \u{b7} Edited {files} file{} \u{b7} +{added} -{removed} (:AiReview)",
+                if files == 1 { "" } else { "s" }
+            ));
+        }
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
+    chat.set_hint(Some(quadraui::StyledText::colored(
+        ai_chat_hint_line(
+            backend,
+            engine.settings.ai_chat_submit_on_enter,
+            engine.acp().queued_prompt.is_some(),
+        ),
+        theme.comment,
+    )));
 }
 
-/// Paint the slash-command completion popup above the AI panel's input box
-/// when [`Engine::ai_command_completions`] has a match (#956, ACP-5).
-/// Reuses [`completion_menu_to_quadraui_completions`] and the
+// ── #1513: pinned, collapsible plan block ────────────────────────────────
+
+/// Build the `quadraui::MultiSectionView` for the AI panel's pinned plan
+/// block, or `None` while `engine.acp().plan` is empty (nothing to pin).
+///
+/// One section, not the whole `ChatController` transcript: pre-#1513 the
+/// plan rendered as a synthetic *trailing* transcript turn
+/// (`populate_ai_chat_controller` used to push one, see that function's git
+/// history) — streaming assistant text kept appending turns after it, so
+/// the plan drifted down and off the visible viewport the moment a reply
+/// started streaming, exactly the issue's complaint. Pinning it in its own
+/// band above `ChatController` (painted by `paint_ai_plan_band`, in a rect
+/// carved out of the panel *before* `ChatController::render` ever sees the
+/// remainder) means it can never move regardless of how much transcript
+/// text streams in below it.
+///
+/// Collapsed (the default, `!engine.ai_plan_expanded`) shows only the
+/// header: `"Plan n/m: <in-progress entry>"` (or "All steps complete" once
+/// `n == m`) — enough to see what the agent is doing right now without
+/// spending any vertical space on the rest of the list. Expanded shows the
+/// full checklist as the section body, one line per entry with the same
+/// status glyphs `plan_to_checklist_text` uses, so a reader who already
+/// knows that convention doesn't have to learn a second one.
+pub fn ai_plan_multi_section_view(
+    engine: &Engine,
+    theme: &Theme,
+) -> Option<quadraui::MultiSectionView> {
+    let plan = &engine.acp().plan;
+    if plan.is_empty() {
+        return None;
+    }
+    let total = plan.len();
+    let done = plan
+        .iter()
+        .filter(|e| e.status == crate::core::acp::AcpPlanEntryStatus::Completed)
+        .count();
+    let expanded = engine.ai_plan_expanded;
+    let title = if expanded {
+        format!("Plan {done}/{total}")
+    } else {
+        let current = plan
+            .iter()
+            .find(|e| e.status == crate::core::acp::AcpPlanEntryStatus::InProgress)
+            .map(|e| e.content.clone())
+            .unwrap_or_else(|| {
+                if done == total {
+                    "All steps complete".to_string()
+                } else {
+                    "Plan".to_string()
+                }
+            });
+        format!("Plan {done}/{total}: {current}")
+    };
+    let lines: Vec<quadraui::StyledText> = plan
+        .iter()
+        .map(|e| {
+            let (glyph, color) = match e.status {
+                crate::core::acp::AcpPlanEntryStatus::Completed => ('\u{2611}', theme.comment),
+                crate::core::acp::AcpPlanEntryStatus::InProgress => ('\u{25d0}', theme.keyword),
+                crate::core::acp::AcpPlanEntryStatus::Pending => ('\u{2610}', theme.foreground),
+            };
+            quadraui::StyledText::colored(format!("{glyph} {}", e.content), color)
+        })
+        .collect();
+    Some(quadraui::MultiSectionView {
+        id: quadraui::WidgetId::new("ai-plan"),
+        sections: vec![quadraui::Section {
+            id: "plan".to_string(),
+            header: quadraui::SectionHeader {
+                icon: None,
+                title: quadraui::StyledText::plain(title),
+                badge: None,
+                actions: Vec::new(),
+                show_chevron: true,
+            },
+            body: quadraui::SectionBody::Text(lines),
+            aux: None,
+            size: quadraui::SectionSize::EqualShare,
+            collapsed: !expanded,
+            min_size: None,
+            max_size: None,
+        }],
+        active_section: None,
+        axis: quadraui::MsvAxis::Vertical,
+        allow_resize: false,
+        allow_collapse: true,
+        scroll_mode: quadraui::ScrollMode::WholePanel,
+        has_focus: false,
+        panel_scroll: 0.0,
+    })
+}
+
+/// Height (in `unit_h` units — pixels on GTK, cells on TUI, same convention
+/// every other AI-panel geometry helper here uses) the plan band should
+/// reserve at the top of the AI panel rect this frame: `0.0` when there is
+/// no plan to pin, one row for the header when collapsed, or the header
+/// plus one row per entry when expanded. Callers subtract this from the
+/// panel rect's height *before* handing the remainder to `ChatController`
+/// (`paint_ai_plan_band`'s doc has the call sequence).
+pub fn ai_plan_band_height(engine: &Engine, unit_h: f32) -> f32 {
+    let Some(plan_len) = (!engine.acp().plan.is_empty()).then(|| engine.acp().plan.len()) else {
+        return 0.0;
+    };
+    let header_rows = 1.0;
+    let body_rows = if engine.ai_plan_expanded {
+        plan_len as f32
+    } else {
+        0.0
+    };
+    (header_rows + body_rows) * unit_h.max(1.0)
+}
+
+/// Paint the plan block into `rect` (the band `ai_plan_band_height` sized)
+/// and cache the layout it painted with in `Engine::ai_plan_layout` — same
+/// "cache what actually got painted" contract `ai_chat_rect`/
+/// `ext_panel_tree_layout` already use, so `route_ai_plan_band_click`'s
+/// hit-test can never derive a different geometry than what's on screen.
+/// No-op (and clears the cached layout/rect) when there's no plan to pin.
+pub fn paint_ai_plan_band(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    theme: &Theme,
+    rect: quadraui::Rect,
+) {
+    let Some(view) = ai_plan_multi_section_view(engine, theme) else {
+        engine
+            .ai_plan_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        *engine.ai_plan_layout.borrow_mut() = None;
+        return;
+    };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        engine
+            .ai_plan_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        *engine.ai_plan_layout.borrow_mut() = None;
+        return;
+    }
+    engine.ai_plan_rect.set(rect);
+    let unit_h = backend.line_height().max(1.0);
+    let metrics = quadraui::MsvLayoutMetrics {
+        header_size: unit_h,
+        divider_size: 0.0,
+        scrollbar_size: 0.0,
+        cell_quantum: 0.0,
+    };
+    // Body content size in main-axis units: one row per plan entry — the
+    // only section, so `SectionSize::EqualShare` above already consumes
+    // exactly `rect`'s height regardless of this value, but `layout` still
+    // wants a `measure` closure per its signature.
+    let plan_len = engine.acp().plan.len() as f32;
+    let layout = view.layout(rect, metrics, |_| quadraui::SectionMeasure {
+        content_size: plan_len * unit_h,
+        aux_size: 0.0,
+    });
+    backend.draw_multi_section_view(rect, &view);
+    *engine.ai_plan_layout.borrow_mut() = Some(layout);
+}
+
+/// Route a press at `pos` (same coordinate space `ai_plan_rect`/
+/// `ai_plan_layout` were painted in) against the plan block. Only the
+/// header is interactive — clicking it (anywhere in the title area, or the
+/// chevron) toggles `Engine::ai_plan_expanded`. Returns whether the press
+/// landed on the band at all, so the caller (`App::route_ai_sidebar_event`)
+/// knows whether to forward the event to `ChatController` instead.
+pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bool {
+    let layout = engine.ai_plan_layout.borrow();
+    let Some(layout) = layout.as_ref() else {
+        return false;
+    };
+    match layout.hit_test(pos.x, pos.y) {
+        quadraui::MultiSectionViewHit::Header { .. } => {
+            engine.ai_plan_expanded = !engine.ai_plan_expanded;
+            true
+        }
+        quadraui::MultiSectionViewHit::Outside => false,
+        // Body/divider/scrollbar/inert: still inside the band's bounds —
+        // consumed so a click there doesn't fall through to the editor
+        // underneath, but nothing to toggle.
+        _ => true,
+    }
+}
+
+/// Braille spinner frame table (#1508) — the same 10-glyph rotation
+/// quadraui's own GTK/TUI/macOS `Spinner` rasterisers use internally
+/// (`gtk::spinner`/`macos::spinner`'s private `FRAMES` const), duplicated
+/// here because neither is a public quadraui export: this one is embedded
+/// directly into the status-strip *text* (`⠹ execute: cargo test · 12s`),
+/// not painted through the `Spinner` primitive itself (that's the
+/// separate icon `ChatController::set_spinner_frame`, just above, already
+/// drives). A cosmetic text constant shared verbatim by both backends —
+/// not per-backend rendering logic — so duplicating it here doesn't need
+/// a quadraui issue first.
+const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn spinner_glyph(frame_idx: usize) -> char {
+    SPINNER_GLYPHS[frame_idx % SPINNER_GLYPHS.len()]
+}
+
+/// The AI-panel status strip's busy-state text (#1508) — what used to be
+/// the frozen literal `"(thinking\u{2026})"` — built fresh every
+/// `populate_ai_chat_controller` call so it reflects the current instant.
+/// Only ever called while `engine.acp().ai_streaming` is true (see the one
+/// call site).
+///
+/// Precedence, most specific first:
+/// 1. A `session/request_permission` parked on the *active* session
+///    (`AcpSession::has_pending_permission`) — the turn is not
+///    progressing at all until a human answers, so naming the one
+///    in-progress tool call here would be misleading (that call is the
+///    one the permission is blocking, but nothing about it is actually
+///    executing right now).
+/// 2. The most recently announced still-running tool call (searched from
+///    the end of `tool_calls` — an upserted `Vec`, not append-order for
+///    updates — so a later call's `in_progress` status wins over an
+///    earlier one still shown as `pending`/`in_progress` from a prior
+///    step of the same turn).
+/// 3. A generic "thinking" fallback — covers both the direct-curl
+///    transport (which never populates `tool_calls` at all) and the ACP
+///    gap between "turn started" and "first tool_call announced".
+///
+/// Every branch is prefixed with the same animated glyph and suffixed
+/// with the same elapsed-time reading, so the busy indicator always
+/// carries both pieces of information the issue asks for regardless of
+/// which branch fires.
+fn ai_busy_status_text(engine: &Engine) -> String {
+    let glyph = spinner_glyph(engine.ai_spinner_frame);
+    let elapsed = engine
+        .acp()
+        .turn_started_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    if engine.acp().has_pending_permission() {
+        return format!("{glyph} Awaiting permission \u{b7} {elapsed}s");
+    }
+    let running_call = engine
+        .acp()
+        .tool_calls
+        .iter()
+        .rev()
+        .find(|c| c.status == crate::core::acp::AcpToolCallStatus::InProgress);
+    match running_call {
+        Some(call) => format!("{glyph} {}: {} \u{b7} {elapsed}s", call.kind, call.title),
+        None => format!("{glyph} thinking\u{2026} \u{b7} {elapsed}s"),
+    }
+}
+
+/// The persistent one-line hint `populate_ai_chat_controller` pins to
+/// [`quadraui::ChatController::set_hint`] (#1507) — unlike the built-in
+/// `TextInput` placeholder it replaces, this stays visible once the user
+/// starts typing (`ChatController`'s own *Persistent hint line* doc), which
+/// is the whole point: the send/stop/leave keys were previously only
+/// discoverable in the empty-input state.
+///
+/// The send-key list is adapted to what actually works on the live
+/// backend rather than a single hardcoded string:
+///
+/// - GTK (`backend_caps().generic_font_families` — true only for a real
+///   font-resolving GUI backend, `false` on every terminal backend per
+///   that field's own doc) reliably delivers a distinct `Ctrl+Enter`, so
+///   that's the one binding shown.
+/// - TUI always has `Alt+Enter` and `Ctrl+S` (`ChatController::handle`'s
+///   module doc: `Ctrl+S` "works on all terminals in both submit_on_enter
+///   modes"). `Ctrl+Enter` is only added when `backend_caps().
+///   kitty_keyboard` is actually active — that field's own doc says
+///   exactly this: "check this before relying on a gesture that needs the
+///   protocol (e.g. Ctrl+Enter distinct from Enter) and fall back to an
+///   always-available binding (Alt+Enter) when it's false" — so a hint
+///   promising a chord the detected terminal can't deliver never ships.
+///
+/// `Esc` and `<leader>ai` both return focus to the editor — the latter
+/// toggles when the panel already has focus and its input is empty (see
+/// [`Engine::ai_leader_toggle_key`], called from this same
+/// `route_ai_chat_event`) — so both are named rather than just `Esc` alone,
+/// closing the discoverability gap #1507 reports for the focus toggle too.
+///
+/// `submit_on_enter` (#1509, `Settings::ai_chat_submit_on_enter`) flips which
+/// key does what, per [`quadraui::ChatController`]'s own *Keyboard
+/// behaviour* doc: when `true` (the default, Zed parity) plain `Enter` sends
+/// and `Shift+Enter`/`Alt+Enter` insert a newline instead; when `false`
+/// (the pre-#1509 default) `Enter` always inserts a newline and the
+/// `send_keys` chord below sends. Either way `Ctrl+S`/`Ctrl+Enter` (when
+/// available) still send, matching `ChatController::handle`'s "in both
+/// modes" bindings — but the hint only needs to name the *primary* gesture
+/// for whichever mode is active, not every equivalent chord.
+fn ai_chat_hint_line(
+    backend: &dyn quadraui::Backend,
+    submit_on_enter: bool,
+    // #1512: whether a message is currently queued
+    // (`AcpSession::queued_prompt`) — when it is, the hint grows the
+    // `^G send now \u{b7} ^R discard` pair so the two new gestures are
+    // discoverable exactly while they're actually relevant, rather than
+    // permanently lengthening this line for every AI-panel frame.
+    has_queued: bool,
+) -> String {
+    let caps = backend.backend_caps();
+    let send_keys = if caps.generic_font_families {
+        "Ctrl+Enter".to_string()
+    } else if caps.kitty_keyboard {
+        "\u{2325}\u{23ce}/^S/Ctrl+Enter".to_string()
+    } else {
+        "\u{2325}\u{23ce}/^S".to_string()
+    };
+    // `<leader>ai` is shown verbatim regardless of `Settings::leader`'s
+    // actual character — the same convention every other leader-sequence
+    // hint in this codebase uses (e.g. `mod.rs`'s command-palette
+    // `shortcut: "<leader>sw"` fields), not a literal re-expansion.
+    let entry_line = if submit_on_enter {
+        "\u{23ce} send \u{b7} \u{21e7}\u{23ce} newline".to_string()
+    } else {
+        format!("\u{23ce} newline \u{b7} {send_keys} send")
+    };
+    let queued_hint = if has_queued {
+        " \u{b7} ^G send now \u{b7} ^R discard"
+    } else {
+        ""
+    };
+    format!("{entry_line} \u{b7} ^C stop{queued_hint} \u{b7} Esc/<leader>ai editor")
+}
+
+/// Paint the slash-command or `@`-mention completion popup above the AI
+/// panel's input box, whichever [`Engine::ai_command_completions`] /
+/// [`Engine::ai_mention_completions`] (#1449) currently has a match — the
+/// two are mutually exclusive by construction (see
+/// `route_ai_chat_event`'s intercept). Reuses
+/// [`completion_menu_to_quadraui_completions`] and the
 /// `quadraui::Completions` primitive verbatim — the same machinery the
 /// editor's own word-completion popup uses — rather than a bespoke widget.
 ///
@@ -19729,7 +21042,10 @@ pub fn paint_ai_command_completions(
     if chat_rect.width <= 0.0 || chat_rect.height <= 0.0 {
         return;
     }
-    let Some(menu) = engine.ai_command_completions() else {
+    let Some(menu) = engine
+        .ai_command_completions()
+        .or_else(|| engine.ai_mention_completions())
+    else {
         return;
     };
     let completions = completion_menu_to_quadraui_completions(&menu);
@@ -20033,86 +21349,6 @@ fn build_tab_bar(engine: &Engine) -> Vec<TabInfo> {
     }
 }
 
-/// Compute wrap segment boundaries for a line, when `'wrap'` soft-wraps it.
-/// Returns a list of `(start_char, end_char)` pairs.
-///
-/// `linebreak` selects which of Vim's two wrap behaviours to use (`:h
-/// 'linebreak'`, #1207):
-/// - `false` (Vim's own default, and this fn's behaviour before #1207):
-///   hard-break exactly at `viewport_cols`, splitting a word mid-way if
-///   that's where the column falls.
-/// - `true`: break at a word boundary (space, hyphen, or `/`) at or before
-///   the column, so words are never split — falling back to a hard break
-///   only when no boundary exists in the segment.
-///
-/// Purely a display-time choice: never mutates or reflows what's actually
-/// stored in the buffer.
-pub fn compute_word_wrap_segments(
-    line: &str,
-    viewport_cols: usize,
-    linebreak: bool,
-) -> Vec<(usize, usize)> {
-    let chars: Vec<char> = line.chars().collect();
-    let total = chars.len();
-    if viewport_cols == 0 || total <= viewport_cols {
-        return vec![(0, total)];
-    }
-    let mut segments = Vec::new();
-    let mut pos = 0;
-    while pos < total {
-        let remaining = total - pos;
-        if remaining <= viewport_cols {
-            segments.push((pos, total));
-            break;
-        }
-        let end = pos + viewport_cols;
-        let mut break_at = end;
-        if linebreak {
-            // Scan backwards from the break point to find a word boundary (space or after punctuation).
-            for i in (pos + 1..=end).rev() {
-                if chars[i - 1] == ' ' || chars[i - 1] == '-' || chars[i - 1] == '/' {
-                    break_at = i;
-                    break;
-                }
-            }
-        }
-        segments.push((pos, break_at));
-        // Safety: guarantee forward progress to prevent infinite loops.
-        pos = break_at.max(pos + 1);
-    }
-    segments
-}
-
-/// Map a visible row index (0-based from scroll_top) to the corresponding
-/// buffer line index, skipping lines hidden inside closed folds.
-/// Shared across all GUI backends for click hit-testing.
-pub fn view_row_to_buf_line(
-    view: &crate::core::view::View,
-    scroll_top: usize,
-    view_row: usize,
-    total_lines: usize,
-) -> usize {
-    let mut buf_line = scroll_top;
-    let mut visible = 0usize;
-    while buf_line < total_lines {
-        if view.is_line_hidden(buf_line) {
-            buf_line += 1;
-            continue;
-        }
-        if visible == view_row {
-            return buf_line;
-        }
-        visible += 1;
-        if let Some(fold) = view.fold_at(buf_line) {
-            buf_line = fold.end + 1;
-        } else {
-            buf_line += 1;
-        }
-    }
-    // Clamp to last valid line
-    total_lines.saturating_sub(1)
-}
-
 /// Offset table produced by expanding `'list'` glyphs (`\t`, plus any
 /// `'listchars'` single-character substitutions — `trail`/`nbsp`/`space`,
 /// #1206) in a line's text. Every position-based field a `RenderedLine`
@@ -20336,15 +21572,6 @@ fn slice_spans_for_segment(
     result
 }
 
-/// Convert a character index within a UTF-8 string to its byte offset.
-/// Returns `s.len()` if `char_idx` is beyond the string length.
-fn char_to_byte_offset(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_rendered_window(
     engine: &Engine,
@@ -20406,8 +21633,48 @@ fn build_rendered_window(
     let scroll_top = view.scroll_top.min(total_lines);
     let cursor_line = view.cursor.line;
 
-    // Whether this buffer has git diff data.
-    let has_git = !buffer_state.git_diff.is_empty();
+    // #1515: `badge` mode's gutter-marker overlay — the lines the most
+    // recent still-outstanding ACP turn checkpoint changed in this buffer,
+    // base = that checkpoint's `pre_turn_content` (not `git diff HEAD` —
+    // see `crate::core::acp_turn::line_status`'s own doc for why the two
+    // bases can legitimately disagree). Only painted under `Badge`: `Auto`
+    // doesn't need it (the full-viewport modal already covers this —
+    // "auto keeps today's behaviour"), and `Off`'s whole contract is
+    // *nothing* until an explicit `:AiReview` ("neither the modal nor the
+    // badge/gutter nudge" — see `AcpReviewOnTurnEnd::Off`'s own doc).
+    // Also skipped when this buffer's path isn't part of any outstanding
+    // checkpoint at all, so the (rare, temporary — only while an
+    // unreviewed turn checkpoint exists) diff cost is paid only for a
+    // buffer an agent turn actually just touched.
+    let acp_turn_status: Vec<Option<GitLineStatus>> = if engine.settings.acp_review_on_turn_end
+        == crate::core::settings::AcpReviewOnTurnEnd::Badge
+    {
+        buffer_state
+            .file_path
+            .as_deref()
+            .and_then(|p| engine.acp_turn_pre_content_for_path(&p.to_string_lossy()))
+            .map(|pre| crate::core::acp_turn::line_status(pre.as_deref(), &buffer.to_string()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Whether this buffer has git diff data (or an outstanding ACP-turn
+    // overlay — #1515 — to show in the same gutter column).
+    let has_git = !buffer_state.git_diff.is_empty() || !acp_turn_status.is_empty();
+
+    // #1517: in-buffer inline review — the still-outstanding hunks between
+    // this buffer's checkpoint entry and its live content, gated the same
+    // `badge`-only way `acp_turn_status` immediately above is (see that
+    // computation's own doc). Reused below to paint a virtual
+    // "[a] keep  [r] reject" action row right after each hunk's last line
+    // — `crate::core::engine::acp_turn_ops::Engine::acp_inline_review_
+    // hunks`'s own doc has the full "why not `ChangeReviewState`" reasoning.
+    let inline_review_hunks: Vec<quadraui::DiffHunk> = buffer_state
+        .file_path
+        .as_deref()
+        .map(|p| engine.acp_inline_review_hunks(&p.to_string_lossy()))
+        .unwrap_or_default();
 
     // Look up LSP diagnostics for this buffer.
     // Diagnostics are keyed by absolute path (from LSP URIs), but buffer file_path
@@ -20567,6 +21834,20 @@ fn build_rendered_window(
     // Look up aligned diff data for this window (for visual padding).
     let diff_aligned: Option<&[AlignedDiffEntry]> =
         engine.diff_aligned.get(&window_id).map(|v| v.as_slice());
+
+    // Whether *open*-foldable-region markers (`-`) paint in this window's
+    // gutter this frame (#1544, VS Code's `editor.showFoldingControls`).
+    // Closed-fold `+` markers are handled separately, inside
+    // `fold_indicator_char`, and always paint under `Mouseover` — a fold you
+    // can't see is a fold you can't discover how to reopen. `Never` hides
+    // both. `engine.gutter_hover_window` is updated by
+    // `route_gutter_hover`, called from the same shared `MouseMoved` path on
+    // both backends (`App::handle_dispatch`) — no per-backend hover logic.
+    let fold_open_markers_visible = match engine.settings.fold_controls {
+        FoldControlsMode::Always => true,
+        FoldControlsMode::Never => false,
+        FoldControlsMode::Mouseover => engine.gutter_hover_window == Some(window_id),
+    };
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
@@ -20734,9 +22015,17 @@ fn build_rendered_window(
             )
         };
 
-        // Git diff status for this line.
+        // Git diff status for this line, falling back to the #1515
+        // ACP-turn overlay (`acp_turn_status`) where the real git diff has
+        // nothing to say about it — a file already git-dirty before the
+        // turn keeps showing its real git status first.
         let git_status = if has_git {
-            buffer_state.git_diff.get(line_idx).copied().flatten()
+            buffer_state
+                .git_diff
+                .get(line_idx)
+                .copied()
+                .flatten()
+                .or_else(|| acp_turn_status.get(line_idx).copied().flatten())
         } else {
             None
         };
@@ -20760,7 +22049,13 @@ fn build_rendered_window(
             })
             .unwrap_or(false);
 
-        let fold_char = fold_indicator_char(buffer, view, line_idx);
+        let fold_char = fold_indicator_char(
+            buffer,
+            view,
+            line_idx,
+            engine.settings.fold_controls,
+            fold_open_markers_visible,
+        );
         // Number of leading marker columns (bp + git) subtracted from the
         // numeric portion so line numbers fill their allotted width correctly.
         let marker_cols = if has_bp { 1 } else { 0 } + if has_git { 1 } else { 0 };
@@ -20865,7 +22160,14 @@ fn build_rendered_window(
         let is_md_preview = engine.md_preview_links.contains_key(&window.buffer_id);
         let wrap_on =
             (engine.settings.wrap || is_md_preview) && render_viewport_cols > 0 && !is_fold_header;
-        let line_char_len = line_str.chars().count();
+        // Wrap on the line's *content* only — without its trailing EOL.
+        // Counting the `\n` as a character made a line whose text exactly
+        // fills its last wrapped row spill the newline into an extra, blank
+        // continuation row that `ensure_cursor_visible_wrap` (which counts
+        // rows on the EOL-stripped text) never accounted for, so `G` could
+        // land the cursor below the viewport (#1496).
+        let wrap_text_len = line_str.trim_end_matches(['\n', '\r']).len();
+        let line_char_len = line_str[..wrap_text_len].chars().count();
         // 'list' (#1190): applied only to the copy handed to the renderer
         // below (`raw_text`/`spans`) — `line_str` above (already consumed
         // by the diagnostics/spell-check UTF-16 offset math) and the word-
@@ -20877,8 +22179,11 @@ fn build_rendered_window(
             // Split long line into viewport-width segments with word-boundary wrapping.
             let vp = render_viewport_cols;
             // Build segment boundaries using word-aware splitting.
-            let segment_boundaries =
-                compute_word_wrap_segments(&line_str, vp, engine.settings.linebreak);
+            let segment_boundaries = compute_word_wrap_segments(
+                &line_str[..wrap_text_len],
+                vp,
+                engine.settings.linebreak,
+            );
             let num_segments = segment_boundaries.len();
             let cursor_seg = if line_idx == cursor_line {
                 // Find which segment contains the cursor column.
@@ -20895,8 +22200,9 @@ fn build_rendered_window(
                 if lines.len() >= visible_lines {
                     break;
                 }
-                let seg_start_byte = char_to_byte_offset(&line_str, seg_start_char);
-                let seg_end_byte = char_to_byte_offset(&line_str, seg_end_char);
+                let seg_start_byte =
+                    quadraui::text_util::char_to_byte_idx(&line_str, seg_start_char);
+                let seg_end_byte = quadraui::text_util::char_to_byte_idx(&line_str, seg_end_char);
                 let seg_text = line_str[seg_start_byte..seg_end_byte].to_string();
                 let seg_spans = slice_spans_for_segment(&spans, seg_start_byte, seg_end_byte);
                 let is_cont = seg > 0;
@@ -21079,6 +22385,63 @@ fn build_rendered_window(
                         colorcolumns: Vec::new(),
                     });
                 }
+            }
+        }
+
+        // #1517: in-buffer inline review — right after the last line of
+        // any still-outstanding hunk, paint a virtual `[a] keep  [r]
+        // reject` action row (no buffer content of its own, same
+        // `is_wrap_continuation: true` convention the ghost-completion
+        // continuation rows above use to stay invisible to cursor
+        // targeting — `render.rs`'s `l.line_idx == ec.line &&
+        // !l.is_wrap_continuation` cursor-row lookup already skips it).
+        if lines.len() < visible_lines {
+            // `hunk_last_right_line_0based` is derived from `str::split
+            // ('\n')` row indices (`quadraui::compute_hunks`'s own
+            // convention), which has one *more* element than a ropey
+            // buffer's real line count whenever the file ends in `\n`
+            // (virtually every file) — a trailing phantom empty "row" a
+            // hunk's context can extend into at end-of-file. Clamped to
+            // the buffer's real last line so the action row lands there
+            // instead of never matching any real `line_idx` at all (the
+            // phantom index is one past every line the outer loop ever
+            // visits).
+            let clamped_total = total_lines.saturating_sub(1);
+            if let Some(hunk) = inline_review_hunks.iter().find(|h| {
+                crate::core::acp_turn::hunk_last_right_line_0based(h).map(|l| l.min(clamped_total))
+                    == Some(line_idx)
+            }) {
+                let edited = buffer_state.file_path.as_deref().is_some_and(|p| {
+                    engine.acp_inline_review_hunk_edited(&p.to_string_lossy(), hunk)
+                });
+                let label = if edited {
+                    "  [a] keep (edited)   [r] revert to pre-turn"
+                } else {
+                    "  [a] keep hunk   [r] reject hunk"
+                };
+                lines.push(RenderedLine {
+                    raw_text: label.to_string(),
+                    gutter_text: " ".repeat(gutter_char_width),
+                    is_current_line: false,
+                    spans: Vec::new(),
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    line_idx,
+                    git_diff: None,
+                    diagnostics: Vec::new(),
+                    spell_errors: Vec::new(),
+                    diff_status: None,
+                    is_breakpoint: false,
+                    is_conditional_bp: false,
+                    is_dap_current: false,
+                    is_wrap_continuation: true,
+                    segment_col_offset: 0,
+                    annotation: None,
+                    ghost_suffix: None,
+                    is_ghost_continuation: false,
+                    indent_guides: Vec::new(),
+                    colorcolumns: Vec::new(),
+                });
             }
         }
 
@@ -21324,6 +22687,97 @@ fn build_rendered_window(
     } else {
         vec![]
     };
+
+    // ── Sticky scroll (#1546) ────────────────────────────────────────────
+    // Pin the header lines of `scroll_top`'s enclosing scopes at the top of
+    // the viewport by splicing them directly over `lines[0..k]` — reusing
+    // the exact same per-row paint + click-to-jump machinery every other
+    // row already goes through (`RenderedLine::line_idx` is what click
+    // hit-testing resolves screen row -> buffer line with). No backend-
+    // specific overlay code, no new quadraui primitive: the covered rows
+    // *are* the pinned band. See `sticky_scroll::enclosing_scope_headers`'s
+    // doc for the scope-source scoping (indent-hierarchy fallback only;
+    // LSP `documentSymbol` as the primary source is a deferred follow-up).
+    //
+    // Applied after indent guides / colorcolumns / bracket-match above, so
+    // spliced header rows don't carry those (cosmetic-only gap — they still
+    // get full syntax highlighting via `build_spans` below). Never covers
+    // the cursor's own row: if the cursor is already at (or above) a row a
+    // header would occupy, this is a no-op for that frame rather than
+    // hiding the cursor.
+    if engine.settings.sticky_scroll && scroll_top > 0 && !lines.is_empty() {
+        let headers = crate::core::engine::sticky_scroll::enclosing_scope_headers(
+            buffer,
+            scroll_top,
+            engine.settings.shift_width as usize,
+        );
+        let k = headers.len().min(lines.len());
+        if k > 0 && !lines[..k].iter().any(|l| l.is_current_line) {
+            let is_markdown = buffer_state
+                .file_path
+                .as_ref()
+                .and_then(|p| p.to_str())
+                .and_then(crate::core::syntax::SyntaxLanguage::from_path)
+                == Some(crate::core::syntax::SyntaxLanguage::Markdown);
+            for (row, &header_line) in headers.iter().take(k).enumerate() {
+                let header_rope_line = buffer.content.line(header_line);
+                let header_line_str = header_rope_line.to_string().replace('\0', "");
+                let header_start_byte = buffer.content.line_to_byte(header_line);
+                let header_end_byte = header_start_byte + header_rope_line.len_bytes();
+                let spans = build_spans(
+                    engine,
+                    theme,
+                    &buffer_state.highlights,
+                    &buffer_state.semantic_tokens,
+                    buffer,
+                    header_line,
+                    &header_line_str,
+                    header_start_byte,
+                    header_end_byte,
+                    is_markdown,
+                    &buf_search_matches,
+                    Some(window.buffer_id) == active_buf_id,
+                );
+                let marker_cols = (if has_bp { 1 } else { 0 }) + (if has_git { 1 } else { 0 });
+                let base_gutter = format_gutter_with_fold(
+                    line_number_mode,
+                    header_line,
+                    cursor_line,
+                    gutter_char_width.saturating_sub(marker_cols),
+                    ' ',
+                );
+                let gutter_text = format!(
+                    "{}{}{}",
+                    if has_bp { " " } else { "" },
+                    if has_git { " " } else { "" },
+                    base_gutter
+                );
+                lines[row] = RenderedLine {
+                    raw_text: header_line_str.trim_end_matches(['\n', '\r']).to_string(),
+                    gutter_text,
+                    is_current_line: false,
+                    spans,
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    line_idx: header_line,
+                    git_diff: None,
+                    diagnostics: Vec::new(),
+                    spell_errors: Vec::new(),
+                    diff_status: None,
+                    is_breakpoint: false,
+                    is_conditional_bp: false,
+                    is_dap_current: false,
+                    is_wrap_continuation: false,
+                    segment_col_offset: 0,
+                    annotation: None,
+                    ghost_suffix: None,
+                    is_ghost_continuation: false,
+                    indent_guides: Vec::new(),
+                    colorcolumns: Vec::new(),
+                };
+            }
+        }
+    }
 
     RenderedWindow {
         window_id,
@@ -21927,10 +23381,31 @@ fn line_indent_of(buffer: &Buffer, line_idx: usize) -> usize {
 /// To avoid false positives (e.g. blank lines, function-call continuations),
 /// `-` is only shown when the current line is a **block opener**: non-blank
 /// and whose trimmed text ends with `{` or `:`.
-fn fold_indicator_char(buffer: &Buffer, view: &View, line_idx: usize) -> char {
+///
+/// `controls` is the `fold_controls` setting (#1544, VS Code's
+/// `editor.showFoldingControls`): `Never` blanks every marker regardless of
+/// fold state; `Mouseover`/`Always` always show a closed fold's `+` (VS
+/// Code never hides an already-collapsed region's marker, even under
+/// `mouseover`), but the open-region `-` only shows when
+/// `open_markers_visible` is true (the caller's `fold_controls`/hover
+/// decision — `Always` passes `true` unconditionally, `Mouseover` passes
+/// whether the pointer is currently over this window's gutter).
+fn fold_indicator_char(
+    buffer: &Buffer,
+    view: &View,
+    line_idx: usize,
+    controls: FoldControlsMode,
+    open_markers_visible: bool,
+) -> char {
+    if controls == FoldControlsMode::Never {
+        return ' ';
+    }
     // Closed fold header takes priority.
     if view.fold_at(line_idx).is_some() {
         return '+';
+    }
+    if !open_markers_visible {
+        return ' ';
     }
     // Only show `-` for genuine block-opener lines.
     let cur_line = buffer.content.line(line_idx);
@@ -22179,32 +23654,45 @@ pub fn build_global_status_bar(engine: &Engine, theme: &Theme) -> quadraui::Stat
     }
 }
 
-/// Build a `quadraui::ToastStack` from `engine.toasts` for the
-/// bottom-right corner. Backends call `quadraui::*::draw_toast_stack`
-/// with the result. Returns None when there are no toasts so callers
-/// can skip the draw entirely.
-pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastStack> {
+/// Build a `quadraui::ToastOverlay` from `engine.toasts` for the
+/// bottom-right corner (#1577 — was `quadraui::ToastStack`, single-action
+/// only). Backends call `quadraui::*::draw_toast_overlay` with the
+/// result. Returns None when there are no toasts so callers can skip the
+/// draw entirely. Also used, with no painting involved, by
+/// `Engine::focus_toast_stack` to hand focus to
+/// `ToastStackController::give_focus`.
+pub fn build_toast_stack(engine: &Engine) -> Option<quadraui::ToastOverlay> {
     if engine.toasts.is_empty() {
         return None;
     }
-    Some(quadraui::ToastStack {
+    Some(quadraui::ToastOverlay {
         id: quadraui::WidgetId::new("toasts"),
         corner: quadraui::ToastCorner::BottomRight,
         toasts: engine
             .toasts
             .iter()
-            .map(|t| quadraui::ToastItem {
+            .map(|t| quadraui::Toast {
                 id: quadraui::WidgetId::new(format!("toast-{}", t.id)),
                 title: t.title.clone(),
                 body: t.body.clone(),
                 severity: t.severity,
-                action: t.action.as_ref().map(|a| quadraui::ToastAction {
-                    id: quadraui::WidgetId::new(format!("toast-action-{}", t.id)),
-                    label: a.button_label().to_string(),
-                }),
+                // Widget ids carry the button's index within `t.actions`
+                // (#1577 — `Engine::run_toast_action`'s doc explains why:
+                // a toast can now have more than one action button).
+                actions: t
+                    .actions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| quadraui::ToastButton {
+                        id: quadraui::WidgetId::new(format!("toast-action-{}-{i}", t.id)),
+                        label: a.kind.button_label().to_string(),
+                        primary: a.primary,
+                    })
+                    .collect(),
                 accent: None,
             })
             .collect(),
+        focus: engine.toast_focus.focus(),
     })
 }
 
@@ -22280,6 +23768,67 @@ fn extract_xy_prefix(msg: &str) -> Option<&str> {
         return None;
     }
     Some(&msg[..j])
+}
+
+/// Map an internal LSP language id (`crate::core::lsp::language_id_from_path`'s
+/// return value, e.g. `"rust"`, `"typescriptreact"`) to the display name a
+/// user actually recognizes (`"Rust"`, `"TypeScript React"`) — VS Code's
+/// status bar language segment shows the latter, never the raw id (#1548).
+///
+/// Every id in [`crate::core::lsp::all_known_language_ids`] has an explicit
+/// entry below; anything else (a future id this list hasn't caught up with
+/// yet) falls back to capitalizing the first character rather than showing
+/// nothing, so an unrecognized id degrades gracefully instead of going
+/// blank.
+pub fn language_display_name(id: &str) -> String {
+    let name = match id {
+        "rust" => "Rust",
+        "python" => "Python",
+        "javascript" => "JavaScript",
+        "javascriptreact" => "JavaScript React",
+        "typescript" => "TypeScript",
+        "typescriptreact" => "TypeScript React",
+        "go" => "Go",
+        "c" => "C",
+        "cpp" => "C++",
+        "java" => "Java",
+        "csharp" => "C#",
+        "ruby" => "Ruby",
+        "lua" => "Lua",
+        "shellscript" => "Shell Script",
+        "json" => "JSON",
+        "toml" => "TOML",
+        "yaml" => "YAML",
+        "html" => "HTML",
+        "css" => "CSS",
+        "markdown" => "Markdown",
+        "zig" => "Zig",
+        "elixir" => "Elixir",
+        "kotlin" => "Kotlin",
+        "php" => "PHP",
+        "haskell" => "Haskell",
+        "ocaml" => "OCaml",
+        "nix" => "Nix",
+        "terraform" => "Terraform",
+        "terraform-vars" => "Terraform Variables",
+        "bicep" => "Bicep",
+        "scala" => "Scala",
+        "graphql" => "GraphQL",
+        "sql" => "SQL",
+        "solidity" => "Solidity",
+        "swift" => "Swift",
+        "latex" => "LaTeX",
+        "bibtex" => "BibTeX",
+        "dockerfile" => "Dockerfile",
+        _ => {
+            let mut chars = id.chars();
+            return match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            };
+        }
+    };
+    name.to_string()
 }
 
 /// Build a per-window status line for a given window.
@@ -22396,8 +23945,14 @@ pub fn build_window_status_line(
                 }
                 branch_text = format!("{} {}", branch_text, parts.join(" "));
             }
+            // #1548: prefix with the branch glyph via the shared `Icon`
+            // constant (`.s()` picks nerd vs ASCII fallback per
+            // `nerd_fonts_enabled()`) rather than a raw literal — a raw PUA
+            // literal here would bypass `tests/icon_font_coverage.rs`'s
+            // bundled-subset-font check entirely, the exact failure mode
+            // that shipped tofu for the status-bar toggles before #1540.
             left.push(StatusSegment {
-                text: format!("  {}", branch_text),
+                text: format!("  {} {}", crate::icons::GIT_BRANCH.s(), branch_text),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -22422,7 +23977,15 @@ pub fn build_window_status_line(
         //
         // Drop order (least → most important):
         //   notification · menu toggle · panel toggle · sidebar toggle ·
-        //   utf-8 · line ending · indent · filetype · LSP · cursor pos
+        //   problems · utf-8 · line ending · indent · language · LSP ·
+        //   cursor pos
+        //
+        // #1548: the problems counter sits above the encoding/line-ending/
+        // indent trio — diagnostics are more consequential to a narrow bar
+        // dropping segments than "how is this file encoded", but it's still
+        // below the toggles (those are single always-present icon buttons,
+        // not counters) and below language/LSP/cursor (higher-signal, more
+        // frequently glanced at).
         let mut right = Vec::new();
 
         // Build each segment optionally; push at the end in priority order.
@@ -22430,7 +23993,6 @@ pub fn build_window_status_line(
 
         // Notification — spinner for in-progress, bell for done
         let notification_seg = if !engine.notifications.is_empty() {
-            let nf = crate::icons::nerd_fonts_enabled();
             let has_active = engine.has_active_notifications();
             let has_done = engine.has_done_notifications();
             let (icon, fg_color) = if has_active {
@@ -22446,8 +24008,10 @@ pub fn build_window_status_line(
                 let frame = frames[elapsed % frames.len()];
                 (format!("{frame}"), theme.function)
             } else if has_done {
-                let bell: &str = if nf { "󰂞" } else { "*" };
-                (bell.to_string(), theme.string_lit)
+                (
+                    crate::icons::STATUS_BELL_DONE.s().to_string(),
+                    theme.string_lit,
+                )
             } else {
                 (String::new(), bar_fg)
             };
@@ -22490,11 +24054,9 @@ pub fn build_window_status_line(
                 theme.status_inactive_fg
             }
         };
-        let nf = crate::icons::nerd_fonts_enabled();
-
         let menu_toggle_seg = if engine.menu_bar_toggleable {
             Some(StatusSegment {
-                text: if nf { " 󰍜 " } else { " [M] " }.to_string(),
+                text: format!(" {} ", crate::icons::STATUS_MENU_TOGGLE.s()),
                 fg: toggle_fg(engine.menu_bar_visible),
                 bg: bar_bg,
                 bold: false,
@@ -22505,7 +24067,7 @@ pub fn build_window_status_line(
         };
 
         let panel_toggle_seg = StatusSegment {
-            text: if nf { " 󰆍 " } else { " [P] " }.to_string(),
+            text: format!(" {} ", crate::icons::STATUS_PANEL_TOGGLE.s()),
             fg: toggle_fg(engine.terminal_open || engine.bottom_panel_open),
             bg: bar_bg,
             bold: false,
@@ -22513,15 +24075,45 @@ pub fn build_window_status_line(
         };
 
         let sidebar_toggle_seg = StatusSegment {
-            text: if nf { " 󰘖 " } else { " [S] " }.to_string(),
+            text: format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s()),
             fg: toggle_fg(engine.session.explorer_visible),
             bg: bar_bg,
             bold: false,
             action: Some(StatusAction::ToggleSidebar),
         };
 
+        // Problems counter (#1548): always visible, even at zero, matching
+        // VS Code's convention — a `0`/`0` count is itself useful signal
+        // ("no problems", not "we don't know"), and hiding the segment at
+        // zero is what the previous (non-window) status line did. Two
+        // segments sharing one action so a click anywhere in the counter
+        // opens the workspace Problems (quickfix) list.
+        let (diag_errors, diag_warnings) = engine.diagnostic_counts();
+        let errors_seg = StatusSegment {
+            text: format!(" {} {}", crate::icons::STATUS_ERROR.s(), diag_errors),
+            fg: if diag_errors > 0 {
+                theme.diagnostic_error
+            } else {
+                bar_fg
+            },
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ShowDiagnostics),
+        };
+        let warnings_seg = StatusSegment {
+            text: format!(" {} {} ", crate::icons::STATUS_WARNING.s(), diag_warnings),
+            fg: if diag_warnings > 0 {
+                theme.diagnostic_warning
+            } else {
+                bar_fg
+            },
+            bg: bar_bg,
+            bold: false,
+            action: Some(StatusAction::ShowDiagnostics),
+        };
+
         let encoding_seg = StatusSegment {
-            text: "utf-8 ".to_string(),
+            text: "UTF-8 ".to_string(),
             fg: bar_fg,
             bg: bar_bg,
             bold: false,
@@ -22546,7 +24138,7 @@ pub fn build_window_status_line(
 
         let filetype_seg = if !filetype.is_empty() {
             Some(StatusSegment {
-                text: format!("{} ", filetype),
+                text: format!("{} ", language_display_name(&filetype)),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -22578,10 +24170,13 @@ pub fn build_window_status_line(
             })
         };
 
-        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment.
+        // 'ruler' (#1190): `:h 'ruler'` gates exactly this segment. This is
+        // the right-most segment of the bar, so no trailing space here
+        // (quadraui#1155 gives pixel backends their own outer edge inset —
+        // a manual trailing space here would double it; see #1541).
         let cursor_seg = if engine.settings.ruler {
             cursor.map(|c| StatusSegment {
-                text: format!(" Ln {}, Col {} ", c.line + 1, c.col + 1),
+                text: format!(" Ln {}, Col {}", c.line + 1, c.col + 1),
                 fg: bar_fg,
                 bg: bar_bg,
                 bold: false,
@@ -22621,6 +24216,8 @@ pub fn build_window_status_line(
         }
         right.push(panel_toggle_seg);
         right.push(sidebar_toggle_seg);
+        right.push(errors_seg);
+        right.push(warnings_seg);
         right.push(encoding_seg);
         right.push(line_ending_seg);
         right.push(indent_seg);
@@ -22663,8 +24260,10 @@ pub fn build_window_status_line(
 
         let right = if engine.settings.ruler {
             if let Some(c) = cursor {
+                // Right-most segment — no trailing space (see the active-
+                // window cursor_seg comment above; quadraui#1155 / #1541).
                 vec![StatusSegment {
-                    text: format!("Ln {}, Col {} ", c.line + 1, c.col + 1),
+                    text: format!("Ln {}, Col {}", c.line + 1, c.col + 1),
                     fg: theme.status_inactive_fg,
                     bg: theme.status_inactive_bg,
                     bold: false,
@@ -22682,37 +24281,6 @@ pub fn build_window_status_line(
             right_segments: right,
         }
     }
-}
-
-/// Compute hit regions from status line segments.
-/// `bar_width` is the total width in char cells.
-/// Returns `(col, width, action)` tuples for all interactive segments.
-pub fn compute_status_hit_regions(
-    left: &[StatusSegment],
-    right: &[StatusSegment],
-    bar_width: usize,
-) -> Vec<(u16, u16, StatusAction)> {
-    let mut regions = Vec::new();
-    // Left segments: accumulate from col 0
-    let mut col: u16 = 0;
-    for seg in left {
-        let w = seg.text.chars().count() as u16;
-        if let Some(ref action) = seg.action {
-            regions.push((col, w, action.clone()));
-        }
-        col += w;
-    }
-    // Right segments: right-aligned
-    let right_width: usize = right.iter().map(|s| s.text.chars().count()).sum();
-    let mut col = bar_width.saturating_sub(right_width) as u16;
-    for seg in right {
-        let w = seg.text.chars().count() as u16;
-        if let Some(ref action) = seg.action {
-            regions.push((col, w, action.clone()));
-        }
-        col += w;
-    }
-    regions
 }
 
 // ─── quadraui::TabBar adapter (A.6c / A.6d) ──────────────────────────────────
@@ -22895,12 +24463,6 @@ pub fn build_bottom_panel_tab_bar(
 
 // ─── Terminal toolbar adapter (#305) ─────────────────────────────────────────
 
-/// Nerd-font icons for the terminal toolbar segments.
-const NF_TERM_CLOSE: &str = "󰅖";
-const NF_TERM_SPLIT: &str = "󰤼";
-const NF_TERM_MAXIMIZE: &str = "󰊗";
-const NF_TERM_UNMAXIMIZE: &str = "󰊓";
-
 /// The terminal toolbar is either a find bar or a tab strip.
 pub enum TerminalToolbar {
     FindBar(quadraui::StatusBar),
@@ -22938,7 +24500,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 action_id: None,
             }],
             right_segments: vec![quadraui::StatusBarSegment {
-                text: format!(" {} ", NF_TERM_CLOSE),
+                text: format!(" {} ", crate::icons::TERM_CLOSE.s()),
                 fg,
                 bg,
                 bold: false,
@@ -22967,9 +24529,9 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
         }
 
         let maxicon = if panel.maximized {
-            NF_TERM_UNMAXIMIZE
+            crate::icons::TERM_UNMAXIMIZE.s()
         } else {
-            NF_TERM_MAXIMIZE
+            crate::icons::TERM_MAXIMIZE.s()
         };
 
         let right = vec![
@@ -22980,7 +24542,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: false,
             },
             quadraui::TabBarSegment {
-                text: format!("{} ", NF_TERM_SPLIT),
+                text: format!("{} ", crate::icons::TERM_SPLIT.s()),
                 width_cells: 2,
                 id: Some(quadraui::WidgetId::new("term_toolbar:split")),
                 is_active: false,
@@ -22992,7 +24554,7 @@ pub fn build_terminal_toolbar(panel: &TerminalPanel, theme: &Theme) -> TerminalT
                 is_active: false,
             },
             quadraui::TabBarSegment {
-                text: format!("{} ", NF_TERM_CLOSE),
+                text: format!("{} ", crate::icons::TERM_CLOSE.s()),
                 width_cells: 2,
                 id: Some(quadraui::WidgetId::new("term_toolbar:close")),
                 is_active: false,
@@ -23020,6 +24582,27 @@ pub fn to_quadraui_theme(theme: &Theme) -> quadraui::Theme {
     to_quadraui_theme_editor(theme, chrome)
 }
 
+/// #1574: this literal is **exhaustive on purpose** — no
+/// `..quadraui::Theme::default()` spread. Every `quadraui::Theme` field
+/// vimcode's rasterisers paint with must come from vimcode's own themed
+/// palette; a spread here would let a newly-added quadraui `Theme` field
+/// silently fall back to quadraui's hardcoded dark default (exactly how
+/// `inactive_selected_bg` shipped unmapped, painting `#333` text on a dark
+/// navy `(35,40,58)` unfocused-selection row under `vscode-light`) instead
+/// of failing the build with `error[E0063]: missing field`. quadraui's own
+/// `theme.rs` uses the identical exhaustive-literal technique for exactly
+/// this reason — that one guards quadraui's downstream consumers (e.g. the
+/// unmapped `tab_active_border_top` it caught in quadraui#620) rather than a
+/// consumer's own mapping, but the compile-time guarantee is the same one
+/// this literal now gives vimcode. Adding a field to `quadraui::Theme` is
+/// a compile error here until it's mapped (or deliberately assigned a
+/// documented vimcode-side value below) — that is the point.
+///
+/// Some fields below (`editor_active_background` through `ghost_text_fg`)
+/// are immediately re-asserted by [`to_quadraui_theme_editor`]'s own
+/// `..chrome` struct-update — they're set here too, to the same value,
+/// purely so this literal stays exhaustive; there is no drift risk
+/// because both sites read the identical `theme.*` field.
 fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
     quadraui::Theme {
         background: theme.background,
@@ -23034,6 +24617,11 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         surface_bg: theme.fuzzy_bg,
         surface_fg: theme.fuzzy_fg,
         selected_bg: theme.fuzzy_selected_bg,
+        // #1574: was missing entirely (fell through to quadraui's dark
+        // `Theme::default()` navy) — this is the Explorer's
+        // unfocused-selected-row background (`sidebar_sel_bg_inactive`,
+        // e4e6f1 under vscode-light).
+        inactive_selected_bg: theme.sidebar_sel_bg_inactive,
         border_fg: theme.fuzzy_border,
         title_fg: theme.fuzzy_title_fg,
         header_bg: theme.status_bg,
@@ -23056,7 +24644,11 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         completion_border: theme.completion_border,
         completion_selected_bg: theme.completion_selected_bg,
         accent_bg: theme.tab_active_accent,
-        scrollbar_track: theme.separator,
+        // #1574: was `theme.separator` — vimcode has its own dedicated
+        // `scrollbar_track` field (distinct from `separator` in every
+        // colourscheme); using it directly is both more correct and
+        // consistent with `scrollbar_thumb` just below.
+        scrollbar_track: theme.scrollbar_track,
         scrollbar_thumb: theme.scrollbar_thumb,
         // #1185: quadraui's `command_line_{bg,fg}` default to its own
         // hardcoded colours (`Theme::default()`'s `bg`/`fg`, unrelated to
@@ -23069,7 +24661,68 @@ fn to_quadraui_theme_chrome(theme: &Theme) -> quadraui::Theme {
         // to read `theme.command_{fg,bg}` by hand).
         command_line_bg: theme.command_bg,
         command_line_fg: theme.command_fg,
-        ..quadraui::Theme::default()
+
+        // ── Editor lift fields — real values set (again) by
+        // `to_quadraui_theme_editor`'s `..chrome` update below. Present
+        // here only so this literal is exhaustive (see doc comment above);
+        // read the doc on each corresponding field in
+        // `to_quadraui_theme_editor` for the actual rationale.
+        editor_active_background: theme.active_background,
+        cursorline_bg: theme.cursorline_bg,
+        dap_stopped_bg: theme.dap_stopped_bg,
+        colorcolumn_bg: theme.colorcolumn_bg,
+        diff_added_bg: theme.diff_added_bg,
+        diff_removed_bg: theme.diff_removed_bg,
+        diff_padding_bg: theme.diff_padding_bg,
+        line_number_fg: theme.line_number_fg,
+        line_number_active_fg: theme.line_number_active_fg,
+        diagnostic_error: theme.diagnostic_error,
+        diagnostic_warning: theme.diagnostic_warning,
+        diagnostic_info: theme.diagnostic_info,
+        diagnostic_hint: theme.diagnostic_hint,
+        git_added: theme.git_added,
+        git_modified: theme.git_modified,
+        git_deleted: theme.git_deleted,
+        lightbulb: theme.lightbulb,
+        spell_error: theme.spell_error,
+        cursor: theme.cursor,
+        cursor_normal_alpha: theme.cursor_normal_alpha as f32,
+        selection: theme.selection,
+        selection_alpha: theme.selection_alpha as f32,
+        yank_highlight_bg: theme.yank_highlight_bg,
+        yank_highlight_alpha: theme.yank_highlight_alpha as f32,
+        bracket_match_bg: theme.bracket_match_bg,
+        indent_guide_fg: theme.indent_guide_fg,
+        indent_guide_active_fg: theme.indent_guide_active_fg,
+        annotation_fg: theme.annotation_fg,
+        ghost_text_fg: theme.ghost_text_fg,
+
+        // ── Board / kanban (#362) — vimcode's `PANEL_BOARD` /
+        // `Backend::draw_board` (#521) were never given their own theme
+        // mapping (#1574 audit); reuse the closest existing semantic
+        // colour rather than leaving them on quadraui's dark default.
+        // Board's selected-card / column-header look like a ListView
+        // selection / a flat header strip respectively, so the same
+        // source fields as `selected_bg`/`header_bg` above apply.
+        board_selected_card_bg: theme.fuzzy_selected_bg,
+        board_col_header_bg: theme.status_bg,
+        // `BadgeStatus` has no vimcode-native equivalent; map onto the
+        // nearest existing semantic colour rather than inventing new
+        // theme fields (one per colourscheme) for a status vocabulary
+        // vimcode doesn't otherwise have:
+        //   running  -> lightbulb (amber "in progress" cue, distinct
+        //               from the warning tone below)
+        //   passed   -> git_added (green)
+        //   warning  -> diagnostic_warning (amber/orange)
+        //   blocked  -> diagnostic_error (red)
+        badge_running: theme.lightbulb,
+        badge_passed: theme.git_added,
+        badge_warning: theme.diagnostic_warning,
+        badge_blocked: theme.diagnostic_error,
+        // `BoardCard::hint` is a callout strip — closest existing
+        // surface is the hover/tooltip popup.
+        card_hint_bg: theme.hover_bg,
+        card_hint_fg: theme.hover_fg,
     }
 }
 
@@ -23374,6 +25027,7 @@ pub fn status_action_id(action: &StatusAction) -> &'static str {
         StatusAction::TogglePanel => "status:toggle_panel",
         StatusAction::ToggleMenuBar => "status:toggle_menu_bar",
         StatusAction::DismissNotifications => "status:dismiss_notifications",
+        StatusAction::ShowDiagnostics => "status:show_diagnostics",
     }
 }
 
@@ -23392,6 +25046,7 @@ pub fn status_action_from_id(id: &str) -> Option<StatusAction> {
         "status:toggle_panel" => Some(StatusAction::TogglePanel),
         "status:toggle_menu_bar" => Some(StatusAction::ToggleMenuBar),
         "status:dismiss_notifications" => Some(StatusAction::DismissNotifications),
+        "status:show_diagnostics" => Some(StatusAction::ShowDiagnostics),
         _ => None,
     }
 }
@@ -23512,7 +25167,7 @@ pub fn tab_hover_tooltip_paint(
         right_segments: vec![],
     };
     let rect = quadraui::Rect::new(x, y, w_chars * uw, unit_h);
-    let _ = backend.draw_status_bar(rect, &bar, None, None);
+    let _ = backend.draw_status_bar_interactive(rect, &bar, &quadraui::InteractionState::new());
 }
 
 pub fn build_command_line(engine: &Engine) -> CommandLineData {
@@ -23612,16 +25267,6 @@ fn command_line_byte_to_char_idx(text: &str, byte_offset: usize) -> usize {
         .unwrap_or_else(|| text.chars().count())
 }
 
-/// The inverse of [`command_line_byte_to_char_idx`] — a character-count
-/// offset converted back to the byte offset `CommandLineLayout::selection_bounds`
-/// expects. Out-of-range indices clamp to `text.len()`.
-fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
-    text.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(text.len())
-}
-
 /// Whether `point` lands inside the painted command-line row, in the same
 /// ABSOLUTE units as `rect` (`Engine::command_line_rect`).
 ///
@@ -23639,6 +25284,15 @@ fn command_line_char_to_byte_idx(text: &str, char_idx: usize) -> usize {
 /// is basically always painted). Delegates to
 /// [`quadraui::Rect::contains`] — the shared point-in-rect primitive —
 /// instead of re-deriving both bounds by hand a second time.
+///
+/// #1528: the GTK `MouseDown` handler that used this to skip the whole
+/// command-line row before running `ctx.window_edge` no longer needs to —
+/// `render::WINDOW_RESIZE_GRIP_PX`'s thin margin already keeps `window_edge`
+/// from firing anywhere in the row except its own outermost sliver, so the
+/// guard's job (stop a full `line_height`-tall margin from eating the whole
+/// row) is now `window_edge`'s own margin's job instead. Kept as a public
+/// helper — still the correct both-axes point-in-`command_line_rect` check
+/// for anything that needs one — rather than deleted with its call site.
 pub fn point_over_command_line(rect: quadraui::Rect, point: quadraui::Point) -> bool {
     rect.width > 0.0 && rect.contains(point)
 }
@@ -23718,8 +25372,8 @@ pub fn command_line_selection_bytes(text: &str, sel: (usize, usize)) -> (usize, 
     let lo = sel.0.min(sel.1);
     let hi = sel.0.max(sel.1);
     (
-        command_line_char_to_byte_idx(text, lo),
-        command_line_char_to_byte_idx(text, hi + 1),
+        quadraui::text_util::char_to_byte_idx(text, lo),
+        quadraui::text_util::char_to_byte_idx(text, hi + 1),
     )
 }
 
@@ -24767,6 +26421,170 @@ pub fn tab_bar_height_px(_line_height: f64, breadcrumbs: bool) -> f64 {
     }
 }
 
+/// One geometry unit [`crate::app::App`] paints in, chosen once by the
+/// caller that constructs it (#1426) — never inferred at runtime by `App`
+/// itself asking "am I GTK?", per the Platform-Neutrality Rule.
+///
+/// Before this struct existed, `App` hardcoded the pixel-flavoured half of
+/// every backend-specific sizing pair listed on each field below (the
+/// `gtk_*`/`GTK_*` name) directly in its own methods, which is correct for
+/// GTK/macOS/Win but wrong on a cell grid — e.g. `TAB_ROW_HEIGHT_PX` (35.0)
+/// read as 35 *rows* on an 80x24 terminal claims more rows than the terminal
+/// has, collapsing the entire editor content band. Every pair already had a
+/// `TUI_*`/cell-flavoured twin (built for the shipped the pre-#1434 TUI shell);
+/// `UnitProfile` just bundles "which half of each pair" into one value
+/// picked once, at construction, by code that already knows its own
+/// backend: [`Self::px`] for GTK/macOS/Win, [`Self::cell`] for the `tui`
+/// harness arm (`crate::tui_main::testing::conformance_harness` /
+/// `crate::harness::build_app_and_config`).
+///
+/// `#[derive(Clone, Copy)]`: every field is either a plain value/tuple or a
+/// capture-less `fn` pointer, so a whole profile is cheap to copy around
+/// (`App` stores one directly, no `Rc`/`Box` needed).
+#[derive(Clone, Copy)]
+pub struct UnitProfile {
+    /// [`tab_row_height_px`] (GTK: fixed 35px regardless of `lh`) vs a
+    /// single cell row (`|lh| lh`, TUI: `lh` is always `1.0`).
+    pub tab_row_h: fn(f64) -> f64,
+    /// [`tab_bar_height_px`] (GTK: fixed 35/57px) vs `lh` or `2*lh` when
+    /// breadcrumbs are on (TUI: one or two cell rows).
+    pub tab_bar_h: fn(f64, bool) -> f64,
+    /// [`BREADCRUMB_ROW_HEIGHT_PX`] (GTK: a fixed 22px regardless of `lh`)
+    /// vs one more full cell row (`|lh| lh`, TUI).
+    pub breadcrumb_row_h: fn(f64) -> f64,
+    /// [`gtk_minimap_sizing`] vs [`TUI_MINIMAP_SIZING`] — both plain values,
+    /// not functions, since neither depends on `line_height`.
+    pub minimap: quadraui::MinimapSizing,
+    /// [`gtk_picker_sizing`] vs [`TUI_PICKER_SIZING`] (ignores the `f32`).
+    pub picker: fn(f32) -> PickerSizing,
+    /// [`gtk_picker_rows`] vs [`TUI_PICKER_ROWS`] (ignores the `f32`).
+    pub picker_rows: fn(f32) -> PickerRowMetrics,
+    /// [`gtk_tab_switcher_sizing`] vs [`TUI_TAB_SWITCHER_SIZING`] (ignores
+    /// the `f32`).
+    pub tab_switcher: fn(f32) -> TabSwitcherSizing,
+    /// [`GTK_FIND_REPLACE_ANCHOR`] vs [`TUI_FIND_REPLACE_ANCHOR`].
+    pub find_replace_anchor: FindReplaceAnchor,
+    /// [`GTK_DIVIDER_METRICS`] (ignores the `bool`) vs the cell metrics
+    /// `tui_main::mouse`'s own divider rung builds inline. TUI's
+    /// `group_horizontal` band reaches across however many rows the tab bar
+    /// occupies (one, or two with breadcrumbs on) rather than back like
+    /// every other band, so this needs the same `breadcrumbs` flag
+    /// `App::render_content` already has in scope wherever it calls this.
+    pub divider_metrics: fn(bool) -> DividerMetrics,
+    /// [`gui_sidebar_system_metrics`] vs the fixed metrics
+    /// the pre-#1434 TUI shell's `from_engine` seeds every `SidebarSystem` with once at
+    /// startup (a cell grid never changes `line_height`, so TUI's never
+    /// depends on the `f32`).
+    pub sidebar_system_metrics: fn(f32) -> quadraui::MsvLayoutMetrics,
+    /// Divider/tab-close grab tolerance: `(6.0, 6.0)` device pixels on GTK,
+    /// `(1.0, 1.0)` cells on TUI — #1068's "irreducible" list.
+    pub hit_tolerance: (f64, f64),
+    /// [`quadraui::ShellConfig::with_activity_bar_width_px`]'s argument.
+    /// `Some(48.0)` on GTK/macOS/Win (VS Code parity, independent of line
+    /// height); `None` on TUI, which leaves
+    /// [`quadraui::ShellConfig::activity_bar_width`]'s own default (a
+    /// 3-line-height multiple) in charge — the same value
+    /// the pre-#1434 TUI shell's `build_shell_config` sets explicitly.
+    pub activity_bar_width_px: Option<f32>,
+    /// [`quadraui::ShellConfig::with_title_bar`]'s `height_lh` argument.
+    pub title_bar_lh: f32,
+    /// Whether [`crate::app::App::shell_config`] should also request
+    /// [`quadraui::ShellConfig::with_client_side_titlebar`].
+    pub client_side_titlebar: bool,
+    /// [`crate::icons::set_gui_backend`]'s argument.
+    pub is_gui_backend: bool,
+    /// The explorer tree's own per-row pixel/cell pitch, given the
+    /// current line height — GTK: `quadraui::gtk::tree`'s own
+    /// `item_height = (line_height * 1.4).round()` (no public accessor;
+    /// duplicated here rather than re-derived from a `TreeController` hit
+    /// test, since building the `TreeView` its layout needs is a private
+    /// method — see `apply_explorer_drag_move`'s doc for the #1429
+    /// consumer this feeds and the upstream gap this constant is a
+    /// stand-in for). TUI: one whole cell (`|lh| lh`) — `quadraui::tui::
+    /// tree`'s own doc states `TreeStyle::row_height` is "a GUI-pixel"
+    /// concept only.
+    pub explorer_row_h: fn(f64) -> f64,
+    /// `(pad_x, pad_y)` the editor hover popup insets its content by,
+    /// matching whichever rasteriser actually painted it:
+    /// `quadraui::gtk::rich_text_popup`'s fixed 4px border/inset on GTK,
+    /// `quadraui::tui::rich_text_popup`'s 2-cell-x/1-cell-y frame on TUI.
+    /// `App::route_and_apply_editor_hover_popup` (press) and
+    /// `handle_mouse_drag_msg`'s `HoverPopupSelection` arm (drag) both
+    /// need the same value, or the two disagree about which content cell
+    /// a given pixel/cell maps to (#1429: found hardcoded to the GTK pair
+    /// in both places, which is why a TUI-native `App`, the `tui` harness
+    /// arm, resolved a drag one row short of wherever the press itself
+    /// had already been landing).
+    pub hover_popup_pad: (f32, f32),
+}
+
+impl UnitProfile {
+    /// GTK/macOS/Win: every value `App` used to hardcode as a `gtk_*`/
+    /// `GTK_*` constant or function, unchanged — #1426's own acceptance bar
+    /// is "no behaviour change on GTK/macOS/Win".
+    pub fn px() -> Self {
+        UnitProfile {
+            tab_row_h: tab_row_height_px,
+            tab_bar_h: tab_bar_height_px,
+            breadcrumb_row_h: |_lh| BREADCRUMB_ROW_HEIGHT_PX,
+            minimap: gtk_minimap_sizing(),
+            picker: gtk_picker_sizing,
+            picker_rows: gtk_picker_rows,
+            tab_switcher: gtk_tab_switcher_sizing,
+            find_replace_anchor: GTK_FIND_REPLACE_ANCHOR,
+            divider_metrics: |_breadcrumbs| GTK_DIVIDER_METRICS,
+            sidebar_system_metrics: gui_sidebar_system_metrics,
+            hit_tolerance: (6.0, 6.0),
+            activity_bar_width_px: Some(48.0),
+            title_bar_lh: 2.0,
+            client_side_titlebar: true,
+            is_gui_backend: true,
+            explorer_row_h: |lh| (lh * 1.4).round(),
+            hover_popup_pad: (4.0, 4.0),
+        }
+    }
+
+    /// The `tui` harness arm: `App` painted through
+    /// `quadraui::tui::TuiBackend`, whose `Backend::line_height`/
+    /// `char_width` are always `1.0` (one terminal cell) — see that
+    /// backend's own impl. Every value here is the cell-flavoured twin
+    /// `px()` reads instead, matching the constant the shipped
+    /// the pre-#1434 TUI shell already paints with (named in each field's own doc
+    /// above).
+    pub fn cell() -> Self {
+        UnitProfile {
+            tab_row_h: |lh| lh,
+            tab_bar_h: |lh, breadcrumbs| if breadcrumbs { lh * 2.0 } else { lh },
+            breadcrumb_row_h: |lh| lh,
+            minimap: TUI_MINIMAP_SIZING,
+            picker: |_lh| TUI_PICKER_SIZING,
+            picker_rows: |_lh| TUI_PICKER_ROWS,
+            tab_switcher: |_lh| TUI_TAB_SWITCHER_SIZING,
+            find_replace_anchor: TUI_FIND_REPLACE_ANCHOR,
+            divider_metrics: |breadcrumbs| DividerMetrics {
+                group_vertical: (1.0, 1.0),
+                group_horizontal: (0.0, if breadcrumbs { 2.0 } else { 1.0 }),
+                window_vertical: (1.0, 1.0),
+                window_horizontal: (1.0, 1.0),
+                quantize: true,
+            },
+            sidebar_system_metrics: |_lh| quadraui::MsvLayoutMetrics {
+                header_size: 1.0,
+                divider_size: 0.0,
+                scrollbar_size: 1.0,
+                cell_quantum: 1.0,
+            },
+            hit_tolerance: (1.0, 1.0),
+            activity_bar_width_px: None,
+            title_bar_lh: 1.0,
+            client_side_titlebar: false,
+            is_gui_backend: false,
+            explorer_row_h: |lh| lh,
+            hover_popup_pad: (2.0, 1.0),
+        }
+    }
+}
+
 /// Compute the height of the bottom chrome (status bar + wildmenu) in pixels.
 ///
 /// `show_global_status` is [`global_status_bar_visible`]'s value, **not**
@@ -25247,6 +27065,162 @@ pub fn tab_drop_overlay(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── quadraui theme mapping (#1574) ────────────────────────────────────
+    //
+    // `to_quadraui_theme` (and its `_chrome`/`_editor` halves) is the single
+    // place vimcode's rich `render::Theme` is narrowed down to the small
+    // `quadraui::Theme` every rasteriser actually paints with. Before #1574,
+    // three of its fields were wrong or missing entirely and fell through to
+    // quadraui's own hardcoded dark `Theme::default()` — this is the
+    // regression test for that class of bug, not just the two named fields
+    // the issue reported.
+
+    /// The two concrete bugs #1574 reported: `inactive_selected_bg` was
+    /// never set at all (falling through to quadraui's dark
+    /// `Theme::default()`, `rgb(35, 40, 58)`, painted behind `#333` text —
+    /// unreadable), and `scrollbar_track` was mapped to `theme.separator`
+    /// instead of vimcode's own dedicated `theme.scrollbar_track` field.
+    /// Both are asserted against `vscode_light`, whose values for these
+    /// fields are nothing like quadraui's dark defaults, so a regression
+    /// back to either bug fails loudly here instead of only looking wrong
+    /// on screen.
+    #[test]
+    fn to_quadraui_theme_maps_inactive_selected_bg_and_scrollbar_track_from_vimcode_theme() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+        let default = quadraui::Theme::default();
+
+        assert_eq!(q.inactive_selected_bg, theme.sidebar_sel_bg_inactive);
+        assert_ne!(q.inactive_selected_bg, default.inactive_selected_bg);
+
+        assert_eq!(q.scrollbar_track, theme.scrollbar_track);
+        assert_ne!(q.scrollbar_track, default.scrollbar_track);
+    }
+
+    /// The remaining unmapped keys #1574 audited (`badge_*`, `board_*`,
+    /// `card_hint_*`) — every one must trace back to a vimcode theme field
+    /// rather than silently keeping quadraui's dark default, the same way
+    /// `inactive_selected_bg` did before this issue.
+    #[test]
+    fn to_quadraui_theme_maps_badge_board_and_card_hint_keys_from_vimcode_theme() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+        let default = quadraui::Theme::default();
+
+        assert_eq!(q.board_selected_card_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.board_col_header_bg, theme.status_bg);
+        assert_eq!(q.badge_running, theme.lightbulb);
+        assert_eq!(q.badge_passed, theme.git_added);
+        assert_eq!(q.badge_warning, theme.diagnostic_warning);
+        assert_eq!(q.badge_blocked, theme.diagnostic_error);
+        assert_eq!(q.card_hint_bg, theme.hover_bg);
+        assert_eq!(q.card_hint_fg, theme.hover_fg);
+
+        // None of these six keys' `vscode_light` values happen to coincide
+        // with quadraui's own dark default — if they ever silently fell
+        // back to it (e.g. a future field addition landing behind a
+        // reintroduced `..Theme::default()` spread), this would catch it.
+        assert_ne!(q.board_selected_card_bg, default.board_selected_card_bg);
+        assert_ne!(q.board_col_header_bg, default.board_col_header_bg);
+        assert_ne!(q.badge_running, default.badge_running);
+        assert_ne!(q.badge_passed, default.badge_passed);
+        assert_ne!(q.badge_warning, default.badge_warning);
+        assert_ne!(q.badge_blocked, default.badge_blocked);
+        assert_ne!(q.card_hint_bg, default.card_hint_bg);
+        assert_ne!(q.card_hint_fg, default.card_hint_fg);
+    }
+
+    /// Every field on `quadraui::Theme` must be reachable from
+    /// `to_quadraui_theme`'s output via *some* vimcode `Theme` field — this
+    /// is the structural half of #1574: `to_quadraui_theme_chrome`'s struct
+    /// literal has no `..quadraui::Theme::default()` spread any more, so a
+    /// future field added upstream is a compile error here (`E0063`) until
+    /// it's mapped, rather than a silent dark leak discovered by eye later.
+    /// This test pins the full mapping table so a regression on any single
+    /// field (not just the ones called out above) is caught.
+    #[test]
+    fn to_quadraui_theme_maps_every_field_from_vscode_light() {
+        let theme = Theme::vscode_light();
+        let q = to_quadraui_theme(&theme);
+
+        assert_eq!(q.background, theme.background);
+        assert_eq!(q.foreground, theme.foreground);
+        assert_eq!(q.tab_bar_bg, theme.tab_bar_bg);
+        assert_eq!(q.tab_active_bg, theme.tab_active_bg);
+        assert_eq!(q.tab_active_fg, theme.tab_active_fg);
+        assert_eq!(q.tab_inactive_fg, theme.tab_inactive_fg);
+        assert_eq!(q.tab_preview_active_fg, theme.tab_preview_active_fg);
+        assert_eq!(q.tab_preview_inactive_fg, theme.tab_preview_inactive_fg);
+        assert_eq!(q.separator, theme.separator);
+        assert_eq!(q.surface_bg, theme.fuzzy_bg);
+        assert_eq!(q.surface_fg, theme.fuzzy_fg);
+        assert_eq!(q.selected_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.inactive_selected_bg, theme.sidebar_sel_bg_inactive);
+        assert_eq!(q.border_fg, theme.fuzzy_border);
+        assert_eq!(q.title_fg, theme.fuzzy_title_fg);
+        assert_eq!(q.header_bg, theme.status_bg);
+        assert_eq!(q.header_fg, theme.status_fg);
+        assert_eq!(q.muted_fg, theme.line_number_fg);
+        assert_eq!(q.error_fg, theme.diagnostic_error);
+        assert_eq!(q.warning_fg, theme.diagnostic_warning);
+        assert_eq!(q.query_fg, theme.fuzzy_query_fg);
+        assert_eq!(q.match_fg, theme.fuzzy_match_fg);
+        assert_eq!(q.accent_fg, theme.cursor);
+        assert_eq!(q.hover_bg, theme.hover_bg);
+        assert_eq!(q.hover_fg, theme.hover_fg);
+        assert_eq!(q.hover_border, theme.hover_border);
+        assert_eq!(q.input_bg, theme.completion_bg);
+        assert_eq!(q.inactive_fg, theme.status_inactive_fg);
+        assert_eq!(q.selection_bg, theme.selection);
+        assert_eq!(q.link_fg, theme.md_link);
+        assert_eq!(q.completion_bg, theme.completion_bg);
+        assert_eq!(q.completion_fg, theme.completion_fg);
+        assert_eq!(q.completion_border, theme.completion_border);
+        assert_eq!(q.completion_selected_bg, theme.completion_selected_bg);
+        assert_eq!(q.accent_bg, theme.tab_active_accent);
+        assert_eq!(q.scrollbar_track, theme.scrollbar_track);
+        assert_eq!(q.scrollbar_thumb, theme.scrollbar_thumb);
+        assert_eq!(q.command_line_bg, theme.command_bg);
+        assert_eq!(q.command_line_fg, theme.command_fg);
+        assert_eq!(q.editor_active_background, theme.active_background);
+        assert_eq!(q.cursorline_bg, theme.cursorline_bg);
+        assert_eq!(q.dap_stopped_bg, theme.dap_stopped_bg);
+        assert_eq!(q.colorcolumn_bg, theme.colorcolumn_bg);
+        assert_eq!(q.diff_added_bg, theme.diff_added_bg);
+        assert_eq!(q.diff_removed_bg, theme.diff_removed_bg);
+        assert_eq!(q.diff_padding_bg, theme.diff_padding_bg);
+        assert_eq!(q.line_number_fg, theme.line_number_fg);
+        assert_eq!(q.line_number_active_fg, theme.line_number_active_fg);
+        assert_eq!(q.diagnostic_error, theme.diagnostic_error);
+        assert_eq!(q.diagnostic_warning, theme.diagnostic_warning);
+        assert_eq!(q.diagnostic_info, theme.diagnostic_info);
+        assert_eq!(q.diagnostic_hint, theme.diagnostic_hint);
+        assert_eq!(q.git_added, theme.git_added);
+        assert_eq!(q.git_modified, theme.git_modified);
+        assert_eq!(q.git_deleted, theme.git_deleted);
+        assert_eq!(q.lightbulb, theme.lightbulb);
+        assert_eq!(q.spell_error, theme.spell_error);
+        assert_eq!(q.cursor, theme.cursor);
+        assert_eq!(q.cursor_normal_alpha, theme.cursor_normal_alpha as f32);
+        assert_eq!(q.selection, theme.selection);
+        assert_eq!(q.selection_alpha, theme.selection_alpha as f32);
+        assert_eq!(q.yank_highlight_bg, theme.yank_highlight_bg);
+        assert_eq!(q.yank_highlight_alpha, theme.yank_highlight_alpha as f32);
+        assert_eq!(q.bracket_match_bg, theme.bracket_match_bg);
+        assert_eq!(q.indent_guide_fg, theme.indent_guide_fg);
+        assert_eq!(q.indent_guide_active_fg, theme.indent_guide_active_fg);
+        assert_eq!(q.annotation_fg, theme.annotation_fg);
+        assert_eq!(q.ghost_text_fg, theme.ghost_text_fg);
+        assert_eq!(q.board_selected_card_bg, theme.fuzzy_selected_bg);
+        assert_eq!(q.board_col_header_bg, theme.status_bg);
+        assert_eq!(q.badge_running, theme.lightbulb);
+        assert_eq!(q.badge_passed, theme.git_added);
+        assert_eq!(q.badge_warning, theme.diagnostic_warning);
+        assert_eq!(q.badge_blocked, theme.diagnostic_error);
+        assert_eq!(q.card_hint_bg, theme.hover_bg);
+        assert_eq!(q.card_hint_fg, theme.hover_fg);
+    }
 
     // ─── Test-only geometry/key helpers (#812) ────────────────────────────
     //
@@ -26237,7 +28211,7 @@ mod tests {
             hint: "h".into(),
             ..Default::default()
         };
-        item_a.icon = "\u{f04b}".into();
+        item_a.icon = crate::icons::DBG_PLAY.nerd.into();
 
         let item_b_child = ExtPanelItem {
             text: "Child".into(),
@@ -26362,13 +28336,94 @@ mod tests {
     }
 
     #[test]
+    fn test_try_from_hex_non_ascii_returns_none_instead_of_panicking() {
+        // #1494: "日本" is 6 *bytes* (two 3-byte UTF-8 chars) but not
+        // ASCII, so it used to match the `6 | 8` byte-length arm and then
+        // panic slicing `&s[0..2]` — byte offset 2 lands inside the first
+        // character, not on a UTF-8 char boundary. Also cover an 8-byte
+        // non-ASCII string, matching `try_from_hex_over`'s `8 =>` arm.
+        assert_eq!(try_from_hex("日本"), None);
+        assert_eq!(try_from_hex_over("日本é", Color::from_rgb(0, 0, 0)), None);
+    }
+
+    /// #1494 CI: the band-clamp that stops the Command Center's
+    /// overflowing search box from eating the window-control buttons'
+    /// clicks. Built from the real primitive (`CommandCenter::layout`)
+    /// rather than a hand-written `CommandCenterLayout` literal, so the
+    /// overflow this guards against is the one quadraui actually produces.
+    #[test]
+    fn command_center_hit_in_band_ignores_the_overflowing_search_box() {
+        let cc = build_command_center_view(true, true, "vimcode");
+        // 272px band — the width `measure_title_bar_bands` hands the
+        // Command Center on an 800px window with a wide UI font. The
+        // primitive's content floor is 2*24 arrows + 2*8 gaps + a 280px
+        // search box = 344px, so 72px of it overflows to the right.
+        let band = quadraui::Rect::new(367.0, 0.0, 272.0, 46.0);
+        let measure =
+            quadraui::CommandCenterMeasure::from_char_width(cc.search_label.as_str(), 8.0, 46.0);
+        let layout = cc.layout(band, measure);
+
+        let search = layout
+            .search_bounds
+            .expect("the search box must be laid out for this to test anything");
+        assert!(
+            search.x + search.width > band.x + band.width,
+            "precondition: this band must be narrow enough that the search \
+             box overflows it; search={search:?} band={band:?}"
+        );
+
+        // Inside the band, on the search box — still a SearchBox hit.
+        let inside_x = band.x + band.width - 1.0;
+        assert_eq!(
+            command_center_hit_in_band(&layout, inside_x, 10.0),
+            Some(quadraui::CommandCenterHit::SearchBox),
+            "a click inside the band must still resolve normally"
+        );
+        assert_eq!(
+            command_center_hit_in_band(&layout, band.x + 4.0, 10.0),
+            Some(quadraui::CommandCenterHit::Back),
+            "the nav arrows must keep working"
+        );
+
+        // Past the band's right edge — where the window-control buttons
+        // live — the overflowing search box must NOT claim the click.
+        // `hit_test` alone does, which is the bug.
+        let overflow_x = band.x + band.width + 1.0;
+        assert!(
+            overflow_x < search.x + search.width,
+            "precondition: this probe must land on the overflowing part of \
+             the search box"
+        );
+        assert_eq!(
+            layout.hit_test(overflow_x, 10.0),
+            quadraui::CommandCenterHit::SearchBox,
+            "precondition: the unclamped primitive really does claim this \
+             out-of-band point — if this ever stops being true the clamp \
+             is obsolete, not the test"
+        );
+        assert_eq!(
+            command_center_hit_in_band(&layout, overflow_x, 10.0),
+            None,
+            "a point outside the painted band must resolve to nothing, so \
+             the caller falls through to whatever owns that pixel"
+        );
+
+        // Outside vertically, too.
+        assert_eq!(
+            command_center_hit_in_band(&layout, band.x + 4.0, band.y + band.height + 1.0),
+            None,
+            "below the band is outside the band"
+        );
+    }
+
+    #[test]
     fn test_strip_json_comments() {
         let input = r#"{
   // line comment
   "key": "value", /* block */
   "str": "has // no comment"
 }"#;
-        let stripped = strip_json_comments(input);
+        let stripped = quadraui::text_util::strip_json_comments(input);
         let val: serde_json::Value = serde_json::from_str(&stripped).unwrap();
         assert_eq!(val["key"], "value");
         assert_eq!(val["str"], "has // no comment");
@@ -26433,6 +28488,112 @@ mod tests {
         assert_eq!(theme.status_bg, try_from_hex("#181825").unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: `activityBar.activeBorder` is VS Code's own colour key for
+    /// the active-item accent line (`activity_active_accent`'s doc). When
+    /// an imported theme sets it explicitly to something other than
+    /// `activityBar.foreground`, the explicit value must win — the two are
+    /// independent colours, not one derived from the other.
+    #[test]
+    fn from_vscode_json_prefers_explicit_active_border_over_foreground() {
+        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            "name": "Test Theme",
+            "colors": {
+                "activityBar.foreground": "#c8c8d2",
+                "activityBar.activeBorder": "#61afef"
+            }
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.activity_bar_fg, try_from_hex("#c8c8d2").unwrap());
+        assert_eq!(
+            theme.activity_active_accent,
+            try_from_hex("#61afef").unwrap(),
+            "an explicit `activityBar.activeBorder` must win over \
+             `activityBar.foreground`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: VS Code's own default for `activityBar.activeBorder` is
+    /// `activityBar.foreground` (see `ACTIVITY_BAR_ACTIVE_BORDER`'s
+    /// `dark`/`light` entries in VS Code's `colorRegistry`) — so an
+    /// imported theme that sets only `activityBar.foreground` must have
+    /// `activity_active_accent` fall back to that value, not stay at
+    /// whatever built-in default `Theme::onedark()` seeded it with.
+    #[test]
+    fn from_vscode_json_falls_back_to_foreground_when_active_border_absent() {
+        let dir = std::env::temp_dir().join("vimcode_test_1547_active_border_fallback");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test-theme.json");
+        std::fs::write(
+            &path,
+            r##"{
+            "name": "Test Theme",
+            "colors": {
+                "activityBar.foreground": "#93a1a1"
+            }
+        }"##,
+        )
+        .unwrap();
+
+        let theme = Theme::from_vscode_json(&path).unwrap();
+        assert_eq!(theme.activity_bar_fg, try_from_hex("#93a1a1").unwrap());
+        assert_eq!(
+            theme.activity_active_accent,
+            try_from_hex("#93a1a1").unwrap(),
+            "with no explicit `activityBar.activeBorder`, `activity_active_accent` \
+             must fall back to `activityBar.foreground`"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1547: `build_activity_bar`'s `active_accent` must come from the
+    /// dedicated `theme.activity_active_accent` colour, not `theme.cursor`
+    /// (the field it silently borrowed before this issue introduced a
+    /// colour dedicated to the activity-bar accent — see that field's own
+    /// doc). `vscode_light`'s `cursor` (`#000000`) and
+    /// `activity_active_accent` (`#646e6e`) are deliberately different, so
+    /// a regression back to `theme.cursor` fails loudly here rather than
+    /// only looking wrong on screen.
+    ///
+    /// Note: as of #1434, `render::build_activity_bar` itself has no
+    /// production caller — `App` renders through
+    /// `quadraui::compose::app_shell::AppShell::build_activity_bar`
+    /// instead, which hardcodes `active_accent: None` pending a quadraui
+    /// hook (that function's own doc cites quadraui#381). This test pins
+    /// the adapter's own field-mapping correctness so it's ready the
+    /// moment such a hook lands and vimcode wires this function (or its
+    /// theme field) back in; it does not claim the accent line paints in
+    /// the shipped app today.
+    #[test]
+    fn build_activity_bar_active_accent_uses_activity_active_accent_not_cursor() {
+        let engine = crate::core::Engine::new_for_test();
+        let theme = Theme::vscode_light();
+        assert_ne!(
+            theme.cursor, theme.activity_active_accent,
+            "fixture must use a theme where the two colours differ, or this \
+             test can't distinguish the fix from the bug"
+        );
+
+        let bar = build_activity_bar(&engine, &theme, true, None);
+
+        let expected = quadraui::Color::rgb(
+            theme.activity_active_accent.r,
+            theme.activity_active_accent.g,
+            theme.activity_active_accent.b,
+        );
+        assert_eq!(bar.active_accent, Some(expected));
     }
 
     /// #1127: `themes_dir()` must derive from the cross-platform
@@ -26658,6 +28819,48 @@ mod tests {
         );
     }
 
+    /// #1541: the ruler segment is the right-most segment of the active
+    /// window's bar, so its own text must not carry a trailing space —
+    /// quadraui#1155 now reserves that outer-edge margin on pixel backends
+    /// (GTK/Win/macOS), and TUI has never had a scrollbar-style gutter to
+    /// hide a trailing blank column in. A stray trailing space here would
+    /// double the gap on the backends that already get one and would be a
+    /// visible dangling blank on TUI, which gets none.
+    ///
+    /// RED against the pre-#1541 body (`format!(" Ln {}, Col {} ", ...)`,
+    /// trailing space included): `right_text` ends in `" "`, and this
+    /// assertion fails — confirmed by reverting just this segment's format
+    /// string and re-running.
+    #[test]
+    fn test_window_status_line_ruler_segment_has_no_trailing_space() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.settings.ruler = true;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let last = status
+            .right_segments
+            .last()
+            .expect("ruler on: the active window's bar must have a right-most segment");
+        assert!(
+            last.text.contains("Ln 1"),
+            "expected the ruler to be the right-most segment, got '{}'",
+            last.text
+        );
+        assert!(
+            !last.text.ends_with(' '),
+            "the right-most segment must not carry a trailing space \
+             (quadraui#1155 gives pixel backends their own outer edge \
+             inset); got {:?}",
+            last.text
+        );
+    }
+
     #[test]
     fn test_window_status_line_inactive() {
         use crate::core::engine::Engine;
@@ -26679,6 +28882,44 @@ mod tests {
         for seg in &status.left_segments {
             assert_eq!(seg.fg, theme.status_inactive_fg);
         }
+    }
+
+    /// #1541: same claim as
+    /// [`test_window_status_line_ruler_segment_has_no_trailing_space`], for
+    /// the inactive-window bar's own (differently-formatted, no leading
+    /// space) ruler segment.
+    ///
+    /// RED against the pre-#1541 body (`format!("Ln {}, Col {} ", ...)`):
+    /// the segment ends in `" "` and this assertion fails — confirmed by
+    /// reverting just this segment's format string and re-running.
+    #[test]
+    fn test_window_status_line_inactive_ruler_segment_has_no_trailing_space() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.settings.ruler = true;
+        engine.buffer_mut().insert(0, "hello world\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, false);
+
+        let last = status
+            .right_segments
+            .last()
+            .expect("ruler on: the inactive window's bar must have a right-most segment");
+        assert!(
+            last.text.contains("Ln 1"),
+            "expected the ruler to be the right-most segment, got '{}'",
+            last.text
+        );
+        assert!(
+            !last.text.ends_with(' '),
+            "the right-most segment must not carry a trailing space \
+             (quadraui#1155 gives pixel backends their own outer edge \
+             inset); got {:?}",
+            last.text
+        );
     }
 
     #[test]
@@ -26980,6 +29221,261 @@ mod tests {
         }
     }
 
+    // ── Status bar polish (#1548) ────────────────────────────────────────
+    //
+    // Black-box coverage note (#1548 review): the six tests below are
+    // ordinary unit tests against `build_window_status_line`/
+    // `handle_status_action` — they assert on the returned `StatusSegment`/
+    // `quickfix` struct fields, not on anything actually painted, and an
+    // earlier revision of this PR mislabeled them as "black-box tests" in
+    // the commit message. That label was wrong: this is exactly the
+    // "state populated, not painted" gap CLAUDE.md's `ScreenLayout.picker`
+    // history warns about. The real driver-tier coverage for the new
+    // clickable `ShowDiagnostics` counter, the `UTF-8` encoding label, the
+    // language display name, and the branch icon lives in
+    // `src/gtk/testing.rs`'s
+    // `status_bar_1548_polish_paints_and_problems_counter_click_opens_workspace_quickfix`,
+    // which asserts each segment's text actually paints
+    // (`GtkDriver::screen_contains`) and drives a real click at the
+    // painted problems-counter segment (recovered from
+    // `status_segment_map`, never a hardcoded coordinate), asserting the
+    // quickfix panel actually paints the diagnostic text — mirroring the
+    // established `status_bar_segment_click_opens_go_to_line_picker` (#672)
+    // precedent for this exact regression class. The unit tests below are
+    // kept alongside it because they pin down the segment *content*
+    // (exact text, per-severity counts, display-name mapping) more
+    // precisely and more cheaply than a pixel/text-search assertion could.
+
+    /// #1548: the problems counter must always paint, even with zero
+    /// diagnostics — VS Code shows `0`/`0`, not nothing, and the previous
+    /// per-window bar had no counter segment at all (only the older,
+    /// non-window `build_status_line`/`build_global_status_bar` had a
+    /// diagnostics blob, and it hid entirely at zero). RED against the
+    /// pre-fix body (no errors/warnings segments in `right`): this search
+    /// for a `ShowDiagnostics`-actioned segment found nothing and the
+    /// assertion failed — confirmed by reverting the `errors_seg`/
+    /// `warnings_seg` push and re-running.
+    #[test]
+    fn test_window_status_line_problems_counter_always_shown_at_zero() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.buffer_mut().insert(0, "hello\n");
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let diag_segs: Vec<&StatusSegment> = status
+            .right_segments
+            .iter()
+            .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
+            .collect();
+        assert_eq!(
+            diag_segs.len(),
+            2,
+            "expected an error segment and a warning segment, both clickable"
+        );
+        let combined: String = diag_segs.iter().map(|s| s.text.clone()).collect();
+        assert!(
+            combined.contains(crate::icons::STATUS_ERROR.s()),
+            "expected the error icon even at zero, got '{combined}'"
+        );
+        assert!(
+            combined.contains(crate::icons::STATUS_WARNING.s()),
+            "expected the warning icon even at zero, got '{combined}'"
+        );
+        assert!(
+            combined.contains('0'),
+            "expected a zero count painted, got '{combined}'"
+        );
+    }
+
+    /// #1548: once diagnostics exist, the painted counts must reflect them
+    /// (not just prove the segment exists at zero, above).
+    #[test]
+    fn test_window_status_line_problems_counter_reflects_diagnostic_counts() {
+        use crate::core::engine::Engine;
+        use crate::core::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+        use std::path::PathBuf;
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.active_buffer_state_mut().file_path = Some(PathBuf::from("/tmp/test_1548.rs"));
+        engine.lsp_diagnostics.insert(
+            PathBuf::from("/tmp/test_1548.rs"),
+            vec![
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "e1".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Error,
+                    message: "e2".to_string(),
+                    source: None,
+                    code: None,
+                },
+                Diagnostic {
+                    range: LspRange::default(),
+                    severity: DiagnosticSeverity::Warning,
+                    message: "w1".to_string(),
+                    source: None,
+                    code: None,
+                },
+            ],
+        );
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+        let combined: String = status
+            .right_segments
+            .iter()
+            .filter(|s| s.action == Some(StatusAction::ShowDiagnostics))
+            .map(|s| s.text.clone())
+            .collect();
+        assert!(
+            combined.contains(&format!("{} 2", crate::icons::STATUS_ERROR.s())),
+            "expected 2 errors painted, got '{combined}'"
+        );
+        assert!(
+            combined.contains(&format!("{} 1", crate::icons::STATUS_WARNING.s())),
+            "expected 1 warning painted, got '{combined}'"
+        );
+    }
+
+    /// #1548: clicking the problems counter opens the workspace-wide
+    /// Problems (quickfix) list. RED against the pre-fix `StatusAction`
+    /// enum (no `ShowDiagnostics` variant existed, so this action id could
+    /// not resolve at all) — confirmed by reverting the enum + dispatch
+    /// addition and re-running.
+    #[test]
+    fn test_status_action_show_diagnostics_opens_quickfix() {
+        use crate::core::engine::Engine;
+        use crate::core::lsp::{Diagnostic, DiagnosticSeverity, LspRange};
+        use std::path::PathBuf;
+
+        let mut engine = Engine::new();
+        engine.lsp_diagnostics.insert(
+            PathBuf::from("/tmp/test_1548_qf.rs"),
+            vec![Diagnostic {
+                range: LspRange::default(),
+                severity: DiagnosticSeverity::Error,
+                message: "boom".to_string(),
+                source: None,
+                code: None,
+            }],
+        );
+
+        engine.handle_status_action(&StatusAction::ShowDiagnostics);
+
+        assert!(engine.quickfix.open, "expected the quickfix list to open");
+        assert_eq!(engine.quickfix.items.len(), 1);
+        assert!(engine.quickfix.items[0].line_text.contains("boom"));
+    }
+
+    /// #1548: the encoding segment must read `UTF-8`, matching VS Code's
+    /// casing — not the lowercase `utf-8` the bar used to paint. RED
+    /// against the pre-fix `"utf-8 "` literal.
+    #[test]
+    fn test_window_status_line_encoding_label_is_uppercase() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let enc = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeEncoding))
+            .expect("expected a ChangeEncoding segment");
+        assert_eq!(enc.text, "UTF-8 ");
+    }
+
+    /// #1548: the language segment must show the display name ("Rust"),
+    /// not the internal LSP id ("rust") the bar used to paint verbatim.
+    /// RED against the pre-fix `format!("{} ", filetype)` body.
+    #[test]
+    fn test_window_status_line_language_segment_uses_display_name() {
+        use crate::core::engine::Engine;
+
+        // Unique per (process, thread) so concurrent test runs can never
+        // collide on this path (#1548 review nit — the fixed-name version
+        // this replaced was low-risk but diverged from the unique-temp-name
+        // convention used elsewhere, e.g. `src/gtk/testing.rs`'s
+        // `gutter_click_opens_diagnostic_hover_for_a_non_canonical_buffer_path_on_gtk`).
+        let rs_path = std::env::temp_dir().join(format!(
+            "vimcode_status_bar_1548_{}_{:?}.rs",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&rs_path, "fn main() {}\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        let _ = engine.open_file_with_mode(&rs_path, crate::core::engine::OpenMode::Permanent);
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let lang = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ChangeLanguage))
+            .expect("expected a ChangeLanguage segment");
+        assert_eq!(lang.text, "Rust ");
+        assert!(
+            !lang.text.contains("rust"),
+            "must not leak the internal lowercase id"
+        );
+
+        let _ = std::fs::remove_file(&rs_path);
+    }
+
+    #[test]
+    fn language_display_name_maps_known_ids_and_falls_back_gracefully() {
+        assert_eq!(language_display_name("rust"), "Rust");
+        assert_eq!(language_display_name("typescriptreact"), "TypeScript React");
+        assert_eq!(language_display_name("csharp"), "C#");
+        // Unknown id: soft fallback, not a blank string.
+        assert_eq!(language_display_name("brainfuck"), "Brainfuck");
+    }
+
+    /// #1548: the branch segment must be prefixed with the branch icon via
+    /// the shared `Icon` constant, not painted as bare text. RED against
+    /// the pre-fix body (`format!("  {}", branch_text)`, no icon at all).
+    #[test]
+    fn test_window_status_line_branch_segment_has_icon_prefix() {
+        use crate::core::engine::Engine;
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.git_branch = Some("main".to_string());
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let branch = status
+            .left_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::SwitchBranch))
+            .expect("expected a SwitchBranch segment");
+        assert!(
+            branch.text.contains(crate::icons::GIT_BRANCH.s()),
+            "expected the branch icon in '{}'",
+            branch.text
+        );
+        assert!(branch.text.contains("main"));
+    }
+
     #[test]
     fn test_status_line_ending_segment() {
         use crate::core::engine::Engine;
@@ -27022,6 +29518,132 @@ mod tests {
             "expected 'Spaces: 4', got '{}'",
             indent_seg.text
         );
+    }
+
+    /// #1540: the sidebar/panel/menu-bar status-bar toggles and the
+    /// done-notification bell used to be raw PUA literals embedded directly
+    /// in `build_window_status_line` (and `notification_seg` just above
+    /// it), invisible to `scripts/gen_icon_font.py`/
+    /// `tests/icon_font_coverage.rs` (both scan only `src/icons.rs`), so the
+    /// bundled subset font never picked up their codepoints and they
+    /// painted as tofu wherever the system font's PUA table didn't happen
+    /// to agree with a Nerd Font's. Asserts the *rendered segment text*
+    /// (not some intermediate flag) matches what the tracked
+    /// `crate::icons::STATUS_*` constants resolve to, in both the Nerd Font
+    /// and ASCII fallback cases -- a coupling guard against future drift
+    /// between this function and `icons.rs` (e.g. one side's fallback
+    /// string changing without the other).
+    ///
+    /// This test alone does **not** go red against the pre-#1540 code: the
+    /// old hand-typed literals (`if nf { " <glyph> " } else { " [P] " }`,
+    /// etc.) rendered byte-identical text to today's `STATUS_*` constants, so a
+    /// text-equality assertion here can't distinguish "sourced from
+    /// `icons.rs`" from "hand-typed to look the same". The actual bug --
+    /// the bundled subset font not containing these codepoints, i.e. tofu
+    /// on any system font that doesn't happen to share a Nerd Font's PUA
+    /// assignment -- is what `tests/icon_font_coverage.rs`'s
+    /// `bundled_font_covers_every_icon_codepoint` and (for the raw-literal
+    /// root cause) `no_raw_pua_literals_outside_icons_rs` cover, and both
+    /// were confirmed red against the pre-fix `src/render.rs`/
+    /// `src/core/lsp.rs`/`data/fonts/vimcode-icons.ttf` (13 missing
+    /// codepoints; 20 raw-literal violations) before this fix, green after.
+    #[test]
+    fn test_status_bar_toggle_and_bell_glyphs_come_from_icons_rs_constants() {
+        use crate::core::engine::Engine;
+
+        // ── Nerd Fonts on (default) ──────────────────────────────────────
+        crate::icons::set_nerd_fonts(true);
+        let mut engine = Engine::new();
+        engine.settings.window_status_line = true;
+        engine.menu_bar_toggleable = true;
+        let notif_id = engine.notify(crate::core::engine::NotificationKind::GitOperation, "done");
+        engine.notify_done(notif_id, None);
+
+        let theme = Theme::onedark();
+        let wid = engine.active_window_id();
+        let status = build_window_status_line(&engine, &theme, wid, true);
+
+        let panel_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::TogglePanel))
+            .expect("expected panel toggle segment");
+        assert_eq!(
+            panel_seg.text,
+            format!(" {} ", crate::icons::STATUS_PANEL_TOGGLE.s()),
+            "panel toggle segment text must come from STATUS_PANEL_TOGGLE"
+        );
+        assert!(
+            panel_seg
+                .text
+                .contains(crate::icons::STATUS_PANEL_TOGGLE.nerd),
+            "expected the tracked STATUS_PANEL_TOGGLE nerd glyph, got '{}'",
+            panel_seg.text
+        );
+
+        let sidebar_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleSidebar))
+            .expect("expected sidebar toggle segment");
+        assert_eq!(
+            sidebar_seg.text,
+            format!(" {} ", crate::icons::STATUS_SIDEBAR_TOGGLE.s())
+        );
+
+        let menu_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleMenuBar))
+            .expect("expected menu toggle segment (menu_bar_toggleable = true)");
+        assert_eq!(
+            menu_seg.text,
+            format!(" {} ", crate::icons::STATUS_MENU_TOGGLE.s())
+        );
+
+        let bell_seg = status
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::DismissNotifications))
+            .expect("expected done-notification bell segment");
+        assert!(
+            bell_seg.text.contains(crate::icons::STATUS_BELL_DONE.nerd),
+            "expected the tracked STATUS_BELL_DONE nerd glyph, got '{}'",
+            bell_seg.text
+        );
+
+        // ── Nerd Fonts off (ASCII fallback) ──────────────────────────────
+        crate::icons::set_nerd_fonts(false);
+        let status_ascii = build_window_status_line(&engine, &theme, wid, true);
+        let panel_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::TogglePanel))
+            .expect("expected panel toggle segment");
+        assert_eq!(panel_seg_ascii.text, " [P] ");
+        let sidebar_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleSidebar))
+            .expect("expected sidebar toggle segment");
+        assert_eq!(sidebar_seg_ascii.text, " [S] ");
+        let menu_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::ToggleMenuBar))
+            .expect("expected menu toggle segment");
+        assert_eq!(menu_seg_ascii.text, " [M] ");
+        let bell_seg_ascii = status_ascii
+            .right_segments
+            .iter()
+            .find(|s| s.action == Some(StatusAction::DismissNotifications))
+            .expect("expected done-notification bell segment");
+        assert!(bell_seg_ascii.text.contains('*'));
+
+        // Restore the default so this test can't leak into others on the
+        // same worker thread (icons.rs's USE_NERD_FONTS is thread-local,
+        // but cargo test can reuse worker threads across tests).
+        crate::icons::set_nerd_fonts(true);
     }
 
     #[test]
@@ -29917,6 +32539,132 @@ mod tests {
         ));
     }
 
+    // ── Outer window resize grip (#1528) ─────────────────────────────────
+    //
+    // Black-box coverage note (#1528 review, blocking finding #1/#2): this
+    // section is unit tests, not a `GtkDriver` black-box test, and that is a
+    // deliberate, stated exemption — not an oversight or a substitute chosen
+    // for convenience. `src/gtk/testing.rs`'s own module doc says "No
+    // window": `App::new_headless` never captures a `gtk4::Window`, so the
+    // pinned quadraui rev's `GtkBackend::begin_window_resize`,
+    // `begin_window_drag`, and `set_cursor` all early-return `false`/no-op on
+    // `self.window.is_none()` before touching anything a test could observe.
+    // Worse, `begin_window_resize`/`begin_window_drag` also require a
+    // `self.pending_window_press` captured from a *real* GDK press event
+    // (device/button/x/y/time) — something only `gtk/run.rs`'s live event
+    // controllers populate, never `GtkDriver::dispatch`'s synthesised
+    // `UiEvent`s. So in headless mode the resize-press block in
+    // `App::handle` never actually consumes the event either way (old
+    // full-row-height grip or this PR's thin grip) — both silently no-op
+    // and fall through — which means the specific real-world regression
+    // #1528 describes (a live window's resize arming and swallowing the
+    // press before the scrollbar/minimap/command-line ever sees it) cannot
+    // be reproduced through the existing harness at all, in either
+    // direction. This mirrors commit `4e2bd1e` ("wire GTK window
+    // edge-resize + resize cursor"), which shipped no test for the same
+    // reason ("Needs a real WM to smoke (Xvfb has no compositor)").
+    //
+    // What IS extracted and unit-tested below, because it doesn't need a
+    // window at all: `WINDOW_RESIZE_GRIP_PX`'s value (a regression guard on
+    // the constant, not the dispatch order) and
+    // `resize_edge_overlaps_change_review_band` (the actual decision
+    // function `App::handle` calls for blocking finding #3's fix, tested
+    // directly against its own inputs/outputs — this one *is* production
+    // logic, not just a constant, and the test fails if the logic
+    // regresses).
+    //
+    // Manual smoke test (see this fix's `SMOKE_TESTS` in the commit/PR):
+    // drag from each outer edge and corner of a live GTK window, with and
+    // without a change-review surface open, and confirm the cursor and
+    // resize both behave as the acceptance criteria describe.
+
+    /// #1528: the grip must be thin — a handful of pixels, VS Code/Electron
+    /// style — not `backend.line_height()` (16-22px). A full row-height grip
+    /// is exactly what made North/South resize dead: it made the grip band as
+    /// tall as the title bar / command-line rows, so those rows' own
+    /// unconditional click handling always resolved first. Pinned as an
+    /// upper bound well below any real line height so a future edit can't
+    /// silently widen the constant back into that failure mode; see
+    /// `WINDOW_RESIZE_GRIP_PX`'s own doc for the full rationale.
+    #[test]
+    fn window_resize_grip_is_a_thin_pixel_margin_not_a_row_height() {
+        assert!(
+            WINDOW_RESIZE_GRIP_PX > 0.0,
+            "a zero-width grip could never resize at all"
+        );
+        assert!(
+            WINDOW_RESIZE_GRIP_PX <= 8.0,
+            "grip {WINDOW_RESIZE_GRIP_PX}px is no longer a thin pixel margin \
+             — a real GTK title-bar/command-line row is comfortably taller \
+             than this, which is the whole point (#1528)"
+        );
+    }
+
+    /// #1528: the grip must stay inside the vertical scrollbar's own gutter
+    /// (`scroll_gutter_width`, `scrollbar_reserve.max(char_width)`) rather
+    /// than reach past it into the minimap strip, which paints a further
+    /// full gutter-width in from the pane's true right edge (see the doc
+    /// comment above `render_engine`'s `minimap_widths`/`minimap`
+    /// construction, #1094) — i.e. the minimap's rightmost column is always
+    /// safely beyond the grip as long as the grip doesn't exceed the
+    /// scrollbar's own column width. Checked across a realistic range of GTK
+    /// char widths — from a small readable font up to a very large one —
+    /// with `scrollbar_reserve` at its common `0.0` (overlay-scrollbar,
+    /// #828/quadraui#776) so the gutter collapses to `char_width` alone, the
+    /// tightest case.
+    #[test]
+    fn window_resize_grip_stays_inside_the_scrollbar_gutter() {
+        for char_width in [6.0_f64, 7.0, 8.8, 11.0, 16.0, 24.0] {
+            let gutter = scroll_gutter_width(0.0, char_width);
+            assert!(
+                f64::from(WINDOW_RESIZE_GRIP_PX) <= gutter,
+                "grip {WINDOW_RESIZE_GRIP_PX}px exceeds the scroll gutter \
+                 ({gutter}px) at char_width {char_width}px — it would reach \
+                 past the vertical scrollbar's own column into the minimap \
+                 strip beyond it"
+            );
+        }
+    }
+
+    /// #1528 review (blocking finding #3): the change-review guard on the
+    /// edge-resize press must cover only the edges that actually overlap the
+    /// change-review surface's own first row — `North`/`NorthEast`/
+    /// `NorthWest` — and must NOT cover `South`/`SouthEast`/`SouthWest`/
+    /// `East`/`West`. A regression that widened the guard back to "every
+    /// edge" (the bug this test pins) would silently make a user unable to
+    /// resize from any edge at all while a change-review surface is open,
+    /// which is exactly the scope-creep the review caught.
+    ///
+    /// RED against the reverted fix: if `resize_edge_overlaps_change_review_
+    /// band` unconditionally returned `true` (i.e. `App::handle` gated ALL
+    /// edges on `change_review_open`, as this PR did before the fix), every
+    /// `assert!(!...)` below would fail. Verified by hand: with the function
+    /// body swapped for a bare `true`, `cargo test --lib resize_edge_overlaps`
+    /// fails at the `!resize_edge_overlaps_change_review_band(ResizeEdge::
+    /// South)` assertion.
+    #[test]
+    fn resize_edge_overlaps_change_review_band_only_covers_the_top() {
+        use quadraui::ResizeEdge;
+
+        assert!(resize_edge_overlaps_change_review_band(ResizeEdge::North));
+        assert!(resize_edge_overlaps_change_review_band(
+            ResizeEdge::NorthEast
+        ));
+        assert!(resize_edge_overlaps_change_review_band(
+            ResizeEdge::NorthWest
+        ));
+
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::South));
+        assert!(!resize_edge_overlaps_change_review_band(
+            ResizeEdge::SouthEast
+        ));
+        assert!(!resize_edge_overlaps_change_review_band(
+            ResizeEdge::SouthWest
+        ));
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::East));
+        assert!(!resize_edge_overlaps_change_review_band(ResizeEdge::West));
+    }
+
     #[test]
     fn command_line_selection_allowed_gates_on_mode_and_message() {
         let mut e = Engine::new();
@@ -31893,6 +34641,62 @@ mod tests {
         assert_eq!(rect, quadraui::Rect::new(300.0, 40.0, 600.0, 500.0));
     }
 
+    /// #1586 (the "unit test on group geometry" acceptance bullet): for a
+    /// stacked (`Ctrl+W s`) group split, no *painted* divider rect may
+    /// intersect either group's own tab-row band.
+    ///
+    /// `GroupLayout::calculate_group_rects`/`dividers` are unchanged by
+    /// #1586 (`GroupDivider::position` for a stacked split still coincides
+    /// exactly with the lower group's tab-row top — see
+    /// [`painted_group_dividers`]'s doc for why that geometry is fine to
+    /// leave alone) — so this pins the *paint-time* invariant instead: after
+    /// [`painted_group_dividers`] filters `GroupLayout::dividers`'s raw
+    /// output, nothing left in the result can ever land inside a tab-row
+    /// band, because a stacked entry never survives the filter at all.
+    ///
+    /// Asserts both halves, so this cannot pass vacuously: (1) the *raw*
+    /// divider genuinely does intersect the lower group's tab-row band —
+    /// proving the filter is doing real work, not filtering nothing — and
+    /// (2) the *painted* (filtered) set is empty, so no rect from it can
+    /// intersect anything.
+    #[test]
+    fn painted_group_dividers_excludes_stacked_entries_that_intersect_tab_rows_1586() {
+        use crate::core::window::{GroupId, GroupLayout, WindowRect};
+
+        let mut layout = GroupLayout::leaf(GroupId(0));
+        layout.split_at(GroupId(0), SplitDirection::Horizontal, GroupId(1), false);
+        let bounds = WindowRect::new(0.0, 0.0, 80.0, 24.0);
+        let tab_bar_height = 1.0;
+
+        let rects = layout.calculate_group_rects(bounds, tab_bar_height);
+        let dividers = layout.dividers(bounds, &mut 0);
+        assert_eq!(dividers.len(), 1);
+        let raw = &dividers[0];
+        assert_eq!(raw.direction, SplitDirection::Horizontal);
+
+        // (1) The raw geometry really does collide with the lower group's
+        // tab row — `GroupTabBar::bounds`'s own doc says that band is
+        // `[rect.y - tab_bar_height, rect.y)`.
+        let lower_tab_row = rects
+            .iter()
+            .map(|(_, r)| (r.y - tab_bar_height, r.y))
+            .find(|&(top, _)| (raw.position - top).abs() < 0.001)
+            .expect("the raw divider's position must coincide with some group's tab-row top");
+        assert!(
+            raw.position >= lower_tab_row.0 && raw.position < lower_tab_row.1,
+            "raw divider at {} must fall inside tab row {lower_tab_row:?} — \
+             otherwise there'd be nothing for `painted_group_dividers` to filter",
+            raw.position
+        );
+
+        // (2) After filtering, nothing paints there at all.
+        let painted = painted_group_dividers(&dividers);
+        assert!(
+            painted.is_empty(),
+            "a stacked split must paint no group-divider line at all (#1586); got {painted:?}"
+        );
+    }
+
     // ── Menu-bar app icon geometry (#720) ────────────────────────────────
 
     #[test]
@@ -32274,9 +35078,9 @@ mod mouse_drag_router_tests {
                 MouseDragRoute::SidebarResize,
             ),
             (
-                "sidebar drag-and-drop",
-                |s| s.sidebar_dnd = true,
-                MouseDragRoute::SidebarBody,
+                "explorer drag-and-drop",
+                |s| s.explorer_dnd_active = true,
+                MouseDragRoute::ExplorerDnd,
             ),
             (
                 "tab drag",
@@ -32332,6 +35136,48 @@ mod mouse_drag_router_tests {
         }
     }
 
+    /// #1429: `apply_explorer_drag_move` promotes an armed source into an
+    /// active `(src, target)` pair once the pointer reaches a different
+    /// row, and `apply_explorer_drop` turns that pair into the same
+    /// move-confirm dialog `Engine::confirm_move_file` always opens.
+    #[test]
+    fn explorer_drag_move_then_drop_opens_confirm_move_dialog() {
+        let mut engine = Engine::new_for_test();
+        engine.explorer_rows = vec![
+            crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: "afile".into(),
+                path: std::path::PathBuf::from("/tmp/afile"),
+                is_dir: false,
+                is_expanded: false,
+            },
+            crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: "adir".into(),
+                path: std::path::PathBuf::from("/tmp/adir"),
+                is_dir: true,
+                is_expanded: false,
+            },
+        ];
+        let rect = quadraui::Rect::new(0.0, 0.0, 40.0, 10.0);
+        let mut src = Some(0usize);
+        let mut active: Option<(usize, Option<usize>)> = None;
+        apply_explorer_drag_move(&engine, rect, 1.0, 5.0, 1.0, &mut src, &mut active);
+        assert_eq!(
+            active,
+            Some((0, Some(1))),
+            "moving onto row 1 must activate the drag with that row as the target"
+        );
+        if let Some((s, t)) = active.take() {
+            apply_explorer_drop(&mut engine, s, t);
+        }
+        assert!(
+            engine.dialog.is_some(),
+            "dropping a file row onto a directory row must open the \
+             move-confirm dialog"
+        );
+    }
+
     /// A held drag over the minimap strip belongs to the minimap.
     ///
     /// Red against unfixed `develop`: there was no shared drag router at all,
@@ -32383,8 +35229,8 @@ mod mouse_drag_router_tests {
     /// instead of continuing to extend the editor selection. `text_selection_active`
     /// is the guard: pins that once a selection has started extending
     /// (`Engine::mouse_drag_active`), it keeps winning over both geometric
-    /// rungs, the same way `sidebar_dnd` keeps winning over the editor once an
-    /// explorer drag has been picked up.
+    /// rungs, the same way `explorer_dnd_active` keeps winning over the
+    /// editor once an explorer drag has been picked up.
     #[test]
     fn a_selection_already_extending_beats_the_minimap_and_terminal_geometry() {
         let engine = drag_engine();
@@ -32803,7 +35649,7 @@ mod slice7_router_tests {
     ///
     /// **Verified RED by reordering one rung on one backend:** move
     /// `render::route_debug_fkey` above `render::route_terminal_key` in
-    /// `TuiShellApp::handle_key_pressed` and
+    /// the pre-#1434 TUI shell's `handle_key_pressed` and
     /// `terminal_keeps_its_own_function_keys` below fails — a focused PTY
     /// stops receiving F5 and the debugger starts a session instead.
     #[test]
@@ -33176,7 +36022,7 @@ mod slice7_router_tests {
         );
     }
 
-    // ── #902: menu_style → native-vs-in-window resolution ────────────────
+    // ── #1580: menu_style → quadraui::MenuStyle, native-vs-in-window ─────
 
     fn caps_with_native_menu(native_menu: bool) -> quadraui::BackendCaps {
         quadraui::BackendCaps {
@@ -33185,20 +36031,48 @@ mod slice7_router_tests {
         }
     }
 
-    /// `Native` and `Inherit` both defer to the backend's own capability —
-    /// they never force a native popup onto a backend that can't paint one
-    /// (GTK, TUI), matching #901's identical gate for the menu bar.
+    /// `to_quadraui_menu_style` is a straight 1:1 translation — no
+    /// capability logic lives here any more (that's
+    /// `quadraui::MenuStyle::resolve`, exercised below against a real
+    /// `BackendCaps`).
     #[test]
-    fn context_menu_should_be_native_follows_capability_for_native_and_inherit() {
+    fn to_quadraui_menu_style_maps_every_variant() {
         use crate::core::settings::MenuStyle;
 
-        for style in [MenuStyle::Native, MenuStyle::Inherit] {
-            assert!(
-                context_menu_should_be_native(style, caps_with_native_menu(true)),
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Auto),
+            quadraui::MenuStyle::Auto
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Native),
+            quadraui::MenuStyle::Native
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom),
+            quadraui::MenuStyle::Custom
+        );
+    }
+
+    /// `Auto` and `Native` both defer to the backend's own capability via
+    /// `quadraui::MenuStyle::resolve` — they never force a native popup
+    /// onto a backend that can't paint one (GTK, TUI), matching #901's
+    /// identical gate for the menu bar. This is quadraui's own contract
+    /// (covered by its own unit tests), pinned here so a future
+    /// `to_quadraui_menu_style` regression that mis-maps a variant would
+    /// still be caught end-to-end.
+    #[test]
+    fn menu_style_resolves_native_only_with_capability() {
+        use crate::core::settings::MenuStyle;
+
+        for style in [MenuStyle::Auto, MenuStyle::Native] {
+            assert_eq!(
+                to_quadraui_menu_style(style).resolve(&caps_with_native_menu(true)),
+                quadraui::ResolvedMenuStyle::Native,
                 "{style:?} must resolve to native when the backend has one"
             );
-            assert!(
-                !context_menu_should_be_native(style, caps_with_native_menu(false)),
+            assert_eq!(
+                to_quadraui_menu_style(style).resolve(&caps_with_native_menu(false)),
+                quadraui::ResolvedMenuStyle::Custom,
                 "{style:?} must fall back to in-window when the backend has \
                  no native context menu"
             );
@@ -33209,35 +36083,27 @@ mod slice7_router_tests {
     /// a native popup — the escape hatch VS Code's `window.menuStyle:
     /// custom` provides.
     #[test]
-    fn context_menu_should_be_native_custom_never_resolves_native() {
+    fn menu_style_custom_never_resolves_native() {
         use crate::core::settings::MenuStyle;
 
-        assert!(!context_menu_should_be_native(
-            MenuStyle::Custom,
-            caps_with_native_menu(true)
-        ));
-        assert!(!context_menu_should_be_native(
-            MenuStyle::Custom,
-            caps_with_native_menu(false)
-        ));
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom).resolve(&caps_with_native_menu(true)),
+            quadraui::ResolvedMenuStyle::Custom
+        );
+        assert_eq!(
+            to_quadraui_menu_style(MenuStyle::Custom).resolve(&caps_with_native_menu(false)),
+            quadraui::ResolvedMenuStyle::Custom
+        );
     }
 
-    /// `paint_context_menu_rung`'s native branch must skip
-    /// `Backend::draw_context_menu` entirely and return `None` — there is
-    /// no in-window layout to cache when nothing was painted in-window.
-    /// The `false` branch is the pre-#902 behaviour: it must still call
-    /// `draw_context_menu` and return `Some`.
-    ///
-    /// Uses `quadraui::testing::RecordingBackend` (a fully-implemented
-    /// `Backend` mock built for exactly this — `Backend` is a sealed
-    /// trait, so a bespoke local stub can't implement it directly).
-    /// `RecordingBackend::show_context_menu` is the trait's own no-op
-    /// default and isn't recorded, so this test can't observe *that* call
-    /// directly; what it can and does prove is the half that matters for
-    /// #902's "no in-window paint" acceptance criterion:
-    /// `draw_context_menu` is never reached.
+    /// `paint_context_menu_rung` always paints in-window now (#1580) — the
+    /// native path moved to `show_context_menu_now`, called at
+    /// event-handler time instead of from this render rung. This is the
+    /// RED-able regression pin for that split: it proves the rung this
+    /// file owns still calls `draw_context_menu` and returns the painted
+    /// layout.
     #[test]
-    fn paint_context_menu_rung_native_skips_the_in_window_draw() {
+    fn paint_context_menu_rung_paints_in_window() {
         let panel = ContextMenuPanel {
             items: vec![ContextMenuRenderItem {
                 label: "Copy".to_string(),
@@ -33252,37 +36118,12 @@ mod slice7_router_tests {
         };
         let viewport = quadraui::Rect::new(0.0, 0.0, 800.0, 600.0);
 
-        let mut native_backend = quadraui::testing::RecordingBackend::new();
-        let native_layout =
-            paint_context_menu_rung(&mut native_backend, &panel, viewport, 8.0, 16.0, 0.0, true);
+        let mut backend = quadraui::testing::RecordingBackend::new();
+        let _layout = paint_context_menu_rung(&mut backend, &panel, viewport, 8.0, 16.0, 0.0);
         assert!(
-            native_layout.is_none(),
-            "native branch must not return a layout"
-        );
-        assert!(
-            !native_backend.calls.contains(&"draw_context_menu"),
-            "native branch must not call draw_context_menu; calls were {:?}",
-            native_backend.calls
-        );
-
-        let mut in_window_backend = quadraui::testing::RecordingBackend::new();
-        let in_window_layout = paint_context_menu_rung(
-            &mut in_window_backend,
-            &panel,
-            viewport,
-            8.0,
-            16.0,
-            0.0,
-            false,
-        );
-        assert!(
-            in_window_layout.is_some(),
-            "non-native branch must return the painted layout"
-        );
-        assert!(
-            in_window_backend.calls.contains(&"draw_context_menu"),
-            "non-native branch must still call draw_context_menu; calls were {:?}",
-            in_window_backend.calls
+            backend.calls.contains(&"draw_context_menu"),
+            "paint_context_menu_rung must call draw_context_menu; calls were {:?}",
+            backend.calls
         );
     }
 

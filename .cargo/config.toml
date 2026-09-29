@@ -1,0 +1,26 @@
+# #1441: `+crt-static` is mandatory for every Windows build of `vcd.exe`.
+#
+# Without it, the MSVC target dynamically links `VCRUNTIME140.dll` (plus the
+# `api-ms-win-crt-*` UCRT forwarders). On a host that lacks the Visual C++
+# redistributable the binary dies before `main()` with *zero* output -- see
+# docs/RELEASING.md Section 1.4. `windows-latest` GitHub runners ship the
+# redist, so a `vcd.exe --version` smoke test in CI/release passes regardless
+# of this flag, which is exactly why v0.13.0 shipped a binary that only ran
+# on hosts that already had the redist installed.
+#
+# This one line covers release.yml's `build-windows` job, ci.yml's
+# `build-windows-tui` job, and any local/`cargo xwin` build of the MSVC
+# target -- nobody has to remember to pass RUSTFLAGS by hand. A `RUSTFLAGS`
+# env var set explicitly (e.g. docs/RELEASING.md Section 1.4,
+# scripts/platform-conformance.sh) still overrides this config, so those
+# invocations keep working unchanged.
+#
+# Note: `.cargo/config.toml` doubles as the opt-in local quadraui
+# co-development override (see `cargo-config-local-quadraui.toml.example`,
+# docs/QUADRAUI_GUIDE.md). Copying that example over this file for local
+# co-dev work will (locally, uncommitted) drop the `+crt-static` flag below --
+# harmless for Linux/GTK dev loops, but restore this file (or merge the
+# `paths = [...]` override in alongside the `[target...]` section below)
+# before trusting a Windows build made while co-developing quadraui locally.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -265,8 +265,9 @@ impl Engine {
                 None
             }
             // "Shift_Tab" is sent by the TUI backend explicitly.
-            // "ISO_Left_Tab" is GDK's key name for Shift+Tab; "BackTab" is the
-            // value produced by map_gtk_key_name("ISO_Left_Tab").  Accept all
+            // "ISO_Left_Tab" is `render::engine_key_from_ui`'s spelling for
+            // `NamedKey::BackTab` (both backends, since #1060); "BackTab" is
+            // kept for any caller still on the pre-#1060 name. Accept all
             // three so backward button cycling works on both backends.
             "Tab" | "Shift_Tab" | "ISO_Left_Tab" | "BackTab" => {
                 let len = dialog.buttons.len();
@@ -607,46 +608,64 @@ impl Engine {
                 // every branch — including a stray "acp_permission" result
                 // for a request that's somehow already gone — produces at
                 // most one reply.
-                let Some((request_id, req)) = self.acp_pending_permission.take() else {
+                let Some((request_id, req)) = self.acp_mut().pending_permission.take() else {
                     return EngineAction::None;
                 };
-                let Some(client) = self.acp_client.as_ref() else {
+                if self.acp().client.is_none() {
                     return EngineAction::None;
-                };
+                }
                 if action == "cancel" {
-                    client.respond_to_client_request(
-                        request_id,
-                        Ok(crate::core::acp::permission_outcome_cancelled()),
-                    );
+                    if let Some(client) = self.acp().client.as_ref() {
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::permission_outcome_cancelled()),
+                        );
+                    }
                     return EngineAction::None;
                 }
                 // Otherwise `action` is the option_id of the button the
                 // human clicked/hotkeyed (`acp_handle_permission_request`
                 // built each `DialogButton::action` from `option_id`).
+                //
+                // Each `client.respond_to_client_request` call below
+                // re-borrows `self.acp().client` immediately before use,
+                // rather than holding one `client` reference across the
+                // `remembered_decisions` mutation in between — the two now
+                // live in the same `AcpSession` behind `Engine::acp_sessions`
+                // (#1463), and unlike separate top-level `Engine` fields, a
+                // `Vec` index can't be borrow-split field-by-field, so an
+                // in-flight `&AcpClient` borrowed via `self.acp()` would
+                // conflict with the `self.acp_mut()` mutation.
                 match req.options.iter().find(|o| o.option_id == action) {
                     Some(opt) => {
                         if opt.kind == "allow_always" {
-                            self.acp_remembered_decisions
+                            self.acp_mut()
+                                .remembered_decisions
                                 .insert(req.tool_call.kind.clone(), true);
                         } else if opt.kind == "reject_always" {
-                            self.acp_remembered_decisions
+                            self.acp_mut()
+                                .remembered_decisions
                                 .insert(req.tool_call.kind.clone(), false);
                         }
-                        client.respond_to_client_request(
-                            request_id,
-                            Ok(crate::core::acp::permission_outcome_selected(
-                                &opt.option_id,
-                            )),
-                        );
+                        if let Some(client) = self.acp().client.as_ref() {
+                            client.respond_to_client_request(
+                                request_id,
+                                Ok(crate::core::acp::permission_outcome_selected(
+                                    &opt.option_id,
+                                )),
+                            );
+                        }
                     }
                     None => {
                         // Shouldn't happen — every dialog button's action
                         // is one of `req.options`' ids — but never leave
                         // the request unanswered on an unrecognized action.
-                        client.respond_to_client_request(
-                            request_id,
-                            Ok(crate::core::acp::permission_outcome_cancelled()),
-                        );
+                        if let Some(client) = self.acp().client.as_ref() {
+                            client.respond_to_client_request(
+                                request_id,
+                                Ok(crate::core::acp::permission_outcome_cancelled()),
+                            );
+                        }
                     }
                 }
                 EngineAction::None
@@ -659,12 +678,13 @@ impl Engine {
                 // reject it. An agent advertising `authMethods` doesn't
                 // necessarily mean auth is *required* right now.
                 if action == "cancel" || action == "acp_auth_skip" {
-                    self.acp_authenticated = true;
+                    self.acp_mut().authenticated = true;
                     self.acp_begin_session();
                     return EngineAction::None;
                 }
                 let Some(method) = self
-                    .acp_auth_methods
+                    .acp_mut()
+                    .auth_methods
                     .iter()
                     .find(|m| m.id == action)
                     .cloned()
@@ -674,19 +694,19 @@ impl Engine {
                     // own ids — but never strand the handshake on an
                     // unrecognized action; fall back to unauthenticated
                     // the same as an explicit skip.
-                    self.acp_authenticated = true;
+                    self.acp_mut().authenticated = true;
                     self.acp_begin_session();
                     return EngineAction::None;
                 };
                 match method.kind {
                     crate::core::acp::AcpAuthMethodKind::Agent => {
-                        if let Some(client) = self.acp_client.as_mut() {
+                        if let Some(client) = self.acp_mut().client.as_mut() {
                             client.authenticate(&method.id);
                             self.message = format!("Authenticating via {}\u{2026}", method.name);
                         }
                     }
                     crate::core::acp::AcpAuthMethodKind::Terminal => {
-                        self.acp_launch_terminal_login(&method.name);
+                        self.acp_launch_terminal_login(&method.name, &method.args);
                     }
                 }
                 EngineAction::None
@@ -1660,6 +1680,14 @@ impl Engine {
                             self.picker_populate_workspace_symbols(symbols);
                             redraw = true;
                         }
+                    } else if self.lsp_pending_ai_mention_symbols == Some(request_id) {
+                        // #1513: `@symbol` mention completion's own
+                        // request — distinct pending-id field from the
+                        // Command Center picker's above, so the two can
+                        // never steal each other's response.
+                        self.lsp_pending_ai_mention_symbols = None;
+                        self.ai_mention_symbol_cache = symbols;
+                        redraw = true;
                     }
                 }
                 LspEvent::WorkProgressBegin {
@@ -1669,12 +1697,17 @@ impl Engine {
                     message,
                     percentage,
                 } => {
+                    // #1583: only request a redraw if the snapshot this
+                    // feeds (the status-bar segment) actually changed — a
+                    // server that repeats an identical begin payload for a
+                    // token it already reported must not force a full
+                    // repaint every time it does. See
+                    // `LspManager::work_progress_begin`'s own doc.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_begin(server_id, token, title, message, percentage);
+                        if mgr.work_progress_begin(server_id, token, title, message, percentage) {
+                            redraw = true;
+                        }
                     }
-                    // Status indicator may change (Running → Initializing
-                    // while indexing) — request a redraw (#450).
-                    redraw = true;
                 }
                 LspEvent::WorkProgressReport {
                     server_id,
@@ -1682,19 +1715,22 @@ impl Engine {
                     message,
                     percentage,
                 } => {
+                    // #1583: ditto — only the message/percentage actually
+                    // changing warrants a redraw of the status segment.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_report(server_id, &token, message, percentage);
+                        if mgr.work_progress_report(server_id, &token, message, percentage) {
+                            redraw = true;
+                        }
                     }
-                    // Message/percentage changed → segment text changed (#221).
-                    redraw = true;
                 }
                 LspEvent::WorkProgressEnd { server_id, token } => {
+                    // #1583: ditto — a stray `end` for a token already gone
+                    // (or already ended) changes nothing on screen.
                     if let Some(mgr) = self.lsp_manager.as_mut() {
-                        mgr.work_progress_end(server_id, &token);
+                        if mgr.work_progress_end(server_id, &token) {
+                            redraw = true;
+                        }
                     }
-                    // Status indicator may change (Initializing → Running
-                    // once indexing completes) — request a redraw (#450).
-                    redraw = true;
                 }
             }
         }
@@ -2360,6 +2396,41 @@ impl Engine {
             .filter(|d| d.severity == DiagnosticSeverity::Warning)
             .count();
         (errors, warnings)
+    }
+
+    /// Flatten every diagnostic currently known across *all* buffers into
+    /// quickfix items, for the status bar's "Problems" counter (#1548) —
+    /// clicking it opens this workspace-wide list, matching VS Code's
+    /// Problems panel (which is workspace-wide even though the status bar
+    /// counter itself, [`Self::diagnostic_counts`], stays scoped to the
+    /// active buffer). Sorted by severity (errors first) and then by file
+    /// and line, so the most actionable entries land at the top regardless
+    /// of which file each buffer happened to report diagnostics for first.
+    pub fn diagnostics_as_quickfix_items(&self) -> Vec<ProjectMatch> {
+        let mut items: Vec<(DiagnosticSeverity, ProjectMatch)> = self
+            .lsp_diagnostics
+            .iter()
+            .flat_map(|(path, diags)| {
+                diags.iter().map(move |d| {
+                    (
+                        d.severity,
+                        ProjectMatch {
+                            file: path.clone(),
+                            line: d.range.start.line as usize,
+                            col: d.range.start.character as usize,
+                            line_text: format!("{}: {}", d.severity.symbol(), d.message),
+                        },
+                    )
+                })
+            })
+            .collect();
+        items.sort_by(|(sev_a, a), (sev_b, b)| {
+            sev_a
+                .cmp(sev_b)
+                .then_with(|| a.file.cmp(&b.file))
+                .then_with(|| a.line.cmp(&b.line))
+        });
+        items.into_iter().map(|(_, m)| m).collect()
     }
 }
 

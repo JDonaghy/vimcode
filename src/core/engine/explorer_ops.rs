@@ -18,6 +18,7 @@ impl Engine {
             &self.explorer_expanded,
             self.settings.show_hidden_files,
             self.settings.explorer_sort_case_insensitive,
+            &self.settings.explorer_exclude,
         );
         if let Some((ref parent_dir, _is_folder)) = self.explorer_new_entry_pending {
             let insert_at = self
@@ -568,6 +569,7 @@ pub fn build_explorer_rows(
     expanded: &HashSet<PathBuf>,
     show_hidden: bool,
     case_insensitive: bool,
+    exclude: &[String],
 ) -> Vec<ExplorerRow> {
     let mut out = Vec::new();
     let root_name = root
@@ -583,9 +585,89 @@ pub fn build_explorer_rows(
         is_expanded: root_expanded,
     });
     if root_expanded {
-        collect_explorer_rows(root, 1, expanded, show_hidden, case_insensitive, &mut out);
+        collect_explorer_rows(
+            root,
+            1,
+            expanded,
+            show_hidden,
+            case_insensitive,
+            exclude,
+            &mut out,
+        );
     }
     out
+}
+
+/// A single `**/name` (or bare `name`) glob from `Settings::explorer_exclude`
+/// matched against an entry's bare file name — see that field's doc for why
+/// only this form is supported. `name` may itself contain `*`/`?` wildcards
+/// (e.g. `**/*.pyc`), matched case-sensitively via
+/// [`explorer_glob_matches`].
+///
+/// Shared by every file-listing surface, not just the explorer tree: the
+/// quick-open file picker ([`Engine::picker_populate_files`]), the ext-panel
+/// `@file` completion walk and the netrw directory listing all filter through
+/// this, so flipping `show_hidden_files` on by default (#1545) can't leak
+/// `.git/` internals into any of them.
+///
+/// [`Engine::picker_populate_files`]: super::Engine
+pub(crate) fn explorer_is_excluded(entry_name: &str, exclude: &[String]) -> bool {
+    exclude.iter().any(|pattern| {
+        let pattern = pattern.strip_prefix("**/").unwrap_or(pattern.as_str());
+        // A pattern with further internal `/` isn't a bare name and can
+        // never match here (see the doc above) — skip it rather than
+        // matching against a path segment it wasn't written for.
+        if pattern.contains('/') {
+            return false;
+        }
+        explorer_glob_matches(pattern, entry_name)
+    })
+}
+
+/// [`explorer_is_excluded`] adapted for an `ignore::WalkBuilder` walk, for use
+/// as a `filter_entry` predicate: excluded *directories* are pruned instead of
+/// descended into and discarded.
+///
+/// The walk root (`depth() == 0`) is never excluded — otherwise opening a
+/// project directory that happens to be named `.git` would yield an entirely
+/// empty file list.
+pub(crate) fn walk_entry_is_excluded(entry: &ignore::DirEntry, exclude: &[String]) -> bool {
+    if entry.depth() == 0 {
+        return false;
+    }
+    explorer_is_excluded(&entry.file_name().to_string_lossy(), exclude)
+}
+
+/// Anchored `*`/`?` glob match, e.g. `explorer_glob_matches("*.pyc", "a.pyc")`.
+/// `*` matches any run of characters (including none), `?` matches exactly
+/// one. No other glob syntax (character classes, brace expansion, `**`) is
+/// recognized — deliberately minimal, since every default
+/// `explorer_exclude` entry is a plain literal name.
+///
+/// This is a naive recursive backtracking matcher with textbook exponential
+/// worst-case behaviour on adversarial patterns with many `*`s (e.g.
+/// `"*a*a*a*a*b"` against a matching-prefix string with no trailing `b`).
+/// `explorer_exclude` is user-configurable via `:set`, so a pathological
+/// (if implausible) hand-entered pattern could stall directory listing.
+/// Accepted for now given the trust boundary (local settings, not external
+/// input) and the small size of every shipped default pattern; if this ever
+/// grows beyond the current handful of literal globs, add a length/segment-
+/// count guard or switch to a linear (e.g. two-pointer) matcher instead of
+/// widening the recursion.
+fn explorer_glob_matches(pattern: &str, name: &str) -> bool {
+    fn matches(pattern: &[char], name: &[char]) -> bool {
+        match pattern.first() {
+            None => name.is_empty(),
+            Some('*') => {
+                matches(&pattern[1..], name) || (!name.is_empty() && matches(pattern, &name[1..]))
+            }
+            Some('?') => !name.is_empty() && matches(&pattern[1..], &name[1..]),
+            Some(c) => name.first() == Some(c) && matches(&pattern[1..], &name[1..]),
+        }
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    matches(&pattern, &name)
 }
 
 /// Ordering used to sort explorer entries: directories before files, then by
@@ -621,6 +703,7 @@ fn collect_explorer_rows(
     expanded: &HashSet<PathBuf>,
     show_hidden: bool,
     case_insensitive: bool,
+    exclude: &[String],
     out: &mut Vec<ExplorerRow>,
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -653,6 +736,9 @@ fn collect_explorer_rows(
         if name.starts_with('.') && !show_hidden {
             continue;
         }
+        if explorer_is_excluded(&name, exclude) {
+            continue;
+        }
         let is_expanded = is_dir && expanded.contains(&path);
         out.push(ExplorerRow {
             depth,
@@ -668,6 +754,7 @@ fn collect_explorer_rows(
                 expanded,
                 show_hidden,
                 case_insensitive,
+                exclude,
                 out,
             );
         }
@@ -843,5 +930,128 @@ mod explorer_sort_tests {
             first_pass,
             vec!["another", "subdir", "alpha.txt", "beta.rs"]
         );
+    }
+}
+
+#[cfg(test)]
+mod explorer_exclude_tests {
+    use super::{build_explorer_rows, explorer_glob_matches, explorer_is_excluded};
+    use std::collections::HashSet;
+
+    #[test]
+    fn glob_matches_literal_name() {
+        assert!(explorer_glob_matches(".git", ".git"));
+        assert!(!explorer_glob_matches(".git", ".gitignore"));
+    }
+
+    #[test]
+    fn glob_matches_star_and_question_wildcards() {
+        assert!(explorer_glob_matches("*.pyc", "foo.pyc"));
+        assert!(explorer_glob_matches("*.pyc", ".pyc"));
+        assert!(!explorer_glob_matches("*.pyc", "foo.pyx"));
+        assert!(explorer_glob_matches("a?c", "abc"));
+        assert!(!explorer_glob_matches("a?c", "ac"));
+    }
+
+    #[test]
+    fn is_excluded_strips_the_leading_doublestar_slash() {
+        let patterns = vec!["**/.git".to_string(), "**/Thumbs.db".to_string()];
+        assert!(explorer_is_excluded(".git", &patterns));
+        assert!(explorer_is_excluded("Thumbs.db", &patterns));
+        assert!(!explorer_is_excluded(".gitignore", &patterns));
+    }
+
+    #[test]
+    fn is_excluded_never_matches_a_pattern_with_further_internal_slashes() {
+        // Documented limitation (see `explorer_is_excluded`'s doc): a
+        // pattern that isn't a bare `**/name` never matches, rather than
+        // matching against a path segment it wasn't written for.
+        let patterns = vec!["**/sub/dir".to_string()];
+        assert!(!explorer_is_excluded("dir", &patterns));
+    }
+
+    #[test]
+    fn build_explorer_rows_shows_dotfiles_but_hides_excluded_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_explorer_ops_unit_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".dotfile"), b"").unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("plain.txt"), b"").unwrap();
+
+        let mut expanded = HashSet::new();
+        expanded.insert(dir.clone());
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let rows = build_explorer_rows(&dir, &expanded, true, true, &exclude);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(
+            names.contains(&".dotfile"),
+            "dotfiles must show when show_hidden is true; got {names:?}"
+        );
+        assert!(
+            names.contains(&"plain.txt"),
+            "ordinary files must always show; got {names:?}"
+        );
+        assert!(
+            !names.contains(&".git"),
+            "'.git' must stay hidden via explorer_exclude even with show_hidden true; \
+             got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `walk_entry_is_excluded`'s `depth() == 0` root exemption: a project
+    /// directory literally named `.git` must not exclude itself (which
+    /// would make every walk starting there list empty) — only a *nested*
+    /// `.git` entry is pruned. Covers the edge case the reviewer flagged as
+    /// documented but untested.
+    #[test]
+    fn walk_entry_is_excluded_exempts_only_the_walk_root() {
+        use super::walk_entry_is_excluded;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vc1545_walk_root_exempt_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The walk root itself is named `.git` — matches a real project
+        // directory checked out under that name.
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join(".git").join(".git")).unwrap();
+
+        let exclude = crate::core::settings::Settings::default().explorer_exclude;
+        let walk_root = dir.join(".git");
+        let entries: Vec<ignore::DirEntry> = ignore::WalkBuilder::new(&walk_root)
+            .hidden(false)
+            .build()
+            .filter_map(|e| e.ok())
+            .collect();
+
+        let root_entry = entries
+            .iter()
+            .find(|e| e.depth() == 0)
+            .expect("walk must yield the root entry");
+        assert_eq!(root_entry.file_name(), ".git");
+        assert!(
+            !walk_entry_is_excluded(root_entry, &exclude),
+            "the walk root must never exclude itself, even when named '.git' \
+             — otherwise a project directory named '.git' would list empty"
+        );
+
+        let nested_entry = entries
+            .iter()
+            .find(|e| e.depth() > 0 && e.file_name() == ".git")
+            .expect("walk must yield the nested '.git' entry");
+        assert!(
+            walk_entry_is_excluded(nested_entry, &exclude),
+            "a nested '.git' entry (depth > 0) must still be excluded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

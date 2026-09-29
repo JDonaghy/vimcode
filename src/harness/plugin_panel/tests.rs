@@ -9,7 +9,7 @@
 //!    which arm it is in — the same reason #984's chevron scenarios are
 //!    hand-written (see `crate::harness::KNOWN_BUGS`).
 //! 2. The `tui_prod` arm needs one `TuiDriver::tick()` before the first
-//!    assertion (to let `TuiShellApp::tick` consume
+//!    assertion (to let the pre-#1434 TUI shell's `tick` consume
 //!    `ext_panel_focus_pending` and put the sidebar onto the plugin panel);
 //!    `tick` is inherent on `TuiDriver`, not on `ConformanceDriver`.
 //! 3. The macro has no `macos` arm.
@@ -37,7 +37,7 @@ const TUI_H: u16 = 30;
 
 // ── tui_prod: the one lane that paints a `PanelRegistration` today ──────
 //
-// `TuiShellApp` -> `tui_main::panels::render_ext_panel` ->
+// the pre-#1434 TUI shell -> `tui_main::panels::render_ext_panel` ->
 // `render::ext_panel_to_tree_view` is the *only* path in this crate that
 // turns a plugin's own sections into painted rows. Everything else goes
 // through `App`'s `id.starts_with("ext:")` arm, which paints the
@@ -52,7 +52,7 @@ fn prod(
         TUI_W,
         TUI_H,
     );
-    // `TuiShellApp::tick` is what consumes `ext_panel_focus_pending` and
+    // the pre-#1434 TUI shell's `tick` is what consumes `ext_panel_focus_pending` and
     // sets `sidebar.ext_panel_name` — the same handoff a live
     // `panel.reveal` / activity-bar click performs.
     h.driver.tick();
@@ -77,7 +77,6 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
         SEC_SUMMARY,
         SEC_COMMITS,
         SEC_EMPTY,
-        ROW_BRANCH,
         ROW_COMMIT_A,
         ROW_CHILD_A,
         ROW_COMMIT_B,
@@ -89,6 +88,42 @@ fn plugin_panel_fixture_paints_all_three_sections_on_tui_prod() {
              were {painted:?}"
         );
     }
+    // `ROW_BRANCH` gets its own, *stricter* check: it is the only row in
+    // the fixture that carries a badge and a hint, which
+    // `ext_panel_to_tree_view` composes into one right-aligned `Badge`
+    // (`ROW_BRANCH_BADGE`) competing with the label for the same ~20-column
+    // sidebar row. Asserting the whole label AND the whole badge run AND
+    // that they share a line with no `…` on it is what proves the two
+    // coexist rather than one eating the other — the failure mode that
+    // #1434 papered over with a two-character-prefix check (against a
+    // label the badge was overwriting) and that quadraui#1183 turned into
+    // a bare `…` (see `ROW_BRANCH_BADGE`'s doc for the full history).
+    let branch_line = h
+        .driver
+        .screen()
+        .lines()
+        .find(|line| line.contains(ROW_BRANCH))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!(
+                "the plugin-panel fixture must paint the branch row's whole \
+                 label {ROW_BRANCH:?} (not a badge-clamped fragment of it); \
+                 painted runs were {painted:?}\nscreen:\n{}",
+                h.driver.screen()
+            )
+        });
+    assert!(
+        branch_line.contains(ROW_BRANCH_BADGE),
+        "the branch row must paint its badge+hint run {ROW_BRANCH_BADGE:?} on \
+         the same line as its label; that line was {branch_line:?}"
+    );
+    assert!(
+        !branch_line.contains('\u{2026}'),
+        "the branch row's label and badge must both fit the sidebar's column \
+         budget — an ellipsis on that line means the tree clamped the label \
+         (quadraui#1183), so nothing below is measuring the row it names; \
+         that line was {branch_line:?}"
+    );
 }
 
 #[test]
@@ -187,7 +222,7 @@ fn plugin_panel_reveal_selects_the_revealed_row_on_tui_prod() {
 // `ConformanceHarness::engine` (it backdates `panel_hover_dwell` and calls
 // `poll_panel_hover` directly, in place of a real wall-clock wait) — the one
 // thing `conformance_harness_prod`'s own doc says its `engine` field cannot
-// give a scenario (`TuiShellApp` owns its `Engine` directly, not behind an
+// give a scenario (the pre-#1434 TUI shell owns its `Engine` directly, not behind an
 // `Rc<RefCell<_>>`; see that function's "not live here" doc). So this
 // scenario is not registered on `tui_prod` at all — see the `tui shared app`
 // arm below, which uses `conformance_harness` (a live `Rc<RefCell<Engine>>`)

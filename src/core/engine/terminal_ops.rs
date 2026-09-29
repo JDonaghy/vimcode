@@ -182,39 +182,75 @@ impl Engine {
         }
     }
 
-    /// Launch the ACP agent's own command line as an *interactive* process
-    /// in a visible terminal pane, for a `type: "terminal"` auth method
-    /// (#957, ACP-6). Terminal auth is not the `authenticate` RPC — per the
-    /// ACP spec's distinction (`core::acp`'s module doc), the client must
-    /// run the adapter attached to a real TTY so its own CLI can drive an
+    /// Launch the ACP agent's own command line, plus the chosen auth
+    /// method's own `args` (#1444), as an *interactive* process in a
+    /// visible terminal pane, for a `type: "terminal"` auth method (#957,
+    /// ACP-6). Terminal auth is not the `authenticate` RPC — per the ACP
+    /// spec's distinction (`core::acp`'s module doc), the client must run
+    /// the adapter attached to a real TTY so its own CLI can drive an
     /// interactive login (a browser OAuth flow, a device code prompt, ...),
     /// then re-initialize once that process exits
     /// (`Engine::acp_finish_terminal_login`, called from `poll_terminal`
     /// below / `terminal_close_active_tab`). This re-runs the exact same
-    /// `settings.acp_agent_command` used for the NDJSON transport — vimcode
-    /// has no agent-specific knowledge of what flag would force "login
-    /// mode" (nor should it, per the ACP track's agent-neutral design), so
-    /// the same command is trusted to behave differently when its stdio is
-    /// a real PTY instead of piped NDJSON (`isatty(stdin)`, in practice).
+    /// command used for the NDJSON transport — resolved through
+    /// `acp_resolve_agent_launch` (the registry's active profile if one is
+    /// configured, else the legacy single-string `acp_agent_command`,
+    /// #958 ACP-7 / #1443) so terminal-auth login always launches whatever
+    /// agent the AI panel actually spawned, not a stale unconditional read
+    /// of `acp_agent_command`.
+    ///
+    /// Running that resolved command *bare* is wrong: the reference Claude
+    /// ACP adapter starts its NDJSON server and waits on stdin when given no
+    /// arguments, even attached to a real TTY — no login flow ever runs, and
+    /// the pane just sits there until the user closes it (read as
+    /// "abandoned"). What actually selects *which* login this specific
+    /// method performs is `login_args`, taken verbatim from the chosen
+    /// [`crate::core::acp::AcpAuthMethod::args`] the agent advertised on the
+    /// wire (e.g. `["--cli", "auth", "login", "--claudeai"]`) and appended
+    /// after the resolved command — vimcode has no agent-specific knowledge
+    /// of what those args mean (nor should it, per the ACP track's
+    /// agent-neutral design); it only forwards what the agent itself said
+    /// this method needs.
     ///
     /// `TerminalSession::spawn` takes a shell *path*, not an argv
     /// (`quadraui::terminal_engine::TerminalSession::spawn`) — the same
     /// constraint `terminal_run_command` above already works around: spawn
-    /// the user's interactive shell, then inject the command as PTY input
-    /// (`build_acp_auth_wrapper`), reusing that existing pattern rather
-    /// than inventing a second one.
-    pub fn acp_launch_terminal_login(&mut self, method_name: &str) {
-        let agent_cmd = self.settings.acp_agent_command.trim().to_string();
+    /// the user's interactive shell (in the resolved profile's `cwd`),
+    /// then inject the command (plus `login_args`) and its `env` as PTY
+    /// input (`build_acp_auth_wrapper`), reusing that existing pattern
+    /// rather than inventing a second one. `login_args` are shell-quoted
+    /// (`quote_shell_arg`) before being appended — they came off the wire,
+    /// not the operator's own keyboard, so unlike the base command string
+    /// itself (`parse_agent_command`'s doc comment) they get no benefit of
+    /// the doubt about containing shell metacharacters.
+    pub fn acp_launch_terminal_login(&mut self, method_name: &str, login_args: &[String]) {
+        // #1443: route through the same registry-aware resolver the
+        // NDJSON transport path uses (`ai_send_message_via_acp`), not
+        // `settings.acp_agent_command` directly — that field is empty
+        // whenever the agent came from `settings.acp_agents`, which made
+        // this path fail with "No ACP agent command configured" even
+        // though the very auth-method dialog it is answering only exists
+        // because a registry agent just spawned successfully.
+        let (_argv, cwd, env, agent_cmd) = self.acp_resolve_agent_launch();
+        let agent_cmd = agent_cmd.trim().to_string();
         if agent_cmd.is_empty() {
             self.message = "No ACP agent command configured".to_string();
             return;
         }
-        let cwd = self.acp_workspace_cwd();
         let history_cap = self.settings.terminal_scrollback_lines;
         let shell = default_shell();
         let is_powershell =
             shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
-        let wrapped = build_acp_auth_wrapper(&agent_cmd, is_powershell);
+        let agent_cmd = if login_args.is_empty() {
+            agent_cmd
+        } else {
+            let quoted_args: Vec<String> = login_args
+                .iter()
+                .map(|a| quote_shell_arg(a, is_powershell))
+                .collect();
+            format!("{agent_cmd} {}", quoted_args.join(" "))
+        };
+        let wrapped = build_acp_auth_wrapper(&agent_cmd, &env, is_powershell);
         // Reuse an already-open pane's dimensions if one exists (the most
         // recently painted size); otherwise fall back to a conventional
         // default — no viewport is available from this call site (invoked
@@ -615,8 +651,9 @@ impl Engine {
     }
 
     /// Dispatch a click on the bottom panel tab bar using the cached
-    /// `TabBarHits` from the last paint. Returns `true` if the click
-    /// was consumed (tab switch or panel close).
+    /// [`BottomTabStripHits`] (`TabBarLayout::hit_test`, #1491) from the last
+    /// paint. Returns `true` if the click was consumed (tab switch or panel
+    /// close).
     pub fn handle_bottom_tab_bar_click(&mut self, click_x: f64) -> bool {
         enum Action {
             Close,
@@ -628,26 +665,22 @@ impl Engine {
             let Some(ref hits) = *hits else {
                 return false;
             };
-            if hits
-                .right_segment_bounds
-                .first()
-                .is_some_and(|&(sx, ex)| click_x >= sx && click_x < ex)
-            {
-                Action::Close
-            } else {
-                let mut kinds = Vec::new();
-                if self.terminal_open {
-                    kinds.push(BottomPanelKind::Terminal);
+            let rel_x = click_x - hits.origin_x;
+            match hits.layout.hit_test(rel_x as f32, 0.0) {
+                quadraui::TabBarHit::RightSegment(id) if id.as_str() == "bottom_tab:close" => {
+                    Action::Close
                 }
-                if !self.dap_output_lines.is_empty() {
-                    kinds.push(BottomPanelKind::DebugOutput);
+                quadraui::TabBarHit::Tab(idx) => {
+                    let mut kinds = Vec::new();
+                    if self.terminal_open {
+                        kinds.push(BottomPanelKind::Terminal);
+                    }
+                    if !self.dap_output_lines.is_empty() {
+                        kinds.push(BottomPanelKind::DebugOutput);
+                    }
+                    kinds.get(idx).cloned().map_or(Action::None, Action::Switch)
                 }
-                hits.slot_positions
-                    .iter()
-                    .enumerate()
-                    .find(|(_, &(sx, ex))| click_x >= sx && click_x < ex)
-                    .and_then(|(idx, _)| kinds.get(idx).cloned())
-                    .map_or(Action::None, Action::Switch)
+                _ => Action::None,
             }
         };
         match action {
@@ -666,8 +699,9 @@ impl Engine {
 
     /// Resolve a terminal toolbar click to an action using cached hit data.
     /// Both TUI (cell columns) and GTK (pixel positions) pass screen-absolute
-    /// coordinates; the method accounts for coordinate-system differences
-    /// between `StatusBarLayout` (bar-relative) and `TabBarHits` (absolute).
+    /// coordinates; each arm shifts by its own cached `origin_x` before
+    /// hit-testing its bar-relative `layout` (#1491 — both `StatusBarLayout`
+    /// and `TabBarLayout` share that bar-relative convention now).
     pub fn resolve_terminal_toolbar_click(&self, click_x: f64) -> TerminalToolbarAction {
         let hits = self.terminal_toolbar_hits.borrow();
         let Some(ref hits) = *hits else {
@@ -685,24 +719,19 @@ impl Engine {
                     _ => TerminalToolbarAction::None,
                 }
             }
-            TerminalToolbarHits::TabStrip(hits) => {
-                for (i, &(sx, ex)) in hits.right_segment_bounds.iter().enumerate() {
-                    if click_x >= sx && click_x < ex {
-                        return match i {
-                            0 => TerminalToolbarAction::AddTab,
-                            1 => TerminalToolbarAction::ToggleSplit,
-                            2 => TerminalToolbarAction::ToggleMaximize,
-                            3 => TerminalToolbarAction::CloseTab,
-                            _ => TerminalToolbarAction::None,
-                        };
-                    }
+            TerminalToolbarHits::TabStrip { layout, origin_x } => {
+                let rel_x = click_x - origin_x;
+                match layout.hit_test(rel_x as f32, 0.0) {
+                    quadraui::TabBarHit::RightSegment(id) => match id.as_str() {
+                        "term_toolbar:add" => TerminalToolbarAction::AddTab,
+                        "term_toolbar:split" => TerminalToolbarAction::ToggleSplit,
+                        "term_toolbar:maximize" => TerminalToolbarAction::ToggleMaximize,
+                        "term_toolbar:close" => TerminalToolbarAction::CloseTab,
+                        _ => TerminalToolbarAction::StartResize,
+                    },
+                    quadraui::TabBarHit::Tab(idx) => TerminalToolbarAction::SwitchTab(idx),
+                    _ => TerminalToolbarAction::StartResize,
                 }
-                for (idx, &(sx, ex)) in hits.slot_positions.iter().enumerate() {
-                    if click_x >= sx && click_x < ex && sx < ex {
-                        return TerminalToolbarAction::SwitchTab(idx);
-                    }
-                }
-                TerminalToolbarAction::StartResize
             }
         }
     }
@@ -1551,11 +1580,366 @@ pub fn build_terminal_install_wrapper(
 ///
 /// Extracted as a pure function, same rationale as
 /// [`build_terminal_install_wrapper`]: testable without a real PTY.
-pub fn build_acp_auth_wrapper(command: &str, is_powershell: bool) -> String {
+///
+/// `env` carries the active agent profile's extra environment variables
+/// (`AcpAgentProfile::env` / `acp_resolve_agent_launch`, #958 ACP-7,
+/// #1443). Unlike the NDJSON transport path (`AcpClient::spawn_with_env`,
+/// a real subprocess `env` map), these vars are injected as shell
+/// statements ahead of the command since the whole wrapper is text typed
+/// into an interactive shell, not argv — `export KEY=VALUE` for POSIX,
+/// `$env:KEY = "VALUE"` for PowerShell. Values are not shell-quoted
+/// beyond that: same "operator-configured, not attacker input" posture
+/// `parse_agent_command`'s doc comment already accepts for the command
+/// string itself.
+pub fn build_acp_auth_wrapper(
+    command: &str,
+    env: &[(String, String)],
+    is_powershell: bool,
+) -> String {
     if is_powershell {
-        format!("{command}\nExit $LASTEXITCODE\n")
+        let env_lines: String = env
+            .iter()
+            .map(|(k, v)| format!("$env:{k} = \"{v}\"\n"))
+            .collect();
+        format!("{env_lines}{command}\nExit $LASTEXITCODE\n")
     } else {
-        format!("{command}\nexit $?\n")
+        let env_lines: String = env
+            .iter()
+            .map(|(k, v)| format!("export {k}=\"{v}\"\n"))
+            .collect();
+        format!("{env_lines}{command}\nexit $?\n")
+    }
+}
+
+/// Shell-quote a single argv word for injection into the interactive shell
+/// wrapper `build_acp_auth_wrapper` builds — used for a `type: "terminal"`
+/// auth method's own `args` (#1444, [`crate::core::acp::AcpAuthMethod::
+/// args`]), which arrive off the wire rather than from the operator's own
+/// keyboard, unlike the base command string (`parse_agent_command`'s doc
+/// comment explains that string's own, more permissive, posture). POSIX
+/// gets single-quoting with the standard `'\''`-splice for an embedded
+/// single quote; PowerShell gets double-quoting with backtick-escaped
+/// backticks and double quotes, matching `build_acp_auth_wrapper`'s own
+/// per-shell split.
+fn quote_shell_arg(arg: &str, is_powershell: bool) -> String {
+    if is_powershell {
+        format!("\"{}\"", arg.replace('`', "``").replace('"', "`\""))
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ACP `terminal/create` (#1522) — served via the same "interactive shell +
+// injected PTY input" technique the two wrappers above already use.
+// ---------------------------------------------------------------------------
+
+/// `"cmd arg1 arg2"` for the live tool-call card header (#1522) — plain
+/// space-joining, purely for display; never re-executed, unlike
+/// [`build_acp_terminal_wrapper`]'s shell-quoted splice.
+pub fn acp_terminal_command_display(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{command} {}", args.join(" "))
+    }
+}
+
+/// Build the PTY-injected wrapper for an ACP-served `terminal/create`
+/// terminal (#1522) — the same "spawn an interactive shell via
+/// `TerminalSession::spawn`, then inject the real command as PTY input"
+/// technique [`build_acp_auth_wrapper`]/[`build_terminal_install_wrapper`]
+/// already use (`TerminalSession::spawn` takes a shell *path*, not an
+/// argv — see this module's top doc for why).
+///
+/// Both `command` and every `arg` are shell-quoted ([`quote_shell_arg`])
+/// before splicing — unlike [`build_acp_auth_wrapper`]'s `agent_cmd`
+/// (operator-typed, see `parse_agent_command`'s doc on that trust model),
+/// *everything* here came off the wire from the agent, not the operator's
+/// own keyboard, so it gets no benefit of the doubt about shell
+/// metacharacters. `env` gets the same treatment: each value is
+/// shell-quoted via [`quote_shell_arg`], and each name is validated
+/// against [`is_valid_env_var_name`] — a name can't be shell-quoted (it
+/// sits to the left of `=` in `export NAME=...`/`$env:NAME = ...`, outside
+/// any quoting), so an entry whose name isn't a bare `[A-Za-z_][A-Za-z0-9_]*`
+/// identifier is dropped rather than spliced in unescaped. Without this, a
+/// malicious agent could smuggle extra shell commands through `env`'s
+/// *name* field (e.g. `"A; rm -rf /tmp #"`) even though `command`/`args`
+/// are locked down.
+///
+/// `begin_marker`/`end_marker_prefix` bracket the command's own output so
+/// [`extract_acp_terminal_output`] can strip the shell's echoed input and
+/// subsequent prompt from the surrounding PTY transcript deterministically.
+/// Both are printed via `printf '%s\n'` / `Write-Host` — never typed as a
+/// bare literal — so the *echoed input* line (which still contains the
+/// marker text, wrapped in shell syntax: `printf '%s\n' '__marker__'`) can
+/// never be mistaken for the *printed output* line
+/// (`extract_acp_terminal_output` only matches a line that, after trimming
+/// trailing whitespace, is nothing but the marker itself).
+pub fn build_acp_terminal_wrapper(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    is_powershell: bool,
+    begin_marker: &str,
+    end_marker_prefix: &str,
+) -> String {
+    let quoted_command = quote_shell_arg(command, is_powershell);
+    let quoted_args: String = args
+        .iter()
+        .map(|a| format!(" {}", quote_shell_arg(a, is_powershell)))
+        .collect();
+    // Names that aren't a bare identifier can't be quoted away (they sit
+    // outside any quoting, to the left of `=`/`:`), so they're dropped
+    // rather than spliced in unescaped — see this function's doc.
+    let safe_env: Vec<(&String, String)> = env
+        .iter()
+        .filter(|(k, _)| is_valid_env_var_name(k))
+        .map(|(k, v)| (k, quote_shell_arg(v, is_powershell)))
+        .collect();
+    if is_powershell {
+        let env_lines: String = safe_env
+            .iter()
+            .map(|(k, quoted_v)| format!("$env:{k} = {quoted_v}\n"))
+            .collect();
+        format!(
+            "{env_lines}Write-Host '{begin_marker}'\n{quoted_command}{quoted_args}\n$__ec = $LASTEXITCODE\nif ($null -eq $__ec) {{ $__ec = 0 }}\nWrite-Host \"{end_marker_prefix}$__ec\"\n"
+        )
+    } else {
+        let env_lines: String = safe_env
+            .iter()
+            .map(|(k, quoted_v)| format!("export {k}={quoted_v}\n"))
+            .collect();
+        format!(
+            "{env_lines}printf '%s\\n' '{begin_marker}'\n{quoted_command}{quoted_args}\n__ec=$?\nprintf '%s\\n' \"{end_marker_prefix}$__ec\"\n"
+        )
+    }
+}
+
+/// Whether `name` is safe to splice unquoted into `export NAME=...` /
+/// `$env:NAME = ...` — i.e. a bare `[A-Za-z_][A-Za-z0-9_]*` identifier,
+/// nothing else. Used by [`build_acp_terminal_wrapper`] to drop
+/// wire-sourced `env` entries whose *name* (not just value) could
+/// otherwise smuggle shell metacharacters, since a variable name can't be
+/// quoted the way a value can.
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Extract the command output produced between the injected
+/// [`build_acp_terminal_wrapper`] begin/end marker lines from a
+/// `TerminalSession::full_text()` snapshot. Returns `(output, exit_code)`:
+///
+/// - `exit_code` is `None` when the begin marker hasn't appeared at all yet
+///   (nothing captured), or has appeared but the end marker hasn't (still
+///   running).
+/// - `Some(code)` once the end marker line is found, parsed from the
+///   numeric suffix the wrapper appended after `end_marker_prefix`
+///   (defaults to `0` in the unreachable case that suffix somehow isn't
+///   numeric, rather than treating a found end marker as "still running").
+///
+/// Only an *exact* line match (after trimming trailing whitespace) counts
+/// as the begin marker line, so the shell's own echo of the *typed*
+/// `printf '%s\n' '<marker>'` invocation — a longer line that still
+/// contains the marker text, wrapped in shell syntax — is never mistaken
+/// for the line the `printf` call itself actually prints.
+pub fn extract_acp_terminal_output(
+    full_text: &str,
+    begin_marker: &str,
+    end_marker_prefix: &str,
+) -> (String, Option<i64>) {
+    let lines: Vec<&str> = full_text.split('\n').collect();
+    let Some(begin_idx) = lines.iter().rposition(|l| l.trim_end() == begin_marker) else {
+        return (String::new(), None);
+    };
+    let after_begin = &lines[begin_idx + 1..];
+    let end_idx = after_begin
+        .iter()
+        .position(|l| l.trim_end().starts_with(end_marker_prefix));
+    match end_idx {
+        Some(end_idx) => {
+            let code = after_begin[end_idx]
+                .trim_end()
+                .strip_prefix(end_marker_prefix)
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
+            (after_begin[..end_idx].join("\n"), Some(code))
+        }
+        None => (after_begin.join("\n"), None),
+    }
+}
+
+/// Apply `terminal/create`'s optional `outputByteLimit` to `output`:
+/// unchanged (not truncated) when `limit` is `None` or `output` already
+/// fits; otherwise keeps the **tail** — the most recent output, what an
+/// agent polling a long-running command's progress actually wants — and
+/// reports `truncated: true`. Clamped to a UTF-8 char boundary so a cut
+/// that would otherwise split a multi-byte codepoint never panics.
+pub fn truncate_terminal_output(output: &str, limit: Option<usize>) -> (String, bool) {
+    let Some(limit) = limit else {
+        return (output.to_string(), false);
+    };
+    if output.len() <= limit {
+        return (output.to_string(), false);
+    }
+    let mut start = output.len() - limit;
+    while start < output.len() && !output.is_char_boundary(start) {
+        start += 1;
+    }
+    (output[start..].to_string(), true)
+}
+
+impl Engine {
+    /// Serve `terminal/create` (#1522): spawn `command`/`args` via
+    /// [`build_acp_terminal_wrapper`]'s injected-shell technique and
+    /// register a fresh `AcpTerminalRecord` in the *active* session's
+    /// `AcpSession::acp_terminals` (`Engine::acp_mut`, already pointed at
+    /// the dispatching session by `poll_acp`/`acp_dispatch_events` — see
+    /// that module's doc). `cols`/`rows` are fixed at a conventional
+    /// default: unlike the visible Terminal panel, nothing ever paints
+    /// this PTY to a real viewport, so there is no size to inherit.
+    pub(crate) fn acp_terminal_create(
+        &mut self,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        output_byte_limit: Option<usize>,
+    ) -> Result<String, String> {
+        let shell = default_shell();
+        let is_powershell =
+            shell.to_lowercase().contains("powershell") || shell.to_lowercase().contains("pwsh");
+        let history_cap = self.settings.terminal_scrollback_lines;
+        let resolved_cwd = cwd
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.cwd.clone());
+
+        let session = self.acp_mut();
+        session.acp_terminal_next_id += 1;
+        let terminal_id = format!("term-{}", session.acp_terminal_next_id);
+        let begin_marker = format!("__acp_term_begin_{terminal_id}__");
+        let end_marker_prefix = format!("__acp_term_end_{terminal_id}__:");
+        let wrapped = build_acp_terminal_wrapper(
+            command,
+            args,
+            env,
+            is_powershell,
+            &begin_marker,
+            &end_marker_prefix,
+        );
+
+        match TerminalSession::spawn(80, 24, &shell, &resolved_cwd, history_cap) {
+            Ok(mut pty) => {
+                pty.write_input(wrapped.as_bytes());
+                let record = crate::core::acp_session::AcpTerminalRecord {
+                    terminal_id: terminal_id.clone(),
+                    command_display: acp_terminal_command_display(command, args),
+                    cwd: cwd.map(|p| p.display().to_string()),
+                    created_at: std::time::Instant::now(),
+                    elapsed_frozen: None,
+                    output_byte_limit,
+                    last_output: String::new(),
+                    exit_status: None,
+                    killed: false,
+                    released: false,
+                    wait_for_exit_pending: None,
+                    session: Some(pty),
+                    begin_marker,
+                    end_marker_prefix,
+                };
+                self.acp_mut()
+                    .acp_terminals
+                    .insert(terminal_id.clone(), record);
+                Ok(terminal_id)
+            }
+            Err(e) => Err(format!("failed to start terminal: {e}")),
+        }
+    }
+
+    /// Poll the given terminal id's PTY once (a no-op if it has no live
+    /// session — already released, or unknown) and refresh its cached
+    /// `last_output`/`exit_status` from the injected wrapper's marker
+    /// lines ([`extract_acp_terminal_output`]). Called both by every
+    /// `terminal/*` request handler right before it reads the record (an
+    /// agent can call these faster than `poll_idle`'s cadence) and by the
+    /// background sweep (`Engine::poll_acp_terminals`).
+    pub(crate) fn acp_terminal_refresh(&mut self, terminal_id: &str) {
+        let Some(record) = self.acp_mut().acp_terminals.get_mut(terminal_id) else {
+            return;
+        };
+        let Some(pty) = record.session.as_mut() else {
+            return;
+        };
+        pty.poll();
+        let full_text = pty.full_text();
+        let (output, exit_code) = extract_acp_terminal_output(
+            &full_text,
+            &record.begin_marker,
+            &record.end_marker_prefix,
+        );
+        record.last_output = output;
+        if record.exit_status.is_none() {
+            if let Some(code) = exit_code {
+                record.exit_status = Some(crate::core::acp::AcpTerminalExitStatus {
+                    exit_code: Some(code),
+                    signal: None,
+                });
+            }
+        }
+    }
+
+    /// Best-effort interrupt for `terminal/kill` (#1522): writes Ctrl-C
+    /// (`0x03`) to the terminal's PTY — the same byte a person pressing
+    /// Ctrl+C in an interactive shell sends. There is no hard-kill
+    /// primitive to reach for instead: `quadraui::terminal_engine::
+    /// TerminalSession` keeps its child-process handle private with no
+    /// `kill()` accessor (unlike, say, `std::process::Child::kill`), so a
+    /// child that traps or ignores SIGINT cannot be forced to stop from
+    /// here today. That is a quadraui-side infrastructure gap, not a
+    /// design choice made here — per the Platform-Neutrality Rule, the fix
+    /// is a quadraui issue (`TerminalSession::kill()`) followed by
+    /// consuming it once shipped, not a backend-specific workaround (and
+    /// there is no such workaround available here regardless, since PTY
+    /// ownership is entirely inside quadraui, not `src/gtk/`/
+    /// `src/tui_main/`). Ctrl-C is nonetheless the correct *first* thing to
+    /// try — it stops the overwhelming majority of real commands (test
+    /// runners, builds, long-running scripts) an ACP agent would
+    /// plausibly ask the client to run.
+    pub(crate) fn acp_terminal_kill(&mut self, terminal_id: &str) {
+        if let Some(record) = self.acp_mut().acp_terminals.get_mut(terminal_id) {
+            record.killed = true;
+            if let Some(pty) = record.session.as_mut() {
+                pty.write_input(&[0x03]);
+            }
+        }
+    }
+
+    /// Serve `terminal/release` (#1522): freeze the card's elapsed-time
+    /// snapshot and drop the live `TerminalSession`/PTY, while keeping the
+    /// `AcpTerminalRecord` itself — and its last captured output/exit
+    /// status — around, per this issue's "persists after release"
+    /// acceptance bar (`AcpTerminalRecord::view`). Sends a courtesy Ctrl-C
+    /// first if the command hadn't already been observed to exit (same
+    /// best-effort caveat as [`Self::acp_terminal_kill`]), so a released
+    /// terminal doesn't necessarily keep running as an untracked orphan
+    /// process just because nothing ever explicitly killed it.
+    pub(crate) fn acp_terminal_release(&mut self, terminal_id: &str) {
+        self.acp_terminal_refresh(terminal_id);
+        if let Some(record) = self.acp_mut().acp_terminals.get_mut(terminal_id) {
+            if record.exit_status.is_none() {
+                if let Some(pty) = record.session.as_mut() {
+                    pty.write_input(&[0x03]);
+                }
+            }
+            record.elapsed_frozen = Some(record.created_at.elapsed());
+            record.released = true;
+            record.session = None;
+        }
     }
 }
 
@@ -1622,8 +2006,10 @@ pub fn key_to_pty_bytes(key_name: &str, unicode: Option<char>, ctrl: bool) -> Ve
 #[cfg(test)]
 mod tests {
     use super::{
-        build_acp_auth_wrapper, build_terminal_install_wrapper, install_exit_code_path,
+        acp_terminal_command_display, build_acp_auth_wrapper, build_acp_terminal_wrapper,
+        build_terminal_install_wrapper, extract_acp_terminal_output, install_exit_code_path,
         install_exit_code_ready, invalidate_install_exit_code, read_install_exit_code,
+        truncate_terminal_output,
     };
     use std::path::PathBuf;
 
@@ -1673,7 +2059,7 @@ mod tests {
     /// status directly.
     #[test]
     fn acp_auth_wrapper_posix_ends_with_bare_exit_of_command_status() {
-        let script = build_acp_auth_wrapper("sh login.sh", false);
+        let script = build_acp_auth_wrapper("sh login.sh", &[], false);
         assert_eq!(
             script, "sh login.sh\nexit $?\n",
             "POSIX ACP auth wrapper must be exactly the command followed by \
@@ -1683,11 +2069,38 @@ mod tests {
 
     #[test]
     fn acp_auth_wrapper_powershell_ends_with_bare_exit_of_last_exit_code() {
-        let script = build_acp_auth_wrapper("sh login.sh", true);
+        let script = build_acp_auth_wrapper("sh login.sh", &[], true);
         assert_eq!(
             script, "sh login.sh\nExit $LASTEXITCODE\n",
             "PowerShell ACP auth wrapper must be exactly the command \
              followed by `Exit $LASTEXITCODE`, nothing else; got:\n{script}"
+        );
+    }
+
+    /// #1443: a registry profile's `env` must reach the terminal-auth
+    /// login pane, not just the NDJSON transport's `spawn_with_env` — the
+    /// wrapper injects it as `export KEY=VALUE` ahead of the command since
+    /// the whole thing is typed into an interactive POSIX shell.
+    #[test]
+    fn acp_auth_wrapper_posix_exports_env_before_command() {
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let script = build_acp_auth_wrapper("sh login.sh", &env, false);
+        assert_eq!(
+            script, "export FOO=\"bar\"\nsh login.sh\nexit $?\n",
+            "POSIX ACP auth wrapper must export env vars ahead of the \
+             command; got:\n{script}"
+        );
+    }
+
+    /// Same as above, PowerShell flavour (`$env:KEY = "VALUE"`).
+    #[test]
+    fn acp_auth_wrapper_powershell_sets_env_before_command() {
+        let env = vec![("FOO".to_string(), "bar".to_string())];
+        let script = build_acp_auth_wrapper("sh login.sh", &env, true);
+        assert_eq!(
+            script, "$env:FOO = \"bar\"\nsh login.sh\nExit $LASTEXITCODE\n",
+            "PowerShell ACP auth wrapper must set env vars ahead of the \
+             command; got:\n{script}"
         );
     }
 
@@ -2106,5 +2519,225 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── ACP `terminal/create` helpers (#1522) ────────────────────────────
+
+    #[test]
+    fn acp_terminal_command_display_joins_args_with_spaces_and_bare_for_no_args() {
+        assert_eq!(acp_terminal_command_display("echo", &[]), "echo");
+        assert_eq!(
+            acp_terminal_command_display("echo", &["hello".to_string(), "world".to_string()]),
+            "echo hello world"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_shell_quotes_command_and_args_and_env() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &["hello world".to_string()],
+            &[("FOO".to_string(), "bar".to_string())],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            script.contains("export FOO='bar'\n"),
+            "env must be exported before the command, value shell-quoted; \
+             got:\n{script}"
+        );
+        assert!(
+            script.contains("printf '%s\\n' '__begin__'\n"),
+            "the begin marker must be printed via printf, not typed bare; \
+             got:\n{script}"
+        );
+        assert!(
+            script.contains("'echo' 'hello world'"),
+            "command and args must both be shell-quoted; got:\n{script}"
+        );
+        assert!(
+            script.contains("printf '%s\\n' \"__end__:$__ec\"\n"),
+            "the end marker must be printed with the command's exit code \
+             appended; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_powershell_flavour_uses_write_host_and_lastexitcode() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &["hi".to_string()],
+            &[],
+            true,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(script.contains("Write-Host '__begin__'\n"));
+        assert!(script.contains("$__ec = $LASTEXITCODE"));
+        assert!(script.contains("Write-Host \"__end__:$__ec\"\n"));
+    }
+
+    // ── ACP `terminal/create` env injection hardening (#1522 review) ─────
+
+    #[test]
+    fn build_acp_terminal_wrapper_shell_quotes_env_values_posix() {
+        // A bare `"` breakout: the pre-fix template spliced the value
+        // straight into `export FOO="{v}"` — an unescaped `"` in the value
+        // closes that string early, turning `; rm -rf /tmp/pwned #` into a
+        // second, executed shell statement (the trailing `#` comments out
+        // the leftover closing quote). This is a regression test for that
+        // exact exploit, not just a "does it contain quotes" check.
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[("FOO".to_string(), "bar\"; rm -rf /tmp/pwned #".to_string())],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            !script
+                .lines()
+                .any(|l| l.trim_start().starts_with("rm -rf /tmp/pwned")),
+            "the malicious suffix must never appear as its own shell \
+             statement/line; got:\n{script}"
+        );
+        assert!(
+            script.contains("export FOO='bar\"; rm -rf /tmp/pwned #'\n"),
+            "the value must be shell-quoted the same way command/args are \
+             (single-quoted, so the embedded `\"` and `;` stay part of the \
+             string rather than starting a new shell statement); \
+             got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_drops_env_entries_with_unsafe_names_posix() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[
+                ("A; rm -rf /tmp/pwned #".to_string(), "x".to_string()),
+                ("SAFE_NAME".to_string(), "y".to_string()),
+            ],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            !script.contains("A; rm -rf /tmp/pwned #"),
+            "a malicious `env` *name* must not be spliced in unescaped \
+             (a name can't be shell-quoted like a value can) — the whole \
+             entry must be dropped; got:\n{script}"
+        );
+        assert!(
+            script.contains("export SAFE_NAME='y'\n"),
+            "a well-formed env entry alongside a malicious one must still \
+             be exported; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_shell_quotes_env_values_and_drops_unsafe_names_powershell() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[
+                (
+                    "FOO".to_string(),
+                    "bar\"; Remove-Item -Recurse C:\\pwned #".to_string(),
+                ),
+                (
+                    "A; Remove-Item -Recurse C:\\pwned #".to_string(),
+                    "x".to_string(),
+                ),
+            ],
+            true,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            script.contains("$env:FOO = \"bar`\"; Remove-Item -Recurse C:\\pwned #\"\n"),
+            "the value's embedded double-quote must be backtick-escaped so \
+             it stays part of the string, not close the quoting early; \
+             got:\n{script}"
+        );
+        assert!(
+            !script.contains("A; Remove-Item -Recurse C:\\pwned #"),
+            "a malicious `env` *name* must be dropped entirely, not \
+             spliced in unescaped; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_returns_none_before_the_begin_marker_appears() {
+        let full_text = "some unrelated prompt text\n";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "");
+        assert_eq!(exit_code, None);
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_is_running_when_only_the_begin_marker_has_appeared() {
+        // The echoed *typed* command line (containing the marker text
+        // wrapped in shell syntax) must not be mistaken for the marker
+        // line itself — only the exact standalone line counts.
+        let full_text = "printf '%s\\n' '__begin__'\n__begin__\nhello\nworld\n";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "hello\nworld\n");
+        assert_eq!(exit_code, None, "no end marker yet -> still running");
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_stops_at_the_end_marker_and_parses_its_exit_code() {
+        let full_text = "printf '%s\\n' '__begin__'\n__begin__\nhello\n__end__:0\n$ ";
+        let (output, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(output, "hello");
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "the trailing shell prompt after the end marker must be excluded"
+        );
+    }
+
+    #[test]
+    fn extract_acp_terminal_output_parses_a_nonzero_exit_code() {
+        let full_text = "__begin__\noutput\n__end__:7\n";
+        let (_, exit_code) = extract_acp_terminal_output(full_text, "__begin__", "__end__:");
+        assert_eq!(exit_code, Some(7));
+    }
+
+    #[test]
+    fn truncate_terminal_output_is_a_no_op_without_a_limit_or_under_it() {
+        assert_eq!(
+            truncate_terminal_output("hello", None),
+            ("hello".to_string(), false)
+        );
+        assert_eq!(
+            truncate_terminal_output("hello", Some(10)),
+            ("hello".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn truncate_terminal_output_keeps_the_tail_and_reports_truncated() {
+        let (out, truncated) = truncate_terminal_output("0123456789", Some(4));
+        assert_eq!(out, "6789");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn truncate_terminal_output_never_splits_a_multibyte_char_boundary() {
+        // "héllo" is 6 bytes (é is 2 bytes) — a byte-4 cut lands mid-é;
+        // the function must round up to the next char boundary instead of
+        // panicking.
+        let (out, truncated) = truncate_terminal_output("héllo", Some(4));
+        assert!(out.is_char_boundary(0));
+        assert!(truncated);
+        // Whatever it kept must itself be valid UTF-8 (would already have
+        // panicked in the `&output[start..]` slice above otherwise), and
+        // must be a genuine suffix of the source string.
+        assert!("héllo".ends_with(&out));
     }
 }

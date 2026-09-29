@@ -423,20 +423,18 @@ impl Engine {
             // Last-writer-wins: replace any pending task for the same callback event.
             self.async_shell_tasks.insert(req.callback_event, rx);
             std::thread::spawn(move || {
-                use std::process::{Command, Stdio};
+                use std::process::Stdio;
                 // #948 review (non-blocking): no dedicated regression test
-                // for this call site specifically — it's the identical
-                // two-line `shell_command()` pattern already covered by
-                // `:!`'s tests (`tests/new_vim_features.rs`'s
+                // for this call site specifically — it goes through the
+                // shared `shell_cmd()` construction point (#1492) already
+                // covered by `:!`'s tests (`tests/new_vim_features.rs`'s
                 // `test_bang_command_honours_shell_env_var` and
                 // `src/tui_main/shell_app.rs`'s
                 // `bang_command_shell_output_paints_on_command_line_via_shell_app`),
                 // so a future divergence here (e.g. someone hand-rolling a
                 // shell string again for "just this one" call site) isn't
                 // caught by this PR's tests.
-                let (shell, flag) = shell_command();
-                let mut cmd = Command::new(shell);
-                cmd.arg(flag).arg(&req.command);
+                let mut cmd = crate::core::terminal::shell_cmd(&req.command);
                 if let Some(ref cwd) = req.cwd {
                     cmd.current_dir(cwd);
                 }

@@ -32,6 +32,247 @@ zero cost instead.
 
 ---
 
+## `MacDriver` has no `set_double_click_folding(false)`, unlike `TuiDriver`/`GtkDriver` (workaround in vimcode#1576)
+
+Since quadraui#486, `MacBackend::fold_double_click` runs every injected
+`MouseDown` through a `DoubleClickDetector` (400 ms window,
+`MAC_DOUBLE_CLICK_RADIUS` = 4 pt). `quadraui::tui::testing::TuiDriver` and
+`quadraui::gtk::testing::GtkDriver` both expose
+`set_double_click_folding(enabled: bool)` so a test doing back-to-back
+independent clicks can opt out; `quadraui::macos::testing::MacDriver` does
+not, and `MacBackend`'s own `set_double_click_folding` doesn't exist either
+(the GTK/TUI backends have a `pub(crate)` one each).
+
+Observed impact: vimcode's `macos::mac_driver_tests::
+picker_row_click_hit_band_matches_the_painted_row` sweeps five single clicks
+~3 pt apart across one picker row; after the pin bump to `286eb6c` sample 1
+arrived as a `UiEvent::DoubleClick`, confirming the wrong picker entry. The
+vimcode test now sleeps 450 ms between samples to let the window lapse —
+correct but slow, and it hardcodes a private quadraui constant.
+
+**Ask:** add `MacDriver::set_double_click_folding(&mut self, enabled: bool)`
+(plus the backing `MacBackend` switch), mirroring the TUI/GTK drivers, so
+cross-backend harness helpers can disable folding uniformly. Do the same for
+`WinDriver` if it has the same gap.
+
+---
+
+## Win-GUI activity bar hardcodes the ASCII fallback glyph, ignoring the `nerd_fonts_enabled` flag `draw_tree` already reads (blocks vimcode#1558)
+
+**Title:** `win::activity_bar::draw_activity_bar` always paints `Icon::fallback`,
+never `Icon::glyph` — `WinBackend::nerd_fonts_enabled` exists and is wired into
+`draw_tree` (#804) but never reaches this rasteriser
+
+**Body:**
+
+vimcode#1558 reports that on Windows, with **Nerd Font Icons on**, the
+activity bar shows placeholder characters (`⊞ / ! Y # > ▦ *`) instead of real
+glyphs, while the macOS build of the identical commit shows the correct
+icons. Root-caused primarily by inspection — the reported placeholder
+characters are an exact, unambiguous match, see below — and corroborated on
+dell64 (this fleet's real Windows 11 host, reachable via WSL2 interop; see
+#1558's "Verify on real Windows" section) by successfully cross-building
+`vimcode.exe` with `cargo xwin build --release --target
+x86_64-pc-windows-msvc --no-default-features --features win --bin vimcode`
+and launching it **directly** (not wine) against a real `HWND` on dell64's
+desktop. Pixel-level confirmation of the glyph fix itself (this entry's own
+ask below, not yet landed) couldn't be captured in that same session: dell64's
+interactive console session was independently locked at the OS level
+(`logonui.exe` running), which blocks GDI-based screen/window-content capture
+regardless of what quadraui paints underneath — see `src/win/mod.rs`'s
+`#1558` doc section in vimcode for the full repro chain:
+
+`quadraui/src/win/activity_bar.rs` (pinned rev `a58e5bec`), the paint loop for
+each activity-bar row:
+
+```rust
+// Uses the ASCII `fallback` — this rasteriser doesn't take a
+// per-frame `nerd_fonts_enabled` toggle yet (issue #683 scoped
+// TUI/GTK/macOS only; Win-GUI has no Nerd Font wiring at all,
+// matching `macos::tree`/`macos::form`'s same fallback-only
+// posture until #25's icon-font plumbing lands here too).
+let icon_str = item.icon.fallback.as_str();
+```
+
+That comment is **stale** — it predates #804/#929, which already gave
+`WinBackend` real Nerd-Font wiring: `WinBackend::nerd_fonts_enabled: bool`
+(`win/backend.rs`, set via `Backend::set_nerd_fonts`) is read by
+`draw_tree`'s call site (`win/backend.rs::draw_tree`, `fn draw_tree`),
+which passes `self.nerd_fonts_enabled` straight through to
+`super::tree::draw_tree(..., self.nerd_fonts_enabled)`. `draw_activity_bar`'s
+call site (same file, `fn draw_activity_bar`) never reads
+`self.nerd_fonts_enabled` at all, and `super::activity_bar::draw_activity_bar`'s
+signature has no parameter for it — `item.icon.fallback` is the only branch
+that exists.
+
+vimcode's `src/icons.rs` fallback strings for the exact activity-bar items
+line up character-for-character with the bug report:
+
+```
+EXPLORER   fallback = "\u{229e}"  ⊞
+DEBUG      fallback = "!"
+GIT_BRANCH fallback = "Y"
+EXTENSIONS fallback = "#"
+AI_CHAT    fallback = ">"
+BOARD      fallback = "\u{25a6}"  ▦
+SETTINGS   fallback = "*"
+```
+
+— `⊞ / ! Y # > ▦ *`, in order, is exactly the reported symptom. This is not a
+DirectWrite font-fallback/rendering issue at all for the activity bar
+specifically (contrast the tab-bar entry below, which is): the rasteriser is
+unconditionally painting the ASCII fallback string, the same string a
+`nerd_fonts_enabled == false` GTK/macOS/TUI build would paint. The already-
+shipped `macos::activity_bar` rasteriser is the reference fix shape: it takes
+`nerd_fonts_enabled: bool` as an explicit parameter and branches
+`item.icon.glyph.as_str()` vs `item.icon.fallback.as_str()` on it
+(`quadraui/src/macos/activity_bar.rs`, "`nerd_fonts_enabled` picks which half
+of each item's `crate::Icon` paints" doc comment).
+
+**Ask:** thread `nerd_fonts_enabled: bool` into
+`win::activity_bar::draw_activity_bar`'s signature (mirroring
+`macos::activity_bar`'s existing parameter) and branch the icon string on it,
+the same one-line change `win/backend.rs::draw_tree` already makes for
+`super::tree::draw_tree` — `win/backend.rs::draw_activity_bar` just needs to
+pass `self.nerd_fonts_enabled` through at its call site. Update the stale
+"#25's icon-font plumbing" comment to note #804/#929 already shipped the
+wiring this rasteriser alone never adopted.
+
+**Test:** #1558's acceptance criterion #2 ("a Windows test asserts that an
+activity-bar icon glyph resolves to a real font face, not a fallback or
+tofu") needs new quadraui-side test infrastructure, not just the fix above —
+`crate::testing::TextRun` (`quadraui/src/testing/mod.rs`) currently records
+only `{ text: String, bounds: Rect }` per painted run, with no font-face
+identity captured, so no existing `WinDriver`/`ConformanceHarness` assertion
+can currently distinguish "painted the real Nerd Font glyph" from "painted a
+`.fallback` string" or "painted tofu" — all three currently produce some
+non-empty `text_runs` entry. At minimum, resolving this issue's own
+acceptance bar needs `TextRun` (or a Win-GUI-specific extension of it) to
+also record which `IDWriteFontFace`/family a run's glyphs actually resolved
+against — e.g. via `IDWriteTextLayout::GetGlyphRunAnalysis` or per-run
+`IDWriteFontFace::GetGdiCompatibleGlyphIndices` coverage checks. Absent
+that, the best a driver test can assert today is that
+`nerd_fonts_enabled(true)` + the fixed rasteriser paints `item.icon.glyph`'s
+*text* (not `.fallback`'s) into a `TextRun` — real, but weaker than "resolved
+to a real font face" per the issue's own wording.
+
+**Blocks:** `JDonaghy/vimcode#1558` (activity-bar half). Leave that issue
+open behind this one per `GOALS.md`'s milestone-discipline rule — there is no
+per-backend vimcode-side fix available (`src/win/mod.rs`/`src/win/backend.rs`
+are thin wrappers with no rasterising decisions per the Platform-Neutrality
+Rule; `App::setup` already calls `render::register_nerd_font_fallback`
+identically for every backend, so the vimcode side of this is already
+correct and unchanged).
+
+---
+
+## Win-GUI tab-bar/editor Nerd-Font glyphs may lose to DirectWrite's own system fallback due to `AddMappings`/`AddMapping` call order (suspected, needs Windows verification; blocks vimcode#1558)
+
+**Title:** `win::text::build_nerd_font_fallback` calls
+`builder.AddMappings(&system_fallback)` **before** its own `AddMapping` for
+the registered Nerd Font — if `IDWriteFontFallbackBuilder` mapping priority
+is first-added-wins (as MS documentation describes for overlapping ranges),
+the app's Nerd-Font mapping can never be reached for any codepoint Windows'
+own system fallback table already claims, which very plausibly includes the
+Private-Use-Area block Nerd Font glyphs live in
+
+**Body:**
+
+vimcode#1558 also reports Win-GUI tab-bar file icons rendering as "only a
+plain document glyph" (not a placeholder character, unlike the activity-bar
+half above — see that entry, which is a fully-confirmed, different root
+cause). Unlike the activity bar, the tab-bar paint path is *not* the
+"unconditionally uses fallback" bug: `render::build_tab_bar_icons`
+(vimcode `src/render.rs`) already only constructs `TabIcon` entries when
+`icons::nerd_fonts_enabled()` is true, and `icons::file_icon_for_name` /
+`icons::Icon::s()` already resolve to the real Nerd-Font PUA codepoint
+(`.nerd`, not `.fallback`) in that case — confirmed by reading both
+functions; this part of the pipeline is platform-neutral and identical to
+GTK/macOS/TUI, which all render tab icons correctly per the issue. So
+`quadraui::TabIcon::glyph` genuinely carries the right string by the time it
+reaches `win::backend::draw_tab_bar_icons`, which paints it via `self.dwrite`
+— the same `DWrite` instance `#929` wires up with the registered Nerd Font's
+`IDWriteFontFallback` via `apply_fallback_to_format`/`SetFontFallback`.
+
+The suspected gap is inside `build_nerd_font_fallback`
+(`quadraui/src/win/text.rs`, pinned rev `a58e5bec`):
+
+```rust
+let system_fallback = unsafe { factory.GetSystemFontFallback()? };
+let builder = unsafe { factory.CreateFontFallbackBuilder()? };
+unsafe { builder.AddMappings(&system_fallback)? };   // added FIRST
+
+let ranges = [DWRITE_UNICODE_RANGE { first: 0x0, last: 0x0010_FFFF }];
+// ... AddMapping(&ranges, &[family], ...) added SECOND, for the whole
+// Unicode range, resolving against the app's registered Nerd Font.
+```
+
+The function's own doc comment states the intent explicitly: "`family` is
+only ever *consulted* for a character none of the higher-priority system
+mappings already resolved" — i.e. system fallback is meant to win first, our
+mapping is the last resort. That is backwards for a Private-Use-Area icon
+font: PUA codepoints have no "correct" system glyph to defer to, and if
+Windows' own system fallback table has *any* entry that claims to cover that
+range (a generic symbol/dingbat font, `Segoe UI Symbol`, a CJK/emoji fallback
+font with broad coverage, or the "Last Resort" font DirectWrite consults for
+otherwise-unmapped codepoints), that entry — not the app's registered Nerd
+Font — is what a first-added-wins fallback builder would resolve to. The
+activity-bar placeholder characters in this same bug report are proven (see
+sibling entry above) to be the plain ASCII `.fallback` string, not tofu or a
+substituted glyph — but the tab-bar symptom ("a plain document glyph",
+implying *something* renders, consistently, for every file regardless of
+extension) is consistent with DirectWrite finding one single system-fallback
+font that happens to have a "generic document" glyph mapped somewhere in the
+PUA range and using it for every Nerd Font codepoint in that font, rather
+than ever reaching the app's own registered font.
+
+**This is a hypothesis, not a confirmed root cause** — dell64 (this fleet's
+real Windows 11 host, see #1558's "Verify on real Windows" section) is
+reachable and `cargo xwin build`/direct-exe-launch both work on it, but
+empirically exercising DirectWrite's actual `IDWriteFontFallbackBuilder`
+priority needs either a live GUI visual check or a new automated test, and
+both avenues hit dell64-local blockers during this investigation (the
+interactive session was locked, blocking screen capture; the `cargo xwin
+test --lib` binary crashes at Windows DLL-load time with
+`STATUS_ENTRYPOINT_NOT_FOUND` before any `#[test]` runs — see `src/win/mod.rs`'s
+`#1558` doc section in vimcode for the full repro of both). So this hypothesis
+is still unconfirmed, but for those two concrete, named reasons — not for
+lack of a host. `IDWriteFontFallbackBuilder`'s actual first-vs-last priority
+for overlapping `AddMapping`/`AddMappings` ranges should be verified against
+Microsoft's documentation (or empirically, once the blockers above are
+cleared) before committing to a fix. If confirmed, the fix is likely as
+simple as swapping the order — call `builder.AddMapping(...)` for the app's
+font first, then
+`builder.AddMappings(&system_fallback)` last, so the app's Nerd Font is
+consulted before Windows' own broad-coverage system fallback rather than
+after it — mirroring the *intended* cascade shape GTK's
+`crate::gtk::with_nerd_font_fallback` doc already describes ("later family in
+the list, consulted only for uncovered characters" — for Pango's cascade,
+the *primary UI/editor font* is first and genuinely lacks PUA coverage, so
+falling through to the Nerd Font next in line works; DirectWrite's
+`IDWriteFontFallback` object is a *separate* structure from the primary
+format's own font, consulted only when the primary font's glyph lookup
+already failed — so within *that* structure, the app's font needs to be
+tried before Windows' generic system fallback, not after).
+
+**Ask:** on real Windows hardware, verify whether swapping the
+`AddMapping`/`AddMappings` call order in `build_nerd_font_fallback` makes
+tab-bar (and editor-body, if any Nerd-Font-glyph content appears there) icons
+resolve to the registered Symbols Nerd Font subset instead of a system
+substitute. If confirmed, land the reordering; if the true cause is
+something else in this pipeline (`register_font_from_memory`'s private
+collection, `attach_surface`/`attach_headless` call ordering relative to
+`App::setup`, or a device-lost surface rebuild dropping the fallback), file
+a follow-up with the real cause once it's found.
+
+**Blocks:** `JDonaghy/vimcode#1558` (tab-bar half). Leave that issue open
+behind both entries above per `GOALS.md`'s milestone-discipline rule — there
+is no per-backend vimcode-side fix available here either; the vimcode-side
+data pipeline (`render::build_tab_bar_icons`, `icons::file_icon_for_name`) is
+already correct and platform-neutral.
+
+---
+
 ## ~~TUI test drivers can't observe `Backend::request_full_repaint`'s effect from a downstream `ShellApp` (blocks vimcode#1243's black-box test)~~ — **FILED as quadraui#1060, do not file (struck 2026-09-24)**
 
 > **This draft is retired: it is now a real issue.** Filed 2026-09-24 as
@@ -366,3 +607,139 @@ this same PR, see that file's new §2c).
 > `resize`/`terminal()` accessor. The full draft text lives in that issue
 > now. It blocks no open vimcode issue; it exists so a future resize/TOCTOU
 > regression has a driver-tier repro path.
+
+---
+
+## `WinBackend::install_menu_bar_now`'s `SetMenu` call re-enters `wndproc` and panics on `ws.state.borrow_mut()` — Win-GUI crashes on every startup once `native_menu` is declared (blocks vimcode#1614, and transitively vimcode#1559/#1562/#1582)
+
+**Title:** `SetMenu` (called from `WinBackend::install_menu_bar_now`, quadraui#1200) synchronously re-enters `win::run`'s `wndproc` with a nested `WM_SIZE` via `SendMessageW`/`CallWindowProcW` while the outer call already holds `ws.state.borrow_mut()`, panicking with `RefCell already borrowed` at `quadraui/src/win/run.rs:1712:42` (line 1711 at the `cc2b80d` pin) — inside a Win32 callback that cannot unwind, so the process aborts. 100% reproducible: `vimcode.exe` crashes before showing a window, on every launch, on real Windows hardware (dell64).
+
+**Body:**
+
+vimcode#1614 asked to bump the pin to pick up quadraui#1197 (block-cursor
+glyph fix), quadraui#1200 (native menu bar), and quadraui#1199 (custom
+title-bar chrome) — three real fixes, each individually verified by their
+own commit messages via `cargo xwin build`/`test`. But none of those
+verifications ran a *live* `vimcode.exe`/example through a real Win32
+message loop with `native_menu: true` declared, which is what surfaces
+this bug: it is a **runtime reentrancy defect**, invisible to
+`HeadlessSurface`-based paint tests and to `cargo check`/`cargo build`
+type-checking alike.
+
+Root-caused via a real cross-compiled build (`cargo xwin build --release
+--target x86_64-pc-windows-msvc --no-default-features --features win`) run
+directly on dell64 (this WSL2 environment's host — `hostname` returns
+`dell64`, so no remote-transfer step was even needed): `vimcode.exe test.txt`
+launched and immediately crashed, writing the following to stderr and
+`%TEMP%\vimcode-crash.log` every time:
+
+```
+thread 'main' (N) panicked at .../quadraui/src/win/run.rs:1712:42:
+RefCell already borrowed
+thread 'main' (N) panicked at .../core/src/panicking.rs:225:5:
+panic in a function that cannot unwind
+stack backtrace:
+  ...
+  CallWindowProcW
+  SendMessageW
+  IsWindowEnabled
+  IsWindowEnabled
+  Ordinal75
+  Ordinal75
+  SendMessageW
+  CallWindowProcW
+  GetFocus
+  EnumDisplayDevicesW
+  KiUserCallbackDispatcher
+  NtUserSetMenu
+  ...
+```
+
+`quadraui/src/win/run.rs:1712` (`win::run`'s `wndproc`, the pinned rev's
+line numbers) is the `WM_SIZE` arm:
+
+```rust
+WM_SIZE => {
+    let (width, height) = size_from_lparam(lparam.0);
+    let viewport = {
+        let mut s = ws.state.borrow_mut();   // <-- panics here
+        ...
+```
+
+The backtrace shows this `WM_SIZE` firing *from inside* `NtUserSetMenu` —
+Win32's `SetMenu` synchronously recalculates the non-client area and can
+dispatch nested messages to the same window on the same thread before
+returning, the same way `DrawMenuBar`/`SetWindowPos` are documented to.
+`WinBackend::install_menu_bar_now` (quadraui#1200, `win/backend.rs`) calls
+`SetMenu(hwnd, ...)` from inside `Self::attach_surface`, which itself runs
+while `win::run`'s window-creation path already holds `ws.state.borrow_mut()`
+— so the nested `WM_SIZE`'s own `ws.state.borrow_mut()` panics on the
+already-live borrow. `wndproc`'s existing re-entrancy guard —
+
+```rust
+if ws.pump_depth.is_pumping() {
+    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+}
+```
+
+— (added for #702, the message-pump reentrancy hazard) does **not** cover
+this path: `pump_depth` tracks the *main event-loop pump*, which hasn't
+started yet during window creation, so a nested message arriving via a
+synchronous Win32 API call (not the pump) sails straight through to the
+`match msg` arms and hits the live borrow.
+
+**Isolation performed (all on real dell64 hardware, `cargo xwin build
+--release --target x86_64-pc-windows-msvc --no-default-features --features
+win`, each launched via `Start-Process`/`Get-Process` against the actual
+Windows session):**
+
+| quadraui rev | Contains | Result |
+|---|---|---|
+| `db92e461` (pin before #1614) | none of #1197/#1199/#1200 | **Launches cleanly** — real window, `Get-Process` shows `MainWindowTitle: VimCode`, `Responding: True` |
+| `cc2b80d` (has #1197 + #1200, not #1199) | block cursor + native menu bar, no custom title bar | **Crashes on every launch**, identical panic site/message |
+| `928f2b5` (develop HEAD; has all three) | block cursor + native menu bar + custom title bar | **Crashes on every launch**, identical panic site/message |
+
+This isolates the regression to quadraui#1200 (`90e4310`, the native-menu-bar
+commit) specifically — `window_chrome`/#1199 is not required to reproduce
+it, and the block-cursor fix (#1197) is inert here (paint-only, no wndproc
+change). `native_menu: true` only gets declared once `WinBackend::
+backend_caps()` picks it up (also part of #1200), and `App::setup`
+(vimcode `src/app.rs`) calls `Backend::install_menu_bar` unconditionally
+for any backend declaring that cap — so any consumer that adopts
+`native_menu` the documented way hits this immediately.
+
+**Ask:** `WinBackend::install_menu_bar_now`'s `SetMenu` call needs to not
+run while `ws.state` is borrowed on the calling stack — either defer the
+actual `SetMenu` call (e.g. via `PostMessage`/a custom registered message,
+so it happens on a later, non-reentrant pump iteration) the way `WM_SIZE`'s
+own resize-settle debounce (`RESIZE_TIMER_ID`, quadraui#780) already defers
+work off the hot path, or make the reentrant `WM_SIZE` (and any other
+message that can arrive synchronously from a Win32 call made mid-borrow)
+robust to a live borrow — e.g. `try_borrow_mut` with a `DefWindowProcW`
+fallback on `Err`, mirroring `pump_depth.is_pumping()`'s existing
+graceful-defer shape, extended to cover reentrancy from *any* source, not
+just the main pump.
+
+**Test:** a `WinDriver`/real-`wndproc` scenario that installs a menu bar
+during window creation (the exact `AppLogic::setup`-time call path
+`install_menu_bar`'s own doc describes) and asserts the window finishes
+creating without panicking — the existing `HeadlessSurface`-based tests in
+`win::backend`'s `#[cfg(test)] mod tests` don't drive a real `wndproc`, so
+this needs either a live (non-headless) `CreateWindowExW` in the test itself
+(gated `target_os = "windows"`, run via `cargo xwin test` on real hardware
+like every other live-window test this crate already has) or a `wndproc`
+unit test that directly synthesizes the nested-`WM_SIZE`-during-`SetMenu`
+sequence against a fake `WindowState` to reproduce the double-borrow without
+needing a live window at all. Observed RED against `cc2b80d`/`928f2b5` (100%
+reproducible, real hardware); must be observed GREEN before closing.
+
+**Blocks:** `JDonaghy/vimcode#1614` directly, and transitively
+`JDonaghy/vimcode#1559`/`#1562`/`#1582` — none of those three can be
+verified (the app never shows a window) let alone closed while this
+crash exists. vimcode's pin stays at `db92e461` (pre-#1197/#1199/#1200)
+until this lands; there is no vimcode-side workaround (`App::setup`'s
+call-site timing for `install_menu_bar` is irrelevant — the crash happens
+inside quadraui's own window-creation sequence regardless of when the
+platform-neutral caller invokes the trait method), per the
+Platform-Neutrality Rule.
+

@@ -11,11 +11,9 @@
 //! GTK (`build_editor_click_context`, which builds a `pango::Context`)
 //! stayed behind in `src/gtk/click.rs`.
 //!
-//! #937's quadraui pin bump deprecated `TabBarHits` (quadraui#823) that this
-//! file reads; migrating to its `TabBarLayout` replacement is an unrelated,
-//! cross-backend refactor deferred to a follow-up, so it's silenced here
-//! rather than left as a stray warning under `-D warnings`.
-#![allow(deprecated)]
+//! #1491 migrated the tab-bar hit-testing this file does off the deprecated
+//! `TabBarHits` (quadraui#823) and onto its replacement,
+//! `quadraui::TabBarLayout::hit_test` — see [`GroupTabBarLayoutMap`].
 
 use crate::core::engine::EngineAction;
 use crate::core::window::GroupId;
@@ -27,163 +25,84 @@ use std::collections::HashMap;
 /// Re-export the shared ClickTarget enum.
 pub(crate) use render_mod::ClickTarget;
 
-/// Per-group pixel-accurate tab-bar hit geometry recovered from
-/// [`quadraui::Backend::tab_bar_layout`] during the ShellApp `render_content`
-/// pass. All x-ranges are **relative to the group's tab-bar left edge** — the
-/// same space as `render::screen_zone_hit_test`'s `local_x`.
+/// Per-group pixel-accurate tab-bar layout recovered from
+/// [`quadraui::Backend::draw_tab_bar_icons_layout`] during the ShellApp
+/// `render_content` pass: the exact `(Rect, TabBarLayout)` the rasteriser
+/// just painted, cached so clicks resolve against what's actually on screen
+/// instead of a second, possibly-drifted measurement (#654/#703's
+/// paint/click desync shape).
 ///
-/// This replaces the char-cell `hit_regions` approximation for GTK tab clicks.
-/// GTK draws tabs with proportional-font Pango widths + fixed pixel padding
-/// (`tab_pad`, `inner_gap`, close-glyph width), so a `name.chars() * char_width`
-/// estimate under-measures every tab — shifting the tab/close boundaries and
-/// making mid-tab clicks land on the close button and right-edge clicks land on
-/// the next tab (#515 regression). The rasteriser reports the exact drawn
-/// geometry, so we hit-test against that. (`hit_regions` stays authoritative for
-/// the monospace TUI backend, whose char-cell layout matches its draw.)
-#[derive(Default, Clone)]
-pub(crate) struct TabBarPixelHits {
-    /// `(start_x, end_x)` per tab index; `(0.0, 0.0)` for scrolled-off tabs.
-    pub slots: Vec<(f64, f64)>,
-    /// `Some((start_x, end_x))` close-button zone per tab, or `None`.
-    pub close: Vec<Option<(f64, f64)>>,
-    /// Right-segment hit zones (split / diff / action buttons) as
-    /// `(start_x, end_x, target)`, disjoint from the tab slots.
-    pub segments: Vec<(f64, f64, crate::core::engine::TabBarClickTarget)>,
-}
+/// `Rect` is the bar's own absolute origin; `TabBarLayout`'s own geometry
+/// (`visible_tabs`/`visible_segments`/`hit_regions`) is bar-**relative** (see
+/// that type's doc) — the same space `render::screen_zone_hit_test`'s
+/// `local_x` uses, so [`render::resolve_tab_bar_click`] can hit-test
+/// directly against it with no further shifting. The stored `Rect` is only
+/// needed to translate that bar-relative geometry back to absolute screen
+/// space for consumers outside the click path (tab-drop geometry, the
+/// engine's visible-tab-count feedback — see
+/// [`abs_slot_positions_from_layout`] / [`tab_bar_available_cols`]).
+///
+/// Replaces the pre-#1491 `TabBarPixelHits`/`TabPixelHitMap` shape, which
+/// hand-rolled this same close-button/segment/slot geometry on top of the
+/// now-deprecated [`quadraui::TabBarHits`] — including a GTK-padding-constant
+/// close-zone trim (`tighten_close_bounds`) that quadraui#1080's
+/// `pixel_tab_bar_layout` now does once, upstream, for every backend
+/// (`TabMeasure::trailing_width`), so every consumer of `TabBarLayout`'s own
+/// `close_bounds` already gets the tight glyph box with no vimcode-side trim
+/// at all.
+///
+/// Key = `group_id.0` (single-group mode keys under the active group's id,
+/// which is what `screen_zone_hit_test` reports for it).
+pub(crate) type GroupTabBarLayoutMap = HashMap<usize, (quadraui::Rect, quadraui::TabBarLayout)>;
 
-/// Key = `group_id.0` (single-group mode keys under the active group's id, which
-/// is what `screen_zone_hit_test` reports for it).
-pub(crate) type TabPixelHitMap = HashMap<usize, TabBarPixelHits>;
-
-// ── GTK editor-group tab-bar close-glyph metrics ─────────────────────────────
-// The quadraui GTK rasteriser lays each non-compact tab out as
-// `tab_pad | label | tab_inner_gap | × | tab_pad | tab_outer_gap` and reports a
-// *padded* close-button hit zone spanning `[label_end, tab_right_edge]`. That
-// zone is far wider than the drawn × glyph, so a click well before the glyph
-// used to close the tab with no warning (#515). We trim the padded zone back to
-// the glyph the rasteriser actually painted — plus the same 2px hover halo it
-// draws behind the ×, so the clickable box equals the highlighted box.
-//
-// These mirror the non-compact constants in quadraui's `gtk::backend`
-// (`tab_pad = 14`, `tab_inner_gap = 10`, `tab_outer_gap = 1`) and the 2px hover
-// pad in `gtk::tab_bar`. Editor-group bars are always built with
-// `compact: false` (see `render::build_tab_bar_primitive`). This duplication is
-// the interim until quadraui exposes the tight glyph rect directly
-// (quadraui#395 tracks the API gap); `tighten_close_bounds` is the single place
-// it lives.
-const CLOSE_TAB_INNER_GAP: f64 = 10.0;
-const CLOSE_TAB_PAD: f64 = 14.0;
-const CLOSE_TAB_OUTER_GAP: f64 = 1.0;
-const CLOSE_HOVER_PAD: f64 = 2.0;
-
-/// Trim a *padded* close-button hit zone `(start, end)` — as reported by
-/// `quadraui::Backend::tab_bar_layout` — down to the tight × glyph box the
-/// rasteriser actually draws (including its 2px hover halo). Leading
-/// `tab_inner_gap` and trailing `tab_pad + tab_outer_gap` are dead padding that
-/// should select the tab, not close it. Returns `None` if the padded zone is
-/// degenerate (too small to contain a glyph). (#515)
-fn tighten_close_bounds(start: f64, end: f64) -> Option<(f64, f64)> {
-    let tight_start = start + CLOSE_TAB_INNER_GAP - CLOSE_HOVER_PAD;
-    let tight_end = end - CLOSE_TAB_PAD - CLOSE_TAB_OUTER_GAP + CLOSE_HOVER_PAD;
-    if tight_end > tight_start {
-        Some((tight_start, tight_end))
-    } else {
-        None
-    }
-}
-
-/// Convert a rasteriser [`quadraui::TabBarHits`] (absolute pixel x, from
-/// `Backend::tab_bar_layout`) plus its source [`quadraui::TabBar`] into a
-/// [`TabBarPixelHits`] with every x-range shifted to be **relative to
-/// `bar_left_x`** (the group tab bar's left edge). Right-segment ids are mapped
-/// to their `TabBarClickTarget` using the same `"tab:*"` ids that
-/// `build_tab_bar_primitive` emits (mirrors `draw::draw_tab_bar`).
-pub(crate) fn tab_hits_to_pixel_hits(
-    hits: &quadraui::TabBarHits,
+/// Absolute x-ranges for every tab slot in a group's just-painted
+/// `TabBarLayout`, index-aligned to the group's own tab list, with a
+/// `(0.0, 0.0)` sentinel left in place for any tab scrolled off the strip —
+/// the convention `quadraui::DropGroupRect::tab_slots` /
+/// `PaneDragRect::tab_slots` document natively, and what
+/// `render::build_tab_drop_ctx` consumes.
+///
+/// `rect` is the bar's own absolute origin (see [`GroupTabBarLayoutMap`]);
+/// `layout.visible_tabs[].bounds` is bar-relative, so this shifts each one
+/// back to absolute screen space.
+pub(crate) fn abs_slot_positions_from_layout(
+    rect: quadraui::Rect,
     bar: &quadraui::TabBar,
-    bar_left_x: f64,
-) -> TabBarPixelHits {
-    use crate::core::engine::TabBarClickTarget as T;
-    let rel = |a: f64, b: f64| (a - bar_left_x, b - bar_left_x);
-    let slots = hits
-        .slot_positions
-        .iter()
-        .map(|&(a, b)| {
-            if (a, b) == (0.0, 0.0) {
-                (0.0, 0.0) // scrolled-off sentinel — leave as zero-width
-            } else {
-                rel(a, b)
-            }
-        })
-        .collect();
-    // Trim the padded close zone the rasteriser reports down to the tight ×
-    // glyph box (relative to the bar's left edge), so clicks/hover only fire on
-    // the drawn glyph — not the ~25px of surrounding tab padding. (#515)
-    let close = hits
-        .close_bounds
-        .iter()
-        .map(|c| c.and_then(|(a, b)| tighten_close_bounds(a, b).map(|(ta, tb)| rel(ta, tb))))
-        .collect();
-    let mut segments = Vec::new();
-    for (i, seg) in bar.right_segments.iter().enumerate() {
-        let Some((a, b)) = hits.right_segment_bounds.get(i).copied() else {
-            continue;
-        };
-        let Some(ref id) = seg.id else { continue };
-        let target = match id.as_str() {
-            "tab:split_right" => Some(T::SplitRight),
-            "tab:split_down" => Some(T::SplitDown),
-            "tab:diff_prev" => Some(T::DiffPrev),
-            "tab:diff_next" => Some(T::DiffNext),
-            "tab:diff_toggle" => Some(T::DiffToggle),
-            "tab:action_menu" => Some(T::ActionMenu),
-            _ => None,
-        };
-        if let Some(t) = target {
-            let (s, e) = rel(a, b);
-            segments.push((s, e, t));
+    layout: &quadraui::TabBarLayout,
+) -> Vec<(f32, f32)> {
+    let mut slots = vec![(0.0_f32, 0.0_f32); bar.tabs.len()];
+    for vt in &layout.visible_tabs {
+        if let Some(slot) = slots.get_mut(vt.tab_idx) {
+            *slot = (rect.x + vt.bounds.x, rect.x + vt.bounds.x + vt.bounds.width);
         }
     }
-    TabBarPixelHits {
-        slots,
-        close,
-        segments,
-    }
+    slots
 }
 
-/// Build the absolute close-glyph hit record for one tab bar from its
-/// bar-relative (already-tightened) close bounds. `bar_left_x` is the bar's
-/// absolute left edge; `y_top`/`y_bot` bracket the tab row. Consumed by
-/// `tab_close_hit_test` for hover. (#515)
-pub(crate) fn abs_close_record(
-    ph_close: &[Option<(f64, f64)>],
-    bar_left_x: f64,
-    y_top: f64,
-    y_bot: f64,
-) -> (f64, f64, Vec<Option<(f64, f64)>>) {
-    let xs = ph_close
-        .iter()
-        .map(|c| c.map(|(a, b)| (a + bar_left_x, b + bar_left_x)))
-        .collect();
-    (y_top, y_bot, xs)
-}
-
-/// Absolute x-ranges for every tab slot in a `TabBarHits`, index-aligned to
-/// the group's own tab list, with a `(0.0, 0.0)` sentinel left in place for
-/// any tab scrolled off the strip.
+/// Tab-bar content width in character columns, estimated from this frame's
+/// own painted geometry — the engine-feedback number `Engine::
+/// set_tab_visible_count` budgets tab visibility in, even on a
+/// proportional-font backend.
 ///
-/// #1370: used to filter the sentinels out and return a contiguous
-/// visible-only run (dropped tabs re-added later by offsetting indices by
-/// the tab bar's `scroll_offset`, in `render::build_tab_drop_groups`). That
-/// offsetting is exactly the convention `quadraui::DropGroupRect::tab_slots`
-/// and `PaneDragRect::tab_slots` document natively — index-aligned with
-/// sentinels — so `render::build_tab_drop_ctx` now wants this unfiltered
-/// (#515's original filtering is gone, not just moved).
-pub(crate) fn abs_slot_positions(hits: &quadraui::TabBarHits) -> Vec<(f32, f32)> {
-    hits.slot_positions
-        .iter()
-        .map(|&(a, b)| (a as f32, b as f32))
-        .collect()
+/// `quadraui::TabBarHits::available_cols` used to carry this (a
+/// backend-internal 15-char-sample Pango estimate, quadraui#1080); no
+/// `TabBarLayout`-based equivalent exists upstream (`TabBarLayout` carries no
+/// `available_cols` field), so this derives the same *budget*, not the same
+/// bit-for-bit pixel sample, from what's already cached: the bar's own
+/// painted width minus whatever right-aligned segments the paint actually
+/// drew (`0` if they overflowed and were dropped — see the "all or nothing"
+/// policy on `TabBar::layout`'s own doc), divided by `char_width` (`1.0` on
+/// TUI, so this reduces to the exact pre-existing cell count there;
+/// `Backend::char_width()`'s Pango `approximate_char_width` on GTK, close
+/// enough for a scroll-visibility budget that was always an estimate).
+pub(crate) fn tab_bar_available_cols(
+    rect: quadraui::Rect,
+    layout: &quadraui::TabBarLayout,
+    char_width: f32,
+) -> usize {
+    let reserved: f32 = layout.visible_segments.iter().map(|s| s.bounds.width).sum();
+    let effective = (rect.width - reserved).max(0.0);
+    (effective / char_width.max(1.0)).floor().max(0.0) as usize
 }
 
 /// Convert pixel (x, y) to a click target using the cached ScreenLayout from
@@ -220,12 +139,12 @@ pub(crate) fn pixel_to_click_target(
     line_height: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    // Pixel-accurate per-group tab-bar hit geometry captured from the
-    // rasteriser during `render_content` (via `Backend::tab_bar_layout`). GTK
-    // draws tabs with proportional-font Pango widths, so the char-cell
+    // Pixel-accurate per-group tab-bar layout captured from the rasteriser
+    // during `render_content` (via `Backend::draw_tab_bar_icons_layout`).
+    // GTK draws tabs with proportional-font Pango widths, so the char-cell
     // `hit_regions` on `cached_layout` do NOT match the drawn geometry — clicks
-    // must resolve against these actual pixel bounds. (#515)
-    tab_pixel_hits: &TabPixelHitMap,
+    // must resolve against this actual painted geometry instead. (#515)
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
     // Cached `quadraui::FrameHitMap` covering the Editor/TabBar surfaces
     // painted this frame (#449), plus a `FrameZone::TabBar { idx } -> (GroupId,
     // rect)` table keyed by the tab bar's *global* surface index (editors are
@@ -333,7 +252,7 @@ pub(crate) fn pixel_to_click_target(
                 local_x,
                 char_width,
                 cached_layout,
-                tab_pixel_hits,
+                group_tab_bar_layouts,
             )
         }
         ScreenZone::Window {
@@ -437,65 +356,35 @@ pub(crate) fn frame_zone_to_screen_zone(
 
 /// Tab bar inner hit-test.
 ///
-/// `local_x` is pixels relative to the tab bar's left edge. For GTK we resolve
-/// against the pixel-accurate geometry the rasteriser actually drew this frame
-/// (`tab_pixel_hits`, captured in `render_content` via `Backend::tab_bar_layout`).
-/// GTK tabs are laid out with proportional-font Pango widths + fixed pixel
-/// padding, so the char-cell `hit_regions` (correct for the monospace TUI) badly
-/// mis-measure them — clicks in a tab's middle landed on the close button and
-/// clicks near its right edge landed on the next tab (#515 regression). Falls
-/// back to the char-cell path only if no pixel geometry was cached (e.g. a click
-/// arriving before the first paint populated the map).
+/// `local_x` is in the tab bar's own unit, relative to its left edge — pixels
+/// for GTK, char cells for TUI. For GTK we resolve against the pixel-accurate
+/// `TabBarLayout` the rasteriser actually painted this frame
+/// (`group_tab_bar_layouts`, captured in `render_content` via
+/// `Backend::draw_tab_bar_icons_layout`). GTK tabs are laid out with
+/// proportional-font Pango widths + fixed pixel padding, so the char-cell
+/// `hit_regions` (correct for the monospace TUI) badly mis-measure them —
+/// clicks in a tab's middle landed on the close button and clicks near its
+/// right edge landed on the next tab (#515 regression). Falls back to the
+/// char-cell path only if no pixel geometry was cached (e.g. a click arriving
+/// before the first paint populated the map).
 fn tab_bar_inner_hit_test(
     engine: &mut Engine,
     group_id: GroupId,
     local_x: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
 ) -> ClickTarget {
-    let target = tab_pixel_hits
+    let target = group_tab_bar_layouts
         .get(&group_id.0)
-        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
+        .and_then(|(_, layout)| render_mod::resolve_tab_bar_click(layout, local_x as f32))
         .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
 
     dispatch_tab_bar_target(engine, group_id, target)
 }
 
-/// Resolve a tab-bar click against the pixel-accurate drawn geometry.
-///
-/// Close buttons are checked before tab bodies (a close zone is a sub-region of
-/// its tab), then tab bodies, then the disjoint right-segment buttons.
-fn resolve_pixel_tab_click(
-    ph: &TabBarPixelHits,
-    local_x: f64,
-) -> Option<crate::core::engine::TabBarClickTarget> {
-    use crate::core::engine::TabBarClickTarget as T;
-
-    let in_range = |(a, b): (f64, f64)| a != b && local_x >= a && local_x < b;
-
-    for (idx, cb) in ph.close.iter().enumerate() {
-        if let Some(&bounds) = cb.as_ref() {
-            if in_range(bounds) {
-                return Some(T::CloseTab(idx));
-            }
-        }
-    }
-    for (idx, &slot) in ph.slots.iter().enumerate() {
-        if in_range(slot) {
-            return Some(T::Tab(idx));
-        }
-    }
-    for &(start, end, target) in &ph.segments {
-        if in_range((start, end)) {
-            return Some(target);
-        }
-    }
-    None
-}
-
 /// Char-cell fallback (matches the TUI monospace layout). Only used before the
-/// first paint has populated the pixel-hit cache.
+/// first paint has populated the pixel-accurate layout cache.
 fn resolve_charcell_tab_click(
     cached_layout: &render::ScreenLayout,
     group_id: GroupId,
@@ -512,7 +401,7 @@ fn resolve_charcell_tab_click(
     } else {
         Some(&cached_layout.tab_bar_hit_regions)
     };
-    layout.and_then(|l| render_mod::resolve_tab_bar_click(l, col))
+    layout.and_then(|l| render_mod::resolve_tab_bar_click(l, col as f32))
 }
 
 /// Resolve which tab (if any) a right-click landed on, without any of the
@@ -534,7 +423,7 @@ pub(crate) fn resolve_tab_right_click(
     line_height: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
 ) -> Option<(GroupId, usize)> {
@@ -563,9 +452,9 @@ pub(crate) fn resolve_tab_right_click(
     else {
         return None;
     };
-    let target = tab_pixel_hits
+    let target = group_tab_bar_layouts
         .get(&group_id.0)
-        .and_then(|ph| resolve_pixel_tab_click(ph, local_x))
+        .and_then(|(_, layout)| render_mod::resolve_tab_bar_click(layout, local_x as f32))
         .or_else(|| resolve_charcell_tab_click(cached_layout, group_id, local_x, char_width));
     match target {
         Some(T::Tab(idx)) | Some(T::CloseTab(idx)) => Some((group_id, idx)),
@@ -650,7 +539,7 @@ pub(crate) fn handle_mouse_click(
     line_height: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     drag: &mut quadraui::DragState,
@@ -663,7 +552,7 @@ pub(crate) fn handle_mouse_click(
         line_height,
         char_width,
         cached_layout,
-        tab_pixel_hits,
+        group_tab_bar_layouts,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -724,7 +613,7 @@ pub(crate) fn handle_mouse_double_click(
     line_height: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     drag: &mut quadraui::DragState,
@@ -737,7 +626,7 @@ pub(crate) fn handle_mouse_double_click(
         line_height,
         char_width,
         cached_layout,
-        tab_pixel_hits,
+        group_tab_bar_layouts,
         frame_hit_map,
         tab_bar_zones,
         true, // real click: focus/tab/gutter side effects are intended
@@ -772,7 +661,7 @@ pub(crate) fn handle_mouse_drag(
     line_height: f64,
     char_width: f64,
     cached_layout: &render::ScreenLayout,
-    tab_pixel_hits: &TabPixelHitMap,
+    group_tab_bar_layouts: &GroupTabBarLayoutMap,
     frame_hit_map: Option<&quadraui::FrameHitMap>,
     tab_bar_zones: &HashMap<usize, (GroupId, quadraui::Rect)>,
     drag: &mut quadraui::DragState,
@@ -785,7 +674,7 @@ pub(crate) fn handle_mouse_drag(
         line_height,
         char_width,
         cached_layout,
-        tab_pixel_hits,
+        group_tab_bar_layouts,
         frame_hit_map,
         tab_bar_zones,
         false, // drag continuation: pure query, no focus/tab/gutter side effects

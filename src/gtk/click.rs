@@ -480,13 +480,18 @@ mod cross_split_drag_focus_tests {
     use super::*;
     use crate::render::build_screen_layout;
 
-    fn empty_tab_pixel_hits() -> TabPixelHitMap {
+    fn empty_tab_pixel_hits() -> GroupTabBarLayoutMap {
         HashMap::new()
     }
 
     #[test]
     fn drag_continuation_does_not_steal_focus_to_neighboring_group() {
         let mut engine = Engine::new();
+        // #1543: line numbers now default on, widening the gutter beyond
+        // one column — pin the pre-#1543 no-gutter geometry this test's
+        // `char_width * 2.0` pixel math assumes, since gutter width isn't
+        // what this test is about.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid_a = engine.active_window_id();
         let group_a = engine.active_group;
@@ -757,6 +762,11 @@ mod frame_hit_map_tests {
         // opposed to the `None` fallback path already covered by
         // `cross_split_drag_focus_tests`.
         let mut engine = Engine::new();
+        // #1543: line numbers now default on, widening the gutter beyond
+        // one column — pin the pre-#1543 no-gutter geometry this test's
+        // `char_width * 2.0` pixel math assumes, since gutter width isn't
+        // what this test is about.
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::None;
         engine.buffer_mut().insert(0, "hello world");
         let wid = engine.active_window_id();
         let theme = Theme::onedark();
@@ -773,7 +783,7 @@ mod frame_hit_map_tests {
         let y = rw.rect.y + line_height * 2.0;
 
         let backend = Rc::new(RefCell::new(super::super::backend::GtkBackend::new()));
-        let empty_pixel_hits: TabPixelHitMap = HashMap::new();
+        let empty_pixel_hits: GroupTabBarLayoutMap = HashMap::new();
 
         let target = pixel_to_click_target(
             &mut engine,
@@ -849,26 +859,44 @@ mod single_group_tab_click_dispatch_tests {
     const CONTENT_Y: f64 = 100.0;
     const CONTENT_W: f64 = 800.0;
     const CONTENT_H: f64 = 600.0;
-    /// Synthetic per-tab pixel width, bar-relative (see [`synthetic_pixel_hits`]).
+    /// Synthetic per-tab pixel width, bar-relative (see [`synthetic_tab_bar_layout`]).
     const TAB_W: f64 = 120.0;
 
-    /// The `TabBarPixelHits` the rasteriser would have cached for a single
-    /// group with `tabs` tabs: contiguous `TAB_W`-wide slots from the bar's left
+    /// The `TabBarLayout` the rasteriser would have cached for a single group
+    /// with `tabs` tabs: contiguous `TAB_W`-wide slots from the bar's left
     /// edge, each with a 15px close (`×`) zone inset near its right edge.
     ///
-    /// Bar-relative, exactly like `tab_hits_to_pixel_hits`'s output — which is
-    /// what `pixel_to_click_target` matches `ScreenZone::TabBar { local_x }`
-    /// against. Synthetic rather than rasterised so the test states its own
-    /// geometry instead of depending on Pango font metrics.
-    fn synthetic_pixel_hits(tabs: usize) -> TabBarPixelHits {
-        TabBarPixelHits {
-            slots: (0..tabs)
-                .map(|i| (i as f64 * TAB_W, (i + 1) as f64 * TAB_W))
-                .collect(),
-            close: (0..tabs)
-                .map(|i| Some((i as f64 * TAB_W + 100.0, i as f64 * TAB_W + 115.0)))
-                .collect(),
-            segments: Vec::new(),
+    /// Bar-relative, exactly like a real `Backend::draw_tab_bar_icons_layout`
+    /// paint's output — which is what `pixel_to_click_target` matches
+    /// `ScreenZone::TabBar { local_x }` against. Synthetic rather than
+    /// rasterised so the test states its own geometry instead of depending on
+    /// Pango font metrics. Close regions are pushed before tab-body regions
+    /// so `TabBarLayout::hit_test` resolves them first, matching a real
+    /// paint's more-specific-first `hit_regions` ordering.
+    fn synthetic_tab_bar_layout(tabs: usize) -> quadraui::TabBarLayout {
+        let mut hit_regions = Vec::new();
+        let mut visible_tabs = Vec::new();
+        for i in 0..tabs {
+            let tab_x = i as f64 * TAB_W;
+            let tab_rect = quadraui::Rect::new(tab_x as f32, 0.0, TAB_W as f32, 24.0);
+            let close_rect = quadraui::Rect::new((tab_x + 100.0) as f32, 0.0, 15.0, 24.0);
+            hit_regions.push((close_rect, quadraui::TabBarHit::TabClose(i)));
+            hit_regions.push((tab_rect, quadraui::TabBarHit::Tab(i)));
+            visible_tabs.push(quadraui::VisibleTab {
+                tab_idx: i,
+                bounds: tab_rect,
+                close_bounds: Some(close_rect),
+            });
+        }
+        quadraui::TabBarLayout {
+            bar_width: (tabs as f64 * TAB_W) as f32,
+            bar_height: 24.0,
+            visible_tabs,
+            visible_segments: Vec::new(),
+            scroll_left: None,
+            scroll_right: None,
+            hit_regions,
+            resolved_scroll_offset: 0,
         }
     }
 
@@ -893,7 +921,7 @@ mod single_group_tab_click_dispatch_tests {
         engine: Engine,
         group: GroupId,
         screen: render::ScreenLayout,
-        tab_pixel_hits: TabPixelHitMap,
+        tab_pixel_hits: GroupTabBarLayoutMap,
         backend: Rc<RefCell<super::super::backend::GtkBackend>>,
         line_height: f64,
         char_width: f64,
@@ -934,8 +962,14 @@ mod single_group_tab_click_dispatch_tests {
                  take the branch that never regressed"
             );
 
-            let mut tab_pixel_hits: TabPixelHitMap = HashMap::new();
-            tab_pixel_hits.insert(group.0, synthetic_pixel_hits(3));
+            let mut tab_pixel_hits: GroupTabBarLayoutMap = HashMap::new();
+            tab_pixel_hits.insert(
+                group.0,
+                (
+                    quadraui::Rect::new(0.0, 0.0, (3.0 * TAB_W) as f32, 24.0),
+                    synthetic_tab_bar_layout(3),
+                ),
+            );
 
             Self {
                 engine,
@@ -1063,11 +1097,15 @@ mod single_group_tab_click_dispatch_tests {
         // rasteriser lays out in production (#515).
         let seg_start = TAB_W * 3.0;
         let seg_end = seg_start + 24.0;
-        f.tab_pixel_hits.get_mut(&group.0).unwrap().segments.push((
-            seg_start,
-            seg_end,
-            crate::core::engine::TabBarClickTarget::SplitRight,
-        ));
+        f.tab_pixel_hits
+            .get_mut(&group.0)
+            .unwrap()
+            .1
+            .hit_regions
+            .push((
+                quadraui::Rect::new(seg_start as f32, 0.0, (seg_end - seg_start) as f32, 24.0),
+                quadraui::TabBarHit::RightSegment(quadraui::WidgetId::new("tab:split_right")),
+            ));
 
         let (click_result, engine_action) = f.full_click(seg_start + 5.0);
         assert_eq!(

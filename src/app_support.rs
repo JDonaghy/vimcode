@@ -1,14 +1,18 @@
 //! Backend-neutral shell support functions used by `crate::app::App` (#862).
 //!
-//! Moved out of `src/gtk/mod.rs` (`gui`-gated) and `src/gtk/{css,util}.rs`:
-//! every item here is pure computation over `Engine`/`quadraui` geometry and
+//! Moved out of `src/gtk/mod.rs` (`gui`-gated) and `src/gtk/util.rs`: every
+//! item here is pure computation over `Engine`/`quadraui` geometry and
 //! string data — none of it names a `gtk4`/`pango`/`gio` type — so nesting it
 //! inside `crate::gtk` only meant `crate::app` (and any future backend reusing
-//! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs`,
-//! `src/gtk/css.rs` and `src/gtk/util.rs` re-export everything below so the
-//! rest of `crate::gtk` keeps resolving these names unchanged. The genuinely
-//! GTK-only siblings (`css::load_css`, `util::install_icon_and_desktop`, ...)
-//! stayed behind.
+//! it) could not resolve it without the `gui` feature. `src/gtk/mod.rs` and
+//! `src/gtk/util.rs` re-export everything below so the rest of `crate::gtk`
+//! keeps resolving these names unchanged. The genuinely GTK-only siblings
+//! (`util::install_icon_and_desktop`, `util::add_icon_theme_search_path`,
+//! ...) stayed behind. `src/css.rs`/`src/gtk/css.rs` — this module's own
+//! former sibling for `make_theme_css`/`STATIC_CSS`/`load_css` — is gone
+//! entirely as of #1498, once JDonaghy/quadraui#1091 gave
+//! `GtkPlatformServices` its own equivalent stylesheet for the native file
+//! dialog's fallback widgets.
 use crate::core;
 use crate::core::Engine;
 use crate::render;
@@ -103,11 +107,52 @@ thread_local! {
     static UI_FONT_SIZE: std::cell::Cell<u8> = const { std::cell::Cell::new(10) };
 }
 
-/// Update this thread's UI font size from `settings`. Called
-/// once per frame at the top of [`App::render_content`] (#672 —
-/// `draw.rs::draw_editor`'s only live caller before the delete).
-pub(crate) fn sync_ui_font_size(settings: &core::settings::Settings) {
-    UI_FONT_SIZE.with(|s| s.set(settings.ui_font_size.max(6)));
+/// Update this thread's UI font size from `settings`, resolving it through
+/// `backend`'s platform-native convention when the user has never
+/// customized `ui_font_size` away from its compile-time default (issue
+/// #1542 — see [`core::settings::Settings::effective_ui_font_size`]'s doc
+/// for the "still at its default means never customized" test this
+/// delegates to). Called once per frame at the top of [`App::render_content`]
+/// (#672 — `draw.rs::draw_editor`'s only live caller before the delete).
+///
+/// `.max(6)` is kept here (on top of `effective_ui_font_size`'s own
+/// `6..=32` clamp) purely for belt-and-suspenders: this is the one call
+/// site every chrome paint call ultimately reads through ([`UI_FONT`]),
+/// so a future caller of `effective_ui_font_size` elsewhere gaining a
+/// bug can never make this thread-local go below a paintable size.
+pub(crate) fn sync_ui_font_size(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) {
+    let size = resolve_ui_font_size(settings, backend);
+    UI_FONT_SIZE.with(|s| s.set(size.max(6)));
+}
+
+/// Resolve this session's editor font `(family, size_pt)` — the user's
+/// explicit `settings.font_family`/`font_size` if they have ever set one,
+/// else `backend`'s own platform-native convention (issue #1156/#1542).
+/// Thin wrapper over [`core::settings::Settings::effective_editor_font`];
+/// exists so every call site (the `ShellConfig`-construction pre-seed in
+/// `App::shell_config` and the per-frame sync in
+/// `App::sync_per_frame_backend_state`) asks `backend` for its defaults
+/// the same way, rather than each inlining its own `backend.default_fonts()`
+/// call.
+pub(crate) fn resolve_editor_font(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) -> (String, f32) {
+    let defaults = backend.default_fonts();
+    settings.effective_editor_font(&defaults.editor_family, defaults.editor_size_pt)
+}
+
+/// Resolve this session's UI/chrome font size in points — [`resolve_editor_font`]'s
+/// twin for `settings.ui_font_size` (#1542). Thin wrapper over
+/// [`core::settings::Settings::effective_ui_font_size`].
+pub(crate) fn resolve_ui_font_size(
+    settings: &core::settings::Settings,
+    backend: &dyn quadraui::Backend,
+) -> u8 {
+    settings.effective_ui_font_size(backend.default_fonts().ui_size_pt)
 }
 
 /// Pango font description string for UI chrome at the currently
@@ -116,15 +161,6 @@ pub(crate) fn sync_ui_font_size(settings: &core::settings::Settings) {
 pub(crate) fn UI_FONT() -> String {
     format!("{} {}", UI_FONT_FAMILY, UI_FONT_SIZE.with(|s| s.get()))
 }
-
-/// Absolute per-group close-glyph hit rects captured during `render_content`.
-/// Keyed by `group_id.0` → `(bar_y_top, bar_y_bottom, per-tab Some((x0, x1)))`.
-/// All coordinates are in **absolute surface pixels** (same space as the raw
-/// mouse position), so hover hit-testing needs no geometry re-derivation. The
-/// x-ranges are the *tight* close-glyph zone (see `crate::click`'s
-/// `tighten_close_bounds`), matching the × highlight the rasteriser draws —
-/// so a hover shows the exact box that a click would close. (#515)
-pub(crate) type TabCloseAbsMap = HashMap<usize, (f64, f64, Vec<Option<(f64, f64)>>)>;
 
 /// Absolute visible tab-slot x-ranges per group (`group_id.0` → `[(x0,x1)]`).
 /// See `ShellApp::cached_tab_slots_abs` for the full doc comment. (#515)
@@ -143,62 +179,6 @@ pub(crate) const SC_COMMIT_BORDER_PX: f32 = 2.0;
 /// consumed by click hit-testing.
 pub(crate) type StatusSegmentMap =
     HashMap<usize, Vec<(f64, f64, crate::core::engine::StatusAction)>>;
-
-/// Calculate gutter width in pixels based on line number mode and buffer size
-#[allow(dead_code)]
-fn calculate_gutter_width(
-    mode: core::settings::LineNumberMode,
-    total_lines: usize,
-    char_width: f64,
-) -> f64 {
-    use core::settings::LineNumberMode;
-    match mode {
-        LineNumberMode::None => 0.0,
-        LineNumberMode::Absolute => {
-            // Width = number of digits + 2 chars padding (1 on each side)
-            let digits = total_lines.to_string().len().max(1);
-            (digits + 2) as f64 * char_width
-        }
-        LineNumberMode::Relative | LineNumberMode::Hybrid => {
-            // Relative numbers can be large for long files, use at least 3 digits + 2 padding
-            let max_relative = total_lines.saturating_sub(1);
-            let digits = max_relative.to_string().len().max(3);
-            (digits + 2) as f64 * char_width
-        }
-    }
-}
-
-/// Compute the editor area bottom Y coordinate.  Must match draw_editor (draw.rs)
-/// so that group rects and divider positions are consistent across draw and click.
-/// Compute the target `terminal_panel_rows` when maximizing the GTK panel.
-///
-/// The rendered terminal panel takes `(terminal_panel_rows + 2) * lh` pixels
-/// (2 chrome rows = bottom-panel tab bar + terminal toolbar). Editor tab bar
-/// stays visible (1 row reserved); breadcrumbs are suppressed elsewhere so
-/// we don't reserve a row for them here. Called every frame from `draw_frame`
-fn gtk_editor_bottom(engine: &Engine, _da_width: f64, da_height: f64, line_height: f64) -> f64 {
-    render::compute_editor_layout(engine, da_height, line_height, false).editor_bottom
-}
-
-/// Compute editor window rects with the same formula `render_content` uses
-/// (previously shared with the now-deleted `sync_scrollbar`, #731), so event
-/// handlers can do hit-testing without duplicating the layout logic.
-pub(crate) fn compute_editor_window_rects(
-    engine: &Engine,
-    da_width: f64,
-    da_height: f64,
-    line_height: f64,
-) -> Vec<(core::WindowId, core::WindowRect)> {
-    let tab_bar_height = render::tab_bar_height_px(line_height, engine.settings.breadcrumbs);
-    let editor_bounds = core::WindowRect::new(
-        0.0,
-        0.0,
-        da_width,
-        gtk_editor_bottom(engine, da_width, da_height, line_height),
-    );
-    let (rects, _dividers) = engine.calculate_group_window_rects(editor_bounds, tab_bar_height);
-    rects
-}
 
 /// Build the layout-only [`quadraui::Editor`] needed to call
 /// [`quadraui::Editor::layout`] for scrollbar geometry — the same
@@ -314,123 +294,87 @@ pub(crate) fn editor_scrollbar_layout(
     Some((editor, layout))
 }
 
-/// Thumb geometry for one window's h scrollbar, derived from
-/// [`editor_scrollbar_layout`]'s `h_scrollbar_bounds` track and the same
-/// [`quadraui::fit_thumb`] call `quadraui::gtk::editor::draw_editor` paints
-/// the thumb with (`Scrollbar::horizontal`'s `min_thumb_len: line_height`).
+/// Which editor scrollbar a geometry/hit-test call is about (#1493).
+///
+/// Horizontal and vertical scrollbars are laid out by the identical
+/// [`quadraui::Editor::layout`] call and hit-tested by the identical
+/// [`quadraui::EditorLayout::hit_test`] — the only per-axis facts are which
+/// `EditorLayout` bounds field to read, which `Editor`/`window.view` scroll
+/// field drives the thumb, and which `quadraui::DragTarget` variant a thumb
+/// grab arms. [`scrollbar_thumb_geometry`] and [`scrollbar_hit_test`] take
+/// this enum instead of existing twice (`h_scrollbar_thumb_geometry`/
+/// `v_scrollbar_thumb_geometry`, `h_scrollbar_hit_test`/
+/// `v_scrollbar_hit_test`) — the two copies had already drifted once: the
+/// horizontal hit-test used inclusive track bounds (`<=`) while the
+/// vertical one had been fixed to half-open (`<`) to avoid swallowing the
+/// group-divider's own hit zone (#987). Reading both through
+/// `quadraui::EditorLayout::hit_test` below means that half-open convention
+/// can never re-diverge per axis again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScrollbarAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Thumb geometry for one window's scrollbar on `axis`, derived from
+/// [`editor_scrollbar_layout`]'s `h_scrollbar_bounds`/`v_scrollbar_bounds`
+/// track and the same [`quadraui::fit_thumb`] call
+/// `quadraui::gtk::editor::draw_editor` paints the thumb with.
 ///
 /// Replaces the pre-#1128 h-scrollbar geometry helper, whose independently
 /// guessed `8.0`px v-scrollbar reserve (the real reserve is one
 /// `char_width`-wide cell, quadraui#968) and gutter-blind track start meant
-/// hover/drag could resolve against a rect paint never actually drew.
+/// hover/drag could resolve against a rect paint never actually drew, and
+/// the pre-#1493 h/v duplication of this same function.
 ///
-/// Returns `(track_x, track_y, track_w, sb_height, thumb_x, thumb_w,
-/// scroll_range, px_per_col)`. `None` when no h-scrollbar is painted
-/// (content fits).
+/// Returns `(track_x, track_y, track_w, track_h, thumb_pos, thumb_len,
+/// scroll_range, px_per_unit)` — `thumb_pos`/`thumb_len` run along the
+/// track's own axis (x/width for horizontal, y/height for vertical).
+/// `None` when no scrollbar on this axis is painted (content fits).
 #[allow(clippy::type_complexity)]
-pub(crate) fn h_scrollbar_thumb_geometry(
+pub(crate) fn scrollbar_thumb_geometry(
     engine: &Engine,
     window_id: core::WindowId,
     rect: &core::WindowRect,
     char_width: f64,
     line_height: f64,
+    axis: ScrollbarAxis,
 ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
     let (editor, layout) =
         editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
-    let track = layout.h_scrollbar_bounds?;
-    let (thumb_start, thumb_len) = quadraui::fit_thumb(
-        editor.scroll_left as f32,
-        editor.max_col as f32,
-        layout.visible_cols as f32,
-        track.width,
-        line_height as f32,
-    );
-    let scroll_range = (editor.max_col as f64 - layout.visible_cols as f64).max(1.0);
-    let px_per_col = if track.width as f64 > thumb_len as f64 {
-        (track.width - thumb_len) as f64 / scroll_range
-    } else {
-        0.0
-    };
-
-    Some((
-        track.x as f64,
-        track.y as f64,
-        track.width as f64,
-        track.height as f64,
-        track.x as f64 + thumb_start as f64,
-        thumb_len as f64,
-        scroll_range,
-        px_per_col,
-    ))
-}
-
-/// Hit-test a point against all h scrollbars. Returns `(window_id,
-/// scroll_left_at_click)` when the point is on any h scrollbar track (not only
-/// the thumb), so the caller can decide between thumb-drag and track-click.
-pub(crate) fn h_scrollbar_hit_test(
-    engine: &Engine,
-    x: f64,
-    y: f64,
-    window_rects: &[(core::WindowId, core::WindowRect)],
-    char_width: f64,
-    line_height: f64,
-) -> Option<(core::WindowId, usize)> {
-    for (window_id, rect) in window_rects {
-        let Some((_, layout)) =
-            editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
-        else {
-            continue;
-        };
-        let Some(track) = layout.h_scrollbar_bounds else {
-            continue;
-        };
-        let (tx, ty, tw, th) = (
-            track.x as f64,
-            track.y as f64,
-            track.width as f64,
-            track.height as f64,
-        );
-        if x >= tx && x <= tx + tw && y >= ty && y <= ty + th {
-            let scroll_left = engine
-                .windows
-                .get(window_id)
-                .map(|w| w.view.scroll_left)
-                .unwrap_or(0);
-            return Some((*window_id, scroll_left));
+    let (track, scroll_pos, extent, visible, track_len) = match axis {
+        ScrollbarAxis::Horizontal => {
+            let track = layout.h_scrollbar_bounds?;
+            (
+                track,
+                editor.scroll_left as f32,
+                editor.max_col as f32,
+                layout.visible_cols as f32,
+                track.width,
+            )
         }
-    }
-    None
-}
-
-/// Thumb geometry for one window's v scrollbar — mirrors
-/// [`h_scrollbar_thumb_geometry`], reading `v_scrollbar_bounds` off the
-/// same [`editor_scrollbar_layout`] call instead of `h_scrollbar_bounds`.
-///
-/// Returns `(track_x, track_y, track_w, track_h, thumb_y, thumb_h, scroll_range, px_per_row)`.
-/// Returns `None` when no scrollbar is needed (content fits).
-#[allow(clippy::type_complexity)]
-pub(crate) fn v_scrollbar_thumb_geometry(
-    engine: &Engine,
-    window_id: core::WindowId,
-    rect: &core::WindowRect,
-    char_width: f64,
-    line_height: f64,
-) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
-    let (editor, layout) =
-        editor_scrollbar_layout(engine, window_id, rect, char_width, line_height)?;
-    let track = layout.v_scrollbar_bounds?;
-    let (thumb_start, thumb_len) = quadraui::fit_thumb(
-        editor.scroll_top as f32,
-        editor.total_lines as f32,
-        layout.visible_lines as f32,
-        track.height,
-        line_height as f32,
-    );
-    let scroll_range = (editor.total_lines as f64 - layout.visible_lines as f64).max(1.0);
-    let px_per_row = if track.height as f64 > thumb_len as f64 {
-        (track.height - thumb_len) as f64 / scroll_range
+        ScrollbarAxis::Vertical => {
+            let track = layout.v_scrollbar_bounds?;
+            (
+                track,
+                editor.scroll_top as f32,
+                editor.total_lines as f32,
+                layout.visible_lines as f32,
+                track.height,
+            )
+        }
+    };
+    let (thumb_start, thumb_len) =
+        quadraui::fit_thumb(scroll_pos, extent, visible, track_len, line_height as f32);
+    let scroll_range = (extent as f64 - visible as f64).max(1.0);
+    let px_per_unit = if track_len as f64 > thumb_len as f64 {
+        (track_len - thumb_len) as f64 / scroll_range
     } else {
         0.0
+    };
+    let thumb_pos = match axis {
+        ScrollbarAxis::Horizontal => track.x as f64 + thumb_start as f64,
+        ScrollbarAxis::Vertical => track.y as f64 + thumb_start as f64,
     };
 
     Some((
@@ -438,57 +382,54 @@ pub(crate) fn v_scrollbar_thumb_geometry(
         track.y as f64,
         track.width as f64,
         track.height as f64,
-        track.y as f64 + thumb_start as f64,
+        thumb_pos,
         thumb_len as f64,
         scroll_range,
-        px_per_row,
+        px_per_unit,
     ))
 }
 
-/// Hit-test a point against all v scrollbars. Returns `(window_id,
-/// scroll_top_at_click)` when the point is on any v scrollbar track (not
-/// only the thumb), so the caller can decide between thumb-drag and
-/// track-page — mirrors [`h_scrollbar_hit_test`].
-pub(crate) fn v_scrollbar_hit_test(
+/// Hit-test a point against all windows' scrollbars on `axis`. Returns
+/// `(window_id, scroll_at_click)` — `scroll_at_click` is `scroll_left` for
+/// [`ScrollbarAxis::Horizontal`], `scroll_top` for
+/// [`ScrollbarAxis::Vertical`] — when the point is on that scrollbar's
+/// track (not only the thumb), so the caller can decide between
+/// thumb-drag and track-click.
+///
+/// Delegates to [`quadraui::EditorLayout::hit_test`] rather than
+/// re-deriving inclusive/exclusive track bounds by hand — the pre-#1493
+/// horizontal copy of this function used an inclusive upper bound (`<=`)
+/// on both `x` and `y` where the vertical copy had already been fixed to
+/// half-open (`<`) so a click on a window's right edge lands on the
+/// group-divider's own hit zone instead of being swallowed by the
+/// scrollbar (#987's `drag_group_divider_resizes` regression). Reading
+/// both axes through the same `hit_test` call means they can never
+/// re-diverge on that convention again.
+pub(crate) fn scrollbar_hit_test(
     engine: &Engine,
     x: f64,
     y: f64,
     window_rects: &[(core::WindowId, core::WindowRect)],
     char_width: f64,
     line_height: f64,
+    axis: ScrollbarAxis,
 ) -> Option<(core::WindowId, usize)> {
+    let want = match axis {
+        ScrollbarAxis::Horizontal => quadraui::EditorHit::HScrollbar,
+        ScrollbarAxis::Vertical => quadraui::EditorHit::VScrollbar,
+    };
     for (window_id, rect) in window_rects {
         let Some((_, layout)) =
             editor_scrollbar_layout(engine, *window_id, rect, char_width, line_height)
         else {
             continue;
         };
-        let Some(track) = layout.v_scrollbar_bounds else {
-            continue;
-        };
-        let (track_x, track_y, track_w, track_h) = (
-            track.x as f64,
-            track.y as f64,
-            track.width as f64,
-            track.height as f64,
-        );
-        // Half-open on the upper `x` bound (unlike `h_scrollbar_hit_test`'s
-        // `<=`) — this column's right edge coincides with the window's own
-        // right edge, which for any window sitting left of a group divider
-        // is also the divider's own hit-test coordinate
-        // (`render::route_divider_grab`'s `position`). An inclusive `<=`
-        // here would let this rung swallow a click aimed at the divider
-        // itself, failing the #987 negative-space case
-        // (`drag_group_divider_resizes`) that pins the divider's own hit
-        // zone must survive this fix. `quadraui::EditorLayout::hit_test`
-        // uses the same half-open convention for its `VScrollbar` arm.
-        if x >= track_x && x < track_x + track_w && y >= track_y && y < track_y + track_h {
-            let scroll_top = engine
-                .windows
-                .get(window_id)
-                .map(|w| w.view.scroll_top)
-                .unwrap_or(0);
-            return Some((*window_id, scroll_top));
+        if layout.hit_test(x as f32, y as f32) == want {
+            let scroll = engine.windows.get(window_id).map(|w| match axis {
+                ScrollbarAxis::Horizontal => w.view.scroll_left,
+                ScrollbarAxis::Vertical => w.view.scroll_top,
+            });
+            return Some((*window_id, scroll.unwrap_or(0)));
         }
     }
     None
@@ -503,3 +444,42 @@ pub(crate) fn v_scrollbar_hit_test(
 /// `register_font_from_memory` override — see that function's doc for how
 /// the in-memory registration now covers every backend, GTK included.
 pub(crate) static ICON_FONT_BYTES: &[u8] = include_bytes!("../data/fonts/vimcode-icons.ttf");
+
+/// The app icon (Dock/app-switcher on macOS, big+small titlebar/taskbar icon
+/// on Win-GUI), rasterised at 512px from `render::APP_ICON_SVG` and embedded
+/// in the binary — quadraui#1142 / vimcode#1531.
+///
+/// A raster PNG rather than the SVG source: `ShellConfig::with_app_icon`
+/// decodes through each backend's *tray*-icon pipeline
+/// (`macos::tray::decode_ns_image` / `win::tray::decode_hicon`), not the
+/// general `Backend::draw_image` path `render::APP_ICON_SVG`'s other call
+/// site uses — `NSImage::initWithData` and WIC's default
+/// `IWICImagingFactory` both decode PNG/JPEG/BMP reliably but have no
+/// guaranteed SVG decoder, so a raster asset is the only format both
+/// backends' tray decoders are guaranteed to accept. quadraui's own
+/// `full_chrome_demo` example makes the same choice for its `with_app_icon`
+/// call, for the same reason.
+///
+/// Backend-neutral home, not `src/gtk/`: `crate::gtk::build_shell_config`
+/// does set it too (for consistency with `crate::macos`/`crate::win`), but
+/// `ShellConfig::app_icon` is a no-op on GTK/TUI per its own doc — this
+/// constant's *only* backend with real behaviour to prove is macOS/Win-GUI.
+/// The byte constant itself carries no GTK dependency and both `src/macos/`
+/// and `src/win/` need to reach it, so it lives beside `ICON_FONT_BYTES`
+/// rather than under a single backend's directory.
+///
+/// `cfg_attr`'d the same way `App::shell_config` is (see that method's own
+/// `#[cfg_attr]`): its only readers are `crate::gtk`/`crate::macos`/
+/// `crate::win`'s `build_shell_config` functions, so a TUI-only
+/// `--no-default-features` build — which compiles none of those three —
+/// would otherwise report this `dead_code`.
+#[cfg_attr(
+    not(any(
+        feature = "gui",
+        feature = "win",
+        all(feature = "macos", target_os = "macos")
+    )),
+    allow(dead_code)
+)]
+pub(crate) static APP_ICON_PNG: &[u8] =
+    include_bytes!("../data/icons/io.github.jdonaghy.VimCode.png");

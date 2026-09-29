@@ -1,6 +1,6 @@
 [package]
 name = "vimcode"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 description = "Vim-like code editor with GTK4 and tree-sitter"
 license = "MIT"
@@ -60,6 +60,24 @@ path = "src/main.rs"
 [[bin]]
 name = "vcd"
 path = "src/tui_bin.rs"
+
+# #1461: the ACP contract-test corpus's replay agent — plays the "agent"
+# side of a transcript recorded by `AcpClient::spawn_with_recording`
+# (`src/core/acp.rs`) back at a real `AcpClient`, so a contract test drives
+# the engine's actual NDJSON parsing + dispatch path against realistic wire
+# shapes instead of only calling engine functions directly. A `[[bin]]`
+# (not a `tests/fixtures/*.sh` script, unlike `fake_acp_agent.sh`) because
+# faithfully rewriting a client-request `id` to match what the live client
+# actually sent — the one bit of real JSON logic replay needs, see its own
+# module doc — is impractical in the jq/python/node-free `/bin/sh` this
+# repo otherwise insists on for ACP fixtures; `serde_json` is already an
+# unconditional dependency, so this costs nothing new in the graph.
+# Located via `env!("CARGO_BIN_EXE_acp-replay-agent")` from
+# `tests/acp_contract.rs`, same mechanism `tests/nvim_conformance.rs` etc.
+# use for `env!("CARGO_BIN_EXE_vimcode")`.
+[[bin]]
+name = "acp-replay-agent"
+path = "tests/fixtures/replay_acp_agent.rs"
 
 # #657: `tests/acceptance.rs` — the sealed oracle-loop suite root — is entirely
 # `#![cfg(all(feature = "test-support", feature = "gui"))]`. Without this
@@ -188,7 +206,79 @@ win = ["quadraui/win"]
 # that file and CLAUDE.md's "Wrong quadraui checkout" section) — this
 # replaces the old `VIMCODE_QUADRAUI_UNPINNED=1` escape hatch, which could
 # not build backwards drift (a checkout older than a rev vimcode requires).
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "20a4486aa6d561eb112d105a587e6aea8960f36e", features = ["tui", "terminal"] }
+#
+# #1498 bumped this to pick up quadraui#1091 (`GtkPlatformServices` themes
+# `gtk4::FileDialog`'s fallback widgets — sidebar/scrollbar/popover — from
+# `Theme` on every `Backend::set_theme` call), which lets this crate delete
+# its own `css.rs`/`gtk/css.rs` copy of the same stylesheet instead of
+# maintaining a duplicate.
+#
+# #1576 bumped this to pick up three light-theme fixes: quadraui#1179 (the
+# macOS clear colour comes from the theme instead of a hard-coded #1F1F24,
+# and the GTK/macOS status bar fills its whole `rect.height` instead of
+# stopping at `current_line_height` — fixes the dark band behind the
+# traffic lights, the dark gap under the breadcrumbs and the dark Settings
+# scrollbar gutter), quadraui#1180 (`AppShell::render` sources the sidebar
+# header and resize divider from `Backend::theme()` — a new trait method
+# that reads back whatever the host last passed to `set_theme` — instead
+# of hard-coded VS-Code-dark literals, and `Form`'s focused row pairs
+# `header_fg` with `selected_bg` for guaranteed contrast instead of
+# `foreground`, which under `vscode-light` was near-black on near-black),
+# and quadraui#1184 (`Theme::default()` stays dark on purpose, but a new
+# `Theme::light_default()` gives light-theme builders a palette to spread
+# `..` over instead of leaking dark defaults into unmapped fields, and the
+# GTK terminal background now comes from the theme). No `quadraui::Theme`
+# field was added by any of the three — `to_quadraui_theme_chrome` below
+# already mapped `header_bg`/`header_fg`/`separator` before this bump, and
+# vimcode's exhaustive literal (not a `..Theme::default()` spread) means
+# `light_default()` doesn't apply here either; nothing to change on the
+# mapping side. Also carries whatever else had landed on quadraui
+# `develop` by then: #1177 (macOS full-screen/traffic-light fix) and
+# #1181–#1183 (TUI minimap slider, Toast layout, TUI Tree badge overlap).
+#
+# #1577 bumped this to pick up quadraui#1185 (VS Code-style actionable
+# toasts): `ToastOverlay`/`Toast`/`ToastButton` replace the single-action
+# `ToastStack`/`ToastItem`/`ToastAction` (now `#[deprecated]`, kept only so
+# a stale caller still compiles — vimcode migrates onto the new shapes in
+# this same bump, see `render::build_toast_stack`), each toast carries an
+# ordered `actions: Vec<ToastButton>` (one may be `primary`) drawn on its
+# own row at the bottom-right (never over the title), and
+# `compose::ToastStackController` gives a non-modal toast stack
+# Tab/Shift+Tab/Left/Right/Up/Down/Enter/Escape keyboard focus with a
+# theme.link_fg focus ring. `Backend::draw_toast_overlay` is the new paint
+# entry point; `draw_toast_stack` survives as a deprecated, defaulted
+# shim that converts and forwards. Queued after #1576 so the two pin
+# bumps don't collide in this file.
+#
+# #1614 investigated bumping to `928f2b5` (quadraui `develop` HEAD at the
+# time) to pick up three Win-GUI fixes — quadraui#1197 (block cursor no
+# longer hides the glyph, `win::editor::draw_editor`'s `CursorShape::Block`
+# arm now re-paints it in `theme.background`, closing vimcode#1559),
+# quadraui#1200 (`WinBackend::install_menu_bar` attaches a real `HMENU` via
+# `SetMenu` and declares `native_menu: true`, closing vimcode#1582), and
+# quadraui#1199 (`WinBackend` declares `window_chrome: true` and `win::run`
+# handles `WM_NCCALCSIZE`/`WM_NCHITTEST`, closing vimcode#1562's title-bar
+# item) — but did **NOT** land the bump: real-hardware verification on
+# dell64 found `928f2b5` crashes `vimcode.exe` on every startup, before any
+# window is shown, with `thread 'main' panicked at quadraui/src/win/run.rs:
+# 1712:42: RefCell already borrowed`, aborting (a panic inside a
+# non-unwinding Win32 callback). Root cause: `WinBackend::
+# install_menu_bar_now`'s `SetMenu` call (new in quadraui#1200) triggers a
+# synchronous nested `WM_SIZE` through `SendMessageW`/`CallWindowProcW`
+# while `win::run`'s outer call already holds `ws.state.borrow_mut()` —
+# `wndproc`'s existing `pump_depth.is_pumping()` re-entrancy guard (#702)
+# does not cover this path, since it fires during window creation, before
+# the main message pump starts. Confirmed present starting at quadraui
+# `90e4310` (the native-menu-bar commit) through `cc2b80d` and `928f2b5`
+# (same panic site, same 100%-reproducible startup crash at each); the
+# immediately-prior pin (`db92e46`, still below) launches cleanly — real
+# window, `Get-Process` shows `Responding: True`. Full repro, isolation
+# steps and stack trace are in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry — file that as a quadraui issue and get a fix merged before
+# attempting this bump again. Leave vimcode#1559/#1562/#1582 open behind
+# it; none of the three can be verified end-to-end while Win-GUI can't
+# start.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "db92e461ca5376103d3147d5267b697cbe002063", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
@@ -262,6 +352,16 @@ sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# #1464: ACP `image` content blocks are `{"type":"image","mimeType",
+# "data":<base64>}` — `base64` is already resolved transitively (via
+# `termwiz`, confirmed in `Cargo.lock`), so pinning it as a direct
+# dependency for `AcpManualAttachment::content_block` costs nothing new in
+# the graph. `png` encodes the `RgbaImage` a clipboard-image paste reads
+# off `quadraui::Clipboard::read_image` into the PNG bytes that block's
+# `data` carries — also already resolved transitively (via `image`, itself
+# a dependency of `arboard`'s clipboard-image support), same reasoning.
+base64 = "0.22"
+png = "0.18"
 
 [dev-dependencies]
 insta = "1.39"
@@ -277,6 +377,21 @@ insta = "1.39"
 # protocol synchronously; #27's fuzzing loop can build on it or swap in
 # nvim-rs then without touching anything else.
 rmpv = "1.3"
+# #1531: a portable "did these bytes decode as a real image" check for the
+# macOS/Win-GUI `build_shell_config` app-icon tests — those two backends have
+# no bundled pixel-decoder exposed to test code the way GTK's `gdk_pixbuf` is
+# (see `src/gtk/mod.rs`'s `shell_config_identity_tests`, which reuses that
+# instead). Already resolved transitively at this exact version (`arboard`'s
+# `image-data` feature, pulled in by quadraui's GTK/macOS clipboard support,
+# already depends on it), so this adds no new crate version to `Cargo.lock` —
+# just a direct name for vimcode's own test code to reach it by.
+# `default-features = false` + `features = ["png"]`: the app icon asset this
+# decodes is always PNG, so vimcode's own declared need stays minimal even
+# though `arboard`'s broader feature request is what actually determines the
+# unified build (Cargo unions feature flags across the whole dependency
+# graph) — narrowing here is correct today and free if `arboard` ever
+# narrows its own request first.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [build-dependencies]
 cc = "1.0"

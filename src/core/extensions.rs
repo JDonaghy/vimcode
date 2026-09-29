@@ -410,7 +410,15 @@ pub struct LspConfig {
     /// binary directly, with no shell command, `sudo`, `unzip`, or PATH
     /// edits. When present, `ext_install_from_registry` prefers this over
     /// `install`/`install_linux`/`install_macos`/`install_windows` — see
-    /// `crate::core::tool_acquire`.
+    /// `crate::core::tool_acquire`. Five of the eight `kind`s (`npm`,
+    /// `pip`, `go`, `cargo`, `dotnet-tool`, #1346) install via the matching
+    /// package manager instead of downloading a release archive, but still
+    /// into a private prefix under vimcode's managed tools dir rather than
+    /// a global, often `sudo`-requiring, install location — see
+    /// `Engine::ext_install_from_registry`'s LSP block for the runtime
+    /// dependency check (`tool_acquire::package_manager_runtime`) that
+    /// falls a manifest through to the visible-terminal tier when e.g.
+    /// `npm` itself isn't on PATH, instead of failing silently.
     #[serde(default)]
     pub acquire: Option<crate::core::tool_acquire::AcquireConfig>,
 }
@@ -661,6 +669,18 @@ const PREREQ_INSTALLS: &[(&str, PrereqInstall)] = &[
             linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
             macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
             windows: "winget install Rustlang.Rustup",
+        },
+    ),
+    // #1346: runtime `[lsp.acquire]`/`[dap.acquire]` kind `pip` needs
+    // `python3 -m venv` (Debian/Ubuntu split that out of the base `python3`
+    // package into `python3-venv`), and the hint is shown wherever a `pip`
+    // acquisition's runtime is missing — see `tool_acquire::package_manager_runtime`.
+    (
+        "python3",
+        PrereqInstall {
+            linux: "sudo apt install python3 python3-venv python3-pip",
+            macos: "brew install python3",
+            windows: "winget install Python.Python.3",
         },
     ),
 ];
@@ -1226,6 +1246,64 @@ binary_path = "terraform-ls"
             crate::core::tool_acquire::AcquireKind::HashicorpRelease
         );
         assert_eq!(acquire.product, "terraform-ls");
+    }
+
+    /// #1346: the five package-manager `[lsp.acquire]` kinds parse from
+    /// TOML the same way the three #1345 archive kinds do.
+    #[test]
+    fn lsp_acquire_table_parses_package_manager_kinds() {
+        let toml = r#"
+name = "pyright"
+display_name = "Pyright"
+[lsp]
+binary = "pyright-langserver"
+[lsp.acquire]
+kind = "npm"
+package = "pyright"
+binary_path = "pyright-langserver"
+"#;
+        let m = ExtensionManifest::parse(toml).expect("should parse");
+        let acquire = m.lsp.acquire.expect("acquire table should parse");
+        assert_eq!(acquire.kind, crate::core::tool_acquire::AcquireKind::Npm);
+        assert_eq!(acquire.package, "pyright");
+
+        let toml_pip = r#"
+name = "pylsp"
+display_name = "Python LSP Server"
+[lsp]
+binary = "pylsp"
+[lsp.acquire]
+kind = "pip"
+package = "python-lsp-server"
+"#;
+        let m = ExtensionManifest::parse(toml_pip).expect("should parse");
+        let acquire = m.lsp.acquire.expect("acquire table should parse");
+        assert_eq!(acquire.kind, crate::core::tool_acquire::AcquireKind::Pip);
+        assert_eq!(acquire.package, "python-lsp-server");
+
+        let toml_dotnet = r#"
+name = "csharprepl"
+display_name = "C# REPL"
+[lsp]
+binary = "csharprepl"
+[lsp.acquire]
+kind = "dotnet-tool"
+package = "csharprepl"
+"#;
+        let m = ExtensionManifest::parse(toml_dotnet).expect("should parse");
+        let acquire = m.lsp.acquire.expect("acquire table should parse");
+        assert_eq!(
+            acquire.kind,
+            crate::core::tool_acquire::AcquireKind::DotnetTool
+        );
+    }
+
+    /// #1346: `pip`'s runtime dependency (`python3`) needs its own
+    /// platform-specific install hint, same as `npm`/`go`/`cargo`/`dotnet`
+    /// already had before this issue.
+    #[test]
+    fn prereq_install_cmd_covers_python3_for_pip_kind() {
+        assert!(prereq_install_cmd("python3").is_some());
     }
 
     #[test]

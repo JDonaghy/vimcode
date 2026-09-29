@@ -169,6 +169,15 @@ Production lines that name a toolkit module or type (`gtk4::`/`gio::`/`glib::`/`
 measured before #785 moved `src/gtk/mod.rs`'s mass into `src/app.rs`, and read
 `src/gtk/mod.rs` at 7,684 lines when it is now 140.*
 
+> **2026-09-26 (audit R4, `02319b83`): the `src/tui_main/` rows below are
+> mostly unreachable code.** Since #1433 (`6ece249`) `tui_main::run` builds the
+> shared `App`; `shell_app.rs`, `mouse.rs`, `render_impl.rs`, `panels.rs` and
+> most of `mod.rs` have no production caller but are still compiled and still
+> counted. The live TUI surface is **≈210** production lines, not the
+> ≈10,800 these rows sum to — `prod_lines.py` measures what compiles, not what
+> runs. §4's "cannot shrink to `src/macos/mod.rs`'s size" no longer holds;
+> vimcode#1434 deletes the unreachable modules.
+
 | File | Production | Native-touching | |
 |---|---:|---:|---:|
 | `src/gtk/mod.rs` | 140 | 8 | 5.7% |

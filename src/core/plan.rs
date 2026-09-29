@@ -16,7 +16,7 @@
 //!
 //! `core::acp` re-exports [`PlanEntry`]/[`PlanEntryStatus`] as
 //! `AcpPlanEntry`/`AcpPlanEntryStatus` so existing ACP call sites
-//! (`Engine::acp_plan`, `render::populate_ai_chat_controller`) are
+//! (`AcpSession::plan` (via `Engine::acp()`), `render::populate_ai_chat_controller`) are
 //! unaffected by this module's existence — this is a relocation of the
 //! model to a source-agnostic home, not a new parallel type.
 

@@ -42,7 +42,7 @@ The principle: **a vimcode primitive migration must collapse paint code on every
 
 **If a primitive is missing from a backend,** file a quadraui issue to add it before starting the vimcode-side migration.
 
-**Once Win-GUI gets rebuilt on quadraui,** the rule grows to include `quadraui::win_gui::*` rasterisers and harnesses. Same for macOS later.
+**All four backends are on quadraui now** — since #1433 TUI, GTK, macOS and Win-GUI all run the single `impl quadraui::ShellApp for App` — so "every vimcode-supported backend" in items 1–3 means `quadraui::{tui,gtk,macos,win}::*` rasterisers and harnesses, not just TUI and GTK. A migration that collapses paint on two backends and leaves bespoke code on macOS or Win is the same two-sources-of-truth failure.
 
 ## Terminal selection stays on `TerminalSelection`, not `TextRegion` (#564)
 

@@ -444,38 +444,16 @@ impl Engine {
             }
         }
 
-        // N-to-dismiss extension hint (#1397 keyboard parity with the toast's
-        // action button / dismiss "×" — see `lsp_did_open`): intercept 'N' in
-        // Normal mode while the install-offer toast for `name` is still up.
-        // Gated on the toast itself (not `self.message`, which the toast no
-        // longer writes to) so it stays live for as long as the toast does —
-        // i.e. until acted on or dismissed, not just until the next status
-        // message.
-        if let Some(ref name) = self.ext_hint_pending_name.clone() {
-            let toast_still_shown = self.toasts.iter().any(
-                |t| matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == name),
-            );
-            if !toast_still_shown {
-                // Toast was dismissed/acted on some other way — forget the
-                // pending name silently.
-                self.ext_hint_pending_name = None;
-            } else if (key_name == "N" || unicode == Some('N'))
-                && !ctrl
-                && matches!(self.mode, Mode::Normal)
-                && self.pending_key.is_none()
-                && self.pending_operator.is_none()
-            {
-                let name = self.ext_hint_pending_name.take().unwrap();
-                self.extension_state.mark_dismissed(&name);
-                let _ = self.extension_state.save();
-                self.toasts.retain(|t| {
-                    !matches!(&t.action, Some(ToastActionKind::InstallExtension(n)) if n == &name)
-                });
-                self.message =
-                    format!("Extension '{name}' dismissed — :ExtEnable {name} to re-enable");
-                return EngineAction::None;
-            }
-        }
+        // #1577: the pre-#1397/#1577 "N-to-dismiss" hijack of vim's own `N`
+        // (search-previous) used to live here — removed. It silently and
+        // permanently dismissed the extension recommendation if the user
+        // pressed `N` to search backward while the (sticky, never-expiring)
+        // toast happened to be up. Keyboard access to the toast's buttons
+        // now goes through `Engine::focus_toast_stack`
+        // (`:Notifications`/`panel_keys.focus_notifications`) and
+        // quadraui's `ToastStackController`, wired in `app.rs`'s shared
+        // `handle_key_press` — a real focus cursor, not a mode-specific key
+        // steal, so `N` always means "previous search match" in Normal mode.
 
         // Safety: dismiss completion popup if it's visible outside Insert mode.
         // This can happen if a late-arriving LSP response set it after mode change.
@@ -5306,9 +5284,44 @@ impl Engine {
         // All known built-in leader sequences
         const SEQUENCES: &[&str] = &[
             "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw",
+            "ai", "ak", "ar",
         ];
 
         match partial.as_str() {
+            "ai" => {
+                // #1450 point 2: in Visual mode, stage the selection as the
+                // next AI-panel attachment and focus the panel (see
+                // `Engine::acp_attach_visual_selection_and_focus`'s doc).
+                // Outside Visual mode there's no selection to attach, so
+                // this just focuses the panel — the same fallback the
+                // palette's plain `chat_open` action already has.
+                //
+                // #1507: this arm only ever runs to *enter* the panel — once
+                // `ai_has_focus` is true, every keystroke (including this
+                // same leader sequence typed again) routes straight to
+                // `render::route_ai_chat_event` instead of reaching
+                // `Engine::handle_key`'s dispatch ladder at all (see
+                // `render::route_focus_key`'s doc), so there is no second
+                // pass through here to toggle. The toggle-back-to-editor
+                // half of `<leader>ai` lives in
+                // `Engine::ai_leader_toggle_key`, called from
+                // `render::route_ai_chat_event` itself.
+                if matches!(
+                    self.mode,
+                    Mode::Visual | Mode::VisualLine | Mode::VisualBlock
+                ) {
+                    self.acp_attach_visual_selection_and_focus();
+                } else {
+                    self.ai_has_focus = true;
+                    // #1507 review: this is a fresh entry into the panel, so
+                    // any `<leader>ai` partial match left buffered from a
+                    // previous session (this arm bypasses
+                    // `clear_sidebar_focus`, unlike `focus_sidebar_panel`)
+                    // must not carry over and wrongly complete against the
+                    // very first characters of this new session's message.
+                    self.ai_leader_toggle_pending.clear();
+                }
+            }
             "b" => {
                 // Enter breadcrumb focus mode
                 self.rebuild_breadcrumb_segments();
@@ -5342,6 +5355,18 @@ impl Engine {
             "gb" => {
                 // Toggle inline git blame
                 self.toggle_inline_blame();
+            }
+            "ak" => {
+                // #1517: in-buffer inline review — keep the agent hunk
+                // under the cursor. Deliberately not bare `a`/`r` (those
+                // are vim's own append/replace-char) — see `acp_turn_ops.
+                // rs`'s "in-buffer inline review" section doc.
+                self.acp_inline_review_keep_at_cursor();
+            }
+            "ar" => {
+                // #1517: in-buffer inline review — revert the agent hunk
+                // under the cursor to its pre-turn content.
+                self.acp_inline_review_reject_at_cursor();
             }
             "sb" => {
                 self.open_picker(PickerSource::Buffers);
@@ -9608,11 +9633,26 @@ impl Engine {
             "ExtDisable",
             "ExtRemove",
             "ExtRefresh",
+            // Notifications (#1577)
+            "Notifications",
+            "NotifyFocus",
             // AI
             "AI ",
             "AiClear",
             "AiMode",
+            "AiConfig",
+            "AiModel",
             "AiAgent",
+            "AiSessions",
+            "AiNew ",
+            "AiNext",
+            "AiPrev",
+            "AiClose",
+            "AiAttach ",
+            "AiPasteImage",
+            "AiReview",
+            "AiRestore",
+            "AiFollow",
             // Markdown
             "MarkdownPreview",
             "MdPreview",
@@ -9741,6 +9781,57 @@ impl Engine {
                     .filter(|m| m.starts_with(arg_partial))
                     .map(|m| format!("Keybindings {m}"))
                     .collect(),
+                // #1520: `:AiConfig <id> <value>` — complete the id
+                // against declared config option ids/names first; once a
+                // second space starts the value half, complete against
+                // that specific option's declared values instead.
+                "AiConfig" => {
+                    if let Some(inner_space) = arg_partial.find(' ') {
+                        let id_partial = &arg_partial[..inner_space];
+                        let value_partial = arg_partial[inner_space + 1..].trim_start();
+                        self.acp()
+                            .config_options
+                            .iter()
+                            .find(|o| {
+                                o.id.eq_ignore_ascii_case(id_partial)
+                                    || o.name.eq_ignore_ascii_case(id_partial)
+                            })
+                            .map(|o| {
+                                o.values
+                                    .iter()
+                                    .filter(|v| {
+                                        v.id.starts_with(value_partial)
+                                            || v.name.starts_with(value_partial)
+                                    })
+                                    .map(|v| format!("AiConfig {id_partial} {}", v.id))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        self.acp()
+                            .config_options
+                            .iter()
+                            .filter(|o| o.id.starts_with(arg_partial))
+                            .map(|o| format!("AiConfig {}", o.id))
+                            .collect()
+                    }
+                }
+                // #1520: `:AiModel <name>` completes against the
+                // `category: "model"` config option's declared values —
+                // there is only ever one positional argument, unlike
+                // `:AiConfig`.
+                "AiModel" => self
+                    .acp_model_option()
+                    .map(|o| {
+                        o.values
+                            .iter()
+                            .filter(|v| {
+                                v.id.starts_with(arg_partial) || v.name.starts_with(arg_partial)
+                            })
+                            .map(|v| format!("AiModel {}", v.id))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 "colorscheme" => {
                     // Complete theme names
                     let mut names = vec![

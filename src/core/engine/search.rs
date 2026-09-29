@@ -187,17 +187,21 @@ impl Engine {
         }
     }
 
-    /// Buffer line `line`'s length in chars, excluding its trailing
-    /// newline — the input `engine_visual_rows_for_line` expects. Small
-    /// private helper factoring out a `.len_chars().saturating_sub(1)` that
-    /// was duplicated across `ensure_cursor_visible_wrap`'s margin/top/
-    /// bottom walks (#1293 review nit).
-    fn wrap_line_len(&self, line: usize) -> usize {
-        self.buffer()
-            .content
-            .line(line)
-            .len_chars()
-            .saturating_sub(1)
+    /// Buffer line `line`'s text with its trailing newline stripped — the
+    /// input `engine_visual_rows_for_line` expects. Small private helper
+    /// factoring out a `.chars().collect()` + drop-last-char that was
+    /// duplicated across `ensure_cursor_visible_wrap`'s margin/top/bottom
+    /// walks (#1293 review nit). Kept as text rather than just a length
+    /// (as it was pre-#1496) so `engine_visual_rows_for_line` can honour
+    /// `'linebreak'`, which needs the actual characters to find a word
+    /// boundary, not just a char count.
+    fn wrap_line_text(&self, line: usize) -> String {
+        // Strip only the EOL (the painter wraps the same EOL-stripped text,
+        // see `render.rs`'s `wrap_text_len`) — the buffer's final line has
+        // none, and blindly dropping the last char there would cut a real
+        // one off.
+        let text = self.buffer().content.line(line).to_string();
+        text.trim_end_matches(['\n', '\r']).to_string()
     }
 
     /// Sum of visual rows occupied by buffer lines `[start, end)`. Used by
@@ -207,8 +211,9 @@ impl Engine {
         if start >= end {
             return 0;
         }
+        let linebreak = self.settings.linebreak;
         (start..end)
-            .map(|r| engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols))
+            .map(|r| engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak))
             .sum()
     }
 
@@ -219,7 +224,21 @@ impl Engine {
     /// has to be counted in *visual* rows instead, since a single wrapped
     /// buffer line can span more than one screen row.
     pub(crate) fn ensure_cursor_visible_wrap(&mut self) {
-        let viewport_cols = self.view().viewport_cols;
+        // Prefer the paint-time column count (exact — the width the painter
+        // actually wrapped each line at) over the resize handler's
+        // approximate `view.viewport_cols`, same as the horizontal branch of
+        // `ensure_cursor_visible` above. Counting visual rows at a width even
+        // one column off the painted one miscounts every line whose wrap
+        // point lands near the edge, drifting the scroll so the cursor's
+        // line can end up below the viewport (#1496).
+        let wid = self.active_window_id();
+        let viewport_cols = self
+            .paint_viewport_cols
+            .borrow()
+            .get(&wid)
+            .copied()
+            .filter(|&c| c > 0)
+            .unwrap_or(self.view().viewport_cols);
         // #185: use effective viewport (accounts for bottom chrome like
         // the quickfix panel that may have opened in the current tick).
         let viewport_lines = self.effective_viewport_lines();
@@ -240,8 +259,12 @@ impl Engine {
             cursor_seg + self.visual_rows_for_range(0, cursor_line, viewport_cols);
         let top_margin = scrolloff.min(rows_above_cursor);
 
-        let cursor_line_segs =
-            engine_visual_rows_for_line(self.wrap_line_len(cursor_line), viewport_cols);
+        let linebreak = self.settings.linebreak;
+        let cursor_line_segs = engine_visual_rows_for_line(
+            &self.wrap_line_text(cursor_line),
+            viewport_cols,
+            linebreak,
+        );
         let rows_below_cursor = cursor_line_segs.saturating_sub(cursor_seg + 1)
             + self.visual_rows_for_range(cursor_line + 1, total_lines, viewport_cols);
         let bottom_margin = scrolloff.min(rows_below_cursor);
@@ -267,7 +290,11 @@ impl Engine {
                     if rows_used >= top_margin {
                         break;
                     }
-                    rows_used += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                    rows_used += engine_visual_rows_for_line(
+                        &self.wrap_line_text(r),
+                        viewport_cols,
+                        linebreak,
+                    );
                     new_scroll_top = r;
                 }
             }
@@ -284,7 +311,8 @@ impl Engine {
         let mut visual_rows: usize = 0;
         for r in scroll_top..=cursor_line {
             if r < cursor_line {
-                visual_rows += engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                visual_rows +=
+                    engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak);
             } else {
                 // Partial count: only up to the cursor's visual segment.
                 visual_rows += cursor_seg + 1;
@@ -305,7 +333,8 @@ impl Engine {
         let mut new_scroll_top = cursor_line;
         if rows_used < target_rows && cursor_line > 0 {
             for r in (0..cursor_line).rev() {
-                let vrows = engine_visual_rows_for_line(self.wrap_line_len(r), viewport_cols);
+                let vrows =
+                    engine_visual_rows_for_line(&self.wrap_line_text(r), viewport_cols, linebreak);
                 if rows_used + vrows > target_rows {
                     break;
                 }

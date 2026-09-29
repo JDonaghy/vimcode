@@ -1,5 +1,12 @@
 use std::path::PathBuf;
 
+// #1554: the Common-Controls v6 manifest gate lives in its own file so
+// `tests/windows_manifest.rs` can `include!` the same source and assert the
+// whole target/feature matrix on any host. See that file's header for why a
+// build script itself cannot be the unit under test.
+#[path = "build_support/windows_manifest.rs"]
+mod windows_manifest;
+
 fn main() {
     // Compile vendored tree-sitter-latex grammar (v0.3.0, language version 14)
     cc::Build::new()
@@ -18,6 +25,57 @@ fn main() {
     // it into the binary here for `vimcode --version` / `vcd --version`
     // (`src/quadraui_pin.rs::version_line`).
     export_quadraui_rev();
+
+    // ── Windows Common-Controls v6 manifest (#1554) ────────────────────────
+    embed_windows_comctl_v6_manifest();
+}
+
+/// Embed a Common-Controls v6 side-by-side manifest dependency in the
+/// binary's linker output (#1554).
+///
+/// # Why this is needed
+///
+/// quadraui's `win` backend calls `TaskDialogIndirect`
+/// (`quadraui/src/win/services.rs`, quadraui#744), which the `windows` crate
+/// imports **statically** from `comctl32.dll`. That export exists only in
+/// the Common-Controls **v6** side-by-side assembly —
+/// `%SystemRoot%\System32\comctl32.dll` is still the legacy 5.82 build. A
+/// Win32 binary only gets the v6 assembly if its own application manifest
+/// declares a dependency on it; without that, the Windows loader resolves
+/// `comctl32.dll` to 5.82, fails to find `TaskDialogIndirect` in its export
+/// table, and kills the process **before `main` runs** — no output, no
+/// panic, just `STATUS_ENTRYPOINT_NOT_FOUND` (`0xC0000139`).
+///
+/// quadraui's own `build.rs` embeds this manifest for *its* bins/tests/
+/// examples, but link args from a build script do **not** propagate to a
+/// downstream crate (quadraui's `build.rs` "Downstream note" says so
+/// explicitly) — vimcode links the `win` backend and must embed an
+/// equivalent manifest of its own, which is what this function does.
+///
+/// `/MANIFEST:EMBED` + `/MANIFESTDEPENDENCY:` is the linker spelling of the
+/// classic `#pragma comment(linker, "/manifestdependency:…")` every C++
+/// TaskDialog sample carries. Both MSVC's `link.exe` (what `windows-latest`
+/// CI uses) and `lld-link` (what `cargo xwin` uses to cross-build from
+/// Linux) implement these two flags natively — neither needs `mt.exe`.
+///
+/// The decision itself (which target/feature combinations get the flags) is
+/// `windows_manifest::comctl_v6_link_args`, kept in `build_support/` so
+/// `tests/windows_manifest.rs` can assert it on a Linux host; this function is
+/// only the cargo-directive plumbing around it.
+fn embed_windows_comctl_v6_manifest() {
+    println!("cargo:rerun-if-changed=build_support/windows_manifest.rs");
+
+    // Host-independent gate: read the *target* cfg cargo hands the build
+    // script, never `cfg!(…)` (which would describe the build host and so
+    // would be wrong for every cross-compile, including the `cargo xwin`
+    // route documented in CLAUDE.md).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let win_feature = std::env::var_os("CARGO_FEATURE_WIN").is_some();
+
+    for arg in windows_manifest::comctl_v6_link_args(&target_os, &target_env, win_feature) {
+        println!("cargo:rustc-link-arg-bin=vimcode={arg}");
+    }
 }
 
 /// Resolve the quadraui git rev this build is locked to, and export it as

@@ -180,6 +180,111 @@ fn unregister_accelerator_removes_match() {
         .is_none());
 }
 
+/// #1495: the engine's accelerator registry used to carry its own copy of
+/// the `KeyBinding` → canonical-string parsing table; it now delegates
+/// entirely to `quadraui::accelerator::parse_binding`. Round-trip a
+/// user-configured binding string through `register_accelerator` /
+/// `match_accelerator` and confirm the match decision agrees with what
+/// quadraui's own parser says the binding means — proving the engine isn't
+/// running a second, possibly-diverging parser under the hood.
+#[test]
+fn user_configured_binding_round_trips_through_quadraui_parser() {
+    let mut e = engine_with("");
+    let user_binding = "<C-A-S-k>";
+
+    e.register_accelerator(Accelerator {
+        id: AcceleratorId::new("test.user_configured"),
+        binding: KeyBinding::Literal(user_binding.into()),
+        scope: AcceleratorScope::Global,
+        label: None,
+    });
+
+    let parsed = vimcode_core::quadraui::accelerator::parse_key_binding(user_binding)
+        .expect("quadraui should parse this vim-style binding");
+
+    // The engine's match decision must agree with quadraui's own parse of
+    // the same string — same modifiers, same key.
+    let hit = e.match_accelerator(
+        parsed.modifiers.ctrl,
+        parsed.modifiers.shift,
+        parsed.modifiers.alt,
+        parsed.key.chars().next(),
+        false,
+        false,
+        false,
+    );
+    assert_eq!(
+        hit.as_ref().map(|i| i.as_str()),
+        Some("test.user_configured")
+    );
+
+    // A press missing one of the modifiers quadraui parsed must NOT match.
+    assert!(e
+        .match_accelerator(
+            parsed.modifiers.ctrl,
+            false, // drop shift
+            parsed.modifiers.alt,
+            parsed.key.chars().next(),
+            false,
+            false,
+            false,
+        )
+        .is_none());
+}
+
+/// #1495 review finding: `register_accelerator` must reject the same
+/// malformed `KeyBinding::Literal` strings the pre-#1495 code rejected via
+/// `settings::parse_key_binding_named` — Cmd modifiers (`<D-...>`/`<M-...>`,
+/// which vimcode's Linux/Windows backends have no equivalent for) and
+/// bindings with no explicit modifier at all (`<t>`, `<F5>`; vimcode's
+/// config format has never accepted those in bracket form). quadraui's own
+/// `parse_key_binding` accepts both — `<D-t>` maps Cmd to `Modifiers::cmd`
+/// and drops it from `match_accelerator`'s comparison, and `<t>`/`<F5>`
+/// simply have no modifier letters — so if `register_accelerator` ever
+/// starts calling quadraui's parser directly for `Literal` bindings instead
+/// of routing through the guarded `parse_key_binding_named`, this binding
+/// would silently start firing on a bare, unmodified `t` keypress.
+#[test]
+fn register_accelerator_rejects_cmd_and_unmodified_literal_bindings() {
+    let mut e = engine_with("");
+
+    e.register_accelerator(Accelerator {
+        id: AcceleratorId::new("test.cmd_binding"),
+        binding: KeyBinding::Literal("<D-t>".into()),
+        scope: AcceleratorScope::Global,
+        label: None,
+    });
+    let reg = e
+        .accelerators
+        .iter()
+        .find(|r| r.acc.id.as_str() == "test.cmd_binding")
+        .expect("registration is kept even when unparseable");
+    assert!(
+        reg.parsed.is_none(),
+        "Cmd-modifier literal binding must not parse, matching pre-#1495 behaviour"
+    );
+    // Must not silently become "bare t" — no unmodified keypress should match.
+    assert!(e
+        .match_accelerator(false, false, false, Some('t'), false, false, false)
+        .is_none());
+
+    e.register_accelerator(Accelerator {
+        id: AcceleratorId::new("test.unmodified_named_key"),
+        binding: KeyBinding::Literal("<F5>".into()),
+        scope: AcceleratorScope::Global,
+        label: None,
+    });
+    let reg = e
+        .accelerators
+        .iter()
+        .find(|r| r.acc.id.as_str() == "test.unmodified_named_key")
+        .expect("registration is kept even when unparseable");
+    assert!(
+        reg.parsed.is_none(),
+        "bracket binding with no explicit modifier must not parse, matching pre-#1495 behaviour"
+    );
+}
+
 #[test]
 fn match_accelerator_skips_non_global_scopes() {
     let mut e = engine_with("");

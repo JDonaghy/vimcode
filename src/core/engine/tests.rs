@@ -473,7 +473,7 @@ fn test_qa_bang_force_quits() {
 /// `Engine::startup_without_session_restore` must ignore a per-workspace
 /// session file that `Engine::startup` would have honoured.
 ///
-/// This is the ambient-input class `TuiShellApp::new_for_test` exists to close:
+/// This is the ambient-input class the pre-#1434 TUI shell's `new_for_test` exists to close:
 /// `Engine::new_for_test()` only replaces the two *global* config reads
 /// (`settings.json` / `session.json`), while `restore_session_files()` does a
 /// second, independent `SessionState::load_for_workspace(&self.cwd)` read keyed
@@ -16699,12 +16699,34 @@ fn test_dap_eval_result_field_default() {
 
 #[test]
 fn test_visual_rows_for_line() {
-    assert_eq!(engine_visual_rows_for_line(0, 80), 1); // empty line = 1 row
-    assert_eq!(engine_visual_rows_for_line(80, 80), 1); // exactly one row
-    assert_eq!(engine_visual_rows_for_line(81, 80), 2); // one char overflow
-    assert_eq!(engine_visual_rows_for_line(160, 80), 2); // exactly two rows
-    assert_eq!(engine_visual_rows_for_line(161, 80), 3);
-    assert_eq!(engine_visual_rows_for_line(10, 0), 1); // zero cols = 1 row
+    let line = |n: usize| "a".repeat(n);
+    assert_eq!(engine_visual_rows_for_line(&line(0), 80, false), 1); // empty line = 1 row
+    assert_eq!(engine_visual_rows_for_line(&line(80), 80, false), 1); // exactly one row
+    assert_eq!(engine_visual_rows_for_line(&line(81), 80, false), 2); // one char overflow
+    assert_eq!(engine_visual_rows_for_line(&line(160), 80, false), 2); // exactly two rows
+    assert_eq!(engine_visual_rows_for_line(&line(161), 80, false), 3);
+    assert_eq!(engine_visual_rows_for_line(&line(10), 0, false), 1); // zero cols = 1 row
+}
+
+#[test]
+fn test_visual_rows_for_line_honours_linebreak() {
+    // A single 81-char word (no boundary anywhere) wraps to 2 rows either
+    // way: 'linebreak' only backs a break up to a word boundary, and there
+    // is none here, so it falls back to the same hard cut.
+    let word = "a".repeat(81);
+    assert_eq!(engine_visual_rows_for_line(&word, 80, false), 2);
+    assert_eq!(engine_visual_rows_for_line(&word, 80, true), 2);
+
+    // 8 'a's + space + 11 'a's = 20 chars, viewport 10. A hard cut (`false`)
+    // needs exactly 2 rows (10 + 10). With 'linebreak' on, the first break
+    // backs up to the space (row of 8 instead of 10), leaving 12 chars for
+    // the rest — one more row than the hard cut needed (#1496: before this
+    // fix, this function only ever saw a char *count*, never the text, so
+    // it could not see the boundary and always returned the linebreak-off
+    // answer here too — the bug that drifted `:set linebreak` scrolling).
+    let line = format!("{} {}", "a".repeat(8), "a".repeat(11));
+    assert_eq!(engine_visual_rows_for_line(&line, 10, false), 2);
+    assert_eq!(engine_visual_rows_for_line(&line, 10, true), 3);
 }
 
 #[test]
@@ -18672,8 +18694,9 @@ fn test_dialog_modifier_only_key_does_not_fire_hotkey() {
     assert!(e.dialog.is_none(), "'s' must still fire the Save hotkey");
 }
 
-/// Shift+Tab (sent as "ISO_Left_Tab" by GDK or "BackTab" after map_gtk_key_name)
-/// must cycle the dialog selection backward (#207 side-effect).
+/// Shift+Tab (sent as "ISO_Left_Tab", both backends' `engine_key_from_ui`
+/// spelling since #1060, or the pre-#1060 "BackTab") must cycle the dialog
+/// selection backward (#207 side-effect).
 #[test]
 fn test_dialog_shift_tab_backward_navigation() {
     let mut e = Engine::new();
@@ -18709,7 +18732,7 @@ fn test_dialog_shift_tab_backward_navigation() {
     // Backward at start wraps to last (0 → 2)
     e.handle_key("ISO_Left_Tab", None, false);
     assert_eq!(e.dialog.as_ref().unwrap().selected, 2);
-    // BackTab (from map_gtk_key_name("ISO_Left_Tab")) → backward (2 → 1)
+    // BackTab (the pre-#1060 spelling, still accepted) → backward (2 → 1)
     e.handle_key("BackTab", None, false);
     assert_eq!(e.dialog.as_ref().unwrap().selected, 1);
     // Shift_Tab (TUI explicit) → backward (1 → 0)
@@ -22845,6 +22868,229 @@ fn test_command_center_chat_with_acp_agent_configured_shows_open_panel() {
          configured: {:?}",
         e.picker_items
     );
+}
+
+/// #1446: `:AI hello` with no ACP agent configured and no API key
+/// resolvable for the (default) `anthropic` provider must fail with an
+/// actionable message naming both missing pieces, instead of spawning curl
+/// and reporting whatever (often empty) stderr the doomed request produces
+/// — the reported bug was a bare "AI error: curl failed:".
+///
+/// RED verified: reverting `ai_send_message`'s new pre-flight check makes
+/// this fail — `e.message` stays empty and `e.acp_mut().ai_streaming` flips to
+/// `true` because the (real, unmocked) `curl` subprocess is spawned
+/// instead.
+#[test]
+fn test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message() {
+    let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+    let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+    let mut e = engine_with_text("hello");
+    assert!(e.settings.ai_api_key.is_empty());
+    assert!(e.settings.acp_agent_command.trim().is_empty());
+    assert!(e.settings.acp_agents.is_empty());
+
+    e.ai_send_message("hello".to_string());
+
+    assert!(
+        !e.acp_mut().ai_streaming,
+        "should not spawn the curl transport when unconfigured"
+    );
+    assert!(
+        e.ai_rx.is_none(),
+        "no background request should have been started"
+    );
+    assert!(
+        e.message.contains("no ACP agent configured"),
+        "message should explain the ACP side is unconfigured: {}",
+        e.message
+    );
+    assert!(
+        e.message.contains("no API key for provider \"anthropic\""),
+        "message should explain the API key side is unconfigured: {}",
+        e.message
+    );
+    // The panel must not swallow the turn the user typed, and the reason
+    // belongs in the transcript too — same shape as the ACP spawn-failure
+    // arm. (Painted-output coverage for both lives in
+    // `ai_panel_submit_without_transport_keeps_turn_and_paints_reason_via_shell_app`.)
+    assert_eq!(
+        e.acp_mut().ai_messages.len(),
+        2,
+        "{:?}",
+        e.acp_mut().ai_messages
+    );
+    assert_eq!(e.acp_mut().ai_messages[0].role, "user");
+    assert_eq!(e.acp_mut().ai_messages[0].content, "hello");
+    assert_eq!(e.acp_mut().ai_messages[1].role, "assistant-thought");
+    assert!(
+        e.acp_mut().ai_messages[1].content.contains("Cannot send"),
+        "transcript should explain why nothing was sent: {}",
+        e.acp_mut().ai_messages[1].content
+    );
+}
+
+/// Companion to the above: an Ollama provider needs no API key at all, so
+/// the pre-flight check must not block it — it should still fall through
+/// to the curl transport (and thus start streaming).
+#[test]
+fn test_ai_send_message_ollama_needs_no_key() {
+    let mut e = engine_with_text("hello");
+    e.settings.ai_provider = "ollama".to_string();
+    assert!(e.settings.ai_api_key.is_empty());
+
+    e.ai_send_message("hello".to_string());
+
+    assert!(
+        e.acp_mut().ai_streaming,
+        "ollama needs no API key, so the curl transport should still start: {}",
+        e.message
+    );
+}
+
+/// #1450: `:'<,'>AI <message>` reaches `Engine::ai_attach_range` through the
+/// normal ex-range parser (`Engine::try_execute_ranged_command`'s new
+/// `name == "AI"` branch), not just via a direct call — stages exactly the
+/// buffer lines the Visual selection covered and still sends the message.
+/// Uses the no-agent-no-key fail-fast path (same lock/guards as
+/// `test_ai_send_message_no_agent_no_key_fails_fast_with_actionable_message`)
+/// so the user's turn lands in the transcript without a real subprocess.
+///
+/// RED verified: with the `name == "AI"` branch removed from
+/// `try_execute_ranged_command`, this fails — `acp_pending_attachment` stays
+/// `None`, because a leading range prefix means the plain `:AI ` fallback in
+/// `execute_command` never sees the command (its `cmd` still starts with
+/// `'<,'>`, not `"AI "`).
+#[test]
+fn test_ranged_ai_command_via_ex_parser_stages_attachment_and_sends() {
+    let _lock = crate::core::ai::AI_API_KEY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard_anthropic = crate::core::ai::EnvVarGuard::unset("ANTHROPIC_API_KEY");
+    let _guard_openai = crate::core::ai::EnvVarGuard::unset("OPENAI_API_KEY");
+
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!("vimcode_test_1450_ex_{}.rs", std::process::id()));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    // Visual-line select lines 0-1, then run the range command while still
+    // in Visual mode — same setup `test_substitute_visual_range` uses.
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    engine.execute_command("'<,'>AI explain this");
+
+    let attachment = engine
+        .acp_pending_attachment
+        .as_ref()
+        .expect("the ex-range form should stage an attachment");
+    assert_eq!(attachment.start_line, 0);
+    assert_eq!(attachment.end_line, 1);
+    assert_eq!(attachment.text, "one\ntwo\n");
+    assert!(engine.ai_has_focus);
+    assert_eq!(
+        engine.acp().ai_messages.first().map(|m| m.content.as_str()),
+        Some("explain this"),
+        "the message must still be sent, not just the attachment staged: {:?}",
+        engine.acp().ai_messages
+    );
+
+    let _ = std::fs::remove_file(&file_path);
+}
+
+/// Companion: `:'<,'>AI` with no trailing message stages the attachment and
+/// focuses the panel without sending anything — reachable through the ex
+/// parser too, not just a direct `Engine::ai_attach_range` call.
+#[test]
+fn test_ranged_ai_command_via_ex_parser_with_no_message_does_not_send() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!(
+        "vimcode_test_1450_ex_empty_{}.rs",
+        std::process::id()
+    ));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    engine.execute_command("'<,'>AI");
+
+    assert!(
+        engine.acp_pending_attachment.is_some(),
+        "the attachment must still be staged"
+    );
+    assert!(engine.ai_has_focus);
+    assert!(
+        engine.acp_mut().ai_messages.is_empty(),
+        "no message means nothing is sent yet: {:?}",
+        engine.acp_mut().ai_messages
+    );
+
+    let _ = std::fs::remove_file(&file_path);
+}
+
+/// #1450 point 2: the Visual-mode `<leader>ai` mapping reaches
+/// `Engine::acp_attach_visual_selection_and_focus` through the real leader
+/// key-dispatch path (`Engine::handle_leader_key`, driven via
+/// `Engine::handle_key`), not just a direct call — proves the "ai" leader
+/// sequence is actually wired into `handle_visual_key`'s leader-mode
+/// routing.
+///
+/// RED verified: with `"ai"` removed from `handle_leader_key`'s `SEQUENCES`
+/// and match arms, this fails — pressing `<leader>a` alone (no known
+/// sequence starts with "a" otherwise) surfaces "Unknown leader sequence"
+/// and never attaches or focuses anything.
+#[test]
+fn test_leader_ai_in_visual_mode_attaches_selection_via_real_key_dispatch() {
+    let mut engine = Engine::new();
+    engine.buffer_mut().insert(0, "one\ntwo\nthree\n");
+
+    let workspace = std::env::temp_dir();
+    engine.workspace_root = Some(workspace.clone());
+    let file_path = workspace.join(format!(
+        "vimcode_test_1450_leader_{}.rs",
+        std::process::id()
+    ));
+    std::fs::write(&file_path, "one\ntwo\nthree\n").expect("write test file");
+    engine.active_buffer_state_mut().file_path = Some(file_path.clone());
+
+    engine.mode = Mode::VisualLine;
+    engine.visual_anchor = Some(Cursor { line: 0, col: 0 });
+    engine.view_mut().cursor = Cursor { line: 1, col: 0 };
+
+    let leader = engine.settings.leader;
+    engine.handle_key(&leader.to_string(), Some(leader), false);
+    engine.handle_key("a", Some('a'), false);
+    engine.handle_key("i", Some('i'), false);
+
+    assert_eq!(
+        engine.mode,
+        Mode::Normal,
+        "the mapping should exit Visual mode"
+    );
+    assert!(engine.ai_has_focus);
+    let attachment = engine
+        .acp_pending_attachment
+        .as_ref()
+        .expect("the leader mapping should stage an attachment");
+    assert_eq!(attachment.text, "one\ntwo\n");
+
+    let _ = std::fs::remove_file(&file_path);
 }
 
 #[test]
