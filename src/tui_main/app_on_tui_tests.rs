@@ -7618,6 +7618,103 @@ mod tests {
         }
     }
 
+    /// #1516: hunk-level Keep/Reject on the ACP turn-review surface — `a`/
+    /// `r` act on the hunk under the cursor, not the whole file. GTK twin:
+    /// `gtk::testing::issue_1516_hunk_level_review`.
+    mod issue_1516_hunk_level_review {
+        use super::*;
+
+        /// Widened (220x30) harness — the change-review surface is
+        /// full-viewport (unlike the badge/gutter overlay `issue_1515_acp_
+        /// review_badge::widened_ai_harness` widens the sidebar column
+        /// for), so a plain wider terminal is all the new, longer
+        /// hunk-level footer legend needs to paint without being clipped;
+        /// no sidebar-collapse or panel-resize keypresses required. Also
+        /// deliberately no leading `Escape`: this module opens the
+        /// turn-review surface with `AcpReviewOnTurnEnd::Auto` *before*
+        /// the harness is built, and an Escape here would immediately
+        /// close the very surface under test
+        /// (`Engine::handle_change_review_key`'s `Escape`/`q` arm).
+        fn widened_harness(
+            engine: crate::core::Engine,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            crate::tui_main::testing::conformance_harness(engine, 220, 30)
+        }
+
+        /// A single file with two well-separated agent edits lands in two
+        /// hunks; keeping hunk 0 (`a`) then reverting hunk 1 (`]` then `r`)
+        /// leaves a genuinely mixed result on disk and the new footer
+        /// legend visible — the core new capability #1516's title names.
+        ///
+        /// RED against unfixed `develop` (pre-#1516 whole-file `a`/`r`):
+        /// pressing `a` once would have kept (accepted) the *entire* file
+        /// and auto-closed the review immediately — the "still open, hunk
+        /// 1 still pending" assertion below would fail, and disk would
+        /// show both `AGENT-A` and `AGENT-B` rather than a mix.
+        #[test]
+        fn keep_one_hunk_reject_the_other_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1516_tui_hunks_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            let lines: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+            std::fs::write(&a, format!("{}\n", lines.join("\n"))).unwrap();
+
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.settings.acp_review_on_turn_end =
+                crate::core::settings::AcpReviewOnTurnEnd::Auto;
+            engine.workspace_root = Some(dir.clone());
+            let mut changed = lines;
+            changed[2] = "AGENT-A".to_string();
+            changed[15] = "AGENT-B".to_string();
+            engine
+                .acp_write_text_file(&a, &format!("{}\n", changed.join("\n")))
+                .unwrap();
+            engine.acp_end_turn();
+
+            let mut h = widened_harness(engine);
+            h.driver.render();
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("a=keep-hunk") && screen.contains("r=revert-hunk"),
+                "the new hunk-level footer legend must paint; screen:\n{screen}"
+            );
+
+            h.driver.type_char('a'); // keep hunk 0
+            h.driver.render();
+            assert!(
+                h.driver.screen().contains("Change 1/1"),
+                "hunk 1 is still pending — the review must still be open"
+            );
+
+            h.driver.type_char(']'); // move to hunk 1
+            h.driver.type_char('r'); // revert hunk 1
+            h.driver.render();
+
+            let on_disk = std::fs::read_to_string(&a).unwrap();
+            assert!(
+                on_disk.contains("AGENT-A"),
+                "the kept hunk's agent content must remain: {on_disk:?}"
+            );
+            assert!(
+                !on_disk.contains("AGENT-B"),
+                "the reverted hunk must be gone: {on_disk:?}"
+            );
+            assert!(
+                on_disk.contains("\n16\n"),
+                "the reverted hunk's line must be back to its pre-turn value \"16\": {on_disk:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// #1510: AI panel assistant/thought turns render as markdown
     /// (`render_markdown_to_styled`) instead of raw markdown source; thought
     /// turns additionally collapse to a fixed one-line "Thinking..."

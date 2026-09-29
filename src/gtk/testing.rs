@@ -7598,212 +7598,25 @@ second line here
         );
     }
 
-    /// #955 (ACP-4) acceptance, GTK's twin of `tui_main::shell_app::tests::
-    /// ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_shell_app`:
-    /// a `diff` content block opens the change-review surface (a real
-    /// `quadraui::DiffView`, painted through `render::paint_change_review_rung`
-    /// — the same shared function TUI calls), and accepting it writes the
-    /// new text to the real file.
+    /// #1516 acceptance (retiring #955's proposal-review write path), GTK's
+    /// twin of `tui_main::app_on_tui_tests`'s
+    /// `ai_panel_tool_call_diff_is_display_only_and_never_writes_via_shell_app`:
+    /// a `diff` tool-call content block is display-only per the ACP spec —
+    /// it must never open the change-review surface and must never write
+    /// to the target file, even though the pre-#1516 client did both.
     ///
-    /// RED verified: with `Engine::acp_open_review_for_diffs` never called
-    /// from `acp_apply_tool_call_update`, the screen never shows `"old
-    /// line"`/`"new line"` and the file on disk is never rewritten — same
-    /// failure shape as the TUI test.
+    /// RED verified against unfixed `develop` (pre-#1516, `Engine::
+    /// acp_open_review_for_diffs` still wired into `acp_apply_tool_call_
+    /// update`): this test's "no 'Change 1/' header" assertion failed —
+    /// the diff opened a full-viewport review exactly as the retired #955
+    /// tests this replaces used to assert — and the file's content
+    /// assertion would have failed too, since accepting used to write
+    /// `newText` straight to disk.
     #[cfg(unix)]
     #[test]
-    fn ai_panel_tool_call_diff_opens_change_review_and_accept_writes_file_via_gtk_driver() {
-        let dir = std::env::temp_dir().join(format!("acp4-gtk-tool-call-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.txt");
-        std::fs::write(&target, "old line\n").unwrap();
-        let target_str = target.to_string_lossy().into_owned();
-
-        let mut h = panel_harness(PANEL_AI);
-        {
-            let mut engine = h.engine.borrow_mut();
-            engine.workspace_root = Some(dir.clone());
-            let argv = vec![
-                "sh".to_string(),
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/fake_acp_agent.sh"
-                )
-                .to_string(),
-            ];
-            let cwd = std::env::temp_dir();
-            let mut client = crate::core::acp::AcpClient::spawn_with_env(
-                &argv,
-                &cwd,
-                &[
-                    ("ACP_FAKE_TOOL_CALL", "1"),
-                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
-                ],
-            )
-            .expect("fixture agent should spawn");
-            client.initialize();
-            engine.acp_mut().client = Some(client);
-            engine.settings.acp_agent_command = "already-spawned-above".to_string();
-        }
-
-        let sb = h.painted_sidebar_bounds.get().unwrap();
-        h.driver.click(sb.x + 20.0, sb.y + 20.0);
-        for c in "please edit".chars() {
-            h.driver.type_char(c);
-        }
-        h.driver.ctrl_char('s');
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
-            h.engine.borrow_mut().poll_acp();
-            h.driver.render();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            h.driver.screen_contains("old line"),
-            "the change-review surface must paint the diff's oldText"
-        );
-        assert!(
-            h.driver.screen_contains("new line"),
-            "the change-review surface must paint the diff's newText"
-        );
-
-        h.driver.type_char('a');
-        h.driver.render();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::fs::read_to_string(&target).unwrap_or_default() != "new line\n"
-            && std::time::Instant::now() < deadline
-        {
-            h.engine.borrow_mut().poll_acp();
-            h.driver.render();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "new line\n",
-            "accepting the change must write newText to the real file"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #1454, GTK's twin of `tui_main::shell_app::tests::
-    /// ai_panel_tool_call_diff_fragment_preserves_surrounding_file_content_via_shell_app`:
-    /// a real ACP adapter's `diff` block is the edited *fragment*, not the
-    /// whole file (`@agentclientprotocol/claude-agent-acp`'s `Edit` tool
-    /// shape) — the fake fixture's fixed "old line\n" -> "new line\n"
-    /// fragment is applied against a target file with real surrounding
-    /// context, and accepting must preserve it rather than truncating the
-    /// file to just the edited region (the exact data-loss repro this issue
-    /// reports).
-    ///
-    /// RED verified: reverting `Engine::acp_open_review_for_diffs` to write
-    /// the raw `diff` block's fragment straight through as a whole-file
-    /// `ProposedChange` (pre-#1454) makes this accept write bare
-    /// `"new line\n"` to disk, discarding `"line1"`/`"line3"`.
-    #[cfg(unix)]
-    #[test]
-    fn ai_panel_tool_call_diff_fragment_preserves_surrounding_file_content_via_gtk_driver() {
-        let dir = std::env::temp_dir().join(format!("acp1454-gtk-fragment-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.txt");
-        std::fs::write(&target, "line1\nold line\nline3\n").unwrap();
-        let target_str = target.to_string_lossy().into_owned();
-
-        let mut h = panel_harness(PANEL_AI);
-        {
-            let mut engine = h.engine.borrow_mut();
-            engine.workspace_root = Some(dir.clone());
-            let argv = vec![
-                "sh".to_string(),
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/fake_acp_agent.sh"
-                )
-                .to_string(),
-            ];
-            let cwd = std::env::temp_dir();
-            let mut client = crate::core::acp::AcpClient::spawn_with_env(
-                &argv,
-                &cwd,
-                &[
-                    ("ACP_FAKE_TOOL_CALL", "1"),
-                    ("ACP_FAKE_TOOL_CALL_PATH", target_str.as_str()),
-                ],
-            )
-            .expect("fixture agent should spawn");
-            client.initialize();
-            engine.acp_mut().client = Some(client);
-            engine.settings.acp_agent_command = "already-spawned-above".to_string();
-        }
-
-        let sb = h.painted_sidebar_bounds.get().unwrap();
-        h.driver.click(sb.x + 20.0, sb.y + 20.0);
-        for c in "please edit".chars() {
-            h.driver.type_char(c);
-        }
-        h.driver.ctrl_char('s');
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
-            h.engine.borrow_mut().poll_acp();
-            h.driver.render();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
-            "the change-review surface must paint the fragment"
-        );
-
-        h.driver.type_char('a');
-        h.driver.render();
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::fs::read_to_string(&target).unwrap_or_default() != "line1\nnew line\nline3\n"
-            && std::time::Instant::now() < deadline
-        {
-            h.engine.borrow_mut().poll_acp();
-            h.driver.render();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "line1\nnew line\nline3\n",
-            "accepting a fragment diff must preserve the surrounding file \
-             content, not truncate the file to just the edited region"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// #955 (ACP-4) review follow-up, GTK's twin of `tui_main::shell_app::
-    /// tests::ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_
-    /// via_shell_app`: "clicking a `location` jumps to that file and line"
-    /// driven through a *real mouse click* (`h.driver.click(x, y)`) against
-    /// the painted diff geometry, not `handle_change_review_key("Return",
-    /// ...)`.
-    ///
-    /// This is also the regression test for the fix this review round
-    /// shipped: before `render::reconcile_change_review_modal_stack`
-    /// existed, a click landing where the activity bar / sidebar chrome
-    /// sits underneath the full-viewport diff overlay never reached
-    /// `App::handle_mouse_click_msg` at all — quadraui's `ShellAdapter::
-    /// handle` claimed it as chrome first (issue #411's exact failure
-    /// shape) — so this deliberately clicks on `"old line"`, which paints
-    /// in the diff's *left* pane starting at column 0, squarely inside
-    /// where the activity bar/sidebar normally live.
-    ///
-    /// RED verified: with the click routed but the surface never
-    /// registered on the modal stack, this click never reached
-    /// `route_and_apply_change_review_click` — the screen kept showing the
-    /// diff/footer instead of jumping, and the on-disk file was never
-    /// touched (same failure shape confirmed live against this branch
-    /// before the modal-stack reconcile was added).
-    #[cfg(unix)]
-    #[test]
-    fn ai_panel_tool_call_diff_click_on_row_jumps_to_file_and_line_via_gtk_driver() {
+    fn ai_panel_tool_call_diff_is_display_only_and_never_writes_via_gtk_driver() {
         let dir =
-            std::env::temp_dir().join(format!("acp4-gtk-tool-call-click-{}", std::process::id()));
+            std::env::temp_dir().join(format!("acp1516-gtk-tool-call-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("target.txt");
         std::fs::write(&target, "old line\n").unwrap();
@@ -7844,60 +7657,27 @@ second line here
         h.driver.ctrl_char('s');
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !h.driver.screen_contains("old line") && std::time::Instant::now() < deadline {
+        while h.engine.borrow().acp().ai_streaming && std::time::Instant::now() < deadline {
             h.engine.borrow_mut().poll_acp();
             h.driver.render();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            h.driver.screen_contains("old line") && h.driver.screen_contains("new line"),
-            "precondition: change-review surface must be open with both \
-             sides of the diff painted before the click"
-        );
-
-        // A real mouse click on the painted "old line" row, at the exact
-        // geometry `App::route_and_apply_change_review_click` resolves
-        // through `render::route_change_review_click`.
-        let (x, y) = h
-            .driver
-            .find("old line")
-            .unwrap_or_else(|| panic!("diff row 'old line' must be locatable on screen"));
-        h.driver.click(x, y);
         h.driver.render();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while h.driver.screen_contains("a=accept") && std::time::Instant::now() < deadline {
-            h.driver.render();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
         assert!(
-            !h.driver.screen_contains("a=accept"),
-            "clicking a diff row must close the change-review surface \
-             (jump, not accept)"
+            !h.driver.screen_contains("Change 1/"),
+            "a diff content block must never open the full-viewport \
+             change-review surface; screen:\n{:?}",
+            h.driver.screen()
         );
-        assert!(
-            !h.driver.screen_contains("new line"),
-            "the surface must be gone — 'new line' (the proposed text) \
-             must no longer paint anywhere on screen"
-        );
-        assert!(
-            h.driver.screen_contains("target.txt"),
-            "the click must have opened target.txt's own tab, proving the \
-             jump landed on the right file"
-        );
-        assert!(
-            h.driver.screen_contains("old line"),
-            "the buffer shown after the jump must be target.txt's real, \
-             unmodified on-disk content ('old line'), not the proposed \
-             ('new line') text — confirming this was a jump, not an accept"
-        );
-
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "old line\n",
-            "a click-to-jump must never write to the file — that's \
-             accept's job, not jump's"
+            "a diff content block must never write to the target file"
+        );
+        assert!(
+            h.engine.borrow_mut().change_review.is_none(),
+            "no review surface should exist at the engine level either"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -21153,6 +20933,87 @@ mod issue_1515_acp_review_badge {
             "off mode must not show the status-strip badge either; \
              painted: {:?}",
             h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// #1516: hunk-level Keep/Reject on the ACP turn-review surface — `a`/`r`
+/// act on the hunk under the cursor, not the whole file. GTK twin of
+/// `tui_main::app_on_tui_tests::tests::issue_1516_hunk_level_review`.
+#[cfg(test)]
+mod issue_1516_hunk_level_review {
+    use super::*;
+
+    /// A single file with two well-separated agent edits lands in two
+    /// hunks; keeping hunk 0 (`a`) then reverting hunk 1 (`]` then `r`)
+    /// leaves a genuinely mixed result on disk — the core new capability
+    /// #1516's title names, driven through a real `GtkDriver`.
+    ///
+    /// RED verified: with `Engine::handle_change_review_key`'s `a`/`r`
+    /// reverted to the old whole-file `change_review_accept_current`/
+    /// `change_review_reject_current` (pre-#1516), the first `a` keeps
+    /// (accepts) the *entire* file and auto-closes the review — the
+    /// "still open" assertion below fails, and disk ends up with both
+    /// `AGENT-A` and `AGENT-B` rather than a mix.
+    #[test]
+    fn keep_one_hunk_reject_the_other_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1516_gtk_hunks_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let lines: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        std::fs::write(&a, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Auto;
+        engine.workspace_root = Some(dir.clone());
+        let mut changed = lines;
+        changed[2] = "AGENT-A".to_string();
+        changed[15] = "AGENT-B".to_string();
+        engine
+            .acp_write_text_file(&a, &format!("{}\n", changed.join("\n")))
+            .unwrap();
+        engine.acp_end_turn();
+
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("a=keep-hunk") && h.driver.screen_contains("r=revert-hunk"),
+            "the new hunk-level footer legend must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.type_char('a'); // keep hunk 0
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Change 1/1"),
+            "hunk 1 is still pending — the review must still be open; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.type_char(']'); // move to hunk 1
+        h.driver.type_char('r'); // revert hunk 1
+        h.driver.render();
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            on_disk.contains("AGENT-A"),
+            "the kept hunk's agent content must remain: {on_disk:?}"
+        );
+        assert!(
+            !on_disk.contains("AGENT-B"),
+            "the reverted hunk must be gone: {on_disk:?}"
+        );
+        assert!(
+            on_disk.contains("\n16\n"),
+            "the reverted hunk's line must be back to its pre-turn value \"16\": {on_disk:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

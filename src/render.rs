@@ -11071,13 +11071,40 @@ pub fn paint_change_review_rung(
         crate::core::review::ChangeDecision::Accepted => "accepted",
         crate::core::review::ChangeDecision::Rejected => "rejected",
     };
-    let msg = format!(
-        " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
-         ]/[=hunk n/p=file Esc=close ",
-        review.current + 1,
-        review.entries.len(),
-        entry.change.path,
-    );
+    // #1516: a turn review's `a`/`r` act on the hunk under the cursor
+    // ("a"/"r"), not the whole file — `A`/`R` (file) and `ga`/`gr` (every
+    // file) cover the old whole-file scope instead. A branch/proposal
+    // review keeps the pre-#1516 whole-file-only legend, since its `a`/`r`
+    // still mean exactly that (`Engine::handle_change_review_key`'s own
+    // doc has the full truth table).
+    let edited_by_you = if engine.turn_review_checkpoint_id.is_some() {
+        " \u{b7} edited by you"
+    } else {
+        ""
+    };
+    let msg = if engine.turn_review_checkpoint_id.is_some() {
+        format!(
+            " Change {}/{} ({decision}){} \u{b7} {} \u{b7} a=keep-hunk r=revert-hunk \
+             A=keep-file R=revert-file ga/gr=all c=comment d=del-comment ]/[=hunk n/p=file \
+             Esc=close ",
+            review.current + 1,
+            review.entries.len(),
+            if engine.current_turn_hunk_edited_by_human() {
+                edited_by_you
+            } else {
+                ""
+            },
+            entry.change.path,
+        )
+    } else {
+        format!(
+            " Change {}/{} ({decision}) \u{b7} {} \u{b7} a=accept r=reject c=comment d=del-comment \
+             ]/[=hunk n/p=file Esc=close ",
+            review.current + 1,
+            review.entries.len(),
+            entry.change.path,
+        )
+    };
     // Provenance (#528): a git-branch-fed review (`Engine::
     // open_branch_review`) is showing the human a diff *of a real branch
     // checked out right here* — the footgun the issue calls out is a human

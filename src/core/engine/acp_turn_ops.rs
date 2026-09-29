@@ -217,6 +217,48 @@ impl Engine {
             .retain(|c| c.id < target_id || !c.entries.is_empty());
     }
 
+    /// Whether the hunk the turn-review surface is currently scrolled to
+    /// has been edited by a human since the agent's own last write to that
+    /// file (#1516's "edited by you" label) — `false` whenever no turn
+    /// review is open, the current file isn't tracked by any outstanding
+    /// checkpoint (shouldn't happen for an entry that exists, but stays
+    /// conservative), or the hunk simply still matches the agent's own
+    /// write (the common case). See
+    /// [`crate::core::acp_turn::hunk_matches_agents_last_write`] for the
+    /// actual comparison.
+    pub(crate) fn current_turn_hunk_edited_by_human(&self) -> bool {
+        if self.turn_review_checkpoint_id.is_none() {
+            return false;
+        }
+        let Some(review) = &self.change_review else {
+            return false;
+        };
+        let Some(entry) = review.current_entry() else {
+            return false;
+        };
+        let Some(hunk_idx) = entry.current_hunk_index() else {
+            return false;
+        };
+        let Some(hunk) = entry.view.hunks.get(hunk_idx) else {
+            return false;
+        };
+        let Some(agent_written) = self
+            .acp_turn_checkpoints
+            .iter()
+            .rev()
+            .find_map(|cp| cp.entries.iter().find(|e| e.path == entry.change.path))
+            .map(|e| e.agent_written_content.clone())
+        else {
+            return false;
+        };
+        !crate::core::acp_turn::hunk_matches_agents_last_write(
+            entry.change.old_text.as_deref(),
+            &agent_written,
+            hunk.left_start,
+            &hunk.rows,
+        )
+    }
+
     /// `:AiReview` — open the turn-review surface for the most recently
     /// completed turn (#1460's "or on `:AiReview`" alternative to the
     /// automatic `PromptStopped` open). A status message, not an error,
@@ -559,6 +601,274 @@ mod tests {
             engine.change_review.is_none(),
             "keeping the only entry auto-closes the surface"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── hunk-level Keep/Reject (#1516) ──────────────────────────────────
+
+    /// Two well-separated changes in the same file (more than twice
+    /// quadraui's 3-line context radius apart, same construction
+    /// `crate::core::review`'s own `two_hunk_state` test fixture uses) land
+    /// in two hunks — the shape every test below needs.
+    fn write_two_hunk_file(engine: &mut Engine, path: &std::path::Path) {
+        let lines: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        let orig = format!("{}\n", lines.join("\n"));
+        std::fs::write(path, &orig).unwrap();
+        let mut changed = lines;
+        changed[2] = "AGENT-A".to_string();
+        changed[15] = "AGENT-B".to_string();
+        let new = format!("{}\n", changed.join("\n"));
+        engine.acp_write_text_file(path, &new).unwrap();
+    }
+
+    /// The core new capability (#1516's own title: "hunk-level Keep/
+    /// Reject"): rejecting the hunk the cursor is on reverts *only* that
+    /// hunk's own lines, leaving the other hunk's agent-written content on
+    /// disk untouched and the review still open (not every hunk is
+    /// decided yet) — proving reject no longer reverts the whole file, the
+    /// exact limitation the issue reports.
+    ///
+    /// RED against the pre-#1516 whole-file `r`: that key reverted the
+    /// entire file back to its pre-turn content, so "AGENT-B" would never
+    /// have survived this call — this test would see the file back to a
+    /// plain `1..20` sequence instead.
+    #[test]
+    fn reject_one_hunk_leaves_the_other_hunks_agent_content_on_disk() {
+        let dir = unique_temp_dir("reject-one-hunk");
+        let a = dir.join("a.txt");
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        write_two_hunk_file(&mut engine, &a);
+        engine.acp_end_turn();
+        let review = engine.change_review.as_ref().unwrap();
+        assert!(
+            review.entries[0].view.hunks.len() >= 2,
+            "test setup: the two changes must land in separate hunks"
+        );
+
+        // Cursor starts at hunk 0 — reject it.
+        engine.handle_change_review_key("", Some('r'));
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            on_disk.contains("\n3\n"),
+            "hunk 0's line must be reverted to its pre-turn value \"3\": {on_disk:?}"
+        );
+        assert!(
+            !on_disk.contains("AGENT-A"),
+            "hunk 0's agent content must be gone: {on_disk:?}"
+        );
+        assert!(
+            on_disk.contains("AGENT-B"),
+            "hunk 1's agent content must survive untouched: {on_disk:?}"
+        );
+        assert!(
+            engine.change_review.is_some(),
+            "hunk 1 is still pending — the review must not auto-close yet"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keeping one hunk then rejecting the other fully decides the entry
+    /// (auto-closing the surface) and leaves a genuinely *mixed* result on
+    /// disk — half the agent's turn kept, half reverted, within the same
+    /// file. This is only possible at hunk granularity; the pre-#1516
+    /// surface could only keep or revert an entire file at once.
+    #[test]
+    fn keep_one_hunk_and_reject_the_other_leaves_a_mixed_result_and_auto_closes() {
+        let dir = unique_temp_dir("keep-one-reject-other");
+        let a = dir.join("a.txt");
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        write_two_hunk_file(&mut engine, &a);
+        engine.acp_end_turn();
+
+        engine.handle_change_review_key("", Some('a')); // keep hunk 0
+        assert!(
+            engine.change_review.is_some(),
+            "hunk 1 is still pending after only deciding hunk 0"
+        );
+        // Cursor is still on hunk 0 (keep doesn't move it) — jump forward.
+        if let Some(review) = &mut engine.change_review {
+            review.next_hunk();
+        }
+        engine.handle_change_review_key("", Some('r')); // revert hunk 1
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(
+            on_disk.contains("AGENT-A"),
+            "the kept hunk's agent content must remain: {on_disk:?}"
+        );
+        assert!(
+            !on_disk.contains("AGENT-B"),
+            "the rejected hunk must be reverted: {on_disk:?}"
+        );
+        assert!(
+            on_disk.contains("\n16\n"),
+            "hunk 1's reverted line must be its pre-turn value \"16\": {on_disk:?}"
+        );
+        assert!(
+            engine.change_review.is_none(),
+            "both hunks now have a decision — the surface must auto-close"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `A` (shift-a) on a turn review keeps every remaining hunk in the
+    /// current file at once — no buffer write, matching plain `a`'s "pure
+    /// decision" contract, just applied file-wide.
+    #[test]
+    fn shift_a_keeps_every_hunk_in_the_current_file() {
+        let dir = unique_temp_dir("shift-a-whole-file");
+        let a = dir.join("a.txt");
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        write_two_hunk_file(&mut engine, &a);
+        engine.acp_end_turn();
+
+        engine.handle_change_review_key("", Some('A'));
+
+        let on_disk = std::fs::read_to_string(&a).unwrap();
+        assert!(on_disk.contains("AGENT-A") && on_disk.contains("AGENT-B"));
+        assert!(
+            engine.change_review.is_none(),
+            "keeping every hunk in the only file auto-closes the review"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `R` (shift-r) on a turn review reverts every remaining hunk in the
+    /// current file at once, ending with the file back to exactly its
+    /// pre-turn content — and, since that means the whole file is now
+    /// fully reverted, the checkpoint forgets it (same bookkeeping
+    /// `Engine::change_review_reject_current_hunk`'s single-hunk path
+    /// already gives).
+    #[test]
+    fn shift_r_reverts_every_hunk_in_the_current_file_and_forgets_the_checkpoint_entry() {
+        let dir = unique_temp_dir("shift-r-whole-file");
+        let a = dir.join("a.txt");
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        write_two_hunk_file(&mut engine, &a);
+        engine.acp_end_turn();
+        let checkpoint_id = engine.turn_review_checkpoint_id.unwrap();
+
+        engine.handle_change_review_key("", Some('R'));
+
+        let expected: String = (1..=20)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            std::fs::read_to_string(&a).unwrap(),
+            expected,
+            "reverting every hunk must restore the file exactly to its pre-turn content"
+        );
+        assert!(engine.change_review.is_none());
+        assert!(
+            !engine
+                .acp_turn_checkpoints
+                .iter()
+                .any(|c| c.id == checkpoint_id
+                    && c.entries.iter().any(|e| e.path == a.to_string_lossy())),
+            "a fully-reverted file must be forgotten from the checkpoint's bookkeeping"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ga` keeps every remaining hunk across *every file* in the review —
+    /// the all-files sweep, proven with two single-hunk files so the
+    /// per-file loop itself (not per-hunk reconstruction, already covered
+    /// above) is what's under test.
+    #[test]
+    fn ga_keeps_every_remaining_hunk_across_every_file() {
+        let dir = unique_temp_dir("ga-keep-all");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "orig a\n").unwrap();
+        std::fs::write(&b, "orig b\n").unwrap();
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "new a\n").unwrap();
+        engine.acp_write_text_file(&b, "new b\n").unwrap();
+        engine.acp_end_turn();
+
+        engine.handle_change_review_key("", Some('g'));
+        engine.handle_change_review_key("", Some('a'));
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new a\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new b\n");
+        assert!(
+            engine.change_review.is_none(),
+            "keeping every hunk in every file must auto-close the review"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `gr` reverts every remaining hunk across every file in the review —
+    /// both files end up back at their pre-turn content, and the
+    /// checkpoint is emptied entirely (every entry it held was reverted).
+    #[test]
+    fn gr_reverts_every_remaining_hunk_across_every_file() {
+        let dir = unique_temp_dir("gr-revert-all");
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "orig a\n").unwrap();
+        std::fs::write(&b, "orig b\n").unwrap();
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "new a\n").unwrap();
+        engine.acp_write_text_file(&b, "new b\n").unwrap();
+        engine.acp_end_turn();
+
+        engine.handle_change_review_key("", Some('g'));
+        engine.handle_change_review_key("", Some('r'));
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "orig a\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "orig b\n");
+        assert!(engine.change_review.is_none());
+        assert!(
+            engine.acp_turn_checkpoints.is_empty(),
+            "every touched file was fully reverted, so the checkpoint must be forgotten entirely"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unrecognised key after `g` must not be silently swallowed — it
+    /// falls through and is handled normally (here: `j` still scrolls),
+    /// matching vim's own g-prefix contract.
+    #[test]
+    fn an_unrecognised_key_after_g_falls_through_to_normal_handling() {
+        let dir = unique_temp_dir("g-then-unrecognised");
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "orig a\n").unwrap();
+        let mut engine = engine_for_turn_review_tests();
+        engine.workspace_root = Some(dir.clone());
+        engine.acp_write_text_file(&a, "new a\n").unwrap();
+        engine.acp_end_turn();
+        let before = engine.change_review.as_ref().unwrap().entries[0]
+            .view
+            .scroll_offset;
+
+        engine.handle_change_review_key("", Some('g'));
+        engine.handle_change_review_key("", Some('j'));
+
+        assert!(
+            engine.change_review.is_some(),
+            "an unrecognised g-follow-up must not have been treated as ga/gr"
+        );
+        let after = engine.change_review.as_ref().unwrap().entries[0]
+            .view
+            .scroll_offset;
+        assert!(after >= before, "the fall-through `j` must still scroll");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

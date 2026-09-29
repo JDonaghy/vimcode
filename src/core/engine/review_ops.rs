@@ -236,22 +236,52 @@ impl Engine {
     /// | `[`         | Jump to the previous hunk                  |
     /// | `n` / Tab   | Next file                                  |
     /// | `p`         | Previous file                              |
-    /// | `a`         | Accept (proposal review) / keep (turn review, #1460) |
-    /// | `r`         | Reject (proposal review) / revert to pre-turn content (turn review, #1460) |
-    /// | `A`         | Approve — report a verdict (#526)          |
+    /// | `a`         | **Turn review (#1460):** keep the current hunk (#1516) — pure decision, no write. **Proposal/branch review:** accept the whole file, unchanged since #955/#525. |
+    /// | `r`         | **Turn review:** revert the current hunk to its pre-turn content (#1516), one undo group. **Proposal/branch review:** reject the whole file, unchanged. |
+    /// | `A`         | **Turn review:** keep every hunk in the current file (#1516). **Otherwise:** Approve — report a verdict (#526). |
+    /// | `R`         | **Turn review only:** revert every hunk in the current file (#1516). No effect otherwise. |
+    /// | `ga`        | **Turn review only:** keep every remaining hunk in every file (#1516). |
+    /// | `gr`        | **Turn review only:** revert every remaining hunk in every file (#1516). |
     /// | `C`         | Request changes — report a verdict (#526)  |
     /// | `M`         | Comment-only — report a verdict (#526)     |
     /// | `c`         | Add/edit a comment on the current line (#527) |
     /// | `d`         | Delete the comment on the current line (#527) |
     ///
-    /// The three verdict keys hand off to
-    /// [`Self::start_review_verdict`], which closes this surface and opens
-    /// a body-composer buffer — see `review_verdict_ops.rs`'s module doc.
-    /// A key with no provider-configured command for that verdict (or no
-    /// reviewed card behind this surface at all — an ACP tool-call diff,
-    /// say) degrades to a status message rather than doing nothing
-    /// silently.
+    /// The verdict keys hand off to [`Self::start_review_verdict`], which
+    /// closes this surface and opens a body-composer buffer — see
+    /// `review_verdict_ops.rs`'s module doc. A key with no provider-
+    /// configured command for that verdict (or no reviewed card behind
+    /// this surface at all — a turn review never has one, see
+    /// `open_change_review_with_turn_marker`'s doc) degrades to a status
+    /// message rather than doing nothing silently; `A` specifically
+    /// prefers the turn-review "keep whole file" meaning over the verdict
+    /// one whenever a turn review is open, since the two can never both
+    /// apply to the same open surface (a turn review is never card-backed).
     pub fn handle_change_review_key(&mut self, key_name: &str, unicode: Option<char>) -> bool {
+        // `g` starts the `ga`/`gr` two-key sequence (#1516) — any other key
+        // first consumes (and clears) a pending one, whether or not it
+        // completes the sequence, mirroring vim's own g-prefix contract: an
+        // unrecognised follow-up key still gets handled normally below,
+        // it's just no longer treated as part of a `g` sequence.
+        if unicode != Some('g') {
+            let had_pending_g = self
+                .change_review
+                .as_mut()
+                .is_some_and(|r| std::mem::take(&mut r.pending_g));
+            if had_pending_g {
+                match unicode {
+                    Some('a') => {
+                        self.change_review_keep_all_files();
+                        return true;
+                    }
+                    Some('r') => {
+                        self.change_review_reject_all_files();
+                        return true;
+                    }
+                    _ => {} // fall through: handle this key normally below
+                }
+            }
+        }
         match key_name {
             "Escape" | "q" => {
                 self.close_change_review();
@@ -319,9 +349,37 @@ impl Engine {
                     review.prev_file();
                 }
             }
-            Some('a') => self.change_review_accept_current(),
-            Some('r') => self.change_review_reject_current(),
-            Some('A') => self.start_review_verdict(crate::core::review::ReviewVerdict::Approve),
+            Some('g') => {
+                if let Some(review) = &mut self.change_review {
+                    review.pending_g = true;
+                }
+            }
+            Some('a') => {
+                if self.turn_review_checkpoint_id.is_some() {
+                    self.change_review_keep_current_hunk();
+                } else {
+                    self.change_review_accept_current();
+                }
+            }
+            Some('r') => {
+                if self.turn_review_checkpoint_id.is_some() {
+                    self.change_review_reject_current_hunk();
+                } else {
+                    self.change_review_reject_current();
+                }
+            }
+            Some('A') => {
+                if self.turn_review_checkpoint_id.is_some() {
+                    self.change_review_keep_current_file_hunks();
+                } else {
+                    self.start_review_verdict(crate::core::review::ReviewVerdict::Approve);
+                }
+            }
+            Some('R') => {
+                if self.turn_review_checkpoint_id.is_some() {
+                    self.change_review_reject_current_file_hunks();
+                }
+            }
             Some('C') => {
                 self.start_review_verdict(crate::core::review::ReviewVerdict::RequestChanges)
             }
@@ -469,6 +527,204 @@ impl Engine {
         if self.change_review.as_ref().is_some_and(|r| r.all_decided()) {
             self.change_review = None;
             self.turn_review_checkpoint_id = None;
+        }
+    }
+
+    // ── hunk-level Keep/Reject (#1516) — turn review only ───────────────
+    //
+    // Every method below is only ever reached from `handle_change_review_
+    // key` while `self.turn_review_checkpoint_id.is_some()` — a branch/
+    // proposal review's `a`/`r`/`A` keep the whole-file semantics above
+    // unchanged. See `crate::core::review::ChangeReviewEntry`'s hunk
+    // methods (`current_hunk_index`, `content_with_hunk_reverted`,
+    // `refresh_after_edit`) for the pure mechanism these just orchestrate
+    // against real buffers/disk.
+
+    /// `a` on a turn review: keep the hunk under the cursor — a pure
+    /// decision, no buffer write, since the file already holds the agent's
+    /// own write for it (same contract the old whole-file `a` had).
+    /// Auto-closes the surface once every hunk in every file has a
+    /// decision.
+    pub(crate) fn change_review_keep_current_hunk(&mut self) {
+        let Some(review) = &mut self.change_review else {
+            return;
+        };
+        let Some(entry) = review.current_entry_mut() else {
+            return;
+        };
+        let Some(idx) = entry.current_hunk_index() else {
+            self.message = "No hunk here to keep".to_string();
+            return;
+        };
+        if entry.hunk_decisions[idx] == crate::core::review::ChangeDecision::Pending {
+            entry.hunk_decisions[idx] = crate::core::review::ChangeDecision::Accepted;
+            entry.sync_decision_from_hunks();
+        }
+        let path = entry.change.path.clone();
+        self.message = format!("Kept hunk in {path}");
+        self.close_turn_review_if_all_decided();
+    }
+
+    /// `r` on a turn review: revert the hunk under the cursor to its
+    /// pre-turn content, as a single undo group, saved to disk — "reject
+    /// reverts a hunk, not the whole file" (#1516's own words). Recomputes
+    /// the entry's diff/hunks afterward (`ChangeReviewEntry::
+    /// refresh_after_edit`) so the rejected hunk disappears and every
+    /// other hunk's position/decision stays correct. If the file is now
+    /// back to exactly its pre-turn content (every hunk gone), forgets it
+    /// from the checkpoint's own bookkeeping (same tail
+    /// [`Self::change_review_reject_current`]'s turn-review branch already
+    /// used) so a later `:AiRestore` neither re-reverts it nor misreports
+    /// it as refused.
+    pub(crate) fn change_review_reject_current_hunk(&mut self) {
+        let Some(checkpoint_id) = self.turn_review_checkpoint_id else {
+            return;
+        };
+        let Some((entry_idx, new_content, path, pre_turn_content)) = (|| {
+            let review = self.change_review.as_ref()?;
+            let entry_idx = review.current;
+            let entry = review.entries.get(entry_idx)?;
+            let hunk_idx = entry.current_hunk_index()?;
+            let new_content = entry.content_with_hunk_reverted(hunk_idx)?;
+            Some((
+                entry_idx,
+                new_content,
+                entry.change.path.clone(),
+                entry.change.old_text.clone(),
+            ))
+        })() else {
+            self.message = "No hunk here to revert".to_string();
+            return;
+        };
+        let is_new_file = pre_turn_content.is_none();
+        let result = if is_new_file {
+            self.acp_delete_file_untracked(std::path::Path::new(&path))
+        } else {
+            self.acp_write_file_untracked(std::path::Path::new(&path), &new_content)
+        };
+        if let Err(msg) = result {
+            self.message = format!("Failed to revert hunk in {path}: {msg}");
+            return;
+        }
+        let fresh_now = if is_new_file {
+            String::new()
+        } else {
+            self.acp_current_file_content(std::path::Path::new(&path))
+                .unwrap_or(new_content)
+        };
+        if let Some(review) = &mut self.change_review {
+            if let Some(entry) = review.entries.get_mut(entry_idx) {
+                entry.refresh_after_edit(entry_idx, fresh_now.clone());
+            }
+        }
+        let fully_reverted = pre_turn_content.as_deref() == Some(fresh_now.as_str())
+            || (pre_turn_content.is_none() && fresh_now.is_empty());
+        if fully_reverted {
+            self.acp_forget_reverted_checkpoint_paths(checkpoint_id, std::slice::from_ref(&path));
+        }
+        self.message = format!("Reverted hunk in {path}");
+        self.close_turn_review_if_all_decided();
+    }
+
+    /// `A` on a turn review: keep every hunk in the current file still
+    /// `Pending` — the whole-file sweep #1516 asks for, expressed as "keep
+    /// every remaining hunk" rather than a separate whole-file code path,
+    /// so it can never disagree with what individually keeping each hunk
+    /// would have done.
+    pub(crate) fn change_review_keep_current_file_hunks(&mut self) {
+        let Some(review) = &mut self.change_review else {
+            return;
+        };
+        let Some(entry) = review.current_entry_mut() else {
+            return;
+        };
+        for d in entry.hunk_decisions.iter_mut() {
+            if *d == crate::core::review::ChangeDecision::Pending {
+                *d = crate::core::review::ChangeDecision::Accepted;
+            }
+        }
+        entry.sync_decision_from_hunks();
+        let path = entry.change.path.clone();
+        self.message = format!("Kept all changes to {path}");
+        self.close_turn_review_if_all_decided();
+    }
+
+    /// `R` on a turn review: revert every hunk in the current file still
+    /// `Pending`, one at a time (each recomputing the diff fresh, so a
+    /// later hunk's shifted position from an earlier hunk's reject is
+    /// always resolved against the *current* state rather than a stale
+    /// index) — reuses [`Self::change_review_reject_current_hunk`] against
+    /// the first remaining pending hunk, repeatedly, rather than
+    /// duplicating the reconstruction logic.
+    pub(crate) fn change_review_reject_current_file_hunks(&mut self) {
+        if self.turn_review_checkpoint_id.is_none() {
+            return;
+        }
+        let Some(entry_idx) = self.change_review.as_ref().map(|r| r.current) else {
+            return;
+        };
+        while let Some(review) = self.change_review.as_ref() {
+            let Some(entry) = review.entries.get(entry_idx) else {
+                break;
+            };
+            let Some(row) = entry.first_pending_hunk_row() else {
+                break;
+            };
+            if let Some(review) = &mut self.change_review {
+                if let Some(entry) = review.entries.get_mut(entry_idx) {
+                    entry.view.scroll_offset = row;
+                }
+            }
+            self.change_review_reject_current_hunk();
+            if self.change_review.is_none() {
+                break; // the whole review auto-closed (fully decided)
+            }
+        }
+    }
+
+    /// `ga` on a turn review: keep every remaining pending hunk in every
+    /// file.
+    pub(crate) fn change_review_keep_all_files(&mut self) {
+        if self.turn_review_checkpoint_id.is_none() {
+            return;
+        }
+        let Some(review) = &mut self.change_review else {
+            return;
+        };
+        for entry in review.entries.iter_mut() {
+            for d in entry.hunk_decisions.iter_mut() {
+                if *d == crate::core::review::ChangeDecision::Pending {
+                    *d = crate::core::review::ChangeDecision::Accepted;
+                }
+            }
+            entry.sync_decision_from_hunks();
+        }
+        self.message = "Kept every remaining change in this review".to_string();
+        self.close_turn_review_if_all_decided();
+    }
+
+    /// `gr` on a turn review: revert every remaining pending hunk in every
+    /// file — walks files left to right, reusing
+    /// [`Self::change_review_reject_current_file_hunks`] against whichever
+    /// file still has a pending hunk.
+    pub(crate) fn change_review_reject_all_files(&mut self) {
+        if self.turn_review_checkpoint_id.is_none() {
+            return;
+        }
+        while let Some(review) = self.change_review.as_ref() {
+            let Some(idx) = review.entries.iter().position(|e| {
+                e.hunk_decisions
+                    .contains(&crate::core::review::ChangeDecision::Pending)
+            }) else {
+                break;
+            };
+            if let Some(review) = &mut self.change_review {
+                review.current = idx;
+            }
+            self.change_review_reject_current_file_hunks();
+            if self.change_review.is_none() {
+                break;
+            }
         }
     }
 
