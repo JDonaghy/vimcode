@@ -163,6 +163,34 @@ pub enum AcpReviewOnTurnEnd {
     Off,
 }
 
+/// Default answer for a `session/request_permission` prompt before any
+/// per-kind session memory or dialog is consulted — `acp_permission_default`
+/// setting (#1518, Zed's `tool_permissions.default`). Checked in
+/// `Engine::acp_handle_permission_request` *after*
+/// `AcpSession::remembered_decisions` (an explicit human choice made
+/// earlier in this session is a stronger signal than a static config
+/// default) but before opening the dialog, so it only ever *skips* asking
+/// — it never overrides a decision the human already made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpPermissionDefault {
+    /// Always ask — the pre-#1518 behaviour, unchanged. Every request
+    /// still opens the dialog unless a per-kind `remembered_decisions`
+    /// entry already answers it.
+    #[default]
+    Ask,
+    /// Auto-select the first `allow_*` option for an `edit`-kind tool call
+    /// without asking; every other kind still asks (subject to
+    /// `remembered_decisions`). For a human who trusts the agent's file
+    /// edits but still wants to approve e.g. `execute` calls one at a
+    /// time.
+    AllowEdits,
+    /// Auto-select the first `allow_*` option for every tool call kind,
+    /// without asking. The most permissive setting — equivalent to
+    /// answering every prompt "Allow" as it arrives.
+    AllowAll,
+}
+
 /// User settings loaded from ~/.config/vimcode/settings.json
 ///
 /// IMPORTANT: When adding new settings fields:
@@ -784,6 +812,16 @@ pub struct Settings {
     /// Toggled via `:AiFollow`.
     #[serde(default)]
     pub acp_follow_agent: bool,
+
+    /// Default answer for a `session/request_permission` prompt (#1518,
+    /// Zed's `tool_permissions.default`) — `"ask"` (default, unchanged
+    /// behaviour), `"allow_edits"` (auto-allow `edit`-kind tool calls
+    /// only), or `"allow_all"` (auto-allow every kind). See
+    /// [`AcpPermissionDefault`]'s own doc for exactly where this is
+    /// consulted relative to the existing per-kind session memory
+    /// (`AcpSession::remembered_decisions`).
+    #[serde(default)]
+    pub acp_permission_default: AcpPermissionDefault,
 
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer. Default **true**
@@ -1855,6 +1893,7 @@ impl Default for Settings {
             acp_mcp_servers: Vec::new(),
             acp_review_on_turn_end: AcpReviewOnTurnEnd::default(),
             acp_follow_agent: false,
+            acp_permission_default: AcpPermissionDefault::default(),
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
             explorer_exclude: default_explorer_exclude(),
@@ -3875,6 +3914,11 @@ impl Settings {
                 AcpReviewOnTurnEnd::Off => "off".to_string(),
             },
             "acp_follow_agent" => self.acp_follow_agent.to_string(),
+            "acp_permission_default" => match self.acp_permission_default {
+                AcpPermissionDefault::Ask => "ask".to_string(),
+                AcpPermissionDefault::AllowEdits => "allow_edits".to_string(),
+                AcpPermissionDefault::AllowAll => "allow_all".to_string(),
+            },
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -4044,6 +4088,14 @@ impl Settings {
                 };
             }
             "acp_follow_agent" => self.acp_follow_agent = value == "true",
+            "acp_permission_default" => {
+                self.acp_permission_default = match value {
+                    "ask" => AcpPermissionDefault::Ask,
+                    "allow_edits" => AcpPermissionDefault::AllowEdits,
+                    "allow_all" => AcpPermissionDefault::AllowAll,
+                    _ => return Err(format!("Unknown acp_permission_default value: {value}")),
+                };
+            }
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4676,6 +4728,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Bool,
     },
     SettingDef {
+        key: "acp_permission_default",
+        label: "Permission Default",
+        description: "Default answer for a tool-call permission prompt: ask (default, always shows the dialog), allow_edits (auto-allow file edits only), or allow_all (auto-allow every tool call)",
+        category: "AI",
+        setting_type: SettingType::Enum(&["ask", "allow_edits", "allow_all"]),
+    },
+    SettingDef {
         key: "indent_guides",
         label: "Indent Guides",
         description: "Show vertical lines at each indentation level",
@@ -5283,6 +5342,33 @@ mod tests {
         assert_eq!(s.get_value_str("acp_follow_agent"), "true");
 
         assert!(SETTING_DEFS.iter().any(|d| d.key == "acp_follow_agent"));
+    }
+
+    /// #1518's `acp_permission_default` setting: defaults to `"ask"` (the
+    /// pre-#1518 always-ask behaviour, unchanged) and round-trips all
+    /// three values via the same `:set` / Settings-UI seam every other
+    /// enum setting here uses.
+    #[test]
+    fn acp_permission_default_defaults_to_ask_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert_eq!(s.acp_permission_default, AcpPermissionDefault::Ask);
+        assert_eq!(s.get_value_str("acp_permission_default"), "ask");
+
+        s.set_value_str("acp_permission_default", "allow_edits")
+            .unwrap();
+        assert_eq!(s.acp_permission_default, AcpPermissionDefault::AllowEdits);
+        assert_eq!(s.get_value_str("acp_permission_default"), "allow_edits");
+
+        s.set_value_str("acp_permission_default", "allow_all")
+            .unwrap();
+        assert_eq!(s.acp_permission_default, AcpPermissionDefault::AllowAll);
+        assert_eq!(s.get_value_str("acp_permission_default"), "allow_all");
+
+        assert!(s.set_value_str("acp_permission_default", "bogus").is_err());
+
+        assert!(SETTING_DEFS
+            .iter()
+            .any(|d| d.key == "acp_permission_default"));
     }
 
     /// #1515's `acp_review_on_turn_end` setting: defaults to `"badge"` (not

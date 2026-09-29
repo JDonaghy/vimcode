@@ -6424,6 +6424,87 @@ second line here
         );
     }
 
+    /// #1518 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1519_acp_conformance::
+    /// permission_dialog_previews_the_proposed_diff_via_shell_app` — but for
+    /// an `execute` (non-edit) tool call carrying `rawInput` and no `diff`
+    /// content, the other half of #1518's scope ("execute/other -> show
+    /// rawInput"). Same native-dialog assertion shape as
+    /// `ai_panel_shows_permission_dialog_and_resumes_turn_on_selection`
+    /// above: a buttons-only dialog goes native on GTK (#727), so this
+    /// asserts on the queued `MessageDialogOptions.body` rather than
+    /// painted pixels.
+    ///
+    /// RED verified: with the `acp_permission_dialog_parts` `rawInput`
+    /// fallback branch short-circuited (`else if false`, same technique
+    /// used to RED-verify the sibling `acp_ops.rs`/TUI tests), this fails
+    /// — `cargo test --quiet` never appears in `opts.body` since the
+    /// unmodified body only ever contains title/kind/locations text.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_permission_dialog_shows_raw_input_for_execute_tool_call() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_REQUEST_PERMISSION_EXECUTE", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_mut().client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please run".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h
+            .engine
+            .borrow()
+            .dialog
+            .as_ref()
+            .is_some_and(|d| d.tag == "acp_permission")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.engine
+                .borrow()
+                .dialog
+                .as_ref()
+                .is_some_and(|d| d.tag == "acp_permission"),
+            "the permission dialog should be open within 5s"
+        );
+        let opts = h.pending_native_dialog.take().expect(
+            "the native dialog present must be queued once the permission \
+             dialog opens",
+        );
+        assert_eq!(opts.title, "Run tests");
+        assert!(
+            opts.body.contains("cargo test --quiet"),
+            "the raw command must be shown so approving isn't blind: {opts:?}"
+        );
+    }
+
     /// #1463 (multiple concurrent ACP sessions), GTK twin of `tui_main::
     /// shell_app::tests::
     /// ai_panel_session_tab_strip_badges_background_permission_and_ainext_switches_to_it_via_shell_app`.

@@ -2522,6 +2522,25 @@ impl Engine {
             }
         }
 
+        // `acp_permission_default` (#1518): a static config default,
+        // consulted *after* the remembered-decision check above so an
+        // explicit human choice made earlier this session always wins over
+        // it. `Ask` (the default) never matches here, so this is a no-op
+        // for every user who hasn't opted in.
+        if let Some(option_id) = Self::acp_permission_default_option(
+            self.settings.acp_permission_default,
+            &req.tool_call.kind,
+            &req.options,
+        ) {
+            if let Some(client) = self.acp_mut().client.as_ref() {
+                client.respond_to_client_request(
+                    request_id,
+                    Ok(crate::core::acp::permission_outcome_selected(&option_id)),
+                );
+            }
+            return;
+        }
+
         let (title, body, buttons) = Self::acp_permission_dialog_parts(&req);
 
         // A backgrounded session's permission request must not pop a modal
@@ -2559,6 +2578,35 @@ impl Engine {
         self.acp_mut().pending_permission = Some((request_id, req));
     }
 
+    /// Resolve `acp_permission_default` (#1518) against one request's
+    /// `kind`/`options`: `Some(option_id)` to auto-answer without ever
+    /// opening the dialog, `None` to fall through to it as normal.
+    /// `AllowEdits` only matches `kind == "edit"`; `AllowAll` matches every
+    /// kind; `Ask` never matches. Like the `remembered_decisions` check
+    /// this sits beside, picks the *first* option whose own kind starts
+    /// with `"allow_"` — a request whose `options` offer no such option at
+    /// all (an agent is free to omit one) falls through to the dialog
+    /// regardless of the setting, same as the remembered-decision case.
+    fn acp_permission_default_option(
+        default: crate::core::settings::AcpPermissionDefault,
+        tool_call_kind: &str,
+        options: &[crate::core::acp::AcpPermissionOption],
+    ) -> Option<String> {
+        use crate::core::settings::AcpPermissionDefault;
+        let applies = match default {
+            AcpPermissionDefault::Ask => false,
+            AcpPermissionDefault::AllowEdits => tool_call_kind == "edit",
+            AcpPermissionDefault::AllowAll => true,
+        };
+        if !applies {
+            return None;
+        }
+        options
+            .iter()
+            .find(|o| o.kind.starts_with("allow_"))
+            .map(|o| o.option_id.clone())
+    }
+
     /// The `(title, body, buttons)` a `session/request_permission`'s parked
     /// request renders as — shared by [`Self::acp_handle_permission_request`]
     /// (the foreground path) and [`Self::acp_activate_session`] (revealing a
@@ -2576,6 +2624,38 @@ impl Engine {
                     None => format!("  {path}"),
                 });
             }
+        }
+        // #1518: show the proposed change itself, not just its title/kind/
+        // locations — a human was otherwise asked to approve blind. An
+        // edit tool call's `diff` content block(s) win over `rawInput` when
+        // both are present (a diff is strictly more informative than the
+        // opaque input that produced it); `rawInput` is the fallback for
+        // every other kind (`execute` most importantly — an agent almost
+        // never attaches a `diff` block to a shell command).
+        let diff_blocks: Vec<(&String, Option<&str>, &String)> = req
+            .tool_call
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                crate::core::acp::AcpToolCallContentBlock::Diff {
+                    path,
+                    old_text,
+                    new_text,
+                } => Some((path, old_text.as_deref(), new_text)),
+                _ => None,
+            })
+            .collect();
+        if !diff_blocks.is_empty() {
+            for (path, old_text, new_text) in diff_blocks {
+                body.push(String::new());
+                body.push(format!("--- {path}"));
+                body.extend(Self::acp_permission_diff_preview_lines(old_text, new_text));
+            }
+        } else if let Some(raw_input) = &req.tool_call.raw_input {
+            body.push(String::new());
+            body.push("Command:".to_string());
+            let pretty = serde_json::to_string_pretty(raw_input).unwrap_or_default();
+            body.extend(pretty.lines().map(str::to_string));
         }
         // Hotkeys must be unique across this dialog's own buttons — a naive
         // "first letter of the name" pick collides for common ACP option
@@ -2610,6 +2690,35 @@ impl Engine {
             })
             .collect();
         (title, body, buttons)
+    }
+
+    /// Cap on how many formatted diff lines
+    /// [`Self::acp_permission_diff_preview_lines`] shows per `diff` content
+    /// block before truncating — a permission dialog is meant to be
+    /// skimmed in a few seconds before deciding, not a full-viewport review
+    /// surface (`crate::core::review::ChangeReviewState`'s job); an agent
+    /// proposing a rewrite of a thousand-line file must not turn "approve
+    /// this edit" into scrolling through a wall of text with no way to
+    /// jump around it (this dialog has no scroll/hunk-nav keys of its
+    /// own).
+    const PERMISSION_DIFF_PREVIEW_LINE_CAP: usize = 60;
+
+    /// Format one `diff` content block's proposed change as plain
+    /// unified-diff text (`crate::core::review::unified_diff_preview_lines`),
+    /// truncated to [`Self::PERMISSION_DIFF_PREVIEW_LINE_CAP`] lines with a
+    /// trailing "N more lines" marker rather than growing the dialog
+    /// without bound (#1518).
+    fn acp_permission_diff_preview_lines(old_text: Option<&str>, new_text: &str) -> Vec<String> {
+        let mut lines = crate::core::review::unified_diff_preview_lines(old_text, new_text);
+        if lines.len() > Self::PERMISSION_DIFF_PREVIEW_LINE_CAP {
+            let omitted = lines.len() - Self::PERMISSION_DIFF_PREVIEW_LINE_CAP;
+            lines.truncate(Self::PERMISSION_DIFF_PREVIEW_LINE_CAP);
+            lines.push(format!(
+                "... ({omitted} more line{})",
+                if omitted == 1 { "" } else { "s" }
+            ));
+        }
+        lines
     }
 
     /// Reply `cancelled` to a parked `session/request_permission` and close
@@ -4586,6 +4695,108 @@ mod tests {
         assert!(
             engine.acp_mut().pending_permission.is_some(),
             "the request must be tracked as parked while its dialog is open"
+        );
+    }
+
+    /// #1518: an edit tool call whose `toolCall.content` carries a `diff`
+    /// block must render the actual proposed change (added/removed lines,
+    /// not just counts) in the permission dialog body — a human must not
+    /// have to approve blind. RED-verified: reverting the
+    /// `acp_permission_dialog_parts` diff-block branch back to only
+    /// rendering `title`/`kind`/`locations` (pre-#1518) makes this fail,
+    /// since neither `old line` nor `new line` appears anywhere in the
+    /// title/kind/locations text the unmodified body already contains.
+    #[cfg(unix)]
+    #[test]
+    fn request_permission_with_diff_content_previews_the_proposed_change() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION_DIFF", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please edit".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        let dialog = engine
+            .dialog
+            .as_ref()
+            .expect("permission dialog should be open");
+        let body = dialog.body.join("\n");
+        assert!(
+            body.contains("- old line"),
+            "the removed line must be previewed in the dialog body: {body:?}"
+        );
+        assert!(
+            body.contains("+ new line"),
+            "the added line must be previewed in the dialog body: {body:?}"
+        );
+    }
+
+    /// #1518: an execute (non-edit) tool call with no `diff` content block
+    /// must fall back to showing `rawInput` — the command about to run —
+    /// so approving it isn't blind either. RED-verified: reverting the
+    /// `acp_permission_dialog_parts` `rawInput` fallback branch makes this
+    /// fail, since `cargo test --quiet` appears nowhere in the unmodified
+    /// title/kind/locations body.
+    #[cfg(unix)]
+    #[test]
+    fn request_permission_execute_with_no_diff_shows_raw_input() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION_EXECUTE", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("please run".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        let dialog = engine
+            .dialog
+            .as_ref()
+            .expect("permission dialog should be open");
+        let body = dialog.body.join("\n");
+        assert!(
+            body.contains("cargo test --quiet"),
+            "the raw command must be shown so approving isn't blind: {body:?}"
+        );
+    }
+
+    /// #1518: `acp_permission_default = allow_all` must auto-answer a
+    /// `session/request_permission` request with the first `allow_*`
+    /// option, without ever opening the dialog at all.
+    #[cfg(unix)]
+    #[test]
+    fn acp_permission_default_allow_all_skips_the_dialog_entirely() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.acp_permission_default =
+            crate::core::settings::AcpPermissionDefault::AllowAll;
+
+        engine.ai_send_message("please edit".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+
+        assert!(
+            engine.dialog.is_none(),
+            "allow_all must never open the permission dialog"
+        );
+        assert!(
+            engine.acp_mut().pending_permission.is_none(),
+            "the request must have been answered, not left parked"
+        );
+    }
+
+    /// #1518: `acp_permission_default = allow_edits` only auto-answers
+    /// `edit`-kind tool calls — an `execute` request must still open the
+    /// dialog and wait for a human.
+    #[cfg(unix)]
+    #[test]
+    fn acp_permission_default_allow_edits_still_asks_for_execute() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_REQUEST_PERMISSION_EXECUTE", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.acp_permission_default =
+            crate::core::settings::AcpPermissionDefault::AllowEdits;
+
+        engine.ai_send_message("please run".to_string());
+        poll_until_permission_dialog(&mut engine);
+
+        assert!(
+            engine.dialog.is_some(),
+            "an execute-kind request must still open the dialog under allow_edits"
         );
     }
 
@@ -7183,6 +7394,8 @@ mod tests {
                     kind: "execute".to_string(),
                     title: "Run tests".to_string(),
                     locations: Vec::new(),
+                    content: Vec::new(),
+                    raw_input: None,
                 },
                 options: Vec::new(),
             },

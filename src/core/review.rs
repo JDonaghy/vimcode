@@ -189,25 +189,70 @@ pub struct ChangeReviewEntry {
     pub hunk_decisions: Vec<ChangeDecision>,
 }
 
+/// Diff hunks for one whole-file `(old, new)` pair — the geometry both
+/// [`ChangeReviewEntry::new`] (an editable, acceptable review surface) and
+/// [`unified_diff_preview_lines`] (a read-only text preview, #1518's ACP
+/// permission dialog) build from, so the two never compute a diff two
+/// different ways for the same content. `old_text: None` is "no left side
+/// at all" (new file) — see `ProposedChange::old_text`'s doc for why this
+/// is not the same as diffing against `""`: `pure_addition_hunks` builds
+/// the addition directly rather than routing through
+/// `quadraui::compute_hunks("", new_text)`.
+pub fn diff_hunks_for(old_text: Option<&str>, new_text: &str) -> Vec<quadraui::DiffHunk> {
+    match old_text {
+        None => pure_addition_hunks(new_text),
+        Some(old) => quadraui::compute_hunks(old, new_text),
+    }
+}
+
+/// Render a whole-file `(old, new)` pair as plain unified-diff-style text
+/// lines — `@@ -l,n +r,m @@` hunk headers
+/// (`quadraui::primitives::diff_view::unified_hunk_header`) plus one
+/// ` `/`-`/`+`-prefixed line per row (`unified_row_style`'s prefix half,
+/// `unified_row_text`'s content half) — the same shared formatting helpers
+/// every backend's `DiffView` rasteriser already paints from (that
+/// module's own doc: "the single source of colour/text selection"), just
+/// linearised into a `Vec<String>` instead of painted into a split-pane
+/// widget.
+///
+/// #1518: this is what lets a `session/request_permission` dialog body
+/// show the *actual proposed change* for an edit tool call, instead of
+/// only its title/kind/locations — a human was otherwise asked to approve
+/// blind. Deliberately reuses the existing `Dialog`/`DialogButton`
+/// machinery the permission prompt already had (`Engine::show_dialog`) via
+/// plain text, rather than opening a second full-viewport `DiffView`
+/// overlay like [`ChangeReviewState`]'s: that surface's `a`/`r` hunk keys
+/// *write to disk* — the wrong vocabulary for a change that hasn't
+/// happened yet and may never be approved — so this stays display-only
+/// text inside the dialog the human is already answering, rather than
+/// reusing (or half-reusing) a widget whose accept/reject keys mean
+/// something else entirely.
+///
+/// The colour half of `unified_row_style` is discarded — this produces
+/// plain text for a `Vec<String>` dialog body, which has no per-line
+/// styling of its own.
+pub fn unified_diff_preview_lines(old_text: Option<&str>, new_text: &str) -> Vec<String> {
+    let hunks = diff_hunks_for(old_text, new_text);
+    let theme = quadraui::Theme::default();
+    let mut lines = Vec::new();
+    for hunk in &hunks {
+        lines.push(quadraui::primitives::diff_view::unified_hunk_header(hunk));
+        for row in &hunk.rows {
+            let (prefix, _, _) =
+                quadraui::primitives::diff_view::unified_row_style(row.kind, &theme);
+            let text = quadraui::primitives::diff_view::unified_row_text(row);
+            lines.push(format!("{prefix} {text}"));
+        }
+    }
+    lines
+}
+
 impl ChangeReviewEntry {
     fn new(change: ProposedChange, id_suffix: usize) -> Self {
         let is_new_file = change.old_text.is_none();
         let left = change.old_text.clone().unwrap_or_default();
         let right = change.new_text.clone();
-        // `oldText: null` (#955's acceptance bar: "renders as a pure
-        // addition, not a crash or an empty pane") is deliberately **not**
-        // routed through `quadraui::compute_hunks("", right)`: `str::split
-        // ('\n')` on `""` yields one empty line, not zero, so diffing
-        // against a literal empty string can align that phantom line with
-        // a real trailing blank line in `right` and mark it `Same` rather
-        // than every row being a clean `Added` — a real, if narrow, gap in
-        // treating "no left side at all" as "an empty string" left side.
-        // `pure_addition_hunks` builds the addition directly instead.
-        let hunks = if is_new_file {
-            pure_addition_hunks(&right)
-        } else {
-            quadraui::compute_hunks(&left, &right)
-        };
+        let hunks = diff_hunks_for(change.old_text.as_deref(), &right);
         let left_label = if is_new_file {
             "(new file)".to_string()
         } else {

@@ -5499,6 +5499,73 @@ mod tests {
             );
         }
 
+        /// #1518 acceptance: a `session/request_permission` request for an
+        /// `edit` tool call whose `toolCall.content` carries a `diff` block
+        /// must paint the actual proposed change (an added and a removed
+        /// line) into the permission dialog, not just its title/kind/
+        /// locations — a human must not have to approve blind. The
+        /// fixture's `$ACP_FAKE_REQUEST_PERMISSION_DIFF` emits that shaped
+        /// request.
+        ///
+        /// RED verified: with the `acp_permission_dialog_parts` diff-block
+        /// branch short-circuited (`let diff_blocks: Vec<..> = Vec::new()`,
+        /// same technique as `acp_ops.rs`'s own unit-test RED
+        /// verification), this fails — neither "- old line" nor "+ new
+        /// line" appears anywhere in the unmodified title/kind/locations
+        /// body the dialog still paints.
+        #[cfg(unix)]
+        #[test]
+        fn permission_dialog_previews_the_proposed_diff_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_REQUEST_PERMISSION_DIFF=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            driver.type_char(':');
+            for c in "AI please edit".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Tool kind: edit") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Tool kind: edit"),
+                "the permission dialog must be open within 5s; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("- old line"),
+                "the removed line must be painted in the dialog: {screen}"
+            );
+            assert!(
+                screen.contains("+ new line"),
+                "the added line must be painted in the dialog: {screen}"
+            );
+        }
+
         /// #1519 acceptance, fix 3: `session/cancel` must mark every
         /// still-unfinished tool call `Cancelled`, painted as the `[-]`
         /// glyph, not left showing `[~]` (in-progress) forever. The
