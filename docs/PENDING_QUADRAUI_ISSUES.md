@@ -32,6 +32,139 @@ zero cost instead.
 
 ---
 
+## `BackendCaps::native_menu` is overloaded across backends — Windows regressed its own `window_chrome` custom title bar (#1562) the moment it also declared `native_menu` (#1582/#1200)
+
+**Title:** `native_menu: true` means "an OS-global menu bar with zero in-window
+footprint" on macOS but "a per-window `SetMenu` `HMENU` sitting directly under
+the caption" on Windows — two different things that happen to share one
+boolean — so a consumer like vimcode that branches `if native_menu {...} else
+if window_chrome {...}` (correct for macOS, where the native caption should
+stay) silently starves `window_chrome`'s custom-caption path on any *other*
+backend that also grows `native_menu: true`, exactly what happened to
+`WinBackend` once quadraui#1200 (#1582's fix) landed alongside quadraui#1199
+(#1562's fix) in the same pin.
+
+**Body:**
+
+vimcode#1622 tried to re-verify vimcode#1562 (custom-drawn title bar with an
+embedded command centre) on real Windows hardware (dell64) after vimcode#1618
+bumped the quadraui pin past both quadraui#1199 (`window_chrome`,
+`WM_NCCALCSIZE`/`WM_NCHITTEST`) and quadraui#1200 (`native_menu`, a real
+`SetMenu`-backed `HMENU`). Built `vimcode.exe` with `cargo xwin build
+--release --target x86_64-pc-windows-msvc --no-default-features --features
+win` and launched it directly on dell64 (real `HWND`, `MainWindowTitle`
+"VimCode", `Responding: True`). A `PrintWindow(PW_RENDERFULLCONTENT)`
+screenshot taken immediately after launch (before any further repaint) shows:
+
+- A stock Windows 11 native caption: app icon, "VimCode" title in the real
+  system UI font, and native-style minimize/restore/close glyphs in the
+  standard caption position.
+- A separate menu row directly underneath showing File/Edit/View/Go/Run/
+  Terminal/Help — a real, clickable native (or owner-drawn) Win32 menu, not
+  vimcode's own drawn row (confirmed working, satisfying vimcode#1582).
+- **No command-centre search box anywhere** — a 3x-zoomed crop of the blank
+  space between the title text and the minimize button shows nothing painted
+  there at all.
+
+This is exactly the pre-#1562 appearance, as if quadraui#1199 had never
+landed, even though the pin contains it.
+
+Root-caused by reading `WinBackend::backend_caps()` (`quadraui/src/win/
+backend.rs`, pinned rev `6e14d8a`) against vimcode's own `src/app.rs`:
+
+```rust
+// quadraui/src/win/backend.rs, WinBackend::backend_caps()
+crate::backend::BackendCaps {
+    ...
+    native_menu: true,    // quadraui#1200 (#1582)
+    window_chrome: true,  // quadraui#1199 (#1562)
+    ..crate::backend::BackendCaps::empty()
+}
+```
+
+`vimcode::App::setup`'s menu-bar branch (`src/app.rs`):
+
+```rust
+if backend.backend_caps().native_menu {
+    // installs a real HMENU via SetMenu; sets menu_bar_visible = false
+    ...
+} else if backend.backend_caps().window_chrome {
+    // GTK's (and any future Win-GUI's) drawn menu bar doubles as the
+    // client-side titlebar — pinned visible always
+    self.engine.borrow_mut().menu_bar_visible = true;
+} else {
+    ...
+}
+```
+
+Since `native_menu` is checked first and is now `true` for `WinBackend`, the
+`window_chrome` arm — the one that makes the drawn CSD row (icon + menu
+items + command centre + controls) live — never runs on Windows.
+`App::capture_window_and_apply_csd` compounds this: it early-returns
+whenever `backend.backend_caps().native_menu` is true, so `Backend::window()
+.set_decorated(false)` — the call that clears `WS_CAPTION` and hands the
+title strip to `win::run`'s `WM_NCCALCSIZE`/`WM_NCHITTEST` handling — is
+never invoked either. Win-GUI ends up with its stock decorated window,
+`WS_CAPTION` intact, exactly as if `window_chrome` were never declared.
+
+This is *not* a new bug in either branch: both were written correctly for
+the backend combination that existed when each landed. `MacBackend` has
+declared `{native_menu: true, window_chrome: true}` for a while (`quadraui/
+src/macos/backend.rs`) — `window_chrome` there is deliberately a narrower
+claim, backing only `begin_window_drag`/`toggle_window_maximize` (see that
+method's own doc: "`CAP_CONTRACTS`'s `window_chrome` cap only requires *any*
+of the three CSD methods"), not "this backend wants its drawn row to replace
+the native caption". macOS's *actual* custom-caption mechanism is a
+completely separate, macOS-only hook: `ShellConfig::client_side_titlebar` /
+`Backend::titlebar_control_inset` (`quadraui/src/shell.rs`, `quadraui/src/
+macos/run.rs`), applied at window-creation time, never touching
+`set_decorated`. `WinBackend` doesn't participate in that hook at all — it
+reuses the *other* CSD mechanism (`set_decorated` + `WM_NCCALCSIZE`/
+`WM_NCHITTEST`), the one GTK also uses, and that one has no distinguishing
+signal for "I also have a native_menu, but keep going with CSD anyway".
+
+vimcode's `App::setup`/`capture_window_and_apply_csd` gate on `native_menu`
+precisely because that was, at the time each was written, a reliable proxy
+for "this backend's menu bar lives entirely outside the window, don't touch
+its native chrome" (true only for macOS, the sole `native_menu` backend
+before quadraui#1200). Once a second backend could declare `native_menu`
+for an unrelated, in-window reason, that proxy broke, and nothing in
+`BackendCaps` (or `ShellConfig`) records which meaning applies.
+
+**Ask:** add a capability (or `ShellConfig`/`RunConfig` field, matching the
+shape of `client_side_titlebar`) that lets a backend declaring both
+`native_menu` and `window_chrome` say which one a generic consumer should
+actually route the *drawn CSD row* through — e.g. `native_menu_is_global:
+bool` (`true` only for macOS's system-wide menu bar; `false` for a
+per-window `SetMenu` like `WinBackend`'s), or fold the distinction into
+`window_chrome` itself by splitting it into the two things it currently
+conflates ("this backend supports CSD drag/resize gestures" vs "this
+backend wants its drawn titlebar row live instead of the native one").
+Either shape needs to land with a `CAP_CONTRACTS` update and each backend's
+own `backend_caps_declares_*` honesty test extended to cover it, the same
+pattern `window_chrome`/`native_menu` themselves already follow.
+
+**Why not fixed in vimcode instead:** the two candidate vimcode-side patches
+(reorder `App::setup`'s branch to prefer `window_chrome`, or change
+`capture_window_and_apply_csd`'s gate to something other than plain
+`native_menu`) both risk changing behaviour on the *other* backend that
+declares this identical pair (`MacBackend`) in a way this dev loop has no
+macOS hardware to verify against — CLAUDE.md's black-box-coverage bar
+can't be met for a change whose only driver-tier check would need a live
+`MacDriver`/real Cocoa window. A vimcode-side fix that can't be verified on
+the backend it's most likely to break is worse than filing the gap.
+`WinBackend`/`MacBackend`'s `backend_caps()` and `App::setup`/
+`capture_window_and_apply_csd`'s branch logic are the only things this
+touches — no `src/win/`/`src/gtk/` wrapper decision involved, so this is
+squarely quadraui-side (the capability model) plus a vimcode-side follow-up
+once the new signal exists, not a `src/win/` fix per the Platform-Neutrality
+Rule.
+
+**Blocks:** `JDonaghy/vimcode#1562`. Leave it open behind this issue per
+`GOALS.md`'s milestone-discipline rule.
+
+---
+
 ## `MacDriver` has no `set_double_click_folding(false)`, unlike `TuiDriver`/`GtkDriver` (workaround in vimcode#1576)
 
 Since quadraui#486, `MacBackend::fold_double_click` runs every injected
