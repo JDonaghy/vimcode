@@ -1657,7 +1657,15 @@ pub fn acp_terminal_command_display(command: &str, args: &[String]) -> String {
 /// (operator-typed, see `parse_agent_command`'s doc on that trust model),
 /// *everything* here came off the wire from the agent, not the operator's
 /// own keyboard, so it gets no benefit of the doubt about shell
-/// metacharacters.
+/// metacharacters. `env` gets the same treatment: each value is
+/// shell-quoted via [`quote_shell_arg`], and each name is validated
+/// against [`is_valid_env_var_name`] — a name can't be shell-quoted (it
+/// sits to the left of `=` in `export NAME=...`/`$env:NAME = ...`, outside
+/// any quoting), so an entry whose name isn't a bare `[A-Za-z_][A-Za-z0-9_]*`
+/// identifier is dropped rather than spliced in unescaped. Without this, a
+/// malicious agent could smuggle extra shell commands through `env`'s
+/// *name* field (e.g. `"A; rm -rf /tmp #"`) even though `command`/`args`
+/// are locked down.
 ///
 /// `begin_marker`/`end_marker_prefix` bracket the command's own output so
 /// [`extract_acp_terminal_output`] can strip the shell's echoed input and
@@ -1681,23 +1689,46 @@ pub fn build_acp_terminal_wrapper(
         .iter()
         .map(|a| format!(" {}", quote_shell_arg(a, is_powershell)))
         .collect();
+    // Names that aren't a bare identifier can't be quoted away (they sit
+    // outside any quoting, to the left of `=`/`:`), so they're dropped
+    // rather than spliced in unescaped — see this function's doc.
+    let safe_env: Vec<(&String, String)> = env
+        .iter()
+        .filter(|(k, _)| is_valid_env_var_name(k))
+        .map(|(k, v)| (k, quote_shell_arg(v, is_powershell)))
+        .collect();
     if is_powershell {
-        let env_lines: String = env
+        let env_lines: String = safe_env
             .iter()
-            .map(|(k, v)| format!("$env:{k} = \"{v}\"\n"))
+            .map(|(k, quoted_v)| format!("$env:{k} = {quoted_v}\n"))
             .collect();
         format!(
             "{env_lines}Write-Host '{begin_marker}'\n{quoted_command}{quoted_args}\n$__ec = $LASTEXITCODE\nif ($null -eq $__ec) {{ $__ec = 0 }}\nWrite-Host \"{end_marker_prefix}$__ec\"\n"
         )
     } else {
-        let env_lines: String = env
+        let env_lines: String = safe_env
             .iter()
-            .map(|(k, v)| format!("export {k}=\"{v}\"\n"))
+            .map(|(k, quoted_v)| format!("export {k}={quoted_v}\n"))
             .collect();
         format!(
             "{env_lines}printf '%s\\n' '{begin_marker}'\n{quoted_command}{quoted_args}\n__ec=$?\nprintf '%s\\n' \"{end_marker_prefix}$__ec\"\n"
         )
     }
+}
+
+/// Whether `name` is safe to splice unquoted into `export NAME=...` /
+/// `$env:NAME = ...` — i.e. a bare `[A-Za-z_][A-Za-z0-9_]*` identifier,
+/// nothing else. Used by [`build_acp_terminal_wrapper`] to drop
+/// wire-sourced `env` entries whose *name* (not just value) could
+/// otherwise smuggle shell metacharacters, since a variable name can't be
+/// quoted the way a value can.
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Extract the command output produced between the injected
@@ -2512,8 +2543,9 @@ mod tests {
             "__end__:",
         );
         assert!(
-            script.contains("export FOO=\"bar\"\n"),
-            "env must be exported before the command; got:\n{script}"
+            script.contains("export FOO='bar'\n"),
+            "env must be exported before the command, value shell-quoted; \
+             got:\n{script}"
         );
         assert!(
             script.contains("printf '%s\\n' '__begin__'\n"),
@@ -2544,6 +2576,98 @@ mod tests {
         assert!(script.contains("Write-Host '__begin__'\n"));
         assert!(script.contains("$__ec = $LASTEXITCODE"));
         assert!(script.contains("Write-Host \"__end__:$__ec\"\n"));
+    }
+
+    // ── ACP `terminal/create` env injection hardening (#1522 review) ─────
+
+    #[test]
+    fn build_acp_terminal_wrapper_shell_quotes_env_values_posix() {
+        // A bare `"` breakout: the pre-fix template spliced the value
+        // straight into `export FOO="{v}"` — an unescaped `"` in the value
+        // closes that string early, turning `; rm -rf /tmp/pwned #` into a
+        // second, executed shell statement (the trailing `#` comments out
+        // the leftover closing quote). This is a regression test for that
+        // exact exploit, not just a "does it contain quotes" check.
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[("FOO".to_string(), "bar\"; rm -rf /tmp/pwned #".to_string())],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            !script
+                .lines()
+                .any(|l| l.trim_start().starts_with("rm -rf /tmp/pwned")),
+            "the malicious suffix must never appear as its own shell \
+             statement/line; got:\n{script}"
+        );
+        assert!(
+            script.contains("export FOO='bar\"; rm -rf /tmp/pwned #'\n"),
+            "the value must be shell-quoted the same way command/args are \
+             (single-quoted, so the embedded `\"` and `;` stay part of the \
+             string rather than starting a new shell statement); \
+             got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_drops_env_entries_with_unsafe_names_posix() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[
+                ("A; rm -rf /tmp/pwned #".to_string(), "x".to_string()),
+                ("SAFE_NAME".to_string(), "y".to_string()),
+            ],
+            false,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            !script.contains("A; rm -rf /tmp/pwned #"),
+            "a malicious `env` *name* must not be spliced in unescaped \
+             (a name can't be shell-quoted like a value can) — the whole \
+             entry must be dropped; got:\n{script}"
+        );
+        assert!(
+            script.contains("export SAFE_NAME='y'\n"),
+            "a well-formed env entry alongside a malicious one must still \
+             be exported; got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn build_acp_terminal_wrapper_shell_quotes_env_values_and_drops_unsafe_names_powershell() {
+        let script = build_acp_terminal_wrapper(
+            "echo",
+            &[],
+            &[
+                (
+                    "FOO".to_string(),
+                    "bar\"; Remove-Item -Recurse C:\\pwned #".to_string(),
+                ),
+                (
+                    "A; Remove-Item -Recurse C:\\pwned #".to_string(),
+                    "x".to_string(),
+                ),
+            ],
+            true,
+            "__begin__",
+            "__end__:",
+        );
+        assert!(
+            script.contains("$env:FOO = \"bar`\"; Remove-Item -Recurse C:\\pwned #\"\n"),
+            "the value's embedded double-quote must be backtick-escaped so \
+             it stays part of the string, not close the quoting early; \
+             got:\n{script}"
+        );
+        assert!(
+            !script.contains("A; Remove-Item -Recurse C:\\pwned #"),
+            "a malicious `env` *name* must be dropped entirely, not \
+             spliced in unescaped; got:\n{script}"
+        );
     }
 
     #[test]
