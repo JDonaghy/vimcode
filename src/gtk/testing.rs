@@ -5908,9 +5908,16 @@ second line here
     /// painted on its own row — this test asserts on the *rendered* input
     /// text via `screen_contains`, not on engine state, so it fails exactly
     /// where the old behavior diverges.
+    ///
+    /// `ai_chat_submit_on_enter` is forced `false` here (#1509 flipped its
+    /// default to `true`, Zed parity — see `issue_1509_ai_chat_submit_on_
+    /// enter_and_stop_segment`) so plain `Enter` still inserts a newline:
+    /// this test is about the multi-line growing input box, not about which
+    /// key sends.
     #[test]
     fn ai_panel_typed_text_supports_multiline_input() {
         let mut h = panel_harness(PANEL_AI);
+        h.engine.borrow_mut().settings.ai_chat_submit_on_enter = false;
         let sb = h.painted_sidebar_bounds.get().unwrap();
         h.driver.click(sb.x + 20.0, sb.y + 20.0);
         assert!(h.engine.borrow().ai_has_focus);
@@ -8550,6 +8557,239 @@ second line here
                 "the spinner glyph painted on screen right before the \
                  tool-call title must change every so often while a turn \
                  is streaming, not stay frozen at its starting glyph"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1509: AI panel adopts wrapping/auto-grow input and `Enter`-sends
+    // (`submit_on_enter`) with a Send/Stop segment (quadraui#1136/#1137).
+    // GTK twin of `tui_main::app_on_tui_tests::tests::
+    // issue_1509_ai_chat_submit_on_enter_and_stop_segment`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1509_ai_chat_submit_on_enter_and_stop_segment {
+        use super::*;
+
+        /// Configure `h`'s engine with an ACP agent pointing at the shared
+        /// echo fixture, so a `Submit` completes a turn deterministically
+        /// with no real network call and no dependence on whether
+        /// `ANTHROPIC_API_KEY` happens to be set in the ambient environment.
+        fn configure_fixture_agent(h: &Harness<impl AppLogic>, extra_env: &[&str]) {
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: extra_env.iter().map(|s| s.to_string()).collect(),
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        /// #1509 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::issue_1509_ai_chat_submit_on_enter_and_stop_segment::
+        /// default_submit_on_enter_sends_message_on_plain_enter_via_shell_app`:
+        /// `ai_chat_submit_on_enter` defaults to `true` (Zed parity,
+        /// quadraui#1137) — typing a message into the focused AI panel and
+        /// pressing plain `Enter` must send it, not insert a newline.
+        /// Proven by the fake agent's own echoed "Hello world" reply
+        /// reaching the painted surface: that text can only paint once
+        /// `session/prompt` was actually dispatched.
+        ///
+        /// RED verified: with `populate_ai_chat_controller`'s
+        /// `chat.set_submit_on_enter(...)` call removed (leaving
+        /// `ChatController`'s own hardcoded `submit_on_enter: false`
+        /// default in effect, the pre-#1509 behaviour this issue changes),
+        /// this fails — plain `Enter` only inserts a newline (confirmed by
+        /// hand, mirroring the TUI twin's RED verification — both call the
+        /// same shared `render::populate_ai_chat_controller`), the message
+        /// is never sent, and "Hello world" never reaches the painted
+        /// surface within the deadline.
+        #[cfg(unix)]
+        #[test]
+        fn default_submit_on_enter_sends_message_on_plain_enter_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            configure_fixture_agent(&h, &[]);
+
+            let sb = h.painted_sidebar_bounds.get().unwrap();
+            h.driver.click(sb.x + 20.0, sb.y + 20.0);
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: a click in the panel body must focus it"
+            );
+
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+                h.engine.borrow_mut().poll_acp();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("Hello world"),
+                "plain Enter must submit the message by default (#1509) — \
+                 the fake agent's echoed reply never reached the painted \
+                 surface within the deadline; painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// #1509 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::issue_1509_ai_chat_submit_on_enter_and_stop_segment::
+        /// submit_on_enter_false_keeps_enter_as_newline_via_shell_app`:
+        /// `ai_chat_submit_on_enter = false` must keep the pre-#1509
+        /// behaviour — plain `Enter` inserts a newline instead of sending —
+        /// while `Ctrl+S` still sends.
+        ///
+        /// RED verified: with `chat.set_submit_on_enter` hardcoded to
+        /// `true` regardless of the setting, this fails — plain `Enter`
+        /// sends immediately and "Hello world" appears well before `Ctrl+S`
+        /// is ever pressed.
+        #[cfg(unix)]
+        #[test]
+        fn submit_on_enter_false_keeps_enter_as_newline_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            configure_fixture_agent(&h, &[]);
+            h.engine.borrow_mut().settings.ai_chat_submit_on_enter = false;
+
+            let sb = h.painted_sidebar_bounds.get().unwrap();
+            h.driver.click(sb.x + 20.0, sb.y + 20.0);
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: a click in the panel body must focus it"
+            );
+
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "hi\n",
+                "with the setting off, plain Enter must insert a newline \
+                 into the input rather than submitting it"
+            );
+
+            // Give any wrongly-sent request a few polls to arrive — it must
+            // not, since nothing has submitted yet.
+            for _ in 0..10 {
+                h.engine.borrow_mut().poll_acp();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                !h.driver.screen_contains("Hello world"),
+                "the message must not have been sent yet — Enter only \
+                 inserted a newline"
+            );
+
+            h.driver.ctrl_char('s');
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+                h.engine.borrow_mut().poll_acp();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("Hello world"),
+                "Ctrl+S must still submit the message even with \
+                 ai_chat_submit_on_enter off; painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// #1509 acceptance (quadraui#1137), GTK twin of `tui_main::
+        /// app_on_tui_tests::tests::
+        /// issue_1509_ai_chat_submit_on_enter_and_stop_segment::
+        /// clicking_stop_segment_cancels_the_turn_via_shell_app`: clicking
+        /// the Send/Stop segment while a turn is streaming (it reads "Stop"
+        /// then) must abort the turn via the same `session/cancel` path as
+        /// `Ctrl+C` (`Engine::acp_cancel_turn`) —
+        /// `Engine::dispatch_ai_chat_event`'s `ChatControllerEvent::
+        /// StopRequested` arm. The fixture's `$ACP_FAKE_TOOL_CALL_HANGS`
+        /// announces one `in_progress` tool call and then never answers
+        /// `session/prompt`, so the scenario stays busy (and the segment
+        /// keeps reading "Stop") until this click cancels it.
+        ///
+        /// Asserts on rendered output only: the transcript's `"[cancelled
+        /// by user]"` line must paint, and the busy tool-call status line
+        /// must be gone — never an internal `ai_streaming` flag read in
+        /// isolation.
+        ///
+        /// RED verified: with `Engine::dispatch_ai_chat_event`'s
+        /// `Ev::StopRequested => { self.acp_cancel_turn(); true }` arm
+        /// removed (falling through to the catch-all `_ => true`, a
+        /// no-op), this fails — the click is consumed but nothing happens:
+        /// the painted surface still shows the busy "execute: Run the
+        /// tests" status line and never shows "[cancelled by user]", even
+        /// after waiting out the full deadline.
+        #[cfg(unix)]
+        #[test]
+        fn clicking_stop_segment_cancels_the_turn_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            configure_fixture_agent(&h, &["ACP_FAKE_TOOL_CALL_HANGS=1"]);
+
+            let sb = h.painted_sidebar_bounds.get().unwrap();
+            h.driver.click(sb.x + 20.0, sb.y + 20.0);
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.ctrl_char('s');
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while !h.driver.screen_contains("execute: Run the tests \u{b7}")
+                && std::time::Instant::now() < deadline
+            {
+                h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("execute: Run the tests \u{b7}"),
+                "setup: the fixture's hung tool call must show up as busy \
+                 first; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let (x, y) = h
+                .driver
+                .find("Stop")
+                .expect("the Send/Stop segment must read \"Stop\" while busy");
+            h.driver.click(x, y);
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !h.driver.screen_contains("[cancelled by user]")
+                && std::time::Instant::now() < deadline
+            {
+                h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("[cancelled by user]"),
+                "clicking the Stop segment must abort the turn via \
+                 session/cancel, same as Ctrl+C; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("execute: Run the tests \u{b7}"),
+                "the busy tool-call status line must be gone once the \
+                 turn is cancelled"
             );
         }
     }
