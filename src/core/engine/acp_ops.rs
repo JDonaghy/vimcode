@@ -4635,6 +4635,12 @@ mod tests {
     /// and asserts on both the turn-review surface and the checkpoint
     /// bookkeeping `:AiRestore` depends on — not just that the writes
     /// landed on disk.
+    ///
+    /// Explicitly opts into `acp_review_on_turn_end = auto` (#1515 changed
+    /// the *default* to `badge`, which no longer auto-opens the modal this
+    /// test asserts on) — this test's whole point is proving the wire path
+    /// reaches `Engine::acp_open_turn_review` at all, which is exactly
+    /// what `auto` (the pre-#1515 behaviour) still does.
     #[cfg(unix)]
     #[test]
     fn acp_turn_with_three_fs_writes_over_the_wire_opens_a_three_file_turn_review() {
@@ -4655,6 +4661,7 @@ mod tests {
             ("ACP_FAKE_FS_WRITE_CONTENT3", "agent c"),
         ]);
         engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Auto;
         engine.workspace_root = Some(dir.clone());
 
         engine.ai_send_message("please write three files".to_string());

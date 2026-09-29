@@ -131,6 +131,38 @@ pub enum FoldControlsMode {
     Never,
 }
 
+/// How a completed ACP turn that wrote files is surfaced —
+/// `acp_review_on_turn_end` setting (#1515). Before this setting existed,
+/// `AcpEvent::PromptStopped` -> `Engine::acp_end_turn`
+/// (`crate::core::engine::acp_turn_ops`) always auto-opened the combined
+/// turn-review surface full-viewport over the whole editor
+/// (`render.rs`'s modal stack) the instant the turn ended — every turn
+/// that touched a file yanked the user out of whatever they were doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AcpReviewOnTurnEnd {
+    /// Auto-open the full-viewport [`crate::core::review::ChangeReviewState`]
+    /// modal the instant a turn that wrote files ends — the pre-#1515
+    /// behaviour, unchanged.
+    Auto,
+    /// Never auto-open the modal. Instead an "Edited N files · +a -r"
+    /// segment rides the AI panel's already-shared status-strip header
+    /// (`render::populate_ai_chat_controller`), and every buffer the turn
+    /// touched gets gutter markers on the lines the agent changed (base =
+    /// the turn checkpoint's `pre_turn_content`, not `git diff HEAD` — a
+    /// file can be turn-dirty without being git-dirty, and vice versa).
+    /// `:AiReview` opens the same modal `Auto` would have opened
+    /// automatically. Default (#1515) — the whole point of this setting:
+    /// a turn that wrote files shouldn't yank the user out of what they
+    /// were doing to look at it.
+    #[default]
+    Badge,
+    /// Neither the modal nor the badge/gutter nudge — only an explicit
+    /// `:AiReview` shows anything, for a user who doesn't want to be
+    /// reminded at all.
+    Off,
+}
+
 /// User settings loaded from ~/.config/vimcode/settings.json
 ///
 /// IMPORTANT: When adding new settings fields:
@@ -729,6 +761,15 @@ pub struct Settings {
     /// ```
     #[serde(default)]
     pub acp_mcp_servers: Vec<crate::core::acp::AcpMcpServerConfig>,
+
+    /// How a completed ACP turn that wrote files is surfaced (#1515):
+    /// `"auto"` (pre-#1515 full-viewport modal, unchanged), `"badge"`
+    /// (default: a status-strip segment + gutter markers, `:AiReview`
+    /// opens the same modal), or `"off"` (no automatic nudge at all,
+    /// `:AiReview` only). See [`AcpReviewOnTurnEnd`]'s own doc for the
+    /// full behaviour each value gives.
+    #[serde(default)]
+    pub acp_review_on_turn_end: AcpReviewOnTurnEnd,
 
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer. Default **true**
@@ -1798,6 +1839,7 @@ impl Default for Settings {
             acp_active_agent: String::new(),
             acp_reopen_last_session: false,
             acp_mcp_servers: Vec::new(),
+            acp_review_on_turn_end: AcpReviewOnTurnEnd::default(),
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
             explorer_exclude: default_explorer_exclude(),
@@ -3812,6 +3854,11 @@ impl Settings {
             "ai_chat_submit_on_enter" => self.ai_chat_submit_on_enter.to_string(),
             "acp_agent_command" => self.acp_agent_command.clone(),
             "acp_reopen_last_session" => self.acp_reopen_last_session.to_string(),
+            "acp_review_on_turn_end" => match self.acp_review_on_turn_end {
+                AcpReviewOnTurnEnd::Auto => "auto".to_string(),
+                AcpReviewOnTurnEnd::Badge => "badge".to_string(),
+                AcpReviewOnTurnEnd::Off => "off".to_string(),
+            },
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -3972,6 +4019,14 @@ impl Settings {
             "ai_chat_submit_on_enter" => self.ai_chat_submit_on_enter = value == "true",
             "acp_agent_command" => self.acp_agent_command = value.to_string(),
             "acp_reopen_last_session" => self.acp_reopen_last_session = value == "true",
+            "acp_review_on_turn_end" => {
+                self.acp_review_on_turn_end = match value {
+                    "auto" => AcpReviewOnTurnEnd::Auto,
+                    "badge" => AcpReviewOnTurnEnd::Badge,
+                    "off" => AcpReviewOnTurnEnd::Off,
+                    _ => return Err(format!("Unknown acp_review_on_turn_end value: {value}")),
+                };
+            }
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4590,6 +4645,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Bool,
     },
     SettingDef {
+        key: "acp_review_on_turn_end",
+        label: "Turn Review",
+        description: "How a turn that wrote files is surfaced when it ends: auto (full-screen review, pre-#1515 behavior), badge (status-strip segment + gutter markers, default), or off (:AiReview only)",
+        category: "AI",
+        setting_type: SettingType::Enum(&["auto", "badge", "off"]),
+    },
+    SettingDef {
         key: "indent_guides",
         label: "Indent Guides",
         description: "Show vertical lines at each indentation level",
@@ -5182,6 +5244,31 @@ mod tests {
         assert!(SETTING_DEFS
             .iter()
             .any(|d| d.key == "acp_reopen_last_session"));
+    }
+
+    /// #1515's `acp_review_on_turn_end` setting: defaults to `"badge"` (not
+    /// the pre-#1515 always-auto-open behaviour) and round-trips all three
+    /// values via the same `:set` / Settings-UI seam every other enum
+    /// setting here uses (`fold_controls`, `line_numbers`, ...).
+    #[test]
+    fn acp_review_on_turn_end_defaults_to_badge_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert_eq!(s.acp_review_on_turn_end, AcpReviewOnTurnEnd::Badge);
+        assert_eq!(s.get_value_str("acp_review_on_turn_end"), "badge");
+
+        s.set_value_str("acp_review_on_turn_end", "auto").unwrap();
+        assert_eq!(s.acp_review_on_turn_end, AcpReviewOnTurnEnd::Auto);
+        assert_eq!(s.get_value_str("acp_review_on_turn_end"), "auto");
+
+        s.set_value_str("acp_review_on_turn_end", "off").unwrap();
+        assert_eq!(s.acp_review_on_turn_end, AcpReviewOnTurnEnd::Off);
+        assert_eq!(s.get_value_str("acp_review_on_turn_end"), "off");
+
+        assert!(s.set_value_str("acp_review_on_turn_end", "bogus").is_err());
+
+        assert!(SETTING_DEFS
+            .iter()
+            .any(|d| d.key == "acp_review_on_turn_end"));
     }
 
     /// #1546's `sticky_scroll` setting (VS Code's

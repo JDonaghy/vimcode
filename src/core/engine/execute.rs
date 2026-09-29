@@ -1131,10 +1131,14 @@ impl Engine {
 
         // :AiReview — open the combined review of everything the most
         // recently completed ACP turn wrote (#1460), the same surface
-        // `PromptStopped` already opens automatically — this is the manual
-        // "look at it again" path, e.g. after closing it with Esc to keep
-        // editing. A status message, not an error, when there's nothing to
-        // review yet.
+        // `PromptStopped` -> `Engine::acp_end_turn` auto-opens under the
+        // `acp_review_on_turn_end = auto` setting — this is the manual
+        // "look at it again" path always available regardless of that
+        // setting: under the default `badge` (or `off`), this is the only
+        // way the modal opens at all (#1515) — the status-strip badge
+        // segment (`render::populate_ai_chat_controller`) is a summary
+        // only, not (yet) itself clickable; see #1515's PR notes. A status
+        // message, not an error, when there's nothing to review yet.
         if cmd == "AiReview" {
             self.cmd_ai_review();
             return EngineAction::None;

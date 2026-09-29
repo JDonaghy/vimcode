@@ -147,6 +147,91 @@ pub fn plan_restore(
         .collect()
 }
 
+/// Per-line change classification for a turn-diff gutter overlay
+/// (`badge`/`off` mode, #1515) — `old` is a checkpoint entry's
+/// `pre_turn_content` (`None` meaning the agent created the path, so every
+/// line paints [`crate::core::git::GitLineStatus::Added`]), `new` is the
+/// path's *current* content. Line 0 of the result corresponds to line 0
+/// of `new` split on `'\n'` — the same convention `ropey::Rope::len_lines`
+/// uses (a trailing `'\n'` yields one trailing empty line, matching
+/// `quadraui::compute_hunks`'s own `split('\n')`), so a caller indexing
+/// with a buffer's own `line_idx` needs no adjustment.
+///
+/// Deliberately independent of [`crate::core::git::compute_file_diff`] —
+/// that diffs the working copy against `git diff HEAD`, the wrong base
+/// here: a file can be turn-dirty without being git-dirty (already
+/// committed once this turn started) and vice versa (already git-dirty
+/// *before* the turn touched it), so the two overlays must be able to
+/// disagree.
+pub fn line_status(old: Option<&str>, new: &str) -> Vec<Option<crate::core::git::GitLineStatus>> {
+    use crate::core::git::GitLineStatus;
+    let total = new.split('\n').count();
+    let Some(old) = old else {
+        return vec![Some(GitLineStatus::Added); total];
+    };
+    let mut result = vec![None; total];
+    for hunk in quadraui::compute_hunks(old, new) {
+        let mut right_idx = hunk.right_start.saturating_sub(1);
+        let mut pending_removed = false;
+        for row in &hunk.rows {
+            match row.kind {
+                quadraui::DiffRowKind::Same => right_idx += 1,
+                quadraui::DiffRowKind::Added => {
+                    if right_idx < total {
+                        result[right_idx] = Some(GitLineStatus::Added);
+                    }
+                    right_idx += 1;
+                }
+                quadraui::DiffRowKind::Changed => {
+                    if right_idx < total {
+                        result[right_idx] = Some(GitLineStatus::Modified);
+                    }
+                    right_idx += 1;
+                }
+                // A pure-deletion row has no right-side line of its own —
+                // anchor it at the current boundary, same convention
+                // `crate::core::git::parse_unified_diff` uses for a
+                // real `git diff` hunk's pure deletions.
+                quadraui::DiffRowKind::Removed => pending_removed = true,
+            }
+        }
+        if pending_removed {
+            let mark = right_idx.min(total.saturating_sub(1));
+            if result.get(mark).is_some_and(|v| v.is_none()) {
+                result[mark] = Some(GitLineStatus::Deleted);
+            }
+        }
+    }
+    result
+}
+
+/// `(added, removed)` line counts for the same diff [`line_status`]
+/// classifies — the `badge` mode's "Edited N files · +a -r" status-strip
+/// summary (`Engine::acp_turn_review_badge`). A `Changed` row (one line
+/// replaced by another) counts as one added *and* one removed line,
+/// matching `git diff --stat`'s own convention.
+pub fn count_changed_lines(old: Option<&str>, new: &str) -> (usize, usize) {
+    let Some(old) = old else {
+        return (new.split('\n').count(), 0);
+    };
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for hunk in quadraui::compute_hunks(old, new) {
+        for row in &hunk.rows {
+            match row.kind {
+                quadraui::DiffRowKind::Added => added += 1,
+                quadraui::DiffRowKind::Removed => removed += 1,
+                quadraui::DiffRowKind::Changed => {
+                    added += 1;
+                    removed += 1;
+                }
+                quadraui::DiffRowKind::Same => {}
+            }
+        }
+    }
+    (added, removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
