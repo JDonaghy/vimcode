@@ -21495,6 +21495,11 @@ mod issue_1517_acp_inline_review {
     /// `<leader>ak` keeps the hunk under the cursor — the file the agent
     /// already wrote is left untouched on disk, and the action row
     /// disappears the same way rejecting one does.
+    ///
+    /// RED verified: with the `"ak"` leader-sequence arm removed from
+    /// `keys.rs`, `<leader>ak` falls through as an unknown sequence and
+    /// the action row is never resolved — the "must disappear" assertion
+    /// below fails (`"keep hunk"` is still on screen).
     #[test]
     fn leader_ak_keeps_the_hunk_under_the_cursor_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
@@ -21534,6 +21539,16 @@ mod issue_1517_acp_inline_review {
     /// hunk's range before deciding is what `<leader>ak` keeps — the
     /// action row's label switches to "(edited)" and disk ends up with
     /// the human's text, not the agent's original write.
+    ///
+    /// RED verified (nit fix, iteration 1): the on-disk assertion alone
+    /// can't fail here — `keep` never writes to disk (it's a pure
+    /// decision; the human's own `:w` a few lines up already put "TWO
+    /// CHANGED BY HUMAN" on disk), so it would pass unchanged even with
+    /// `<leader>ak` completely disabled. The "action row disappears"
+    /// assertion below closes that gap: with the `"ak"` leader-sequence
+    /// arm removed from `keys.rs`, this test's final `screen_contains` on
+    /// "keep hunk" fails (the row never disappears — nothing resolved
+    /// it).
     #[test]
     fn editing_a_hunk_before_keep_labels_it_edited_and_keeps_the_edit_via_gtk_driver() {
         let dir = std::env::temp_dir().join(format!(
@@ -21582,6 +21597,115 @@ mod issue_1517_acp_inline_review {
             on_disk, "one\nTWO CHANGED BY HUMAN\nthree\nfour\n",
             "keeping an edited hunk must keep the human's edit, not the \
              agent's original write"
+        );
+        assert!(
+            !h.driver.screen_contains("keep hunk"),
+            "the action row must disappear once the only (edited) hunk \
+             is resolved — this is what actually proves `<leader>ak` ran, \
+             since keeping never touches disk; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review-fix (iteration 1): `]c` must land on the *outstanding*
+    /// in-buffer review hunk, not wherever the buffer's raw `git diff
+    /// HEAD` markers happen to point — the ordinary case for a
+    /// git-tracked file the agent just edited, where `has_git` in
+    /// `Engine::jump_next_hunk` is `true` too (`git_diff` is populated on
+    /// every buffer open, per `refresh_git_diff`).
+    ///
+    /// The fixture manufactures a case where the two sources genuinely
+    /// disagree: turn 1 changes line 2 and is then *kept* (resolved, so
+    /// no longer an outstanding review hunk) but never committed, so
+    /// `git diff HEAD` still reports it; turn 2 changes line 8, the only
+    /// hunk actually outstanding for review. `]c` from the top of the
+    /// buffer must jump into that line-8 hunk (`quadraui::compute_hunks`
+    /// pads it with surrounding unchanged context, so its `right_start`
+    /// is line 5, not line 8 itself — 0-indexed line 4), never anywhere
+    /// near the already-resolved line-2 change (0-indexed line 1).
+    ///
+    /// RED verified (manually, reverting `jump_next_hunk` to the old
+    /// `if has_git { .. } else { <@@ fallback> }` order that made the
+    /// in-buffer-review branch unreachable): with that ordering restored,
+    /// `has_git` is `true` for this git-tracked, previously committed
+    /// file, so `]c` lands on 0-indexed line 1 (the raw git diff's line-2
+    /// hunk) instead of line 4 (the actual outstanding review hunk) —
+    /// this test's cursor-line assertion fails with `left: 1, right: 4`.
+    #[test]
+    fn jump_next_hunk_prefers_the_outstanding_review_hunk_over_raw_git_diff_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1517_gtk_git_precedence_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        };
+        run_git(&["init"]);
+        run_git(&["config", "user.email", "t@t.com"]);
+        run_git(&["config", "user.name", "T"]);
+
+        let a = dir.join("a.txt");
+        let lines: Vec<String> = (1..=10).map(|n| format!("line{n}")).collect();
+        std::fs::write(&a, format!("{}\n", lines.join("\n"))).unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Badge;
+        engine.workspace_root = Some(dir.clone());
+
+        // Turn 1: agent changes line 2, turn ends, human keeps the hunk
+        // (resolved — no longer outstanding — but still uncommitted, so
+        // `git diff HEAD` still reports it).
+        let mut turn1 = lines.clone();
+        turn1[1] = "LINE2 CHANGED".to_string();
+        engine
+            .acp_write_text_file(&a, &format!("{}\n", turn1.join("\n")))
+            .unwrap();
+        engine.acp_end_turn();
+        engine.acp_inline_review_keep_hunk_at_line(&a.to_string_lossy(), 2);
+
+        // Turn 2: agent changes line 8 — the only hunk actually
+        // outstanding for review afterward.
+        let mut turn2 = turn1.clone();
+        turn2[7] = "LINE8 CHANGED".to_string();
+        engine
+            .acp_write_text_file(&a, &format!("{}\n", turn2.join("\n")))
+            .unwrap();
+        engine.acp_end_turn();
+
+        // Open through the real path so `refresh_git_diff` populates
+        // `buffer_state.git_diff` from disk exactly like a normal file
+        // open would — `git diff HEAD` at this point covers both the
+        // (resolved) line-2 change and the (outstanding) line-8 change,
+        // since neither has been committed.
+        engine
+            .open_file_with_mode(&a, crate::core::engine::OpenMode::Permanent)
+            .unwrap();
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        h.driver.type_char(']');
+        h.driver.type_char('c');
+        h.driver.render();
+
+        let cursor_line = h.engine.borrow().view().cursor.line;
+        assert_eq!(
+            cursor_line, 4,
+            "`]c` must land inside the outstanding review hunk (0-indexed \
+             line 4, the context-padded start of the line-8 change), not \
+             the raw git diff's line-2 hunk (0-indexed line 1)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
