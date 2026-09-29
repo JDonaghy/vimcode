@@ -20196,10 +20196,20 @@ pub fn populate_ai_chat_controller(
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     chat.set_busy(engine.acp().ai_streaming);
+    // #1508: advance the status-strip's `Spinner` primitive to the frame
+    // `Engine::tick_ai_spinner` last stamped (`poll_idle`, ≥4 Hz while busy
+    // — see `App::tick_dispatch`'s `request_frame_in` re-arm). Harmless to
+    // call every frame regardless of `busy`: `ChatController::render` only
+    // ever paints the glyph when `self.busy` is also true (see
+    // `set_busy`'s own doc), so this can't animate a frozen/idle panel.
+    chat.set_spinner_frame(engine.ai_spinner_frame);
     let header_fg = theme.status_fg;
     let ai_chat_icon = crate::icons::AI_CHAT.nerd;
     let mut header = if engine.acp().ai_streaming {
-        format!(" {ai_chat_icon} AI ASSISTANT  (thinking\u{2026})")
+        format!(
+            " {ai_chat_icon} AI ASSISTANT  {}",
+            ai_busy_status_text(engine)
+        )
     } else {
         format!(" {ai_chat_icon} AI ASSISTANT")
     };
@@ -20271,6 +20281,70 @@ pub fn populate_ai_chat_controller(
         ai_chat_hint_line(backend),
         theme.comment,
     )));
+}
+
+/// Braille spinner frame table (#1508) — the same 10-glyph rotation
+/// quadraui's own GTK/TUI/macOS `Spinner` rasterisers use internally
+/// (`gtk::spinner`/`macos::spinner`'s private `FRAMES` const), duplicated
+/// here because neither is a public quadraui export: this one is embedded
+/// directly into the status-strip *text* (`⠹ execute: cargo test · 12s`),
+/// not painted through the `Spinner` primitive itself (that's the
+/// separate icon `ChatController::set_spinner_frame`, just above, already
+/// drives). A cosmetic text constant shared verbatim by both backends —
+/// not per-backend rendering logic — so duplicating it here doesn't need
+/// a quadraui issue first.
+const SPINNER_GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+fn spinner_glyph(frame_idx: usize) -> char {
+    SPINNER_GLYPHS[frame_idx % SPINNER_GLYPHS.len()]
+}
+
+/// The AI-panel status strip's busy-state text (#1508) — what used to be
+/// the frozen literal `"(thinking\u{2026})"` — built fresh every
+/// `populate_ai_chat_controller` call so it reflects the current instant.
+/// Only ever called while `engine.acp().ai_streaming` is true (see the one
+/// call site).
+///
+/// Precedence, most specific first:
+/// 1. A `session/request_permission` parked on the *active* session
+///    (`AcpSession::has_pending_permission`) — the turn is not
+///    progressing at all until a human answers, so naming the one
+///    in-progress tool call here would be misleading (that call is the
+///    one the permission is blocking, but nothing about it is actually
+///    executing right now).
+/// 2. The most recently announced still-running tool call (searched from
+///    the end of `tool_calls` — an upserted `Vec`, not append-order for
+///    updates — so a later call's `in_progress` status wins over an
+///    earlier one still shown as `pending`/`in_progress` from a prior
+///    step of the same turn).
+/// 3. A generic "thinking" fallback — covers both the direct-curl
+///    transport (which never populates `tool_calls` at all) and the ACP
+///    gap between "turn started" and "first tool_call announced".
+///
+/// Every branch is prefixed with the same animated glyph and suffixed
+/// with the same elapsed-time reading, so the busy indicator always
+/// carries both pieces of information the issue asks for regardless of
+/// which branch fires.
+fn ai_busy_status_text(engine: &Engine) -> String {
+    let glyph = spinner_glyph(engine.ai_spinner_frame);
+    let elapsed = engine
+        .acp()
+        .turn_started_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    if engine.acp().has_pending_permission() {
+        return format!("{glyph} Awaiting permission \u{b7} {elapsed}s");
+    }
+    let running_call = engine
+        .acp()
+        .tool_calls
+        .iter()
+        .rev()
+        .find(|c| c.status == crate::core::acp::AcpToolCallStatus::InProgress);
+    match running_call {
+        Some(call) => format!("{glyph} {}: {} \u{b7} {elapsed}s", call.kind, call.title),
+        None => format!("{glyph} thinking\u{2026} \u{b7} {elapsed}s"),
+    }
 }
 
 /// The persistent one-line hint `populate_ai_chat_controller` pins to

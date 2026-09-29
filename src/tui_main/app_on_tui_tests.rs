@@ -6951,4 +6951,124 @@ mod tests {
             );
         }
     }
+
+    mod issue_1508_ai_panel_busy_status {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// #1508 acceptance: the AI panel's status strip must show the live
+        /// in-progress tool call's title plus an elapsed-time reading while
+        /// busy, replacing the old frozen `"(thinking\u{2026})"` literal —
+        /// and the busy `Spinner` icon (`ChatController::set_spinner_frame`,
+        /// previously never called at all — see the issue) must actually
+        /// animate. The fixture's `$ACP_FAKE_TOOL_CALL_HANGS` announces one
+        /// `in_progress` "execute: Run the tests" call and then never
+        /// answers `session/prompt`, so the scenario stays busy
+        /// indefinitely — long enough to observe both the tool-call text
+        /// and a spinner-frame advance without racing a real completion.
+        ///
+        /// Distinguishing the new status-strip text from the pre-existing
+        /// transcript line: `AcpToolCallStatus::glyph()` prefixes the
+        /// transcript's own summary with a bracketed glyph (`"[~] execute:
+        /// Run the tests"`, no elapsed reading), while the status strip's
+        /// text has no brackets and is suffixed with `"\u{b7} <N>s"` — so
+        /// searching for the title immediately followed by that separator
+        /// only matches the new text this issue adds.
+        ///
+        /// RED verified: reverting `render::populate_ai_chat_controller`'s
+        /// header back to the static `"(thinking\u{2026})"` literal (this
+        /// issue's starting point, with no `chat.set_spinner_frame` call
+        /// either) makes this fail on both counts — the screen never shows
+        /// "execute: Run the tests \u{b7}" anywhere, and
+        /// `Engine::ai_spinner_frame` never advances past its `0` starting
+        /// value no matter how many ticks are driven.
+        #[test]
+        fn busy_status_shows_running_tool_call_and_elapsed_time_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TOOL_CALL_HANGS=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+
+            // A wide sidebar (same `Alt+Right` gesture/target width as
+            // `ai_panel_hint_and_focus_toggle::ai_panel_harness_widened`)
+            // — the default 20-cell content rect clips this status line's
+            // longer text down to a bare glyph, well before the "execute:
+            // Run the tests \u{b7}" substring below it.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            {
+                let driver = &mut h.driver;
+                driver.press_named(quadraui::NamedKey::Escape);
+                for _ in 0..40 {
+                    driver.dispatch(quadraui::UiEvent::KeyPressed {
+                        key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                        modifiers: quadraui::Modifiers {
+                            alt: true,
+                            ..Default::default()
+                        },
+                        repeat: false,
+                    });
+                }
+            }
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(6);
+            let mut screen = driver.screen();
+            while !screen.contains("execute: Run the tests \u{b7}") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("execute: Run the tests \u{b7}"),
+                "the status strip must show the live tool call's title \
+                 plus an elapsed-time separator, distinct from the \
+                 transcript's own bracketed `[~] execute: ...` line; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("[~] execute: Run the tests"),
+                "sanity: the transcript's own summary line must still \
+                 paint too, unaffected by the status-strip change; \
+                 screen:\n{screen}"
+            );
+
+            // The spinner frame must actually move, not just exist — sample
+            // it across several driven ticks (each `driver.tick()` runs one
+            // `App::tick_dispatch` -> `poll_idle` -> `Engine::
+            // tick_ai_spinner` pass while `ai_streaming` stays `true`).
+            let frame_a = h.engine.borrow().ai_spinner_frame;
+            let advance_deadline = Instant::now() + Duration::from_secs(2);
+            let mut frame_b = frame_a;
+            while frame_b == frame_a && Instant::now() < advance_deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(20));
+                frame_b = h.engine.borrow().ai_spinner_frame;
+            }
+            assert_ne!(
+                frame_a, frame_b,
+                "Engine::ai_spinner_frame must advance every tick while a \
+                 turn is streaming, not stay frozen at its starting value"
+            );
+        }
+    }
 }
