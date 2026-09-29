@@ -987,6 +987,10 @@ impl Engine {
     pub(crate) fn acp_reset_transcript_for_resume(&mut self) {
         self.acp_mut().remembered_decisions.clear();
         self.acp_mut().ai_messages.clear();
+        // #1510: same reasoning as `Engine::ai_clear` — a resumed session's
+        // freshly-replayed messages must not land on stale cached markdown
+        // renders left over at the same indices.
+        self.acp_mut().markdown_turn_cache.get_mut().clear();
         self.acp_mut().plan.clear();
         self.acp_mut().available_commands.clear();
         self.acp_mut().command_completion_idx = 0;

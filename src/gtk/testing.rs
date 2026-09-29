@@ -21113,3 +21113,144 @@ mod issue_1515_acp_review_badge {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// #1510: AI panel assistant/thought turns render as markdown
+/// (`render_markdown_to_styled`) instead of raw markdown source; thought
+/// turns additionally collapse to a fixed one-line "Thinking..." summary.
+/// TUI twin: `tui_main::app_on_tui_tests::tests::
+/// issue_1510_ai_panel_markdown_rendering`.
+mod issue_1510_ai_panel_markdown_rendering {
+    use super::*;
+
+    /// An `Engine` with the AI panel shown and a fixture agent configured
+    /// to reply with `$ACP_FAKE_MARKDOWN_REPLY`'s markdown thought/message
+    /// chunks and no follow-up tool-call machinery
+    /// (`$ACP_FAKE_NO_TOOL_REQUEST`), so the turn ends cleanly.
+    fn markdown_engine() -> Engine {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_AI,
+        ));
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec![
+                "ACP_FAKE_MARKDOWN_REPLY=1".to_string(),
+                "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+            ],
+            mcp_servers: Vec::new(),
+        }];
+        engine.settings.acp_active_agent = "alpha".to_string();
+        engine
+    }
+
+    /// #1510 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1510_ai_panel_markdown_rendering::assistant_markdown_reply_
+    /// renders_stripped_and_styled_via_shell_app`: the assistant's markdown
+    /// reply (`"# Heading\n**bold** text"`) must paint as rendered markdown
+    /// — "Heading" and "bold" visible, with no literal `#`/`**` syntax
+    /// characters on the painted surface.
+    ///
+    /// RED verified: with `populate_ai_chat_controller`'s markdown path
+    /// reverted to `quadraui::StyledText::colored(m.content.clone(), fg)`
+    /// (this issue's starting point), this fails — the painted surface
+    /// shows the literal source `"# Heading"` and `"**bold** text"`
+    /// verbatim, so the two `!screen_contains(...)` assertions below both
+    /// fail.
+    #[cfg(unix)]
+    #[test]
+    fn assistant_markdown_reply_renders_stripped_and_styled_via_gtk_driver() {
+        let mut h = harness(markdown_engine(), 1200, 800);
+        for c in ":AI hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Heading") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Heading"),
+            "the rendered heading text must reach the painted surface; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("bold"),
+            "the rendered bold text must reach the painted surface; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("# Heading"),
+            "the raw '#' heading marker must never reach the painted \
+             surface — markdown must be rendered, not shown verbatim; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("**bold**"),
+            "the raw '**' emphasis markers must never reach the painted \
+             surface — markdown must be rendered, not shown verbatim; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #1510 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1510_ai_panel_markdown_rendering::thought_turn_collapses_to_
+    /// thinking_summary_via_shell_app`: a thought turn's markdown content
+    /// (`"# Pondering\n**deeply**"`) must never reach the painted surface
+    /// at all — thought turns collapse by default to a fixed one-line
+    /// "Thinking..." summary.
+    ///
+    /// RED verified: with the `chat.set_turn_collapsed`/`set_turn_summary`
+    /// calls this issue adds removed, this fails — the thought's own text
+    /// ("Pondering"/"deeply") paints on the surface instead of the
+    /// "Thinking..." summary.
+    #[cfg(unix)]
+    #[test]
+    fn thought_turn_collapses_to_thinking_summary_via_gtk_driver() {
+        let mut h = harness(markdown_engine(), 1200, 800);
+        for c in ":AI hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Thinking") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Thinking"),
+            "a thought turn must collapse to a one-line 'Thinking...' \
+             summary; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("Pondering"),
+            "the thought turn's own markdown content must not reach the \
+             painted surface while collapsed; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("deeply"),
+            "the thought turn's own markdown content must not reach the \
+             painted surface while collapsed; painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+}

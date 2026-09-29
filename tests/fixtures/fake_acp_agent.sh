@@ -91,7 +91,13 @@
 #                           registry entries (only `env` differs) and tell
 #                           their replies apart, proving the multi-agent
 #                           registry is a config fact, not a Rust
-#                           special-case.
+#                           special-case. If $ACP_FAKE_MARKDOWN_REPLY is set
+#                           (#1510), both the thought chunk and the message
+#                           chunk instead carry markdown source (a heading +
+#                           bold text) so a test can assert the AI panel
+#                           renders it — heading/emphasis styled, syntax
+#                           characters stripped — rather than showing the
+#                           raw markdown text.
 #                           Then, unless $ACP_FAKE_NO_TOOL_REQUEST is set, a
 #                           scripted agent->client request (fixed id 9001,
 #                           method fs/read_text_file) that BLOCKS reading one
@@ -518,9 +524,21 @@ while IFS= read -r line; do
       if [ -n "$ACP_FAKE_AGENT_LABEL" ]; then
         hello_text="Hello_${ACP_FAKE_AGENT_LABEL}"
       fi
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}\n'
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$hello_text"
-      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
+      # #1510: with $ACP_FAKE_MARKDOWN_REPLY set, both the thought chunk and
+      # the message chunk carry markdown source (a heading + bold text)
+      # instead of the plain greeting above — a test asserts the *rendered*
+      # form ("Heading", "bold" with no literal "#"/"**") reaches the
+      # painted surface, and that the thought's markdown never reaches it
+      # at all (thought turns collapse to a fixed one-line "Thinking..."
+      # summary regardless of content).
+      if [ -n "$ACP_FAKE_MARKDOWN_REPLY" ]; then
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"# Pondering\\n**deeply**"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"# Heading\\n**bold** text"}}}}\n'
+      else
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"pondering the question"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$hello_text"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" world"}}}}\n'
+      fi
       if [ -n "$ACP_FAKE_NO_TOOL_REQUEST" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_PLAN" ]; then

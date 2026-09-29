@@ -20103,6 +20103,68 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
     })
 }
 
+/// Render `content` as markdown into a single joined [`quadraui::StyledText`]
+/// (`\n`-separated spans, one per source line, matching
+/// [`quadraui::ChatController::push_turn_markdown`]'s own join) plus its
+/// per-line heading scales, reusing `cache[idx]` when `content`'s length is
+/// unchanged since the last call — see [`AcpSession::markdown_turn_cache`]'s
+/// doc for why length is a sufficient staleness check here. Written as a
+/// free function (rather than calling `push_turn_markdown` itself) because
+/// [`populate_ai_chat_controller`] builds a whole `Vec<ChatTurn>` to hand to
+/// `set_transcript` in one shot, not one turn at a time onto the live
+/// controller.
+fn markdown_turn_styled_cached(
+    cache: &std::cell::RefCell<
+        std::collections::HashMap<usize, crate::core::acp_session::MarkdownTurnCacheEntry>,
+    >,
+    idx: usize,
+    content: &str,
+    theme: &quadraui::Theme,
+) -> (quadraui::StyledText, Vec<f32>) {
+    if let Some((cached_len, text, line_scales)) = cache.borrow().get(&idx) {
+        if *cached_len == content.len() {
+            return (text.clone(), line_scales.clone());
+        }
+    }
+    let rendered = quadraui::render_markdown_to_styled(content, theme);
+    let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
+    for (i, line) in rendered.lines.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(quadraui::StyledSpan::plain("\n"));
+        }
+        spans.extend(line.spans);
+    }
+    let text = quadraui::StyledText { spans };
+    let line_scales = rendered.line_scales;
+    cache
+        .borrow_mut()
+        .insert(idx, (content.len(), text.clone(), line_scales.clone()));
+    (text, line_scales)
+}
+
+/// True if `ai_messages[idx]` (an `"assistant-thought"`-role turn) is
+/// genuine agent reasoning (`AcpChunkKind::Thought`, streamed by
+/// `Engine::acp_append_chunk`) rather than one of the one-shot system/error
+/// notices *also* pushed under that same role string — agent-failed-to-
+/// start, protocol-version-mismatch, turn-stopped-early, cancelled-by-user
+/// (see `AiMessage`'s own doc on this pre-existing role conflation, and
+/// `Engine::acp_cancel_turn`/`poll_acp`'s various pushes).
+///
+/// Genuine thought chunks are always followed, later in the same
+/// conversation, by a real `"assistant"`-role reply; every notice case
+/// above is pushed as (and then stays) the transcript's *last* message
+/// once it lands — nothing about a terminal/error condition produces a
+/// further assistant reply afterward. A thought chunk still streaming in
+/// with no reply yet (the brief window between `agent_thought_chunk` and
+/// the first `agent_message_chunk`) reads as `false` here too — shown in
+/// full rather than collapsed for that one frame or two, self-correcting
+/// the moment the reply arrives. That false-negative is a far safer
+/// failure mode than the reverse: permanently hiding a cancellation/error
+/// notice behind a "Thinking..." summary.
+fn is_genuine_thought_chunk(ai_messages: &[crate::core::ai::AiMessage], idx: usize) -> bool {
+    ai_messages[idx + 1..].iter().any(|m| m.role == "assistant")
+}
+
 /// Populate `engine.ai_chat` (a [`quadraui::ChatController`]) with the
 /// current conversation and busy state for the next `render()`/`handle()`
 /// pass — the AI-panel twin of [`populate_explorer_tree_controller`]. Call
@@ -20120,7 +20182,6 @@ pub fn populate_ai_chat_controller(
     backend: &dyn quadraui::Backend,
 ) {
     let user_fg = theme.keyword;
-    let asst_fg = theme.string_lit;
     // ACP-1 (#952): agent "thought" chunks (`session/update`'s
     // `agent_thought_chunk`, role "assistant-thought" — see
     // `Engine::acp_append_chunk`) render under `ChatRole::System`, not
@@ -20130,21 +20191,57 @@ pub fn populate_ai_chat_controller(
     // distinct from message chunks, not merely a different tint on the same
     // "AI" label.
     let thought_fg = theme.comment;
+    // #1510: assistant/thought turns render as markdown
+    // (`render_markdown_to_styled`) so fences, headings, lists, and inline
+    // code paint as such instead of raw source text; user turns stay plain
+    // (`StyledText::colored`) since a user's own words are never markdown
+    // *content* to re-render, just text they typed. The per-role colour
+    // that used to tint the whole message body is no longer the mechanism
+    // that keeps thought turns visually distinct from assistant turns —
+    // `ChatRole::System` (vs `Assistant`) already earns that on its own via
+    // `ChatController::build_transcript_rows`'s role-header label/colour
+    // (see the comment above), and thought turns additionally collapse to a
+    // one-line summary below.
+    let q_theme = to_quadraui_theme(theme);
     let mut turns: Vec<quadraui::ChatTurn> = engine
         .acp()
         .ai_messages
         .iter()
-        .map(|m| {
-            let (role, fg) = match m.role.as_str() {
-                "user" => (quadraui::ChatRole::User, user_fg),
-                "assistant-thought" => (quadraui::ChatRole::System, thought_fg),
-                _ => (quadraui::ChatRole::Assistant, asst_fg),
-            };
-            quadraui::ChatTurn {
-                role,
-                text: quadraui::StyledText::colored(m.content.clone(), fg),
+        .enumerate()
+        .map(|(idx, m)| match m.role.as_str() {
+            "user" => quadraui::ChatTurn {
+                role: quadraui::ChatRole::User,
+                text: quadraui::StyledText::colored(m.content.clone(), user_fg),
                 timestamp_unix: None,
                 line_scales: Vec::new(),
+            },
+            "assistant-thought" => {
+                let (text, line_scales) = markdown_turn_styled_cached(
+                    &engine.acp().markdown_turn_cache,
+                    idx,
+                    &m.content,
+                    &q_theme,
+                );
+                quadraui::ChatTurn {
+                    role: quadraui::ChatRole::System,
+                    text,
+                    timestamp_unix: None,
+                    line_scales,
+                }
+            }
+            _ => {
+                let (text, line_scales) = markdown_turn_styled_cached(
+                    &engine.acp().markdown_turn_cache,
+                    idx,
+                    &m.content,
+                    &q_theme,
+                );
+                quadraui::ChatTurn {
+                    role: quadraui::ChatRole::Assistant,
+                    text,
+                    timestamp_unix: None,
+                    line_scales,
+                }
             }
         })
         .collect();
@@ -20195,6 +20292,30 @@ pub fn populate_ai_chat_controller(
 
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
+    // #1510: thought turns collapse to a one-line "Thinking..." summary by
+    // default — full expansion is out of scope here (arrives with the
+    // tool-card issue). Forced every frame (after `set_transcript` above,
+    // so `set_turn_collapsed`'s range check sees the current transcript)
+    // rather than left to `ChatController`'s own Tab+Enter collapse toggle:
+    // a user who somehow toggled one open would see it snap back shut on
+    // the very next frame, matching "thought turns are collapsed", full
+    // stop, for now.
+    //
+    // Gated on `is_genuine_thought_chunk`, not just `role ==
+    // "assistant-thought"`: that role string is pre-existing shorthand
+    // ACP-1 reused for two different things (see `AiMessage`'s own doc) —
+    // real `agent_thought_chunk` reasoning, *and* one-shot system/error
+    // notices (`Engine::acp_cancel_turn`'s `"[cancelled by user]"`,
+    // `poll_acp`'s failed-request/protocol-mismatch warnings, ...).
+    // Collapsing those into "Thinking..." would hide the one thing the
+    // user most needs to see right after the turn ended abnormally.
+    let ai_messages = &engine.acp().ai_messages;
+    for (idx, m) in ai_messages.iter().enumerate() {
+        if m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, idx) {
+            chat.set_turn_collapsed(idx, true);
+            chat.set_turn_summary(idx, Some("Thinking\u{2026}".to_string()));
+        }
+    }
     chat.set_busy(engine.acp().ai_streaming);
     // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
     // `ChatController` every call — cheap enough to set unconditionally
