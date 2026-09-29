@@ -2956,7 +2956,21 @@ impl Engine {
     /// a chat user is not looking at.
     pub fn ai_send_message(&mut self, text: String) {
         let text = text.trim().to_string();
-        if text.is_empty() || self.acp_mut().ai_streaming {
+        // #1512: a message submitted while a turn is already in flight is
+        // queued rather than silently dropped — `quadraui::ChatController`
+        // itself swallows an empty `Submit` before it ever reaches this
+        // function (see `try_submit`'s doc), so an empty `text` here can
+        // only come from a call site other than the chat input's own
+        // Enter/Ctrl+S (there is none today) — kept as a no-op, matching
+        // the pre-#1512 behaviour for that case, rather than queuing an
+        // empty message.
+        if self.acp_mut().ai_streaming {
+            if !text.is_empty() {
+                self.ai_queue_message(text);
+            }
+            return;
+        }
+        if text.is_empty() {
             return;
         }
         let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
@@ -3001,6 +3015,19 @@ impl Engine {
             role: "user".to_string(),
             content: text,
         });
+        self.ai_dispatch_curl_request();
+    }
+
+    /// Spawn the blocking `curl` background thread off whatever's
+    /// currently in `ai_messages` (`curl_transport_history` filters to
+    /// `"user"`/`"assistant"` turns, dropping ACP-only roles like
+    /// `"user-queued"`/`"assistant-thought"`). Split out from
+    /// `ai_send_message_via_curl` so #1512's queued-message dispatch
+    /// (`Engine::ai_dispatch_queued_message`) can reuse it without
+    /// pushing a second transcript turn for a message that's already
+    /// there — it just flips the existing dimmed `"user-queued"` turn
+    /// back to plain `"user"` first.
+    fn ai_dispatch_curl_request(&mut self) {
         self.acp_begin_streaming();
 
         let provider = self.settings.ai_provider.clone();
@@ -3169,6 +3196,149 @@ impl Engine {
         }
     }
 
+    // ── #1512: queue a message typed while the agent is busy ────────────
+
+    /// Called from `ai_send_message` when a turn is already in flight
+    /// (`ai_streaming`) instead of the pre-#1512 silent no-op. Only one
+    /// message can be queued at a time — a second call while one is
+    /// already queued *replaces* its content in place (same dimmed
+    /// transcript turn, new text) rather than stacking a second one, so
+    /// the status strip's "queued (1)" segment (`render::
+    /// populate_ai_chat_controller`) never has to count higher than one.
+    fn ai_queue_message(&mut self, text: String) {
+        if let Some(idx) = self.acp_mut().queued_prompt_idx {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.content = text.clone();
+            }
+        } else {
+            // #1512: rendered dimmed (`render::populate_ai_chat_controller`'s
+            // `"user-queued"` arm) and prefixed `"(queued) "` on the
+            // painted text itself, not just a colour — a colour alone
+            // isn't something a black-box test (or a low-color terminal)
+            // can reliably read back, unlike a literal substring.
+            let idx = self.acp_mut().ai_messages.len();
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "user-queued".to_string(),
+                content: text.clone(),
+            });
+            self.acp_mut().queued_prompt_idx = Some(idx);
+        }
+        self.acp_mut().queued_prompt = Some(text);
+        self.message = "Queued (1) \u{2014} sends automatically once the \
+                         current turn finishes (Ctrl+G to send now, Ctrl+R to discard)."
+            .to_string();
+    }
+
+    /// Drop whatever's queued without sending it (Ctrl+R,
+    /// `dispatch_ai_chat_event` — the busy-panel analogue of that same key's
+    /// existing "drop the most-recently-staged attachment" behaviour,
+    /// falling through to this once neither attachment kind is staged).
+    /// Returns `false` (and does nothing) if nothing was queued, so the
+    /// caller can chain further Ctrl+R fallbacks / know whether to show a
+    /// message.
+    ///
+    /// The dimmed transcript turn is left in place rather than removed —
+    /// this panel's transcript is append-only everywhere else (e.g.
+    /// `acp_cancel_turn`'s `"[cancelled by user]"` notice never removes
+    /// the turn it's about either), and removing it would shift every
+    /// `ai_messages` index recorded after it (`tool_call_anchor`,
+    /// `thought_expanded`, `markdown_turn_cache`) out from under whatever
+    /// they name. Relabelled `"(discarded)"` instead so the history stays
+    /// honest about what happened without needing index surgery.
+    pub(crate) fn ai_discard_queued_message(&mut self) -> bool {
+        if self.acp_mut().queued_prompt.take().is_none() {
+            return false;
+        }
+        if let Some(idx) = self.acp_mut().queued_prompt_idx.take() {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.content = format!("{} (discarded)", m.content);
+            }
+        }
+        true
+    }
+
+    /// Send whatever's queued right now instead of waiting for the
+    /// in-flight turn to reach `PromptStopped` on its own (Ctrl+G,
+    /// `dispatch_ai_chat_event`) — cancels the current turn
+    /// (`acp_cancel_turn`, the same "[cancelled by user]" path `Ctrl+C`
+    /// uses while streaming) and immediately dispatches the queued
+    /// message. A no-op if nothing is queued.
+    pub(crate) fn ai_send_queued_now(&mut self) {
+        if self.acp_mut().queued_prompt.is_none() {
+            return;
+        }
+        self.acp_cancel_turn();
+        self.ai_dispatch_queued_message();
+    }
+
+    /// Actually send whatever's queued (`AcpSession::queued_prompt`) — the
+    /// shared tail both `Engine::ai_send_queued_now` ("send now") and the
+    /// natural `AcpEvent::PromptStopped`/curl-completion paths
+    /// (`poll_acp`/`poll_ai`) call once a turn genuinely ends. Flips the
+    /// dimmed `"user-queued"` transcript turn back to a plain `"user"`
+    /// one (it's already showing the right text; no second push) and then
+    /// dispatches it over whichever transport is currently configured —
+    /// deliberately re-read from `self.settings` here rather than
+    /// remembered from queue time, since a setting could plausibly change
+    /// while the previous turn was still running. A no-op if nothing is
+    /// queued.
+    pub(crate) fn ai_dispatch_queued_message(&mut self) {
+        let Some(text) = self.acp_mut().queued_prompt.take() else {
+            return;
+        };
+        if let Some(idx) = self.acp_mut().queued_prompt_idx.take() {
+            if let Some(m) = self.acp_mut().ai_messages.get_mut(idx) {
+                m.role = "user".to_string();
+            }
+        }
+        let acp_configured = !self.settings.acp_agent_command.trim().is_empty()
+            || !self.settings.acp_agents.is_empty();
+        if acp_configured && self.acp_mut().client.is_some() {
+            self.acp_begin_streaming();
+            self.acp_mut().streaming_turn = None;
+            if let Some(session_id) = self.acp_mut().session_id.clone() {
+                let content = self.acp_prompt_content_blocks(&text);
+                if let Some(client) = self.acp_mut().client.as_mut() {
+                    client.prompt(&session_id, content);
+                }
+            } else {
+                // The handshake somehow isn't finished yet (shouldn't
+                // normally happen — queuing only ever starts once
+                // `ai_streaming` was already `true`, which implies a
+                // session already existed) — fall back to the handshake
+                // mechanism (`AcpEvent::SessionCreated`/`SessionLoaded`)
+                // rather than losing the message.
+                self.acp_mut().pending_prompt = Some(text);
+            }
+            return;
+        }
+        // #1446: same fail-fast shape as `ai_send_message`'s no-transport
+        // branch — a queued message that can no longer be sent (agent
+        // process died, or no API key) must say so, not just silently
+        // vanish now that its dimmed turn has already flipped to plain
+        // "user".
+        let provider = self.settings.ai_provider.clone();
+        if crate::core::ai::provider_needs_api_key(&provider)
+            && crate::core::ai::resolve_api_key(&provider, &self.settings.ai_api_key).is_empty()
+        {
+            self.message = format!(
+                "AI: no ACP agent configured (acp_agents / acp_agent_command) and no \
+                 API key for provider \"{provider}\""
+            );
+            self.acp_mut().ai_messages.push(AiMessage {
+                role: "assistant-thought".to_string(),
+                content: format!(
+                    "\u{26a0} Cannot send queued message: no ACP agent is configured \
+                     (set `acp_agents` or `acp_agent_command`) and no API key is \
+                     available for provider \"{provider}\" (set `ai_api_key`, or the \
+                     provider's API-key environment variable)."
+                ),
+            });
+            return;
+        }
+        self.ai_dispatch_curl_request();
+    }
+
     /// Non-blocking poll for a completed AI response. Returns `true` if something changed.
     pub fn poll_ai(&mut self) -> bool {
         let result = if let Some(rx) = &self.ai_rx {
@@ -3192,6 +3362,9 @@ impl Engine {
                 self.message = format!("AI error: {e}");
             }
         }
+        // #1512: the curl transport's analogue of `AcpEvent::PromptStopped`
+        // — send whatever queued up while this request was in flight.
+        self.ai_dispatch_queued_message();
         true
     }
 
@@ -3240,6 +3413,11 @@ impl Engine {
         // queued one.
         self.acp_pending_resume = None;
         self.acp_mut().pending_prompt_display = None;
+        // #1512: a queued message belongs to the conversation being
+        // cleared — nothing left to send it to, or to un-dim once this
+        // clear wipes the transcript it was queued into.
+        self.acp_mut().queued_prompt = None;
+        self.acp_mut().queued_prompt_idx = None;
         self.acp_mut().streaming_turn = None;
         // #956 (ACP-5): plan/commands/modes/usage are all session-scoped —
         // clearing the conversation ends the session, so none of it should
@@ -3660,23 +3838,42 @@ impl Engine {
                 }
                 true
             }
-            // #1450 point 4 / #1464: Ctrl+R drops the most-recently-staged
-            // attachment without sending it — "let the user remove it
-            // before sending". Checks the Visual-selection/`:{range}AI`
-            // range attachment first (unchanged #1450 behaviour), then
-            // falls through to popping the last manually attached
-            // file/image (#1464) once that's empty — one key, most-recent-
-            // first, across both kinds of pending attachment. Same escape-
-            // hatch shape as Ctrl+C above: `ChatController` doesn't bind
-            // Ctrl+R internally, so it reaches here as a plain
-            // `KeyPressed`. A no-op (still consumes the key) when nothing is
-            // staged at all.
+            // #1450 point 4 / #1464 / #1512: Ctrl+R drops the most-
+            // recently-staged "about to send" thing without sending it —
+            // "let the user remove it before sending". Checks the
+            // Visual-selection/`:{range}AI` range attachment first
+            // (unchanged #1450 behaviour), then falls through to popping
+            // the last manually attached file/image (#1464) once that's
+            // empty, then finally a message already queued while the
+            // agent was busy (#1512, `ai_discard_queued_message`) — one
+            // key, most-recent-first, across all three. Same escape-hatch
+            // shape as Ctrl+C above: `ChatController` doesn't bind Ctrl+R
+            // internally, so it reaches here as a plain `KeyPressed`. A
+            // no-op (still consumes the key) when nothing is staged at
+            // all.
             Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('r')" => {
                 if self.acp_pending_attachment.take().is_some() {
                     self.message = "Attachment removed.".to_string();
                 } else if let Some(removed) = self.acp_manual_attachments.pop() {
                     self.message = format!("Removed {}.", removed.chip());
+                } else if self.ai_discard_queued_message() {
+                    self.message = "Queued message discarded.".to_string();
                 }
+                true
+            }
+            // #1512: Ctrl+G ("go now") — cancel the in-flight turn and
+            // immediately dispatch whatever's queued instead of waiting
+            // for it to be sent automatically once the turn reaches
+            // `PromptStopped` on its own. `ChatController` doesn't bind
+            // Ctrl+G internally (unlike Enter/Ctrl+S/Ctrl+Enter, all of
+            // which fully consume "submit" — including on an *empty*
+            // input, where `try_submit` returns `Ignored` before this
+            // function is ever called — which is why "send now" can't
+            // reuse the ordinary submit chord), so it reaches here as a
+            // plain `KeyPressed`, same as Ctrl+C/Ctrl+R above. A no-op
+            // (still consumes the key) when nothing is queued.
+            Ev::KeyPressed { key, modifiers } if modifiers.ctrl && key == "Char('g')" => {
+                self.ai_send_queued_now();
                 true
             }
             // #1511: a click landed on transcript turn `turn_idx`, row

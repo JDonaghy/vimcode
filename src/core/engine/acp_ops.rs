@@ -159,6 +159,11 @@ impl Engine {
                     // land after.
                     self.acp_pending_resume = None;
                     self.acp_mut().pending_prompt_display = None;
+                    // #1512: the agent this was queued for is gone — same
+                    // "no transcript left for it to land after" reasoning
+                    // as `pending_prompt_display` just above.
+                    self.acp_mut().queued_prompt = None;
+                    self.acp_mut().queued_prompt_idx = None;
                     self.acp_mut().streaming_turn = None;
                     // #956 (ACP-5): session-scoped, same as the decisions
                     // map above — see `Engine::ai_clear`'s matching reset.
@@ -428,6 +433,12 @@ impl Engine {
                     // wrote and open the combined turn-review surface, same
                     // moment `:AiReview` would open it manually.
                     self.acp_end_turn();
+                    // #1512: send whatever queued up while this turn was
+                    // streaming — a no-op if nothing did. Must run after
+                    // `ai_streaming` is cleared above (it flips back to
+                    // `true` itself, via `acp_begin_streaming`, the moment
+                    // it actually has something to send).
+                    self.ai_dispatch_queued_message();
                     redraw = true;
                 }
                 AcpEvent::RequestFailed {
@@ -493,6 +504,17 @@ impl Engine {
                         self.acp_mut().pending_prompt = None;
                         self.acp_mut().pending_prompt_display = None;
                     }
+                    // #1512: a failed `session/prompt` (the `else` branch
+                    // above) still ends the turn that had something queued
+                    // behind it — give the queued message its chance to
+                    // send rather than leaving it stuck forever. Harmless
+                    // no-op for every other failing method, and for the
+                    // `session/load` branch above (nothing can be queued
+                    // that early — see `AcpSession::queued_prompt`'s doc:
+                    // queuing only ever starts once `ai_streaming` was
+                    // already `true`, which implies an established session
+                    // already sent at least one prompt).
+                    self.ai_dispatch_queued_message();
                     redraw = true;
                 }
                 AcpEvent::ClientRequest {
@@ -993,6 +1015,12 @@ impl Engine {
     pub(crate) fn acp_reset_transcript_for_resume(&mut self) {
         self.acp_mut().remembered_decisions.clear();
         self.acp_mut().ai_messages.clear();
+        // #1512: whatever was queued belonged to the session being
+        // abandoned here — the resumed session's replayed history is
+        // about to occupy `ai_messages` from index 0, so a leftover
+        // `queued_prompt_idx` would point at the wrong turn entirely.
+        self.acp_mut().queued_prompt = None;
+        self.acp_mut().queued_prompt_idx = None;
         // #1510: same reasoning as `Engine::ai_clear` — a resumed session's
         // freshly-replayed messages must not land on stale cached markdown
         // renders left over at the same indices.
@@ -3172,6 +3200,304 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// #1512 acceptance: submitting a second message while the first turn
+    /// is still streaming (`ai_streaming`) must queue it — a dimmed
+    /// `"user-queued"` transcript turn plus `AcpSession::queued_prompt` —
+    /// instead of the pre-#1512 silent no-op (`ai_send_message`'s old
+    /// `if text.is_empty() || self.acp_mut().ai_streaming { return; }`).
+    /// Nothing extra reaches the wire yet: only the first turn's
+    /// `session/prompt` is captured.
+    ///
+    /// `ACP_FAKE_TOOL_CALL_HANGS` keeps the first turn genuinely busy on
+    /// the wire (not just synchronously busy for one tick) so this can
+    /// assert against a turn actually confirmed in flight, not merely
+    /// `ai_send_message`'s own synchronous `ai_streaming = true` write.
+    ///
+    /// RED verified: reverting `ai_send_message` to the pre-#1512 `if
+    /// text.is_empty() || self.acp_mut().ai_streaming { return; }` early
+    /// return makes this fail — the second call is silently dropped,
+    /// `queued_prompt` stays `None`, and `ai_messages.len()` never grows
+    /// past the first turn's three entries (user/thought/tool-call-less
+    /// nothing — see the assertion below for the exact pre-fix count).
+    #[cfg(unix)]
+    #[test]
+    fn queuing_a_second_message_while_busy_defers_it_and_shows_a_dimmed_turn() {
+        let capture = capture_file_path("queue_defer");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_TOOL_CALL_HANGS", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("first".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().tool_calls.is_empty());
+        assert!(
+            engine.acp_mut().ai_streaming,
+            "sanity: the first turn must still be busy (the fixture hangs \
+             after announcing its tool call)"
+        );
+
+        engine.ai_send_message("second".to_string());
+
+        assert_eq!(
+            engine.acp_mut().queued_prompt.as_deref(),
+            Some("second"),
+            "the second message must be queued, not dropped"
+        );
+        let last = engine
+            .acp_mut()
+            .ai_messages
+            .last()
+            .expect("a transcript turn for the queued message");
+        assert_eq!(last.role, "user-queued", "must be the dimmed queued role");
+        assert_eq!(last.content, "second");
+        assert!(
+            engine.message.contains("Queued (1)"),
+            "status message should confirm the queue: {}",
+            engine.message
+        );
+
+        // Only the first prompt should have reached the wire so far.
+        let content = std::fs::read_to_string(&capture).unwrap_or_default();
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "the queued message must not be sent until the first turn ends: {content}"
+        );
+
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// #1512 acceptance: a queued message is sent automatically the moment
+    /// the in-flight turn reaches `AcpEvent::PromptStopped` — no further
+    /// user action required. Uses `ACP_FAKE_NO_TOOL_REQUEST` so both turns
+    /// complete on their own; the second message is submitted synchronously
+    /// right after the first (before any `poll_acp` has run), which is
+    /// exactly the busy window `ai_streaming` guarantees is still open at
+    /// that point.
+    ///
+    /// RED verified: with `Engine::ai_dispatch_queued_message`'s call in
+    /// `PromptStopped`'s handler removed, this fails — `queued_prompt`
+    /// stays `Some("second")` forever and only one `"assistant"` turn ever
+    /// lands, since nothing ever sends the second prompt.
+    #[cfg(unix)]
+    #[test]
+    fn queued_message_auto_sends_once_the_turn_ends() {
+        let capture = capture_file_path("queue_autosend");
+        let _ = std::fs::remove_file(&capture);
+        let mut engine = engine_with_fixture_agent(&[
+            ("ACP_FAKE_NO_TOOL_REQUEST", "1"),
+            ("ACP_FAKE_CAPTURE_PROMPT_TO", capture.to_str().unwrap()),
+        ]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("first".to_string());
+        // Nothing has been polled yet, so `ai_streaming` is still exactly
+        // what `ai_send_message` synchronously set it to — this is queued,
+        // not sent as a second independent turn.
+        engine.ai_send_message("second".to_string());
+        assert_eq!(engine.acp_mut().queued_prompt.as_deref(), Some("second"));
+
+        poll_acp_until(&mut engine, |e| {
+            e.acp()
+                .ai_messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .count()
+                >= 2
+        });
+        assert_eq!(
+            engine
+                .acp_mut()
+                .ai_messages
+                .iter()
+                .filter(|m| m.role == "assistant")
+                .count(),
+            2,
+            "both turns should have completed within the deadline: {:?}",
+            engine.acp_mut().ai_messages
+        );
+        assert!(
+            engine.acp_mut().queued_prompt.is_none(),
+            "the queued message must be consumed once sent"
+        );
+        let flipped = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .find(|m| m.content == "second")
+            .expect("the queued turn should still be present");
+        assert_eq!(
+            flipped.role, "user",
+            "the dimmed queued turn must flip to a plain user turn once sent"
+        );
+
+        poll_acp_until(&mut engine, |e| !e.acp().ai_streaming);
+        assert!(
+            !engine.acp_mut().ai_streaming,
+            "the second (auto-sent) turn should also reach stopReason: end_turn"
+        );
+
+        let content = std::fs::read_to_string(&capture).unwrap_or_default();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "exactly two session/prompt calls should have reached the wire: {content}"
+        );
+        let second: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("captured line should be valid JSON");
+        assert_eq!(
+            second["params"]["prompt"][0]["text"], "second",
+            "the second wire request must carry the queued text: {second}"
+        );
+
+        let _ = std::fs::remove_file(&capture);
+    }
+
+    /// #1512 acceptance: Ctrl+R falls through to discarding a queued
+    /// message once neither attachment kind (#1450/#1464) is staged —
+    /// the third rung of the same "most-recent-first" removal chain
+    /// `ctrl_r_falls_through_to_popping_the_last_manual_attachment_when_
+    /// none_is_staged` already covers the first two rungs of.
+    ///
+    /// RED verified: with the `else if self.ai_discard_queued_message()`
+    /// arm removed from `dispatch_ai_chat_event`'s Ctrl+R match, this
+    /// fails — `queued_prompt` stays `Some`.
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_r_discards_a_queued_message_when_no_attachment_is_staged() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_TOOL_CALL_HANGS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("first".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().tool_calls.is_empty());
+        engine.ai_send_message("second".to_string());
+        assert!(engine.acp_mut().queued_prompt.is_some());
+        assert!(engine.acp_pending_attachment.is_none());
+        assert!(engine.acp_manual_attachments.is_empty());
+
+        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+            key: "Char('r')".to_string(),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                cmd: false,
+            },
+        });
+
+        assert!(kept_focus, "Ctrl+R must not drop panel focus");
+        assert!(
+            engine.acp_mut().queued_prompt.is_none(),
+            "the queued message must be discarded"
+        );
+        let discarded = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .find(|m| m.content.starts_with("second"))
+            .expect("the discarded turn should still be present in the transcript");
+        assert_eq!(
+            discarded.content, "second (discarded)",
+            "the turn should be relabelled, not removed"
+        );
+        assert!(
+            engine.message.contains("discarded"),
+            "status message should confirm the discard: {}",
+            engine.message
+        );
+    }
+
+    /// #1512 acceptance: Ctrl+G ("send now") cancels the in-flight turn
+    /// (same `"[cancelled by user]"` path Ctrl+C uses — see
+    /// `ctrl_c_during_a_streaming_turn_cancels_via_acp_cancel_turn_not_
+    /// ai_clear` below) and immediately dispatches the queued message,
+    /// rather than waiting for `AcpEvent::PromptStopped` to send it on its
+    /// own — proven by the same engine-state transition
+    /// `Engine::ai_dispatch_queued_message`'s own wire round trip is
+    /// proven by (`queued_message_auto_sends_once_the_turn_ends`, above)
+    /// applying immediately (synchronously) rather than only after a
+    /// `PromptStopped` arrives. `ACP_FAKE_TOOL_CALL_HANGS` is used here
+    /// deliberately *because* it never recovers on its own (see that
+    /// fixture branch's own doc: "simulating a turn the human cancels
+    /// mid-flight") — the whole point of "send now" is a turn the human
+    /// has given up waiting on, so this is the realistic case, not an
+    /// edge one. It also means a second `session/prompt` genuinely
+    /// reaching *this* particular agent process isn't observable (the
+    /// fixture discards every line after its hang, cancel notification
+    /// included) — that half of the contract is what
+    /// `queued_message_auto_sends_once_the_turn_ends` already proves
+    /// against a cooperative agent instead.
+    ///
+    /// RED verified: with the Ctrl+G arm removed from
+    /// `dispatch_ai_chat_event`, this fails — `queued_prompt` stays
+    /// `Some("second")` and `ai_streaming` stays `false` (the turn stays
+    /// cancelled, nothing resent).
+    #[cfg(unix)]
+    #[test]
+    fn ctrl_g_cancels_the_current_turn_and_sends_the_queued_message_now() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_TOOL_CALL_HANGS", "1")]);
+        engine.settings.acp_agent_command = "already-spawned-above".to_string();
+
+        engine.ai_send_message("first".to_string());
+        poll_acp_until(&mut engine, |e| !e.acp().tool_calls.is_empty());
+        engine.ai_send_message("second".to_string());
+        assert!(engine.acp_mut().queued_prompt.is_some());
+
+        let kept_focus = engine.dispatch_ai_chat_event(quadraui::ChatControllerEvent::KeyPressed {
+            key: "Char('g')".to_string(),
+            modifiers: quadraui::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                cmd: false,
+            },
+        });
+
+        assert!(kept_focus, "Ctrl+G must not drop panel focus");
+        assert!(
+            engine.acp_mut().queued_prompt.is_none(),
+            "the queued message must be consumed"
+        );
+        assert!(
+            engine
+                .acp_mut()
+                .ai_messages
+                .iter()
+                .any(|m| m.role == "assistant-thought" && m.content == "[cancelled by user]"),
+            "the current turn must be cancelled first: {:?}",
+            engine.acp_mut().ai_messages
+        );
+        assert_eq!(
+            engine
+                .acp_mut()
+                .tool_calls
+                .iter()
+                .find(|c| c.id == "tc-1")
+                .map(|c| c.status),
+            Some(crate::core::acp::AcpToolCallStatus::Cancelled),
+            "the cancelled turn's unfinished tool call must be marked Cancelled"
+        );
+        assert!(
+            engine.acp_mut().ai_streaming,
+            "the queued message's own turn should now be streaming — \
+             `ai_dispatch_queued_message` must have actually run, not just \
+             cleared `queued_prompt`"
+        );
+        let flipped = engine
+            .acp_mut()
+            .ai_messages
+            .iter()
+            .find(|m| m.content == "second")
+            .expect("the queued turn should still be present");
+        assert_eq!(
+            flipped.role, "user",
+            "the dimmed queued turn must flip to a plain user turn once (re)sent"
+        );
     }
 
     /// Acceptance: `ai_clear` drops a staged attachment too — composed but

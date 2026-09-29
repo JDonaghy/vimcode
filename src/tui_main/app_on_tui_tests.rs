@@ -8355,4 +8355,200 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1512: AI panel queues a message typed while the agent is busy.
+    // GTK twin: `gtk::testing::issue_1512_queue_message_while_busy`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1512_queue_message_while_busy {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// Same widening + fixture-agent shape as
+        /// `issue_1509_ai_chat_submit_on_enter_and_stop_segment::
+        /// widened_harness_with_agent` — a fresh copy per module (each
+        /// `mod issue_*` block in this file defines its own; see that
+        /// module's doc) so this scenario can pick its own `extra_env`.
+        /// `ACP_FAKE_TOOL_CALL_HANGS` keeps a turn busy indefinitely (the
+        /// same fixture behaviour `issue_1508_ai_panel_busy_status`
+        /// depends on) — deterministic, no race against a real completion.
+        fn widened_harness_with_hanging_agent() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TOOL_CALL_HANGS=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        fn ctrl_key(
+            driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+            c: char,
+        ) {
+            driver.dispatch(quadraui::UiEvent::KeyPressed {
+                key: quadraui::Key::Char(c),
+                modifiers: quadraui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                repeat: false,
+            });
+        }
+
+        /// #1512 acceptance, full flow through the real `App`/`TuiDriver`
+        /// stack: a message submitted while the agent is busy paints as a
+        /// dimmed `"(queued) ..."` transcript turn plus a `"queued (1)"`
+        /// status-strip segment (never a silent no-op — the pre-#1512
+        /// behaviour); Ctrl+R discards it (relabels it `"(discarded)"`,
+        /// drops the status segment); a message queued again and sent with
+        /// Ctrl+G ("send now") cancels the busy turn (`"[cancelled by
+        /// user]"` painted, same as Ctrl+C) and flips the queued turn to a
+        /// plain, undimmed line — all read from the *painted* screen, not
+        /// engine state.
+        ///
+        /// RED verified: reverting `ai_send_message` to the pre-#1512 `if
+        /// text.is_empty() || self.acp_mut().ai_streaming { return; }`
+        /// early return (dropping the Ctrl+R/Ctrl+G arms along with it)
+        /// makes this fail at the very first assertion — "second" never
+        /// reaches the input at all as a queued turn; the screen shows no
+        /// `"(queued)"` text and no `"queued (1)"` segment anywhere.
+        #[cfg(unix)]
+        #[test]
+        fn queue_discard_and_send_now_via_shell_app() {
+            let mut h = widened_harness_with_hanging_agent();
+            {
+                let driver = &mut h.driver;
+                driver.type_char(' ');
+                driver.type_char('a');
+                driver.type_char('i');
+                driver.render();
+            }
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel"
+            );
+
+            for c in "first".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = h.driver.screen();
+            while !screen.contains("execute: Run the tests") && Instant::now() < deadline {
+                h.driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = h.driver.screen();
+            }
+            assert!(
+                screen.contains("execute: Run the tests"),
+                "setup: the first turn must be genuinely busy on the wire \
+                 before submitting a second message; screen:\n{screen}"
+            );
+
+            // ── Queue a second message while busy ───────────────────────
+            for c in "second".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            screen = h.driver.screen();
+            assert!(
+                screen.contains("(queued) second"),
+                "a message submitted while busy must paint as a dimmed \
+                 queued turn, not vanish silently; screen:\n{screen}"
+            );
+            // Not the trailing `)`: `ChatController::render` overlays a
+            // separate busy `Spinner` icon at a fixed position at the
+            // right end of the status strip (quadraui's own doc: "2.
+            // Spinner (overlaid at the right end of the status strip)"),
+            // painted on top of whatever status text lands under it — at
+            // this harness width, that's this segment's own closing
+            // paren. A pre-existing widget behaviour, unrelated to #1512;
+            // the substring below still only matches once this segment's
+            // text is actually present.
+            assert!(
+                screen.contains("queued (1"),
+                "the status strip must show the queued count; screen:\n{screen}"
+            );
+
+            // ── Ctrl+R discards it ───────────────────────────────────────
+            ctrl_key(&mut h.driver, 'r');
+            h.driver.render();
+            screen = h.driver.screen();
+            assert!(
+                screen.contains("(queued) second (discarded)"),
+                "Ctrl+R must relabel the queued turn as discarded, not \
+                 remove it outright; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("queued (1)"),
+                "the queued-count segment must clear once nothing is \
+                 queued; screen:\n{screen}"
+            );
+
+            // ── Queue again, then Ctrl+G ("send now") ───────────────────
+            for c in "third".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            assert!(
+                h.driver.screen().contains("(queued) third"),
+                "sanity: the second queue must also paint before Ctrl+G; \
+                 screen:\n{}",
+                h.driver.screen()
+            );
+
+            ctrl_key(&mut h.driver, 'g');
+            h.driver.render();
+            screen = h.driver.screen();
+            assert!(
+                screen.contains("[cancelled by user]"),
+                "Ctrl+G must cancel the current turn first, same as Ctrl+C \
+                 while streaming; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("(queued) third"),
+                "the sent turn must no longer paint as queued/dimmed; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("third"),
+                "the message itself must still be on screen, just no \
+                 longer marked queued; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("queued (1)"),
+                "nothing should still be queued after send-now consumed it; \
+                 screen:\n{screen}"
+            );
+        }
+    }
 }
