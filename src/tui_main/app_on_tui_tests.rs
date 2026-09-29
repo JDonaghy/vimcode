@@ -7540,5 +7540,58 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+
+        /// Review finding (#1515 fix iteration 1): `off` mode's contract
+        /// is "neither the modal nor the badge/gutter nudge — only an
+        /// explicit `:AiReview` shows anything"
+        /// (`AcpReviewOnTurnEnd::Off`'s own doc). GTK twin:
+        /// `gtk::testing::issue_1515_acp_review_badge::
+        /// off_mode_paints_no_gutter_markers_via_gtk_driver`.
+        ///
+        /// RED verified against the pre-fix code (gated on `!= Auto`
+        /// instead of `== Badge`): the gutter marker glyph assertion
+        /// below failed, since `off` painted the same "▌" marker `badge`
+        /// does.
+        #[test]
+        fn off_mode_paints_no_gutter_markers_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1515_tui_off_gutter_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Off;
+            engine.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+            engine.workspace_root = Some(dir.clone());
+            engine
+                .acp_write_text_file(&a, "one\nTWO CHANGED\nthree\n")
+                .unwrap();
+            engine.acp_end_turn();
+            let buf_id = engine.buffer_manager.open_file(&a).unwrap();
+            let win_id = engine.active_window_id();
+            engine.windows.get_mut(&win_id).unwrap().buffer_id = buf_id;
+
+            let mut h = widened_ai_harness(engine);
+            h.driver.render();
+            let screen = h.driver.screen();
+
+            assert!(
+                !screen.contains("\u{258c}"),
+                "off mode must not paint the ACP-turn gutter overlay at \
+                 all; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("Edited 1 file"),
+                "off mode must not show the status-strip badge either; \
+                 screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
