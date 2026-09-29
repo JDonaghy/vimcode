@@ -20193,19 +20193,40 @@ fn markdown_turn_styled_cached(
 /// (see `AiMessage`'s own doc on this pre-existing role conflation, and
 /// `Engine::acp_cancel_turn`/`poll_acp`'s various pushes).
 ///
-/// Genuine thought chunks are always followed, later in the same
-/// conversation, by a real `"assistant"`-role reply; every notice case
-/// above is pushed as (and then stays) the transcript's *last* message
-/// once it lands — nothing about a terminal/error condition produces a
-/// further assistant reply afterward. A thought chunk still streaming in
-/// with no reply yet (the brief window between `agent_thought_chunk` and
-/// the first `agent_message_chunk`) reads as `false` here too — shown in
-/// full rather than collapsed for that one frame or two, self-correcting
-/// the moment the reply arrives. That false-negative is a far safer
-/// failure mode than the reverse: permanently hiding a cancellation/error
-/// notice behind a "Thinking..." summary.
+/// Genuine thought chunks are always followed, **within the same turn**, by
+/// a real `"assistant"`-role reply; every notice case above is pushed as
+/// (and then stays) the *last message of its turn* — nothing about a
+/// terminal/error condition produces a further assistant reply before the
+/// conversation's next user prompt. Crucially, this only scans forward
+/// *up to the next `"user"`-role message* (exclusive) rather than the rest
+/// of `ai_messages` — every real prompt turn starts with a fresh `"user"`
+/// push (see `poll_acp`'s `SessionCreated`/`RequestFailed` arms and
+/// `ai_send_message_via_acp`), so a later, unrelated turn's assistant reply
+/// can never be mistaken for this turn's own reply. Review regression
+/// (#1510): the previous "scan to the end of `ai_messages`" version let a
+/// turn cancelled/stopped/failed mid-conversation get permanently
+/// re-collapsed into "Thinking…" the moment the *next* prompt in the same
+/// session got a normal reply — `Engine::acp_cancel_turn`/`PromptStopped`
+/// (non-`end_turn`)/`RequestFailed` none tear down the session, so the
+/// conversation carries on and that later reply used to satisfy the old,
+/// unscoped "any later assistant message" check.
+///
+/// A thought chunk still streaming in with no reply yet (the brief window
+/// between `agent_thought_chunk` and the first `agent_message_chunk`) reads
+/// as `false` here too — shown in full rather than collapsed for that one
+/// frame or two, self-correcting the moment the reply arrives within the
+/// same turn. That false-negative is a far safer failure mode than the
+/// reverse: permanently hiding a cancellation/error notice behind a
+/// "Thinking..." summary.
 fn is_genuine_thought_chunk(ai_messages: &[crate::core::ai::AiMessage], idx: usize) -> bool {
-    ai_messages[idx + 1..].iter().any(|m| m.role == "assistant")
+    let turn_end = ai_messages[idx + 1..]
+        .iter()
+        .position(|m| m.role == "user")
+        .map(|offset| idx + 1 + offset)
+        .unwrap_or(ai_messages.len());
+    ai_messages[idx + 1..turn_end]
+        .iter()
+        .any(|m| m.role == "assistant")
 }
 
 /// Populate `engine.ai_chat` (a [`quadraui::ChatController`]) with the
