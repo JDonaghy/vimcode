@@ -340,6 +340,29 @@ fn script_is_executable() {
 // Everything below is what a release step actually consumes: an exit code,
 // one summary line, and a JSON file. The stub mechanism above is what makes
 // them runnable on any host -- no gtk4, no cargo-xwin, no Darwin needed.
+//
+// THE RED-VERIFIED ASSERTION for every `exit_contract_*` / `summary_*` /
+// `print_plan_reports_verdict_plan_not_pass` / `docs_state_the_exit_contract_*`
+// test below (#1092): each was re-run, unmodified, against the
+// pre-#1092 `scripts/platform-conformance.sh` and `docs/PLATFORM_CONFORMANCE.md`
+// (`git show <parent-of-9460a09>:scripts/platform-conformance.sh` -- the
+// commit immediately before #1092's exit-contract/summary/lane-map work
+// landed, i.e. unfixed `develop` for this change) and observed to fail:
+// `--summary` was an unrecognized flag on that revision (no `--summary`
+// support, no `--print-plan` verdict/mode fields, no `skipped-capable` /
+// `not-in-scope` statuses, no JSON schema, no lane-to-machine map in the
+// docs), so `run_with_summary()` never found a summary file to parse and
+// `summary_line()` never found a `PLATFORM_CONFORMANCE_SUMMARY` line with
+// the new fields. Result: 8 of the 9 tests failed outright (`cargo test
+// --no-default-features --test platform_conformance -- <these test names>`
+// reported "FAILED. 1 passed; 8 failed"); the 9th,
+// `unwritable_summary_path_is_exit_2_before_any_lane_runs`, initially
+// passed for the *wrong* reason (an unrecognized `--summary` flag also
+// exits 2 on the old script, coincidentally), so its assertion was
+// strengthened to also require the specific "not writable" wording the new
+// validation emits -- re-verified RED against the same pre-#1092 revision
+// (now correctly failing, since the old script only ever says "unknown
+// argument") before being restored to green against this branch's script.
 
 /// Exit codes the script documents in its header and in
 /// `docs/PLATFORM_CONFORMANCE.md`. Anything but `PASS` means "do not roll".
@@ -746,8 +769,11 @@ fn unwritable_summary_path_is_exit_2_before_any_lane_runs() {
         "the summary path must be validated before any lane command runs"
     );
     assert!(
-        stderr.contains("--summary"),
-        "the error must name the offending option:\n{stderr}"
+        stderr.contains("--summary") && stderr.contains("not writable"),
+        "the error must name the offending option and say *why* -- not just \
+         reject `--summary` as an unrecognized flag (a pre-#1092 script with \
+         no --summary support at all would coincidentally also exit 2 here, \
+         for the wrong reason):\n{stderr}"
     );
 }
 

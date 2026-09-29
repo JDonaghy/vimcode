@@ -466,6 +466,15 @@ run_lane() {
     LANE_AUTO[$idx]=$([ "$auto" -eq 1 ] && echo true || echo false)
     LANE_TIER[$idx]="$tier"
 
+    # Compute (and record) the command up front, before any of the
+    # early-return branches below -- `skipped-capable` and `error` still
+    # answer "what would I need to run to close this gap", not just
+    # `passed`/`failed`/`check-only`. Cheap: this only formats a string, it
+    # never executes anything.
+    local cmd
+    cmd="$(command_for "$lane" "$tier")"
+    LANE_CMD[$idx]="$cmd"
+
     if [ "$capable" -ne 1 ]; then
         if [ "$forced" -eq 1 ]; then
             record "$idx" "error" "forced but unsupported: $reason"
@@ -486,10 +495,6 @@ run_lane() {
         COVERAGE_GAP=1
         return
     fi
-
-    local cmd
-    cmd="$(command_for "$lane" "$tier")"
-    LANE_CMD[$idx]="$cmd"
 
     if [ "$PRINT_PLAN" -eq 1 ]; then
         if [ "$tier" = "checkonly" ]; then
