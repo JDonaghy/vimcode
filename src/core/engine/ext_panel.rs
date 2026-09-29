@@ -3277,6 +3277,15 @@ impl Engine {
         // still discards the surface itself (same "closing the session
         // ends it" reasoning as everything else in this block).
         self.acp_mut().tool_calls.clear();
+        // #1511: the tool-call/thought expand state and the anchor/kind
+        // maps `populate_ai_chat_controller` builds them from are all
+        // session-scoped too, same reasoning as `tool_calls` just above —
+        // otherwise a fresh conversation's tool calls could reuse an id or
+        // index a previous one left expanded.
+        self.acp_mut().tool_call_anchor.clear();
+        self.acp_mut().tool_call_expanded.clear();
+        self.acp_mut().thought_expanded.clear();
+        self.acp_mut().transcript_turn_kinds.get_mut().clear();
         self.change_review = None;
         // #1460: the per-turn tracking + checkpoint history are session-
         // scoped too, same reasoning as `acp_tool_calls`/`change_review`
@@ -3670,7 +3679,147 @@ impl Engine {
                 }
                 true
             }
+            // #1511: a click landed on transcript turn `turn_idx`, row
+            // `row_in_turn` into it (`quadraui::ChatController`'s own doc:
+            // row 0 is always the role-header row). See
+            // `Self::ai_chat_turn_clicked` for what each turn kind does
+            // with it — a tool-call card's header toggles it, a click
+            // inside its expanded body jumps to its first location, a
+            // thought card toggles on any row (it's a single summary row
+            // while collapsed).
+            Ev::TurnClicked {
+                turn_idx,
+                row_in_turn,
+            } => {
+                self.ai_chat_turn_clicked(turn_idx, row_in_turn);
+                true
+            }
             _ => true,
+        }
+    }
+
+    /// Apply a [`quadraui::ChatControllerEvent::TurnClicked`] (#1511): a
+    /// click or the equivalent focused-turn `Enter` (see
+    /// `render::route_ai_chat_event`'s Enter intercept, which resolves the
+    /// same way this does before calling this method) landed on transcript
+    /// turn `turn_idx`. Resolves `turn_idx` back to what it actually is via
+    /// `AcpSession::transcript_turn_kinds` — populated fresh every frame by
+    /// `render::populate_ai_chat_controller`, which always runs before this
+    /// can be reached (see that field's own doc) — and toggles/acts on it:
+    ///
+    /// - A genuine thought turn ([`crate::render::is_genuine_thought_chunk`])
+    ///   toggles regardless of `row_in_turn` — a collapsed thought card is
+    ///   already exactly one summary row, so there's no header/body
+    ///   distinction to make.
+    /// - A tool-call card toggles on `row_in_turn <= 1` — row 0 is
+    ///   `ChatController`'s own role-header row ("System"/"System ▸"), row 1
+    ///   is the card's own title line (`tool_call_title_line`/
+    ///   `tool_call_summary_line`'s first line), present at that same row
+    ///   position whether the card is collapsed (it's the whole body) or
+    ///   expanded (it's the body's first line) — so this is "click the
+    ///   card's header", collapsed or not. Any higher `row_in_turn` (only
+    ///   reachable once expanded, since a collapsed card is exactly rows 0
+    ///   and 1) instead jumps to the call's first location, if it has one
+    ///   (`Self::ai_open_tool_call_location`) — per-line resolution (mapping
+    ///   a *specific* higher `row_in_turn` to a *specific* `-> path:line`)
+    ///   isn't attempted: the card's word-wrapped body means a given
+    ///   `row_in_turn` doesn't map losslessly back to a specific source line
+    ///   the way it would for unwrapped text, so "first location" is the
+    ///   honest, unsurprising behaviour rather than a heuristic that's right
+    ///   most of the time and silently wrong the rest.
+    /// - An ordinary message turn or the trailing plan checklist has no
+    ///   collapse state at all — ignored.
+    pub fn ai_chat_turn_clicked(&mut self, turn_idx: usize, row_in_turn: usize) {
+        use crate::core::acp_session::TranscriptTurnKind;
+        let Some(kind) = self
+            .acp()
+            .transcript_turn_kinds
+            .borrow()
+            .get(turn_idx)
+            .cloned()
+        else {
+            return;
+        };
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                if crate::render::is_genuine_thought_chunk(&self.acp().ai_messages, idx) {
+                    self.ai_chat_toggle_turn(turn_idx);
+                }
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                if row_in_turn <= 1 {
+                    self.ai_chat_toggle_turn(turn_idx);
+                } else if let Some(loc) = self
+                    .acp()
+                    .tool_calls
+                    .iter()
+                    .find(|c| c.id == id)
+                    .and_then(|c| c.locations.first().cloned())
+                {
+                    self.ai_open_tool_call_location(&loc.0, loc.1);
+                }
+            }
+            TranscriptTurnKind::Plan => {}
+        }
+    }
+
+    /// Flip `turn_idx`'s persistent expand state (#1511) — the shared
+    /// bottom half of [`Self::ai_chat_turn_clicked`] and
+    /// `render::route_ai_chat_event`'s focused-turn `Enter` intercept.
+    /// Resolves `turn_idx` via `AcpSession::transcript_turn_kinds` (same as
+    /// its caller) and writes to `AcpSession::thought_expanded`/
+    /// `tool_call_expanded` — **not** `quadraui::ChatController`'s own
+    /// internal collapsed-turn map, which `populate_ai_chat_controller`
+    /// treats as a pure render target and overwrites from these two maps
+    /// every frame (see that function's doc on why the vimcode-side maps,
+    /// not quadraui's, are the source of truth).
+    pub(crate) fn ai_chat_toggle_turn(&mut self, turn_idx: usize) {
+        use crate::core::acp_session::TranscriptTurnKind;
+        let Some(kind) = self
+            .acp()
+            .transcript_turn_kinds
+            .borrow()
+            .get(turn_idx)
+            .cloned()
+        else {
+            return;
+        };
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                if !self.acp_mut().thought_expanded.remove(&idx) {
+                    self.acp_mut().thought_expanded.insert(idx);
+                }
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                if !self.acp_mut().tool_call_expanded.remove(&id) {
+                    self.acp_mut().tool_call_expanded.insert(id);
+                }
+            }
+            TranscriptTurnKind::Plan => {}
+        }
+    }
+
+    /// Open `path` (resolved against the ACP workspace root if relative) and
+    /// jump the active window's cursor to `line` (#1511, "jump to a
+    /// location" — a `tool_call`'s `locations` line is 1-based per the ACP
+    /// v1 schema, [`crate::core::acp::AcpToolCallInfo`]'s own doc; internal
+    /// cursor positions are 0-indexed, same conversion
+    /// `Engine::open_search_result` already does for project-search
+    /// results). `line: None` just opens the file without moving the
+    /// cursor.
+    pub(crate) fn ai_open_tool_call_location(&mut self, path: &str, line: Option<u32>) {
+        let p = std::path::Path::new(path);
+        let p = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.acp_workspace_cwd().join(p)
+        };
+        self.open_file_in_tab(&p);
+        if let Some(line) = line {
+            let wid = self.active_window_id();
+            let line0 = (line as usize).saturating_sub(1);
+            self.set_cursor_for_window(wid, line0, 0);
+            self.ensure_cursor_visible();
         }
     }
 

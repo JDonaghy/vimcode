@@ -39,7 +39,7 @@
 //! this module's fields used to receive only in the single-session shape.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::acp::{
     AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpMcpCapabilities,
@@ -52,6 +52,23 @@ use super::ai::AiMessage;
 /// rendered [`quadraui::StyledText`], and its per-line heading scales. See
 /// [`AcpSession::markdown_turn_cache`]'s doc.
 pub type MarkdownTurnCacheEntry = (usize, quadraui::StyledText, Vec<f32>);
+
+/// What one `ChatController` transcript turn index actually is (#1511) —
+/// rebuilt fresh by `render::populate_ai_chat_controller` every frame into
+/// [`AcpSession::transcript_turn_kinds`] and read back by
+/// `Engine::dispatch_ai_chat_event`'s `TurnClicked` arm so a click/`Enter`
+/// on a turn knows what to toggle (a tool-call card, a thought card) versus
+/// what to leave alone (an ordinary message turn, the trailing plan
+/// checklist).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptTurnKind {
+    /// An ordinary `ai_messages[idx]` turn (user/assistant/thought-notice).
+    Message(usize),
+    /// A tool-call card, keyed by [`AcpToolCall::id`].
+    ToolCall(String),
+    /// The trailing plan-checklist turn (`AcpSession::plan`).
+    Plan,
+}
 
 /// One ACP conversation: its own agent process (or none yet), its own
 /// `session/new` id, its own transcript, its own in-flight protocol state.
@@ -137,6 +154,48 @@ pub struct AcpSession {
     /// cleared session's fresh messages never collide with stale entries
     /// left over at the same indices from the previous conversation.
     pub markdown_turn_cache: RefCell<HashMap<usize, MarkdownTurnCacheEntry>>,
+
+    /// First-appearance anchor for each tool call (#1511): `ai_messages
+    /// .len()` at the moment [`crate::core::engine::Engine::
+    /// acp_upsert_tool_call`] first saw this id — i.e. "insert this card's
+    /// transcript turn right after message index `anchor - 1`" (`anchor ==
+    /// 0` means before the very first message). Recorded once per id and
+    /// never touched by a later `tool_call_update` (an update patches an
+    /// existing call in place; it never changes *when* the call happened).
+    /// `render::populate_ai_chat_controller` reads this to interleave
+    /// tool-call cards chronologically instead of appending every call
+    /// after the whole conversation, which is the behaviour the issue this
+    /// was added for (#1511) exists to fix.
+    pub tool_call_anchor: HashMap<String, usize>,
+
+    /// Tool-call cards the user has expanded (#1511) — every card starts
+    /// collapsed; presence here means the user clicked/`Tab`+`Enter`-ed it
+    /// open. Keyed by `AcpToolCall::id`, not a transcript index, since the
+    /// chronological interleave (`tool_call_anchor` above) means a card's
+    /// transcript index can shift frame to frame as earlier tool calls are
+    /// upserted or messages stream in ahead of it.
+    pub tool_call_expanded: HashSet<String>,
+
+    /// Genuine thought turns (`AcpChunkKind::Thought`, see
+    /// `render::is_genuine_thought_chunk`) the user has expanded (#1511,
+    /// extending #1510's always-forced collapse). Every genuine thought
+    /// turn starts collapsed as a one-line "Thinking…" card; presence here
+    /// means the user opened it. Keyed by `ai_messages` index, the same key
+    /// `markdown_turn_cache` uses — stable because a thought turn's index
+    /// never moves once appended (only later messages append after it).
+    pub thought_expanded: HashSet<usize>,
+
+    /// Which `ChatController` transcript turn index is which, rebuilt fresh
+    /// by `render::populate_ai_chat_controller` every frame (#1511) —
+    /// read back by `Engine::dispatch_ai_chat_event`'s `TurnClicked` arm to
+    /// resolve a click/`Enter` on a turn to "toggle this tool-call card" /
+    /// "toggle this thought card" / "ordinary message turn, ignore".
+    /// Meaningless before the first populate call of a frame, but
+    /// `render::route_ai_chat_event` and both backends' `PANEL_AI` render
+    /// arms always populate before `ChatController::handle` can produce a
+    /// `TurnClicked`, so it is always fresh by the time a click is
+    /// dispatched.
+    pub transcript_turn_kinds: RefCell<Vec<TranscriptTurnKind>>,
 }
 
 impl AcpSession {

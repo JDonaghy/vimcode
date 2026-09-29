@@ -1752,6 +1752,16 @@ pub struct AcpToolCall {
     pub status: AcpToolCallStatus,
     pub locations: Vec<(String, Option<u32>)>,
     pub content: Vec<AcpToolCallContentBlock>,
+    /// The raw `rawInput` value the agent sent with the tool call, if any
+    /// (#1511) — the arguments the tool was invoked with, verbatim, shown
+    /// pretty-printed in the card's expanded view
+    /// ([`tool_call_expanded_text`]). `None` when the agent didn't send one
+    /// (the field is optional on the wire).
+    pub raw_input: Option<serde_json::Value>,
+    /// The raw `rawOutput` value, if any (#1511) — usually arrives later,
+    /// on a `tool_call_update` once the tool finishes. Same "shown
+    /// pretty-printed when expanded" treatment as `raw_input`.
+    pub raw_output: Option<serde_json::Value>,
 }
 
 /// Parse a `session/update`'s `tool_call` variant — the tool call's
@@ -1779,6 +1789,8 @@ pub fn parse_tool_call(update: &serde_json::Value) -> Option<AcpToolCall> {
         status,
         locations: parse_tool_call_locations(update),
         content: parse_tool_call_content(update),
+        raw_input: update.get("rawInput").cloned(),
+        raw_output: update.get("rawOutput").cloned(),
     })
 }
 
@@ -1796,6 +1808,14 @@ pub struct AcpToolCallUpdate {
     pub status: Option<AcpToolCallStatus>,
     pub content: Option<Vec<AcpToolCallContentBlock>>,
     pub locations: Option<Vec<(String, Option<u32>)>>,
+    /// Present when the wire message carried a `rawInput` field (#1511) —
+    /// same "present replaces, absent leaves untouched" contract as
+    /// `content`/`locations`.
+    pub raw_input: Option<serde_json::Value>,
+    /// Present when the wire message carried a `rawOutput` field (#1511) —
+    /// this is normally how a call's output actually arrives, since the
+    /// initial `tool_call` fires before the tool has run.
+    pub raw_output: Option<serde_json::Value>,
 }
 
 /// Parse a `session/update`'s `tool_call_update` variant. Returns `None`
@@ -1823,21 +1843,40 @@ pub fn parse_tool_call_update(update: &serde_json::Value) -> Option<AcpToolCallU
         id,
         status,
         content,
+        raw_input: update.get("rawInput").cloned(),
+        raw_output: update.get("rawOutput").cloned(),
         locations,
     })
 }
 
+/// The one-line `{glyph} {kind}: {title}` header every rendering of an
+/// [`AcpToolCall`] starts with (#1511) — no locations, no content, just the
+/// status/kind/title triple. Split out of [`tool_call_summary_line`] so it
+/// can also serve as [`quadraui::ChatController::turn_summary_line`]'s
+/// override for a *collapsed* card (`▸ [x] edit: Edit src/foo.rs`):
+/// `turn_summary_line` renders as a single `MessageRow`, so a multi-line
+/// string (locations included) would show an embedded `\n` verbatim
+/// instead of wrapping.
+pub fn tool_call_title_line(call: &AcpToolCall) -> String {
+    format!("{} {}: {}", call.status.glyph(), call.kind, call.title)
+}
+
 /// Render one [`AcpToolCall`] as its collapsed transcript summary line —
-/// `title` + `kind` per the issue's acceptance bar, prefixed by
-/// [`AcpToolCallStatus::glyph`] so `pending -> in_progress -> completed |
-/// failed` transitions are visible without expanding anything, plus one
-/// indented `-> path[:line]` line per location. Content blocks
-/// (`Text`/`Terminal`) are never inlined here — "collapsed by default" —
-/// a `Diff` block instead opens the change-review surface
-/// (`crate::core::engine::review_ops::acp_open_review_for_new_diffs`)
+/// [`tool_call_title_line`] prefixed by [`AcpToolCallStatus::glyph`] so
+/// `pending -> in_progress -> completed | failed` transitions are visible
+/// without expanding anything, plus one indented `-> path[:line]` line per
+/// location. Content blocks (`Text`/`Terminal`) are never inlined here —
+/// "collapsed by default" — a `Diff` block instead opens the change-review
+/// surface (`crate::core::engine::review_ops::acp_open_review_for_new_diffs`)
 /// rather than dumping a patch into the chat log.
+///
+/// Used by the request-permission dialog body and by tests written before
+/// #1511 gave cards their own expand/collapse; the live transcript card
+/// itself uses [`tool_call_title_line`] (collapsed) /
+/// [`tool_call_expanded_text`] (expanded) instead — see
+/// `render::populate_ai_chat_controller`.
 pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
-    let mut line = format!("{} {}: {}", call.status.glyph(), call.kind, call.title);
+    let mut line = tool_call_title_line(call);
     for (path, ln) in &call.locations {
         match ln {
             Some(l) => line.push_str(&format!("\n    \u{2192} {path}:{l}")),
@@ -1845,6 +1884,65 @@ pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
         }
     }
     line
+}
+
+/// Render one [`AcpToolCall`] as its **expanded** card body (#1511's
+/// acceptance bar: "expanded ▾ shows rawInput/rawOutput/text content in a
+/// fenced block; diff content summarised as `+12 -3 src/foo.rs`") —
+/// [`tool_call_summary_line`]'s title+locations header, followed by every
+/// content block in full:
+///
+/// - [`AcpToolCallContentBlock::Text`] — a fenced block, verbatim.
+/// - [`AcpToolCallContentBlock::Diff`] — summarised as `+A -R path` (added/
+///   removed line counts via [`crate::core::acp_turn::count_changed_lines`],
+///   the same helper the turn-review badge uses) rather than the full
+///   patch — the diff itself already opened the change-review surface when
+///   this call streamed in (see [`tool_call_summary_line`]'s doc), so
+///   repeating it here would just be noise.
+/// - [`AcpToolCallContentBlock::Terminal`] — a one-line placeholder;
+///   terminal content is out of scope for the whole ACP track (this
+///   module's top doc).
+///
+/// then `rawInput`/`rawOutput`, each pretty-printed into its own fenced
+/// `json` block when the agent sent one.
+pub fn tool_call_expanded_text(call: &AcpToolCall) -> String {
+    let mut out = tool_call_summary_line(call);
+    for block in &call.content {
+        out.push_str("\n\n");
+        match block {
+            AcpToolCallContentBlock::Text(text) => {
+                out.push_str("```\n");
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("```");
+            }
+            AcpToolCallContentBlock::Diff {
+                path,
+                old_text,
+                new_text,
+            } => {
+                let (added, removed) =
+                    crate::core::acp_turn::count_changed_lines(old_text.as_deref(), new_text);
+                out.push_str(&format!("+{added} -{removed} {path}"));
+            }
+            AcpToolCallContentBlock::Terminal => {
+                out.push_str("(terminal output omitted)");
+            }
+        }
+    }
+    if let Some(input) = &call.raw_input {
+        out.push_str("\n\nInput:\n```json\n");
+        out.push_str(&serde_json::to_string_pretty(input).unwrap_or_default());
+        out.push_str("\n```");
+    }
+    if let Some(output) = &call.raw_output {
+        out.push_str("\n\nOutput:\n```json\n");
+        out.push_str(&serde_json::to_string_pretty(output).unwrap_or_default());
+        out.push_str("\n```");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3246,6 +3344,8 @@ mod tests {
             status: AcpToolCallStatus::InProgress,
             locations: vec![("src/main.rs".to_string(), Some(10))],
             content: vec![],
+            raw_input: None,
+            raw_output: None,
         };
         let line = tool_call_summary_line(&call);
         assert_eq!(

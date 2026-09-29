@@ -182,6 +182,12 @@ impl Engine {
                     // #955 (ACP-4): session-scoped, same as the rest above
                     // — see `Engine::ai_clear`'s matching reset.
                     self.acp_mut().tool_calls.clear();
+                    // #1511: session-scoped, same reasoning as `tool_calls`
+                    // just above.
+                    self.acp_mut().tool_call_anchor.clear();
+                    self.acp_mut().tool_call_expanded.clear();
+                    self.acp_mut().thought_expanded.clear();
+                    self.acp_mut().transcript_turn_kinds.get_mut().clear();
                     self.change_review = None;
                     // #1460: deliberately NOT cleared here, unlike
                     // `acp_tool_calls`/`change_review` above — a dead agent
@@ -998,6 +1004,12 @@ impl Engine {
         self.acp_mut().current_mode_id = None;
         self.acp_mut().usage = None;
         self.acp_mut().tool_calls.clear();
+        // #1511: same reasoning as `Engine::ai_clear` — see that function's
+        // comment on the same three lines.
+        self.acp_mut().tool_call_anchor.clear();
+        self.acp_mut().tool_call_expanded.clear();
+        self.acp_mut().thought_expanded.clear();
+        self.acp_mut().transcript_turn_kinds.get_mut().clear();
         self.change_review = None;
         self.ai_chat.borrow_mut().set_transcript_scroll_top(0);
     }
@@ -1893,7 +1905,19 @@ impl Engine {
             .find(|t| t.id == call.id)
         {
             Some(existing) => *existing = call,
-            None => self.acp_mut().tool_calls.push(call),
+            None => {
+                // #1511: stamp this call's chronological anchor — the
+                // number of `ai_messages` accumulated so far — the first
+                // (and only the first) time this id is ever seen. See
+                // `AcpSession::tool_call_anchor`'s doc for why this must
+                // not move on a later re-announcement of the same id.
+                let anchor = self.acp_mut().ai_messages.len();
+                self.acp_mut()
+                    .tool_call_anchor
+                    .entry(call.id.clone())
+                    .or_insert(anchor);
+                self.acp_mut().tool_calls.push(call);
+            }
         }
     }
 
@@ -1927,6 +1951,15 @@ impl Engine {
         }
         if let Some(locations) = update.locations {
             call.locations = locations;
+        }
+        // #1511: same "present replaces" contract as content/locations
+        // above — most agents don't know `rawOutput` until the tool
+        // finishes, so this is the normal way it arrives.
+        if let Some(raw_input) = update.raw_input {
+            call.raw_input = Some(raw_input);
+        }
+        if let Some(raw_output) = update.raw_output {
+            call.raw_output = Some(raw_output);
         }
     }
 
@@ -4138,6 +4171,8 @@ mod tests {
             status: AcpToolCallStatus::InProgress,
             locations: vec![("src/first.rs".to_string(), Some(1))],
             content: vec![AcpToolCallContentBlock::Text("first content".to_string())],
+            raw_input: None,
+            raw_output: None,
         });
 
         engine.acp_apply_tool_call_update(AcpToolCallUpdate {
@@ -4147,6 +4182,8 @@ mod tests {
                 "second content".to_string(),
             )]),
             locations: Some(vec![("src/second.rs".to_string(), Some(2))]),
+            raw_input: None,
+            raw_output: None,
         });
 
         let call = engine

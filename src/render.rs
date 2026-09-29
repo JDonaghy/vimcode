@@ -8919,6 +8919,34 @@ pub fn route_ai_chat_event(
     }
     populate_ai_chat_controller(engine, theme, backend);
 
+    // #1511: plain `Enter` while a transcript turn (not the input) has
+    // keyboard focus is the "keyboard toggle without a mouse" the issue
+    // asks for — `quadraui::ChatController::handle` already implements
+    // exactly this gesture (see its module doc's Enter arm), but it acts on
+    // its own *internal* `turn_collapsed` map, which `populate_ai_chat_
+    // controller` overwrites from `AcpSession::thought_expanded`/
+    // `tool_call_expanded` every frame (that function's doc explains why
+    // those two, not `ChatController`'s own map, are the source of truth).
+    // Left alone, an internal-only toggle would be invisible: the very next
+    // frame's populate call stomps it straight back to whatever the
+    // vimcode-side maps say. Intercepted here, ahead of `ChatController::
+    // handle`, with the identical guard `ChatController` itself uses, so
+    // `Engine::ai_chat_toggle_turn` flips the persistent state instead.
+    if let quadraui::UiEvent::KeyPressed { key, modifiers, .. } = event {
+        if matches!(key, quadraui::Key::Named(quadraui::NamedKey::Enter)) && !modifiers.ctrl {
+            let focused = {
+                let chat = engine.ai_chat.borrow();
+                (!chat.input_has_focus())
+                    .then(|| chat.focused_turn())
+                    .flatten()
+            };
+            if let Some(turn_idx) = focused {
+                engine.ai_chat_toggle_turn(turn_idx);
+                return engine.ai_has_focus;
+            }
+        }
+    }
+
     // #1507: the `<leader>ai` focus-toggle gesture (see
     // `Engine::ai_leader_toggle_key`'s doc for why this has to be
     // intercepted here, ahead of the ordinary `ChatController::handle`
@@ -20218,7 +20246,10 @@ fn markdown_turn_styled_cached(
 /// same turn. That false-negative is a far safer failure mode than the
 /// reverse: permanently hiding a cancellation/error notice behind a
 /// "Thinking..." summary.
-fn is_genuine_thought_chunk(ai_messages: &[crate::core::ai::AiMessage], idx: usize) -> bool {
+pub(crate) fn is_genuine_thought_chunk(
+    ai_messages: &[crate::core::ai::AiMessage],
+    idx: usize,
+) -> bool {
     let turn_end = ai_messages[idx + 1..]
         .iter()
         .position(|m| m.role == "user")
@@ -20267,12 +20298,85 @@ pub fn populate_ai_chat_controller(
     // (see the comment above), and thought turns additionally collapse to a
     // one-line summary below.
     let q_theme = to_quadraui_theme(theme);
-    let mut turns: Vec<quadraui::ChatTurn> = engine
-        .acp()
-        .ai_messages
-        .iter()
-        .enumerate()
-        .map(|(idx, m)| match m.role.as_str() {
+    let acp = engine.acp();
+    let ai_messages = &acp.ai_messages;
+
+    // #1511: tool calls interleave chronologically instead of all landing
+    // after the whole conversation (the pre-#1511 behaviour, and this
+    // issue's core complaint — see `AcpSession::tool_call_anchor`'s doc).
+    // Bucket every call by its recorded anchor once, up front, so the
+    // per-index interleave loop below is a plain lookup rather than an
+    // O(messages × tool_calls) scan. `anchor` ranges `0..=ai_messages.len()`
+    // by construction (`Engine::acp_upsert_tool_call` stamps it from
+    // `ai_messages.len()` at the moment the call first appeared), so a
+    // `Vec` indexed directly by anchor needs no `HashMap` at all.
+    let mut tool_calls_by_anchor: Vec<Vec<&crate::core::acp::AcpToolCall>> =
+        vec![Vec::new(); ai_messages.len() + 1];
+    for call in &acp.tool_calls {
+        let anchor = acp
+            .tool_call_anchor
+            .get(&call.id)
+            .copied()
+            .unwrap_or(ai_messages.len())
+            .min(ai_messages.len());
+        tool_calls_by_anchor[anchor].push(call);
+    }
+
+    let mut turns: Vec<quadraui::ChatTurn> = Vec::new();
+    let mut kinds: Vec<crate::core::acp_session::TranscriptTurnKind> = Vec::new();
+
+    // #955 (ACP-4) / #1511: one card per tool call — collapsed by default
+    // (`turn_summary_line` below is `tool_call_title_line`'s single-line
+    // `{glyph} {kind}: {title}`), expanded on demand into the full body
+    // `tool_call_expanded_text` builds (locations, content blocks,
+    // rawInput/rawOutput). `set_turn_collapsed`/`set_turn_summary` calls
+    // for these land after `set_transcript` below, once `kinds` (built
+    // here) is known to line up with the transcript it describes.
+    let push_tool_calls_at =
+        |anchor: usize,
+         turns: &mut Vec<quadraui::ChatTurn>,
+         kinds: &mut Vec<crate::core::acp_session::TranscriptTurnKind>| {
+            for call in &tool_calls_by_anchor[anchor] {
+                let expanded = acp.tool_call_expanded.contains(&call.id);
+                // Deliberately plain (`StyledText::colored`), never markdown
+                // — unlike assistant/thought turns (#1510). Routing this
+                // through `render_markdown_to_styled` would flip the whole
+                // card onto quadraui's char-wrapped `WrapPolicy::Char` path
+                // the moment *any* line in it carries styling (the fenced
+                // ```json``` blocks always do), which would mid-word-break
+                // the plain `-> path:line` header/location lines too —
+                // exactly the "Hello world ANSWE"/"RED1519" failure mode
+                // `markdown_turn_styled_cached`'s own doc warns about,
+                // just triggered by this card's own content instead of an
+                // unrelated later message. Plain text keeps the whole card
+                // on the word-wrapped flat path, same as before #1511.
+                let text = if expanded {
+                    quadraui::StyledText::colored(
+                        crate::core::acp::tool_call_expanded_text(call),
+                        thought_fg,
+                    )
+                } else {
+                    // Collapsed cards render through `turn_summary_line`
+                    // instead (a single `MessageRow`, set below) — this
+                    // `ChatTurn::text` value is never painted while
+                    // collapsed, so an empty placeholder is fine here.
+                    quadraui::StyledText::plain("")
+                };
+                turns.push(quadraui::ChatTurn {
+                    role: quadraui::ChatRole::System,
+                    text,
+                    timestamp_unix: None,
+                    line_scales: Vec::new(),
+                });
+                kinds.push(crate::core::acp_session::TranscriptTurnKind::ToolCall(
+                    call.id.clone(),
+                ));
+            }
+        };
+
+    for (idx, m) in ai_messages.iter().enumerate() {
+        push_tool_calls_at(idx, &mut turns, &mut kinds);
+        let chat_turn = match m.role.as_str() {
             "user" => quadraui::ChatTurn {
                 role: quadraui::ChatRole::User,
                 text: quadraui::StyledText::colored(m.content.clone(), user_fg),
@@ -20281,7 +20385,7 @@ pub fn populate_ai_chat_controller(
             },
             "assistant-thought" => {
                 let (text, line_scales) = markdown_turn_styled_cached(
-                    &engine.acp().markdown_turn_cache,
+                    &acp.markdown_turn_cache,
                     idx,
                     &m.content,
                     &q_theme,
@@ -20295,7 +20399,7 @@ pub fn populate_ai_chat_controller(
             }
             _ => {
                 let (text, line_scales) = markdown_turn_styled_cached(
-                    &engine.acp().markdown_turn_cache,
+                    &acp.markdown_turn_cache,
                     idx,
                     &m.content,
                     &q_theme,
@@ -20307,28 +20411,15 @@ pub fn populate_ai_chat_controller(
                     line_scales,
                 }
             }
-        })
-        .collect();
-
-    // #955 (ACP-4): tool calls, rendered as one collapsed one-line summary
-    // turn per call, appended *after* the real conversation — same
-    // "synthetic turn, never mixed into `ai_messages`" treatment #956 gave
-    // the plan checklist below. `tool_call_summary_line` already bakes in
-    // the status glyph, so a `tool_call_update`'s `pending -> in_progress
-    // -> completed | failed` transition is visible here without any
-    // expand/collapse state to track — every call always renders its
-    // current status, every frame.
-    for call in &engine.acp().tool_calls {
-        turns.push(quadraui::ChatTurn {
-            role: quadraui::ChatRole::System,
-            text: quadraui::StyledText::colored(
-                crate::core::acp::tool_call_summary_line(call),
-                thought_fg,
-            ),
-            timestamp_unix: None,
-            line_scales: Vec::new(),
-        });
+        };
+        turns.push(chat_turn);
+        kinds.push(crate::core::acp_session::TranscriptTurnKind::Message(idx));
     }
+    // Trailing tool calls anchored at `ai_messages.len()` — issued after the
+    // most recent message currently in the transcript (the common case
+    // while a turn is still streaming: message chunks lag the tool calls
+    // that triggered them).
+    push_tool_calls_at(ai_messages.len(), &mut turns, &mut kinds);
 
     // #956 (ACP-5): the agent's current plan, rendered as one synthetic
     // checklist turn appended *after* the real conversation — never mixed
@@ -20342,60 +20433,82 @@ pub fn populate_ai_chat_controller(
     // visible without scrolling (`ChatController` stays stuck-to-bottom),
     // at the deliberate cost of it not being in strict chronological order
     // with any later message chunks in the same turn.
-    if !engine.acp().plan.is_empty() {
+    if !acp.plan.is_empty() {
         turns.push(quadraui::ChatTurn {
             role: quadraui::ChatRole::System,
             text: quadraui::StyledText::colored(
-                crate::core::acp::plan_to_checklist_text(&engine.acp().plan),
+                crate::core::acp::plan_to_checklist_text(&acp.plan),
                 thought_fg,
             ),
             timestamp_unix: None,
             line_scales: Vec::new(),
         });
+        kinds.push(crate::core::acp_session::TranscriptTurnKind::Plan);
     }
 
-    let turns_len = turns.len();
+    *acp.transcript_turn_kinds.borrow_mut() = kinds;
+
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
-    // #1510: thought turns collapse to a one-line "Thinking..." summary by
-    // default — full expansion is out of scope here (arrives with the
-    // tool-card issue). Forced every frame (after `set_transcript` above,
-    // so `set_turn_collapsed`'s range check sees the current transcript)
-    // rather than left to `ChatController`'s own Tab+Enter collapse toggle:
-    // a user who somehow toggled one open would see it snap back shut on
-    // the very next frame, matching "thought turns are collapsed", full
-    // stop, for now.
+    // #1510/#1511: thought turns and tool-call cards each collapse to a
+    // one-line summary by default; a user click/`Tab`+`Enter` toggle
+    // (`Engine::dispatch_ai_chat_event`'s `TurnClicked`/`KeyPressed` arms)
+    // records the override in `AcpSession::thought_expanded`/
+    // `tool_call_expanded`, keyed by `ai_messages` index / tool-call id
+    // respectively rather than transcript index — the interleave above
+    // means a card's transcript index can move frame to frame as earlier
+    // tool calls upsert or new messages stream in ahead of it, but its
+    // `ai_messages` index / call id never does.
     //
-    // Gated on `is_genuine_thought_chunk`, not just `role ==
-    // "assistant-thought"`: that role string is pre-existing shorthand
-    // ACP-1 reused for two different things (see `AiMessage`'s own doc) —
-    // real `agent_thought_chunk` reasoning, *and* one-shot system/error
-    // notices (`Engine::acp_cancel_turn`'s `"[cancelled by user]"`,
-    // `poll_acp`'s failed-request/protocol-mismatch warnings, ...).
-    // Collapsing those into "Thinking..." would hide the one thing the
-    // user most needs to see right after the turn ended abnormally.
-    //
-    // Every index in the *current* transcript is written on every frame,
-    // the `false`/`None` case included, because `ChatController` keeps
-    // collapsed/summary state in its own maps **keyed by transcript
+    // Written for every index in the *current* transcript on every frame,
+    // the "stays collapsed"/`None` case included, because `ChatController`
+    // keeps collapsed/summary state in its own maps **keyed by transcript
     // index**, and `set_transcript` deliberately does not clear them (see
-    // its doc). Only setting the `true` case would therefore leak a
+    // its doc). Only setting the "expanded" case would therefore leak a
     // previous conversation's collapse onto whatever later lands at the
     // same index: after `:AiClear` + `:AiSessions` resume, index 1 was a
     // thought turn before the clear and the replayed *assistant* reply
     // after it, so the reply painted as a collapsed "Thinking…" card with
     // its text nowhere on screen — the bug
     // `ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
-    // transcript` catches. The loop also covers the trailing tool-call /
-    // attachment turns appended past `ai_messages`' length, which must
-    // never inherit a stale collapse either.
-    let ai_messages = &engine.acp().ai_messages;
-    for idx in 0..turns_len {
-        let is_thought = ai_messages.get(idx).is_some_and(|m| {
-            m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, idx)
-        });
-        chat.set_turn_collapsed(idx, is_thought);
-        chat.set_turn_summary(idx, is_thought.then(|| "Thinking\u{2026}".to_string()));
+    // transcript` catches.
+    for (turn_idx, kind) in acp.transcript_turn_kinds.borrow().iter().enumerate() {
+        use crate::core::acp_session::TranscriptTurnKind;
+        match kind {
+            TranscriptTurnKind::Message(idx) => {
+                // Gated on `is_genuine_thought_chunk`, not just `role ==
+                // "assistant-thought"`: that role string is pre-existing
+                // shorthand ACP-1 reused for two different things (see
+                // `AiMessage`'s own doc) — real `agent_thought_chunk`
+                // reasoning, *and* one-shot system/error notices
+                // (`Engine::acp_cancel_turn`'s `"[cancelled by user]"`,
+                // `poll_acp`'s failed-request/protocol-mismatch warnings,
+                // ...). Collapsing those into "Thinking..." would hide the
+                // one thing the user most needs to see right after the
+                // turn ended abnormally.
+                let is_thought = ai_messages.get(*idx).is_some_and(|m| {
+                    m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, *idx)
+                });
+                let collapsed = is_thought && !acp.thought_expanded.contains(idx);
+                chat.set_turn_collapsed(turn_idx, collapsed);
+                chat.set_turn_summary(turn_idx, collapsed.then(|| "Thinking\u{2026}".to_string()));
+            }
+            TranscriptTurnKind::ToolCall(id) => {
+                let call = acp.tool_calls.iter().find(|c| &c.id == id);
+                let collapsed = !acp.tool_call_expanded.contains(id);
+                chat.set_turn_collapsed(turn_idx, collapsed);
+                chat.set_turn_summary(
+                    turn_idx,
+                    collapsed
+                        .then(|| call.map(crate::core::acp::tool_call_title_line))
+                        .flatten(),
+                );
+            }
+            TranscriptTurnKind::Plan => {
+                chat.set_turn_collapsed(turn_idx, false);
+                chat.set_turn_summary(turn_idx, None);
+            }
+        }
     }
     chat.set_busy(engine.acp().ai_streaming);
     // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
