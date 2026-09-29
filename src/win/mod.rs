@@ -362,6 +362,40 @@
 //! status-segment item still separately needs its own real-hardware
 //! re-check, unaffected by this finding.
 //!
+//! **Reconciliation (#1622 fix round 1):** the correction above's "the
+//! drawn CSD row/command centre never goes live on Windows" wording
+//! conflates two things #939 deliberately decoupled. Re-reading
+//! `render::FramePresence::from_screen` (`src/render.rs`) shows
+//! `command_center`'s gate is `title_bar_band_live` alone — not
+//! `screen.menu_bar_visible`, and therefore not this three-way branch
+//! either — a contract the existing, passing
+//! `command_center_liveness_is_split_from_menu_bar_visible` test
+//! (`src/render.rs`) and this module's own `command_center_paints_on_a_
+//! native_menu_backend` test (below) both pin directly for `WinBackend`.
+//! So the Command Center should still paint into the client-area title-bar
+//! band on Windows even with `native_menu: true` suppressing the drawn menu
+//! row — the branch-order bug above explains the missing *drawn menu row
+//! and `WS_CAPTION`*, not a missing Command Center.
+//!
+//! A second dell64 session (this fix round) re-ran the real-hardware check
+//! and found the *entire* client area — not selectively the Command Center
+//! — reading back blank/black through two independent capture methods
+//! (`PrintWindow`, and a direct `GetWindowDC`+`BitBlt` read), with
+//! `GetForegroundWindow()` returning `NULL` throughout, confirming the
+//! interactive session was locked again. That is the identical symptom
+//! this file's own `#1558`/`#1561` sections and `src/win/backend.rs`'s
+//! `#1559` section already document for this host under a locked session —
+//! a Direct2D device-loss/suspended-composition artifact, not a
+//! Command-Center-specific starvation. See
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "Correction (#1622 fix round 1)" for
+//! the full capture-method write-up. Net: the `WS_CAPTION`/native-caption
+//! half of this finding stands (independently reproduced again this
+//! round); the Command Center half is retracted as unsupported by the
+//! available evidence and contradicted by the tested contract above —
+//! #1562's Command Center acceptance criterion remains **unverified**,
+//! blocked by the same dell64-locked-session limitation as #1559, not
+//! resolved and not falsified by this investigation.
+//!
 //! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
 //! # gap #1562 found, but the narrower `native_menu` half of it
 //!

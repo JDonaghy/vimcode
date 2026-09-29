@@ -64,7 +64,11 @@ screenshot taken immediately after launch (before any further repaint) shows:
   vimcode's own drawn row (confirmed working, satisfying vimcode#1582).
 - **No command-centre search box anywhere** — a 3x-zoomed crop of the blank
   space between the title text and the minimize button shows nothing painted
-  there at all.
+  there at all. **Retracted by the "Correction (#1622 fix round 1)" note
+  below — this bullet's crop is inside the native, DWM-owned caption, and
+  the entire *client area* was independently found blank/black on a later
+  re-check, not selectively the Command Center. Read that note before
+  citing this bullet as command-centre-specific evidence.**
 
 This is exactly the pre-#1562 appearance, as if quadraui#1199 had never
 landed, even though the pin contains it.
@@ -99,13 +103,19 @@ if backend.backend_caps().native_menu {
 
 Since `native_menu` is checked first and is now `true` for `WinBackend`, the
 `window_chrome` arm — the one that makes the drawn CSD row (icon + menu
-items + command centre + controls) live — never runs on Windows.
+items + controls) live and pins `menu_bar_visible = true` — never runs on
+Windows. **This branch does *not* additionally gate the Command Center —
+see the "Correction (#1622 fix round 1)" note below; the paragraph above
+originally claimed it did, which was wrong.**
 `App::capture_window_and_apply_csd` compounds this: it early-returns
 whenever `backend.backend_caps().native_menu` is true, so `Backend::window()
 .set_decorated(false)` — the call that clears `WS_CAPTION` and hands the
 title strip to `win::run`'s `WM_NCCALCSIZE`/`WM_NCHITTEST` handling — is
 never invoked either. Win-GUI ends up with its stock decorated window,
-`WS_CAPTION` intact, exactly as if `window_chrome` were never declared.
+`WS_CAPTION` intact, exactly as if `window_chrome` were never declared. This
+half — the native caption never being replaced by the drawn CSD row — is
+independently reproduced again in the fix-round correction below and is not
+in question.
 
 This is *not* a new bug in either branch: both were written correctly for
 the backend combination that existed when each landed. `MacBackend` has
@@ -160,8 +170,84 @@ squarely quadraui-side (the capability model) plus a vimcode-side follow-up
 once the new signal exists, not a `src/win/` fix per the Platform-Neutrality
 Rule.
 
-**Blocks:** `JDonaghy/vimcode#1562`. Leave it open behind this issue per
-`GOALS.md`'s milestone-discipline rule.
+**Correction (#1622 fix round 1):** a review of the entry above found its
+central causal claim — "the drawn CSD row/command centre never goes live on
+Windows" — conflates two rungs this codebase's own #939 fix deliberately
+decoupled. Reading `render::FramePresence::from_screen` (`src/render.rs`)
+shows `menu_row`/`menu_dropdown` *are* coupled to `screen.menu_bar_visible`
+(correctly identified above), but `command_center` is computed as
+`title_bar_band_live` alone — explicitly *not* gated on `menu_bar_visible`
+or on which arm of `App::setup`'s three-way branch ran; that file's own
+doc comment at the field says so in as many words ("the command center
+still belongs in that band — same as VS Code on macOS. So this rung depends
+only on the band existing, not on whether the drawn menu row is
+suppressed"). `ShellConfig::has_title_bar` is set unconditionally `true` for
+every GUI backend regardless of `native_menu`/`window_chrome` (`src/app.rs`,
+the `if !self.units.is_gui_backend` guard only affects the TUI `cell`
+profile), and the `presence.command_center` gate at its `App::render_content`
+call site has no dependency on the `native_menu`/`window_chrome` branch
+either. This exact scenario is the literal docstring of the existing,
+passing regression test `command_center_liveness_is_split_from_menu_bar_
+visible` (`src/render.rs`) — RED-verified against its own reverted-fix
+comment — and `src/win/mod.rs`'s own `command_center_paints_on_a_native_
+menu_backend` test (added in the prior #1618 review-fix commit) asserts the
+identical contract specifically for `WinBackend`. So per the codebase's own
+tested contract, the Command Center should still paint into the client-area
+title-bar band on `WinBackend` even with `native_menu: true` suppressing the
+drawn menu row — independent of the branch-order bug this entry blames. That
+half of the causal claim is retracted.
+
+A second dell64 session (this fix round) re-ran the same real-hardware
+check, twice, on two independently launched processes (fresh `APPDATA`
+scratch profiles each time), and got new, more specific evidence pointing at
+a different, already-known cause instead:
+
+- `PrintWindow(PW_RENDERFULLCONTENT)` against the live window returned the
+  native caption and native menu row correctly, but a **solid white** client
+  area below them — no tabs, no status bar, no editor text, no Command
+  Center, nothing (not merely a missing search box). After moving/resizing
+  the window and forcing `InvalidateRect`/`UpdateWindow`, a second
+  `PrintWindow` capture returned a stale, duplicated frame pinned at the
+  window's *original* bounds — the same "Windows suspends live composition
+  for a locked/occluded window" artifact vimcode#1561's own investigation
+  already recorded for this exact host.
+- A direct `GetWindowDC` + `BitBlt` read (bypassing `PrintWindow`'s
+  synthetic `WM_PRINT`-fallback rendering) showed the native menu row's real
+  GDI content faithfully, but **solid black** for the entire client area —
+  the identical "solid black" signature vimcode#1558's investigation already
+  recorded for `Graphics.CopyFromScreen` under a locked dell64 session.
+  `GetForegroundWindow()` returned `NULL` throughout both captures,
+  confirming the session was (again) locked at the OS level.
+
+Two independent capture methods, on two separate launches, agree: the
+*entire* Direct2D-painted client area is blank/black, not selectively the
+Command Center's band. That is the same symptom vimcode#1559 already
+discloses ("dell64's interactive session was locked for the whole run...
+quadraui's own `win::run` `WM_PAINT` handler already names as a device-loss
+trigger for the Direct2D editor surface... editor pane blank every frame")
+generalised from "the cursor/editor surface" to every piece of client-area
+content, Command Center included — not a Command-Center-specific starvation
+bug, and not evidence the #939 decoupling fails to apply to `WinBackend`.
+
+**Net effect on this entry:** the `WS_CAPTION`/native-caption half of the
+diagnosis is solid and independently reproduced a second time this round
+(real DWM caption, real native min/max/close, real native menu row — none of
+it replaced by vimcode's own drawn CSD row) — that part of the **Ask** below
+still stands. The "starves the Command Center" framing is retracted: per the
+tested contract above, Command Center liveness does not depend on this
+branch at all, and the only evidence offered for "no Command Center" is
+structurally consistent with (and, on the fresh capture-method evidence
+above, better explained by) the identical locked-session Direct2D
+suspension #1559 already discloses. `JDonaghy/vimcode#1562`'s Command Center
+acceptance criterion remains **unverified** — blocked by that same
+dell64-local environmental limitation, not resolved and not falsified by
+this investigation. A live, unlocked-session re-check (mirroring #1559's own
+outstanding ask) is the only way to close either one.
+
+**Blocks:** `JDonaghy/vimcode#1562`'s `window_chrome`/native-caption
+acceptance criterion only, per the correction above — not its Command
+Center criterion, which is not blocked on this gap. Leave the issue open
+behind this one per `GOALS.md`'s milestone-discipline rule.
 
 ---
 
