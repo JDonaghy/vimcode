@@ -127,35 +127,22 @@ cargo fmt                         # Format
 That job is the **only** one that runs `cargo fmt -- --check` and
 `cargo clippy --no-default-features -- -D warnings` (the GUI job runs `cargo test`
 alone), so a *lint or formatting* failure shows up as exactly one red check and
-zero red tests.
-
-**Since #639 the toolchain is pinned, so this is no longer a toolchain-skew
-mystery.** `rust-toolchain.toml` at the repo root names an exact `X.Y.Z`
-channel, and every job in `.github/workflows/*.yml` installs
-`dtolnay/rust-toolchain@master` with `toolchain: ${{ env.RUST_TOOLCHAIN }}`,
-pinned to the same version. CI and your machine therefore run the *same*
-compiler and the *same* clippy — a red lint check is a real lint in your diff,
-not a Rust release that happened to land this morning. (Before #639 CI used
-`@stable`, i.e. whatever stable was newest on the day the job ran, so every
-six-weekly release could redden CI with zero code changes. That was the same
-"build input moved without a commit" failure class as #615 and #625/#638.)
-
-`rustup` applies the pin automatically — just run the normal commands:
+zero red tests. Before hunting for a phantom test regression, check the
+toolchain: CI uses `dtolnay/rust-toolchain@stable`, i.e. **whatever stable is
+newest on the day the job runs**, while your machine is on whatever you last
+installed. Every six weeks a new clippy adds lints that turn pre-existing,
+previously-clean code into `-D warnings` errors.
 
 ```bash
-cargo fmt -- --check
-cargo clippy --no-default-features -- -D warnings
-rustup show active-toolchain                    # confirm the pin took effect
+rustup check                                    # is CI's stable newer than yours?
+rustup toolchain install <newer> --component clippy,rustfmt --profile minimal
+cargo +<newer> fmt -- --check
+cargo +<newer> clippy --no-default-features -- -D warnings
 ```
 
-**Bumping the toolchain** is a deliberate, reviewable commit, exactly like the
-quadraui `rev` pin: edit `channel` in `rust-toolchain.toml` **and**
-`RUST_TOOLCHAIN` in all three workflow files, then re-run the four gate
-commands. `tests/toolchain_pin.rs` fails the build if the two drift apart, if a
-workflow reverts to a floating `@stable`, or if an install step forgets
-`components: clippy, rustfmt` (the action installs `--profile minimal`, and
-GitHub runners only preinstall clippy/rustfmt for *stable*). New clippy lints
-reported after a bump are real — fix them rather than reverting the bump.
+Fix the lints (they are real, just newly reported) — do **not** pin the workflow
+to an old toolchain to make the check go green. Verify the fix still compiles on
+the older stable too, so you don't accidentally raise the MSRV.
 
 ## Code Style
 - `rustfmt` defaults (4-space indent)
