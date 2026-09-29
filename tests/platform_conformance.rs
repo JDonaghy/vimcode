@@ -10,6 +10,16 @@
 //! so the Test stage compiled zero GTK assertions and every GTK issue earned
 //! a vacuously green verdict with no error and no warning.
 //!
+//! #1092 made the script *gateable*: a documented exit contract (0 pass /
+//! 1 fail / 2 usage / 3 coverage-gap), a machine-readable per-lane summary
+//! (`--summary <path>`, schema `vimcode.platform-conformance/1`) and a
+//! single greppable `PLATFORM_CONFORMANCE_SUMMARY ...` line, so a release
+//! step can refuse a roll from the exit code and one line of output alone.
+//! The `exit_contract_*` / `summary_*` tests below pin that contract:
+//! a failing lane, a supported-but-skipped lane, a zero-test lane and an
+//! all-green run, each asserting both the exit code and the parsed summary
+//! a release caller would actually read.
+//!
 //! These tests shell out to the real script with **stubbed lane commands and
 //! probe overrides** (`PLATCONF_CMD_<LANE>` / `PLATCONF_OVERRIDE_<LANE>`, both
 //! documented in the script's own header) so they run deterministically on
@@ -323,6 +333,415 @@ fn script_is_executable() {
         mode & 0o111 != 0,
         "scripts/platform-conformance.sh is not executable (mode {mode:o})"
     );
+}
+
+// ── #1092: the release-gate contract ──────────────────────────────────
+//
+// Everything below is what a release step actually consumes: an exit code,
+// one summary line, and a JSON file. The stub mechanism above is what makes
+// them runnable on any host -- no gtk4, no cargo-xwin, no Darwin needed.
+
+/// Exit codes the script documents in its header and in
+/// `docs/PLATFORM_CONFORMANCE.md`. Anything but `PASS` means "do not roll".
+const EXIT_PASS: i32 = 0;
+const EXIT_FAIL: i32 = 1;
+const EXIT_USAGE: i32 = 2;
+const EXIT_COVERAGE_GAP: i32 = 3;
+
+/// A scratch directory unique per test, so concurrent `cargo test` threads
+/// never fight over one summary path.
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "vimcode_platform_conformance_{}_{}",
+        std::process::id(),
+        tag
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    dir
+}
+
+/// Run the script with `--summary <tmpfile>` and return
+/// (stdout, stderr, exit code, parsed summary JSON if one was written).
+fn run_with_summary(
+    tag: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, i32, Option<serde_json::Value>) {
+    let dir = scratch_dir(tag);
+    let path = dir.join("summary.json");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.display().to_string();
+
+    let mut full_args: Vec<&str> = args.to_vec();
+    full_args.push("--summary");
+    full_args.push(&path_str);
+
+    let (stdout, stderr, code) = run_script(&full_args, envs);
+    let json = std::fs::read_to_string(&path)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            serde_json::from_str(&s)
+                .unwrap_or_else(|e| panic!("summary is not valid JSON: {e}\n{s}"))
+        });
+    let _ = std::fs::remove_dir_all(&dir);
+    (stdout, stderr, code, json)
+}
+
+/// Parse the single `PLATFORM_CONFORMANCE_SUMMARY k=v k=v ...` line a caller
+/// that only reads stdout would grep for.
+fn summary_line(stdout: &str) -> std::collections::HashMap<String, String> {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("PLATFORM_CONFORMANCE_SUMMARY "))
+        .unwrap_or_else(|| panic!("no PLATFORM_CONFORMANCE_SUMMARY line in:\n{stdout}"));
+    line.split_whitespace()
+        .skip(1)
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// Lane status from the parsed summary document.
+fn lane_status(summary: &serde_json::Value, lane: &str) -> String {
+    summary["lanes"]
+        .as_array()
+        .expect("lanes array")
+        .iter()
+        .find(|l| l["lane"] == lane)
+        .unwrap_or_else(|| panic!("lane {lane} missing from summary: {summary}"))["status"]
+        .as_str()
+        .expect("status string")
+        .to_string()
+}
+
+/// CONTRACT, all-green: every in-scope lane green ⇒ exit 0, `verdict=pass`,
+/// and every lane in the summary carries a green terminal status (`passed`
+/// or the win cross-compile tier's `check-only`).
+#[test]
+fn exit_contract_all_green_run_is_exit_0_and_verdict_pass() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "all_green",
+        &[],
+        &[
+            (
+                "PLATCONF_CMD_TUI",
+                "echo 'test result: ok. 12 passed; 0 failed; 0 ignored'",
+            ),
+            ("PLATCONF_OVERRIDE_GTK", "capable=1;auto=1"),
+            (
+                "PLATCONF_CMD_GTK",
+                "echo 'test result: ok. 7 passed; 0 failed; 0 ignored'",
+            ),
+            ("PLATCONF_OVERRIDE_MACOS", "capable=1;auto=1"),
+            (
+                "PLATCONF_CMD_MACOS",
+                "echo 'test result: ok. 4 passed; 0 failed; 0 ignored'",
+            ),
+            (
+                "PLATCONF_OVERRIDE_WIN",
+                "capable=1;auto=1;tier=checkonly;reason=stubbed: no wsl interop",
+            ),
+            ("PLATCONF_CMD_WIN_CHECKONLY", "exit 0"),
+        ],
+    );
+    assert_eq!(
+        code, EXIT_PASS,
+        "all-green run must exit 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let line = summary_line(&stdout);
+    assert_eq!(line.get("verdict").map(String::as_str), Some("pass"));
+    assert_eq!(line.get("exit").map(String::as_str), Some("0"));
+    assert_eq!(line.get("tests_passed").map(String::as_str), Some("23"));
+    assert_eq!(line.get("tests_failed").map(String::as_str), Some("0"));
+
+    let summary = summary.expect("a --summary file must be written on a green run");
+    assert_eq!(summary["verdict"], "pass");
+    assert_eq!(summary["exit_code"], 0);
+    assert_eq!(summary["mode"], "run");
+    assert_eq!(lane_status(&summary, "tui"), "passed");
+    assert_eq!(lane_status(&summary, "gtk"), "passed");
+    assert_eq!(lane_status(&summary, "macos"), "passed");
+    // check-only is green but explicitly NOT "passed" -- see #926.
+    assert_eq!(lane_status(&summary, "win"), "check-only");
+    assert_eq!(summary["totals"]["tests_passed"], 23);
+}
+
+/// CONTRACT, failing lane: a lane whose tests fail ⇒ exit 1, `verdict=fail`,
+/// and the failing lane is named in the summary with its failure count, so a
+/// release step knows *which* lane blocked the roll without scrollback.
+#[test]
+fn exit_contract_failing_lane_is_exit_1_and_names_the_lane() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "failing_lane",
+        &[],
+        &[
+            (
+                "PLATCONF_CMD_TUI",
+                "echo 'test result: ok. 12 passed; 0 failed; 0 ignored'",
+            ),
+            ("PLATCONF_OVERRIDE_GTK", "capable=1;auto=1"),
+            (
+                "PLATCONF_CMD_GTK",
+                "echo 'test result: FAILED. 5 passed; 2 failed; 0 ignored'; exit 101",
+            ),
+            (
+                "PLATCONF_OVERRIDE_MACOS",
+                "capable=0;auto=0;reason=stubbed: not darwin",
+            ),
+            (
+                "PLATCONF_OVERRIDE_WIN",
+                "capable=0;auto=0;reason=stubbed: no cargo-xwin",
+            ),
+        ],
+    );
+    assert_eq!(
+        code, EXIT_FAIL,
+        "a failing lane must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let line = summary_line(&stdout);
+    assert_eq!(line.get("verdict").map(String::as_str), Some("fail"));
+    assert_eq!(line.get("exit").map(String::as_str), Some("1"));
+    assert!(
+        line["lanes"].contains("gtk:failed"),
+        "summary line must name the failing lane: {}",
+        line["lanes"]
+    );
+
+    let summary = summary.expect("a --summary file must be written even when a lane fails");
+    assert_eq!(summary["verdict"], "fail");
+    assert_eq!(summary["exit_code"], 1);
+    assert_eq!(lane_status(&summary, "gtk"), "failed");
+    assert_eq!(lane_status(&summary, "tui"), "passed");
+    assert_eq!(summary["totals"]["tests_failed"], 2);
+}
+
+/// CONTRACT, supported-but-skipped lane: the host's probe says the lane is
+/// CAPABLE, but policy did not auto-select it (GTK on Darwin is the real
+/// case). Nothing is broken, but this host's run does not cover what it
+/// could have ⇒ its own exit code, 3, distinct from both a green run and a
+/// real failure, and a distinct `skipped-capable` status so the gap is
+/// visible in the record rather than inferred.
+#[test]
+fn exit_contract_capable_but_skipped_lane_is_exit_3_coverage_gap() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "coverage_gap",
+        &[],
+        &[
+            (
+                "PLATCONF_CMD_TUI",
+                "echo 'test result: ok. 12 passed; 0 failed; 0 ignored'",
+            ),
+            (
+                "PLATCONF_OVERRIDE_GTK",
+                "capable=1;auto=0;reason=stubbed: opt-in on Darwin",
+            ),
+            (
+                "PLATCONF_OVERRIDE_MACOS",
+                "capable=0;auto=0;reason=stubbed: not darwin",
+            ),
+            (
+                "PLATCONF_OVERRIDE_WIN",
+                "capable=0;auto=0;reason=stubbed: no cargo-xwin",
+            ),
+        ],
+    );
+    assert_eq!(
+        code, EXIT_COVERAGE_GAP,
+        "a capable-but-skipped lane must exit 3, not 0\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let line = summary_line(&stdout);
+    assert_eq!(line.get("verdict").map(String::as_str), Some("coverage-gap"));
+    assert_eq!(line.get("exit").map(String::as_str), Some("3"));
+
+    let summary = summary.expect("a --summary file must be written on a coverage-gap run");
+    assert_eq!(summary["verdict"], "coverage-gap");
+    assert_eq!(summary["exit_code"], 3);
+    assert_eq!(lane_status(&summary, "gtk"), "skipped-capable");
+    // An *incapable* lane stays plain `skipped` and is not a gap: that host
+    // genuinely cannot run it, so there is nothing for it to have covered.
+    assert_eq!(lane_status(&summary, "macos"), "skipped");
+    let gtk = summary["lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["lane"] == "gtk")
+        .unwrap()
+        .clone();
+    assert_eq!(gtk["capable"], true);
+    assert_eq!(gtk["auto_selected"], false);
+    assert!(
+        gtk["detail"]
+            .as_str()
+            .unwrap()
+            .contains("stubbed: opt-in on Darwin"),
+        "the gap must carry its reason: {gtk}"
+    );
+}
+
+/// CONTRACT, zero-test lane: the #645 vacuous-green trap reported through
+/// the machine-readable surface a release step reads, not just the human
+/// matrix. `tests_passed: 0` with a green exit would be exactly the bug the
+/// script exists to prevent, so this pins exit 1 + `failed` + a detail that
+/// names the guard.
+#[test]
+fn exit_contract_zero_test_lane_is_exit_1_in_the_summary_too() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "zero_tests",
+        &["--lane", "tui"],
+        &[(
+            "PLATCONF_CMD_TUI",
+            "echo 'test result: ok. 0 passed; 0 failed; 0 ignored'",
+        )],
+    );
+    assert_eq!(
+        code, EXIT_FAIL,
+        "a zero-test lane must exit 1\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let line = summary_line(&stdout);
+    assert_eq!(line.get("verdict").map(String::as_str), Some("fail"));
+    assert!(line["lanes"].contains("tui:failed"), "{}", line["lanes"]);
+
+    let summary = summary.expect("summary must be written for a vacuous-pass failure");
+    assert_eq!(summary["verdict"], "fail");
+    assert_eq!(lane_status(&summary, "tui"), "failed");
+    let tui = summary["lanes"].as_array().unwrap()[0].clone();
+    assert_eq!(tui["tests_passed"], 0);
+    assert!(
+        tui["detail"].as_str().unwrap().contains("vacuous"),
+        "the record must say why it failed: {tui}"
+    );
+}
+
+/// A forced `--lane` subset leaves the other lanes unprobed. The summary
+/// must still list them, as `not-in-scope` — "which lane was not covered on
+/// this roll?" is the question the machine-readable matrix exists to answer,
+/// and silence would be indistinguishable from a green lane.
+#[test]
+fn summary_records_lanes_this_host_never_probed_as_not_in_scope() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "not_in_scope",
+        &["--lane", "tui"],
+        &[(
+            "PLATCONF_CMD_TUI",
+            "echo 'test result: ok. 3 passed; 0 failed; 0 ignored'",
+        )],
+    );
+    assert_eq!(code, EXIT_PASS, "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let summary = summary.expect("summary file");
+    assert_eq!(lane_status(&summary, "tui"), "passed");
+    for lane in ["gtk", "macos", "win"] {
+        assert_eq!(
+            lane_status(&summary, lane),
+            "not-in-scope",
+            "lane {lane} was never probed and must say so"
+        );
+    }
+    assert_eq!(summary["scope"], serde_json::json!(["tui"]));
+    assert!(
+        summary_line(&stdout)["lanes"].contains("gtk:not-in-scope"),
+        "the one-line summary must carry the uncovered lanes too"
+    );
+}
+
+/// `--summary -` emits the same document on stdout after a marker line, for
+/// a caller that would rather pipe than write a file.
+#[test]
+fn summary_dash_writes_the_same_json_to_stdout() {
+    let (stdout, stderr, code) = run_script(
+        &["--lane", "tui", "--summary", "-"],
+        &[(
+            "PLATCONF_CMD_TUI",
+            "echo 'test result: ok. 9 passed; 0 failed; 0 ignored'",
+        )],
+    );
+    assert_eq!(code, EXIT_PASS, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let (_, json_part) = stdout
+        .split_once("===PLATFORM-CONFORMANCE-JSON===\n")
+        .unwrap_or_else(|| panic!("no JSON marker in stdout:\n{stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(json_part)
+        .unwrap_or_else(|e| panic!("stdout JSON did not parse: {e}\n{json_part}"));
+    assert_eq!(parsed["schema"], "vimcode.platform-conformance/1");
+    assert_eq!(parsed["verdict"], "pass");
+    assert_eq!(lane_status(&parsed, "tui"), "passed");
+}
+
+/// CONTRACT, usage error: an unwritable `--summary` path is exit 2 and is
+/// detected BEFORE any lane runs — a release caller passing a bad path
+/// should find out in a second, not after a ten-minute `cargo test` whose
+/// only machine-readable record is then lost. Proven with a sentinel stub
+/// that would touch a file if the lane had been invoked.
+#[test]
+fn unwritable_summary_path_is_exit_2_before_any_lane_runs() {
+    let dir = scratch_dir("unwritable_summary");
+    let sentinel = dir.join("tui-was-run");
+    let _ = std::fs::remove_file(&sentinel);
+    let stub_cmd = format!("touch {}", sentinel.display());
+
+    let (stdout, stderr, code) = run_script(
+        &[
+            "--lane",
+            "tui",
+            "--summary",
+            "/definitely/not/a/directory/summary.json",
+        ],
+        &[("PLATCONF_CMD_TUI", &stub_cmd)],
+    );
+    let sentinel_exists = sentinel.exists();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        code, EXIT_USAGE,
+        "a bad --summary path is a usage error\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !sentinel_exists,
+        "the summary path must be validated before any lane command runs"
+    );
+    assert!(
+        stderr.contains("--summary"),
+        "the error must name the offending option:\n{stderr}"
+    );
+}
+
+/// The exit contract is only usable if it is written down where a release
+/// operator will look. Pin the four codes and the lane→machine map to
+/// `docs/PLATFORM_CONFORMANCE.md` so a future edit to one side cannot
+/// silently drift from the other.
+#[test]
+fn docs_state_the_exit_contract_and_the_lane_to_machine_map() {
+    let doc = std::fs::read_to_string(repo_root().join("docs/PLATFORM_CONFORMANCE.md"))
+        .expect("docs/PLATFORM_CONFORMANCE.md must exist");
+    for needle in [
+        "## Exit contract",
+        "`0`",
+        "`1`",
+        "`2`",
+        "`3`",
+        "coverage-gap",
+        "skipped-capable",
+        "not-in-scope",
+        "--summary",
+        "PLATFORM_CONFORMANCE_SUMMARY",
+        "vimcode.platform-conformance/1",
+        // lane → machine map (#1092 scope item 3)
+        "## Lane-to-machine map",
+        "dellserver",
+        "macmini",
+        "dell64",
+        // what the release side calls (#1092 scope item 4)
+        "## What the release side calls",
+    ] {
+        assert!(
+            doc.contains(needle),
+            "docs/PLATFORM_CONFORMANCE.md must document {needle:?}"
+        );
+    }
 }
 
 /// Static guard for the crt-static requirement called out in the issue: the
