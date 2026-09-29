@@ -65,9 +65,18 @@ impl Engine {
     }
 
     /// End the in-flight turn (`AcpEvent::PromptStopped`): roll whatever it
-    /// wrote into a fresh [`AcpTurnCheckpoint`] and open the combined turn-
-    /// review surface for it. A no-op if the turn wrote nothing — nothing
-    /// to review, nothing to checkpoint.
+    /// wrote into a fresh [`AcpTurnCheckpoint`] and — only when
+    /// [`crate::core::settings::AcpReviewOnTurnEnd::Auto`] is configured
+    /// (`acp_review_on_turn_end` setting, #1515; `Auto` is the pre-#1515
+    /// behaviour) — open the combined turn-review surface for it
+    /// automatically. Under the default `Badge` (and under `Off`), the
+    /// checkpoint is still recorded — `:AiReview`/`Self::cmd_ai_review`,
+    /// the status-strip badge (`Self::acp_turn_review_badge`,
+    /// `render::populate_ai_chat_controller`), and the gutter-marker
+    /// overlay (`Self::acp_turn_pre_content_for_path`,
+    /// `render::build_render_window`) all read the same checkpoint list —
+    /// only the automatic full-viewport pop-up is skipped. A no-op if the
+    /// turn wrote nothing — nothing to review, nothing to checkpoint.
     pub(crate) fn acp_end_turn(&mut self) {
         if self.acp_current_turn_entries.is_empty() {
             return;
@@ -77,7 +86,54 @@ impl Engine {
         let entries = std::mem::take(&mut self.acp_current_turn_entries);
         self.acp_turn_checkpoints
             .push(AcpTurnCheckpoint { id, entries });
-        self.acp_open_turn_review(id);
+        if self.settings.acp_review_on_turn_end == crate::core::settings::AcpReviewOnTurnEnd::Auto {
+            self.acp_open_turn_review(id);
+        }
+    }
+
+    /// The most recent still-outstanding checkpoint's summary for the
+    /// `badge` mode's "Edited N files · +a -r" status-strip segment
+    /// (#1515) — `(files, added_lines, removed_lines)`, or `None` once
+    /// there is no checkpoint left to summarise (nothing has ever run
+    /// yet, or every checkpoint has been fully reverted via `:AiRestore` —
+    /// see [`Self::acp_forget_reverted_checkpoint_paths`]). Recomputed
+    /// fresh on every call rather than cached: a human edit to a touched
+    /// file after the turn ended must be reflected on the very next
+    /// render, the same "buffer-first, never stale" contract
+    /// [`Self::acp_open_turn_review`] already gives the full modal.
+    pub(crate) fn acp_turn_review_badge(&self) -> Option<(usize, usize, usize)> {
+        let checkpoint = self.acp_turn_checkpoints.last()?;
+        if checkpoint.entries.is_empty() {
+            return None;
+        }
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        for entry in &checkpoint.entries {
+            let now = self
+                .acp_current_file_content(std::path::Path::new(&entry.path))
+                .unwrap_or_else(|_| entry.agent_written_content.clone());
+            let (a, r) =
+                crate::core::acp_turn::count_changed_lines(entry.pre_turn_content.as_deref(), &now);
+            added += a;
+            removed += r;
+        }
+        Some((checkpoint.entries.len(), added, removed))
+    }
+
+    /// The base text a `badge`/`off`-mode gutter-marker overlay diffs
+    /// `path`'s live buffer content against (#1515) — the most recent
+    /// still-outstanding checkpoint's entry for `path`, if any.
+    /// `Some(None)` distinguishes "touched, but the agent created this
+    /// path" (no prior content at all — every line paints as added) from
+    /// a plain `None` ("`path` isn't part of any outstanding checkpoint —
+    /// no overlay"). See [`AcpTurnFileEntry::pre_turn_content`]'s own doc
+    /// for why `None` there specifically means "created", not "emptied".
+    pub(crate) fn acp_turn_pre_content_for_path(&self, path: &str) -> Option<Option<String>> {
+        self.acp_turn_checkpoints
+            .iter()
+            .rev()
+            .find_map(|cp| cp.entries.iter().find(|e| e.path == path))
+            .map(|e| e.pre_turn_content.clone())
     }
 
     /// Open the turn-review surface for `checkpoint_id` — one
@@ -265,6 +321,21 @@ impl Engine {
 mod tests {
     use super::*;
 
+    /// Every test in this module exercises the turn-review/checkpoint
+    /// machinery itself (opening the modal, restoring a checkpoint, ...),
+    /// which pre-#1515 always ran on `Engine::acp_end_turn`. #1515 changed
+    /// the *default* `acp_review_on_turn_end` setting to `badge` (no
+    /// auto-open) — this helper opts every test here back into `auto`
+    /// (the pre-#1515 behaviour) so the module keeps testing exactly what
+    /// it always tested, unaffected by the new default a *different* set
+    /// of tests (`Engine::acp_turn_review_badge`'s own, and the
+    /// `render`/driver-level #1515 tests) covers instead.
+    fn engine_for_turn_review_tests() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Auto;
+        engine
+    }
+
     /// Unique scratch dir per test — same manual pattern `review_ops.rs`'s
     /// own `unique_temp_dir` uses.
     ///
@@ -309,7 +380,7 @@ mod tests {
         std::fs::write(&b, "orig b\n").unwrap();
         std::fs::write(&c, "orig c\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "new a\n").unwrap();
         engine.acp_write_text_file(&b, "new b\n").unwrap();
@@ -360,7 +431,7 @@ mod tests {
     /// fabricate a checkpoint.
     #[test]
     fn ending_a_turn_with_no_writes_is_a_noop() {
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.acp_end_turn();
         assert!(engine.acp_turn_checkpoints.is_empty());
         assert!(engine.change_review.is_none());
@@ -378,7 +449,7 @@ mod tests {
         std::fs::write(&a, "orig a\n").unwrap();
         std::fs::write(&b, "orig b\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "new a\n").unwrap();
         engine.acp_write_text_file(&b, "new b\n").unwrap();
@@ -414,7 +485,7 @@ mod tests {
         let new_file = dir.join("brand-new.txt");
         assert!(!new_file.exists(), "sanity: must not exist yet");
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine
             .acp_write_text_file(&new_file, "created by agent\n")
@@ -439,7 +510,7 @@ mod tests {
         let dir = unique_temp_dir("restore-created-file");
         let new_file = dir.join("brand-new.txt");
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine
             .acp_write_text_file(&new_file, "created by agent\n")
@@ -465,7 +536,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "new a\n").unwrap();
         engine.acp_end_turn();
@@ -499,7 +570,7 @@ mod tests {
         std::fs::write(&a, "orig a\n").unwrap();
         std::fs::write(&b, "orig b\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "agent a\n").unwrap();
         engine.acp_write_text_file(&b, "agent b\n").unwrap();
@@ -581,7 +652,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "agent a\n").unwrap();
         engine.acp_end_turn();
@@ -652,7 +723,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "turn1 a\n").unwrap();
         engine.acp_end_turn();
@@ -667,7 +738,7 @@ mod tests {
 
     #[test]
     fn restore_checkpoint_errors_with_no_checkpoints() {
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         let err = engine.acp_restore_checkpoint(None).unwrap_err();
         assert!(err.contains("no ACP turn checkpoints"));
     }
@@ -678,7 +749,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "new a\n").unwrap();
         engine.acp_end_turn();
@@ -694,7 +765,7 @@ mod tests {
 
     #[test]
     fn cmd_ai_review_with_nothing_to_review_leaves_a_message() {
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.cmd_ai_review();
         assert!(engine.change_review.is_none());
         assert!(engine.message.contains("No ACP turn changes"));
@@ -708,7 +779,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "new a\n").unwrap();
         engine.acp_end_turn();
@@ -728,7 +799,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "turn1 a\n").unwrap();
         engine.acp_end_turn();
@@ -752,7 +823,7 @@ mod tests {
         let a = dir.join("a.txt");
         std::fs::write(&a, "orig a\n").unwrap();
 
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "turn1 a\n").unwrap();
         engine.acp_end_turn();
@@ -772,7 +843,7 @@ mod tests {
 
     #[test]
     fn ai_restore_ex_command_with_no_checkpoints_errors() {
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         let action = engine.execute_command("AiRestore");
         assert_eq!(action, EngineAction::Error);
         assert!(engine.message.contains("no ACP turn checkpoints"));
@@ -780,7 +851,7 @@ mod tests {
 
     #[test]
     fn ai_restore_ex_command_rejects_a_non_numeric_argument() {
-        let mut engine = Engine::new_for_test();
+        let mut engine = engine_for_turn_review_tests();
         let action = engine.execute_command("AiRestore notanumber");
         assert_eq!(action, EngineAction::Error);
         assert!(engine.message.contains("Usage: AiRestore"));

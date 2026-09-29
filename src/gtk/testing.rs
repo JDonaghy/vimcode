@@ -20591,6 +20591,11 @@ mod issue_1460_acp_turn_review_and_checkpoints {
         std::fs::write(&c, "ccc1\n").unwrap();
 
         let mut engine = Engine::new_for_test();
+        // #1515 changed the *default* `acp_review_on_turn_end` to `badge`,
+        // which no longer auto-opens the modal this test asserts on —
+        // explicitly opt into `auto` (the pre-#1515 behaviour) since that's
+        // exactly what this test is about.
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Auto;
         engine.workspace_root = Some(dir.clone());
         engine.acp_write_text_file(&a, "aaa2\n").unwrap();
         engine.acp_write_text_file(&b, "bbb2\n").unwrap();
@@ -20916,5 +20921,142 @@ mod issue_1460_acp_turn_review_and_checkpoints {
 
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+/// #1515: turn-end review, badge instead of auto-opening the full-screen
+/// review. GTK twin of `tui_main::app_on_tui_tests::tests::
+/// issue_1515_acp_review_badge`'s scenario — see that module's own doc for
+/// the shared rationale.
+#[cfg(test)]
+mod issue_1515_acp_review_badge {
+    use super::*;
+
+    /// `acp_review_on_turn_end = badge` (the new default, replacing the
+    /// pre-#1515 always-auto-open behaviour) must not auto-open the
+    /// full-viewport turn-review modal `Engine::acp_end_turn` opened
+    /// unconditionally before this issue — instead an "Edited N files ·
+    /// +a -r" segment rides the AI panel's status-strip header, and
+    /// `:AiReview` still opens the same modal on demand. Drives the same
+    /// real `Engine::acp_write_text_file` + `Engine::acp_end_turn` calls
+    /// `issue_1460_acp_turn_review_and_checkpoints`'s tests use (bypassing
+    /// the ACP wire — the checkpoint bookkeeping under test doesn't care
+    /// how it got populated), then asserts on the painted screen via the
+    /// real `GtkDriver`, not `Engine::change_review` state.
+    ///
+    /// RED verified: with `Engine::acp_end_turn`'s `acp_review_on_turn_end`
+    /// gate removed (always calling `acp_open_turn_review`, restoring the
+    /// pre-#1515 behaviour), the full-viewport "Change 1/2" modal paints
+    /// immediately after `acp_end_turn()` and the very first "must not
+    /// auto-open" assertion below fails.
+    #[test]
+    fn badge_mode_suppresses_auto_open_and_shows_edited_summary_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1515_gtk_badge_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "aaa1\n").unwrap();
+        std::fs::write(&b, "bbb1\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Badge;
+        engine.workspace_root = Some(dir.clone());
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_AI,
+        ));
+        engine.acp_write_text_file(&a, "aaa2\nnew line\n").unwrap();
+        engine.acp_write_text_file(&b, "bbb2\n").unwrap();
+        engine.acp_end_turn();
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Change 1/"),
+            "badge mode must not auto-open the full-viewport turn review; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Edited 2 files"),
+            "the status-strip badge must summarise how many files the \
+             turn touched; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains(":AiReview"),
+            "the badge must name the command that opens the review; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // `:AiReview` must still open the same modal on demand.
+        for c in ":AiReview".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("Change 1/2"),
+            ":AiReview must open the turn review even in badge mode; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The complementary half of the scenario above: gutter markers.
+    /// `badge`/`off` mode paints a marker on every line the turn actually
+    /// changed in a still-open, touched buffer (base = the checkpoint's
+    /// `pre_turn_content`, #1515) — proved here in a plain (non-git)
+    /// temp directory, so any marker painted can only have come from the
+    /// ACP-turn overlay, never `crate::core::git::compute_file_diff`.
+    ///
+    /// RED verified: with `render::build_render_window`'s
+    /// `acp_turn_status` overlay removed (reverting `has_git`/`git_status`
+    /// to read only `buffer_state.git_diff`, the pre-#1515 code), this
+    /// buffer never gets a gutter column at all (it isn't a git repo, and
+    /// `git_diff` stays empty) — the "▌" assertion below fails.
+    #[test]
+    fn badge_mode_paints_gutter_markers_on_agent_changed_lines_via_gtk_driver() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1515_gtk_gutter_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Badge;
+        engine.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+        engine.workspace_root = Some(dir.clone());
+        engine
+            .acp_write_text_file(&a, "one\nTWO CHANGED\nthree\n")
+            .unwrap();
+        engine.acp_end_turn();
+        let buf_id = engine.buffer_manager.open_file(&a).unwrap();
+        let win_id = engine.active_window_id();
+        engine.windows.get_mut(&win_id).unwrap().buffer_id = buf_id;
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("\u{258c}"),
+            "an agent-changed line must paint the same gutter marker glyph \
+             a real git-diff line uses, even outside a git repo; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

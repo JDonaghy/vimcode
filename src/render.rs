@@ -20283,6 +20283,21 @@ pub fn populate_ai_chat_controller(
     for attachment in &engine.acp_manual_attachments {
         header.push_str(&format!("  \u{b7} {}", attachment.chip()));
     }
+    // #1515: `badge` mode's "Edited N files · +a -r" segment — the
+    // replacement for the pre-#1515 always-auto-open full-viewport turn
+    // review (`acp_review_on_turn_end` setting, `Engine::acp_end_turn`).
+    // Folds into this same always-repainted, focus-safe status line, same
+    // reasoning as every other chip/suffix above it. `:AiReview`
+    // (`Engine::cmd_ai_review`) opens the same modal this segment
+    // summarises.
+    if engine.settings.acp_review_on_turn_end == crate::core::settings::AcpReviewOnTurnEnd::Badge {
+        if let Some((files, added, removed)) = engine.acp_turn_review_badge() {
+            header.push_str(&format!(
+                "  \u{b7} Edited {files} file{} \u{b7} +{added} -{removed} (:AiReview)",
+                if files == 1 { "" } else { "s" }
+            ));
+        }
+    }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
     chat.set_hint(Some(quadraui::StyledText::colored(
         ai_chat_hint_line(backend, engine.settings.ai_chat_submit_on_enter),
@@ -21029,8 +21044,32 @@ fn build_rendered_window(
     let scroll_top = view.scroll_top.min(total_lines);
     let cursor_line = view.cursor.line;
 
-    // Whether this buffer has git diff data.
-    let has_git = !buffer_state.git_diff.is_empty();
+    // #1515: `badge`/`off` mode's gutter-marker overlay — the lines the
+    // most recent still-outstanding ACP turn checkpoint changed in this
+    // buffer, base = that checkpoint's `pre_turn_content` (not `git diff
+    // HEAD` — see `crate::core::acp_turn::line_status`'s own doc for why
+    // the two bases can legitimately disagree). Skipped entirely under
+    // `Auto` (the full-viewport modal already covers this — "auto keeps
+    // today's behaviour") and when this buffer's path isn't part of any
+    // outstanding checkpoint at all, so the (rare, temporary — only while
+    // an unreviewed turn checkpoint exists) diff cost is paid only for a
+    // buffer an agent turn actually just touched.
+    let acp_turn_status: Vec<Option<GitLineStatus>> = if engine.settings.acp_review_on_turn_end
+        != crate::core::settings::AcpReviewOnTurnEnd::Auto
+    {
+        buffer_state
+            .file_path
+            .as_deref()
+            .and_then(|p| engine.acp_turn_pre_content_for_path(&p.to_string_lossy()))
+            .map(|pre| crate::core::acp_turn::line_status(pre.as_deref(), &buffer.to_string()))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Whether this buffer has git diff data (or an outstanding ACP-turn
+    // overlay — #1515 — to show in the same gutter column).
+    let has_git = !buffer_state.git_diff.is_empty() || !acp_turn_status.is_empty();
 
     // Look up LSP diagnostics for this buffer.
     // Diagnostics are keyed by absolute path (from LSP URIs), but buffer file_path
@@ -21371,9 +21410,17 @@ fn build_rendered_window(
             )
         };
 
-        // Git diff status for this line.
+        // Git diff status for this line, falling back to the #1515
+        // ACP-turn overlay (`acp_turn_status`) where the real git diff has
+        // nothing to say about it — a file already git-dirty before the
+        // turn keeps showing its real git status first.
         let git_status = if has_git {
-            buffer_state.git_diff.get(line_idx).copied().flatten()
+            buffer_state
+                .git_diff
+                .get(line_idx)
+                .copied()
+                .flatten()
+                .or_else(|| acp_turn_status.get(line_idx).copied().flatten())
         } else {
             None
         };
