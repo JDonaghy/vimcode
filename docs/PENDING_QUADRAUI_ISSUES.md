@@ -610,325 +610,136 @@ this same PR, see that file's new §2c).
 
 ---
 
-## Win-GUI `draw_editor`'s block cursor paints over the glyph underneath instead of re-painting it, unlike `macos::editor::draw_editor` (blocks vimcode#1559)
+## `WinBackend::install_menu_bar_now`'s `SetMenu` call re-enters `wndproc` and panics on `ws.state.borrow_mut()` — Win-GUI crashes on every startup once `native_menu` is declared (blocks vimcode#1614, and transitively vimcode#1559/#1562/#1582)
 
-**Title:** `win::editor::draw_editor`'s `CursorShape::Block` arm fills an
-opaque `bg.blend(theme.cursor, …)` rectangle *after* text is painted and never
-redraws the covered glyph — `macos::editor::draw_editor` already re-paints it
-in `theme.background` on top of the same fill
+**Title:** `SetMenu` (called from `WinBackend::install_menu_bar_now`, quadraui#1200) synchronously re-enters `win::run`'s `wndproc` with a nested `WM_SIZE` via `SendMessageW`/`CallWindowProcW` while the outer call already holds `ws.state.borrow_mut()`, panicking with `RefCell already borrowed` at `quadraui/src/win/run.rs:1712:42` (line 1711 at the `cc2b80d` pin) — inside a Win32 callback that cannot unwind, so the process aborts. 100% reproducible: `vimcode.exe` crashes before showing a window, on every launch, on real Windows hardware (dell64).
 
 **Body:**
 
-vimcode#1559 reports that on Windows, the NORMAL-mode block cursor **hides**
-the character underneath it: a buffer containing `1789518172522` renders as
-`█789518172522` with the cursor on column 1. The macOS build of the identical
-commit keeps the character visible inside the block. Root-caused by reading
-both rasterisers at the pinned rev (`9f8766d3`, `Cargo.toml`'s current pin):
+vimcode#1614 asked to bump the pin to pick up quadraui#1197 (block-cursor
+glyph fix), quadraui#1200 (native menu bar), and quadraui#1199 (custom
+title-bar chrome) — three real fixes, each individually verified by their
+own commit messages via `cargo xwin build`/`test`. But none of those
+verifications ran a *live* `vimcode.exe`/example through a real Win32
+message loop with `native_menu: true` declared, which is what surfaces
+this bug: it is a **runtime reentrancy defect**, invisible to
+`HeadlessSurface`-based paint tests and to `cargo check`/`cargo build`
+type-checking alike.
 
-`quadraui/src/win/editor.rs::draw_editor` paints every line's text first
-(the `for (view_idx, line) in editor.lines.iter().enumerate()` loop, lines
-145–199), then paints the cursor afterwards, with no further painting once
-the block rect is filled:
+Root-caused via a real cross-compiled build (`cargo xwin build --release
+--target x86_64-pc-windows-msvc --no-default-features --features win`) run
+directly on dell64 (this WSL2 environment's host — `hostname` returns
+`dell64`, so no remote-transfer step was even needed): `vimcode.exe test.txt`
+launched and immediately crashed, writing the following to stderr and
+`%TEMP%\vimcode-crash.log` every time:
+
+```
+thread 'main' (N) panicked at .../quadraui/src/win/run.rs:1712:42:
+RefCell already borrowed
+thread 'main' (N) panicked at .../core/src/panicking.rs:225:5:
+panic in a function that cannot unwind
+stack backtrace:
+  ...
+  CallWindowProcW
+  SendMessageW
+  IsWindowEnabled
+  IsWindowEnabled
+  Ordinal75
+  Ordinal75
+  SendMessageW
+  CallWindowProcW
+  GetFocus
+  EnumDisplayDevicesW
+  KiUserCallbackDispatcher
+  NtUserSetMenu
+  ...
+```
+
+`quadraui/src/win/run.rs:1712` (`win::run`'s `wndproc`, the pinned rev's
+line numbers) is the `WM_SIZE` arm:
 
 ```rust
-// ── Cursor ───────────────────────────────────────────────────────
-if let Some(cursor) = &editor.cursor {
-    ...
-    match cursor.shape {
-        CursorShape::Block => {
-            let color = bg.blend(theme.cursor, theme.cursor_normal_alpha as f64);
-            let _ = fill_rect(target, Rect::new(x, y, cell_width, line_height), color);
-        }
+WM_SIZE => {
+    let (width, height) = size_from_lparam(lparam.0);
+    let viewport = {
+        let mut s = ws.state.borrow_mut();   // <-- panics here
         ...
-    }
-}
 ```
 
-`bg.blend(theme.cursor, theme.cursor_normal_alpha as f64)` pre-blends the
-cursor colour against the editor background *before* painting, producing a
-single opaque colour that is then filled with `fill_rect` — a normal opaque
-Direct2D rectangle fill, not a translucent compositing operation. Because it
-paints strictly after the glyph and never repaints anything on top of itself,
-the glyph is fully overwritten and never seen again — exactly the reported
-symptom.
-
-`quadraui/src/macos/editor.rs::draw_editor`'s `CursorShape::Block` arm is the
-reference fix shape — it fills the same opaque `theme.cursor` rect, then
-explicitly re-paints the single glyph under the cursor on top, in the
-background colour, so it reads against the block fill:
+The backtrace shows this `WM_SIZE` firing *from inside* `NtUserSetMenu` —
+Win32's `SetMenu` synchronously recalculates the non-client area and can
+dispatch nested messages to the same window on the same thread before
+returning, the same way `DrawMenuBar`/`SetWindowPos` are documented to.
+`WinBackend::install_menu_bar_now` (quadraui#1200, `win/backend.rs`) calls
+`SetMenu(hwnd, ...)` from inside `Self::attach_surface`, which itself runs
+while `win::run`'s window-creation path already holds `ws.state.borrow_mut()`
+— so the nested `WM_SIZE`'s own `ws.state.borrow_mut()` panics on the
+already-live borrow. `wndproc`'s existing re-entrancy guard —
 
 ```rust
-CursorShape::Block => {
-    fill_rect(ctx, cur_x, cur_y, char_width, line_height, theme.cursor);
-    // Re-paint the glyph under the cursor in background
-    // colour so it reads against the cursor fill.
-    let ch = line.raw_text[prefix_end..]
-        .chars()
-        .next()
-        .map(|c| c.to_string())
-        .unwrap_or_default();
-    if !ch.is_empty() {
-        draw_text(ctx, font, &ch, cur_x, cur_y, color_to_cg(theme.background));
-    }
+if ws.pump_depth.is_pumping() {
+    return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
 }
 ```
 
-Win-GUI's `draw_editor` has everything this needs already in scope at the
-cursor-painting call site: `dwrite` (a `&DWrite`), `line` is reachable via
-`editor.lines.get(cursor.pos.view_line)` (not currently fetched there — the
-text-painting loop above already borrows `editor.lines` per-line, but the
-cursor block is a separate loop with only `cursor` in scope), and
-`dwrite.draw_text`/`draw_text_styled` are the same primitives
-`paint_line_text` already uses for every other glyph in this file.
+— (added for #702, the message-pump reentrancy hazard) does **not** cover
+this path: `pump_depth` tracks the *main event-loop pump*, which hasn't
+started yet during window creation, so a nested message arriving via a
+synchronous Win32 API call (not the pump) sails straight through to the
+`match msg` arms and hits the live borrow.
 
-**Ask:** in `win::editor::draw_editor`'s `CursorShape::Block` arm, after the
-`fill_rect` call, look up the glyph at `cursor.pos.col` on
-`editor.lines[cursor.pos.view_line]` (mirroring `char_byte_offset` from the
-macOS file, or the equivalent byte-offset lookup `paint_line_text` already
-does via `chars: Vec<(usize, char)>`) and `dwrite.draw_text` it at `(x, y)` in
-`theme.background`, matching `macos::editor::draw_editor`'s comment and
-behaviour exactly. Leave `Bar`/`Underline` untouched — neither obscures the
-glyph, matching macOS's own scoping (macOS only re-paints for `Block`).
+**Isolation performed (all on real dell64 hardware, `cargo xwin build
+--release --target x86_64-pc-windows-msvc --no-default-features --features
+win`, each launched via `Start-Process`/`Get-Process` against the actual
+Windows session):**
 
-**Test:** `quadraui/src/win/editor.rs`'s existing `#[cfg(test)] mod tests`
-already has a `HeadlessSurface`-based `editor`/`plain_line` fixture (used by
-its current panic-only tests) and `crate::win::testing::HeadlessSurface`
-exposes `pixel_at(x, y) -> Color` (`win/testing.rs`) — the Win-GUI twin of
-macOS's `BitmapSurface::pixel` that `block_cursor_paints_theme_cursor_color`
-already probes in `macos/editor.rs`'s test module. Add a
-`block_cursor_repaints_glyph_in_background_colour` test there: paint an
-`Editor` with a `Block` cursor over a known character (e.g. column 0 of
-`"1789518172522"`, matching vimcode#1559's own repro string), then
-`pixel_at` a coordinate inside the glyph's ink (not the cell's empty
-padding) and assert it reads `theme.background`, not `theme.cursor`. Like
-every other test in this module's `HeadlessSurface`-based suite, it only
-*runs* on `target_os = "windows"` (`HeadlessSurface::new` always returns
-`Err` off Windows — no non-Windows Direct2D to build one from) but type-checks
-everywhere; observe it RED against the unfixed `CursorShape::Block` arm
-above, on real Windows hardware (dell64, `cargo xwin test --release --target
-x86_64-pc-windows-msvc --no-default-features --features win --lib --no-run`
-then the printed test `.exe` run directly — see vimcode `src/win/mod.rs`'s
-`win_driver_tests` module doc for the current dell64-local blockers on
-running any `cargo xwin test --lib` binary, which this test inherits until
-those are separately resolved).
+| quadraui rev | Contains | Result |
+|---|---|---|
+| `db92e461` (pin before #1614) | none of #1197/#1199/#1200 | **Launches cleanly** — real window, `Get-Process` shows `MainWindowTitle: VimCode`, `Responding: True` |
+| `cc2b80d` (has #1197 + #1200, not #1199) | block cursor + native menu bar, no custom title bar | **Crashes on every launch**, identical panic site/message |
+| `928f2b5` (develop HEAD; has all three) | block cursor + native menu bar + custom title bar | **Crashes on every launch**, identical panic site/message |
 
-**Blocks:** `JDonaghy/vimcode#1559`. Leave that issue open behind this one
-per `GOALS.md`'s milestone-discipline rule — there is no per-backend
-vimcode-side fix available: `src/win/backend.rs` is a 9-line re-export of
-`quadraui::win::WinBackend` (see that file's own doc comment), with zero
-rasterising decisions of its own to change. The bug and its fix are entirely
-inside `quadraui::win::editor::draw_editor`.
+This isolates the regression to quadraui#1200 (`90e4310`, the native-menu-bar
+commit) specifically — `window_chrome`/#1199 is not required to reproduce
+it, and the block-cursor fix (#1197) is inert here (paint-only, no wndproc
+change). `native_menu: true` only gets declared once `WinBackend::
+backend_caps()` picks it up (also part of #1200), and `App::setup`
+(vimcode `src/app.rs`) calls `Backend::install_menu_bar` unconditionally
+for any backend declaring that cap — so any consumer that adopts
+`native_menu` the documented way hits this immediately.
 
----
+**Ask:** `WinBackend::install_menu_bar_now`'s `SetMenu` call needs to not
+run while `ws.state` is borrowed on the calling stack — either defer the
+actual `SetMenu` call (e.g. via `PostMessage`/a custom registered message,
+so it happens on a later, non-reentrant pump iteration) the way `WM_SIZE`'s
+own resize-settle debounce (`RESIZE_TIMER_ID`, quadraui#780) already defers
+work off the hot path, or make the reentrant `WM_SIZE` (and any other
+message that can arrive synchronously from a Win32 call made mid-borrow)
+robust to a live borrow — e.g. `try_borrow_mut` with a `DefWindowProcW`
+fallback on `Err`, mirroring `pump_depth.is_pumping()`'s existing
+graceful-defer shape, extended to cover reentrancy from *any* source, not
+just the main pump.
 
-## `WinBackend` never declares `native_menu`/`window_chrome`, and `win::run` has no custom-caption window style — Win-GUI's title bar can never reach GTK/macOS parity (blocks vimcode#1562)
+**Test:** a `WinDriver`/real-`wndproc` scenario that installs a menu bar
+during window creation (the exact `AppLogic::setup`-time call path
+`install_menu_bar`'s own doc describes) and asserts the window finishes
+creating without panicking — the existing `HeadlessSurface`-based tests in
+`win::backend`'s `#[cfg(test)] mod tests` don't drive a real `wndproc`, so
+this needs either a live (non-headless) `CreateWindowExW` in the test itself
+(gated `target_os = "windows"`, run via `cargo xwin test` on real hardware
+like every other live-window test this crate already has) or a `wndproc`
+unit test that directly synthesizes the nested-`WM_SIZE`-during-`SetMenu`
+sequence against a fake `WindowState` to reproduce the double-borrow without
+needing a live window at all. Observed RED against `cc2b80d`/`928f2b5` (100%
+reproducible, real hardware); must be observed GREEN before closing.
 
-**Title:** `win::backend::WinBackend::backend_caps()`'s struct literal sets
-neither `native_menu` nor `window_chrome`, so vimcode's drawn title-bar
-band/command-centre falls into its most degraded ("fully toggleable, TUI
-`cell`-profile") posture on Windows; separately, `win::run`'s `CreateWindowExW`
-call uses plain `WS_OVERLAPPEDWINDOW` with no `WM_NCCALCSIZE`/`WM_NCHITTEST`
-client-area-extension, so even fixing the cap would stack a second,
-vimcode-drawn row underneath the real native caption rather than replacing it
+**Blocks:** `JDonaghy/vimcode#1614` directly, and transitively
+`JDonaghy/vimcode#1559`/`#1562`/`#1582` — none of those three can be
+verified (the app never shows a window) let alone closed while this
+crash exists. vimcode's pin stays at `db92e461` (pre-#1197/#1199/#1200)
+until this lands; there is no vimcode-side workaround (`App::setup`'s
+call-site timing for `install_menu_bar` is irrelevant — the crash happens
+inside quadraui's own window-creation sequence regardless of when the
+platform-neutral caller invokes the trait method), per the
+Platform-Neutrality Rule.
 
-**Body:**
-
-vimcode#1562 asks for Win-GUI chrome parity with macOS: a custom title bar
-with back/forward buttons and the command-centre search box, instead of only
-the plain native Win32 caption. vimcode's own title-bar band and command
-centre are already fully backend-neutral (`App::render_content`'s
-`FrameOp::CommandCenter` rung, `render::build_command_center_view`/
-`paint_command_center_rung`, `RenderPresence::command_center` in `render.rs`
-gated only on the reserved band existing, not on which backend is running) —
-see vimcode `src/win/mod.rs`'s `#1562` doc section for the full read-through.
-Two things stop that shared code from ever painting a GTK/macOS-equivalent
-Windows title bar, both entirely inside quadraui at the pinned rev
-(`9f8766d3`, unchanged since the `a58e5bec` pin vimcode#1562's own real-
-hardware observation named):
-
-1. `App::render_content` (vimcode `src/app.rs`) decides the drawn title-bar
-   row's visibility with a three-way branch on `backend.backend_caps()`:
-
-   ```rust
-   if backend.backend_caps().native_menu {
-       // real OS menu bar (macOS) — drawn row suppressed, menu_bar_visible = false
-   } else if backend.backend_caps().window_chrome {
-       // GTK's (and any future Win-GUI's) drawn menu bar doubles as the
-       // client-side titlebar — pinned visible always
-       self.engine.borrow_mut().menu_bar_visible = true;
-   } else {
-       // no OS menu bar to hide behind and no window chrome for the drawn
-       // row to double as — the `cell` profile (TUI-via-`App`) today.
-       self.engine.borrow_mut().menu_bar_toggleable = true;
-   }
-   ```
-
-   The comment on the middle arm — "GTK's (and any future Win-GUI's) drawn
-   menu bar doubles as the client-side titlebar" — already anticipates
-   Win-GUI declaring `window_chrome`. It never does:
-   `quadraui/src/win/backend.rs::backend_caps`'s struct literal (confirmed
-   at both `a58e5bec` and `9f8766d3`) sets `file_dialogs`, `folder_dialogs`,
-   `native_dialogs`, `notifications`, `pointer_cursor`, `mouse`, `scroll`,
-   `drag`, `text_selection`, `app_font_registration`, `generic_font_
-   families`, `window_control`, and `tray` — never `native_menu` or
-   `window_chrome`. So Win-GUI silently takes the third, TUI-shaped arm:
-   the whole band (menu row *and* the command centre painted into it)
-   starts hidden/toggleable rather than pinned visible, unlike GTK.
-
-2. Even with `window_chrome: true` added, `quadraui/src/win/run.rs`'s window
-   creation (`win32::run_inner`, `CreateWindowExW(..., WS_OVERLAPPEDWINDOW,
-   ...)`) still produces a window with the real Win32 caption — title text,
-   native min/max/close, and the standard resize border — and nothing in
-   that file handles `WM_NCCALCSIZE` (to extend the client area up into the
-   caption) or `WM_NCHITTEST` (to make the drawn band's non-button area
-   report `HTCAPTION` for dragging, the way every "modern chrome" Windows
-   app — Windows Terminal, VS Code's own win32 shell — does). Without that,
-   Windows would end up with a real native caption *and*, stacked directly
-   underneath it, vimcode's own drawn band — a double title bar, not the
-   single "custom-drawn caption with native min/max/close" #1562 asks for.
-
-**Ask:** two-part, either of which can land independently but both are
-needed for full parity:
-
-- Add `window_chrome: true` to `WinBackend::backend_caps()`'s struct
-  literal (mirroring `GtkBackend::backend_caps()`'s existing declaration),
-  once part 2 below makes that honest — declaring it before the window
-  style changes would just turn today's "hidden band" into an always-drawn
-  *second* row under the native caption, trading one bad look for another.
-- Give `win::run` a custom-caption window: on `WM_NCCALCSIZE` return a
-  client rect that keeps the window's outer bounds but zeroes the caption
-  height (leaving the resize-border handling alone), and on `WM_NCHITTEST`
-  classify a hit inside vimcode's drawn title-bar band as `HTCAPTION`
-  unless it lands on the band's own inline min/max/close buttons (already
-  painted by `App::paint_title_bar_band`/`StatusBarInteraction`, per
-  vimcode `src/app.rs`) or the command-centre search box, in which case
-  fall through to the client area so those widgets keep receiving normal
-  mouse events. `WinBackend::backend_caps()`'s existing `window_control:
-  true` (issue #950, `impl WindowControl for WinBackend`) already backs
-  real `SetWindowPos`/`ShowWindow`/`SetWindowTextW` calls — the inline
-  min/max/close buttons vimcode already draws into the band can call
-  through that same trait instead of needing new plumbing.
-
-**Test:** a `WinDriver`-based scenario mirroring `crate::testing`'s existing
-`ConformanceHarness` shape (see quadraui's `macos/mod.rs::mac_driver_tests`
-for the sibling pattern vimcode's own `win_driver_tests` module already
-copies): resize a headless-surfaced window, assert `WM_NCHITTEST` at a point
-inside the drawn band's empty area reports `HTCAPTION` and a point on an
-inline window-control button reports `HTCLIENT`; a second, `BackendCaps`-only
-test asserting `WinBackend::backend_caps().window_chrome` is `true` once
-declared (mirrors `tests/conformance/caps.rs`'s `BackendSource::declared`
-parsing this project already runs, per this file's own top-of-file note on
-`ACCEPTED_DEFAULTS`).
-
-**Blocks:** `JDonaghy/vimcode#1562` (title-bar/command-centre item only —
-that issue's font and status-segment items were investigated and found
-already correct on both backends; see vimcode `src/win/mod.rs`'s `#1562` doc
-section). Leave #1562 open behind this one per `GOALS.md`'s milestone-
-discipline rule — there is no per-backend vimcode-side fix available:
-`src/win/mod.rs`/`src/win/backend.rs` are thin wrappers with no window-style
-or capability decisions of their own (Platform-Neutrality Rule), and
-vimcode's title-bar/command-centre paint code is already fully backend-
-neutral and would light up on Windows unchanged once these two quadraui
-gaps close.
-
----
-
-## `WinBackend::install_menu_bar` doesn't exist and `native_menu` is never declared, so Win-GUI has no menu bar at all — nothing discoverable to click (blocks vimcode#1582)
-
-**Title:** `Backend::install_menu_bar`/`show_context_menu` are still the
-trait's no-op defaults on `WinBackend` (no override in
-`quadraui/src/win/backend.rs`, confirmed at the pinned rev), and
-`backend_caps()`'s struct literal never sets `native_menu: true` — unlike
-`MacBackend`, which implements both (`quadraui/src/macos/menu_bar_install.rs`)
-and declares the cap. `event.rs`'s own doc on `UiEvent::MenuActivated`
-already earmarks the intended shape ("system-installed menus (macOS NSMenu;
-**future Win32 `SetMenu`**)") — this issue is building that anticipated,
-not-yet-built half.
-
-**Body:**
-
-vimcode#1582 reports the Windows GUI build (`vimcode.exe`) shows **no menu
-bar at all** on a fresh launch — nothing discoverable to reach File/Edit/
-View/etc. without already knowing a keybinding. Root-caused by reading
-`App::setup` (vimcode `src/app.rs`, ~L8479–8543) against `WinBackend::
-backend_caps()` at the pinned rev (`9f8766d3`, unchanged since `a58e5bec`):
-`App::setup`'s menu-bar-visibility decision is a three-way branch —
-`native_menu` (install a real OS menu, macOS) / `window_chrome` (drawn row
-pinned always-visible, GTK) / neither (the `cell`/TUI profile: hidden by
-default, toggleable at runtime, only started visible in vscode-mode).
-`WinBackend::backend_caps()` sets neither flag, so Win-GUI silently falls
-into the third arm and the whole band — menu row included — starts hidden
-with no chrome to reveal it. This is the *same* capability gap vimcode#1562
-already found blocking the title-bar/command-centre item (see the entry
-immediately above this one and vimcode `src/win/mod.rs`'s `#1562` doc
-section) — but #1582 only needs *one* of the two paths that entry names, and
-the narrower one:
-
-- The `window_chrome` path (the entry above) requires `win::run` to grow
-  `WM_NCCALCSIZE`/`WM_NCHITTEST` custom-caption handling first, or declaring
-  the cap paints a *second* row stacked under the real native caption — a
-  substantial, separate piece of work.
-- The `native_menu` path — this entry — needs no window-style change at
-  all. A real Win32 menu (`CreateMenu`/`AppendMenuW`/`SetMenu`) attaches
-  *underneath* the existing native caption the standard way every classic
-  Win32 app already does (Notepad, the pre-ribbon Office apps) — it does
-  not touch caption hit-testing or the resize border. `App::setup`'s
-  `native_menu` arm (`src/app.rs` L8493–8526) already builds a
-  `MenuBar` from the same platform-neutral `MenuDef`s the drawn row and
-  macOS's `NSMenu` both consume (`render::build_menu_defs`/
-  `menu_defs_to_menu_bar`) and calls `Backend::install_menu_bar(&bar)`
-  unconditionally on any backend declaring the cap — **no vimcode-side
-  change is needed once this lands**, exactly as `#1562`'s title-bar entry
-  already documents for its own path.
-
-`quadraui::macos::menu_bar_install::install_menu_bar` is the reference
-shape: it walks `MenuBar`'s `Vec<MenuDef>`, builds native `NSMenu`/
-`NSMenuItem`s recursively, and wires each leaf item's action selector
-(`quadraMenuAction:`) to look up and dispatch the item's `WidgetId` back
-through the app's event queue as `UiEvent::MenuActivated(id)` — the exact
-variant `crate::event::UiEvent`'s own doc already names Win32's future
-`SetMenu` as the sibling implementation for (`event.rs` ~L843–847), and the
-exact variant vimcode's `App::handle_event` already matches generically
-(`src/app.rs` L7808, no backend-specific branch — it fires from macOS today
-and would fire from Windows unchanged).
-
-**Ask:** in `quadraui/src/win/backend.rs`, override `install_menu_bar` on
-`WinBackend`: build a native `HMENU` tree from the passed `MenuBar` via
-`CreateMenu`/`CreatePopupMenu`/`AppendMenuW` (submenus as `MF_POPUP`, leaf
-items as `MF_STRING` with a per-item command id), call `SetMenu(hwnd,
-hmenu)`, and keep an id→`WidgetId` table on `WinBackend` for dispatch.  In
-`quadraui/src/win/run.rs`'s `wndproc` (~L1599), add a `WM_COMMAND` arm: when
-`wparam`'s high word is `0` (menu, not an accelerator/control notification)
-and the low word matches a table entry, push `UiEvent::MenuActivated(id)`
-the same way the adjacent `WM_LBUTTONDOWN`/`WM_SIZE` arms already push their
-events. Add `native_menu: true` to `backend_caps()`'s struct literal
-alongside the other Windows-only fields, satisfied honestly the moment
-`install_menu_bar` is overridden (`tests/conformance/caps.rs`'s
-`BackendSource::declared` parse). `show_context_menu` can stay the trait
-default for this issue — vimcode#1582 only asks for the menu *bar*, and
-right-click context menus are a separate, already-tracked surface.
-
-**Test:** a `BackendCaps`-only source-parse assertion
-(`WinBackend::backend_caps().native_menu` is `true`, mirroring the pattern
-`tests/conformance/caps.rs` already runs for every other backend) plus a
-`WinDriver`/`HeadlessSurface`-based scenario in `win::backend`'s own
-`#[cfg(test)] mod tests` (same fixture shape the block-cursor entry above
-this one already uses): install a `MenuBar` with one known item, synthesize
-the matching `WM_COMMAND` through `wndproc` directly (or the test seam
-`win::testing` already exposes for synthetic messages), and assert the
-resulting `UiEvent::MenuActivated` carries that item's `WidgetId` — not just
-that `SetMenu` was called, the #587/#592 "assert on effect, not on state
-populated" lesson vimcode's own `CLAUDE.md` states for exactly this reason.
-Runs on `target_os = "windows"` only (real `HMENU`/`SetMenu` calls), type-
-checks everywhere else; observe it RED against the unfixed no-op
-`install_menu_bar` default first, on real Windows hardware (dell64), before
-declaring it fixed.
-
-**Blocks:** `JDonaghy/vimcode#1582`. Leave that issue open behind this one
-per `GOALS.md`'s milestone-discipline rule — there is no per-backend
-vimcode-side fix available: `App::setup`'s `native_menu` arm (`src/app.rs`)
-already builds and installs the menu bar generically on any backend that
-declares the cap, and `App::handle_event` already matches
-`UiEvent::MenuActivated` generically (both proven live today by macOS) — the
-entire gap is `WinBackend::install_menu_bar` not existing and `native_menu`
-never being declared, both inside `quadraui::win`.

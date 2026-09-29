@@ -249,6 +249,35 @@ win = ["quadraui/win"]
 # entry point; `draw_toast_stack` survives as a deprecated, defaulted
 # shim that converts and forwards. Queued after #1576 so the two pin
 # bumps don't collide in this file.
+#
+# #1614 investigated bumping to `928f2b5` (quadraui `develop` HEAD at the
+# time) to pick up three Win-GUI fixes — quadraui#1197 (block cursor no
+# longer hides the glyph, `win::editor::draw_editor`'s `CursorShape::Block`
+# arm now re-paints it in `theme.background`, closing vimcode#1559),
+# quadraui#1200 (`WinBackend::install_menu_bar` attaches a real `HMENU` via
+# `SetMenu` and declares `native_menu: true`, closing vimcode#1582), and
+# quadraui#1199 (`WinBackend` declares `window_chrome: true` and `win::run`
+# handles `WM_NCCALCSIZE`/`WM_NCHITTEST`, closing vimcode#1562's title-bar
+# item) — but did **NOT** land the bump: real-hardware verification on
+# dell64 found `928f2b5` crashes `vimcode.exe` on every startup, before any
+# window is shown, with `thread 'main' panicked at quadraui/src/win/run.rs:
+# 1712:42: RefCell already borrowed`, aborting (a panic inside a
+# non-unwinding Win32 callback). Root cause: `WinBackend::
+# install_menu_bar_now`'s `SetMenu` call (new in quadraui#1200) triggers a
+# synchronous nested `WM_SIZE` through `SendMessageW`/`CallWindowProcW`
+# while `win::run`'s outer call already holds `ws.state.borrow_mut()` —
+# `wndproc`'s existing `pump_depth.is_pumping()` re-entrancy guard (#702)
+# does not cover this path, since it fires during window creation, before
+# the main message pump starts. Confirmed present starting at quadraui
+# `90e4310` (the native-menu-bar commit) through `cc2b80d` and `928f2b5`
+# (same panic site, same 100%-reproducible startup crash at each); the
+# immediately-prior pin (`db92e46`, still below) launches cleanly — real
+# window, `Get-Process` shows `Responding: True`. Full repro, isolation
+# steps and stack trace are in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry — file that as a quadraui issue and get a fix merged before
+# attempting this bump again. Leave vimcode#1559/#1562/#1582 open behind
+# it; none of the three can be verified end-to-end while Win-GUI can't
+# start.
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "db92e461ca5376103d3147d5267b697cbe002063", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
