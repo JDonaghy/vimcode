@@ -6996,14 +6996,22 @@ second line here
     /// pointing at `src/first.rs`, then a `tool_call_update` pointing at
     /// `src/second.rs`.
     ///
-    /// RED verified the same way as the TUI twin: with
+    /// #1511 moved locations out of the collapsed one-line summary
+    /// (`tool_call_title_line`, just `{glyph} {kind}: {title}`) into the
+    /// card's *expanded* body (`tool_call_expanded_text`) — every card now
+    /// starts collapsed, so this test clicks the card open (on its title
+    /// text, which is stable across the replace) before checking which
+    /// location is showing.
+    ///
+    /// RED verified against this expand-then-check shape: with
     /// `call.content.append(&mut blocks)`/`call.locations.append(...)`
     /// restored in place of the plain assignment in `Engine::
-    /// acp_apply_tool_call_update`, this fails — the screen shows both
-    /// `first.rs` and `second.rs` instead of just the latter.
+    /// acp_apply_tool_call_update`, this fails — the expanded card shows
+    /// both `first.rs` and `second.rs` instead of just the latter.
     #[cfg(unix)]
     #[test]
     fn tool_call_update_replace_paints_only_the_new_location_via_gtk_driver() {
+        use quadraui::testing::ConformanceDriver;
         let mut h = panel_harness(PANEL_AI);
 
         let fixture = concat!(
@@ -7031,6 +7039,22 @@ second line here
         h.driver.render();
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("edit: Edit") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("edit: Edit"),
+            "the tool call's collapsed card must paint within 5s"
+        );
+
+        // #1511: expand the card — collapsed cards show only
+        // `tool_call_title_line` (no locations at all).
+        h.driver.click_text("edit: Edit");
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !h.driver.screen_contains("second.rs") && std::time::Instant::now() < deadline {
             h.engine.borrow_mut().poll_acp();
             h.driver.render();
@@ -7038,7 +7062,8 @@ second line here
         }
         assert!(
             h.driver.screen_contains("second.rs"),
-            "the tool_call_update's new location must paint within 5s"
+            "the tool_call_update's new location must paint within 5s of \
+             expanding the card"
         );
         assert!(
             !h.driver.screen_contains("first.rs"),
@@ -21374,6 +21399,156 @@ mod issue_1510_ai_panel_markdown_rendering {
              — it must never be re-collapsed into \"Thinking…\"; \
              painted: {:?}",
             h.driver.painted_texts()
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_1511_ai_panel_tool_call_cards {
+    use super::*;
+    use quadraui::testing::ConformanceDriver;
+
+    /// An `Engine` with the AI panel shown and a fixture agent configured
+    /// to reply via `$ACP_FAKE_TOOL_CALL_CARD` — see that env var's doc in
+    /// `tests/fixtures/fake_acp_agent.sh` for the exact sequence (a
+    /// `tool_call` carrying `rawInput`, a `tool_call_update` adding
+    /// `rawOutput`, then a SECOND thought+message pair emitted afterward).
+    fn tool_call_card_engine() -> Engine {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_AI,
+        ));
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec!["ACP_FAKE_TOOL_CALL_CARD=1".to_string()],
+            mcp_servers: Vec::new(),
+        }];
+        engine.settings.acp_active_agent = "alpha".to_string();
+        engine
+    }
+
+    /// #1511 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1511_ai_panel_tool_call_cards::tool_call_card_collapses_by_
+    /// default_and_toggles_via_click_via_shell_app`: a tool-call card
+    /// renders collapsed by default (no `rawInput`/`rawOutput` on the
+    /// painted surface), a click on it expands the card to reveal both,
+    /// and a second click collapses it again.
+    ///
+    /// RED verified: with `populate_ai_chat_controller` reverted to
+    /// pre-#1511 (`tool_call_summary_line` painted unconditionally, no
+    /// `set_turn_collapsed`/`is_turn_collapsed` for tool calls), this fails
+    /// at the very first assertion — `bytesWritten` (the `rawOutput` value)
+    /// is on the painted surface immediately, before any click.
+    #[cfg(unix)]
+    #[test]
+    fn tool_call_card_collapses_by_default_and_toggles_via_click_via_gtk_driver() {
+        let mut h = harness(tool_call_card_engine(), 1200, 800);
+        for c in ":AI hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Goodbye") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Goodbye"),
+            "setup: the fixture's second reply must paint within 5s; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("edit: Edit files"),
+            "the collapsed card's title line must paint; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            !h.driver.screen_contains("bytesWritten"),
+            "a collapsed card must not show its rawOutput; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.click_text("edit: Edit files");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("bytesWritten"),
+            "clicking the collapsed card must expand it, revealing its \
+             rawOutput; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.click_text("edit: Edit files");
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("bytesWritten"),
+            "clicking an expanded card must collapse it again; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #1511 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1511_ai_panel_tool_call_cards::tool_call_card_interleaves_
+    /// chronologically_between_replies_via_shell_app`: the tool-call card
+    /// paints between the two replies it chronologically belongs between,
+    /// not after the whole conversation.
+    ///
+    /// RED verified: with the interleave reverted to the pre-#1511 "build
+    /// every message turn, then push every tool call after the loop" shape,
+    /// this fails — the second reply's painted text-run index is lower
+    /// than the card's, instead of higher.
+    #[cfg(unix)]
+    #[test]
+    fn tool_call_card_interleaves_chronologically_between_replies_via_gtk_driver() {
+        let mut h = harness(tool_call_card_engine(), 1200, 800);
+        for c in ":AI hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Goodbye") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let texts = h.driver.painted_texts();
+        let pos_hello = texts
+            .iter()
+            .position(|t| t.contains("Hello world"))
+            .expect("the first reply must paint");
+        let pos_card = texts
+            .iter()
+            .position(|t| t.contains("edit: Edit files"))
+            .expect("the tool-call card must paint");
+        let pos_goodbye = texts
+            .iter()
+            .position(|t| t.contains("Goodbye"))
+            .expect("the second reply must paint");
+
+        assert!(
+            pos_hello < pos_card,
+            "the tool call must paint after the first reply that preceded \
+             it over the wire; painted: {texts:?}"
+        );
+        assert!(
+            pos_card < pos_goodbye,
+            "the tool call must paint before the second reply that \
+             followed it over the wire — not after the whole \
+             conversation; painted: {texts:?}"
         );
     }
 }

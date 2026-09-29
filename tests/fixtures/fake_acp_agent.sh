@@ -227,7 +227,18 @@
 #                           `-32601` (this line arrives) instead of leaving
 #                           it parked forever (which would hang this
 #                           `read` and the turn would never reach
-#                           `PromptStopped`). With $ACP_FAKE_SESSION_TITLE
+#                           `PromptStopped`). With $ACP_FAKE_TOOL_CALL_CARD
+#                           set (#1511): emits a "tool_call" (id "tc-1")
+#                           carrying a `rawInput` object and a `locations`
+#                           entry pointing at `$ACP_FAKE_TOOL_CALL_PATH`
+#                           (default "src/main.rs"), a "tool_call_update"
+#                           attaching `rawOutput`, and — AFTER the tool
+#                           call, not before it — a second thought+message
+#                           pair ("more thinking" / "Goodbye") so a test can
+#                           confirm the card paints chronologically between
+#                           the first and second reply rather than after the
+#                           whole conversation (the pre-#1511 behaviour).
+#                           With $ACP_FAKE_SESSION_TITLE
 #                           set to a title string (#1519): emits a
 #                           `session_info_update` notification carrying
 #                           that title after the usual message chunks, so a
@@ -631,6 +642,18 @@ while IFS= read -r line; do
         # update must REPLACE both fields, not append to them.
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit files","kind":"edit","status":"in_progress","locations":[{"path":"src/first.rs","line":1}],"content":[{"type":"content","content":{"type":"text","text":"first content"}}]}}}\n'
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","locations":[{"path":"src/second.rs","line":2}],"content":[{"type":"content","content":{"type":"text","text":"second content"}}]}}}\n'
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TOOL_CALL_CARD" ]; then
+        # #1511: a tool call carrying `rawInput`, then a `tool_call_update`
+        # adding `rawOutput`, with a SECOND thought+message pair emitted
+        # afterward — proving the card interleaves chronologically (between
+        # the first and second reply) rather than landing after the whole
+        # conversation.
+        tc_path="${ACP_FAKE_TOOL_CALL_PATH:-src/main.rs}"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Edit files","kind":"edit","status":"in_progress","locations":[{"path":"%s","line":3}],"rawInput":{"path":"%s","line":3}}}}\n' "$tc_path" "$tc_path"
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed","rawOutput":{"bytesWritten":42}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"more thinking"}}}}\n'
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Goodbye"}}}}\n'
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_TOOL_CALL_HANGS" ]; then
         # #1519: announce an in-progress tool call, then never answer

@@ -5415,15 +5415,20 @@ mod tests {
         /// spec deviation #1519 fixes (#955 originally appended). The
         /// fixture's `$ACP_FAKE_TOOL_CALL_REPLACE` emits a `tool_call`
         /// pointing at `src/first.rs`, then a `tool_call_update` pointing
-        /// at `src/second.rs` — `tool_call_summary_line` paints every
-        /// location, so this is observable straight off the transcript
-        /// text, no internal field peeking needed.
+        /// at `src/second.rs`.
         ///
-        /// RED verified: with `call.content.append(&mut blocks)` /
-        /// `call.locations.append(...)` restored in place of the plain
-        /// assignment in `Engine::acp_apply_tool_call_update`, this fails
-        /// — the screen shows both `first.rs` and `second.rs` instead of
-        /// just the latter.
+        /// #1511 moved locations out of the collapsed one-line summary
+        /// (`tool_call_title_line`, just `{glyph} {kind}: {title}`) into the
+        /// card's *expanded* body (`tool_call_expanded_text`) — every card
+        /// now starts collapsed, so this test clicks the card open (on its
+        /// title text, which is stable across the replace) before checking
+        /// which location is showing.
+        ///
+        /// RED verified against this expand-then-check shape: with
+        /// `call.content.append(&mut blocks)` / `call.locations.append(...)`
+        /// restored in place of the plain assignment in `Engine::
+        /// acp_apply_tool_call_update`, this fails — the expanded card shows
+        /// both `first.rs` and `second.rs` instead of just the latter.
         #[cfg(unix)]
         #[test]
         fn tool_call_update_replace_paints_only_the_new_location_via_shell_app() {
@@ -5458,6 +5463,24 @@ mod tests {
 
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut screen = driver.screen();
+            while !screen.contains("edit: Edit") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("edit: Edit"),
+                "the tool call's collapsed card must paint within 5s; \
+                 screen:\n{screen}"
+            );
+
+            // #1511: expand the card — collapsed cards show only
+            // `tool_call_title_line` (no locations at all).
+            driver.click_text("edit: Edit");
+            driver.tick();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
             while !screen.contains("second.rs") && Instant::now() < deadline {
                 driver.tick();
                 std::thread::sleep(Duration::from_millis(10));
@@ -5465,8 +5488,8 @@ mod tests {
             }
             assert!(
                 screen.contains("second.rs"),
-                "the tool_call_update's new location must paint within 5s; \
-                 screen:\n{screen}"
+                "the tool_call_update's new location must paint within 5s \
+                 of expanding the card; screen:\n{screen}"
             );
             assert!(
                 !screen.contains("first.rs"),
@@ -7930,6 +7953,308 @@ mod tests {
                  even after a later, unrelated turn gets a normal \
                  assistant reply — it must never be re-collapsed into \
                  \"Thinking…\"; screen:\n{screen}"
+            );
+        }
+    }
+
+    mod issue_1511_ai_panel_tool_call_cards {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// A wide (220x30, `Alt+Right` x40 — same widening
+        /// `issue_1510_ai_panel_markdown_rendering`'s harnesses use, so a
+        /// card's title/location text never word-wraps and confuses a
+        /// `screen.contains`/ordering check) harness with a fixture agent
+        /// configured to reply via `$ACP_FAKE_TOOL_CALL_CARD` — see that
+        /// env var's doc in `tests/fixtures/fake_acp_agent.sh` for the exact
+        /// sequence (a `tool_call` carrying `rawInput`, a `tool_call_update`
+        /// adding `rawOutput`, then a SECOND thought+message pair emitted
+        /// afterward).
+        fn widened_tool_call_card_harness() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TOOL_CALL_CARD=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// Send `"AI hi"` and block until the fixture's second reply
+        /// ("Goodbye") has painted — i.e. the whole scripted turn (both
+        /// replies AND the tool call between them) has fully streamed in.
+        fn send_and_wait_for_turn_end(
+            driver: &mut quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        ) -> String {
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Goodbye") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Goodbye"),
+                "setup: the fixture's second reply must paint within 5s; \
+                 screen:\n{screen}"
+            );
+            screen
+        }
+
+        /// #1511 acceptance: a tool-call card renders collapsed by default
+        /// (just the `{glyph} {kind}: {title}` line — no `rawInput`/
+        /// `rawOutput`, no locations), and a click on it expands the card to
+        /// show both, then a second click collapses it again.
+        ///
+        /// RED verified: with `populate_ai_chat_controller` reverted to
+        /// pre-#1511 (`tool_call_summary_line` painted unconditionally, no
+        /// `set_turn_collapsed`/`is_turn_collapsed` for tool calls), this
+        /// fails at the very first assertion — `bytesWritten` (the
+        /// `rawOutput` value) is on screen immediately, before any click.
+        #[cfg(unix)]
+        #[test]
+        fn tool_call_card_collapses_by_default_and_toggles_via_click_via_shell_app() {
+            let mut h = widened_tool_call_card_harness();
+            let driver = &mut h.driver;
+            let screen = send_and_wait_for_turn_end(driver);
+
+            assert!(
+                screen.contains("edit: Edit files"),
+                "the collapsed card's title line must paint; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("bytesWritten"),
+                "a collapsed card must not show its rawOutput; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("Input:") && !screen.contains("Output:"),
+                "a collapsed card must not show its rawInput/rawOutput \
+                 section headers either; screen:\n{screen}"
+            );
+
+            driver.click_text("edit: Edit files");
+            driver.tick();
+            let screen = driver.screen();
+            assert!(
+                screen.contains("bytesWritten"),
+                "clicking the collapsed card must expand it, revealing its \
+                 rawOutput; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("Input:") && screen.contains("Output:"),
+                "the expanded card must label its rawInput/rawOutput \
+                 sections; screen:\n{screen}"
+            );
+
+            driver.click_text("edit: Edit files");
+            driver.tick();
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("bytesWritten"),
+                "clicking an expanded card must collapse it again; \
+                 screen:\n{screen}"
+            );
+        }
+
+        /// #1511 acceptance: the tool-call card renders **between** the two
+        /// replies it chronologically belongs between, not after the whole
+        /// conversation — the issue's core complaint
+        /// (`populate_ai_chat_controller` used to append every tool call
+        /// after all of `ai_messages`, "at the deliberate cost of it not
+        /// being in strict chronological order").
+        ///
+        /// RED verified: with the interleave reverted to the pre-#1511
+        /// "build every message turn, then push every tool call after the
+        /// loop" shape, this fails — `"Goodbye"` (the second reply, which
+        /// streams in AFTER the tool call over the wire) paints *above* the
+        /// card instead of below it, so `pos("Goodbye") < pos(card)` and
+        /// the ordering assertion fails.
+        #[cfg(unix)]
+        #[test]
+        fn tool_call_card_interleaves_chronologically_between_replies_via_shell_app() {
+            let mut h = widened_tool_call_card_harness();
+            let driver = &mut h.driver;
+            let screen = send_and_wait_for_turn_end(driver);
+
+            let pos_hello = screen
+                .find("Hello world")
+                .expect("the first reply must paint");
+            let pos_card = screen
+                .find("edit: Edit files")
+                .expect("the tool-call card must paint");
+            let pos_goodbye = screen.find("Goodbye").expect("the second reply must paint");
+
+            assert!(
+                pos_hello < pos_card,
+                "the tool call must paint after the first reply that \
+                 preceded it over the wire; screen:\n{screen}"
+            );
+            assert!(
+                pos_card < pos_goodbye,
+                "the tool call must paint before the second reply that \
+                 followed it over the wire — not after the whole \
+                 conversation; screen:\n{screen}"
+            );
+        }
+
+        /// #1511 acceptance: `Tab` moves keyboard focus onto the tool-call
+        /// card, and plain `Enter` toggles it open — the "keyboard, not just
+        /// mouse" half of "Toggle via click / `Tab`/`Enter` on the focused
+        /// card".
+        ///
+        /// RED verified: with `render::route_ai_chat_event`'s focused-turn
+        /// `Enter` intercept removed, `ChatController::handle` still
+        /// consumes the key (toggling its own *internal* collapsed map) but
+        /// the very next frame's `populate_ai_chat_controller` call
+        /// overwrites that from `AcpSession::tool_call_expanded`, which
+        /// never got the toggle — so `bytesWritten` never appears and this
+        /// fails.
+        #[cfg(unix)]
+        #[test]
+        fn tab_enter_toggles_the_focused_tool_call_card_via_shell_app() {
+            let mut h = widened_tool_call_card_harness();
+            let driver = &mut h.driver;
+            let _ = send_and_wait_for_turn_end(driver);
+
+            // Cycle keyboard focus with `Tab` until the tool-call card is
+            // reached — the fixture's fixed transcript is: user, thought,
+            // "Hello world", the card, thought, "Goodbye" (6 turns), so 4
+            // `Tab`s land on the card (0-indexed turn 3).
+            for _ in 0..4 {
+                driver.press_named(quadraui::NamedKey::Tab);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.tick();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("bytesWritten"),
+                "Tab-focusing the tool-call card then pressing Enter must \
+                 expand it, revealing its rawOutput; screen:\n{screen}"
+            );
+        }
+
+        /// #1511 acceptance: clicking inside an *expanded* card's body (as
+        /// opposed to its row-0/row-1 header, which toggles it — see
+        /// `tool_call_card_collapses_by_default_and_toggles_via_click_via_
+        /// shell_app`) jumps to the tool call's location — "→ path:line
+        /// location can't be followed" from the issue's Problem section.
+        ///
+        /// RED verified: with `Engine::ai_chat_turn_clicked`'s `else if`
+        /// branch (the `Self::ai_open_tool_call_location` call) deleted,
+        /// this fails — clicking `"bytesWritten"` does nothing, no new tab
+        /// opens, and the status bar never shows `"Ln 3"`.
+        #[cfg(unix)]
+        #[test]
+        fn expanded_card_click_jumps_to_the_tool_calls_location_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "issue-1511-tool-call-location-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let target = dir.join("target.txt");
+            std::fs::write(&target, "one\ntwo\nthree\nfour\n").unwrap();
+            let target_str = target.to_string_lossy().into_owned();
+
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.workspace_root = Some(dir.clone());
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_TOOL_CALL_CARD=1".to_string(),
+                    format!("ACP_FAKE_TOOL_CALL_PATH={target_str}"),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            let driver = &mut h.driver;
+            let _ = send_and_wait_for_turn_end(driver);
+
+            // Expand the card (row 1 — the title line).
+            driver.click_text("edit: Edit files");
+            driver.tick();
+            let screen = driver.screen();
+            assert!(
+                screen.contains("bytesWritten"),
+                "setup: the card must be expanded before its body is \
+                 clickable; screen:\n{screen}"
+            );
+
+            // Click inside the expanded body (well past row 1) — must jump
+            // to the call's location (`target.txt`, line 3) rather than
+            // re-collapsing the card.
+            driver.click_text("bytesWritten");
+            driver.tick();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Ln 3") && Instant::now() < deadline {
+                driver.tick();
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("target.txt"),
+                "clicking the expanded card's body must open the call's \
+                 location's file; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("Ln 3"),
+                "clicking the expanded card's body must jump the cursor to \
+                 the call's location's line (3); screen:\n{screen}"
             );
         }
     }
