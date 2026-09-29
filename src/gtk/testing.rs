@@ -21273,4 +21273,107 @@ mod issue_1510_ai_panel_markdown_rendering {
             h.driver.painted_texts()
         );
     }
+
+    /// Review regression (#1510): `is_genuine_thought_chunk`'s original
+    /// "does any LATER message in `ai_messages` have role `assistant`"
+    /// heuristic scanned the *whole rest* of the conversation, not just the
+    /// same turn — so a turn cancelled/stopped/failed mid-conversation
+    /// (pushing its notice under `"assistant-thought"`) got permanently
+    /// re-collapsed into "Thinking…" the instant a *later*, unrelated turn
+    /// in the same session got a normal `"assistant"` reply.
+    /// `Engine::acp_cancel_turn`/`AcpEvent::PromptStopped` (non-`end_turn`)/
+    /// `AcpEvent::RequestFailed` never tear down the ACP session, so
+    /// continuing the conversation after one of these is a normal,
+    /// supported flow — not an edge case.
+    ///
+    /// Seeds a `"[cancelled by user]"` notice directly onto `ai_messages`
+    /// (the same technique `ai_panel_scrolls_transcript`/`ai_panel_renders_
+    /// plan_built_without_any_acp_transport` already use to test the render
+    /// layer independent of whatever transport produced the content — the
+    /// bug lives entirely in `populate_ai_chat_controller`/
+    /// `is_genuine_thought_chunk`, a pure function of `ai_messages`'
+    /// *contents*, not of how they got there) to stand in for turn 1's
+    /// cancellation, then drives a REAL second turn through the fixture
+    /// agent and asserts the seeded notice is still visible, verbatim,
+    /// once the real reply lands.
+    ///
+    /// RED verified: reverting `is_genuine_thought_chunk` to its pre-fix
+    /// `ai_messages[idx + 1..].iter().any(|m| m.role == "assistant")`
+    /// (scanning to the end of the conversation instead of stopping at the
+    /// next `"user"` message) makes this fail — once turn 2's "Hello
+    /// world" reply lands, the unscoped scan finds *that* assistant
+    /// message and re-collapses turn 1's "[cancelled by user]" notice into
+    /// "Thinking…", so the final `screen_contains("[cancelled by
+    /// user]")` assertion below fails.
+    #[cfg(unix)]
+    #[test]
+    fn cancelled_turn_notice_stays_visible_after_a_later_reply_via_gtk_driver() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_AI,
+        ));
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec!["ACP_FAKE_NO_TOOL_REQUEST=1".to_string()],
+            mcp_servers: Vec::new(),
+        }];
+        engine.settings.acp_active_agent = "alpha".to_string();
+        // Stand in for a turn 1 that was cancelled: a real user prompt
+        // followed by the exact notice `Engine::acp_cancel_turn` pushes.
+        engine.acp_mut().ai_messages = vec![
+            crate::core::ai::AiMessage {
+                role: "user".to_string(),
+                content: "first, cancelled".to_string(),
+            },
+            crate::core::ai::AiMessage {
+                role: "assistant-thought".to_string(),
+                content: "[cancelled by user]".to_string(),
+            },
+        ];
+
+        let mut h = harness(engine, 1200, 800);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("[cancelled by user]"),
+            "setup: the seeded cancellation notice must paint in full \
+             before any second turn; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "second, real reply".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+        h.driver.render();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("Hello world") && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("Hello world"),
+            "setup: the second turn must actually complete with a real \
+             assistant reply; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("[cancelled by user]"),
+            "turn 1's cancellation notice must stay visible verbatim even \
+             after a later, unrelated turn gets a normal assistant reply \
+             — it must never be re-collapsed into \"Thinking…\"; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }

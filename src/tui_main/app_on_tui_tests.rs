@@ -7807,5 +7807,130 @@ mod tests {
                 );
             }
         }
+
+        /// Same widened harness as [`widened_markdown_harness`], but the
+        /// fixture completes plainly (no `$ACP_FAKE_MARKDOWN_REPLY`) and
+        /// `ai_messages` is pre-seeded with a cancelled turn 1 before the
+        /// harness takes ownership of the engine — the fixture for
+        /// `cancelled_turn_notice_stays_visible_after_a_later_reply_via_
+        /// shell_app` below.
+        fn widened_cancelled_then_reply_harness() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_NO_TOOL_REQUEST=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            // Stand in for a turn 1 that was cancelled: a real user prompt
+            // followed by the exact notice `Engine::acp_cancel_turn` pushes.
+            engine.acp_mut().ai_messages = vec![
+                crate::core::ai::AiMessage {
+                    role: "user".to_string(),
+                    content: "first, cancelled".to_string(),
+                },
+                crate::core::ai::AiMessage {
+                    role: "assistant-thought".to_string(),
+                    content: "[cancelled by user]".to_string(),
+                },
+            ];
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// Review regression (#1510): `is_genuine_thought_chunk`'s original
+        /// "does any LATER message in `ai_messages` have role `assistant`"
+        /// heuristic scanned the *whole rest* of the conversation, not just
+        /// the same turn — so a turn cancelled/stopped/failed mid-
+        /// conversation (pushing its notice under `"assistant-thought"`)
+        /// got permanently re-collapsed into "Thinking…" the instant a
+        /// *later*, unrelated turn in the same session got a normal
+        /// `"assistant"` reply. `Engine::acp_cancel_turn`/
+        /// `AcpEvent::PromptStopped` (non-`end_turn`)/
+        /// `AcpEvent::RequestFailed` never tear down the ACP session, so
+        /// continuing the conversation after one of these is a normal,
+        /// supported flow — not an edge case. GTK twin:
+        /// `gtk::testing::issue_1510_ai_panel_markdown_rendering::
+        /// cancelled_turn_notice_stays_visible_after_a_later_reply_via_
+        /// gtk_driver`.
+        ///
+        /// Seeds a `"[cancelled by user]"` notice directly onto
+        /// `ai_messages` (the same technique `plain_reply_word_wraps_not_
+        /// mid_word_in_narrow_panel_via_shell_app` above uses to test the
+        /// render layer independent of whatever transport produced the
+        /// content) to stand in for turn 1's cancellation, then drives a
+        /// REAL second turn through the fixture agent and asserts the
+        /// seeded notice is still visible, verbatim, once the real reply
+        /// lands.
+        ///
+        /// RED verified: reverting `is_genuine_thought_chunk` to its
+        /// pre-fix `ai_messages[idx + 1..].iter().any(|m| m.role ==
+        /// "assistant")` (scanning to the end of the conversation instead
+        /// of stopping at the next `"user"` message) makes this fail —
+        /// once turn 2's "Hello world" reply lands, the unscoped scan
+        /// finds *that* assistant message and re-collapses turn 1's
+        /// "[cancelled by user]" notice into "Thinking…", so the final
+        /// `screen.contains("[cancelled by user]")` assertion below fails.
+        #[cfg(unix)]
+        #[test]
+        fn cancelled_turn_notice_stays_visible_after_a_later_reply_via_shell_app() {
+            let mut h = widened_cancelled_then_reply_harness();
+            let driver = &mut h.driver;
+            let screen = driver.screen();
+            assert!(
+                screen.contains("[cancelled by user]"),
+                "setup: the seeded cancellation notice must paint in full \
+                 before any second turn; screen:\n{screen}"
+            );
+
+            driver.type_char(':');
+            for c in "AI second, real reply".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Hello world") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Hello world"),
+                "setup: the second turn must actually complete with a \
+                 real assistant reply; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("[cancelled by user]"),
+                "turn 1's cancellation notice must stay visible verbatim \
+                 even after a later, unrelated turn gets a normal \
+                 assistant reply — it must never be re-collapsed into \
+                 \"Thinking…\"; screen:\n{screen}"
+            );
+        }
     }
 }
