@@ -4641,6 +4641,15 @@ pub struct Engine {
 
     /// Rate-limiting timer for `check_file_changes` inside `poll_idle`.
     idle_last_file_check: std::time::Instant,
+
+    /// Busy-spinner animation frame (#1508), advanced by `poll_idle` once
+    /// per tick while any `acp_sessions` entry is `ai_streaming` — the app-
+    /// owned counter `quadraui::Spinner`'s own doc says a host must drive
+    /// (`ChatController::set_spinner_frame`, painted by
+    /// `render::populate_ai_chat_controller`). Left unchanged while idle,
+    /// same "app decides when frames advance, primitive has no timer of its
+    /// own" contract every other quadraui `Spinner` adopter follows.
+    pub ai_spinner_frame: usize,
 }
 
 impl Engine {
@@ -5268,6 +5277,7 @@ impl Engine {
             file_watcher_pending: HashSet::new(),
             accelerators: Vec::new(),
             idle_last_file_check: std::time::Instant::now(),
+            ai_spinner_frame: 0,
         };
         // A freshly-built `AppShell` (above) defaults `sidebar_visible: true`,
         // so this only ever needs to *hide* it here — but it's expressed via
@@ -5411,6 +5421,7 @@ impl Engine {
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
         redraw |= self.poll_acp();
+        redraw |= self.tick_ai_spinner();
         if self.poll_project_search() {
             self.search_switch_to_results();
             redraw = true;

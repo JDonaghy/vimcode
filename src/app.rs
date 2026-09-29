@@ -8234,6 +8234,26 @@ impl App {
             self.draw_needed.set(true);
         }
 
+        // #1508: while any ACP session (or the direct-curl transport, which
+        // also flips `ai_streaming`) has a turn in flight, keep re-arming
+        // `tick` at the cadence `quadraui::runner::Reaction::RedrawAfter`'s
+        // own doc recommends for exactly this case (its "thinking-spinner
+        // countdown" example) — 100ms, i.e. ≥4 Hz — rather than trusting
+        // the coarser 250ms `IDLE_POLL_CEILING` fallback every backend
+        // keeps regardless. `Engine::tick_ai_spinner` (called from
+        // `poll_idle` above, inside `handle_poll_tick`) already advanced
+        // the frame this tick and set `draw_needed`, so the `Redraw` below
+        // paints the new frame now; this re-arms the *next* wake.
+        if self
+            .engine
+            .borrow()
+            .acp_sessions
+            .iter()
+            .any(|s| s.ai_streaming)
+        {
+            backend.request_frame_in(std::time::Duration::from_millis(100));
+        }
+
         if self.draw_needed.get() {
             self.draw_needed.set(false);
             quadraui::Reaction::Redraw

@@ -28,6 +28,17 @@ impl Engine {
         &mut self.acp_sessions[self.acp_active_session]
     }
 
+    /// Mark the active session's turn as started (#1508): the one place
+    /// `ai_streaming` flips `true` from. Every call site that used to write
+    /// `self.acp_mut().ai_streaming = true;` directly now calls this
+    /// instead, so `AcpSession::turn_started_at` — the status-strip elapsed
+    /// timer's start point — can never drift out of sync with the flag.
+    pub(crate) fn acp_begin_streaming(&mut self) {
+        let session = self.acp_mut();
+        session.ai_streaming = true;
+        session.turn_started_at = Some(std::time::Instant::now());
+    }
+
     /// Non-blocking drain of every live ACP session's events (#1463) — not
     /// just the active one, so a backgrounded session keeps its agent's
     /// stdout drained (and its turn progressing) while another session is
@@ -58,6 +69,25 @@ impl Engine {
         }
         self.acp_active_session = foreground.min(self.acp_sessions.len().saturating_sub(1));
         redraw
+    }
+
+    /// Advance [`Self::ai_spinner_frame`] once per `poll_idle` tick while
+    /// any session (not just the foreground one — a backgrounded turn is
+    /// still genuinely running) is `ai_streaming` (#1508). Returns `true`
+    /// (a redraw is warranted) exactly when it actually advanced, so a
+    /// fully idle engine doesn't request a repaint every tick forever.
+    ///
+    /// Backends keep this ticking at the ≥4 Hz the issue asks for via
+    /// `App::tick_dispatch`'s own `Reaction::RedrawAfter`/
+    /// `Backend::request_frame_in` re-arm while busy — see that call
+    /// site's doc — rather than relying on quadraui's coarser 250ms
+    /// idle-poll fallback ceiling alone.
+    pub(crate) fn tick_ai_spinner(&mut self) -> bool {
+        if !self.acp_sessions.iter().any(|s| s.ai_streaming) {
+            return false;
+        }
+        self.ai_spinner_frame = self.ai_spinner_frame.wrapping_add(1);
+        true
     }
 
     /// The per-session `AcpEvent` handling `poll_acp` used to inline
@@ -432,7 +462,7 @@ impl Engine {
                             });
                         }
                         if self.acp_mut().pending_prompt.is_some() {
-                            self.acp_mut().ai_streaming = true;
+                            self.acp_begin_streaming();
                         }
                         self.acp_begin_session();
                     } else {
@@ -893,7 +923,7 @@ impl Engine {
         // below gets there; leaving it `false` in between would show the
         // panel as idle while a `session/load` round trip is genuinely in
         // flight.
-        self.acp_mut().ai_streaming = true;
+        self.acp_begin_streaming();
 
         if self.acp_mut().client.is_some() && self.acp_mut().session_id.is_some() {
             self.acp_pending_resume = Some(session_id);

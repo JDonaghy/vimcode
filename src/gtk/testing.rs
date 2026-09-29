@@ -8416,6 +8416,109 @@ second line here
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1508: AI panel busy status strip — live tool-call title + elapsed
+    // time, animated spinner. GTK twin of `tui_main::app_on_tui_tests::
+    // tests::issue_1508_ai_panel_busy_status`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1508_ai_panel_busy_status {
+        use super::*;
+
+        /// #1508 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::issue_1508_ai_panel_busy_status::
+        /// busy_status_shows_running_tool_call_and_elapsed_time_via_shell_
+        /// app`: the AI panel's status strip must show the live in-progress
+        /// tool call's title plus an elapsed-time reading while busy,
+        /// replacing the old frozen `"(thinking\u{2026})"` literal, and the
+        /// busy `Spinner` icon (`ChatController::set_spinner_frame`,
+        /// previously never called at all) must actually animate. The
+        /// fixture's `$ACP_FAKE_TOOL_CALL_HANGS` announces one `in_progress`
+        /// "execute: Run the tests" call and then never answers
+        /// `session/prompt`, so the scenario stays busy indefinitely.
+        ///
+        /// `GtkDriver` has no `tick()` (see `ai_panel_streams_acp_thought_
+        /// and_message_chunks`'s own doc for why) — draining is done
+        /// directly via `Engine::poll_idle` (not the narrower `poll_acp`
+        /// those other tests use: `poll_idle` is also what advances
+        /// `Engine::ai_spinner_frame`, via `Engine::tick_ai_spinner`),
+        /// followed by an explicit `h.driver.render()`.
+        ///
+        /// RED verified the same way as the TUI twin: reverting
+        /// `render::populate_ai_chat_controller`'s header back to the
+        /// static `"(thinking\u{2026})"` literal (with no
+        /// `chat.set_spinner_frame` call either) makes this fail on both
+        /// counts — the painted surface never shows "execute: Run the
+        /// tests \u{b7}", and `Engine::ai_spinner_frame` never advances past
+        /// its `0` starting value no matter how many polls are driven.
+        #[cfg(unix)]
+        #[test]
+        fn busy_status_shows_running_tool_call_and_elapsed_time_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            {
+                let mut engine = h.engine.borrow_mut();
+                engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                    name: "alpha".to_string(),
+                    command: format!("sh \"{fixture}\""),
+                    cwd: String::new(),
+                    env: vec!["ACP_FAKE_TOOL_CALL_HANGS=1".to_string()],
+                    mcp_servers: Vec::new(),
+                }];
+                engine.settings.acp_active_agent = "alpha".to_string();
+            }
+
+            let sb = h.painted_sidebar_bounds.get().unwrap();
+            h.driver.click(sb.x + 20.0, sb.y + 20.0);
+            for c in "hi".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.ctrl_char('s');
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !h.driver.screen_contains("execute: Run the tests \u{b7}")
+                && std::time::Instant::now() < deadline
+            {
+                h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("execute: Run the tests \u{b7}"),
+                "the status strip must show the live tool call's title \
+                 plus an elapsed-time separator, distinct from the \
+                 transcript's own bracketed `[~] execute: ...` line; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("[~] execute: Run the tests"),
+                "sanity: the transcript's own summary line must still \
+                 paint too, unaffected by the status-strip change"
+            );
+
+            let frame_a = h.engine.borrow().ai_spinner_frame;
+            let advance_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut frame_b = frame_a;
+            while frame_b == frame_a && std::time::Instant::now() < advance_deadline {
+                h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                frame_b = h.engine.borrow().ai_spinner_frame;
+            }
+            assert_ne!(
+                frame_a, frame_b,
+                "Engine::ai_spinner_frame must advance every `poll_idle` \
+                 tick while a turn is streaming, not stay frozen at its \
+                 starting value"
+            );
+        }
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

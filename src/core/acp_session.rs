@@ -102,6 +102,14 @@ pub struct AcpSession {
     /// True while a turn on *this* session is in flight, regardless of
     /// which session is currently in the foreground.
     pub ai_streaming: bool,
+    /// Wall-clock start of the turn currently in flight (#1508). Stamped by
+    /// `Engine::acp_begin_streaming` — the one place `ai_streaming` flips
+    /// `true` from — so it can never drift out of sync with the flag it's
+    /// paired with. `render::populate_ai_chat_controller`'s status-strip
+    /// reads this to show an elapsed-time suffix (e.g. "· 12s") while busy.
+    /// Left stale (not cleared) once the turn ends — harmless, since every
+    /// reader gates on `ai_streaming` being `true` first.
+    pub turn_started_at: Option<std::time::Instant>,
 }
 
 impl AcpSession {

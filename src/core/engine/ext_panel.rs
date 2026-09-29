@@ -3001,7 +3001,7 @@ impl Engine {
             role: "user".to_string(),
             content: text,
         });
-        self.acp_mut().ai_streaming = true;
+        self.acp_begin_streaming();
 
         let provider = self.settings.ai_provider.clone();
         let api_key = self.settings.ai_api_key.clone();
@@ -3106,7 +3106,7 @@ impl Engine {
                 content: displayed_text,
             });
         }
-        self.acp_mut().ai_streaming = true;
+        self.acp_begin_streaming();
         self.acp_mut().streaming_turn = None;
 
         if self.acp_mut().client.is_some() {
