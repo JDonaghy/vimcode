@@ -22,7 +22,251 @@ impl Engine {
     /// makes loaning `&mut Engine` to Lua sound (no outstanding borrow of
     /// `self.plugin_manager` is held across the call).
     pub fn set_plugin_manager(&mut self, mgr: plugin::PluginManager) {
+        // #146: seed `plugin_views` so a `vimcode.ui.register_view` panel is
+        // recognisable as view-backed before its `render` callback has ever run
+        // (the sidebar has to pick a body *shape* on the first frame it paints).
+        for name in mgr.view_names() {
+            self.plugin_views.entry(name).or_default();
+        }
         self.plugin_manager = Some(std::rc::Rc::new(mgr));
+    }
+
+    // ── Plugin-declared UI views (#146) ────────────────────────────────────
+
+    /// Whether `name` names a `vimcode.ui.register_view` view.
+    pub fn is_plugin_view(&self, name: &str) -> bool {
+        self.plugin_views.contains_key(name)
+    }
+
+    /// Re-run `name`'s `render` callback and store the widget tree it returns.
+    ///
+    /// Returns `true` when the stored tree changed (i.e. a repaint is worth it).
+    /// A Lua error is surfaced on the status line and leaves the previous tree in
+    /// place, so a broken `render` degrades to a stale panel rather than an empty
+    /// one.
+    pub fn refresh_plugin_view(&mut self, name: &str) -> bool {
+        if !self.plugin_views.contains_key(name) {
+            return false;
+        }
+        // `apply_plugin_ctx` below honours `vimcode.ui.refresh`, so a `render`
+        // callback that refreshes a view can re-enter here. Bound it rather than
+        // forbid it: one level of "render, then ask for one more pass" is a
+        // legitimate pattern (populate-then-redraw), an unbounded chain is a
+        // plugin bug that must not become a stack overflow.
+        const MAX_RENDER_DEPTH: u32 = 4;
+        if self.plugin_view_render_depth >= MAX_RENDER_DEPTH {
+            return false;
+        }
+        self.plugin_view_render_depth += 1;
+        let out = self.refresh_plugin_view_inner(name);
+        self.plugin_view_render_depth -= 1;
+        out
+    }
+
+    fn refresh_plugin_view_inner(&mut self, name: &str) -> bool {
+        let ctx = self.make_plugin_ctx(true);
+        let name_owned = name.to_string();
+        let Some((ctx, result)) = self.with_plugin_dispatch(|pm| pm.render_view(&name_owned, ctx))
+        else {
+            return false;
+        };
+        self.apply_plugin_ctx(ctx);
+        match result {
+            Ok(view) => {
+                let changed = self.plugin_views.get(name) != Some(&view);
+                if changed {
+                    // A shorter tree must not leave the selection past its end.
+                    if self.ext_panel_active.as_deref() == Some(name)
+                        && self.ext_panel_selected >= view.fields.len()
+                    {
+                        self.ext_panel_selected = view.first_focusable().unwrap_or(0);
+                    }
+                    self.plugin_views.insert(name.to_string(), view);
+                }
+                changed
+            }
+            Err(msg) => {
+                self.message = format!("plugin view {name}: {msg}");
+                false
+            }
+        }
+    }
+
+    /// Called when an `ext:` sidebar panel becomes the active one.
+    ///
+    /// Fires the `panel_focus` hook (how a `vimcode.panel.register` panel learns
+    /// to populate its sections) and, for a `vimcode.ui.register_view` panel,
+    /// re-runs its `render` callback so the form painted this frame is current
+    /// (#146). Both activation paths — the activity-bar click router in
+    /// `render.rs` and `Engine::activate_activity_bar_item` — go through here so
+    /// the two cannot drift.
+    pub(crate) fn on_ext_panel_focused(&mut self, name: &str) {
+        self.plugin_event("panel_focus", name);
+        if self.is_plugin_view(name) {
+            self.refresh_plugin_view(name);
+            // Park the selection on something `Enter` can act on.
+            let first = self
+                .plugin_views
+                .get(name)
+                .and_then(|v| v.first_focusable())
+                .unwrap_or(0);
+            self.ext_panel_selected = first;
+        }
+    }
+
+    /// Keyboard handling for a view-backed sidebar panel.
+    ///
+    /// Returns `true` when the key was consumed. Keys this returns `false` for
+    /// fall through to `Engine::handle_ext_panel_key`'s generic panel bindings
+    /// (`q`/`Escape` to unfocus, `h`/`Left` back to the activity bar, `?` help),
+    /// so a plugin view keeps the same panel chrome bindings every other sidebar
+    /// panel has.
+    ///
+    /// Navigation skips rows that cannot emit events (`label`, `read_only`,
+    /// `disabled`), so `j`/`k` never parks the selection somewhere `Enter` does
+    /// nothing.
+    pub(crate) fn handle_plugin_view_key(&mut self, name: &str, key: &str) -> bool {
+        use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind, ViewFieldKind};
+
+        let Some(view) = self.plugin_views.get(name) else {
+            return false;
+        };
+        let focusable: Vec<usize> = view
+            .fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_interactive() && !f.disabled)
+            .map(|(i, _)| i)
+            .collect();
+
+        match key {
+            "j" | "Down" | "Tab" => {
+                let next = focusable
+                    .iter()
+                    .copied()
+                    .find(|i| *i > self.ext_panel_selected)
+                    .or_else(|| focusable.first().copied());
+                if let Some(i) = next {
+                    self.ext_panel_selected = i;
+                }
+                self.ext_panel_ensure_visible(0);
+                true
+            }
+            "k" | "Up" => {
+                let prev = focusable
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|i| *i < self.ext_panel_selected)
+                    .or_else(|| focusable.last().copied());
+                if let Some(i) = prev {
+                    self.ext_panel_selected = i;
+                }
+                self.ext_panel_ensure_visible(0);
+                true
+            }
+            "g" => {
+                if let Some(i) = focusable.first().copied() {
+                    self.ext_panel_selected = i;
+                }
+                self.ext_panel_scroll_top = 0;
+                true
+            }
+            "G" => {
+                if let Some(i) = focusable.last().copied() {
+                    self.ext_panel_selected = i;
+                }
+                self.ext_panel_ensure_visible(0);
+                true
+            }
+            "Return" | "Enter" | "Space" | " " => {
+                let Some(field) = view.fields.get(self.ext_panel_selected) else {
+                    return true;
+                };
+                if field.disabled {
+                    return true;
+                }
+                // The *plugin* owns the declared value: vimcode reports the value
+                // the activation implies and the next `render` reflects whatever
+                // the handler decided to store. Nothing is mutated here.
+                let (widget_id, kind) = match &field.kind {
+                    ViewFieldKind::Button => (field.id.clone(), ViewEventKind::ButtonClicked),
+                    ViewFieldKind::Toggle { value } => (
+                        field.id.clone(),
+                        ViewEventKind::ToggleChanged { value: !*value },
+                    ),
+                    ViewFieldKind::Toggles { toggles } => match toggles.first() {
+                        Some(t) => (
+                            t.id.clone(),
+                            ViewEventKind::ToggleChanged { value: !t.value },
+                        ),
+                        None => return true,
+                    },
+                    ViewFieldKind::Buttons { buttons } => {
+                        match buttons.iter().find(|b| !b.disabled) {
+                            Some(b) => (b.id.clone(), ViewEventKind::ButtonClicked),
+                            None => return true,
+                        }
+                    }
+                    ViewFieldKind::Dropdown { options, selected } => {
+                        if options.is_empty() {
+                            return true;
+                        }
+                        let next = (*selected + 1) % options.len();
+                        (
+                            field.id.clone(),
+                            ViewEventKind::DropdownChanged { selected: next },
+                        )
+                    }
+                    ViewFieldKind::Segmented { options, selected } => {
+                        if options.is_empty() {
+                            return true;
+                        }
+                        let next = (*selected + 1) % options.len();
+                        (
+                            field.id.clone(),
+                            ViewEventKind::SegmentedChanged { selected: next },
+                        )
+                    }
+                    ViewFieldKind::Text { value, .. }
+                    | ViewFieldKind::Password { value, .. }
+                    | ViewFieldKind::TextArea { value, .. } => (
+                        field.id.clone(),
+                        // Text *entry* into a plugin view is #1403 Phase 2; Enter
+                        // on a text row commits the value the plugin declared, so
+                        // "type in a real buffer, press Enter here" already works
+                        // as a submit affordance.
+                        ViewEventKind::TextCommitted {
+                            value: value.clone(),
+                        },
+                    ),
+                    ViewFieldKind::Label | ViewFieldKind::ReadOnly { .. } => return true,
+                };
+                self.dispatch_plugin_view_event(PluginViewEvent {
+                    view: name.to_string(),
+                    widget_id,
+                    kind,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Route one resolved widget event to the owning view's `on_event` callback.
+    ///
+    /// The view is re-rendered afterwards unconditionally: the whole point of the
+    /// callback is that it mutates plugin-side state the next `render` reflects,
+    /// and a handler has no way to know whether its own mutation was visible.
+    pub fn dispatch_plugin_view_event(&mut self, event: crate::core::plugin_ui::PluginViewEvent) {
+        if !self.plugin_views.contains_key(&event.view) {
+            return;
+        }
+        let ctx = self.make_plugin_ctx(true);
+        if let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_view_event(&event, ctx)) {
+            self.apply_plugin_ctx(ctx);
+        }
+        self.refresh_plugin_view(&event.view);
     }
 
     /// Whether a Lua dispatch could actually run right now — plugins enabled, a
@@ -990,6 +1234,12 @@ impl Engine {
         }
         for url in ctx.open_urls {
             self.open_url(&url);
+        }
+        // #146: honour `vimcode.ui.refresh(name)`. Bounded by
+        // `plugin_view_render_depth` inside `refresh_plugin_view`, so a `render`
+        // callback that asks to refresh itself settles instead of recursing.
+        for name in ctx.plugin_view_refresh {
+            self.refresh_plugin_view(&name);
         }
         // A dispatch's queued output is now applied, so this is the end of that
         // dispatch: flush any event that fired from inside it (#1214). Doing it

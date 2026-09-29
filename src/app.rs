@@ -3585,6 +3585,42 @@ impl App {
                         .render_and_cache(backend, body_rect);
                 });
             }
+            id if id
+                .strip_prefix("ext:")
+                .is_some_and(|name| engine.is_plugin_view(name)) =>
+            {
+                // #146: a `vimcode.ui.register_view` panel — the plugin declared
+                // a widget tree, so paint it as a `quadraui::Form` through the
+                // *same* shared `FormController` the `PANEL_SETTINGS` arm above
+                // uses, rather than as `ExtPanelItem` tree rows. This is the
+                // whole per-surface cost of plugin UI: one arm in the shared
+                // shell, zero lines in `src/gtk/` or `src/tui_main/`.
+                let panel = render::SidebarPanelBody {
+                    background: Some(theme.tab_bar_bg),
+                    chrome: render::SidebarPanelChrome::Header(format!(
+                        " {}",
+                        screen
+                            .ext_panel
+                            .as_ref()
+                            .map(|p| p.title.clone())
+                            .unwrap_or_default()
+                    )),
+                    scrollbar_gutter: None,
+                };
+                panel.render_with(backend, q_sb, |backend, body_rect| {
+                    // Same contract as the Settings arm: cache the exact rect
+                    // painted, because `handle_plugin_view_ui_event` re-derives
+                    // row geometry from it.
+                    engine.plugin_view_form_rect.set(body_rect);
+                    engine.ext_panel_content_rect.set(q_sb);
+                    if render::populate_plugin_view_form_controller(engine) {
+                        engine
+                            .plugin_view_form_controller
+                            .borrow_mut()
+                            .render_and_cache(backend, body_rect);
+                    }
+                });
+            }
             id if id.starts_with("ext:") => {
                 // #1089: a plugin-provided panel — paint its own sections +
                 // items via `render::ext_panel_to_tree_view` +
@@ -6505,7 +6541,23 @@ impl App {
                 if is_press {
                     engine.ext_panel_has_focus = true;
                 }
+                // #146: a view-backed panel painted a `quadraui::Form`, so its
+                // clicks resolve through `FormController` (and dispatch to the
+                // plugin's `on_event`), not through the tree-row router.
+                let is_view = engine
+                    .ext_panel_active
+                    .as_deref()
+                    .is_some_and(|n| engine.is_plugin_view(n));
+                // `handle_plugin_view_ui_event`'s own `bool` return is ignored
+                // for the same reason the Settings arm ignores it: the position
+                // is already known to be inside the sidebar, so even a click on
+                // empty panel padding belongs here rather than leaking to the
+                // editor underneath.
                 match event {
+                    _ if is_view => {
+                        let rect = engine.plugin_view_form_rect.get();
+                        render::handle_plugin_view_ui_event(&mut engine, event, rect);
+                    }
                     UiEvent::Scroll { delta, .. } => {
                         let flat_len = engine.ext_panel_flat_len();
                         let step = (delta.y.abs() * 3.0).round().max(1.0) as usize;

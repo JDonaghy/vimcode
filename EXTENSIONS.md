@@ -626,6 +626,103 @@ vimcode.panel.reveal("my_panel", "Section A", "item_id")
 | `"dim"` | Muted/grey text |
 | `"bold"` | Highlighted/bright text |
 
+### View API (`vimcode.ui.*`) — declarative widget panels (#146)
+
+`vimcode.panel.*` above paints a **tree of rows**. `vimcode.ui.register_view`
+paints a **form of widgets** — text fields, dropdowns, toggles, buttons — from a
+declarative tree your `render` callback returns, and routes widget events back to
+your `on_event` callback.
+
+```lua
+local method = 1   -- 0-based index into the options list below
+local status = ""
+
+vimcode.ui.register_view("my_view", {
+    title = "My View",             -- sidebar header + activity-bar tooltip
+    icon = "",                    -- single character for the activity bar
+    fallback_icon = "M",           -- used when Nerd Fonts are disabled
+
+    -- Called when the panel is focused and after every `on_event`.
+    -- Return the widget tree to paint. `ctx.view` is the view's name.
+    render = function(ctx)
+        return {
+            id = "main",
+            schema_version = 1,
+            fields = {
+                { type = "label",  id = "hdr",    label = "Request" },
+                { type = "text",   id = "url",    label = "URL",
+                  value = "https://example.com", placeholder = "https://" },
+                { type = "dropdown", id = "method", label = "Method",
+                  options = { "GET", "POST" }, selected = method },
+                { type = "toggle", id = "tls",    label = "Verify TLS",
+                  value = true },
+                { type = "button", id = "send",   label = "Send" },
+                { type = "read_only", id = "st",  label = "Status",
+                  value = status },
+            },
+        }
+    end,
+
+    -- Called with the widget the user activated. Plain data — no closures.
+    on_event = function(ctx, event)
+        if event.kind == "ButtonClicked" and event.widget_id == "send" then
+            status = "sent"
+        elseif event.kind == "DropdownChanged" and event.widget_id == "method" then
+            method = event.value          -- 0-based index
+        end
+    end,
+})
+
+-- Ask for a re-render from anywhere (e.g. an async_shell callback):
+vimcode.ui.refresh("my_view")
+```
+
+`register_view` must be called at **load time** (like `vimcode.command` and
+`vimcode.keymap`). The `render` / `on_event` callbacks are stored and invoked
+later, and may use the whole `vimcode.*` API — including the immediate
+`vimcode.buffer.*` / `vimcode.window.*` API.
+
+**Field types:**
+
+| `type` | Extra keys | Emits |
+|--------|-----------|-------|
+| `"label"` | — | nothing (section header) |
+| `"read_only"` | `value` | nothing |
+| `"text"` | `value`, `placeholder` | `TextCommitted` |
+| `"password"` | `value`, `placeholder` | `TextCommitted` |
+| `"text_area"` | `value`, `placeholder`, `rows` | `TextCommitted` |
+| `"toggle"` | `value` | `ToggleChanged` (`event.value` = bool) |
+| `"button"` | — | `ButtonClicked` |
+| `"dropdown"` | `options`, `selected` | `DropdownChanged` (`event.value` = 0-based index) |
+| `"segmented"` | `options`, `selected` | `SegmentedChanged` (`event.value` = 0-based index) |
+| `"buttons"` | `buttons = {{id=,label=,disabled=}}` | `ButtonClicked` per button id |
+| `"toggles"` | `toggles = {{id=,label=,value=}}` | `ToggleChanged` per toggle id |
+
+Every field also accepts `label`, `hint`, `disabled`, `error` and `warning`
+(`error` / `warning` render an indicator plus the message instead of the hint).
+
+**Your widget ids are yours.** Internally they are namespaced
+(`plugin:<view>:<id>`) so two extensions can both call a button `"send"`, but
+`event.widget_id` is always the id *you* wrote.
+
+**Your state is yours.** Vimcode never edits the values you declared — it reports
+what the activation implies (`ToggleChanged` carries the *new* value) and paints
+whatever your next `render` returns. Selection and scroll position are vimcode's
+and survive a re-render.
+
+**Keys (when the panel has focus):** `j`/`k`/`Tab` move between interactive
+fields (labels and read-only rows are skipped), `Enter`/`Space` activates the
+focused field, `g`/`G` jump to the first/last field, `q`/`Escape` unfocus,
+`h`/`Left` returns to the activity bar.
+
+**`schema_version`** declares which vocabulary your tree uses. Omit it for the
+current version (1). A view declaring a version newer than the running vimcode
+understands is refused with a status-line error instead of being half-rendered.
+
+**Not yet supported (tracked by #1403):** in-panel text *entry* (declared text
+values paint and `Enter` commits them, but typing into a field is Phase 2), and
+hosting a view in an editor-area tab rather than the sidebar.
+
 ### Comment Style Override
 
 Override comment syntax for a language (useful for custom/niche languages):

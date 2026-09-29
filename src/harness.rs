@@ -139,6 +139,12 @@
 #[cfg(test)]
 pub mod plugin_panel;
 
+/// #146: the plugin-declared **view** (`vimcode.ui.register_view`) fixture +
+/// scenarios. Sibling of [`plugin_panel`], which covers the older
+/// `vimcode.panel.register` tree panels.
+#[cfg(test)]
+pub mod plugin_view;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
