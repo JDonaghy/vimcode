@@ -328,12 +328,39 @@
 //! `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`) and the
 //! `JDonaghy/quadraui#1213` reentrancy fix that unblocked bumping past it
 //! (see the `Cargo.toml` pin comment). `App::render_content`'s existing
-//! three-way branch needed no vimcode-side change to pick it up, confirming
-//! the analysis above. Real-hardware verification on dell64 (see this
-//! issue's tracking notes) confirms the custom title bar and command
-//! centre now render instead of falling into the TUI-shaped hidden arm —
-//! the status-segment item still separately needs its own real-hardware
-//! re-check now that Win-GUI can start again.
+//! three-way branch needed no vimcode-side change to pick it up — but see
+//! the correction immediately below: it doesn't actually reach the
+//! `window_chrome` arm on Windows either.
+//!
+//! **Correction (#1622):** the "confirms the custom title bar and command
+//! centre now render" line above was wrong — #1618's dell64 session only
+//! re-verified #1582's menu bar, not this one. #1622 actually built and
+//! ran `vimcode.exe` on dell64: it shows the stock native caption (icon,
+//! title, real min/max/close) plus a separate native/owner-drawn Win32
+//! menu row underneath — the pre-#1562 look — with no command-centre
+//! search box anywhere in the band (confirmed via a 3x-zoomed crop of the
+//! blank space between the title and the window buttons). The three-way
+//! branch *is* reached, but it never takes the `window_chrome` arm for
+//! Win-GUI: `WinBackend::backend_caps()` now declares `native_menu: true`
+//! as well (quadraui#1200, for #1582), the `if native_menu {...} else if
+//! window_chrome {...}` order in `App::setup` always prefers the first
+//! arm, and `capture_window_and_apply_csd`'s `!backend.backend_caps()
+//! .native_menu` gate (`src/app.rs`) means `set_decorated(false)` — the
+//! call that would clear `WS_CAPTION` and hand the title strip to
+//! `WM_NCCALCSIZE`/`WM_NCHITTEST` — never runs either. `MacBackend` has
+//! declared this identical `{native_menu: true, window_chrome: true}` pair
+//! for a while, which is exactly why this regressed silently: the two
+//! caps mean different things per backend (macOS's native menu bar has no
+//! in-window footprint at all; Windows' is a per-window `SetMenu` `HMENU`
+//! right under the caption) and nothing in `BackendCaps`/`ShellConfig`
+//! currently says which one a given backend means — see
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the drafted ask. Not
+//! patched blind in `src/app.rs`: the only two candidate fixes (reorder
+//! the branch, or gate `capture_window_and_apply_csd` on something other
+//! than `native_menu`) both risk an unverifiable macOS regression, and
+//! this dev loop has no macOS hardware to check either against. The
+//! status-segment item still separately needs its own real-hardware
+//! re-check, unaffected by this finding.
 //!
 //! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
 //! # gap #1562 found, but the narrower `native_menu` half of it
