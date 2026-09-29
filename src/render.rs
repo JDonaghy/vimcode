@@ -20466,31 +20466,12 @@ pub fn populate_ai_chat_controller(
     // that triggered them).
     push_tool_calls_at(ai_messages.len(), &mut turns, &mut kinds);
 
-    // #956 (ACP-5): the agent's current plan, rendered as one synthetic
-    // checklist turn appended *after* the real conversation — never mixed
-    // into `engine.acp().ai_messages` itself. `engine.acp().plan` already holds
-    // only the latest `plan` update (a full replacement, not a delta — see
-    // that field's doc), so this turn is rebuilt fresh from it every call:
-    // two successive `plan` updates leave exactly one checklist rendered,
-    // reflecting the second, by construction (there is only ever one
-    // `acp_plan` value to read). Appending at the end rather than inline
-    // where the update actually streamed keeps "current plan state" always
-    // visible without scrolling (`ChatController` stays stuck-to-bottom),
-    // at the deliberate cost of it not being in strict chronological order
-    // with any later message chunks in the same turn.
-    if !acp.plan.is_empty() {
-        turns.push(quadraui::ChatTurn {
-            role: quadraui::ChatRole::System,
-            text: quadraui::StyledText::colored(
-                crate::core::acp::plan_to_checklist_text(&acp.plan),
-                thought_fg,
-            ),
-            timestamp_unix: None,
-            line_scales: Vec::new(),
-        });
-        kinds.push(crate::core::acp_session::TranscriptTurnKind::Plan);
-    }
-
+    // #956/#1513: the agent's current plan no longer appends as a synthetic
+    // trailing transcript turn — see `ai_plan_multi_section_view`'s doc for
+    // why (streaming text used to push it around and scroll it away, #1513's
+    // whole complaint). It paints as its own pinned block above the
+    // transcript instead; `ai_messages`/`turns`/`kinds` here are untouched
+    // by `engine.acp().plan`.
     *acp.transcript_turn_kinds.borrow_mut() = kinds;
 
     let mut chat = engine.ai_chat.borrow_mut();
@@ -20549,10 +20530,6 @@ pub fn populate_ai_chat_controller(
                         .flatten(),
                 );
             }
-            TranscriptTurnKind::Plan => {
-                chat.set_turn_collapsed(turn_idx, false);
-                chat.set_turn_summary(turn_idx, None);
-            }
         }
     }
     chat.set_busy(engine.acp().ai_streaming);
@@ -20603,6 +20580,20 @@ pub fn populate_ai_chat_controller(
             })
             .collect();
         header.push_str(&format!("  [{}]", strip.join(" | ")));
+    }
+    // #1513: "Plan n/m" progress folds into this same always-repainted
+    // header line — the pinned plan block below (`ai_plan_multi_section_
+    // view`) carries the full checklist, but a quick "how far along" glance
+    // shouldn't require expanding it, same reasoning as every other chip/
+    // suffix on this line.
+    if !acp.plan.is_empty() {
+        let total = acp.plan.len();
+        let done = acp
+            .plan
+            .iter()
+            .filter(|e| e.status == crate::core::acp::AcpPlanEntryStatus::Completed)
+            .count();
+        header.push_str(&format!("  \u{b7} Plan {done}/{total}"));
     }
     // #956 (ACP-5): current mode + usage telemetry both fold into this one
     // existing status line rather than a new widget — "unobtrusive status
@@ -20658,6 +20649,15 @@ pub fn populate_ai_chat_controller(
     for attachment in &engine.acp_manual_attachments {
         header.push_str(&format!("  \u{b7} {}", attachment.chip()));
     }
+    // #1513: every staged `@symbol` mention gets its own chip on this same
+    // always-repainted, focus-safe status line — same reasoning as the
+    // manual-attachment chips immediately above.
+    for symbol in &engine.acp_pending_symbol_mentions {
+        header.push_str(&format!(
+            "  \u{b7} {}",
+            symbol.chip(&engine.acp_workspace_cwd())
+        ));
+    }
     // #1512: "queued (1)" while a message submitted mid-turn is waiting to
     // be sent (`AcpSession::queued_prompt`) — same always-repainted,
     // focus-safe status line as every other chip/suffix here. Only ever
@@ -20691,6 +20691,189 @@ pub fn populate_ai_chat_controller(
         ),
         theme.comment,
     )));
+}
+
+// ── #1513: pinned, collapsible plan block ────────────────────────────────
+
+/// Build the `quadraui::MultiSectionView` for the AI panel's pinned plan
+/// block, or `None` while `engine.acp().plan` is empty (nothing to pin).
+///
+/// One section, not the whole `ChatController` transcript: pre-#1513 the
+/// plan rendered as a synthetic *trailing* transcript turn
+/// (`populate_ai_chat_controller` used to push one, see that function's git
+/// history) — streaming assistant text kept appending turns after it, so
+/// the plan drifted down and off the visible viewport the moment a reply
+/// started streaming, exactly the issue's complaint. Pinning it in its own
+/// band above `ChatController` (painted by `paint_ai_plan_band`, in a rect
+/// carved out of the panel *before* `ChatController::render` ever sees the
+/// remainder) means it can never move regardless of how much transcript
+/// text streams in below it.
+///
+/// Collapsed (the default, `!engine.ai_plan_expanded`) shows only the
+/// header: `"Plan n/m: <in-progress entry>"` (or "All steps complete" once
+/// `n == m`) — enough to see what the agent is doing right now without
+/// spending any vertical space on the rest of the list. Expanded shows the
+/// full checklist as the section body, one line per entry with the same
+/// status glyphs `plan_to_checklist_text` uses, so a reader who already
+/// knows that convention doesn't have to learn a second one.
+pub fn ai_plan_multi_section_view(
+    engine: &Engine,
+    theme: &Theme,
+) -> Option<quadraui::MultiSectionView> {
+    let plan = &engine.acp().plan;
+    if plan.is_empty() {
+        return None;
+    }
+    let total = plan.len();
+    let done = plan
+        .iter()
+        .filter(|e| e.status == crate::core::acp::AcpPlanEntryStatus::Completed)
+        .count();
+    let expanded = engine.ai_plan_expanded;
+    let title = if expanded {
+        format!("Plan {done}/{total}")
+    } else {
+        let current = plan
+            .iter()
+            .find(|e| e.status == crate::core::acp::AcpPlanEntryStatus::InProgress)
+            .map(|e| e.content.clone())
+            .unwrap_or_else(|| {
+                if done == total {
+                    "All steps complete".to_string()
+                } else {
+                    "Plan".to_string()
+                }
+            });
+        format!("Plan {done}/{total}: {current}")
+    };
+    let lines: Vec<quadraui::StyledText> = plan
+        .iter()
+        .map(|e| {
+            let (glyph, color) = match e.status {
+                crate::core::acp::AcpPlanEntryStatus::Completed => ('\u{2611}', theme.comment),
+                crate::core::acp::AcpPlanEntryStatus::InProgress => ('\u{25d0}', theme.keyword),
+                crate::core::acp::AcpPlanEntryStatus::Pending => ('\u{2610}', theme.foreground),
+            };
+            quadraui::StyledText::colored(format!("{glyph} {}", e.content), color)
+        })
+        .collect();
+    Some(quadraui::MultiSectionView {
+        id: quadraui::WidgetId::new("ai-plan"),
+        sections: vec![quadraui::Section {
+            id: "plan".to_string(),
+            header: quadraui::SectionHeader {
+                icon: None,
+                title: quadraui::StyledText::plain(title),
+                badge: None,
+                actions: Vec::new(),
+                show_chevron: true,
+            },
+            body: quadraui::SectionBody::Text(lines),
+            aux: None,
+            size: quadraui::SectionSize::EqualShare,
+            collapsed: !expanded,
+            min_size: None,
+            max_size: None,
+        }],
+        active_section: None,
+        axis: quadraui::MsvAxis::Vertical,
+        allow_resize: false,
+        allow_collapse: true,
+        scroll_mode: quadraui::ScrollMode::WholePanel,
+        has_focus: false,
+        panel_scroll: 0.0,
+    })
+}
+
+/// Height (in `unit_h` units — pixels on GTK, cells on TUI, same convention
+/// every other AI-panel geometry helper here uses) the plan band should
+/// reserve at the top of the AI panel rect this frame: `0.0` when there is
+/// no plan to pin, one row for the header when collapsed, or the header
+/// plus one row per entry when expanded. Callers subtract this from the
+/// panel rect's height *before* handing the remainder to `ChatController`
+/// (`paint_ai_plan_band`'s doc has the call sequence).
+pub fn ai_plan_band_height(engine: &Engine, unit_h: f32) -> f32 {
+    let Some(plan_len) = (!engine.acp().plan.is_empty()).then(|| engine.acp().plan.len()) else {
+        return 0.0;
+    };
+    let header_rows = 1.0;
+    let body_rows = if engine.ai_plan_expanded {
+        plan_len as f32
+    } else {
+        0.0
+    };
+    (header_rows + body_rows) * unit_h.max(1.0)
+}
+
+/// Paint the plan block into `rect` (the band `ai_plan_band_height` sized)
+/// and cache the layout it painted with in `Engine::ai_plan_layout` — same
+/// "cache what actually got painted" contract `ai_chat_rect`/
+/// `ext_panel_tree_layout` already use, so `route_ai_plan_band_click`'s
+/// hit-test can never derive a different geometry than what's on screen.
+/// No-op (and clears the cached layout/rect) when there's no plan to pin.
+pub fn paint_ai_plan_band(
+    backend: &mut dyn quadraui::Backend,
+    engine: &Engine,
+    theme: &Theme,
+    rect: quadraui::Rect,
+) {
+    let Some(view) = ai_plan_multi_section_view(engine, theme) else {
+        engine
+            .ai_plan_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        *engine.ai_plan_layout.borrow_mut() = None;
+        return;
+    };
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        engine
+            .ai_plan_rect
+            .set(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0));
+        *engine.ai_plan_layout.borrow_mut() = None;
+        return;
+    }
+    engine.ai_plan_rect.set(rect);
+    let unit_h = backend.line_height().max(1.0);
+    let metrics = quadraui::MsvLayoutMetrics {
+        header_size: unit_h,
+        divider_size: 0.0,
+        scrollbar_size: 0.0,
+        cell_quantum: 0.0,
+    };
+    // Body content size in main-axis units: one row per plan entry — the
+    // only section, so `SectionSize::EqualShare` above already consumes
+    // exactly `rect`'s height regardless of this value, but `layout` still
+    // wants a `measure` closure per its signature.
+    let plan_len = engine.acp().plan.len() as f32;
+    let layout = view.layout(rect, metrics, |_| quadraui::SectionMeasure {
+        content_size: plan_len * unit_h,
+        aux_size: 0.0,
+    });
+    backend.draw_multi_section_view(rect, &view);
+    *engine.ai_plan_layout.borrow_mut() = Some(layout);
+}
+
+/// Route a press at `pos` (same coordinate space `ai_plan_rect`/
+/// `ai_plan_layout` were painted in) against the plan block. Only the
+/// header is interactive — clicking it (anywhere in the title area, or the
+/// chevron) toggles `Engine::ai_plan_expanded`. Returns whether the press
+/// landed on the band at all, so the caller (`App::route_ai_sidebar_event`)
+/// knows whether to forward the event to `ChatController` instead.
+pub fn route_ai_plan_band_click(engine: &mut Engine, pos: quadraui::Point) -> bool {
+    let layout = engine.ai_plan_layout.borrow();
+    let Some(layout) = layout.as_ref() else {
+        return false;
+    };
+    match layout.hit_test(pos.x, pos.y) {
+        quadraui::MultiSectionViewHit::Header { .. } => {
+            engine.ai_plan_expanded = !engine.ai_plan_expanded;
+            true
+        }
+        quadraui::MultiSectionViewHit::Outside => false,
+        // Body/divider/scrollbar/inert: still inside the band's bounds —
+        // consumed so a click there doesn't fall through to the editor
+        // underneath, but nothing to toggle.
+        _ => true,
+    }
 }
 
 /// Braille spinner frame table (#1508) — the same 10-glyph rotation

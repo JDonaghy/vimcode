@@ -1680,6 +1680,14 @@ impl Engine {
                             self.picker_populate_workspace_symbols(symbols);
                             redraw = true;
                         }
+                    } else if self.lsp_pending_ai_mention_symbols == Some(request_id) {
+                        // #1513: `@symbol` mention completion's own
+                        // request — distinct pending-id field from the
+                        // Command Center picker's above, so the two can
+                        // never steal each other's response.
+                        self.lsp_pending_ai_mention_symbols = None;
+                        self.ai_mention_symbol_cache = symbols;
+                        redraw = true;
                     }
                 }
                 LspEvent::WorkProgressBegin {

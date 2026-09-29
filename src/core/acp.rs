@@ -1321,6 +1321,85 @@ fn mime_type_for_path(path: &std::path::Path) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt context — `@symbol` mentions (#1513)
+// ---------------------------------------------------------------------------
+
+/// A `@symbol` mention accepted from the AI panel's `@`-completion popup
+/// (#1513) — staged the moment the user accepts a symbol candidate
+/// (`Engine::ai_mention_accept_selected`) into `Engine::acp_pending_
+/// symbol_mentions`, the same "compute now, send whenever the next prompt
+/// goes out" contract [`AcpRangeAttachment`] already uses.
+///
+/// Unlike a `@path` file mention — re-resolved from the filesystem at send
+/// time by [`crate::core::engine::Engine::acp_mention_content_blocks`] —
+/// an LSP symbol's location only exists in the `workspace/symbol` response
+/// that found it; there is nothing in the literal `@path#Name` text spliced
+/// into the input to re-derive a line number from, so this has to be
+/// staged eagerly instead of re-parsed lazily.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpSymbolMention {
+    /// Resolved, workspace-relative-safe path (see
+    /// [`resolve_path_within_roots`]) — never the raw path the LSP server
+    /// reported.
+    pub path: std::path::PathBuf,
+    pub name: String,
+    /// 0-based line the symbol's `selectionRange` (or `range`, see
+    /// [`crate::core::lsp::SymbolInfo`]) starts at.
+    pub line: u32,
+    /// The symbol's `detail` (e.g. a function signature), if the LSP
+    /// server reported one — folded into the `resource`/`resource_link`
+    /// block's text so an agent gets more than a bare name, without this
+    /// codebase needing to read the file itself to synthesize a snippet.
+    pub detail: Option<String>,
+}
+
+impl AcpSymbolMention {
+    /// The `⚑ <name> (<path>:<line>)` chip shown in the AI panel header
+    /// while this mention is pending — same "one chip per staged item"
+    /// convention [`AcpManualAttachment::chip`] already uses, distinct
+    /// glyph so a symbol mention doesn't read as a manually attached file.
+    pub fn chip(&self, workspace_cwd: &std::path::Path) -> String {
+        let display = workspace_relative_display(&self.path, workspace_cwd);
+        format!("\u{2691} {} ({display}:{})", self.name, self.line + 1)
+    }
+
+    /// This mention's `session/prompt` content block, chosen per
+    /// `caps.embedded_context` — same branch [`AcpRangeAttachment::
+    /// content_blocks`] takes, for the same reason: a `resource` block
+    /// (carrying inline `text`) is only safe to send once the agent has
+    /// declared it understands `embeddedContext`; baseline ACP v1 falls
+    /// back to a `resource_link` whose `name` folds in what little text
+    /// context is available (the symbol's `detail`, if any).
+    pub fn content_block(&self, caps: AcpPromptCapabilities) -> serde_json::Value {
+        let line1 = self.line + 1;
+        let body = self.detail.clone().unwrap_or_else(|| self.name.clone());
+        if caps.embedded_context {
+            serde_json::json!({
+                "type": "resource",
+                "resource": {
+                    "uri": format!(
+                        "{}#L{line1}-L{line1}",
+                        crate::core::lsp::path_to_uri(&self.path)
+                    ),
+                    "mimeType": mime_type_for_path(&self.path),
+                    "text": body,
+                },
+            })
+        } else {
+            let name = format!("{} ({}:{line1})", self.name, self.path.display());
+            serde_json::json!({
+                "type": "resource_link",
+                "uri": format!(
+                    "{}#L{line1}-L{line1}",
+                    crate::core::lsp::path_to_uri(&self.path)
+                ),
+                "name": name,
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Prompt context — manual file/image attachments (#1464)
 // ---------------------------------------------------------------------------
 
@@ -3803,6 +3882,71 @@ mod tests {
         assert_eq!(
             block["data"],
             base64::engine::general_purpose::STANDARD.encode([0x89, 0x50, 0x4e, 0x47])
+        );
+    }
+
+    /// #1513: `caps.embedded_context == true` produces a `resource` block
+    /// carrying an `#L<line>-L<line>` fragment and the symbol's `detail`
+    /// as inline text.
+    #[test]
+    fn symbol_mention_with_embedded_context_sends_a_resource_block_with_the_symbols_range() {
+        let mention = AcpSymbolMention {
+            path: PathBuf::from("/work/src/lib.rs"),
+            name: "MyStruct".to_string(),
+            line: 41,
+            detail: Some("struct MyStruct".to_string()),
+        };
+        let block = mention.content_block(AcpPromptCapabilities {
+            embedded_context: true,
+            ..Default::default()
+        });
+        assert_eq!(block["type"], "resource");
+        assert_eq!(
+            block["resource"]["uri"],
+            format!("{}#L42-L42", crate::core::lsp::path_to_uri(&mention.path))
+        );
+        assert_eq!(block["resource"]["text"], "struct MyStruct");
+    }
+
+    /// Baseline ACP v1 (no `embeddedContext`) falls back to a
+    /// `resource_link` whose `name` still carries the symbol name and
+    /// location, same "some context beats none" reasoning `AcpRangeAttachment
+    /// ::content_blocks`'s fallback arm already uses.
+    ///
+    /// RED verified: with `content_block`'s `else` arm stubbed to always
+    /// emit the `resource` shape (ignoring `caps`), this fails — the block
+    /// type isn't `resource_link`.
+    #[test]
+    fn symbol_mention_without_embedded_context_falls_back_to_a_resource_link() {
+        let mention = AcpSymbolMention {
+            path: PathBuf::from("/work/src/lib.rs"),
+            name: "MyStruct".to_string(),
+            line: 41,
+            detail: None,
+        };
+        let block = mention.content_block(AcpPromptCapabilities::default());
+        assert_eq!(block["type"], "resource_link");
+        assert!(
+            block["name"].as_str().unwrap().contains("MyStruct"),
+            "{block:?}"
+        );
+        assert!(
+            block["name"].as_str().unwrap().contains(":42"),
+            "the 1-based line must be in the fallback name: {block:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_mention_chip_is_workspace_relative() {
+        let mention = AcpSymbolMention {
+            path: PathBuf::from("/work/src/lib.rs"),
+            name: "MyStruct".to_string(),
+            line: 41,
+            detail: None,
+        };
+        assert_eq!(
+            mention.chip(Path::new("/work")),
+            "\u{2691} MyStruct (src/lib.rs:42)"
         );
     }
 

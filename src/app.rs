@@ -3655,11 +3655,39 @@ impl App {
                 // `Engine` (not here) so `route_ai_chat_event` re-derives
                 // the identical layout `render()` painted (#544/#582/#646).
                 render::populate_ai_chat_controller(engine, theme, backend);
-                engine.ai_chat_rect.set(q_sb);
-                engine.ai_chat.borrow().render(backend, q_sb);
+                // #1513: the pinned plan block gets a band carved off the
+                // top of the panel rect *before* `ChatController` ever sees
+                // the remainder — `ai_chat_rect` (and therefore every
+                // `route_ai_chat_event` hit-test) is the shrunk rect, so a
+                // click inside the band never reaches the transcript below
+                // it. Zero-height (no-op split) while there's no plan.
+                let plan_h = render::ai_plan_band_height(engine, backend.line_height());
+                let (plan_rect, chat_rect) = if plan_h > 0.0 {
+                    (
+                        quadraui::Rect::new(q_sb.x, q_sb.y, q_sb.width, plan_h),
+                        quadraui::Rect::new(
+                            q_sb.x,
+                            q_sb.y + plan_h,
+                            q_sb.width,
+                            (q_sb.height - plan_h).max(0.0),
+                        ),
+                    )
+                } else {
+                    (quadraui::Rect::new(q_sb.x, q_sb.y, 0.0, 0.0), q_sb)
+                };
+                render::paint_ai_plan_band(backend, engine, theme, plan_rect);
+                engine.ai_chat_rect.set(chat_rect);
+                engine.ai_chat.borrow().render(backend, chat_rect);
                 // #956 (ACP-5): slash-command completions, painted on top —
                 // no-op unless the input matches an agent-declared command.
-                render::paint_ai_command_completions(backend, engine, q_sb);
+                // `chat_rect` (not `q_sb`), per `paint_ai_command_completions`'s
+                // own contract: the same rect `ai_chat.render()` just used,
+                // so the popup anchors off the input box's *actual* position
+                // — unaffected by the #1513 plan-band split in the common
+                // case (the band only eats space off the top), but wrong to
+                // silently keep passing the unshrunk sidebar rect here now
+                // that the two can differ.
+                render::paint_ai_command_completions(backend, engine, chat_rect);
                 // `cached_explorer_metrics`'s drift guard, ported: `backend`'s
                 // "current" line_height/char_width are mutable and can be
                 // overwritten by whatever paints next this frame or the
@@ -6512,7 +6540,7 @@ impl App {
                 }
                 true
             }
-            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, starts_interaction),
+            render::SidebarOwner::Ai => self.route_ai_sidebar_event(event, pos, starts_interaction),
             render::SidebarOwner::Board => {
                 self.route_board_sidebar_event(event, pos, starts_interaction)
             }
@@ -6667,11 +6695,13 @@ impl App {
     fn route_ai_sidebar_event(
         &mut self,
         event: &quadraui::UiEvent,
+        pos: quadraui::Point,
         starts_interaction: bool,
     ) -> bool {
         let mut engine = self.engine.borrow_mut();
         let rect = engine.ai_chat_rect.get();
-        if rect.width <= 0.0 {
+        let plan_rect = engine.ai_plan_rect.get();
+        if rect.width <= 0.0 && plan_rect.width <= 0.0 {
             return false;
         }
         if starts_interaction {
@@ -6682,6 +6712,23 @@ impl App {
             // (unlike a keystroke) has no natural place in the input to
             // insert buffered text.
             engine.ai_leader_toggle_pending.clear();
+            // #1513: a press landing on the pinned plan block's band
+            // toggles its collapse state instead of reaching `ChatController`
+            // — checked first (before the metrics re-apply/`route_ai_chat_
+            // event` call below) exactly like `route_board_sidebar_event`'s
+            // right-click resolves against its own cached layout ahead of
+            // falling through to generic nav.
+            if plan_rect.width > 0.0
+                && plan_rect.height > 0.0
+                && pos.y >= plan_rect.y
+                && pos.y < plan_rect.y + plan_rect.height
+            {
+                render::route_ai_plan_band_click(&mut engine, pos);
+                return true;
+            }
+        }
+        if rect.width <= 0.0 {
+            return true;
         }
         let theme = render::Theme::from_name(&engine.settings.colorscheme);
         let backend_rc = self.backend.clone();

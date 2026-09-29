@@ -8696,4 +8696,266 @@ mod tests {
             );
         }
     }
+
+    mod issue_1513_ai_panel_plan_block {
+        use super::*;
+
+        /// Wide (220x30, `Alt+Right` x40 — same widening
+        /// `issue_1511_ai_panel_tool_call_cards`'s harness uses, so the
+        /// plan entries' text never word-wraps and confuses a
+        /// `screen.contains` check) harness with the AI panel open and no
+        /// ACP agent configured — `AcpSession::plan` is set directly, the
+        /// same "source-agnostic model, no transport in play" contract
+        /// `ai_panel_renders_plan_built_without_any_acp_transport` (GTK's
+        /// twin of this test, `src/gtk/testing.rs`) already covers.
+        fn widened_plan_harness() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            engine.acp_mut().plan = vec![
+                crate::core::acp::AcpPlanEntry {
+                    content: "PLAN_STEP_DONE".to_string(),
+                    status: crate::core::acp::AcpPlanEntryStatus::Completed,
+                },
+                crate::core::acp::AcpPlanEntry {
+                    content: "PLAN_STEP_ACTIVE".to_string(),
+                    status: crate::core::acp::AcpPlanEntryStatus::InProgress,
+                },
+            ];
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// #1513 acceptance: the plan checklist pins as its own
+        /// collapsible block above the transcript instead of appending as
+        /// a synthetic trailing turn that streaming text pushes around and
+        /// scrolls away (the issue's core complaint). Collapsed (the
+        /// default) shows only the in-progress entry plus `n/m` progress
+        /// in the status strip; clicking the block's header expands it to
+        /// the full checklist.
+        ///
+        /// RED verified: with `render::ai_plan_multi_section_view`
+        /// reverted to always report `collapsed: false` (i.e. #1513's
+        /// default-collapsed behaviour undone), the second assertion below
+        /// — that the completed entry is *not* painted before the header
+        /// click — fails.
+        #[test]
+        fn plan_block_collapses_to_in_progress_entry_and_expands_on_header_click_via_shell_app() {
+            let mut h = widened_plan_harness();
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("Plan 1/2"),
+                "the status strip must show n/m progress (1 of the 2 \
+                 seeded entries is Completed); screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("PLAN_STEP_ACTIVE"),
+                "the collapsed plan block must show the in-progress entry; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("PLAN_STEP_DONE"),
+                "collapsed (the default) must not show the completed \
+                 entry; screen:\n{screen}"
+            );
+
+            let plan_rect = h.engine.borrow().ai_plan_rect.get();
+            assert!(
+                plan_rect.width > 0.0 && plan_rect.height > 0.0,
+                "the plan band must have painted a non-empty rect; got \
+                 {plan_rect:?}"
+            );
+            h.driver.click(plan_rect.x + 1.0, plan_rect.y + 0.1);
+            h.driver.render();
+
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("PLAN_STEP_DONE"),
+                "clicking the plan header must expand it to the full \
+                 checklist; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("PLAN_STEP_ACTIVE"),
+                "the in-progress entry must still be visible expanded; \
+                 screen:\n{screen}"
+            );
+        }
+    }
+
+    mod issue_1513_at_dir_and_at_symbol_mentions {
+        use super::*;
+
+        /// Wide (220x30, `Alt+Right` x40 — same widening every other
+        /// AI-panel test in this file uses) harness with the AI panel open
+        /// and `engine.cwd`/`workspace_root` pointed at a real temp
+        /// directory, so `Engine::ai_mention_completions`' ignore-aware
+        /// filesystem walk has something real to find.
+        fn widened_ai_panel_harness(
+            workspace: &std::path::Path,
+        ) -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.cwd = workspace.to_path_buf();
+            engine.workspace_root = Some(workspace.to_path_buf());
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            // Real keyboard-focus path into the panel's own input box, not
+            // `engine.ai_has_focus = true` directly — `<leader>ai` (default
+            // leader Space), same production gesture
+            // `leader_ai_toggles_focus_back_to_editor_via_shell_app` uses.
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('i');
+            h.driver.render();
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: <leader>ai must focus the AI panel input"
+            );
+            h
+        }
+
+        /// #1513 acceptance: `@dir/` — typing `@` plus a matching directory
+        /// prefix shows a trailing-slash directory candidate in the
+        /// completion popup, and accepting it (Enter, same key `ai_
+        /// mention_accept_selected`'s existing `@file` behaviour uses)
+        /// splices the literal `@subdir/ ` text into the input.
+        ///
+        /// RED verified: with `ai_mention_completions`' directory-walk
+        /// change reverted (only `entry.file_type().is_file()` offered, no
+        /// `is_dir` arm), the first `screen.contains("@subdir/")` assertion
+        /// fails — no directory candidate ever appears in the popup.
+        #[test]
+        fn at_dir_completion_popup_paints_and_accepts_via_shell_app() {
+            let workspace = std::env::temp_dir()
+                .join(format!("vimcode_test_1513_tui_dir_{}", std::process::id()));
+            std::fs::create_dir_all(workspace.join("subdir")).expect("create test dir");
+            std::fs::write(workspace.join("subdir/a.rs"), "").expect("write file");
+            let mut h = widened_ai_panel_harness(&workspace);
+
+            for c in "@subd".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("@subdir/"),
+                "the completion popup must show a trailing-slash directory \
+                 candidate; screen:\n{screen}"
+            );
+
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "@subdir/ ",
+                "accepting the directory candidate must splice the literal \
+                 text verbatim plus a trailing space"
+            );
+
+            let _ = std::fs::remove_dir_all(&workspace);
+        }
+
+        /// #1513 acceptance: `@symbol` — with a `workspace/symbol` result
+        /// already cached (`Engine::ai_mention_symbol_cache`, standing in
+        /// for a real LSP round trip the same way this file's other
+        /// LSP-adjacent tests seed `picker_all_items`/`SymbolInfo`
+        /// directly rather than driving a real language server — see
+        /// `Engine::ai_mention_tick`'s own doc for why the fetch itself is
+        /// unit-tested separately, not through a driver), typing `@` plus
+        /// a matching symbol name shows a `@path#Name` candidate in the
+        /// popup, and accepting it (a) splices that literal text into the
+        /// input and (b) shows the symbol's chip on the always-repainted
+        /// status line — proving the accept path actually staged an
+        /// `AcpSymbolMention`, not just updated the input text.
+        ///
+        /// RED verified: with the `chosen.strip_prefix('@')`/
+        /// `split_once('#')` staging block removed from `Engine::
+        /// ai_mention_accept_selected`, the chip assertion fails (no
+        /// `⚑ MyStruct` on screen) even though the input-text assertion
+        /// above it still passes.
+        #[test]
+        fn at_symbol_completion_popup_paints_accepts_and_shows_a_chip_via_shell_app() {
+            let workspace = std::env::temp_dir().join(format!(
+                "vimcode_test_1513_tui_symbol_{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&workspace).expect("create test dir");
+            let mut h = widened_ai_panel_harness(&workspace);
+            h.engine.borrow_mut().ai_mention_symbol_cache = vec![crate::core::lsp::SymbolInfo {
+                name: "MyStruct".to_string(),
+                kind: crate::core::lsp::SymbolKind::Struct,
+                detail: Some("struct MyStruct".to_string()),
+                container: None,
+                path: Some(workspace.join("src/lib.rs")),
+                line: 41,
+                character: 0,
+                children: Vec::new(),
+            }];
+
+            for c in "@MyStr".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.render();
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("@src/lib.rs#MyStruct"),
+                "the completion popup must show a @path#Name symbol \
+                 candidate; screen:\n{screen}"
+            );
+
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+            assert_eq!(
+                h.engine.borrow().ai_chat.borrow().input_text(),
+                "@src/lib.rs#MyStruct ",
+                "accepting the symbol candidate must splice the literal \
+                 @path#Name text verbatim plus a trailing space"
+            );
+            assert_eq!(
+                h.engine.borrow().acp_pending_symbol_mentions.len(),
+                1,
+                "accepting a symbol candidate must stage an AcpSymbolMention"
+            );
+            let screen = h.driver.screen();
+            assert!(
+                screen.contains("MyStruct"),
+                "the staged symbol mention's chip must paint on the \
+                 always-repainted status line; screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&workspace);
+        }
+    }
 }
