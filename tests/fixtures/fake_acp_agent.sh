@@ -132,7 +132,16 @@
 #                           second one's request never needs a dialog
 #                           (client-side allow_always memory) while still
 #                           proving the reply actually reaches this process
-#                           each time. With $ACP_FAKE_DIE_DURING_PERMISSION
+#                           each time. With $ACP_FAKE_REQUEST_PERMISSION_DIFF
+#                           set (#1518): same request_permission shape, but
+#                           the toolCall also carries a `diff` content block
+#                           — for asserting the dialog previews the
+#                           proposed change. With
+#                           $ACP_FAKE_REQUEST_PERMISSION_EXECUTE set (#1518):
+#                           an execute-kind toolCall with `rawInput` and no
+#                           diff content — for asserting the dialog falls
+#                           back to showing the raw command. With
+#                           $ACP_FAKE_DIE_DURING_PERMISSION
 #                           set: emits that same request_permission request
 #                           and exits immediately without reading a reply —
 #                           for the "agent dies with a permission dialog
@@ -610,6 +619,31 @@ while IFS= read -r line; do
       elif [ -n "$ACP_FAKE_REQUEST_PERMISSION" ]; then
         printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
         # Park: block until the client answers request 9002 out of band.
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_REQUEST_PERMISSION_DIFF" ]; then
+        # #1518: same as $ACP_FAKE_REQUEST_PERMISSION but the toolCall also
+        # carries a `diff` content block, so a test can assert the
+        # permission dialog previews the actual proposed change (not just
+        # title/kind/locations) before the human approves it.
+        # Two separate single-line runs (a pure deletion, then a pure
+        # addition several lines later) rather than one line replacing
+        # another — a same-position 1-line-for-1-line change classifies as
+        # quadraui's `DiffRowKind::Changed` (`quadraui::diff::compute_
+        # hunks`), whose *unified*-mode text (`unified_row_text`) shows
+        # only the new side, discarding the old — correct for the shared
+        # primitive's own side-by-side use, but not what this scripted
+        # fixture needs to exercise both an old (`-`) and a new (`+`) line
+        # unambiguously in the unified preview text a test asserts on.
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Edit src/main.rs","kind":"edit","locations":[{"path":"src/main.rs","line":42}],"content":[{"type":"diff","path":"src/main.rs","oldText":"keep1\\nold line\\nkeep2\\n","newText":"keep1\\nkeep2\\nnew line\\n"}]},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
+        read -r _reply
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_REQUEST_PERMISSION_EXECUTE" ]; then
+        # #1518: an execute-kind tool call with `rawInput` but no `diff`
+        # content block — the dialog body must fall back to showing
+        # rawInput (the command about to run) since there's no diff to
+        # preview.
+        printf '{"jsonrpc":"2.0","id":9002,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"title":"Run tests","kind":"execute","rawInput":{"command":"cargo test --quiet"}},"options":[{"optionId":"allow-once","name":"Allow Once","kind":"allow_once"},{"optionId":"allow-always","name":"Always Allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}\n'
         read -r _reply
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       elif [ -n "$ACP_FAKE_DIE_DURING_PERMISSION" ]; then

@@ -1689,12 +1689,16 @@ pub struct AcpPermissionOption {
     pub kind: String,
 }
 
-/// The `toolCall` a `session/request_permission` request asks about, pared
-/// down to exactly what #953's acceptance bar requires a human see before
-/// deciding: `title`, `kind`, `locations`. Everything else `toolCall` may
-/// carry (`rawInput`, `content`, `status`, ...) is out of scope for this
-/// slice's dialog (ACP-4/5 render the fuller tool-call shape elsewhere).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The `toolCall` a `session/request_permission` request asks about:
+/// `title`, `kind`, `locations` (#953's original acceptance bar — exactly
+/// what a human sees before deciding), plus `content`/`raw_input` (#1518 —
+/// the proposed diff for an edit, or the raw command for an execute/other
+/// tool call), so the permission dialog no longer asks a human to approve
+/// blind. `status` is deliberately still out of scope here: a tool call
+/// being asked about hasn't run yet, so a wire-sent `status` on this
+/// particular request would be meaningless (ACP-4/5's [`AcpToolCall`]
+/// tracks the real lifecycle once approved).
+#[derive(Debug, Clone, PartialEq)]
 pub struct AcpToolCallInfo {
     pub title: String,
     /// The tool-call's category (e.g. `"edit"`, `"execute"`, `"read"`) —
@@ -1706,13 +1710,26 @@ pub struct AcpToolCallInfo {
     /// `(path, line)` — `line` is 1-based and `None` when the agent didn't
     /// supply one.
     pub locations: Vec<(String, Option<u32>)>,
+    /// `toolCall.content[]`, parsed the same way [`AcpToolCall::content`]
+    /// is (via [`parse_tool_call_content`]) — #1518: a `Diff` block here is
+    /// what lets the permission dialog preview the actual proposed change
+    /// (`crate::core::review::unified_diff_preview_lines`) rather than just
+    /// naming the file. Empty when the agent's `toolCall` carried no
+    /// `content` array, same "absent, not a parse failure" convention
+    /// every other optional field on this struct already has.
+    pub content: Vec<AcpToolCallContentBlock>,
+    /// `toolCall.rawInput`, if the agent sent one — #1518: for a
+    /// non-`edit` tool call (`execute` most importantly) this is usually
+    /// the only human-legible description of what's about to run, since
+    /// `execute` tool calls don't carry a `diff` content block.
+    pub raw_input: Option<serde_json::Value>,
 }
 
 /// A parsed `session/request_permission` request — the whole payload the
 /// permission dialog needs, independent of the JSON-RPC `id` (the caller,
 /// [`crate::core::engine::Engine::poll_acp`], already has that from
 /// [`AcpEvent::ClientRequest`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AcpPermissionRequest {
     pub session_id: String,
     pub tool_call: AcpToolCallInfo,
@@ -1720,12 +1737,19 @@ pub struct AcpPermissionRequest {
 }
 
 /// Parse a `session/request_permission` request's `params` object per the
-/// ACP v1 schema: `{sessionId, toolCall: {title, kind, locations}, options:
-/// [{optionId, name, kind}]}`. Returns `None` for a malformed request
-/// (missing `sessionId`, no `options` array, or an option missing
-/// `optionId`) — the caller must still answer such a request (with a
-/// JSON-RPC error, not silence) rather than open a dialog with nothing
-/// selectable in it.
+/// ACP v1 schema: `{sessionId, toolCall: {title, kind, locations, content,
+/// rawInput}, options: [{optionId, name, kind}]}`. Returns `None` for a
+/// malformed request (missing `sessionId`, no `options` array, or an
+/// option missing `optionId`) — the caller must still answer such a
+/// request (with a JSON-RPC error, not silence) rather than open a dialog
+/// with nothing selectable in it.
+///
+/// `content`/`rawInput` (#1518) are parsed the same way
+/// [`parse_tool_call`]/[`parse_tool_call_update`] parse them off a
+/// `tool_call`/`tool_call_update` — `parse_tool_call_content` for the
+/// former, a direct `.get("rawInput").cloned()` for the latter — so a
+/// `diff` block or a raw command an agent sends here reads identically to
+/// one sent on the lifecycle updates.
 pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermissionRequest> {
     let session_id = params.get("sessionId")?.as_str()?.to_string();
     let tool_call_json = params.get("toolCall")?;
@@ -1752,6 +1776,8 @@ pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermiss
                 .collect()
         })
         .unwrap_or_default();
+    let content = parse_tool_call_content(tool_call_json);
+    let raw_input = tool_call_json.get("rawInput").cloned();
 
     let options_json = params.get("options")?.as_array()?;
     let mut options = Vec::with_capacity(options_json.len());
@@ -1793,6 +1819,8 @@ pub fn parse_request_permission(params: &serde_json::Value) -> Option<AcpPermiss
             title,
             kind,
             locations,
+            content,
+            raw_input,
         },
         options,
     })
@@ -3379,6 +3407,76 @@ mod tests {
     }
 
     // ---- parse_request_permission / permission_outcome_*: pure, no subprocess (#953, ACP-2) ----
+
+    /// #1518: a `diff` content block on `toolCall.content` must parse into
+    /// `AcpToolCallInfo::content`, the same shape a `tool_call`/
+    /// `tool_call_update` update parses it as — this is what lets the
+    /// permission dialog preview the actual proposed change instead of
+    /// just the tool call's title/kind/locations.
+    #[test]
+    fn parse_request_permission_reads_content_diff_block() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "title": "Edit src/main.rs",
+                "kind": "edit",
+                "content": [
+                    {"type": "diff", "path": "src/main.rs", "oldText": "old\n", "newText": "new\n"},
+                ],
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow Once", "kind": "allow_once"},
+            ],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert_eq!(
+            req.tool_call.content,
+            vec![AcpToolCallContentBlock::Diff {
+                path: "src/main.rs".to_string(),
+                old_text: Some("old\n".to_string()),
+                new_text: "new\n".to_string(),
+            }]
+        );
+    }
+
+    /// #1518: `toolCall.rawInput` must parse into
+    /// `AcpToolCallInfo::raw_input` verbatim — the permission dialog's
+    /// fallback for a non-edit (`execute` most importantly) tool call that
+    /// carries no `diff` content.
+    #[test]
+    fn parse_request_permission_reads_raw_input() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {
+                "title": "Run tests",
+                "kind": "execute",
+                "rawInput": {"command": "cargo test"},
+            },
+            "options": [
+                {"optionId": "allow-once", "name": "Allow Once", "kind": "allow_once"},
+            ],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert_eq!(
+            req.tool_call.raw_input,
+            Some(serde_json::json!({"command": "cargo test"}))
+        );
+    }
+
+    /// A `toolCall` with neither `content` nor `rawInput` must parse to an
+    /// empty/`None` pair, not fail — most tool calls (`read`, etc.) carry
+    /// neither.
+    #[test]
+    fn parse_request_permission_defaults_content_and_raw_input_when_absent() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "toolCall": {"title": "t", "kind": "read"},
+            "options": [{"optionId": "x", "name": "Go", "kind": "allow_once"}],
+        });
+        let req = parse_request_permission(&params).expect("should parse");
+        assert!(req.tool_call.content.is_empty());
+        assert!(req.tool_call.raw_input.is_none());
+    }
 
     #[test]
     fn parse_request_permission_reads_tool_call_and_options() {
