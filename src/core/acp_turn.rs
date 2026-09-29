@@ -289,6 +289,149 @@ pub fn hunk_matches_agents_last_write(
     now_right == agent_right
 }
 
+// ── in-buffer inline review (#1517) ─────────────────────────────────────
+//
+// Zed-style "review in the normal editor": rather than a separate
+// full-viewport pass (`crate::core::review::ChangeReviewState`, #955/#1516),
+// an outstanding checkpoint entry's hunks can be kept/rejected directly
+// against the buffer, with the human free to edit in between. Deliberately
+// *not* built on `ChangeReviewState` — that struct's `hunk_decisions`
+// vector exists to drive the modal surface, and `Engine::change_review.
+// is_some()` is treated as "the modal is showing, swallow every key/click"
+// throughout the engine (`review_ops.rs`'s own module doc); reusing it here
+// would mean auditing and re-gating every one of those call sites just to
+// keep normal editing alive, for a feature whose entire point is that
+// normal editing *stays* alive. Instead: [`AcpTurnFileEntry::pre_turn_
+// content`] is the one piece of state a hunk decision needs, and it
+// already exists — "keep" advances it forward past the kept hunk's range
+// (that range stops diffing as changed), "reject" reverts the *current*
+// buffer content's range back to it (identical math the modal's `r` key
+// already uses, `crate::core::review::ChangeReviewEntry::content_with_
+// hunk_reverted`, just lifted to a free function so this module doesn't
+// need to depend on `crate::core::review` at all). No separate decision
+// vector, so no way for the two to disagree about what's still pending —
+// a hunk is pending exactly when [`hunks_for`] still returns it.
+
+/// Hunks still outstanding between `pre_turn_content` and `current` — the
+/// in-buffer review's "what's still pending for this file" query. `None`
+/// pre-content means the agent created this path this turn (mirrors
+/// [`crate::core::review::ChangeReviewEntry::new`]'s "new file" branch —
+/// every line of `current` renders as a pure addition, one hunk).
+pub fn hunks_for(pre_turn_content: Option<&str>, current: &str) -> Vec<quadraui::DiffHunk> {
+    match pre_turn_content {
+        Some(pre) => quadraui::compute_hunks(pre, current),
+        None => pure_addition_hunks(current),
+    }
+}
+
+/// Mirror of `crate::core::review::pure_addition_hunks` (private there,
+/// duplicated here in miniature rather than made `pub(crate)` across a
+/// module boundary this module's own doc says to stay independent of) —
+/// every line of `text` as a single `Added` hunk. See that function's own
+/// doc for why a single trailing empty split element is dropped and why a
+/// genuinely empty `text` yields no hunks at all.
+fn pure_addition_hunks(text: &str) -> Vec<quadraui::DiffHunk> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if lines.len() > 1 && lines.last() == Some(&"") {
+        lines.pop();
+    }
+    vec![quadraui::DiffHunk {
+        left_start: 1,
+        right_start: 1,
+        rows: lines
+            .into_iter()
+            .map(|line| quadraui::DiffRow {
+                left: None,
+                right: Some(line.to_string()),
+                kind: quadraui::DiffRowKind::Added,
+            })
+            .collect(),
+    }]
+}
+
+/// Whether 1-based buffer line `line` falls inside `hunk`'s right-side
+/// (current-content) row range — the in-buffer surface's "which hunk is
+/// the cursor on" resolution, shared by keyboard action dispatch
+/// (`Engine::acp_inline_review_keep_hunk_at_line`/`..._reject_hunk_at_
+/// line`) and `]c`/`[c` navigation fallback (`Engine::jump_next_hunk`/
+/// `jump_prev_hunk`, `buffers.rs`). `false` for a pure-deletion hunk (no
+/// right-side row at all — nothing in the live buffer to point at).
+pub fn hunk_contains_right_line(hunk: &quadraui::DiffHunk, line: usize) -> bool {
+    let right_count = hunk.rows.iter().filter(|r| r.right.is_some()).count();
+    right_count > 0 && line >= hunk.right_start && line < hunk.right_start + right_count
+}
+
+/// 0-based buffer line of `hunk`'s last right-side row — where `render.rs`
+/// paints the in-buffer "[a] keep  [r] reject" virtual action row, right
+/// after the hunk's own content. `None` for a pure-deletion hunk (see
+/// [`hunk_contains_right_line`]'s doc).
+pub fn hunk_last_right_line_0based(hunk: &quadraui::DiffHunk) -> Option<usize> {
+    let right_count = hunk.rows.iter().filter(|r| r.right.is_some()).count();
+    if right_count == 0 {
+        return None;
+    }
+    Some(hunk.right_start + right_count - 2)
+}
+
+/// `r` (reject) on `hunk`: revert its range within `now` (the live buffer
+/// content) back to the hunk's left-side (pre-turn) text — every line
+/// outside the hunk's range is left exactly as `now` already has it.
+/// Verbatim lift of `crate::core::review::ChangeReviewEntry::content_
+/// with_hunk_reverted`'s math (see that method's doc for the reasoning);
+/// duplicated rather than shared for the same "stay independent of
+/// `crate::core::review`" reason [`hunks_for`]'s doc gives.
+pub fn revert_hunk(now: &str, hunk: &quadraui::DiffHunk) -> String {
+    let now_lines: Vec<&str> = now.split('\n').collect();
+    let right_start = hunk.right_start.saturating_sub(1).min(now_lines.len());
+    let right_count = hunk.rows.iter().filter(|r| r.right.is_some()).count();
+    let right_end = (right_start + right_count).min(now_lines.len());
+    let old_lines: Vec<&str> = hunk
+        .rows
+        .iter()
+        .filter_map(|row| row.left.as_deref())
+        .collect();
+    let mut result: Vec<&str> = Vec::with_capacity(now_lines.len());
+    result.extend_from_slice(&now_lines[..right_start]);
+    result.extend(old_lines);
+    result.extend_from_slice(&now_lines[right_end..]);
+    result.join("\n")
+}
+
+/// `a` (keep) on `hunk`: the file already holds the agent's write for it
+/// (same "pure decision, no buffer write" contract the modal's `a` key
+/// has, #1516), so keeping only needs to stop this range showing as
+/// pending — advance `pre` forward past it by splicing in the hunk's own
+/// right-side (current) text where its left-side (pre-turn) text used to
+/// be. `pre: None` (the agent created this path) always has exactly one
+/// hunk covering the whole file (see [`hunks_for`]'s doc) — keeping it
+/// means the file itself is no longer pending at all, so the new
+/// `pre_turn_content` becomes `current` verbatim rather than re-deriving
+/// it from the hunk's rows (avoids the phantom-empty-line hazard
+/// `crate::core::review`'s `pure_addition_hunks` doc warns a diff against
+/// a bare `""` left side has).
+pub fn keep_hunk(pre: Option<&str>, current: &str, hunk: &quadraui::DiffHunk) -> String {
+    let Some(pre) = pre else {
+        return current.to_string();
+    };
+    let pre_lines: Vec<&str> = pre.split('\n').collect();
+    let left_start = hunk.left_start.saturating_sub(1).min(pre_lines.len());
+    let left_count = hunk.rows.iter().filter(|r| r.left.is_some()).count();
+    let left_end = (left_start + left_count).min(pre_lines.len());
+    let new_lines: Vec<&str> = hunk
+        .rows
+        .iter()
+        .filter_map(|row| row.right.as_deref())
+        .collect();
+    let mut result: Vec<&str> = Vec::with_capacity(pre_lines.len());
+    result.extend_from_slice(&pre_lines[..left_start]);
+    result.extend(new_lines);
+    result.extend_from_slice(&pre_lines[left_end..]);
+    result.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +756,69 @@ mod tests {
             left_start,
             &rows
         ));
+    }
+
+    // ── in-buffer inline review (#1517) ─────────────────────────────────
+
+    #[test]
+    fn hunks_for_a_new_file_is_one_pure_addition_hunk() {
+        let hunks = hunks_for(None, "one\ntwo\n");
+        assert_eq!(hunks.len(), 1);
+        assert!(hunks[0].rows.iter().all(|r| r.left.is_none()));
+    }
+
+    #[test]
+    fn hunks_for_an_untouched_file_is_empty() {
+        assert!(hunks_for(Some("same\n"), "same\n").is_empty());
+    }
+
+    #[test]
+    fn hunk_contains_right_line_matches_only_its_own_range() {
+        let hunks = hunks_for(Some("one\ntwo\nthree\n"), "one\nTWO\nthree\n");
+        let hunk = &hunks[0];
+        // 1-based right-side line 2 ("TWO") is inside the hunk; lines 1
+        // and 3 (unchanged context the same hunk may still bracket) are
+        // only "inside" if `compute_hunks` happened to include them as
+        // context rows — assert on the specific changed line instead,
+        // which must always be contained.
+        assert!(hunk_contains_right_line(hunk, 2));
+        assert!(!hunk_contains_right_line(hunk, 100));
+    }
+
+    #[test]
+    fn hunk_last_right_line_0based_points_at_the_final_right_row() {
+        let hunks = hunks_for(None, "a\nb\nc\n");
+        let hunk = &hunks[0];
+        // Three added lines, right_start = 1 (1-based) -> last right row
+        // is 1-based line 3 -> 0-based line 2.
+        assert_eq!(hunk_last_right_line_0based(hunk), Some(2));
+    }
+
+    #[test]
+    fn revert_hunk_restores_the_pre_turn_text_for_its_range_only() {
+        let pre = "one\ntwo\nthree\n";
+        let now = "one\nTWO CHANGED\nthree\n";
+        let hunk = &hunks_for(Some(pre), now)[0];
+        let reverted = revert_hunk(now, hunk);
+        assert_eq!(reverted, pre);
+    }
+
+    #[test]
+    fn keep_hunk_advances_pre_turn_content_so_the_hunk_stops_being_pending() {
+        let pre = "one\ntwo\nthree\n";
+        let now = "one\nTWO CHANGED\nthree\n";
+        let hunk = &hunks_for(Some(pre), now)[0];
+        let new_pre = keep_hunk(Some(pre), now, hunk);
+        // The kept hunk must no longer show up as pending against the new
+        // pre-turn baseline.
+        assert!(hunks_for(Some(&new_pre), now).is_empty());
+    }
+
+    #[test]
+    fn keep_hunk_on_a_new_file_resolves_the_whole_file_at_once() {
+        let now = "created by agent\n";
+        let hunk = &hunks_for(None, now)[0];
+        let new_pre = keep_hunk(None, now, hunk);
+        assert!(hunks_for(Some(&new_pre), now).is_empty());
     }
 }

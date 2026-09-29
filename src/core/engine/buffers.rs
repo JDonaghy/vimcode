@@ -1517,6 +1517,10 @@ impl Engine {
                 i += 1;
             }
             self.message = "No more hunks".to_string();
+        } else if let Some(line) = self.next_inline_review_hunk_line(bid, cur) {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+            self.scroll_cursor_center();
         } else {
             // Fallback: search for @@ headers in diff buffers.
             let start = cur + 1;
@@ -1531,6 +1535,34 @@ impl Engine {
             }
             self.message = "No more hunks".to_string();
         }
+    }
+
+    /// `]c`/`[c` fallback (#1517): the 0-based buffer line of the first
+    /// in-buffer-review hunk (`Engine::acp_inline_review_hunks`) whose
+    /// right-side start is strictly after/before `cur` — `None` when this
+    /// buffer has no file path, no outstanding hunks, or no hunk on the
+    /// requested side, so the caller falls through to the plain `@@`-
+    /// header search unchanged.
+    fn next_inline_review_hunk_line(&self, bid: BufferId, cur: usize) -> Option<usize> {
+        let path = self.buffer_manager.get(bid)?.file_path.clone()?;
+        let hunks = self.acp_inline_review_hunks(&path.to_string_lossy());
+        hunks
+            .iter()
+            .map(|h| h.right_start.saturating_sub(1))
+            .filter(|&start| start > cur)
+            .min()
+    }
+
+    /// The previous-direction twin of [`Self::next_inline_review_hunk_
+    /// line`].
+    fn prev_inline_review_hunk_line(&self, bid: BufferId, cur: usize) -> Option<usize> {
+        let path = self.buffer_manager.get(bid)?.file_path.clone()?;
+        let hunks = self.acp_inline_review_hunks(&path.to_string_lossy());
+        hunks
+            .iter()
+            .map(|h| h.right_start.saturating_sub(1))
+            .filter(|&start| start < cur)
+            .max()
     }
 
     /// Jump to the previous changed region above the cursor.
@@ -1577,6 +1609,10 @@ impl Engine {
                 i -= 1;
             }
             self.message = "No more hunks".to_string();
+        } else if let Some(line) = self.prev_inline_review_hunk_line(bid, cur) {
+            self.view_mut().cursor.line = line;
+            self.view_mut().cursor.col = 0;
+            self.scroll_cursor_center();
         } else {
             for i in (0..cur).rev() {
                 let line: String = self.buffer().content.line(i).chars().collect();

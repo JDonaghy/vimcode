@@ -5283,7 +5283,8 @@ impl Engine {
 
         // All known built-in leader sequences
         const SEQUENCES: &[&str] = &[
-            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw", "ai",
+            "b", "rn", "gf", "gF", "gi", "gb", "ca", "sb", "sf", "sg", "sk", "so", "sp", "sw",
+            "ai", "ak", "ar",
         ];
 
         match partial.as_str() {
@@ -5354,6 +5355,18 @@ impl Engine {
             "gb" => {
                 // Toggle inline git blame
                 self.toggle_inline_blame();
+            }
+            "ak" => {
+                // #1517: in-buffer inline review — keep the agent hunk
+                // under the cursor. Deliberately not bare `a`/`r` (those
+                // are vim's own append/replace-char) — see `acp_turn_ops.
+                // rs`'s "in-buffer inline review" section doc.
+                self.acp_inline_review_keep_at_cursor();
+            }
+            "ar" => {
+                // #1517: in-buffer inline review — revert the agent hunk
+                // under the cursor to its pre-turn content.
+                self.acp_inline_review_reject_at_cursor();
             }
             "sb" => {
                 self.open_picker(PickerSource::Buffers);

@@ -21659,6 +21659,19 @@ fn build_rendered_window(
     // overlay — #1515 — to show in the same gutter column).
     let has_git = !buffer_state.git_diff.is_empty() || !acp_turn_status.is_empty();
 
+    // #1517: in-buffer inline review — the still-outstanding hunks between
+    // this buffer's checkpoint entry and its live content, gated the same
+    // `badge`-only way `acp_turn_status` immediately above is (see that
+    // computation's own doc). Reused below to paint a virtual
+    // "[a] keep  [r] reject" action row right after each hunk's last line
+    // — `crate::core::engine::acp_turn_ops::Engine::acp_inline_review_
+    // hunks`'s own doc has the full "why not `ChangeReviewState`" reasoning.
+    let inline_review_hunks: Vec<quadraui::DiffHunk> = buffer_state
+        .file_path
+        .as_deref()
+        .map(|p| engine.acp_inline_review_hunks(&p.to_string_lossy()))
+        .unwrap_or_default();
+
     // Look up LSP diagnostics for this buffer.
     // Diagnostics are keyed by absolute path (from LSP URIs), but buffer file_path
     // may be relative, so use the pre-computed canonical_path cached at file-open
@@ -22368,6 +22381,63 @@ fn build_rendered_window(
                         colorcolumns: Vec::new(),
                     });
                 }
+            }
+        }
+
+        // #1517: in-buffer inline review — right after the last line of
+        // any still-outstanding hunk, paint a virtual `[a] keep  [r]
+        // reject` action row (no buffer content of its own, same
+        // `is_wrap_continuation: true` convention the ghost-completion
+        // continuation rows above use to stay invisible to cursor
+        // targeting — `render.rs`'s `l.line_idx == ec.line &&
+        // !l.is_wrap_continuation` cursor-row lookup already skips it).
+        if lines.len() < visible_lines {
+            // `hunk_last_right_line_0based` is derived from `str::split
+            // ('\n')` row indices (`quadraui::compute_hunks`'s own
+            // convention), which has one *more* element than a ropey
+            // buffer's real line count whenever the file ends in `\n`
+            // (virtually every file) — a trailing phantom empty "row" a
+            // hunk's context can extend into at end-of-file. Clamped to
+            // the buffer's real last line so the action row lands there
+            // instead of never matching any real `line_idx` at all (the
+            // phantom index is one past every line the outer loop ever
+            // visits).
+            let clamped_total = total_lines.saturating_sub(1);
+            if let Some(hunk) = inline_review_hunks.iter().find(|h| {
+                crate::core::acp_turn::hunk_last_right_line_0based(h).map(|l| l.min(clamped_total))
+                    == Some(line_idx)
+            }) {
+                let edited = buffer_state.file_path.as_deref().is_some_and(|p| {
+                    engine.acp_inline_review_hunk_edited(&p.to_string_lossy(), hunk)
+                });
+                let label = if edited {
+                    "  [a] keep (edited)   [r] revert to pre-turn"
+                } else {
+                    "  [a] keep hunk   [r] reject hunk"
+                };
+                lines.push(RenderedLine {
+                    raw_text: label.to_string(),
+                    gutter_text: " ".repeat(gutter_char_width),
+                    is_current_line: false,
+                    spans: Vec::new(),
+                    is_fold_header: false,
+                    folded_line_count: 0,
+                    line_idx,
+                    git_diff: None,
+                    diagnostics: Vec::new(),
+                    spell_errors: Vec::new(),
+                    diff_status: None,
+                    is_breakpoint: false,
+                    is_conditional_bp: false,
+                    is_dap_current: false,
+                    is_wrap_continuation: true,
+                    segment_col_offset: 0,
+                    annotation: None,
+                    ghost_suffix: None,
+                    is_ghost_continuation: false,
+                    indent_guides: Vec::new(),
+                    colorcolumns: Vec::new(),
+                });
             }
         }
 
