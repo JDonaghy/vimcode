@@ -321,11 +321,22 @@
 //! decision — per the Platform-Neutrality Rule this is not a fix to
 //! attempt here. Drafted as a pending quadraui issue in
 //! `docs/PENDING_QUADRAUI_ISSUES.md` (new entry) rather than built in this
-//! crate. Leave #1562 open behind it — two of its three items are already
-//! resolved/no-defect-found, the title-bar/command-centre item is real and
-//! substantial, and the status-segment item needs a real-hardware
-//! re-check, none of which this repo's `git`-only worker access can close
-//! out further this session.
+//! crate.
+//!
+//! **Update (#1614):** the title-bar/command-centre fix landed upstream as
+//! quadraui#1199 (`WinBackend::backend_caps()` declares `window_chrome:
+//! true`, `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`),
+//! and `App::render_content`'s existing three-way branch needed no change
+//! to pick it up, confirming the analysis above. **The pin was not
+//! bumped**, though: the quadraui rev containing #1199 also contains
+//! #1200 (native menu bar), and real-hardware verification on dell64 found
+//! #1200 crashes `vimcode.exe` on every startup before any window shows
+//! (`RefCell already borrowed` panic inside `win::run`'s `wndproc`,
+//! reentered synchronously from `SetMenu`). Full repro and a fix sketch
+//! are drafted as a new `docs/PENDING_QUADRAUI_ISSUES.md` entry. Leave
+//! this item of #1562 open behind that regression, not behind the
+//! original `window_chrome` gap — the status-segment item still separately
+//! needs its own real-hardware re-check once Win-GUI can start again.
 //!
 //! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
 //! # gap #1562 found, but the narrower `native_menu` half of it
@@ -366,8 +377,23 @@
 //! quadraui issue in `docs/PENDING_QUADRAUI_ISSUES.md`, explicitly scoped
 //! to the `native_menu` path so it does not duplicate or conflict with
 //! `#1562`'s separate `window_chrome` entry — either can land
-//! independently, and #1582 needs only this one. Leave #1582 open behind
-//! it.
+//! independently, and #1582 needs only this one.
+//!
+//! **Update (#1614):** `WinBackend::install_menu_bar`/`native_menu: true`
+//! landed upstream as quadraui#1200, and confirmed the prediction above —
+//! `App::setup`'s existing `native_menu` arm and `App::handle_event`'s
+//! existing `MenuActivated` match need no vimcode-side change. But
+//! real-hardware verification on dell64 found #1200 itself is broken:
+//! `install_menu_bar_now`'s `SetMenu` call re-enters `win::run`'s
+//! `wndproc` with a nested `WM_SIZE` while the outer call already holds
+//! `ws.state.borrow_mut()`, panicking (`RefCell already borrowed`) and
+//! aborting the process — 100% reproducible, every launch, confirmed at
+//! both `cc2b80d` and `928f2b5`. Isolated to #1200 specifically (the
+//! immediately-prior pin, `db92e46`, launches cleanly; adding #1199's
+//! `window_chrome` on top makes no difference to the crash). **The pin
+//! was not bumped.** Full repro, isolation table and a fix sketch are in
+//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — file that on quadraui
+//! and get a fix merged before #1582 can be verified, let alone closed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
