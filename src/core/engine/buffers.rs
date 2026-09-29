@@ -1478,8 +1478,11 @@ impl Engine {
     }
 
     /// Jump to the next changed region below the cursor.
-    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
-    /// In two-window diff mode: uses `diff_results` for navigation.
+    /// When the buffer has outstanding in-buffer agent-review hunks
+    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// uses `git_diff` markers. On diff buffers: searches for `@@`
+    /// headers. In two-window diff mode: uses `diff_results` for
+    /// navigation.
     pub fn jump_next_hunk(&mut self) {
         if let Some((a, b)) = self.diff_window_pair {
             let active = self.active_window_id();
@@ -1493,7 +1496,28 @@ impl Engine {
         let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
         let has_git = git_diff.is_some_and(|d| !d.is_empty());
 
-        if has_git {
+        if self.has_inline_review_hunks(bid) {
+            // Outstanding agent hunks (#1517) take priority over the raw
+            // `git diff HEAD` markers: for any git-tracked file the agent
+            // just edited, `git_diff` is non-empty too (it's the union of
+            // *every* uncommitted turn's changes against HEAD), so an
+            // unconditional `if has_git` would own `]c`/`[c` and make the
+            // in-buffer review navigation unreachable in the ordinary case
+            // this feature targets. The in-buffer review hunks are scoped
+            // to the *current* outstanding checkpoint and are the more
+            // precise source of truth while a review is active, so once
+            // this buffer has any (`has_inline_review_hunks`), review
+            // navigation owns `]c`/`[c` for it exclusively — falling
+            // through to `has_git` here would silently mix two sources
+            // that can disagree about hunk boundaries.
+            if let Some(line) = self.next_inline_review_hunk_line(bid, cur) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                self.scroll_cursor_center();
+            } else {
+                self.message = "No more hunks".to_string();
+            }
+        } else if has_git {
             // Navigate using git_diff markers on real files.
             let gd = self.buffer_manager.get(bid).unwrap();
             let total = gd.git_diff.len();
@@ -1517,10 +1541,6 @@ impl Engine {
                 i += 1;
             }
             self.message = "No more hunks".to_string();
-        } else if let Some(line) = self.next_inline_review_hunk_line(bid, cur) {
-            self.view_mut().cursor.line = line;
-            self.view_mut().cursor.col = 0;
-            self.scroll_cursor_center();
         } else {
             // Fallback: search for @@ headers in diff buffers.
             let start = cur + 1;
@@ -1537,12 +1557,29 @@ impl Engine {
         }
     }
 
+    /// Whether `bid` has any outstanding in-buffer review hunks
+    /// (`Engine::acp_inline_review_hunks`) right now. `]c`/`[c`
+    /// (`jump_next_hunk`/`jump_prev_hunk`) gate on this *before* looking at
+    /// `git_diff` — see the comment in `jump_next_hunk` for why the two
+    /// sources can't just be tried in fallback order.
+    fn has_inline_review_hunks(&self, bid: BufferId) -> bool {
+        let Some(path) = self
+            .buffer_manager
+            .get(bid)
+            .and_then(|s| s.file_path.clone())
+        else {
+            return false;
+        };
+        !self
+            .acp_inline_review_hunks(&path.to_string_lossy())
+            .is_empty()
+    }
+
     /// `]c`/`[c` fallback (#1517): the 0-based buffer line of the first
     /// in-buffer-review hunk (`Engine::acp_inline_review_hunks`) whose
     /// right-side start is strictly after/before `cur` — `None` when this
     /// buffer has no file path, no outstanding hunks, or no hunk on the
-    /// requested side, so the caller falls through to the plain `@@`-
-    /// header search unchanged.
+    /// requested side.
     fn next_inline_review_hunk_line(&self, bid: BufferId, cur: usize) -> Option<usize> {
         let path = self.buffer_manager.get(bid)?.file_path.clone()?;
         let hunks = self.acp_inline_review_hunks(&path.to_string_lossy());
@@ -1566,8 +1603,11 @@ impl Engine {
     }
 
     /// Jump to the previous changed region above the cursor.
-    /// On real files: uses `git_diff` markers. On diff buffers: searches for `@@` headers.
-    /// In two-window diff mode: uses `diff_results` for navigation.
+    /// When the buffer has outstanding in-buffer agent-review hunks
+    /// (#1517): navigates those exclusively. Otherwise, on real files:
+    /// uses `git_diff` markers. On diff buffers: searches for `@@`
+    /// headers. In two-window diff mode: uses `diff_results` for
+    /// navigation.
     pub fn jump_prev_hunk(&mut self) {
         if let Some((a, b)) = self.diff_window_pair {
             let active = self.active_window_id();
@@ -1581,7 +1621,18 @@ impl Engine {
         let git_diff = &self.buffer_manager.get(bid).map(|s| &s.git_diff);
         let has_git = git_diff.is_some_and(|d| !d.is_empty());
 
-        if has_git {
+        if self.has_inline_review_hunks(bid) {
+            // See the matching comment in `jump_next_hunk`: outstanding
+            // in-buffer review hunks own `]c`/`[c` exclusively rather than
+            // falling through to the raw `git_diff` markers.
+            if let Some(line) = self.prev_inline_review_hunk_line(bid, cur) {
+                self.view_mut().cursor.line = line;
+                self.view_mut().cursor.col = 0;
+                self.scroll_cursor_center();
+            } else {
+                self.message = "No more hunks".to_string();
+            }
+        } else if has_git {
             let gd = self.buffer_manager.get(bid).unwrap();
             // Skip backwards past the current changed region.
             let mut i = cur.saturating_sub(1);
@@ -1609,10 +1660,6 @@ impl Engine {
                 i -= 1;
             }
             self.message = "No more hunks".to_string();
-        } else if let Some(line) = self.prev_inline_review_hunk_line(bid, cur) {
-            self.view_mut().cursor.line = line;
-            self.view_mut().cursor.col = 0;
-            self.scroll_cursor_center();
         } else {
             for i in (0..cur).rev() {
                 let line: String = self.buffer().content.line(i).chars().collect();
