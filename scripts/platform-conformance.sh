@@ -75,6 +75,8 @@
 # (printed as one physical line). Lane statuses are exactly:
 # `passed`, `failed`, `check-only`, `skipped`, `skipped-capable`, `error`,
 # `not-in-scope`, and in `--print-plan` mode `plan:run` / `plan:check-only`.
+# Split `lanes=` on commas and each pair on its FIRST colon -- a plan status
+# contains one itself (a plan run is never a gate result: verdict=plan).
 #
 # Lanes:
 #

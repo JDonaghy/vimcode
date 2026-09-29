@@ -60,7 +60,10 @@ PLATFORM_CONFORMANCE_SUMMARY schema=1 verdict=coverage-gap exit=3 mode=run host=
 ```
 
 That line alone is enough to gate on: it names all four lanes and their
-statuses, whether or not this host probed them.
+statuses, whether or not this host probed them. Split the `lanes=` field on
+commas and each pair on its **first** colon — under `--print-plan` a status is
+itself `plan:run` / `plan:check-only`, so a naive split on every colon
+mis-parses a plan run (which is never a gate result anyway: `verdict=plan`).
 
 `--summary <path>` writes the full document (schema
 `vimcode.platform-conformance/1`):
