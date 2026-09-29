@@ -610,7 +610,17 @@ this same PR, see that file's new §2c).
 
 ---
 
-## `WinBackend::install_menu_bar_now`'s `SetMenu` call re-enters `wndproc` and panics on `ws.state.borrow_mut()` — Win-GUI crashes on every startup once `native_menu` is declared (blocks vimcode#1614, and transitively vimcode#1559/#1562/#1582)
+## ~~`WinBackend::install_menu_bar_now`'s `SetMenu` call re-enters `wndproc` and panics on `ws.state.borrow_mut()` — Win-GUI crashes on every startup once `native_menu` is declared (blocks vimcode#1614, and transitively vimcode#1559/#1562/#1582)~~ — **FIXED upstream, struck 2026-09-29 (#1618)**
+
+> **This entry is resolved.** The reentrancy fix landed upstream as
+> `ce1c763` (a `ModalPumpGuard` around the reentrant `SetMenu` call), with a
+> regression test added in `6e14d8a` — both are ancestors of the pin
+> `6e14d8a081929cb5c6792c91e15e5ffa26fc47da` that vimcode#1618 bumped
+> `Cargo.toml` to. Real-hardware verification on dell64 (#1618) confirms
+> `vimcode.exe` launches cleanly with a native menu bar, custom title bar,
+> command centre, and glyph-preserving block cursor all present at
+> startup — unblocking vimcode#1559/#1562/#1582 for closure. The original
+> repro/isolation/ask below is left intact for history.
 
 **Title:** `SetMenu` (called from `WinBackend::install_menu_bar_now`, quadraui#1200) synchronously re-enters `win::run`'s `wndproc` with a nested `WM_SIZE` via `SendMessageW`/`CallWindowProcW` while the outer call already holds `ws.state.borrow_mut()`, panicking with `RefCell already borrowed` at `quadraui/src/win/run.rs:1712:42` (line 1711 at the `cc2b80d` pin) — inside a Win32 callback that cannot unwind, so the process aborts. 100% reproducible: `vimcode.exe` crashes before showing a window, on every launch, on real Windows hardware (dell64).
 
@@ -734,12 +744,13 @@ needing a live window at all. Observed RED against `cc2b80d`/`928f2b5` (100%
 reproducible, real hardware); must be observed GREEN before closing.
 
 **Blocks:** `JDonaghy/vimcode#1614` directly, and transitively
-`JDonaghy/vimcode#1559`/`#1562`/`#1582` — none of those three can be
-verified (the app never shows a window) let alone closed while this
-crash exists. vimcode's pin stays at `db92e461` (pre-#1197/#1199/#1200)
-until this lands; there is no vimcode-side workaround (`App::setup`'s
-call-site timing for `install_menu_bar` is irrelevant — the crash happens
+`JDonaghy/vimcode#1559`/`#1562`/`#1582` — none of those three could be
+verified (the app never showed a window) let alone closed while this
+crash existed. vimcode's pin stayed at `db92e461` (pre-#1197/#1199/#1200)
+until this landed; there was no vimcode-side workaround (`App::setup`'s
+call-site timing for `install_menu_bar` is irrelevant — the crash happened
 inside quadraui's own window-creation sequence regardless of when the
 platform-neutral caller invokes the trait method), per the
-Platform-Neutrality Rule.
+Platform-Neutrality Rule. **Resolved by #1618** — see the struck-entry
+note above.
 

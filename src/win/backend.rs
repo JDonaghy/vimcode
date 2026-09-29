@@ -23,15 +23,15 @@
 //! rasterising decision of its own to make, per the Platform-Neutrality
 //! Rule.
 //!
-//! **Update (#1614):** the fix landed upstream as quadraui#1197 (the
+//! **Update (#1618):** the fix landed upstream as quadraui#1197 (the
 //! `CursorShape::Block` arm now re-paints the covered glyph in
-//! `theme.background`) but **the pin was not bumped to pick it up** — see
-//! the Cargo.toml `quadraui` pin's own comment and
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry: the quadraui rev
-//! containing this fix also contains #1200 (native menu bar), which
-//! crashes `vimcode.exe` on every startup on real Windows hardware
-//! (confirmed on dell64). Leave #1559 open until a quadraui fix for that
-//! regression lands and the pin can move past it.
+//! `theme.background`), and the pin now includes it — #1614 had found the
+//! quadraui rev containing this fix also contained #1200 (native menu bar),
+//! which crashed `vimcode.exe` on every startup (`JDonaghy/quadraui#1213`);
+//! that regression's fix (`ce1c763`'s `ModalPumpGuard`, regression-tested by
+//! `6e14d8a`) landed upstream and is also in the new pin — see the
+//! `Cargo.toml` `quadraui` pin's own comment. Real-hardware verification on
+//! dell64 confirms the block cursor now shows the glyph underneath it.
 //!
 //! # #1561: left-edge desktop strip — investigated, no fix here
 //!
@@ -53,48 +53,47 @@
 //! fixed upstream (`quadraui::win::backend::parse_ui_font_desc`'s
 //! `GenericFamily` resolution; the shared `primitives::status_bar::
 //! native_surface_paint::paint` rasteriser both backends call) — nothing
-//! for this file to change. The title-bar/command-centre item is real:
-//! `WinBackend::backend_caps()` declares neither `native_menu` nor
-//! `window_chrome`, and `win::run` creates a plain `WS_OVERLAPPEDWINDOW`
-//! with no custom-caption `WM_NCCALCSIZE`/`WM_NCHITTEST` handling. See
-//! `src/win/mod.rs`'s `#1562` doc section for the full write-up and
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the drafted ask —
-//! both are quadraui-side (`WinBackend`/`win::run`), so nothing changes in
-//! this 1-line re-export.
+//! for this file to change. The title-bar/command-centre item, at the time
+//! of the original investigation, was a real gap: `WinBackend::
+//! backend_caps()` declared neither `native_menu` nor `window_chrome`, and
+//! `win::run` created a plain `WS_OVERLAPPEDWINDOW` with no custom-caption
+//! `WM_NCCALCSIZE`/`WM_NCHITTEST` handling. See `src/win/mod.rs`'s `#1562`
+//! doc section for the full write-up and `docs/PENDING_QUADRAUI_ISSUES.md`'s
+//! entry for the drafted ask — both are quadraui-side (`WinBackend`/
+//! `win::run`), so nothing changes in this 1-line re-export.
 //!
-//! **Update (#1614):** the fix landed upstream as quadraui#1199
-//! (`WinBackend` declares `window_chrome: true`, `win::run`'s `wndproc`
-//! handles `WM_NCCALCSIZE`/`WM_NCHITTEST`) but **the pin was not bumped**
-//! — same blocker as the `#1559` update above: the containing rev crashes
-//! on startup (quadraui#1200's `SetMenu` reentrancy bug, see
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry). Leave the title-bar/
-//! command-centre item of #1562 open behind it.
+//! **Update (#1618):** the fix landed upstream as quadraui#1199
+//! (`WinBackend::backend_caps()` now declares `window_chrome: true`,
+//! `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`), and the
+//! pin now includes it along with the `JDonaghy/quadraui#1213` reentrancy
+//! fix that had blocked bumping past it (see the `Cargo.toml` pin comment
+//! and `src/win/mod.rs`'s `#1618` update). Real-hardware verification on
+//! dell64 confirms the custom title bar and command centre now render.
 //!
 //! # #1582: no menu bar at startup — the same `backend_caps` gap as #1562,
 //! # narrower fix (`native_menu`, not `window_chrome`)
 //!
 //! vimcode#1582 reports no menu bar at all on Win-GUI startup — the same
-//! root cause the `#1562` section above already names
-//! (`WinBackend::backend_caps()` sets neither flag `App::setup`'s branch
-//! checks), but satisfiable by the narrower of the two paths: `native_menu`
-//! (a real `SetMenu`-backed `HMENU`, the shape macOS's `install_menu_bar`
-//! already uses) needs no window-style change, unlike `window_chrome`
-//! (gated on `#1562`'s custom-caption work landing first). See
-//! `src/win/mod.rs`'s `#1582` doc section for the full write-up and
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry (scoped to `native_menu`
-//! only, so it does not duplicate `#1562`'s `window_chrome` entry) — both
-//! quadraui-side, so nothing changes in this 1-line re-export.
+//! root cause the `#1562` section above already names (at the time of the
+//! original investigation, `WinBackend::backend_caps()` set neither flag
+//! `App::setup`'s branch checks), but satisfiable by the narrower of the
+//! two paths: `native_menu` (a real `SetMenu`-backed `HMENU`, the shape
+//! macOS's `install_menu_bar` already uses) needs no window-style change,
+//! unlike `window_chrome` (gated on `#1562`'s custom-caption work landing
+//! first). See `src/win/mod.rs`'s `#1582` doc section for the full
+//! write-up and `docs/PENDING_QUADRAUI_ISSUES.md`'s entry (scoped to
+//! `native_menu` only, so it does not duplicate `#1562`'s `window_chrome`
+//! entry) — both quadraui-side, so nothing changes in this 1-line
+//! re-export.
 //!
-//! **Update (#1614):** `WinBackend::install_menu_bar`/`native_menu: true`
-//! did land upstream as quadraui#1200, but real-hardware verification on
-//! dell64 found it introduces a **worse** regression than the one it
-//! fixes: `install_menu_bar_now`'s `SetMenu` call re-enters `wndproc` with
-//! a nested `WM_SIZE` while `ws.state` is already borrowed, panicking
-//! (`RefCell already borrowed`) and aborting the process on every single
-//! startup once `native_menu` is declared — the app never shows a window.
-//! 100% reproducible; full repro, isolation and a fix sketch are in
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry. **The pin was not
-//! bumped** — nothing changed in this file, but #1582 stays open behind
-//! the new quadraui-side regression, not behind the original gap.
+//! **Update (#1618):** `WinBackend::install_menu_bar`/`native_menu: true`
+//! landed upstream as quadraui#1200, confirming the analysis above. #1614
+//! had found #1200 itself crashed `vimcode.exe` on every startup
+//! (`RefCell already borrowed`, `JDonaghy/quadraui#1213`) — that fix
+//! landed upstream as `ce1c763` (a `ModalPumpGuard` around the reentrant
+//! `SetMenu` call) plus a regression test in `6e14d8a`, and the pin now
+//! includes both (see the `Cargo.toml` pin comment). Real-hardware
+//! verification on dell64 confirms `vimcode.exe` launches cleanly with a
+//! real, clickable native menu bar present at startup.
 
 pub use quadraui::win::WinBackend;
