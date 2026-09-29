@@ -21044,18 +21044,21 @@ fn build_rendered_window(
     let scroll_top = view.scroll_top.min(total_lines);
     let cursor_line = view.cursor.line;
 
-    // #1515: `badge`/`off` mode's gutter-marker overlay — the lines the
-    // most recent still-outstanding ACP turn checkpoint changed in this
-    // buffer, base = that checkpoint's `pre_turn_content` (not `git diff
-    // HEAD` — see `crate::core::acp_turn::line_status`'s own doc for why
-    // the two bases can legitimately disagree). Skipped entirely under
-    // `Auto` (the full-viewport modal already covers this — "auto keeps
-    // today's behaviour") and when this buffer's path isn't part of any
-    // outstanding checkpoint at all, so the (rare, temporary — only while
-    // an unreviewed turn checkpoint exists) diff cost is paid only for a
+    // #1515: `badge` mode's gutter-marker overlay — the lines the most
+    // recent still-outstanding ACP turn checkpoint changed in this buffer,
+    // base = that checkpoint's `pre_turn_content` (not `git diff HEAD` —
+    // see `crate::core::acp_turn::line_status`'s own doc for why the two
+    // bases can legitimately disagree). Only painted under `Badge`: `Auto`
+    // doesn't need it (the full-viewport modal already covers this —
+    // "auto keeps today's behaviour"), and `Off`'s whole contract is
+    // *nothing* until an explicit `:AiReview` ("neither the modal nor the
+    // badge/gutter nudge" — see `AcpReviewOnTurnEnd::Off`'s own doc).
+    // Also skipped when this buffer's path isn't part of any outstanding
+    // checkpoint at all, so the (rare, temporary — only while an
+    // unreviewed turn checkpoint exists) diff cost is paid only for a
     // buffer an agent turn actually just touched.
     let acp_turn_status: Vec<Option<GitLineStatus>> = if engine.settings.acp_review_on_turn_end
-        != crate::core::settings::AcpReviewOnTurnEnd::Auto
+        == crate::core::settings::AcpReviewOnTurnEnd::Badge
     {
         buffer_state
             .file_path

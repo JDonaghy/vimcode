@@ -69,14 +69,19 @@ impl Engine {
     /// [`crate::core::settings::AcpReviewOnTurnEnd::Auto`] is configured
     /// (`acp_review_on_turn_end` setting, #1515; `Auto` is the pre-#1515
     /// behaviour) — open the combined turn-review surface for it
-    /// automatically. Under the default `Badge` (and under `Off`), the
-    /// checkpoint is still recorded — `:AiReview`/`Self::cmd_ai_review`,
-    /// the status-strip badge (`Self::acp_turn_review_badge`,
-    /// `render::populate_ai_chat_controller`), and the gutter-marker
-    /// overlay (`Self::acp_turn_pre_content_for_path`,
-    /// `render::build_render_window`) all read the same checkpoint list —
-    /// only the automatic full-viewport pop-up is skipped. A no-op if the
-    /// turn wrote nothing — nothing to review, nothing to checkpoint.
+    /// automatically. Under both the default `Badge` and `Off`, the
+    /// checkpoint is still recorded — `:AiReview`/`Self::cmd_ai_review`
+    /// still reads it under either setting, and the default `Badge` also
+    /// surfaces it via the status-strip badge
+    /// (`Self::acp_turn_review_badge`, `render::populate_ai_chat_controller`)
+    /// and the gutter-marker overlay (`Self::acp_turn_pre_content_for_path`,
+    /// `render::build_rendered_window`). `Off`'s contract is stricter —
+    /// neither of those two nudges shows anything, only the explicit
+    /// `:AiReview` does (see [`crate::core::settings::AcpReviewOnTurnEnd::Off`]'s
+    /// own doc) — so callers of `acp_turn_review_badge` and
+    /// `acp_turn_pre_content_for_path` gate their use on `Badge`
+    /// specifically, not "not `Auto`". A no-op if the turn wrote nothing —
+    /// nothing to review, nothing to checkpoint.
     pub(crate) fn acp_end_turn(&mut self) {
         if self.acp_current_turn_entries.is_empty() {
             return;
@@ -120,9 +125,11 @@ impl Engine {
         Some((checkpoint.entries.len(), added, removed))
     }
 
-    /// The base text a `badge`/`off`-mode gutter-marker overlay diffs
-    /// `path`'s live buffer content against (#1515) — the most recent
-    /// still-outstanding checkpoint's entry for `path`, if any.
+    /// The base text a `badge`-mode gutter-marker overlay diffs `path`'s
+    /// live buffer content against (#1515; `off` mode never calls this —
+    /// see [`crate::core::settings::AcpReviewOnTurnEnd::Off`]'s own doc) —
+    /// the most recent still-outstanding checkpoint's entry for `path`, if
+    /// any.
     /// `Some(None)` distinguishes "touched, but the agent created this
     /// path" (no prior content at all — every line paints as added) from
     /// a plain `None` ("`path` isn't part of any outstanding checkpoint —

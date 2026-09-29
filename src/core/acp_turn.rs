@@ -174,6 +174,21 @@ pub fn line_status(old: Option<&str>, new: &str) -> Vec<Option<crate::core::git:
         let mut right_idx = hunk.right_start.saturating_sub(1);
         let mut pending_removed = false;
         for row in &hunk.rows {
+            // A pure-deletion row has no right-side line of its own; once
+            // the run of consecutive `Removed` rows ends, flush a marker
+            // anchored at the boundary those deletions sit at *right now*
+            // — the same convention `crate::core::git::parse_unified_diff`
+            // uses for a real `git diff` hunk's pure deletions. Flushing
+            // per run (not once per hunk) is what lets two separate
+            // deletion runs within a single hunk each get their own
+            // marker instead of collapsing into (at most) one.
+            if row.kind != quadraui::DiffRowKind::Removed && pending_removed {
+                let mark = right_idx.min(total.saturating_sub(1));
+                if result.get(mark).is_some_and(|v| v.is_none()) {
+                    result[mark] = Some(GitLineStatus::Deleted);
+                }
+                pending_removed = false;
+            }
             match row.kind {
                 quadraui::DiffRowKind::Same => right_idx += 1,
                 quadraui::DiffRowKind::Added => {
@@ -188,13 +203,11 @@ pub fn line_status(old: Option<&str>, new: &str) -> Vec<Option<crate::core::git:
                     }
                     right_idx += 1;
                 }
-                // A pure-deletion row has no right-side line of its own —
-                // anchor it at the current boundary, same convention
-                // `crate::core::git::parse_unified_diff` uses for a
-                // real `git diff` hunk's pure deletions.
                 quadraui::DiffRowKind::Removed => pending_removed = true,
             }
         }
+        // Trailing pure-deletions at the end of the hunk (mirrors
+        // `parse_unified_diff`'s own end-of-diff flush).
         if pending_removed {
             let mark = right_idx.min(total.saturating_sub(1));
             if result.get(mark).is_some_and(|v| v.is_none()) {
@@ -406,6 +419,74 @@ mod tests {
                 pre_turn_content: None,
             }],
             "reverting an agent-created file must plan a delete (None), not an empty overwrite"
+        );
+    }
+
+    /// Review finding (#1515 fix iteration 1): two separate deletion runs
+    /// within a single diff hunk must each get their own `Deleted` marker
+    /// — not collapse into (at most) one at the position of the *last*
+    /// run, silently dropping the earlier one. `old` has 10 lines, `new`
+    /// deletes both "2" (right after line "1") and "9" (right before line
+    /// "10") — both within the same hunk since the two deletions are
+    /// close enough that quadraui's default context window merges them.
+    #[test]
+    fn line_status_marks_every_separate_deletion_run_in_a_single_hunk() {
+        use crate::core::git::GitLineStatus;
+        let old = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+        let new = "1\n3\n4\n5\n6\n7\n8\n10";
+        let hunks = quadraui::compute_hunks(old, new);
+        assert_eq!(
+            hunks.len(),
+            1,
+            "test setup: expected both deletions to land in a single hunk"
+        );
+
+        let statuses = line_status(Some(old), new);
+        // new's lines: 0:"1" 1:"3" 2:"4" 3:"5" 4:"6" 5:"7" 6:"8" 7:"10"
+        // Same convention `parse_unified_diff` uses (see
+        // `test_parse_unified_diff_pure_deletion`): a pure-deletion run is
+        // anchored at the first surviving line *after* it, not before.
+        assert_eq!(
+            statuses[1],
+            Some(GitLineStatus::Deleted),
+            "the deletion of \"2\" must be anchored at \"3\" (index 1), the \
+             first surviving line after it — not lost or merged into the \
+             later deletion's marker"
+        );
+        assert_eq!(
+            statuses[7],
+            Some(GitLineStatus::Deleted),
+            "the deletion of \"9\" must be anchored at \"10\" (index 7), the \
+             first surviving line after it"
+        );
+        for (idx, status) in statuses.iter().enumerate() {
+            if idx != 1 && idx != 7 {
+                assert_eq!(
+                    *status, None,
+                    "unchanged line at index {idx} must not be marked"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn line_status_marks_a_single_in_place_edit_as_modified() {
+        use crate::core::git::GitLineStatus;
+        let old = "a\nb\nc";
+        let new = "a\nB\nc";
+        assert_eq!(
+            line_status(Some(old), new),
+            vec![None, Some(GitLineStatus::Modified), None]
+        );
+    }
+
+    #[test]
+    fn line_status_marks_every_line_added_when_no_pre_turn_content() {
+        use crate::core::git::GitLineStatus;
+        let new = "a\nb";
+        assert_eq!(
+            line_status(None, new),
+            vec![Some(GitLineStatus::Added), Some(GitLineStatus::Added)]
         );
     }
 }
