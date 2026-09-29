@@ -606,7 +606,7 @@ impl Engine {
             self.ext_panel_active = Some(name.clone());
             self.ext_panel_has_focus = true;
             self.ext_panel_selected = 0;
-            self.plugin_event("panel_focus", &name);
+            self.on_ext_panel_focused(&name);
             return ActivityBarActivation::ExtPanelFocused(name);
         }
 

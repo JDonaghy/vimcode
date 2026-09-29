@@ -20,6 +20,7 @@ pub mod mode;
 pub mod paths;
 pub mod plan;
 pub mod plugin;
+pub mod plugin_ui;
 pub mod project_search;
 pub mod registry;
 pub mod review;

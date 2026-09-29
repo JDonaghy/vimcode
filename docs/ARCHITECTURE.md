@@ -162,7 +162,7 @@ The Engine is split into focused submodules. Each file adds `impl Engine` blocks
 | `lsp_ops.rs` | All `lsp_*` methods, code actions, diagnostics, hover, completion |
 | `ext_panel.rs` | `ext_*` methods, `handle_ext_*`, extension + settings panel |
 | `panels.rs` | AI (`ai_*`), dialog system, swap files |
-| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks |
+| `plugins.rs` | Plugin init, event dispatch, command/keymap hooks, plugin-declared UI views (`refresh_plugin_view`, `dispatch_plugin_view_event`, `handle_plugin_view_key` — #146) |
 | `dap_ops.rs` | DAP/debug: poll_dap, breakpoints, sidebar, stepping |
 | `vscode.rs` | VSCode mode, menu bar methods |
 | `picker.rs` | Fuzzy score, unified picker, quickfix |

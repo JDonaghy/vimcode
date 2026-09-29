@@ -4544,6 +4544,26 @@ pub struct Engine {
     pub ext_panel_selected: usize,
     /// Scroll offset for the extension panel.
     pub ext_panel_scroll_top: usize,
+    /// Last widget tree each `vimcode.ui.register_view` view's `render` callback
+    /// returned, by view name (#146).
+    ///
+    /// Presence in this map is what makes an `ext:` panel paint a
+    /// `quadraui::Form` (through [`Engine::plugin_view_form_controller`]) instead
+    /// of the `ExtPanelItem` tree rows a `vimcode.panel.register` panel paints.
+    /// The map is seeded when the `PluginManager` is attached, so a view-backed
+    /// panel is distinguishable from a tree panel before its first render.
+    pub plugin_views: HashMap<String, crate::core::plugin_ui::PluginView>,
+    /// The shared `quadraui::FormController` a plugin view is painted through —
+    /// the same compose-tier host the Settings panel uses, so neither backend
+    /// needs per-backend row geometry for plugin UI.
+    pub plugin_view_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the plugin view's form into, cached
+    /// for the click router (same contract as
+    /// [`Engine::settings_form_rect`](Self::settings_form_rect)).
+    pub plugin_view_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// Recursion bound for `Engine::refresh_plugin_view` — a `render` callback
+    /// may call `vimcode.ui.refresh`, which re-enters it.
+    pub(crate) plugin_view_render_depth: u32,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5309,6 +5329,12 @@ impl Engine {
             ext_panel_has_focus: false,
             ext_panel_selected: 0,
             ext_panel_scroll_top: 0,
+            plugin_views: HashMap::new(),
+            plugin_view_form_controller: std::cell::RefCell::new(quadraui::FormController::new(
+                "plugin-view".to_string(),
+            )),
+            plugin_view_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            plugin_view_render_depth: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),

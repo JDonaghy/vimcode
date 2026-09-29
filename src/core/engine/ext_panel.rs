@@ -272,6 +272,13 @@ impl Engine {
             return true;
         }
 
+        // #146: a `vimcode.ui.register_view` panel paints a `quadraui::Form`, so
+        // navigation/activation resolve against its fields, not the tree rows
+        // below. Keys the view doesn't own (`q`, `h`, `?`, …) fall through.
+        if self.is_plugin_view(&panel_name) && self.handle_plugin_view_key(&panel_name, key) {
+            return true;
+        }
+
         match key {
             "q" | "Escape" => {
                 self.ext_panel_has_focus = false;

@@ -200,6 +200,138 @@ fn live_engine<R>(what: &str, f: impl FnOnce(&mut Engine) -> R) -> LuaResult<R> 
     })
 }
 
+// ─── Lua → plugin_ui vocabulary (#146) ───────────────────────────────────────
+
+/// Parse the table a view's `render()` returned into a
+/// [`crate::core::plugin_ui::PluginView`].
+///
+/// Hand-written rather than derived through `mlua`'s serde bridge on purpose:
+/// the errors are the ones a plugin author needs ("field 3: unknown type
+/// \"buton\"") and the parse cannot be perturbed by an `mlua` feature flag.
+/// The accepted vocabulary is still pinned to the serde tags — every `type`
+/// string below is a [`crate::core::plugin_ui::ViewFieldKind::type_name`].
+fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::PluginView> {
+    use crate::core::plugin_ui::{
+        PluginView, ViewButton, ViewField, ViewFieldKind, ViewToggle, VIEW_SCHEMA_VERSION,
+    };
+
+    let schema_version: u32 = tbl.get("schema_version").unwrap_or(VIEW_SCHEMA_VERSION);
+    if schema_version > VIEW_SCHEMA_VERSION {
+        return Err(LuaError::RuntimeError(format!(
+            "view declares schema_version {schema_version}, but this vimcode \
+             understands at most {VIEW_SCHEMA_VERSION}"
+        )));
+    }
+    let id: String = tbl.get("id").unwrap_or_default();
+
+    let mut fields = Vec::new();
+    if let Ok(fields_tbl) = tbl.get::<_, LuaTable>("fields") {
+        for (idx, row) in fields_tbl.sequence_values::<LuaTable>().enumerate() {
+            let row = row?;
+            let type_name: String = row.get("type").unwrap_or_else(|_| "label".to_string());
+            let field_id: String = row.get("id").unwrap_or_default();
+            let label: String = row.get("label").unwrap_or_default();
+            let hint: String = row.get("hint").unwrap_or_default();
+            let disabled: bool = row.get("disabled").unwrap_or(false);
+            let error: Option<String> =
+                row.get::<_, String>("error").ok().filter(|s| !s.is_empty());
+            let warning: Option<String> = row
+                .get::<_, String>("warning")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let value_str = |key: &str| -> String { row.get::<_, String>(key).unwrap_or_default() };
+            let options = |key: &str| -> Vec<String> {
+                row.get::<_, LuaTable>(key)
+                    .map(|t| t.sequence_values::<String>().flatten().collect())
+                    .unwrap_or_default()
+            };
+            // `selected` is 0-based, matching the Rust/JSON shape. Lua's
+            // 1-based array convention applies to the `options` table itself,
+            // not to an index the plugin stores as data.
+            let selected: usize = row.get("selected").unwrap_or(0);
+
+            let kind = match type_name.as_str() {
+                "label" => ViewFieldKind::Label,
+                "text" => ViewFieldKind::Text {
+                    value: value_str("value"),
+                    placeholder: value_str("placeholder"),
+                },
+                "password" => ViewFieldKind::Password {
+                    value: value_str("value"),
+                    placeholder: value_str("placeholder"),
+                },
+                "text_area" => ViewFieldKind::TextArea {
+                    value: value_str("value"),
+                    placeholder: value_str("placeholder"),
+                    rows: row.get("rows").unwrap_or(3),
+                },
+                "toggle" => ViewFieldKind::Toggle {
+                    value: row.get("value").unwrap_or(false),
+                },
+                "button" => ViewFieldKind::Button,
+                "read_only" => ViewFieldKind::ReadOnly {
+                    value: value_str("value"),
+                },
+                "dropdown" => ViewFieldKind::Dropdown {
+                    options: options("options"),
+                    selected,
+                },
+                "segmented" => ViewFieldKind::Segmented {
+                    options: options("options"),
+                    selected,
+                },
+                "buttons" => {
+                    let mut buttons = Vec::new();
+                    if let Ok(t) = row.get::<_, LuaTable>("buttons") {
+                        for b in t.sequence_values::<LuaTable>().flatten() {
+                            buttons.push(ViewButton {
+                                id: b.get("id").unwrap_or_default(),
+                                label: b.get("label").unwrap_or_default(),
+                                disabled: b.get("disabled").unwrap_or(false),
+                            });
+                        }
+                    }
+                    ViewFieldKind::Buttons { buttons }
+                }
+                "toggles" => {
+                    let mut toggles = Vec::new();
+                    if let Ok(t) = row.get::<_, LuaTable>("toggles") {
+                        for b in t.sequence_values::<LuaTable>().flatten() {
+                            toggles.push(ViewToggle {
+                                id: b.get("id").unwrap_or_default(),
+                                label: b.get("label").unwrap_or_default(),
+                                value: b.get("value").unwrap_or(false),
+                            });
+                        }
+                    }
+                    ViewFieldKind::Toggles { toggles }
+                }
+                other => {
+                    return Err(LuaError::RuntimeError(format!(
+                        "view field {} (id {field_id:?}): unknown type {other:?}",
+                        idx + 1
+                    )));
+                }
+            };
+            fields.push(ViewField {
+                id: field_id,
+                label,
+                hint,
+                disabled,
+                error,
+                warning,
+                kind,
+            });
+        }
+    }
+
+    Ok(PluginView {
+        id,
+        schema_version,
+        fields,
+    })
+}
+
 // ─── Extension panel types ──────────────────────────────────────────────────
 
 /// Registration info for an extension-provided sidebar panel.
@@ -304,6 +436,27 @@ pub enum ExtPanelStyle {
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
+// ─── Plugin-declared UI views (#146) ─────────────────────────────────────────
+
+/// A `vimcode.ui.register_view` registration, harvested at load time.
+///
+/// The two Lua functions live in the Lua registry (not in a `PluginCallContext`)
+/// precisely because they are **stored and invoked later** — the shape #1214's
+/// live-engine seam exists to support, and what lets an `on_event` handler use
+/// the immediate `vimcode.buffer.*` API.
+struct ViewRegistration {
+    panel: PanelRegistration,
+    render: LuaRegistryKey,
+    on_event: Option<LuaRegistryKey>,
+}
+
+/// A registered view's stored callbacks, keyed by view name in
+/// [`PluginManager::views`].
+struct StoredView {
+    render: LuaRegistryKey,
+    on_event: Option<LuaRegistryKey>,
+}
+
 /// Manages all loaded Lua plugins and their registered callbacks.
 pub struct PluginManager {
     lua: Lua,
@@ -319,6 +472,8 @@ pub struct PluginManager {
     pub panels: HashMap<String, PanelRegistration>,
     /// Extension panel help bindings harvested from plugin scripts.
     pub help_bindings: HashMap<String, Vec<(String, String)>>,
+    /// `vimcode.ui.register_view` registrations, by view name (#146).
+    views: HashMap<String, StoredView>,
 }
 
 /// Metadata about a single plugin file / directory.
@@ -417,6 +572,9 @@ pub struct PluginCallContext {
     pub panel_help_entries: Vec<(String, Vec<(String, String)>)>,
     /// Panel input field text values to set: `(panel_name, text)`.
     pub panel_input_values: Vec<(String, String)>,
+    /// `vimcode.ui.refresh(name)` requests — view names whose `render` callback
+    /// should run again after this call returns (#146).
+    pub plugin_view_refresh: Vec<String>,
     /// Editor hover content registrations: `(0-indexed line, markdown)`.
     pub editor_hover_entries: Vec<(usize, String)>,
     /// Panel reveal request: `(panel_name, section_name, item_id)`.
@@ -446,6 +604,7 @@ struct PluginRegistrations {
     hooks: HashMap<String, Vec<LuaRegistryKey>>,
     panels: Vec<PanelRegistration>,
     help_bindings: Vec<(String, Vec<(String, String)>)>,
+    views: Vec<ViewRegistration>,
 }
 
 // ─── PluginManager implementation ────────────────────────────────────────────
@@ -463,6 +622,7 @@ impl PluginManager {
             hooks: HashMap::new(),
             panels: HashMap::new(),
             help_bindings: HashMap::new(),
+            views: HashMap::new(),
         })
     }
 
@@ -543,6 +703,21 @@ impl PluginManager {
             }
             for (panel_name, bindings) in reg.help_bindings {
                 self.help_bindings.insert(panel_name, bindings);
+            }
+            // #146: a view-backed panel is registered in `panels` like any other
+            // (so the activity bar and `Engine::ext_panels` need no new path)
+            // *and* in `views`, whose presence is what makes the sidebar paint a
+            // `quadraui::Form` instead of tree rows.
+            for view in reg.views {
+                let name = view.panel.name.clone();
+                self.panels.insert(name.clone(), view.panel);
+                self.views.insert(
+                    name,
+                    StoredView {
+                        render: view.render,
+                        on_event: view.on_event,
+                    },
+                );
             }
         }
 
@@ -665,6 +840,122 @@ impl PluginManager {
             .remove_app_data::<PluginCallContext>()
             .unwrap_or_default();
         (true, ctx)
+    }
+
+    // ─── Plugin-declared UI views (#146) ───────────────────────────────────
+
+    /// Names of every `vimcode.ui.register_view` view, in unspecified order.
+    pub fn view_names(&self) -> Vec<String> {
+        self.views.keys().cloned().collect()
+    }
+
+    /// Whether `name` is a view-backed panel (as opposed to a
+    /// `vimcode.panel.register` tree panel).
+    pub fn is_view(&self, name: &str) -> bool {
+        self.views.contains_key(name)
+    }
+
+    /// Run a view's `render` callback and parse the widget tree it returns.
+    ///
+    /// Returns `(updated_context, Ok(view) | Err(message))`. A Lua error or a
+    /// malformed tree is surfaced as `Err` rather than panicking, so one broken
+    /// plugin cannot take the sidebar down.
+    pub fn render_view(
+        &self,
+        name: &str,
+        ctx: PluginCallContext,
+    ) -> (
+        PluginCallContext,
+        Result<crate::core::plugin_ui::PluginView, String>,
+    ) {
+        let Some(stored) = self.views.get(name) else {
+            return (ctx, Err(format!("no registered view named {name:?}")));
+        };
+        self.lua.set_app_data(ctx);
+        let result = match self.lua.registry_value::<LuaFunction>(&stored.render) {
+            Ok(f) => match f.call::<LuaTable, LuaValue>(self.view_ctx_table(name)) {
+                Ok(LuaValue::Table(t)) => lua_table_to_view(&t).map_err(|e| e.to_string()),
+                Ok(LuaValue::Nil) => Ok(crate::core::plugin_ui::PluginView::default()),
+                Ok(_) => Err(format!(
+                    "view {name:?}: render() must return a table (got a non-table value)"
+                )),
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => Err(e.to_string()),
+        };
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (ctx, result)
+    }
+
+    /// Fire a view's `on_event` callback for one widget event.
+    ///
+    /// Returns the updated context. A view without an `on_event` handler, or one
+    /// whose handler errors, leaves the context otherwise untouched.
+    pub fn call_view_event(
+        &self,
+        event: &crate::core::plugin_ui::PluginViewEvent,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        let Some(stored) = self.views.get(&event.view) else {
+            return ctx;
+        };
+        let Some(key) = stored.on_event.as_ref() else {
+            return ctx;
+        };
+        self.lua.set_app_data(ctx);
+        if let Ok(f) = self.lua.registry_value::<LuaFunction>(key) {
+            if let Ok(tbl) = self.view_event_table(event) {
+                let _ = f.call::<(LuaTable, LuaTable), ()>((self.view_ctx_table(&event.view), tbl));
+            }
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// The `ctx` table handed to `render(ctx)` / `on_event(ctx, event)`.
+    ///
+    /// Deliberately minimal: everything a callback needs is already reachable
+    /// through `vimcode.*` (including the immediate `vimcode.buffer.*` API,
+    /// #1214). `ctx` only names *which* view is being rendered, so one Lua
+    /// function can serve several registered views.
+    fn view_ctx_table(&self, view: &str) -> LuaTable<'_> {
+        let tbl = self.lua.create_table().unwrap_or_else(|_| {
+            // `create_table` only fails on OOM; there is no useful fallback, and
+            // an empty table keeps the signature infallible for callers.
+            self.lua.create_table().expect("lua table")
+        });
+        let _ = tbl.set("view", view);
+        tbl
+    }
+
+    /// Convert a [`crate::core::plugin_ui::PluginViewEvent`] into the Lua table
+    /// `on_event` receives: `{widget_id=, kind=, view=, value=}`.
+    fn view_event_table(
+        &self,
+        event: &crate::core::plugin_ui::PluginViewEvent,
+    ) -> LuaResult<LuaTable<'_>> {
+        use crate::core::plugin_ui::ViewEventKind;
+        let tbl = self.lua.create_table()?;
+        tbl.set("view", event.view.as_str())?;
+        tbl.set("widget_id", event.widget_id.as_str())?;
+        tbl.set("kind", event.kind.kind_name())?;
+        match &event.kind {
+            ViewEventKind::ToggleChanged { value } => tbl.set("value", *value)?,
+            ViewEventKind::DropdownChanged { selected }
+            | ViewEventKind::SegmentedChanged { selected } => {
+                // 0-based, matching the `selected` the plugin authored.
+                tbl.set("value", *selected as i64)?
+            }
+            ViewEventKind::TextChanged { value } | ViewEventKind::TextCommitted { value } => {
+                tbl.set("value", value.as_str())?
+            }
+            ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
+        }
+        Ok(tbl)
     }
 
     // ─── Lua API setup ─────────────────────────────────────────────────────
@@ -2037,6 +2328,84 @@ impl PluginManager {
 
         vimcode.set("panel", panel_tbl)?;
 
+        // ── vimcode.ui subtable (#146) ─────────────────────────────────────
+        let ui_tbl = lua.create_table()?;
+
+        // vimcode.ui.register_view(name, {title=, icon=, fallback_icon=,
+        //                                 render=fn, on_event=fn})
+        //
+        // Load-time only (like `vimcode.command` / `vimcode.keymap`): the two
+        // callbacks are stashed in the Lua registry so they survive the load and
+        // can be fired from any later dispatch. `PluginRegistrations` is only
+        // installed while a plugin's top-level chunk runs, so a `register_view`
+        // from inside a callback is a no-op — documented in EXTENSIONS.md.
+        ui_tbl.set(
+            "register_view",
+            lua.create_function(|lua, (name, opts): (String, LuaTable)| {
+                if name.is_empty() {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.ui.register_view: name must not be empty".to_string(),
+                    ));
+                }
+                let render: LuaFunction = opts.get("render").map_err(|_| {
+                    LuaError::RuntimeError(format!(
+                        "vimcode.ui.register_view({name:?}): `render` must be a function"
+                    ))
+                })?;
+                let render_key = lua.create_registry_value(render)?;
+                let on_event_key = match opts.get::<_, LuaFunction>("on_event") {
+                    Ok(f) => Some(lua.create_registry_value(f)?),
+                    Err(_) => None,
+                };
+                let title: String = opts.get("title").unwrap_or_default();
+                let title = if title.is_empty() {
+                    name.clone()
+                } else {
+                    title
+                };
+                let icon_str: String = opts.get("icon").unwrap_or_default();
+                let icon = icon_str
+                    .chars()
+                    .next()
+                    .unwrap_or(crate::icons::PLUGIN_FALLBACK.c());
+                let fb_str: String = opts.get("fallback_icon").unwrap_or_default();
+                let panel = PanelRegistration {
+                    name: name.clone(),
+                    title,
+                    icon,
+                    fallback_icon: fb_str.chars().next(),
+                    // A view-backed panel paints a `quadraui::Form`, not
+                    // sections of tree rows — but the sidebar's activity-bar
+                    // registration path is shared with `vimcode.panel.register`,
+                    // which requires at least one section name.
+                    sections: vec!["Default".to_string()],
+                };
+                if let Some(mut regs) = lua.app_data_mut::<PluginRegistrations>() {
+                    regs.views.push(ViewRegistration {
+                        panel,
+                        render: render_key,
+                        on_event: on_event_key,
+                    });
+                }
+                Ok(())
+            })?,
+        )?;
+
+        // vimcode.ui.refresh(name) — re-run a view's `render` callback.
+        ui_tbl.set(
+            "refresh",
+            lua.create_function(|lua, name: String| {
+                if let Some(mut ctx) = lua.app_data_mut::<PluginCallContext>() {
+                    if !ctx.plugin_view_refresh.contains(&name) {
+                        ctx.plugin_view_refresh.push(name);
+                    }
+                }
+                Ok(())
+            })?,
+        )?;
+
+        vimcode.set("ui", ui_tbl)?;
+
         // ── vimcode.editor subtable ────────────────────────────────────────
         let editor_tbl = lua.create_table()?;
 
@@ -2519,5 +2888,204 @@ mod tests {
         assert!(found);
         // Both calls should be silently ignored (empty command or empty event).
         assert_eq!(ctx.async_shell_requests.len(), 0);
+    }
+
+    // ── #146: `vimcode.ui.*` view registration and dispatch ─────────────
+
+    fn pm_with_view(tag: &str, code: &str) -> PluginManager {
+        let dir = std::env::temp_dir().join(format!("vc_plugin_view_unit_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_temp_plugin(&dir, "viewext", code);
+        let mut pm = PluginManager::new().unwrap();
+        pm.load_plugins_dir(&dir, &[]);
+        assert!(
+            pm.plugins.iter().all(|p| p.error.is_none()),
+            "plugin must load cleanly: {:?}",
+            pm.plugins
+                .iter()
+                .filter_map(|p| p.error.clone())
+                .collect::<Vec<_>>()
+        );
+        pm
+    }
+
+    #[test]
+    fn view_registration_also_registers_an_activity_bar_panel() {
+        let pm = pm_with_view(
+            "reg",
+            r#"
+            vimcode.ui.register_view("vext", {
+                title = "V Ext",
+                icon = "V",
+                render = function() return { fields = {} } end,
+            })
+            "#,
+        );
+        assert!(pm.is_view("vext"));
+        assert_eq!(pm.view_names(), vec!["vext".to_string()]);
+        // The same registration must show up as an ordinary sidebar panel, so the
+        // activity bar and `Engine::ext_panels` need no view-specific path.
+        let panel = pm.panels.get("vext").expect("panel registration");
+        assert_eq!(panel.title, "V Ext");
+        assert_eq!(panel.icon, 'V');
+    }
+
+    #[test]
+    fn render_callback_returns_the_declared_tree() {
+        use crate::core::plugin_ui::{ViewFieldKind, VIEW_SCHEMA_VERSION};
+        let pm = pm_with_view(
+            "render",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function(ctx)
+                    return {
+                        id = "main",
+                        fields = {
+                            { type = "label", id = "hdr", label = "H" },
+                            { type = "text", id = "url", label = "URL", value = "u" },
+                            { type = "dropdown", id = "m", options = {"GET","POST"},
+                              selected = 1 },
+                            { type = "button", id = "go", label = "Go" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(view.id, "main");
+        assert_eq!(view.schema_version, VIEW_SCHEMA_VERSION);
+        assert_eq!(view.fields.len(), 4);
+        assert_eq!(view.fields[1].label, "URL");
+        assert_eq!(
+            view.fields[1].kind,
+            ViewFieldKind::Text {
+                value: "u".to_string(),
+                placeholder: String::new(),
+            }
+        );
+        assert_eq!(
+            view.fields[2].kind,
+            ViewFieldKind::Dropdown {
+                options: vec!["GET".to_string(), "POST".to_string()],
+                selected: 1,
+            }
+        );
+        assert_eq!(view.fields[3].kind, ViewFieldKind::Button);
+    }
+
+    #[test]
+    fn an_unknown_field_type_is_an_error_not_a_silent_drop() {
+        let pm = pm_with_view(
+            "badtype",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { fields = { { type = "buton", id = "go" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unknown widget type must not be dropped");
+        assert!(
+            err.contains("buton"),
+            "the error must name the offending type: {err}"
+        );
+    }
+
+    #[test]
+    fn a_future_schema_version_is_refused() {
+        let pm = pm_with_view(
+            "schema",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { schema_version = 99, fields = {} }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a newer schema version must be refused");
+        assert!(
+            err.contains("schema_version 99"),
+            "the error must name the declared version: {err}"
+        );
+    }
+
+    #[test]
+    fn on_event_receives_the_plugin_authored_widget_id_and_kind() {
+        use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+        let pm = pm_with_view(
+            "event",
+            r#"
+            local last = "none"
+            vimcode.ui.register_view("vext", {
+                render = function() return { fields = {} } end,
+                on_event = function(ctx, event)
+                    last = ctx.view .. "/" .. event.widget_id .. "/" .. event.kind
+                        .. "/" .. tostring(event.value)
+                end,
+            })
+            vimcode.command("Last", function() vimcode.message(last) end)
+            "#,
+        );
+        let ctx = pm.call_view_event(
+            &PluginViewEvent {
+                view: "vext".to_string(),
+                // The plugin sees the id it authored, never the namespaced
+                // `plugin:vext:tls` `WidgetId` the paint layer uses.
+                widget_id: "tls".to_string(),
+                kind: ViewEventKind::ToggleChanged { value: true },
+            },
+            PluginCallContext::default(),
+        );
+        assert!(ctx.message.is_none(), "on_event must not message by itself");
+        let (found, ctx) = pm.call_command("Last", "", PluginCallContext::default());
+        assert!(found);
+        assert_eq!(ctx.message.as_deref(), Some("vext/tls/ToggleChanged/true"));
+    }
+
+    #[test]
+    fn ui_refresh_queues_the_view_name_on_the_context() {
+        let pm = pm_with_view(
+            "refresh",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function() return { fields = {} } end,
+            })
+            vimcode.command("Poke", function()
+                vimcode.ui.refresh("vext")
+                vimcode.ui.refresh("vext")
+            end)
+            "#,
+        );
+        let (found, ctx) = pm.call_command("Poke", "", PluginCallContext::default());
+        assert!(found);
+        // De-duplicated: two calls in one dispatch are one refresh.
+        assert_eq!(ctx.plugin_view_refresh, vec!["vext".to_string()]);
+    }
+
+    #[test]
+    fn register_view_without_a_render_callback_is_an_error() {
+        let dir = std::env::temp_dir().join("vc_plugin_view_unit_norender");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_temp_plugin(
+            &dir,
+            "viewext",
+            r#"vimcode.ui.register_view("vext", { title = "No Render" })"#,
+        );
+        let mut pm = PluginManager::new().unwrap();
+        pm.load_plugins_dir(&dir, &[]);
+        let err = pm.plugins[0]
+            .error
+            .as_deref()
+            .expect("a view with no render callback must be a load error");
+        assert!(err.contains("render"), "error must name `render`: {err}");
+        assert!(!pm.is_view("vext"));
     }
 }

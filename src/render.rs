@@ -8267,7 +8267,7 @@ pub fn apply_activity_panel_switch(engine: &mut Engine, panel_id: &str) -> Activ
                 engine.ext_panel_has_focus = true;
                 if !already_showing {
                     engine.ext_panel_selected = 0;
-                    engine.plugin_event("panel_focus", name);
+                    engine.on_ext_panel_focused(name);
                 }
             }
         }
@@ -20027,6 +20027,286 @@ pub fn handle_settings_form_ui_event(
             true
         }
     }
+}
+
+// ─── Plugin-declared UI views (#146) ────────────────────────────────────────
+
+/// Adapt a plugin-declared [`crate::core::plugin_ui::PluginView`] into a
+/// `quadraui::Form`.
+///
+/// This function is the *entire* translation layer between the vimcode-owned
+/// widget vocabulary plugins author (see `core::plugin_ui`'s module doc for why
+/// the ABI is vimcode-owned rather than quadraui's serde shape) and the
+/// primitive both backends paint. A breaking change to `quadraui::Form` is
+/// absorbed here and nowhere else — no plugin has to be rewritten for it.
+///
+/// Widget ids are namespaced (`plugin:<view>:<field>`, #146 invariant 4) so two
+/// plugins that both name a button `"send"` cannot collide, and so
+/// [`handle_plugin_view_ui_event`] can tell a plugin field from a Settings one.
+///
+/// `selected` / `scroll_top` / `has_focus` are vimcode-owned interaction state
+/// (the existing `ext_panel_*` fields), *not* plugin-declared: a re-render must
+/// not move the user's cursor.
+pub fn plugin_view_to_form(
+    view_name: &str,
+    view: &crate::core::plugin_ui::PluginView,
+    selected: usize,
+    scroll_top: usize,
+    has_focus: bool,
+) -> quadraui::Form {
+    use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
+    use quadraui::{
+        ButtonRowItem, FieldKind, Form, FormField, StyledText, ToggleGroupItem, ValidationState,
+        WidgetId,
+    };
+
+    let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
+
+    let fields: Vec<FormField> = view
+        .fields
+        .iter()
+        .map(|f| {
+            let kind = match &f.kind {
+                ViewFieldKind::Label => FieldKind::Label,
+                ViewFieldKind::Text { value, placeholder } => FieldKind::TextInput {
+                    value: value.clone(),
+                    placeholder: placeholder.clone(),
+                    // `cursor: None` renders read-only (no caret). Text *entry*
+                    // into a plugin view is Phase 2 (#1403); the value a plugin
+                    // declares still paints, and click/keyboard activation of
+                    // buttons, toggles and choices works today.
+                    cursor: None,
+                    selection_anchor: None,
+                },
+                ViewFieldKind::Password { value, placeholder } => FieldKind::PasswordInput {
+                    value: value.clone(),
+                    placeholder: placeholder.clone(),
+                    cursor: None,
+                    mask_char: '•',
+                },
+                ViewFieldKind::TextArea {
+                    value,
+                    placeholder,
+                    rows,
+                } => FieldKind::TextArea {
+                    value: value.clone(),
+                    placeholder: placeholder.clone(),
+                    cursor: None,
+                    visible_rows: (*rows).max(1),
+                },
+                ViewFieldKind::Toggle { value } => FieldKind::Toggle { value: *value },
+                ViewFieldKind::Button => FieldKind::Button,
+                ViewFieldKind::ReadOnly { value } => FieldKind::ReadOnly {
+                    value: StyledText::plain(value.clone()),
+                },
+                ViewFieldKind::Dropdown { options, selected } => FieldKind::Dropdown {
+                    options: options.iter().map(StyledText::plain).collect(),
+                    selected_idx: (*selected).min(options.len().saturating_sub(1)),
+                },
+                ViewFieldKind::Segmented { options, selected } => FieldKind::SegmentedControl {
+                    options: options.clone(),
+                    selected_idx: (*selected).min(options.len().saturating_sub(1)),
+                },
+                ViewFieldKind::Buttons { buttons } => FieldKind::ButtonRow {
+                    buttons: buttons
+                        .iter()
+                        .map(|b| ButtonRowItem {
+                            id: wid(&b.id),
+                            label: b.label.clone(),
+                            disabled: b.disabled,
+                            icon: None,
+                        })
+                        .collect(),
+                },
+                ViewFieldKind::Toggles { toggles } => FieldKind::ToggleGroup {
+                    toggles: toggles
+                        .iter()
+                        .map(|t| ToggleGroupItem {
+                            id: wid(&t.id),
+                            label: t.label.clone(),
+                            value: t.value,
+                        })
+                        .collect(),
+                },
+            };
+            FormField {
+                id: wid(&f.id),
+                label: StyledText::plain(&f.label),
+                kind,
+                hint: StyledText::plain(&f.hint),
+                disabled: f.disabled,
+                validation: match (&f.error, &f.warning) {
+                    (Some(e), _) => Some(ValidationState::Error(e.clone())),
+                    (None, Some(w)) => Some(ValidationState::Warning(w.clone())),
+                    (None, None) => None,
+                },
+            }
+        })
+        .collect();
+
+    let focused_field = fields.get(selected).map(|f| f.id.clone());
+
+    Form {
+        id: WidgetId::new(if view.id.is_empty() {
+            format!("plugin-view-{view_name}")
+        } else {
+            crate::core::plugin_ui::namespaced_widget_id(view_name, &view.id)
+        }),
+        fields,
+        focused_field,
+        scroll_offset: scroll_top,
+        has_focus,
+    }
+}
+
+/// Populate `Engine::plugin_view_form_controller` from the active plugin view.
+///
+/// Returns `false` when the active sidebar panel is not a plugin view, so the
+/// caller can fall through to the ordinary `ExtPanelItem` tree body. This is the
+/// plugin-view twin of [`populate_settings_form_controller`].
+pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
+    let Some(name) = engine.ext_panel_active.clone() else {
+        return false;
+    };
+    let Some(view) = engine.plugin_views.get(&name) else {
+        return false;
+    };
+    let form = plugin_view_to_form(
+        &name,
+        view,
+        engine.ext_panel_selected,
+        engine.ext_panel_scroll_top,
+        engine.ext_panel_has_focus,
+    );
+    let mut fc = engine.plugin_view_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.ext_panel_scroll_top);
+    fc.set_has_focus(engine.ext_panel_has_focus);
+    true
+}
+
+/// Route a pointer event over a plugin view through the shared
+/// `quadraui::FormController` and dispatch whatever widget event it resolves to
+/// the plugin's `on_event` callback.
+///
+/// `rect` must be the *same* rect the last frame passed to
+/// `FormController::render_and_cache` (cached in
+/// `Engine::plugin_view_form_rect`) — `handle_cached` re-derives its row layout
+/// from it. Same contract, and the same reason, as
+/// [`handle_settings_form_ui_event`].
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_ui_event(
+    engine: &mut Engine,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_form_controller(engine) {
+        return false;
+    }
+    // `FormController` has no `DoubleClick` arm — probe with the equivalent
+    // press (mirrors `handle_settings_form_ui_event`).
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: widget.clone(),
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine.plugin_view_form_controller.borrow().scroll_offset();
+        engine.ext_panel_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+
+    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    // Selection follows the click, so j/k continues from where the user clicked.
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        // `field_id` may name a sub-widget (a `buttons`/`toggles` entry) that is
+        // not itself a row; only move the selection when it *is* a row.
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.ext_panel_selected = idx;
+        }
+    }
+    engine.ext_panel_has_focus = true;
+    if matches!(kind, ViewEventKind::FocusChanged) {
+        // A plain focus move is not something a plugin needs to hear about on
+        // every click; it is reported only so a handler can track selection.
+        // Keep it, but don't re-render for it beyond the selection change above.
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
+/// Decompose a `quadraui::FormEvent` into `(view, plugin-authored field id,
+/// event kind)`, or `None` when the event's widget is not in the plugin
+/// namespace (a Settings field, say) or carries no plugin meaning.
+///
+/// Kept separate from [`handle_plugin_view_ui_event`] so the mapping is unit
+/// testable without a `FormController`.
+pub(crate) fn plugin_view_event_from_form_event(
+    action: &quadraui::FormEvent,
+) -> Option<(String, String, crate::core::plugin_ui::ViewEventKind)> {
+    use crate::core::plugin_ui::{split_widget_id, ViewEventKind};
+    let (id, kind) = match action {
+        quadraui::FormEvent::ButtonClicked { id } => (id, ViewEventKind::ButtonClicked),
+        quadraui::FormEvent::ToggleChanged { id, value } => {
+            (id, ViewEventKind::ToggleChanged { value: *value })
+        }
+        quadraui::FormEvent::DropdownChanged { id, selected_idx } => (
+            id,
+            ViewEventKind::DropdownChanged {
+                selected: *selected_idx,
+            },
+        ),
+        quadraui::FormEvent::SegmentedControlChanged { id, selected_idx } => (
+            id,
+            ViewEventKind::SegmentedChanged {
+                selected: *selected_idx,
+            },
+        ),
+        quadraui::FormEvent::TextInputChanged { id, value } => (
+            id,
+            ViewEventKind::TextChanged {
+                value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::TextInputCommitted { id, value } => (
+            id,
+            ViewEventKind::TextCommitted {
+                value: value.clone(),
+            },
+        ),
+        quadraui::FormEvent::FocusChanged { id } => (id, ViewEventKind::FocusChanged),
+        _ => return None,
+    };
+    let (view, field) = split_widget_id(id.as_str())?;
+    Some((view.to_string(), field.to_string(), kind))
 }
 
 /// Adapt the quickfix panel data into a generic `quadraui::ListView`.
@@ -36398,5 +36678,143 @@ mod slice7_router_tests {
             marked, "foo",
             "diagnostic mark must land on 'foo', not shifted left"
         );
+    }
+
+    // ── #146: plugin-declared view → `quadraui::Form` ───────────────────
+
+    fn fixture_view() -> crate::core::plugin_ui::PluginView {
+        use crate::core::plugin_ui::{PluginView, ViewField, ViewFieldKind, VIEW_SCHEMA_VERSION};
+        let f = |id: &str, label: &str, kind: ViewFieldKind| ViewField {
+            id: id.to_string(),
+            label: label.to_string(),
+            hint: String::new(),
+            disabled: false,
+            error: None,
+            warning: None,
+            kind,
+        };
+        PluginView {
+            id: "main".to_string(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            fields: vec![
+                f("hdr", "Header", ViewFieldKind::Label),
+                f(
+                    "url",
+                    "URL",
+                    ViewFieldKind::Text {
+                        value: "https://x".to_string(),
+                        placeholder: String::new(),
+                    },
+                ),
+                f("send", "Send", ViewFieldKind::Button),
+            ],
+        }
+    }
+
+    #[test]
+    fn plugin_view_form_namespaces_every_widget_id() {
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 1, 0, true);
+        let ids: Vec<String> = form
+            .fields
+            .iter()
+            .map(|f| f.id.as_str().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "plugin:my-ext:hdr".to_string(),
+                "plugin:my-ext:url".to_string(),
+                "plugin:my-ext:send".to_string(),
+            ]
+        );
+        // Interaction state is vimcode-owned, taken from the arguments rather
+        // than from anything the plugin declared.
+        assert_eq!(
+            form.focused_field.as_ref().map(|w| w.as_str()),
+            Some("plugin:my-ext:url")
+        );
+        assert!(form.has_focus);
+    }
+
+    #[test]
+    fn plugin_view_form_never_hands_a_plugin_the_text_cursor() {
+        // `cursor`/`selection_anchor` are byte offsets into the value; letting a
+        // plugin set them is how you get a caret mid-codepoint. #146's ABI
+        // decision keeps them out of the vocabulary entirely — assert the
+        // adapter does not invent one either.
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 0, 0, false);
+        match &form.fields[1].kind {
+            quadraui::FieldKind::TextInput {
+                cursor,
+                selection_anchor,
+                ..
+            } => {
+                assert!(cursor.is_none());
+                assert!(selection_anchor.is_none());
+            }
+            other => panic!("expected a TextInput field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_settings_form_event_is_not_mistaken_for_a_plugin_one() {
+        // The Settings panel paints through the *same* `FormController` shape,
+        // with ids like `cat-0` / `core-tabstop`. If the namespace check were
+        // dropped, a Settings click would be dispatched into a plugin.
+        assert!(
+            plugin_view_event_from_form_event(&quadraui::FormEvent::ButtonClicked {
+                id: quadraui::WidgetId::new("save"),
+            })
+            .is_none()
+        );
+        let plugin = plugin_view_event_from_form_event(&quadraui::FormEvent::ButtonClicked {
+            id: quadraui::WidgetId::new("plugin:my-ext:send"),
+        })
+        .expect("a namespaced id must resolve");
+        assert_eq!(plugin.0, "my-ext");
+        assert_eq!(plugin.1, "send");
+        assert_eq!(
+            plugin.2,
+            crate::core::plugin_ui::ViewEventKind::ButtonClicked
+        );
+    }
+
+    #[test]
+    fn a_toggle_group_entry_keeps_its_own_id_through_the_round_trip() {
+        use crate::core::plugin_ui::{
+            PluginView, ViewEventKind, ViewField, ViewFieldKind, ViewToggle, VIEW_SCHEMA_VERSION,
+        };
+        let view = PluginView {
+            id: "f".to_string(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            fields: vec![ViewField {
+                id: "flags".to_string(),
+                label: "Flags".to_string(),
+                hint: String::new(),
+                disabled: false,
+                error: None,
+                warning: None,
+                kind: ViewFieldKind::Toggles {
+                    toggles: vec![ViewToggle {
+                        id: "case".to_string(),
+                        label: "Aa".to_string(),
+                        value: false,
+                    }],
+                },
+            }],
+        };
+        let form = plugin_view_to_form("my-ext", &view, 0, 0, false);
+        let inner = match &form.fields[0].kind {
+            quadraui::FieldKind::ToggleGroup { toggles } => toggles[0].id.clone(),
+            other => panic!("expected a ToggleGroup, got {other:?}"),
+        };
+        assert_eq!(inner.as_str(), "plugin:my-ext:case");
+        let resolved = plugin_view_event_from_form_event(&quadraui::FormEvent::ToggleChanged {
+            id: inner,
+            value: true,
+        })
+        .expect("the sub-widget id must resolve back to the plugin");
+        assert_eq!(resolved.1, "case");
+        assert_eq!(resolved.2, ViewEventKind::ToggleChanged { value: true });
     }
 }
