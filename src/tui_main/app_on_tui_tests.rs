@@ -7594,4 +7594,158 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
+
+    /// #1510: AI panel assistant/thought turns render as markdown
+    /// (`render_markdown_to_styled`) instead of raw markdown source; thought
+    /// turns additionally collapse to a fixed one-line "Thinking..."
+    /// summary. GTK twin: `gtk::testing::issue_1510_ai_panel_markdown_
+    /// rendering`.
+    mod issue_1510_ai_panel_markdown_rendering {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// A wide (220x30, `Alt+Right` x40 — same widening every other AI
+        /// panel test in this file uses) harness with a fixture agent
+        /// configured to reply with `$ACP_FAKE_MARKDOWN_REPLY`'s markdown
+        /// thought/message chunks and no follow-up tool-call machinery
+        /// (`$ACP_FAKE_NO_TOOL_REQUEST`), so the turn ends cleanly.
+        fn widened_markdown_harness() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_MARKDOWN_REPLY=1".to_string(),
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// #1510 acceptance: the assistant's markdown reply
+        /// (`"# Heading\n**bold** text"`) must paint as rendered markdown —
+        /// "Heading" and "bold" visible, with no literal `#`/`**` syntax
+        /// characters on screen — proving the transcript now goes through
+        /// `quadraui::render_markdown_to_styled` rather than
+        /// `StyledText::colored` on the raw source.
+        ///
+        /// RED verified: with `populate_ai_chat_controller`'s markdown path
+        /// reverted to `quadraui::StyledText::colored(m.content.clone(),
+        /// fg)` (this issue's starting point), this fails — the screen
+        /// shows the literal source `"# Heading"` and `"**bold** text"`
+        /// verbatim, so the `!screen.contains("# Heading")` and
+        /// `!screen.contains("**bold**")` assertions below both fail.
+        #[cfg(unix)]
+        #[test]
+        fn assistant_markdown_reply_renders_stripped_and_styled_via_shell_app() {
+            let mut h = widened_markdown_harness();
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Heading") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Heading"),
+                "the rendered heading text must reach the screen; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("bold"),
+                "the rendered bold text must reach the screen; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("# Heading"),
+                "the raw '#' heading marker must never reach the screen — \
+                 markdown must be rendered, not shown verbatim; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("**bold**"),
+                "the raw '**' emphasis markers must never reach the \
+                 screen — markdown must be rendered, not shown verbatim; \
+                 screen:\n{screen}"
+            );
+        }
+
+        /// #1510 acceptance: a thought turn's markdown content
+        /// (`"# Pondering\n**deeply**"`) must never reach the screen at
+        /// all — thought turns collapse by default to a fixed one-line
+        /// "Thinking..." summary (full expansion is out of scope here).
+        ///
+        /// RED verified: with the `chat.set_turn_collapsed`/
+        /// `set_turn_summary` calls this issue adds removed, this fails —
+        /// the thought's own text ("Pondering"/"deeply") paints on screen
+        /// instead of the "Thinking..." summary.
+        #[cfg(unix)]
+        #[test]
+        fn thought_turn_collapses_to_thinking_summary_via_shell_app() {
+            let mut h = widened_markdown_harness();
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Thinking") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Thinking"),
+                "a thought turn must collapse to a one-line 'Thinking...' \
+                 summary; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("Pondering"),
+                "the thought turn's own markdown content must not reach \
+                 the screen while collapsed; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("deeply"),
+                "the thought turn's own markdown content must not reach \
+                 the screen while collapsed; screen:\n{screen}"
+            );
+        }
+    }
 }

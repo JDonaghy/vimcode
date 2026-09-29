@@ -38,6 +38,7 @@
 //! — not just `acp_active_session` — reusing the exact per-event handling
 //! this module's fields used to receive only in the single-session shape.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::acp::{
@@ -46,6 +47,11 @@ use super::acp::{
     AcpUsage,
 };
 use super::ai::AiMessage;
+
+/// One cached markdown render: the source content's byte length, the
+/// rendered [`quadraui::StyledText`], and its per-line heading scales. See
+/// [`AcpSession::markdown_turn_cache`]'s doc.
+pub type MarkdownTurnCacheEntry = (usize, quadraui::StyledText, Vec<f32>);
 
 /// One ACP conversation: its own agent process (or none yet), its own
 /// `session/new` id, its own transcript, its own in-flight protocol state.
@@ -110,6 +116,27 @@ pub struct AcpSession {
     /// Left stale (not cleared) once the turn ends — harmless, since every
     /// reader gates on `ai_streaming` being `true` first.
     pub turn_started_at: Option<std::time::Instant>,
+
+    /// Cache of markdown-rendered assistant/thought turns (#1510), keyed by
+    /// index into `ai_messages`. Each entry pairs the source message's
+    /// content length with the `quadraui::StyledText`/per-line heading-scale
+    /// pair `quadraui::render_markdown_to_styled` produced for it.
+    ///
+    /// `render::populate_ai_chat_controller` rebuilds `ChatController`'s
+    /// transcript from `ai_messages` on *every* frame (matching
+    /// `set_transcript`'s "replace, don't accumulate" contract), but during
+    /// a streaming turn only the newest (last) message's content actually
+    /// changes frame-to-frame — every earlier, already-settled message would
+    /// otherwise be re-parsed as markdown dozens of times a second for no
+    /// reason. Keyed by content length rather than a hash of the content
+    /// itself: a streamed message only ever grows (chunks are appended, not
+    /// rewritten), so a length mismatch is a correct enough staleness check
+    /// without hashing the whole string every frame.
+    ///
+    /// `Engine::ai_clear` empties this alongside `ai_messages` itself, so a
+    /// cleared session's fresh messages never collide with stale entries
+    /// left over at the same indices from the previous conversation.
+    pub markdown_turn_cache: RefCell<HashMap<usize, MarkdownTurnCacheEntry>>,
 }
 
 impl AcpSession {

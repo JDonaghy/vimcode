@@ -3223,6 +3223,11 @@ impl Engine {
             self.dialog = None;
         }
         self.acp_mut().ai_messages.clear();
+        // #1510: drop cached markdown renders alongside the transcript they
+        // describe — otherwise the next conversation's messages could land
+        // at the same indices and (if a coincidentally equal content length
+        // ever occurred) read a stale render meant for different text.
+        self.acp_mut().markdown_turn_cache.get_mut().clear();
         self.ai_rx = None;
         self.acp_mut().ai_streaming = false;
         self.acp_mut().client = None;
