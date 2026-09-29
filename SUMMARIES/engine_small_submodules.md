@@ -86,13 +86,16 @@ AI chat panel, dialog system, and swap file crash recovery.
 - `check_swap_recovery(path)` — detect and offer crash recovery
 - `emergency_swap_flush()` — write swap files for ALL dirty buffers immediately (called from panic hooks)
 
-## plugins.rs — 653 lines
-Lua plugin lifecycle and dispatch.
+## plugins.rs — 1,172 lines
+Lua plugin lifecycle and dispatch, plus the engine half of the immediate API (#1214).
 - `plugin_init()` — load plugins from `~/.config/vimcode/plugins/` and extension dirs
-- `plugin_fire_event(event)` — dispatch hook to all plugins
-- `plugin_run_command(name, args)` — try plugin command handler
-- `plugin_run_keymap(mode, key)` — try plugin keymap handler
-- `apply_plugin_ctx(ctx)` — apply plugin side-effects to engine state
+- `set_plugin_manager(mgr)` — install the manager (wrapped in the dispatch `Rc`)
+- `plugin_event(event, arg)` — dispatch hook to all plugins; defers a nested event onto `deferred_plugin_events`
+- `with_plugin_dispatch(f)` — the one dispatch seam: `Rc`-clones the manager, installs an `EngineLoan`, enforces the reentrancy guard, closes plugin undo groups
+- `plugin_run_command(name, args)` — try plugin command handler (in `keys.rs`)
+- `plugin_run_keymap(mode, key)` — try plugin keymap handler (in `keys.rs`)
+- `apply_plugin_ctx(ctx)` — apply queued plugin side-effects, then drain deferred events
+- `plugin_api_*` — immediate-API primitives behind `vimcode.buffer.*` / `vimcode.window.*` (resolve handles, get/set lines, create buffer, window buf/cursor)
 
 ## dap_ops.rs — 1,541 lines
 DAP debugger operations: polling, breakpoints, sidebar navigation, stepping.

@@ -364,6 +364,68 @@ vimcode.buf.open_scratch(name, content, opts) -- Open a scratch buffer
   -- opts (optional table): readonly=bool, filetype=string, split="vertical"|"horizontal"
 ```
 
+Writes made through `vimcode.buf.*` are **queued** and applied *after* your
+callback returns, and reads come from a snapshot taken *before* it ran — so a
+read never sees a write made in the same callback. When you need
+read-after-write, a buffer you did not open, or a handle to pass around, use the
+immediate API below.
+
+### Immediate Buffer / Window API (`vimcode.buffer.*`, `vimcode.window.*`)
+
+These take effect **at call time**, against the live editor. Buffers and windows
+are plain integer handles, and `0` always means "current".
+
+```lua
+vimcode.buffer.current()              -- Handle of the active buffer
+vimcode.buffer.is_valid(buf)          -- Does this handle name a live buffer?
+vimcode.buffer.line_count(buf)        -- Number of lines
+vimcode.buffer.get_lines(buf, s, e)   -- Lines [s, e) as a table, no trailing "\n"
+vimcode.buffer.set_lines(buf, s, e, lines) -- Replace lines [s, e); applied immediately
+vimcode.buffer.create(opts)           -- New buffer -> handle
+  -- opts (optional table): scratch=bool, name=string
+
+vimcode.window.current()              -- Handle of the focused window
+vimcode.window.is_valid(win)
+vimcode.window.get_buf(win)           -- Buffer shown in this window
+vimcode.window.set_buf(win, buf)      -- Show `buf` in `win` (fires `BufEnter`)
+vimcode.window.get_cursor(win)        -- {line=N, col=M} (also [1]=N, [2]=M), 1-indexed
+vimcode.window.set_cursor(win, pos)   -- pos: {line=N, col=M} or {N, M}, 1-indexed
+```
+
+Conventions, and how they differ from `vimcode.buf.*`:
+
+- `get_lines`/`set_lines` are **0-indexed with an exclusive end**, and a negative
+  index counts back from the end of the buffer (same as `vimcode.buf.get_lines`).
+- `get_lines` strips the trailing newline; `vimcode.buf.get_lines` does not.
+- `line_count` counts *logical* lines, so a buffer ending in a newline does not
+  report an extra empty line, and
+  `set_lines(b, 0, line_count(b), get_lines(b, 0, line_count(b)))` is a no-op.
+  `vimcode.buf.line_count()` is one larger on such buffers.
+- Cursors are 1-indexed, like `vimcode.buf.cursor()`.
+- All of a plugin's immediate edits to one buffer in one callback collapse into a
+  single undo step.
+- If you mix the two tiers in one callback, the queued write is applied last and
+  therefore wins.
+- Calling these outside a callback (e.g. at the top level of your script, during
+  load) is an error: there is no live editor to talk to yet. Do the work from a
+  `vimcode.on("VimEnter", …)` hook instead.
+
+Example — build a scratch report and show it:
+
+```lua
+vimcode.command("Report", function(_)
+  local src = vimcode.buffer.current()
+  local n = vimcode.buffer.line_count(src)
+  local out = vimcode.buffer.create({ scratch = true, name = "Report" })
+  vimcode.buffer.set_lines(out, 0, -1, { "lines: " .. n, "" })
+  for _, line in ipairs(vimcode.buffer.get_lines(src, 0, math.min(n, 20))) do
+    local at = vimcode.buffer.line_count(out)
+    vimcode.buffer.set_lines(out, at, at, { "  " .. line })
+  end
+  vimcode.window.set_buf(0, out)
+end)
+```
+
 ### Settings Functions (`vimcode.opt.*`)
 
 ```lua
@@ -586,7 +648,7 @@ vimcode.set_comment_style("haskell", {
 | `BufWrite` | file path | After buffer is written to disk |
 | `open` | file path | File opened in editor |
 | `BufNew` | file path | New buffer created |
-| `BufEnter` | file path | Buffer/window entered |
+| `BufEnter` | file path, or display name for an unnamed/scratch buffer | Buffer/window entered (including via `vimcode.window.set_buf`) |
 | `cursor_move` | `"line,col"` | Cursor moves (Normal mode only) |
 | `VimEnter` | `""` | Editor initialization complete |
 | `InsertEnter` | mode name | Entered Insert mode |
@@ -602,6 +664,12 @@ vimcode.set_comment_style("haskell", {
 | `git_branch_changed` | new branch name (or `""`) | External git branch change detected (rate-limited to once per 2s) |
 | `panel_input` | `"panel\|\|\|text\|"` | Panel input field text changed |
 | Custom | shell output | `async_shell()` callback event |
+
+An event triggered by your own callback — e.g. `BufEnter` from
+`vimcode.window.set_buf` — is **deferred**: it runs as soon as your callback
+returns and its queued effects have been applied, not in the middle of it. Your
+hook for such an event therefore sees the finished state of the change that
+caused it.
 
 ---
 
