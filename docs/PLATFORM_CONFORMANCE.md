@@ -44,7 +44,15 @@ Anything other than `0` means **do not roll**.
 | `3` | `coverage-gap` | Every lane that ran is green, but at least one lane was **skipped on a host whose probe says it is capable** (`skipped-capable` — e.g. GTK on Darwin, capable but opt-in). Nothing is known to be broken; the run simply does not cover what it could have. Do not roll on this host's evidence alone: re-run with `--lane <name>` to force it, or point at another machine's summary that covers it. |
 
 The `--summary` destination is validated (and truncated) **before any lane
-runs**, so a bad path costs a second rather than a full `cargo test`.
+runs**, so a bad path costs a second rather than a full `cargo test`. That
+truncation is also why `1` has a shape `2` does not: if the script dies via
+the `on_exit` EXIT trap (#933) *after* the path was validated (the file now
+exists, truncated to empty) but *before* the final JSON is written, the exit
+code is still correctly `1` — do not roll — but the summary path is left
+behind as an **existing, empty, invalid-JSON file**, not "no file at all."
+A parser that only checks "does the file exist" and then reads it must also
+treat empty/unparseable content as `1`, the same as a missing file; a naive
+"file exists ⇒ trust it" parser would mishandle this one shape.
 
 ## Machine-readable summary
 
@@ -285,8 +293,8 @@ macos    skipped          host is not Darwin (uname: Linux)
 win      check-only       cargo-xwin present but no WSL interop detected ...; compiled ok; not executed
 ```
 
-Six states, each meaning something different (the same strings appear in the
-machine-readable summary's `status` field):
+Seven states, each meaning something different (the same strings appear in
+the machine-readable summary's `status` field):
 
 - **`passed`** — the lane ran and every test in it passed. The script also
   guards against this being reported when zero tests actually executed (the
