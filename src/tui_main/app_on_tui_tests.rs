@@ -6979,9 +6979,15 @@ mod tests {
         /// header back to the static `"(thinking\u{2026})"` literal (this
         /// issue's starting point, with no `chat.set_spinner_frame` call
         /// either) makes this fail on both counts — the screen never shows
-        /// "execute: Run the tests \u{b7}" anywhere, and
-        /// `Engine::ai_spinner_frame` never advances past its `0` starting
-        /// value no matter how many ticks are driven.
+        /// "execute: Run the tests \u{b7}" anywhere, and the glyph painted
+        /// immediately before "execute: Run the tests" on screen never
+        /// changes no matter how many ticks are driven.
+        ///
+        /// `#[cfg(unix)]`: shells out to the `.sh` fixture via `sh
+        /// "$fixture"`, same as every other ACP-agent test in this file
+        /// (e.g. `ai_agent_status_line_shows_active_mcp_server_via_shell_app`
+        /// above).
+        #[cfg(unix)]
         #[test]
         fn busy_status_shows_running_tool_call_and_elapsed_time_via_shell_app() {
             let mut engine = plain_engine();
@@ -7052,22 +7058,53 @@ mod tests {
                  screen:\n{screen}"
             );
 
-            // The spinner frame must actually move, not just exist — sample
-            // it across several driven ticks (each `driver.tick()` runs one
-            // `App::tick_dispatch` -> `poll_idle` -> `Engine::
-            // tick_ai_spinner` pass while `ai_streaming` stays `true`).
-            let frame_a = h.engine.borrow().ai_spinner_frame;
+            // The spinner glyph painted immediately before "execute: Run
+            // the tests" must actually move on the *rendered surface* —
+            // not just some internal engine counter (that was this
+            // review's finding: an `Engine::ai_spinner_frame` assertion
+            // can stay green even if `ChatController::render`/the TUI
+            // rasteriser stops repainting the glyph, e.g. a stale
+            // `set_spinner_frame` call or a layout cache suppressing the
+            // repaint). Extract the literal glyph character painted on
+            // `driver.screen()` right before the tool-call title and
+            // sample it across several driven ticks.
+            fn painted_spinner_glyph(screen: &str) -> char {
+                let line = screen
+                    .lines()
+                    .find(|l| l.contains("execute: Run the tests"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected a screen line containing \
+                             \"execute: Run the tests\"; screen:\n{screen}"
+                        )
+                    });
+                let idx = line.find("execute: Run the tests").unwrap();
+                line[..idx]
+                    .trim_end()
+                    .chars()
+                    .next_back()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected a spinner glyph immediately before \
+                             \"execute: Run the tests\" on line {line:?}"
+                        )
+                    })
+            }
+
+            let glyph_a = painted_spinner_glyph(&driver.screen());
             let advance_deadline = Instant::now() + Duration::from_secs(2);
-            let mut frame_b = frame_a;
-            while frame_b == frame_a && Instant::now() < advance_deadline {
+            let mut glyph_b = glyph_a;
+            while glyph_b == glyph_a && Instant::now() < advance_deadline {
                 driver.tick();
+                driver.render();
                 std::thread::sleep(Duration::from_millis(20));
-                frame_b = h.engine.borrow().ai_spinner_frame;
+                glyph_b = painted_spinner_glyph(&driver.screen());
             }
             assert_ne!(
-                frame_a, frame_b,
-                "Engine::ai_spinner_frame must advance every tick while a \
-                 turn is streaming, not stay frozen at its starting value"
+                glyph_a, glyph_b,
+                "the spinner glyph painted on screen right before the \
+                 tool-call title must change every so often while a turn \
+                 is streaming, not stay frozen at its starting glyph"
             );
         }
     }

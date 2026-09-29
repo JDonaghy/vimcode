@@ -8502,20 +8502,54 @@ second line here
                  paint too, unaffected by the status-strip change"
             );
 
-            let frame_a = h.engine.borrow().ai_spinner_frame;
+            // The spinner glyph painted immediately before "execute: Run
+            // the tests" must actually move on the *painted surface* —
+            // not just `Engine::ai_spinner_frame` (an internal counter
+            // that can advance while `ChatController::render`/the GTK
+            // rasteriser stops repainting the glyph, e.g. a stale
+            // `set_spinner_frame` call or a layout cache suppressing the
+            // repaint). `painted_texts()` lists each distinct text run the
+            // GTK rasteriser drew this frame; the status-strip header is
+            // pushed as one homogeneously-colored `StyledText` (see
+            // `populate_ai_chat_controller`), so the glyph and the
+            // tool-call title land in the same run.
+            fn painted_spinner_glyph(painted: &[&str]) -> char {
+                let run = painted
+                    .iter()
+                    .find(|t| t.contains("execute: Run the tests"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected a painted text run containing \
+                             \"execute: Run the tests\"; painted: {painted:?}"
+                        )
+                    });
+                let idx = run.find("execute: Run the tests").unwrap();
+                run[..idx]
+                    .trim_end()
+                    .chars()
+                    .next_back()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected a spinner glyph immediately before \
+                         \"execute: Run the tests\" in run {run:?}"
+                        )
+                    })
+            }
+
+            let glyph_a = painted_spinner_glyph(&h.driver.painted_texts());
             let advance_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let mut frame_b = frame_a;
-            while frame_b == frame_a && std::time::Instant::now() < advance_deadline {
+            let mut glyph_b = glyph_a;
+            while glyph_b == glyph_a && std::time::Instant::now() < advance_deadline {
                 h.engine.borrow_mut().poll_idle();
                 h.driver.render();
                 std::thread::sleep(std::time::Duration::from_millis(20));
-                frame_b = h.engine.borrow().ai_spinner_frame;
+                glyph_b = painted_spinner_glyph(&h.driver.painted_texts());
             }
             assert_ne!(
-                frame_a, frame_b,
-                "Engine::ai_spinner_frame must advance every `poll_idle` \
-                 tick while a turn is streaming, not stay frozen at its \
-                 starting value"
+                glyph_a, glyph_b,
+                "the spinner glyph painted on screen right before the \
+                 tool-call title must change every so often while a turn \
+                 is streaming, not stay frozen at its starting glyph"
             );
         }
     }

@@ -82,6 +82,18 @@ impl Engine {
     /// `Backend::request_frame_in` re-arm while busy — see that call
     /// site's doc — rather than relying on quadraui's coarser 250ms
     /// idle-poll fallback ceiling alone.
+    ///
+    /// Not a true fixed-interval animation clock: this advances once per
+    /// `poll_idle` *call*, and `poll_idle`'s cadence is whatever the
+    /// backend happens to invoke it at — the 100ms `request_frame_in`
+    /// re-arm above is the intended floor, but any other event that
+    /// triggers a tick (a keypress, an LSP/ACP message, a timer from an
+    /// unrelated subsystem) also advances the frame. So the perceived
+    /// animation speed isn't strictly tied to wall-clock time and can
+    /// differ between GTK and TUI, or between a quiet and a busy moment
+    /// of the same turn. Acceptable for a cosmetic "still working"
+    /// indicator; worth revisiting if a future feature needs a real
+    /// fixed-interval clock.
     pub(crate) fn tick_ai_spinner(&mut self) -> bool {
         if !self.acp_sessions.iter().any(|s| s.ai_streaming) {
             return false;
