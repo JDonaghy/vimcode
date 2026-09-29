@@ -18,97 +18,32 @@
 
 use quadraui::{DiffEditability, DiffMode, DiffPane, DiffView};
 
-/// One proposed change to a single file — source-agnostic: an ACP `diff`
-/// content block and a git-branch diff both construct this the same way.
-/// `old_text: None` marks a new file (no left side at all, per the ACP v1
-/// schema's `oldText: string | null`) — distinct from `Some(String::new())`
-/// (an existing, empty file), though [`ChangeReviewEntry::new`] diffs both
-/// the same way (`compute_hunks` against `""`).
+/// One proposed change to a single file — source-agnostic: a git-branch
+/// diff (#525) and an ACP turn's tracked writes (#1460, via
+/// `crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`) both
+/// construct this the same way. `old_text: None` marks a new file (no left
+/// side at all) — distinct from `Some(String::new())` (an existing, empty
+/// file), though [`ChangeReviewEntry::new`] diffs both the same way
+/// (`compute_hunks` against `""`).
 ///
 /// **Both `old_text` and `new_text` must be whole-file content by the time
-/// they land here** (#1454). A real ACP adapter's `diff` content block is
-/// *not* guaranteed to be whole-file — `@agentclientprotocol/claude-agent-acp`
-/// emits the edited snippet only (`oldText`/`newText` covering just the
-/// changed region) — so a caller feeding this from a wire `diff` block must
-/// resolve that snippet against the file's actual current contents first
-/// ([`resolve_fragment`] does exactly that) rather than passing the raw
-/// fragment straight through. This module has no filesystem/buffer access to
-/// do that resolution itself, hence it living in the caller
-/// (`crate::core::engine::acp_ops::Engine::acp_open_review_for_diffs`) —
-/// but the *contract* that `old_text`/`new_text` are whole-file lives here,
-/// next to the type it protects: this is what makes both the accept-write
-/// (`Engine::change_review_accept_current`, which writes `new_text` as the
-/// entire file) and the `DiffView` this module builds correct at once,
-/// rather than each needing its own fragment-awareness.
+/// they land here** — never a fragment/snippet. #1454 first stated this
+/// contract for a since-retired feeder (a `diff` ACP tool-call content
+/// block, resolved fragment-against-current-content before landing here);
+/// #1516 retired that feeder outright (a `diff` block is display-only per
+/// the ACP spec — see `crate::core::engine::acp_ops::Engine::
+/// acp_upsert_tool_call`'s doc for why), but the whole-file contract itself
+/// stays, since every remaining feeder already only ever constructs a
+/// `ProposedChange` from real whole-file content (a `git show` for #525, a
+/// tracked turn's pre/post content for #1460) — this is what makes both the
+/// accept-write (`Engine::change_review_accept_current`, which writes
+/// `new_text` as the entire file) and the `DiffView` this module builds
+/// correct at once, rather than each needing its own fragment-awareness.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProposedChange {
     pub path: String,
     pub old_text: Option<String>,
     pub new_text: String,
-}
-
-/// Outcome of resolving a `diff` content block's `old_text` fragment against
-/// a file's actual current whole-file content (#1454) — the safety check
-/// that stands between an agent-reported snippet and ever writing it as if
-/// it were the entire file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FragmentResolution {
-    /// `fragment` occurs in `current` exactly once: unambiguous. `old_whole`
-    /// is `current` itself (the diff's whole-file "before"); `new_whole` is
-    /// `current` with that one occurrence replaced by `replacement` (the
-    /// whole-file "after") — both ready to feed [`ProposedChange`] as-is.
-    Applied {
-        old_whole: String,
-        new_whole: String,
-    },
-    /// `fragment` occurs zero times, but `replacement` already occurs
-    /// exactly once — the edit already landed by some other path (e.g. the
-    /// agent's own `fs/write_text_file` beat this `diff` report to the
-    /// buffer/disk, the double-apply race #1454 flags for ACP adapters that
-    /// apply edits themselves and merely *report* them via `diff`). Nothing
-    /// left to do; a caller should treat this as informational, not as a
-    /// pending change to review.
-    AlreadyApplied,
-    /// `fragment` occurs zero times (and `replacement` doesn't uniquely
-    /// identify an already-applied edit either), or two or more times —
-    /// there is no single unambiguous place to apply this edit. Carries a
-    /// human-readable reason. A caller must refuse rather than guess: never
-    /// silently write `replacement` over the whole file (the data-loss bug
-    /// #1454 reported) and never pick an arbitrary occurrence among several.
-    Refused(String),
-}
-
-/// Resolve a `diff` content block's fragment (`fragment` = the wire's
-/// `oldText`, `replacement` = its `newText`) against `current` — a file's
-/// actual whole-file content, read fresh (buffer-first) by the caller right
-/// before opening the review, per [`ProposedChange`]'s doc. Exact
-/// single-occurrence match is the only case that's safe to treat as
-/// unambiguous; see [`FragmentResolution`] for the other two outcomes.
-///
-/// Callers: only for a `diff` block whose `oldText` is non-null (an edit to
-/// an existing file) — a null `oldText` (a new file) has no "current
-/// contents" to resolve against and is handled entirely by the caller
-/// without involving this function at all.
-pub fn resolve_fragment(current: &str, fragment: &str, replacement: &str) -> FragmentResolution {
-    let occurrences = current.matches(fragment).count();
-    if occurrences == 1 {
-        return FragmentResolution::Applied {
-            old_whole: current.to_string(),
-            new_whole: current.replacen(fragment, replacement, 1),
-        };
-    }
-    if occurrences == 0 {
-        if current.matches(replacement).count() == 1 {
-            return FragmentResolution::AlreadyApplied;
-        }
-        return FragmentResolution::Refused(
-            "change text was not found in the current file contents".to_string(),
-        );
-    }
-    FragmentResolution::Refused(format!(
-        "change text appears {occurrences} times in the current file contents; \
-         refusing an ambiguous edit"
-    ))
 }
 
 /// Human decision on one [`ChangeReviewEntry`]. `Pending` is the only
@@ -244,6 +179,14 @@ pub struct ChangeReviewEntry {
     pub change: ProposedChange,
     pub view: DiffView,
     pub decision: ChangeDecision,
+    /// Per-hunk decision (#1516), one entry per `view.hunks[i]` — the
+    /// granularity a turn review's `a`/`r` (current hunk) and `A`/`R`
+    /// (whole file, all of its hunks at once) act on. A branch/proposal
+    /// review never reads this field (its `a`/`r` keys stay whole-file,
+    /// see `review_ops.rs`'s `handle_change_review_key`), but every entry
+    /// still carries one so the two review kinds share one struct without
+    /// an `Option` — an empty/unused `Vec` costs nothing.
+    pub hunk_decisions: Vec<ChangeDecision>,
 }
 
 impl ChangeReviewEntry {
@@ -283,10 +226,12 @@ impl ChangeReviewEntry {
             focused_pane: DiffPane::Left,
             has_focus: true,
         };
+        let hunk_decisions = vec![ChangeDecision::Pending; view.hunks.len()];
         Self {
             change,
             view,
             decision: ChangeDecision::Pending,
+            hunk_decisions,
         }
     }
 
@@ -303,6 +248,143 @@ impl ChangeReviewEntry {
         }
         starts
     }
+
+    /// Which hunk (index into `self.view.hunks`/`self.hunk_decisions`) the
+    /// surface is currently scrolled to — what a turn review's `a`/`r`
+    /// (#1516) act on. `None` only for a genuinely hunk-less entry (no
+    /// real diff at all — shouldn't happen for an entry that exists, but
+    /// this stays fallible rather than panicking).
+    pub(crate) fn current_hunk_index(&self) -> Option<usize> {
+        let starts = self.hunk_start_rows();
+        if starts.is_empty() {
+            return None;
+        }
+        let mut idx = 0;
+        for (i, &s) in starts.iter().enumerate() {
+            if s <= self.view.scroll_offset {
+                idx = i;
+            } else {
+                break;
+            }
+        }
+        Some(idx)
+    }
+
+    /// The scroll-offset row of the first hunk still `Pending` in
+    /// [`Self::hunk_decisions`], if any — how a whole-file/whole-review
+    /// hunk sweep (`A`/`R`, `ga`/`gr`, #1516) walks every remaining hunk by
+    /// repeatedly moving "the cursor" to it and reusing the single-hunk
+    /// operation, rather than duplicating the hunk-reconstruction logic.
+    pub(crate) fn first_pending_hunk_row(&self) -> Option<usize> {
+        let starts = self.hunk_start_rows();
+        self.hunk_decisions
+            .iter()
+            .position(|d| *d == ChangeDecision::Pending)
+            .and_then(|i| starts.get(i).copied())
+    }
+
+    /// The full-file content that results from reverting hunk `hunk_idx`
+    /// of this entry's *current* diff (`self.change.old_text` vs
+    /// `self.change.new_text`) back to its left-side (pre-turn) text —
+    /// every other line, inside or outside any other hunk, is left exactly
+    /// as `new_text` already has it. `None` if `hunk_idx` is out of range.
+    /// The core mechanism behind hunk-level reject (#1516): reusing the
+    /// exact rows already computed for painting (`self.view.hunks`) rather
+    /// than re-deriving the diff a second way, so "what reject undoes" can
+    /// never disagree with "what the surface is showing".
+    pub(crate) fn content_with_hunk_reverted(&self, hunk_idx: usize) -> Option<String> {
+        let hunk = self.view.hunks.get(hunk_idx)?;
+        let now_lines: Vec<&str> = self.change.new_text.split('\n').collect();
+        let right_start = hunk.right_start.saturating_sub(1).min(now_lines.len());
+        let right_count = hunk.rows.iter().filter(|r| r.right.is_some()).count();
+        let right_end = (right_start + right_count).min(now_lines.len());
+        let old_lines: Vec<&str> = hunk
+            .rows
+            .iter()
+            .filter_map(|row| row.left.as_deref())
+            .collect();
+        let mut result: Vec<&str> = Vec::with_capacity(now_lines.len());
+        result.extend_from_slice(&now_lines[..right_start]);
+        result.extend(old_lines);
+        result.extend_from_slice(&now_lines[right_end..]);
+        Some(result.join("\n"))
+    }
+
+    /// Recompute this entry's `view`/`hunks` from `self.change.old_text`
+    /// (immutable across the review's life) against `new_text` (the file's
+    /// fresh content after a hunk decision changed it, #1516) — reusing
+    /// [`Self::new`]'s exact construction so the rebuilt view can never
+    /// disagree with a freshly-opened one. `id_suffix` is only ever used
+    /// for the rebuilt `DiffView`'s widget id, which is then overwritten
+    /// with `self.view.id`'s original value, so a caller doesn't need to
+    /// track a globally-unique suffix — just something to pass through.
+    ///
+    /// Every hunk decision already made is carried forward by matching
+    /// hunks on `left_start` — a position within the *immutable* pre-turn
+    /// text, so it stays a stable identity no matter how much a rejected
+    /// hunk elsewhere in the file shifts every later hunk's right-side line
+    /// numbers. A hunk whose `left_start` no longer appears at all (the
+    /// diff against it has disappeared — the common case right after that
+    /// exact hunk was itself just rejected) is simply gone, nothing to
+    /// carry forward.
+    pub(crate) fn refresh_after_edit(&mut self, id_suffix: usize, new_text: String) {
+        let carried: Vec<(usize, ChangeDecision)> = self
+            .view
+            .hunks
+            .iter()
+            .zip(self.hunk_decisions.iter())
+            .map(|(h, d)| (h.left_start, *d))
+            .collect();
+        let change = ProposedChange {
+            path: self.change.path.clone(),
+            old_text: self.change.old_text.clone(),
+            new_text,
+        };
+        let mut rebuilt = ChangeReviewEntry::new(change, id_suffix);
+        rebuilt.view.id = self.view.id.clone();
+        let mut new_decisions = vec![ChangeDecision::Pending; rebuilt.view.hunks.len()];
+        for (i, h) in rebuilt.view.hunks.iter().enumerate() {
+            if let Some((_, d)) = carried.iter().find(|(ls, _)| *ls == h.left_start) {
+                new_decisions[i] = *d;
+            }
+        }
+        self.change = rebuilt.change;
+        self.view = rebuilt.view;
+        self.hunk_decisions = new_decisions;
+        self.sync_decision_from_hunks();
+        let last_row = self.view.flat_rows().len().saturating_sub(1);
+        self.view.scroll_offset = self.view.scroll_offset.min(last_row);
+    }
+
+    /// Roll [`Self::hunk_decisions`] up into the whole-file
+    /// [`Self::decision`] every branch/proposal-review code path (auto-
+    /// close, the footer's "(pending/accepted/rejected)" label) already
+    /// reads — so hunk-level decisions (#1516) stay compatible with that
+    /// existing generic machinery instead of it needing its own
+    /// hunk-awareness. `Pending` while any hunk is undecided; once every
+    /// hunk has a decision, `Accepted` unless *every* hunk was rejected (in
+    /// which case the file behaves exactly like the old whole-file
+    /// reject).
+    pub(crate) fn sync_decision_from_hunks(&mut self) {
+        self.decision = if self.hunk_decisions.is_empty() {
+            // Only reachable after `refresh_after_edit` recomputed zero
+            // hunks left at all — meaning a reject just erased the last
+            // remaining difference from this file's pre-turn content, so
+            // "nothing left to review" reads as fully (and entirely)
+            // rejected, not as still-pending.
+            ChangeDecision::Rejected
+        } else if self.hunk_decisions.contains(&ChangeDecision::Pending) {
+            ChangeDecision::Pending
+        } else if self
+            .hunk_decisions
+            .iter()
+            .all(|d| *d == ChangeDecision::Rejected)
+        {
+            ChangeDecision::Rejected
+        } else {
+            ChangeDecision::Accepted
+        };
+    }
 }
 
 /// The change-review surface's whole state: an ordered list of per-file
@@ -318,6 +400,14 @@ pub struct ChangeReviewState {
     /// caller finds "the comment already on this line" to edit/delete
     /// rather than accumulating duplicates.
     pub comments: Vec<ReviewComment>,
+    /// Transient two-key sequence state for `ga`/`gr` (#1516, "reject/keep
+    /// every remaining hunk in every file"): set by a bare `g` keypress,
+    /// consumed (and cleared) by the very next keypress regardless of
+    /// whether that key completes the sequence — mirrors vim's own
+    /// g-prefix contract (an unrecognised follow-up key is handled fresh,
+    /// never silently swallowed). Lives here, not on `Engine`, since it's
+    /// UI input state scoped entirely to this surface being open.
+    pub pending_g: bool,
 }
 
 impl ChangeReviewState {
@@ -335,6 +425,7 @@ impl ChangeReviewState {
             entries,
             current: 0,
             comments: Vec::new(),
+            pending_g: false,
         }
     }
 
@@ -676,6 +767,161 @@ mod tests {
         );
     }
 
+    // ── hunk-level machinery (#1516) ────────────────────────────────────
+
+    /// Two well-separated changes land in two hunks, each starting with a
+    /// fresh `hunk_decisions` entry all `Pending` — the ground state
+    /// hunk-level `a`/`r` acts on.
+    fn two_hunk_state() -> ChangeReviewState {
+        let lines: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        let old = format!("{}\n", lines.join("\n"));
+        let mut changed_lines = lines.clone();
+        changed_lines[2] = "CHANGED-A".to_string();
+        changed_lines[15] = "CHANGED-B".to_string();
+        let new = format!("{}\n", changed_lines.join("\n"));
+        ChangeReviewState::new(vec![change("f", Some(&old), &new)])
+    }
+
+    #[test]
+    fn new_entry_starts_with_one_pending_hunk_decision_per_hunk() {
+        let state = two_hunk_state();
+        let entry = &state.entries[0];
+        assert_eq!(entry.hunk_decisions.len(), entry.view.hunks.len());
+        assert!(entry
+            .hunk_decisions
+            .iter()
+            .all(|d| *d == ChangeDecision::Pending));
+    }
+
+    #[test]
+    fn current_hunk_index_follows_scroll_offset() {
+        let mut state = two_hunk_state();
+        assert_eq!(state.entries[0].current_hunk_index(), Some(0));
+        state.next_hunk();
+        assert_eq!(
+            state.entries[0].current_hunk_index(),
+            Some(1),
+            "after next_hunk, the cursor sits in the second hunk"
+        );
+    }
+
+    /// The core reject mechanism: reverting hunk 0 restores exactly its
+    /// own lines ("CHANGED-A" -> "3") while every other line — including
+    /// hunk 1's still-pending "CHANGED-B" — is left untouched.
+    #[test]
+    fn content_with_hunk_reverted_touches_only_that_hunks_own_lines() {
+        let state = two_hunk_state();
+        let entry = &state.entries[0];
+        let reverted = entry.content_with_hunk_reverted(0).expect("hunk 0 exists");
+        assert!(
+            reverted.contains("\n3\n") || reverted.starts_with("3\n"),
+            "hunk 0's own line must be restored to its pre-turn value: {reverted:?}"
+        );
+        assert!(
+            reverted.contains("CHANGED-B"),
+            "hunk 1's still-pending change must be untouched: {reverted:?}"
+        );
+        assert!(
+            !reverted.contains("CHANGED-A"),
+            "hunk 0's change must be gone once reverted: {reverted:?}"
+        );
+    }
+
+    /// After `refresh_after_edit` reflects hunk 0's reject on disk, hunk 0
+    /// disappears from the recomputed diff entirely (content now matches
+    /// pre-turn there) while hunk 1 survives as still-`Pending` — proving
+    /// decisions aren't lost or misassigned across a recompute.
+    #[test]
+    fn refresh_after_edit_drops_the_rejected_hunk_and_keeps_the_other_pending() {
+        let mut state = two_hunk_state();
+        let entry = state.entries.get_mut(0).unwrap();
+        let reverted = entry.content_with_hunk_reverted(0).unwrap();
+        entry.refresh_after_edit(0, reverted);
+
+        assert_eq!(
+            entry.view.hunks.len(),
+            1,
+            "only hunk 1 (still pending) should remain after hunk 0 was reverted"
+        );
+        assert_eq!(entry.hunk_decisions, vec![ChangeDecision::Pending]);
+        assert_eq!(entry.decision, ChangeDecision::Pending);
+    }
+
+    /// A hunk explicitly marked `Accepted` before a *different* hunk's
+    /// reject triggers `refresh_after_edit` must survive the rebuild — the
+    /// "carried forward by `left_start` identity" contract.
+    #[test]
+    fn refresh_after_edit_carries_forward_an_already_kept_hunks_decision() {
+        let mut state = two_hunk_state();
+        let entry = state.entries.get_mut(0).unwrap();
+        entry.hunk_decisions[1] = ChangeDecision::Accepted;
+        let reverted = entry.content_with_hunk_reverted(0).unwrap();
+        entry.refresh_after_edit(0, reverted);
+
+        assert_eq!(
+            entry.hunk_decisions,
+            vec![ChangeDecision::Accepted],
+            "hunk 1's earlier Accepted decision must survive hunk 0's reject"
+        );
+        assert_eq!(
+            entry.decision,
+            ChangeDecision::Accepted,
+            "the only remaining hunk is Accepted, so the whole-file rollup must be too"
+        );
+    }
+
+    #[test]
+    fn sync_decision_from_hunks_is_pending_until_every_hunk_is_decided() {
+        let mut state = two_hunk_state();
+        let entry = state.entries.get_mut(0).unwrap();
+        entry.hunk_decisions[0] = ChangeDecision::Accepted;
+        entry.sync_decision_from_hunks();
+        assert_eq!(entry.decision, ChangeDecision::Pending);
+        entry.hunk_decisions[1] = ChangeDecision::Rejected;
+        entry.sync_decision_from_hunks();
+        assert_eq!(
+            entry.decision,
+            ChangeDecision::Accepted,
+            "mixed accept+reject rolls up to Accepted, not Pending or Rejected"
+        );
+    }
+
+    #[test]
+    fn sync_decision_from_hunks_is_rejected_only_when_every_hunk_is_rejected() {
+        let mut state = two_hunk_state();
+        let entry = state.entries.get_mut(0).unwrap();
+        entry.hunk_decisions[0] = ChangeDecision::Rejected;
+        entry.hunk_decisions[1] = ChangeDecision::Rejected;
+        entry.sync_decision_from_hunks();
+        assert_eq!(entry.decision, ChangeDecision::Rejected);
+    }
+
+    /// Rejecting the single hunk of a brand-new file (`old_text: None`)
+    /// reconstructs to an empty string — the "nothing left, this is really
+    /// a delete" signal the engine-level reject uses (#1516).
+    #[test]
+    fn content_with_hunk_reverted_is_empty_for_a_new_files_only_hunk() {
+        let state = ChangeReviewState::new(vec![change("new.rs", None, "fn main() {}\n")]);
+        let entry = &state.entries[0];
+        assert_eq!(entry.view.hunks.len(), 1);
+        assert_eq!(entry.content_with_hunk_reverted(0), Some(String::new()));
+    }
+
+    #[test]
+    fn first_pending_hunk_row_finds_the_earliest_undecided_hunk() {
+        let mut state = two_hunk_state();
+        let entry = state.entries.get_mut(0).unwrap();
+        let hunk1_start = entry.view.scroll_offset; // hunk 0
+        entry.hunk_decisions[0] = ChangeDecision::Accepted;
+        let row = entry
+            .first_pending_hunk_row()
+            .expect("hunk 1 is still pending");
+        assert!(
+            row > hunk1_start,
+            "must point at hunk 1's start row, not hunk 0's"
+        );
+    }
+
     #[test]
     fn accept_marks_decision_and_returns_the_change() {
         let mut state = ChangeReviewState::new(vec![change("f", Some("x"), "y")]);
@@ -763,6 +1009,7 @@ mod tests {
             entries: vec![],
             current: 0,
             comments: vec![],
+            pending_g: false,
         };
         assert!(state.current_location().is_none());
     }
@@ -921,93 +1168,5 @@ mod tests {
         assert_ne!(default_out, custom_out);
         assert!(default_out.contains("**x.rs:1**"));
         assert_eq!(custom_out, "x.rs,1,note");
-    }
-
-    // ── resolve_fragment (#1454) ────────────────────────────────────────────
-
-    /// The core data-loss fix: a fragment `oldText` that occurs exactly once
-    /// inside a much larger file resolves to a whole-file `new_whole` that
-    /// still carries every surrounding line — not just the replacement
-    /// snippet. RED against the bug this issue reports: writing `new_text`
-    /// (the bare fragment) straight to disk would have truncated the file to
-    /// just "new line".
-    #[test]
-    fn resolve_fragment_replaces_only_the_matched_region_within_a_larger_file() {
-        let current = "line1\nold line\nline3\n";
-        match resolve_fragment(current, "old line\n", "new line\n") {
-            FragmentResolution::Applied {
-                old_whole,
-                new_whole,
-            } => {
-                assert_eq!(old_whole, current);
-                assert_eq!(new_whole, "line1\nnew line\nline3\n");
-            }
-            other => panic!("expected Applied, got {other:?}"),
-        }
-    }
-
-    /// A fragment that is itself the *entire* current file (the fake-agent
-    /// fixture's shape, and #955's original whole-file assumption) still
-    /// resolves cleanly — the fix is backward-compatible with a whole-file
-    /// `diff` block, not just additive for fragments.
-    #[test]
-    fn resolve_fragment_handles_a_fragment_that_is_the_whole_file() {
-        match resolve_fragment("old line\n", "old line\n", "new line\n") {
-            FragmentResolution::Applied {
-                old_whole,
-                new_whole,
-            } => {
-                assert_eq!(old_whole, "old line\n");
-                assert_eq!(new_whole, "new line\n");
-            }
-            other => panic!("expected Applied, got {other:?}"),
-        }
-    }
-
-    /// A fragment occurring twice is refused, not applied to an arbitrary
-    /// occurrence — the exact ambiguous-`oldText` case #1454 asks be
-    /// refused rather than silently guessing.
-    #[test]
-    fn resolve_fragment_refuses_an_ambiguous_fragment_that_occurs_twice() {
-        let current = "old line\nold line\n";
-        match resolve_fragment(current, "old line\n", "new line\n") {
-            FragmentResolution::Refused(reason) => {
-                assert!(
-                    reason.contains("ambiguous") || reason.contains("2 times"),
-                    "reason should explain the ambiguity: {reason}"
-                );
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
-    }
-
-    /// A fragment that matches nowhere, and whose replacement doesn't
-    /// already uniquely identify an applied edit, is refused with a clear
-    /// reason — never silently written as if the fragment were the whole
-    /// file.
-    #[test]
-    fn resolve_fragment_refuses_a_fragment_not_found_anywhere() {
-        let current = "completely different contents\n";
-        match resolve_fragment(current, "old line\n", "new line\n") {
-            FragmentResolution::Refused(reason) => {
-                assert!(reason.contains("not found"), "reason: {reason}");
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
-    }
-
-    /// Double-apply guard: if `oldText` is no longer present but `newText`
-    /// already appears exactly once, the edit already landed (e.g. the
-    /// agent's own `fs/write_text_file` beat the `diff` report) — treated
-    /// as `AlreadyApplied`, not `Refused`, so a caller can skip it silently
-    /// rather than surfacing a scary "not found" error for an edit that in
-    /// fact already succeeded.
-    #[test]
-    fn resolve_fragment_recognises_an_edit_that_already_landed() {
-        let current = "line1\nnew line\nline3\n";
-        assert_eq!(
-            resolve_fragment(current, "old line\n", "new line\n"),
-            FragmentResolution::AlreadyApplied
-        );
     }
 }

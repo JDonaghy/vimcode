@@ -245,6 +245,50 @@ pub fn count_changed_lines(old: Option<&str>, new: &str) -> (usize, usize) {
     (added, removed)
 }
 
+/// Hunk-granularity version of [`plan_restore`]'s whole-file "edited since"
+/// check (#1516): whether the hunk identified by `left_start`/`rows` (as
+/// painted from the *current* diff between a turn entry's
+/// `pre_turn_content` and its live content) still matches exactly what the
+/// agent's own last write (`agent_written`) produced there. `left_start` —
+/// a position within the immutable pre-turn text — is used rather than the
+/// hunk's own (shiftable) right-side position, the same stable-identity
+/// trick [`crate::core::review::ChangeReviewEntry::refresh_after_edit`]
+/// uses to carry decisions across a recompute.
+///
+/// `false` ("edited by you") either because the agent's own diff has no
+/// hunk at that same pre-turn position at all (a human introduced a wholly
+/// new change there after the agent finished), or because it does but its
+/// right-side text differs from `rows`'.
+///
+/// `pre_turn: None` (the agent created this path) reduces to plain
+/// whole-file equality against `agent_written` rather than re-deriving
+/// hunks against a literal `""` left side — the same phantom-empty-line
+/// hazard `crate::core::review`'s `pure_addition_hunks` doc warns a diff
+/// against a bare `""` has, and moot anyway since a brand-new path only
+/// ever has the one hunk covering its entire content.
+pub fn hunk_matches_agents_last_write(
+    pre_turn: Option<&str>,
+    agent_written: &str,
+    left_start: usize,
+    rows: &[quadraui::DiffRow],
+) -> bool {
+    let now_right: Vec<&str> = rows.iter().filter_map(|r| r.right.as_deref()).collect();
+    let Some(left_text) = pre_turn else {
+        let now_joined = now_right.join("\n");
+        return now_joined.trim_end_matches('\n') == agent_written.trim_end_matches('\n');
+    };
+    let agent_hunks = quadraui::compute_hunks(left_text, agent_written);
+    let Some(agent_hunk) = agent_hunks.iter().find(|h| h.left_start == left_start) else {
+        return false;
+    };
+    let agent_right: Vec<&str> = agent_hunk
+        .rows
+        .iter()
+        .filter_map(|r| r.right.as_deref())
+        .collect();
+    now_right == agent_right
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +532,86 @@ mod tests {
             line_status(None, new),
             vec![Some(GitLineStatus::Added), Some(GitLineStatus::Added)]
         );
+    }
+
+    // ── hunk_matches_agents_last_write (#1516) ──────────────────────────
+
+    fn only_hunk(pre_turn: &str, now: &str) -> (usize, Vec<quadraui::DiffRow>) {
+        let hunk = quadraui::compute_hunks(pre_turn, now)
+            .into_iter()
+            .next()
+            .expect("test setup: a real diff");
+        (hunk.left_start, hunk.rows)
+    }
+
+    /// The common case: nothing touched the file since the agent's last
+    /// write — the hunk the review is currently painting is *exactly* the
+    /// agent's own hunk, so this must read as "still matches", not "edited
+    /// by you".
+    #[test]
+    fn hunk_matches_when_now_equals_the_agents_last_write() {
+        let pre = "1\n2\n3\n";
+        let agent_written = "1\nAGENT\n3\n";
+        let (left_start, rows) = only_hunk(pre, agent_written);
+        assert!(hunk_matches_agents_last_write(
+            Some(pre),
+            agent_written,
+            left_start,
+            &rows
+        ));
+    }
+
+    /// The exact scenario #1516 names: a human hand-edits the same region
+    /// the agent last wrote, after the fact — the hunk's own right-side
+    /// text no longer agrees with what the agent produced there.
+    #[test]
+    fn hunk_does_not_match_after_a_human_edit_on_top_of_the_agents_hunk() {
+        let pre = "1\n2\n3\n";
+        let agent_written = "1\nAGENT\n3\n";
+        let human_now = "1\nHUMAN EDIT\n3\n";
+        let (left_start, rows) = only_hunk(pre, human_now);
+        assert!(!hunk_matches_agents_last_write(
+            Some(pre),
+            agent_written,
+            left_start,
+            &rows
+        ));
+    }
+
+    /// A human edit *elsewhere* in the file (a region the agent's own diff
+    /// never touched, so it never appears in `agent_written`'s hunks at
+    /// all) — one of the "no matching hunk at all" cases, also "edited by
+    /// you" for that hunk specifically.
+    #[test]
+    fn hunk_does_not_match_a_brand_new_human_only_change() {
+        let pre = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+        // The agent never touched this file at all this turn (a
+        // degenerate but legal input: "agent_written" identical to `pre`).
+        let agent_written = pre;
+        let human_now = "1\n2\n3\n4\nHUMAN\n6\n7\n8\n9\n10\n";
+        let (left_start, rows) = only_hunk(pre, human_now);
+        assert!(!hunk_matches_agents_last_write(
+            Some(pre),
+            agent_written,
+            left_start,
+            &rows
+        ));
+    }
+
+    /// `pre_turn: None` (agent-created path) reduces to whole-file equality
+    /// against `agent_written` — matches when nothing has changed since.
+    #[test]
+    fn hunk_matches_for_a_new_file_when_untouched_since_the_agents_write() {
+        let agent_written = "created by agent\n";
+        let now = agent_written;
+        let (left_start, rows) = only_hunk("", now);
+        // `left_start` from a `("", now)` diff isn't meaningful for the
+        // `None` branch (it never consults it) — passed through as-is.
+        assert!(hunk_matches_agents_last_write(
+            None,
+            agent_written,
+            left_start,
+            &rows
+        ));
     }
 }

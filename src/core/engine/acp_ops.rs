@@ -1893,11 +1893,26 @@ impl Engine {
 
     /// Insert or replace `call` in `self.acp_mut().tool_calls`, keyed by
     /// `AcpToolCall::id` — the "addressable collection, not an
-    /// append-only log" the issue asks for. Any `diff` content block the
-    /// call already carries opens (or extends) the change-review surface
-    /// immediately, same as a `tool_call_update` adding one later.
+    /// append-only log" the issue asks for.
+    ///
+    /// #1516: a `diff` content block is **display-only** (the ACP spec's
+    /// own contract) — it is never applied to a buffer/disk from here.
+    /// Pre-#1516 this method opened (or extended) the change-review
+    /// surface for it and let `a` write `newText` straight to the file;
+    /// that "proposal review" write path is retired outright, since a real
+    /// adapter is free to *also* apply the edit itself via
+    /// `fs/write_text_file` (`Self::acp_write_text_file`) — the #1454
+    /// double-apply race this client could only ever heuristically guard
+    /// against (`crate::core::review::resolve_fragment`'s `AlreadyApplied`
+    /// case), never eliminate, as long as a second write path existed at
+    /// all. `call.content` is still stored on the call as before, so the
+    /// tool card's own expanded body still renders a `diff` block's
+    /// `+A -R path` summary (`crate::core::acp::tool_call_expanded_text`) —
+    /// the "annotate the tool card" half of the design stays exactly as it
+    /// already was; only the write half is gone. Reviewing/reverting an
+    /// agent's real writes is what the turn-review surface (#1460, #1516)
+    /// is for.
     fn acp_upsert_tool_call(&mut self, call: crate::core::acp::AcpToolCall) {
-        self.acp_open_review_for_diffs(&call.content);
         match self
             .acp_mut()
             .tool_calls
@@ -1926,15 +1941,16 @@ impl Engine {
     /// completed | failed` transition the issue's acceptance bar checks —
     /// and `content`/`locations`, when present, each **replace** the
     /// call's existing field wholesale (#1519 — the ACP spec's actual
-    /// contract; #955 originally appended, duplicating blocks and
-    /// re-opening the diff review on every re-sent update for the same
-    /// call). An update for an id this client never saw a `tool_call` for
-    /// is a no-op — nothing to patch, and inventing a call from a bare
-    /// update would render with an empty title.
+    /// contract; #955 originally appended, duplicating blocks). An update
+    /// for an id this client never saw a `tool_call` for is a no-op —
+    /// nothing to patch, and inventing a call from a bare update would
+    /// render with an empty title.
+    ///
+    /// #1516: `content`'s `diff` blocks are display-only here too, same as
+    /// [`Self::acp_upsert_tool_call`]'s own doc — no review surface opens
+    /// and nothing is written from a `diff` block arriving on an update
+    /// either.
     fn acp_apply_tool_call_update(&mut self, update: crate::core::acp::AcpToolCallUpdate) {
-        if let Some(blocks) = &update.content {
-            self.acp_open_review_for_diffs(blocks);
-        }
         let Some(call) = self
             .acp_mut()
             .tool_calls
@@ -1963,116 +1979,13 @@ impl Engine {
         }
     }
 
-    /// Open (or extend) the change-review surface for every `diff` block in
-    /// `blocks` — "a `diff` content block opens the change-review surface"
-    /// (#955's acceptance bar). Non-diff blocks are ignored here; they're
-    /// already stored on the call itself by the caller. Source-agnostic:
-    /// builds `crate::core::review::ProposedChange`, the exact shape a
-    /// non-ACP feeder (e.g. #525's git-branch diff list) would construct
-    /// directly.
-    ///
-    /// Each block is resolved through [`Self::acp_resolve_diff_block`]
-    /// first (#1454) — a block whose `oldText` can't be unambiguously
-    /// located in the file's actual current content never reaches
-    /// `changes` at all, so a batch with one bad block still opens (or
-    /// extends) the surface with whichever others resolved cleanly.
-    fn acp_open_review_for_diffs(&mut self, blocks: &[crate::core::acp::AcpToolCallContentBlock]) {
-        let mut changes: Vec<crate::core::review::ProposedChange> = Vec::new();
-        for block in blocks {
-            let crate::core::acp::AcpToolCallContentBlock::Diff {
-                path,
-                old_text,
-                new_text,
-            } = block
-            else {
-                continue;
-            };
-            if let Some(change) = self.acp_resolve_diff_block(path, old_text.as_deref(), new_text) {
-                changes.push(change);
-            }
-        }
-        if changes.is_empty() {
-            return;
-        }
-        match &mut self.change_review {
-            Some(review) => review.extend(changes),
-            None => self.change_review = Some(crate::core::review::ChangeReviewState::new(changes)),
-        }
-    }
-
-    /// Resolve one `diff` content block into a whole-file
-    /// [`crate::core::review::ProposedChange`] ready for the review
-    /// surface, or `None` if it must not open (or extend) one at all
-    /// (#1454) — the safety gate between an agent-reported fragment and
-    /// ever treating it as if it were the entire file.
-    ///
-    /// `old_text: None` (a new file, per the ACP v1 schema's `oldText:
-    /// string | null`) passes `new_text` straight through unchanged —
-    /// there is no "current contents" to resolve a new file against. A
-    /// non-null `old_text` is resolved via
-    /// [`crate::core::review::resolve_fragment`] against the file's actual
-    /// current content (read buffer-first, matching every other ACP
-    /// `fs/*` read in this module, via [`Self::acp_current_file_content`]):
-    /// an unambiguous single match becomes an `Applied` [`ProposedChange`]
-    /// whose `old_text`/`new_text` are both provably whole-file (never the
-    /// bare fragment); `AlreadyApplied` (the edit already landed some other
-    /// way — the double-apply race #1454 flags for an adapter that applies
-    /// edits itself and merely *reports* them via `diff`) and `Refused`
-    /// (the fragment doesn't uniquely identify a location) both leave
-    /// [`Self::message`](Engine::message) with a human-readable explanation
-    /// and return `None` rather than ever opening an entry whose
-    /// `new_text` isn't safe to write.
-    ///
-    /// [`ProposedChange`]: crate::core::review::ProposedChange
-    fn acp_resolve_diff_block(
-        &mut self,
-        path: &str,
-        old_text: Option<&str>,
-        new_text: &str,
-    ) -> Option<crate::core::review::ProposedChange> {
-        let Some(fragment) = old_text else {
-            return Some(crate::core::review::ProposedChange {
-                path: path.to_string(),
-                old_text: None,
-                new_text: new_text.to_string(),
-            });
-        };
-        let current = match self.acp_current_file_content(std::path::Path::new(path)) {
-            Ok(text) => text,
-            Err(msg) => {
-                self.message = format!(
-                    "Change review: could not read {path} to apply the proposed edit ({msg})"
-                );
-                return None;
-            }
-        };
-        match crate::core::review::resolve_fragment(&current, fragment, new_text) {
-            crate::core::review::FragmentResolution::Applied {
-                old_whole,
-                new_whole,
-            } => Some(crate::core::review::ProposedChange {
-                path: path.to_string(),
-                old_text: Some(old_whole),
-                new_text: new_whole,
-            }),
-            crate::core::review::FragmentResolution::AlreadyApplied => {
-                self.message =
-                    format!("Change review: {path} edit already applied, nothing to review");
-                None
-            }
-            crate::core::review::FragmentResolution::Refused(reason) => {
-                self.message = format!("Change review: refusing edit to {path}: {reason}");
-                None
-            }
-        }
-    }
-
     /// Read `path`'s current whole-file content the same buffer-first way
     /// [`Self::acp_read_text_file`] does, first resolved within the
     /// workspace roots (matching where [`Self::acp_write_text_file`] will
-    /// eventually write) — the "current contents"
-    /// [`crate::core::review::resolve_fragment`] needs in order to safely
-    /// locate a `diff` block's fragment (#1454).
+    /// eventually write) — the "current contents" a turn review diffs a
+    /// checkpoint entry's `pre_turn_content` against
+    /// (`crate::core::engine::acp_turn_ops::Engine::acp_open_turn_review`,
+    /// `Engine::change_review_reject_current_hunk`, #1460/#1516).
     pub(crate) fn acp_current_file_content(&self, path: &Path) -> Result<String, String> {
         let roots = self.acp_workspace_roots();
         let resolved = crate::core::acp::resolve_path_within_roots(path, &roots)?;
@@ -5424,7 +5337,20 @@ mod tests {
         assert!(engine.acp_mut().client.is_none());
     }
 
-    // ── acp_open_review_for_diffs fragment safety (#1454) ───────────────────
+    // ── retired proposal-review write path (#1516) ──────────────────────
+    //
+    // Pre-#1516 this section tested `acp_open_review_for_diffs` resolving
+    // an ACP `diff` block's fragment (#1454) into a whole-file
+    // `ProposedChange` and opening a review whose `a` key wrote it to
+    // disk. That mechanism is gone outright — the ACP spec's own contract
+    // is that `diff` content is display-only, and a real adapter applying
+    // the edit itself via `fs/write_text_file` made the write path a
+    // standing double-apply hazard (#1454's `AlreadyApplied` case was only
+    // ever a heuristic mitigation for it, never an elimination). These
+    // tests now prove the retirement: a `diff` block never opens a review
+    // and never touches disk, on either a fresh `tool_call` or a later
+    // `tool_call_update`, no matter how the fragment resolves against the
+    // file's current content.
 
     fn diff_block(
         path: &str,
@@ -5438,165 +5364,134 @@ mod tests {
         }
     }
 
-    /// The core data-loss fix at the `Engine` level (mirrors
-    /// `core::review::tests::resolve_fragment_replaces_only_the_matched_region_within_a_larger_file`,
-    /// exercised through the real entry point `acp_open_review_for_diffs`
-    /// uses): a `diff` block whose `oldText`/`newText` are a *fragment* of a
-    /// much larger file opens a review entry whose `old_text`/`new_text`
-    /// are the WHOLE file, surrounding lines intact — never the bare
-    /// fragment.
-    ///
-    /// RED against the bug this issue reports: before this fix,
-    /// `acp_open_review_for_diffs` passed the wire `oldText`/`newText`
-    /// straight through as `ProposedChange`, so this entry's `new_text`
-    /// would have been the literal fragment `"new line\n"`, and accepting
-    /// it would have truncated the file to just that line (2959 -> 16
-    /// lines, per the reported repro) — this asserts the *entry itself*,
-    /// before any accept, already carries the surrounding context.
+    fn tool_call_with_diff(
+        id: &str,
+        block: crate::core::acp::AcpToolCallContentBlock,
+    ) -> crate::core::acp::AcpToolCall {
+        crate::core::acp::AcpToolCall {
+            id: id.to_string(),
+            title: "Edit".to_string(),
+            kind: "edit".to_string(),
+            status: crate::core::acp::AcpToolCallStatus::Completed,
+            locations: Vec::new(),
+            content: vec![block],
+            raw_input: None,
+            raw_output: None,
+        }
+    }
+
+    /// #1516's core assertion, RED against the pre-#1516 code (which
+    /// called `acp_open_review_for_diffs` from here and always opened a
+    /// review for an unambiguous fragment): a `tool_call` carrying a
+    /// `diff` content block must never open the change-review surface, and
+    /// the target file must never be touched — display-only, exactly the
+    /// ACP spec's own contract for this content kind.
     #[test]
-    fn acp_open_review_for_diffs_resolves_a_fragment_against_the_whole_file() {
-        let dir = unique_temp_dir("review-fragment");
+    fn tool_call_diff_block_never_opens_a_review_or_touches_disk() {
+        let dir = unique_temp_dir("retired-write-path-tool-call");
         let target = dir.join("target.txt");
         std::fs::write(&target, "line1\nold line\nline3\n").unwrap();
 
         let mut engine = Engine::new_for_test();
         engine.workspace_root = Some(dir.clone());
-        engine.acp_open_review_for_diffs(&[diff_block(
-            target.to_str().unwrap(),
-            Some("old line\n"),
-            "new line\n",
-        )]);
-
-        let review = engine
-            .change_review
-            .as_ref()
-            .expect("an unambiguous fragment must open a review entry");
-        let entry = review.current_entry().unwrap();
-        assert_eq!(
-            entry.change.old_text.as_deref(),
-            Some("line1\nold line\nline3\n"),
-            "old_text must be the whole current file, not the bare fragment"
-        );
-        assert_eq!(
-            entry.change.new_text, "line1\nnew line\nline3\n",
-            "new_text must preserve every surrounding line, not just the \
-             edited fragment"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// "A duplicate `oldText` is refused" (#1454's acceptance bar): a
-    /// fragment that occurs twice in the current file must never open a
-    /// review entry (there is no single unambiguous place to apply it), and
-    /// the refusal is surfaced via `Engine::message` rather than silently
-    /// dropped. The file on disk is untouched — this never even reaches a
-    /// write.
-    #[test]
-    fn acp_open_review_for_diffs_refuses_an_ambiguous_duplicate_fragment() {
-        let dir = unique_temp_dir("review-ambiguous");
-        let target = dir.join("target.txt");
-        std::fs::write(&target, "old line\nold line\n").unwrap();
-
-        let mut engine = Engine::new_for_test();
-        engine.workspace_root = Some(dir.clone());
-        engine.acp_open_review_for_diffs(&[diff_block(
-            target.to_str().unwrap(),
-            Some("old line\n"),
-            "new line\n",
-        )]);
+        engine.acp_upsert_tool_call(tool_call_with_diff(
+            "tc-1",
+            diff_block(target.to_str().unwrap(), Some("old line\n"), "new line\n"),
+        ));
 
         assert!(
             engine.change_review.is_none(),
-            "an ambiguous fragment must never open a review entry"
-        );
-        assert!(
-            engine.message.contains("ambiguous") || engine.message.contains("refus"),
-            "the refusal must be surfaced with a clear reason: {:?}",
-            engine.message
+            "a diff content block must never open the change-review surface"
         );
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
-            "old line\nold line\n",
-            "a refused edit must never touch the filesystem"
+            "line1\nold line\nline3\n",
+            "a diff content block must never write to disk"
         );
+        // Still stored for the tool card's own display (#1511's `+A -R
+        // path` summary) — only the *write* half is retired, not the
+        // "annotate the card" half.
+        assert_eq!(engine.acp_mut().tool_calls[0].content.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Double-apply guard (#1454): if the file's current content no longer
-    /// contains `oldText` but already contains `newText` exactly once, the
-    /// edit already landed by some other path (the real Claude ACP
-    /// adapter's own `fs/write_text_file` beating this `diff` *report* to
-    /// the buffer, per the issue). This must not open a review entry
-    /// (nothing to accept) and must not be reported as a scary "not found"
-    /// failure.
+    /// Same guarantee on the `tool_call_update` path (a diff attached to a
+    /// later status transition, #955's original scenario) — the update
+    /// still replaces `content` wholesale (#1519's own contract,
+    /// unaffected by this retirement) but still never opens a review or
+    /// writes.
     #[test]
-    fn acp_open_review_for_diffs_treats_an_already_applied_edit_as_a_no_op() {
-        let dir = unique_temp_dir("review-already-applied");
-        let target = dir.join("target.txt");
-        std::fs::write(&target, "line1\nnew line\nline3\n").unwrap();
-
-        let mut engine = Engine::new_for_test();
-        engine.workspace_root = Some(dir.clone());
-        engine.acp_open_review_for_diffs(&[diff_block(
-            target.to_str().unwrap(),
-            Some("old line\n"),
-            "new line\n",
-        )]);
-
-        assert!(
-            engine.change_review.is_none(),
-            "an already-applied edit must not open a review entry"
-        );
-        assert!(
-            engine.message.contains("already applied"),
-            "expected an informational message, not a failure: {:?}",
-            engine.message
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A `diff` block whose fragment happens to be the *entire* current
-    /// file (the fake-agent fixture's shape, and #955's original
-    /// assumption) still resolves and opens a review entry — the fix is
-    /// backward-compatible with a whole-file `diff` block.
-    #[test]
-    fn acp_open_review_for_diffs_still_handles_a_whole_file_fragment() {
-        let dir = unique_temp_dir("review-whole-file");
+    fn tool_call_update_diff_block_never_opens_a_review_or_touches_disk() {
+        let dir = unique_temp_dir("retired-write-path-update");
         let target = dir.join("target.txt");
         std::fs::write(&target, "old line\n").unwrap();
 
         let mut engine = Engine::new_for_test();
         engine.workspace_root = Some(dir.clone());
-        engine.acp_open_review_for_diffs(&[diff_block(
-            target.to_str().unwrap(),
-            Some("old line\n"),
-            "new line\n",
-        )]);
+        engine.acp_upsert_tool_call(crate::core::acp::AcpToolCall {
+            id: "tc-1".to_string(),
+            title: "Edit".to_string(),
+            kind: "edit".to_string(),
+            status: crate::core::acp::AcpToolCallStatus::Pending,
+            locations: Vec::new(),
+            content: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+        });
+        engine.acp_apply_tool_call_update(crate::core::acp::AcpToolCallUpdate {
+            id: "tc-1".to_string(),
+            status: Some(crate::core::acp::AcpToolCallStatus::Completed),
+            content: Some(vec![diff_block(
+                target.to_str().unwrap(),
+                Some("old line\n"),
+                "new line\n",
+            )]),
+            locations: None,
+            raw_input: None,
+            raw_output: None,
+        });
 
-        let review = engine.change_review.as_ref().unwrap();
-        let entry = review.current_entry().unwrap();
-        assert_eq!(entry.change.old_text.as_deref(), Some("old line\n"));
-        assert_eq!(entry.change.new_text, "new line\n");
+        assert!(engine.change_review.is_none());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old line\n");
+        assert_eq!(engine.acp_mut().tool_calls[0].content.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `old_text: None` (a new file) passes `new_text` straight through
-    /// with no fragment resolution attempted — there's no "current
-    /// contents" to resolve a new file against.
+    /// The exact #1454 double-apply scenario, now closed by removing the
+    /// second write path entirely rather than heuristically detecting it:
+    /// an adapter that (a) actually writes the file via
+    /// `fs/write_text_file` *and* (b) separately reports the same edit as
+    /// a `diff` tool-call block must end up with the file written exactly
+    /// once, by the real write — the `diff` block contributes nothing.
     #[test]
-    fn acp_open_review_for_diffs_passes_a_new_file_through_unresolved() {
-        let mut engine = Engine::new_for_test();
-        engine.workspace_root = Some(unique_temp_dir("review-new-file"));
-        engine.acp_open_review_for_diffs(&[diff_block("brand/new.rs", None, "fn main() {}\n")]);
+    fn a_diff_block_alongside_a_real_write_never_double_applies() {
+        let dir = unique_temp_dir("retired-write-path-alongside-real-write");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "old line\n").unwrap();
 
-        let review = engine.change_review.as_ref().unwrap();
-        let entry = review.current_entry().unwrap();
-        assert_eq!(entry.change.old_text, None);
-        assert_eq!(entry.change.new_text, "fn main() {}\n");
+        let mut engine = Engine::new_for_test();
+        engine.workspace_root = Some(dir.clone());
+        engine
+            .acp_write_text_file(&target, "new line\n")
+            .expect("the real fs/write_text_file write must succeed");
+        engine.acp_upsert_tool_call(tool_call_with_diff(
+            "tc-1",
+            diff_block(target.to_str().unwrap(), Some("old line\n"), "new line\n"),
+        ));
+
+        assert!(
+            engine.change_review.is_none(),
+            "the diff block must not open a second, competing review"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new line\n",
+            "the file must reflect exactly the real write, untouched by the diff block"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── user-configured MCP servers on session/new + session/load (#1487,
