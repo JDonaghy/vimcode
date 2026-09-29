@@ -20609,7 +20609,22 @@ pub fn populate_ai_chat_controller(
     // indicator" per the issue, and by construction can't steal focus or
     // churn layout since the header is already repainted every frame at a
     // fixed position.
-    if let Some(mode_id) = engine.acp().current_mode_id.as_deref() {
+    // #1520: `configOptions`' `category: "model"` entry is ACP v1's only
+    // model picker (no dedicated `session/set_mode`-style method for a
+    // model) — prefer showing it here over the older `modes` segment
+    // below when both are present, rather than showing both for the same
+    // underlying "what is this agent currently set to" question.
+    if let Some(model_option) = engine
+        .acp()
+        .config_options
+        .iter()
+        .find(|o| o.category.as_deref() == Some("model"))
+    {
+        header.push_str(&format!(
+            "  \u{b7} model: {}",
+            model_option.current_value_label()
+        ));
+    } else if let Some(mode_id) = engine.acp().current_mode_id.as_deref() {
         let mode_label = engine
             .acp()
             .modes

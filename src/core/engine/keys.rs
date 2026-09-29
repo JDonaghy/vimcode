@@ -9627,6 +9627,8 @@ impl Engine {
             "AI ",
             "AiClear",
             "AiMode",
+            "AiConfig",
+            "AiModel",
             "AiAgent",
             "AiSessions",
             "AiNew ",
@@ -9765,6 +9767,57 @@ impl Engine {
                     .filter(|m| m.starts_with(arg_partial))
                     .map(|m| format!("Keybindings {m}"))
                     .collect(),
+                // #1520: `:AiConfig <id> <value>` — complete the id
+                // against declared config option ids/names first; once a
+                // second space starts the value half, complete against
+                // that specific option's declared values instead.
+                "AiConfig" => {
+                    if let Some(inner_space) = arg_partial.find(' ') {
+                        let id_partial = &arg_partial[..inner_space];
+                        let value_partial = arg_partial[inner_space + 1..].trim_start();
+                        self.acp()
+                            .config_options
+                            .iter()
+                            .find(|o| {
+                                o.id.eq_ignore_ascii_case(id_partial)
+                                    || o.name.eq_ignore_ascii_case(id_partial)
+                            })
+                            .map(|o| {
+                                o.values
+                                    .iter()
+                                    .filter(|v| {
+                                        v.id.starts_with(value_partial)
+                                            || v.name.starts_with(value_partial)
+                                    })
+                                    .map(|v| format!("AiConfig {id_partial} {}", v.id))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        self.acp()
+                            .config_options
+                            .iter()
+                            .filter(|o| o.id.starts_with(arg_partial))
+                            .map(|o| format!("AiConfig {}", o.id))
+                            .collect()
+                    }
+                }
+                // #1520: `:AiModel <name>` completes against the
+                // `category: "model"` config option's declared values —
+                // there is only ever one positional argument, unlike
+                // `:AiConfig`.
+                "AiModel" => self
+                    .acp_model_option()
+                    .map(|o| {
+                        o.values
+                            .iter()
+                            .filter(|v| {
+                                v.id.starts_with(arg_partial) || v.name.starts_with(arg_partial)
+                            })
+                            .map(|v| format!("AiModel {}", v.id))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 "colorscheme" => {
                     // Complete theme names
                     let mut names = vec![

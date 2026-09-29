@@ -36,7 +36,15 @@
 #                           result also carries a `modes` field with two
 #                           modes ("code" current, "plan" available) — for a
 #                           test to drive `:AiMode`/`session/set_mode`
-#                           against. (#1487) If $ACP_FAKE_CAPTURE_SESSION_NEW_TO
+#                           against. If $ACP_FAKE_SESSION_CONFIG_OPTIONS is
+#                           set (#1520), the result also carries a
+#                           `configOptions` field with one option (id
+#                           "model", category "model", current value
+#                           "sonnet", values "sonnet"/"opus") — for a test to
+#                           drive `:AiConfig`/`:AiModel`/
+#                           `session/set_config_option` against, independently
+#                           of $ACP_FAKE_SESSION_MODES (either, both, or
+#                           neither can be set). (#1487) If $ACP_FAKE_CAPTURE_SESSION_NEW_TO
 #                           names a file, the raw request line is appended to
 #                           it first, unconditionally — lets a test assert on
 #                           the actual `mcpServers` array `session/new`
@@ -250,6 +258,12 @@
 #                           same modeId the request asked for (#956, ACP-5)
 #                           — proving the displayed mode follows the
 #                           notification, not the request succeeding.
+#   - session/set_config_option -> (#1520) replies with an empty result,
+#                           then emits a config_option_update notification
+#                           carrying back the same configOptionId/valueId
+#                           the request asked for — same "displayed value
+#                           follows the notification" shape as
+#                           session/set_mode above.
 #   - authenticate       -> (#957, ACP-6) if $ACP_FAKE_AUTH_FAIL is set,
 #                           replies with a JSON-RPC error; otherwise replies
 #                           with an empty success result.
@@ -472,12 +486,22 @@ while IFS= read -r line; do
       if [ -n "$ACP_FAKE_CAPTURE_SESSION_NEW_TO" ]; then
         printf '%s\n' "$line" >> "$ACP_FAKE_CAPTURE_SESSION_NEW_TO"
       fi
+      # #1520: $ACP_FAKE_SESSION_MODES and $ACP_FAKE_SESSION_CONFIG_OPTIONS
+      # are independent result fields — built up separately so a test can
+      # set either, both, or neither without this script needing a case
+      # per combination (same shape as the capability flags in `initialize`
+      # above).
+      result_fields="\"sessionId\":\"sess-1\""
+      if [ -n "$ACP_FAKE_SESSION_MODES" ]; then
+        result_fields="${result_fields},\"modes\":{\"currentModeId\":\"code\",\"availableModes\":[{\"id\":\"code\",\"name\":\"Code\"},{\"id\":\"plan\",\"name\":\"Plan\"}]}"
+      fi
+      if [ -n "$ACP_FAKE_SESSION_CONFIG_OPTIONS" ]; then
+        result_fields="${result_fields},\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"currentValueId\":\"sonnet\",\"values\":[{\"id\":\"sonnet\",\"name\":\"Claude Sonnet\"},{\"id\":\"opus\",\"name\":\"Claude Opus\"}]}]"
+      fi
       if [ -n "$ACP_FAKE_SESSION_NEW_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"cwd not permitted"}}\n' "$id"
-      elif [ -n "$ACP_FAKE_SESSION_MODES" ]; then
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Code"},{"id":"plan","name":"Plan"}]}}}\n' "$id"
       else
-        printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}\n' "$id"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{%s}}\n' "$id" "$result_fields"
       fi
       ;;
     *'"method":"session/load"'*)
@@ -699,6 +723,13 @@ while IFS= read -r line; do
       mode_id=$(printf '%s' "$line" | sed -n 's/.*"modeId":"\([^"]*\)".*/\1/p')
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"current_mode_update","currentModeId":"%s"}}}\n' "$mode_id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      id=$(extract_id "$line")
+      config_option_id=$(printf '%s' "$line" | sed -n 's/.*"configOptionId":"\([^"]*\)".*/\1/p')
+      value_id=$(printf '%s' "$line" | sed -n 's/.*"valueId":"\([^"]*\)".*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"config_option_update","configOptionId":"%s","currentValueId":"%s"}}}\n' "$config_option_id" "$value_id"
       ;;
     *'"method":"authenticate"'*)
       id=$(extract_id "$line")

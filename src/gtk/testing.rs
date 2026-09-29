@@ -6691,6 +6691,92 @@ second line here
         );
     }
 
+    /// #1520 acceptance: "session config options — :AiModel". ACP v1 has
+    /// no dedicated `session/set_model`; the fixture's
+    /// `$ACP_FAKE_SESSION_CONFIG_OPTIONS` `category: "model"` config
+    /// option is the only model picker the spec offers at all. GTK's twin
+    /// of `ai_panel_mode_switch_round_trips_via_session_set_mode` above,
+    /// for the config-option mechanism instead of `modes`: `:AiModel
+    /// <name>` (the real ex-command path) must reach the agent via
+    /// `session/set_config_option`, and the header must only flip to the
+    /// new model once the fixture's `config_option_update` notification —
+    /// not the request's own (empty) response — lands.
+    ///
+    /// RED verified: with `Engine::acp_handle_session_update`'s
+    /// `config_option_update` arm deleted (so the notification is
+    /// silently dropped as an unrecognized update kind), this test fails
+    /// — the header stays on "model: Claude Sonnet" forever even though
+    /// the fixture did reply to `session/set_config_option` and did emit
+    /// the notification.
+    #[cfg(unix)]
+    #[test]
+    fn ai_panel_model_switch_round_trips_via_session_set_config_option() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_SESSION_CONFIG_OPTIONS", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_mut().client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+        }
+
+        // Drive the handshake (initialize -> session/new) so `session/new`'s
+        // `configOptions` field lands and the panel has a session id to
+        // address `session/set_config_option` to.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("model: Claude Sonnet")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("model: Claude Sonnet"),
+            "session/new's configOptions' current value must render in \
+             the status header within 5s"
+        );
+
+        // The real ex-command path, not a direct `acp_set_model` call.
+        h.engine.borrow_mut().execute_command("AiModel opus");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("model: Claude Sonnet"),
+            "the displayed model must NOT change optimistically just \
+             because the request was sent -- only config_option_update \
+             may change it"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.driver.screen_contains("model: Claude Opus")
+            && std::time::Instant::now() < deadline
+        {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            h.driver.screen_contains("model: Claude Opus"),
+            "the fixture's config_option_update notification must flip the \
+             displayed model within 5s of the session/set_config_option \
+             round trip"
+        );
+    }
+
     /// #958 (ACP-7) acceptance, GTK's twin of `tui_main::shell_app::tests::
     /// ai_panel_switches_between_registered_agents_via_ai_agent_command_
     /// via_shell_app`: a second, differently-configured

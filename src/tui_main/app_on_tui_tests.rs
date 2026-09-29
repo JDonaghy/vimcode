@@ -5730,6 +5730,151 @@ mod tests {
         }
     }
 
+    mod issue_1520_acp_config_options {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// #1520 acceptance: "session config options — :AiModel". ACP v1
+        /// has no dedicated `session/set_model`; the fixture's
+        /// `$ACP_FAKE_SESSION_CONFIG_OPTIONS` `category: "model"` config
+        /// option is the only model picker the spec offers at all. Drives
+        /// the real `:AiModel <name>` ex-command path (not a direct
+        /// `Engine::acp_set_model` call) and confirms the header's
+        /// "model: ..." segment only flips once the fixture's
+        /// `config_option_update` notification lands — never
+        /// optimistically on the `session/set_config_option` request
+        /// alone. TUI's twin of `gtk::testing::sidebar_panel_clicks::
+        /// ai_panel_mode_switch_round_trips_via_session_set_mode`'s own
+        /// round-trip shape, for the config-option mechanism instead of
+        /// `modes`.
+        ///
+        /// RED verified: with `Engine::acp_handle_session_update`'s
+        /// `config_option_update` dispatch arm deleted (so the
+        /// notification is silently dropped as an unrecognized update
+        /// kind, the same "forward-compatible no-op" fate an unknown kind
+        /// already gets), this test fails — the header stays on "model:
+        /// Claude Sonnet" forever even though the fixture did reply to
+        /// `session/set_config_option` and did emit the notification.
+        #[cfg(unix)]
+        #[test]
+        fn ai_model_switch_round_trips_via_session_set_config_option_via_shell_app() {
+            let mut engine = plain_engine();
+            // See `acp_mcp_servers`'s sibling tests for why this must run
+            // before the fixture agent is configured.
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec![
+                    "ACP_FAKE_SESSION_CONFIG_OPTIONS=1".to_string(),
+                    "ACP_FAKE_NO_TOOL_REQUEST=1".to_string(),
+                ],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+
+            // #1520 review: the default 20-cell sidebar width clips the
+            // status header's own text mid-word (confirmed while writing
+            // this test — "model: Claude Sonnet" reads as truncated "· m"
+            // at the default width), the exact same clipping
+            // `ai_panel_harness_widened`'s own doc names for the
+            // send/stop/leave hint. Widened the same way: a wider
+            // terminal plus 40 real `Alt+Right` "resize sidebar" presses
+            // (`render::alt_resized_sidebar_width`) rather than a bespoke
+            // fixed-width workaround.
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            let driver = &mut h.driver;
+            driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+
+            // Drive the full handshake (spawn -> initialize -> session/new
+            // -> session/prompt) via a real sent message, the same
+            // ":AI <text>" entry point `acp_mcp_servers`/
+            // `issue_1519_acp_conformance`'s tests above use — the
+            // fixture's `configOptions` only ever lands on the
+            // `session/new` response, so there is no earlier trigger to
+            // drive this from.
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("Hello world") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("Hello world"),
+                "sanity: the turn must complete within 5s before the \
+                 model round trip below can prove anything; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("model: Claude Sonnet"),
+                "session/new's configOptions' current value must render \
+                 in the status header once the handshake completes; \
+                 screen:\n{screen}"
+            );
+
+            // The real ex-command path, not a direct `acp_set_model` call.
+            // `Escape` first: the chat input still has keyboard focus after
+            // submitting the first message, so ':' would otherwise be typed
+            // as literal chat text instead of opening the command line —
+            // the same leave-chat-focus step
+            // `session_info_update_title_paints_on_the_sessions_picker_
+            // via_shell_app` above takes before its own second `:` command.
+            driver.press_named(quadraui::NamedKey::Escape);
+            driver.type_char(':');
+            for c in "AiModel opus".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+            assert!(
+                driver.screen().contains("model: Claude Sonnet"),
+                "the displayed model must NOT change optimistically just \
+                 because the request was sent -- only \
+                 config_option_update may change it"
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !screen.contains("model: Claude Opus") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("model: Claude Opus"),
+                "the fixture's config_option_update notification must \
+                 flip the displayed model within 5s of the \
+                 session/set_config_option round trip; screen:\n{screen}"
+            );
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // #1500: public App-on-TUI test seam
     //

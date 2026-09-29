@@ -301,7 +301,10 @@ impl Engine {
                     redraw = true;
                 }
                 AcpEvent::SessionCreated {
-                    session_id, modes, ..
+                    session_id,
+                    modes,
+                    config_options,
+                    ..
                 } => {
                     self.acp_mut().session_id = Some(session_id.clone());
                     // #1459: remember this session (id, agent, cwd, first
@@ -330,6 +333,13 @@ impl Engine {
                         self.acp_mut().modes = list;
                         self.acp_mut().current_mode_id = current;
                     }
+                    // #1520: `session/new`'s optional `configOptions` field
+                    // — same "absent means the agent doesn't support it,
+                    // not an error" policy as `modes` above.
+                    if let Some(config_options_json) = config_options {
+                        self.acp_mut().config_options =
+                            crate::core::acp::parse_config_options(&config_options_json);
+                    }
                     if let Some(text) = self.acp_mut().pending_prompt.take() {
                         // #1449: rebuilt fresh here (rather than carrying
                         // pre-built blocks in `acp_pending_prompt` itself)
@@ -349,7 +359,11 @@ impl Engine {
                     }
                     redraw = true;
                 }
-                AcpEvent::SessionLoaded { modes, .. } => {
+                AcpEvent::SessionLoaded {
+                    modes,
+                    config_options,
+                    ..
+                } => {
                     // #1459: `acp_session_id` was already set to the
                     // resumed id by `Engine::acp_begin_session` before the
                     // `session/load` request was even sent — see that
@@ -368,6 +382,12 @@ impl Engine {
                         let (current, list) = crate::core::acp::parse_session_modes(&modes_json);
                         self.acp_mut().modes = list;
                         self.acp_mut().current_mode_id = current;
+                    }
+                    // #1520: same "resumed session re-declares its config
+                    // options" contract as `modes` immediately above.
+                    if let Some(config_options_json) = config_options {
+                        self.acp_mut().config_options =
+                            crate::core::acp::parse_config_options(&config_options_json);
                     }
                     if let Some(session_id) = self.acp_mut().session_id.clone() {
                         // #1459 review: refresh this record's `updated_at`
@@ -1898,6 +1918,11 @@ impl Engine {
             self.acp_mut().command_completion_idx = 0;
         } else if let Some(mode_id) = crate::core::acp::parse_current_mode_update(inner) {
             self.acp_mut().current_mode_id = Some(mode_id);
+        } else if let Some((config_option_id, value_id)) =
+            crate::core::acp::parse_config_option_update(inner)
+        {
+            // #1520.
+            self.acp_apply_config_option_update(&config_option_id, &value_id);
         } else if let Some(usage) = crate::core::acp::parse_usage_update(inner) {
             self.acp_mut().usage = Some(usage);
         } else if let Some(call) = crate::core::acp::parse_tool_call(inner) {
@@ -2067,6 +2092,146 @@ impl Engine {
             client.set_mode(&session_id, &mode_id);
             self.message = format!("Switching to mode: {mode_id}\u{2026}");
         }
+    }
+
+    // ── configOptions / session/set_config_option (#1520) ──────────────────
+    //
+    // ACP v1 has no dedicated `session/set_model`; a config option tagged
+    // `category: "model"` is the *only* model picker the spec offers at
+    // all — `:AiModel` below is sugar over exactly that, built entirely on
+    // top of the generic `:AiConfig` machinery rather than a separate
+    // mechanism.
+
+    /// Human-readable summary of the ACP agent's declared config options
+    /// and each one's current value, for `:AiConfig` with no arguments.
+    pub(crate) fn acp_config_status_line(&self) -> String {
+        if self.acp().config_options.is_empty() {
+            return "ACP agent has no config options".to_string();
+        }
+        let entries: Vec<String> = self
+            .acp()
+            .config_options
+            .iter()
+            .map(|o| format!("{} = {}", o.id, o.current_value_label()))
+            .collect();
+        format!("Config options: {}", entries.join(", "))
+    }
+
+    /// Find a declared config option by id or name (case-insensitive) —
+    /// the same "match by id or name" policy `Self::acp_set_mode` uses for
+    /// modes.
+    fn acp_find_config_option(&self, id: &str) -> Option<&crate::core::acp::AcpConfigOption> {
+        self.acp()
+            .config_options
+            .iter()
+            .find(|o| o.id.eq_ignore_ascii_case(id) || o.name.eq_ignore_ascii_case(id))
+    }
+
+    /// Human-readable summary of one config option's declared values and
+    /// which is current, for `:AiConfig <id>` given with no value
+    /// argument — `id` matched by id or name, same lookup
+    /// [`Self::acp_set_config_option`] uses.
+    pub(crate) fn acp_config_option_status_line(&self, id: &str) -> String {
+        let Some(option) = self.acp_find_config_option(id) else {
+            return format!("Unknown ACP config option: {id}");
+        };
+        let values: Vec<String> = option
+            .values
+            .iter()
+            .map(|v| {
+                if Some(v.id.as_str()) == option.current_value_id.as_deref() {
+                    format!("*{}", v.name)
+                } else {
+                    v.name.clone()
+                }
+            })
+            .collect();
+        format!("{}: {}", option.name, values.join(", "))
+    }
+
+    /// Send `session/set_config_option` for `id`/`value`, each matched
+    /// against the agent's declared config options/values by id or name
+    /// (case-insensitive) — the exact "match by id or name" policy
+    /// [`Self::acp_set_mode`] uses. The displayed value does **not**
+    /// change optimistically here — it only changes once the agent's own
+    /// `config_option_update` notification lands
+    /// ([`Self::acp_handle_session_update`]), matching `acp_set_mode`'s
+    /// own round-trip contract.
+    pub(crate) fn acp_set_config_option(&mut self, id: &str, value: &str) {
+        let Some(session_id) = self.acp_mut().session_id.clone() else {
+            self.message = "No active ACP session".to_string();
+            return;
+        };
+        let Some(option) = self.acp_find_config_option(id) else {
+            self.message = format!("Unknown ACP config option: {id}");
+            return;
+        };
+        let option_id = option.id.clone();
+        let Some(matched_value) = option
+            .values
+            .iter()
+            .find(|v| v.id.eq_ignore_ascii_case(value) || v.name.eq_ignore_ascii_case(value))
+        else {
+            self.message = format!("Unknown value {value:?} for ACP config option: {option_id}");
+            return;
+        };
+        let value_id = matched_value.id.clone();
+        if let Some(client) = self.acp_mut().client.as_mut() {
+            client.set_config_option(&session_id, &option_id, &value_id);
+            self.message = format!("Switching {option_id} to: {value_id}\u{2026}");
+        }
+    }
+
+    /// Apply a `config_option_update` notification: the **only** thing
+    /// that should ever change a config option's displayed current value
+    /// — a `session/set_config_option` request succeeding is not itself
+    /// sufficient, mirroring [`crate::core::acp::parse_current_mode_update`]'s
+    /// own "displayed state follows the notification" contract. A
+    /// notification naming an option id this session never declared is a
+    /// no-op — nothing to patch.
+    fn acp_apply_config_option_update(&mut self, config_option_id: &str, value_id: &str) {
+        if let Some(option) = self
+            .acp_mut()
+            .config_options
+            .iter_mut()
+            .find(|o| o.id == config_option_id)
+        {
+            option.current_value_id = Some(value_id.to_string());
+        }
+    }
+
+    /// The agent's declared "model" config option, if it has one — the
+    /// first `config_options` entry whose `category` is `"model"`. An
+    /// agent declaring more than one is unspecified territory; first-match
+    /// is a deliberate, simple tie-break rather than silently picking
+    /// none.
+    pub(crate) fn acp_model_option(&self) -> Option<&crate::core::acp::AcpConfigOption> {
+        self.acp()
+            .config_options
+            .iter()
+            .find(|o| o.category.as_deref() == Some("model"))
+    }
+
+    /// Human-readable summary for `:AiModel` with no argument —
+    /// distinguishes "no config options at all" from "config options, but
+    /// none tagged `category: model`" rather than reusing
+    /// [`Self::acp_config_status_line`]'s generic message for both.
+    pub(crate) fn acp_model_status_line(&self) -> String {
+        let Some(option) = self.acp_model_option() else {
+            return "ACP agent has no model config option".to_string();
+        };
+        let id = option.id.clone();
+        self.acp_config_option_status_line(&id)
+    }
+
+    /// `:AiModel <name>` — sugar over [`Self::acp_set_config_option`]
+    /// against whichever config option is tagged `category: "model"`.
+    pub(crate) fn acp_set_model(&mut self, name: &str) {
+        let Some(option_id) = self.acp_model_option().map(|o| o.id.clone()) else {
+            self.message = "ACP agent has no model config option".to_string();
+            return;
+        };
+        self.acp_set_config_option(&option_id, name);
     }
 
     // ── session/request_permission (#953, ACP-2) ────────────────────────────
@@ -5310,6 +5475,65 @@ mod tests {
         let mut engine = Engine::new_for_test();
         engine.execute_command("AiMode nonexistent");
         assert_eq!(engine.message, "No active ACP session");
+    }
+
+    /// #1520: `:AiConfig` (no argument) must summarise every declared
+    /// config option and mark each one's current value — engine-level
+    /// coverage underneath the driver-tier round-trip test that covers
+    /// `:AiConfig <id> <value>`/`:AiModel <name>` actually reaching the
+    /// wire via `session/set_config_option`.
+    #[cfg(unix)]
+    #[test]
+    fn ai_config_no_arg_lists_options_and_marks_current_value() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_CONFIG_OPTIONS", "1")]);
+        poll_acp_until(&mut engine, |e| !e.acp().config_options.is_empty());
+
+        engine.execute_command("AiConfig");
+        assert_eq!(engine.message, "Config options: model = Claude Sonnet");
+    }
+
+    /// `:AiConfig <id>` (one argument, no value) shows that option's
+    /// declared values with the current one starred, matched by id or
+    /// name case-insensitively.
+    #[cfg(unix)]
+    #[test]
+    fn ai_config_one_arg_shows_option_values_with_current_starred() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_CONFIG_OPTIONS", "1")]);
+        poll_acp_until(&mut engine, |e| !e.acp().config_options.is_empty());
+
+        engine.execute_command("AiConfig model");
+        assert_eq!(engine.message, "Model: *Claude Sonnet, Claude Opus");
+    }
+
+    /// An unknown config option id must be rejected with a clear message,
+    /// never silently sent to the agent as-is.
+    #[test]
+    fn ai_config_unknown_id_is_rejected_without_a_client() {
+        let mut engine = Engine::new_for_test();
+        engine.execute_command("AiConfig model opus");
+        assert_eq!(engine.message, "No active ACP session");
+    }
+
+    /// #1520: `:AiModel` (no argument) is sugar for the `category: "model"`
+    /// config option — same summary `:AiConfig model` produces, reached
+    /// without the caller needing to know that option's id.
+    #[cfg(unix)]
+    #[test]
+    fn ai_model_no_arg_shows_model_option_values() {
+        let mut engine = engine_with_fixture_agent(&[("ACP_FAKE_SESSION_CONFIG_OPTIONS", "1")]);
+        poll_acp_until(&mut engine, |e| !e.acp().config_options.is_empty());
+
+        engine.execute_command("AiModel");
+        assert_eq!(engine.message, "Model: *Claude Sonnet, Claude Opus");
+    }
+
+    /// An agent with config options but none tagged `category: "model"`
+    /// must say so distinctly from "no config options at all".
+    #[test]
+    fn ai_model_no_option_is_reported_distinctly() {
+        let mut engine = Engine::new_for_test();
+        engine.execute_command("AiModel");
+        assert_eq!(engine.message, "ACP agent has no model config option");
     }
 
     // ── #957 (ACP-6): auth.terminal — subscription login ─────────────────

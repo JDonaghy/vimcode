@@ -42,9 +42,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use super::acp::{
-    AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpMcpCapabilities,
-    AcpPermissionRequest, AcpPlanEntry, AcpPromptCapabilities, AcpSessionMode, AcpToolCall,
-    AcpUsage,
+    AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpConfigOption,
+    AcpMcpCapabilities, AcpPermissionRequest, AcpPlanEntry, AcpPromptCapabilities, AcpSessionMode,
+    AcpToolCall, AcpUsage,
 };
 use super::ai::AiMessage;
 
@@ -122,6 +122,17 @@ pub struct AcpSession {
     pub mention_completion_idx: usize,
     pub modes: Vec<AcpSessionMode>,
     pub current_mode_id: Option<String>,
+    /// This session's declared config options (#1520) — `session/new`'s
+    /// optional `configOptions` field, kept fresh by `config_option_update`
+    /// notifications (`Engine::acp_handle_session_update`). ACP v1 has no
+    /// dedicated `session/set_model`; a `category: "model"` entry here is
+    /// the *only* model picker the spec offers at all, which is why
+    /// `:AiModel` is sugar over this list rather than a separate mechanism.
+    /// Unlike `modes`/`current_mode_id` (one agent-wide current value),
+    /// each option here carries its own current value
+    /// (`AcpConfigOption::current_value_id`), since an agent may expose
+    /// several independent options at once.
+    pub config_options: Vec<AcpConfigOption>,
     pub usage: Option<AcpUsage>,
     pub auth_methods: Vec<AcpAuthMethod>,
     pub authenticated: bool,
