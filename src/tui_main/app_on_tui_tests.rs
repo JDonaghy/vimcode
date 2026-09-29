@@ -7747,5 +7747,65 @@ mod tests {
                  the screen while collapsed; screen:\n{screen}"
             );
         }
+
+        /// #1510 regression: routing transcript turns through the markdown
+        /// renderer must NOT cost plain replies their word wrapping.
+        ///
+        /// `ChatController::build_transcript_rows` picks its wrap policy
+        /// off `ChatTurn::line_scales`: turns that carry per-line scales
+        /// wrap with `WrapPolicy::Char` (mid-word, exactly at the
+        /// display-width budget), turns without them word-wrap via
+        /// `text_util::word_wrap`. Handing quadraui styled rows for a
+        /// message containing no markdown at all therefore chopped every
+        /// plain agent reply mid-word in the narrow default AI panel
+        /// (`"Hello world ANSWE"` / `"RED1519"`), which is why
+        /// `render::markdown_turn_styled_cached` returns empty
+        /// `line_scales` when the render came back with nothing to style.
+        ///
+        /// Seeds the transcript on the `Engine` before the harness takes
+        /// it (the driver owns the engine afterwards) — the same
+        /// seeded-transcript shape `gtk::testing::…::
+        /// ai_panel_scrolls_transcript` uses — and asserts each word of a
+        /// reply long enough to need three rows survives whole. RED
+        /// verified: with the `has_styling` branch removed from
+        /// `markdown_turn_styled_cached` (so every turn carries
+        /// `line_scales`), "charlie" is painted as "charl"/"ie" across two
+        /// rows and this fails.
+        #[test]
+        fn plain_reply_word_wraps_not_mid_word_in_narrow_panel_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            for (role, content) in [
+                ("user", "wrap me"),
+                (
+                    "assistant",
+                    "alpha bravo charlie delta echo foxtrot golf hotel",
+                ),
+            ] {
+                engine
+                    .acp_mut()
+                    .ai_messages
+                    .push(crate::core::ai::AiMessage {
+                        role: role.to_string(),
+                        content: content.to_string(),
+                    });
+            }
+            let mut h = harness(engine);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            let screen = h.driver.screen();
+
+            for word in [
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ] {
+                assert!(
+                    screen.contains(word),
+                    "a plain (non-markdown) reply must word-wrap, so every \
+                     word stays whole on some row — {word:?} was split \
+                     across rows; screen:\n{screen}"
+                );
+            }
+        }
     }
 }

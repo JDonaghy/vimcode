@@ -6154,6 +6154,15 @@ second line here
     /// quadraui's `System` role label, message under `AI`) once the turn
     /// completes.
     ///
+    /// Since #1510 the thought turn paints *collapsed* — its own text is
+    /// replaced by the fixed one-line "Thinking…" summary — so this asserts
+    /// on that summary row rather than on the fixture's
+    /// `"pondering the question"` wording. The original intent is intact:
+    /// a `System`-role turn carrying a "Thinking…" row exists only because
+    /// the `agent_thought_chunk` arrived and was mapped to a transcript
+    /// turn of its own, so this still fails if the chunk is dropped as an
+    /// unrecognized update kind.
+    ///
     /// `GtkDriver` has no `tick()` (unlike `TuiDriver` — GTK's poll_idle is
     /// driven by a `glib` timer this headless harness never runs), so the
     /// background agent's progress is drained directly via
@@ -6230,9 +6239,11 @@ second line here
              transcript within 5s"
         );
         assert!(
-            h.driver.screen_contains("pondering the question"),
-            "the agent_thought_chunk must also reach the transcript, not be \
-             dropped as an unrecognized update kind"
+            h.driver.screen_contains("Thinking\u{2026}"),
+            "the agent_thought_chunk must also reach the transcript (as its \
+             own collapsed \"Thinking…\" turn since #1510), not be dropped \
+             as an unrecognized update kind; painted: {:?}",
+            h.driver.painted_texts()
         );
         assert!(
             h.driver.screen_contains("System"),
@@ -7257,6 +7268,14 @@ second line here
     /// `Engine::acp_begin_session`'s resume branch deleted (so
     /// `acp_pending_resume` is silently ignored), this test fails at the
     /// "It prints hello." wait — no `session/load` request is ever sent.
+    ///
+    /// Doubles as #1510's regression guard for collapsed-turn staleness:
+    /// `ChatController` keys collapsed/summary state by *transcript index*
+    /// and `set_transcript` does not clear it, so a `populate_ai_chat_
+    /// controller` that only ever sets the collapsed case leaves index 1's
+    /// pre-`:AiClear` "Thinking…" collapse on the assistant reply replayed
+    /// at that index by `session/load` — the replayed text then never
+    /// paints at all and this same "It prints hello." assertion fails.
     #[cfg(unix)]
     #[test]
     fn ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_transcript() {
@@ -7334,7 +7353,8 @@ second line here
         assert!(
             h.driver.screen_contains("It prints hello."),
             "the assistant turn replayed via session/load must rebuild in \
-             the transcript within 5s"
+             the transcript within 5s; painted: {:?}",
+            h.driver.painted_texts()
         );
         assert!(
             h.driver.screen_contains("what does main.rs do"),
