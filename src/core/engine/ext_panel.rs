@@ -3166,7 +3166,7 @@ impl Engine {
         self.acp_mut().label = self.acp_active_agent_name();
         match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
             Ok(mut client) => {
-                client.initialize();
+                client.initialize(self.settings.acp_terminal_enabled);
                 self.acp_mut().client = Some(client);
                 self.acp_mut().pending_prompt = Some(text);
             }

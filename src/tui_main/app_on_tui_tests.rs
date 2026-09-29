@@ -9600,4 +9600,142 @@ mod tests {
             let _ = std::fs::remove_dir_all(&workspace);
         }
     }
+
+    mod issue_1522_acp_terminal_cards {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        /// Wide (220x30, `Alt+Right` x40 — same widening every other
+        /// AI-panel test in this file uses, so the card's `$ echo …`/`cwd:
+        /// …`/exit-status lines never word-wrap) harness with a fixture
+        /// agent configured to reply via `$ACP_FAKE_TERMINAL` — see that
+        /// env var's doc in `tests/fixtures/fake_acp_agent.sh` for the
+        /// exact `terminal/create` -> `terminal/wait_for_exit` ->
+        /// `terminal/release` sequence it drives.
+        fn widened_acp_terminal_harness() -> crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        > {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_TERMINAL=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 220, 30);
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for _ in 0..40 {
+                h.driver.dispatch(quadraui::UiEvent::KeyPressed {
+                    key: quadraui::Key::Named(quadraui::NamedKey::Right),
+                    modifiers: quadraui::Modifiers {
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                });
+            }
+            h
+        }
+
+        /// #1522 acceptance: `{type: "terminal"}` tool content, previously
+        /// parsed but never rendered (a one-line "(terminal output
+        /// omitted)" placeholder), now expands into a live card showing
+        /// the command line, its `cwd`, and its exit status/output — and
+        /// that card keeps rendering after the agent calls
+        /// `terminal/release` (this issue's "persists after release"
+        /// acceptance bar), instead of the card going blank or the
+        /// terminal's resources leaving no trace at all.
+        ///
+        /// RED verified: with `AcpToolCallContentBlock::Terminal`'s render
+        /// arm in `tool_call_expanded_text` reverted to the pre-#1522
+        /// `"(terminal output omitted)"` placeholder, this fails — none of
+        /// `cwd:`/`exit code 0`/the captured `acp-terminal-output` text
+        /// ever appear on screen, expanded or not.
+        #[cfg(unix)]
+        #[test]
+        fn terminal_tool_content_renders_a_live_card_that_persists_after_release_via_shell_app() {
+            let mut h = widened_acp_terminal_harness();
+            let driver = &mut h.driver;
+            driver.type_char(':');
+            for c in "AI hi".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            // Wait for the fixture's scripted round trip to fully finish —
+            // `terminal/create` -> `terminal/wait_for_exit` ->
+            // `terminal/release`, each parked and answered out of band by
+            // the real `Engine::acp_handle_terminal_*` handlers this issue
+            // adds — not just the tool call reaching "completed" (which
+            // happens *before* `terminal/release` is even sent; see the
+            // fixture's own doc). Polling engine state here only decides
+            // *when* to stop driving the event loop; every actual
+            // assertion below reads painted screen text, never this state,
+            // per this repo's "rendered output, not state" rule.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let released = loop {
+                driver.tick();
+                let released = h
+                    .engine
+                    .borrow()
+                    .acp()
+                    .acp_terminals
+                    .values()
+                    .next()
+                    .map(|r| r.released)
+                    .unwrap_or(false);
+                if released || Instant::now() >= deadline {
+                    break released;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                released,
+                "setup: the fixture's terminal/release round trip must \
+                 complete within 5s"
+            );
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("[x] execute: Run a command"),
+                "the tool call must reach its completed collapsed summary \
+                 line; screen:\n{screen}"
+            );
+
+            driver.click_text("execute: Run a command");
+            driver.tick();
+            let screen = driver.screen();
+            assert!(
+                screen.contains("$ echo acp-terminal-output"),
+                "expanding the card must show the terminal's command line; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("cwd: /tmp"),
+                "expanding the card must show the terminal's cwd; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("exit code 0"),
+                "expanding the card must show the terminal's exit status, \
+                 read after terminal/release dropped the live PTY — proving \
+                 the card's snapshot survives release; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("acp-terminal-output"),
+                "expanding the card must show the command's own captured \
+                 output; screen:\n{screen}"
+            );
+        }
+    }
 }

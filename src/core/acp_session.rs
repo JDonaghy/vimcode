@@ -40,13 +40,108 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use super::acp::{
     AcpAuthMethod, AcpAvailableCommand, AcpChunkKind, AcpClient, AcpConfigOption,
     AcpMcpCapabilities, AcpPermissionRequest, AcpPlanEntry, AcpPromptCapabilities, AcpSessionMode,
-    AcpToolCall, AcpUsage,
+    AcpTerminalExitStatus, AcpTerminalView, AcpToolCall, AcpUsage,
 };
 use super::ai::AiMessage;
+
+/// One terminal an ACP agent asked the client to run via `terminal/create`
+/// (#1522) — the client-served counterpart to a *visible* Terminal-panel
+/// `TerminalSlot` (`crate::core::engine::terminal_ops`), which this
+/// deliberately is not: an ACP terminal never appears in
+/// `Engine::terminal_panes`/the Terminal panel UI, only as a live card
+/// inside whichever tool call referenced it
+/// (`crate::core::acp::AcpToolCallContentBlock::Terminal`).
+///
+/// Lives inside [`AcpSession`] (like `client: Option<AcpClient>` above,
+/// which owns the agent's own subprocess) rather than on `Engine` directly
+/// — an ACP terminal's id namespace is scoped to the session that created
+/// it, per the ACP spec, so clearing a session must take its terminals
+/// with it rather than leaking them into whatever session comes next.
+///
+/// Survives `terminal/release` (`Engine::acp_terminal_release`,
+/// `src/core/engine/terminal_ops.rs`) — only `session` (the live
+/// `TerminalSession`/PTY handle) is dropped then; every other field is a
+/// frozen-enough snapshot for [`Self::view`] to keep rendering the card
+/// afterward, per this issue's "persists after release" acceptance bar.
+pub struct AcpTerminalRecord {
+    pub terminal_id: String,
+    /// `"cmd arg1 arg2"` for the card header — see
+    /// `crate::core::engine::terminal_ops::acp_terminal_command_display`.
+    pub command_display: String,
+    pub cwd: Option<String>,
+    pub created_at: Instant,
+    /// Stamped by `Engine::acp_terminal_release` so the card's elapsed
+    /// time freezes at the moment of release instead of counting up
+    /// forever afterward (measuring "how long ago was this released"
+    /// instead of "how long did/has it run").
+    pub elapsed_frozen: Option<Duration>,
+    pub output_byte_limit: Option<usize>,
+    /// Latest captured command output (the text between the injected
+    /// wrapper's begin/end markers — see
+    /// `crate::core::engine::terminal_ops::extract_acp_terminal_output`),
+    /// refreshed by `Engine::acp_terminal_refresh`. Stored untruncated;
+    /// `output_byte_limit` is applied on read (`Self::view`, `terminal/
+    /// output`), not baked in here.
+    pub last_output: String,
+    /// `None` while still running.
+    pub exit_status: Option<AcpTerminalExitStatus>,
+    /// `true` once `terminal/kill` was served — see
+    /// `Engine::acp_terminal_kill`'s doc for why this is a best-effort
+    /// Ctrl-C, not a guaranteed stop.
+    pub killed: bool,
+    /// `true` once `terminal/release` was served.
+    pub released: bool,
+    /// Set while a `terminal/wait_for_exit` request is parked awaiting
+    /// this terminal's exit (`Engine::acp_terminal_wait_for_exit`) —
+    /// answered by `Engine::poll_acp_terminals`'s background sweep, or
+    /// immediately by that same handler if the terminal had already
+    /// exited by the time the request arrived.
+    pub wait_for_exit_pending: Option<i64>,
+    /// The live PTY. `None` once `terminal/release` dropped it — see this
+    /// struct's own doc for why everything else survives that and this
+    /// doesn't.
+    pub session: Option<quadraui::terminal_engine::TerminalSession>,
+    /// The exact line the injected wrapper prints (via `printf`/
+    /// `Write-Host`, never typed as a bare literal) right before running
+    /// the command — the anchor
+    /// `crate::core::engine::terminal_ops::extract_acp_terminal_output`
+    /// uses for where the command's own output starts.
+    pub begin_marker: String,
+    /// The line prefix the injected wrapper prints right after the
+    /// command, followed by its exit code — the anchor
+    /// `extract_acp_terminal_output` uses for where the command's own
+    /// output ends.
+    pub end_marker_prefix: String,
+}
+
+impl AcpTerminalRecord {
+    /// Build the read-only [`AcpTerminalView`] rendering actually reads —
+    /// see `crate::core::acp::terminal_card_text`.
+    pub fn view(&self) -> AcpTerminalView {
+        let elapsed = self
+            .elapsed_frozen
+            .unwrap_or_else(|| self.created_at.elapsed());
+        let (output_tail, truncated) = crate::core::engine::terminal_ops::truncate_terminal_output(
+            &self.last_output,
+            self.output_byte_limit,
+        );
+        AcpTerminalView {
+            command_display: self.command_display.clone(),
+            cwd: self.cwd.clone(),
+            elapsed,
+            exit_status: self.exit_status.clone(),
+            killed: self.killed,
+            released: self.released,
+            output_tail,
+            truncated,
+        }
+    }
+}
 
 /// One cached markdown render: the source content's byte length, the
 /// rendered [`quadraui::StyledText`], and its per-line heading scales. See
@@ -234,6 +329,20 @@ pub struct AcpSession {
     /// `TurnClicked`, so it is always fresh by the time a click is
     /// dispatched.
     pub transcript_turn_kinds: RefCell<Vec<TranscriptTurnKind>>,
+
+    /// Every terminal this session's agent has `terminal/create`d (#1522),
+    /// keyed by the client-generated terminal id — see
+    /// [`AcpTerminalRecord`]'s own doc for why this lives here rather than
+    /// on `Engine` directly, and why it's a plain map that keeps entries
+    /// around after `terminal/release` rather than removing them.
+    pub acp_terminals: HashMap<String, AcpTerminalRecord>,
+    /// Counter for generating this session's next terminal id
+    /// (`format!("term-{n}")`, `Engine::acp_terminal_create`) — the ACP
+    /// spec leaves the id's shape entirely up to the client, and a
+    /// monotonic counter (rather than reusing `acp_terminals.len()`) keeps
+    /// ids unique even though released terminals are never removed from
+    /// the map above.
+    pub acp_terminal_next_id: u64,
 }
 
 impl AcpSession {

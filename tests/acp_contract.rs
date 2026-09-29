@@ -104,7 +104,7 @@ fn engine_with_replay(transcript_name: &str, fixture_dir: &Path) -> Engine {
     let cwd = std::env::temp_dir();
     let mut client =
         AcpClient::spawn_with_env(&argv, &cwd, &[]).expect("replay agent should spawn");
-    client.initialize();
+    client.initialize(true);
 
     // `Engine::new_for_test` is `#[cfg(test)]`-only and therefore invisible
     // from an external integration-test crate (only compiled when

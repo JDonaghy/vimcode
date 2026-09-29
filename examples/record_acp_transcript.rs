@@ -67,7 +67,7 @@ fn main() {
                 std::process::exit(1);
             });
 
-    client.initialize();
+    client.initialize(true);
     let mut prompted = false;
     loop {
         for event in client.poll() {

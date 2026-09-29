@@ -68,6 +68,7 @@ impl Engine {
             redraw |= self.acp_dispatch_events(events, idx == foreground);
         }
         self.acp_active_session = foreground.min(self.acp_sessions.len().saturating_sub(1));
+        redraw |= self.poll_acp_terminals();
         redraw
     }
 
@@ -552,6 +553,31 @@ impl Engine {
                         "fs/write_text_file" => {
                             self.acp_handle_write_text_file(request_id, params);
                         }
+                        // #1522: served only when `settings.acp_terminal_
+                        // enabled` is on (default) — matching
+                        // `AcpClient::initialize`'s own gate on actually
+                        // advertising `clientCapabilities.terminal`. A
+                        // well-behaved agent never sends these when the
+                        // capability wasn't offered, but falling through
+                        // to the method-not-found arm below if one does
+                        // anyway (rather than serving it regardless) keeps
+                        // the setting meaningful as an actual opt-out, not
+                        // just an advertisement toggle.
+                        "terminal/create" if self.settings.acp_terminal_enabled => {
+                            self.acp_handle_terminal_create(request_id, params);
+                        }
+                        "terminal/output" if self.settings.acp_terminal_enabled => {
+                            self.acp_handle_terminal_output(request_id, params);
+                        }
+                        "terminal/wait_for_exit" if self.settings.acp_terminal_enabled => {
+                            self.acp_handle_terminal_wait_for_exit(request_id, params);
+                        }
+                        "terminal/kill" if self.settings.acp_terminal_enabled => {
+                            self.acp_handle_terminal_kill_request(request_id, params);
+                        }
+                        "terminal/release" if self.settings.acp_terminal_enabled => {
+                            self.acp_handle_terminal_release_request(request_id, params);
+                        }
                         // Any other method this client doesn't implement is
                         // answered immediately with the JSON-RPC standard
                         // "method not found" error (-32601), never left
@@ -1000,7 +1026,7 @@ impl Engine {
             env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         match crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, &env_refs) {
             Ok(mut client) => {
-                client.initialize();
+                client.initialize(self.settings.acp_terminal_enabled);
                 self.acp_mut().client = Some(client);
             }
             Err(e) => {
@@ -1211,8 +1237,9 @@ impl Engine {
         if exit_code == Some(0) {
             self.acp_mut().authenticated = true;
             self.message = "Sign-in complete, resuming\u{2026}".to_string();
+            let terminal_enabled = self.settings.acp_terminal_enabled;
             if let Some(client) = self.acp_mut().client.as_mut() {
-                client.initialize();
+                client.initialize(terminal_enabled);
             }
             return;
         }
@@ -2050,6 +2077,210 @@ impl Engine {
         }
     }
 
+    // ── terminal/create, terminal/output, terminal/wait_for_exit,
+    //    terminal/kill, terminal/release (#1522) ─────────────────────────
+
+    /// Answer a parked `terminal/create` request. A malformed request
+    /// (missing `sessionId`/`command`) gets a JSON-RPC error, never
+    /// silence — same policy as every other `acp_handle_*` request
+    /// handler in this file. The actual spawn lives in
+    /// `Engine::acp_terminal_create` (`src/core/engine/terminal_ops.rs`),
+    /// which owns the `TerminalSession`/PTY mechanics; this method is only
+    /// the wire-shape parse + reply.
+    fn acp_handle_terminal_create(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_terminal_create_params(&params) else {
+            self.acp_respond_error(request_id, "invalid terminal/create params");
+            return;
+        };
+        let cwd = req.cwd.as_ref().map(std::path::Path::new);
+        match self.acp_terminal_create(
+            &req.command,
+            &req.args,
+            &req.env,
+            cwd,
+            req.output_byte_limit,
+        ) {
+            Ok(terminal_id) => {
+                if let Some(client) = self.acp_mut().client.as_ref() {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::terminal_create_result(&terminal_id)),
+                    );
+                }
+            }
+            Err(msg) => self.acp_respond_error(request_id, &msg),
+        }
+    }
+
+    /// Answer a parked `terminal/output` request: refresh the record from
+    /// its live PTY one more time (an agent can call this faster than
+    /// `poll_idle`'s own background sweep, `Engine::poll_acp_terminals`),
+    /// then reply with whatever's captured so far, truncated to
+    /// `outputByteLimit` if the terminal was created with one.
+    fn acp_handle_terminal_output(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_terminal_id_params(&params) else {
+            self.acp_respond_error(request_id, "invalid terminal/output params");
+            return;
+        };
+        self.acp_terminal_refresh(&req.terminal_id);
+        let Some(record) = self.acp().acp_terminals.get(&req.terminal_id) else {
+            self.acp_respond_error(request_id, "unknown terminalId");
+            return;
+        };
+        let (output, truncated) = crate::core::engine::terminal_ops::truncate_terminal_output(
+            &record.last_output,
+            record.output_byte_limit,
+        );
+        let exit_status = record.exit_status.clone();
+        if let Some(client) = self.acp_mut().client.as_ref() {
+            client.respond_to_client_request(
+                request_id,
+                Ok(crate::core::acp::terminal_output_result(
+                    &output,
+                    truncated,
+                    exit_status.as_ref(),
+                )),
+            );
+        }
+    }
+
+    /// Answer (eventually) a `terminal/wait_for_exit` request. Never
+    /// blocks the engine's own sync tick to do it: if the terminal has
+    /// already exited by the time this is called, replies immediately;
+    /// otherwise parks the request id on
+    /// `AcpTerminalRecord::wait_for_exit_pending`, and
+    /// `Engine::poll_acp_terminals`'s background sweep answers it the
+    /// moment the terminal's exit marker actually appears — the same
+    /// "park, don't block" shape `session/request_permission`/`fs/*` use
+    /// for a human-in-the-loop wait, just driven by a PTY instead of a
+    /// dialog.
+    fn acp_handle_terminal_wait_for_exit(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_terminal_id_params(&params) else {
+            self.acp_respond_error(request_id, "invalid terminal/wait_for_exit params");
+            return;
+        };
+        self.acp_terminal_refresh(&req.terminal_id);
+        let Some(record) = self.acp_mut().acp_terminals.get_mut(&req.terminal_id) else {
+            self.acp_respond_error(request_id, "unknown terminalId");
+            return;
+        };
+        match record.exit_status.clone() {
+            Some(status) => {
+                if let Some(client) = self.acp_mut().client.as_ref() {
+                    client.respond_to_client_request(
+                        request_id,
+                        Ok(crate::core::acp::terminal_exit_status_result(&status)),
+                    );
+                }
+            }
+            None => {
+                record.wait_for_exit_pending = Some(request_id);
+            }
+        }
+    }
+
+    /// Answer a parked `terminal/kill` request. Per the ACP spec this kills
+    /// without releasing — the terminal stays queryable via
+    /// `terminal/output`/`terminal/wait_for_exit` afterward — and replies
+    /// immediately rather than waiting to observe the process actually
+    /// stop; see `Engine::acp_terminal_kill`'s doc for what "kill" means
+    /// here (best-effort Ctrl-C, not a guaranteed hard stop).
+    fn acp_handle_terminal_kill_request(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_terminal_id_params(&params) else {
+            self.acp_respond_error(request_id, "invalid terminal/kill params");
+            return;
+        };
+        if !self.acp().acp_terminals.contains_key(&req.terminal_id) {
+            self.acp_respond_error(request_id, "unknown terminalId");
+            return;
+        }
+        self.acp_terminal_kill(&req.terminal_id);
+        if let Some(client) = self.acp_mut().client.as_ref() {
+            client.respond_to_client_request(request_id, Ok(serde_json::Value::Null));
+        }
+    }
+
+    /// Answer a parked `terminal/release` request. Replies immediately —
+    /// `Engine::acp_terminal_release` freezes the card's snapshot and
+    /// drops the live PTY synchronously, nothing to wait on.
+    fn acp_handle_terminal_release_request(&mut self, request_id: i64, params: serde_json::Value) {
+        let Some(req) = crate::core::acp::parse_terminal_id_params(&params) else {
+            self.acp_respond_error(request_id, "invalid terminal/release params");
+            return;
+        };
+        if !self.acp().acp_terminals.contains_key(&req.terminal_id) {
+            self.acp_respond_error(request_id, "unknown terminalId");
+            return;
+        }
+        self.acp_terminal_release(&req.terminal_id);
+        if let Some(client) = self.acp_mut().client.as_ref() {
+            client.respond_to_client_request(request_id, Ok(serde_json::Value::Null));
+        }
+    }
+
+    /// Background sweep for every `terminal/create`d terminal across every
+    /// ACP session (#1522) — mirrors `poll_terminal`'s per-tick PTY drain
+    /// for the *visible* Terminal panel, but for the entirely separate
+    /// `AcpSession::acp_terminals` registry a client-served ACP terminal
+    /// lives in (it never appears in `self.terminal_panes`). Called from
+    /// `Self::poll_acp` so a backgrounded session's terminal keeps
+    /// progressing — and its live card keeps updating — even while a
+    /// different session is in the foreground, matching `poll_acp`'s own
+    /// per-session model. Also resolves any `terminal/wait_for_exit`
+    /// request parked on a terminal that has since exited.
+    fn poll_acp_terminals(&mut self) -> bool {
+        let mut redraw = false;
+        let foreground = self.acp_active_session;
+        for idx in 0..self.acp_sessions.len() {
+            let terminal_ids: Vec<String> = self.acp_sessions[idx]
+                .acp_terminals
+                .iter()
+                .filter(|(_, record)| record.session.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            if terminal_ids.is_empty() {
+                continue;
+            }
+            self.acp_active_session = idx;
+            for terminal_id in terminal_ids {
+                let before_len = self.acp_sessions[idx]
+                    .acp_terminals
+                    .get(&terminal_id)
+                    .map(|r| r.last_output.len());
+                self.acp_terminal_refresh(&terminal_id);
+                let resolved = {
+                    let Some(record) = self.acp_sessions[idx].acp_terminals.get_mut(&terminal_id)
+                    else {
+                        continue;
+                    };
+                    let changed = before_len != Some(record.last_output.len());
+                    let ready = match (record.wait_for_exit_pending, record.exit_status.clone()) {
+                        (Some(request_id), Some(status)) => {
+                            record.wait_for_exit_pending = None;
+                            Some((request_id, status))
+                        }
+                        _ => None,
+                    };
+                    (changed, ready)
+                };
+                if resolved.0 {
+                    redraw = true;
+                }
+                if let Some((request_id, status)) = resolved.1 {
+                    if let Some(client) = self.acp_sessions[idx].client.as_ref() {
+                        client.respond_to_client_request(
+                            request_id,
+                            Ok(crate::core::acp::terminal_exit_status_result(&status)),
+                        );
+                    }
+                    redraw = true;
+                }
+            }
+        }
+        self.acp_active_session = foreground.min(self.acp_sessions.len().saturating_sub(1));
+        redraw
+    }
+
     /// Append one `session/update` chunk to the AI panel transcript
     /// (`self.acp_mut().ai_messages`), appending to the in-progress streamed turn
     /// when `kind` matches it and starting a new turn otherwise — the
@@ -2844,7 +3075,7 @@ mod tests {
         let cwd = std::env::temp_dir();
         let mut client = crate::core::acp::AcpClient::spawn_with_env(&argv, &cwd, extra_env)
             .expect("fixture agent should spawn");
-        client.initialize();
+        client.initialize(true);
 
         let mut engine = Engine::new_for_test();
         engine.acp_mut().client = Some(client);
