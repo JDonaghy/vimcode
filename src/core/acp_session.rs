@@ -58,16 +58,20 @@ pub type MarkdownTurnCacheEntry = (usize, quadraui::StyledText, Vec<f32>);
 /// [`AcpSession::transcript_turn_kinds`] and read back by
 /// `Engine::dispatch_ai_chat_event`'s `TurnClicked` arm so a click/`Enter`
 /// on a turn knows what to toggle (a tool-call card, a thought card) versus
-/// what to leave alone (an ordinary message turn, the trailing plan
-/// checklist).
+/// what to leave alone (an ordinary message turn).
+///
+/// #1513: the plan checklist used to get a third variant here (`Plan`,
+/// rendered as a synthetic trailing transcript turn) — it no longer does.
+/// `AcpSession::plan` now paints as its own pinned, collapsible block above
+/// the transcript (`render::ai_plan_multi_section_view`/`paint_ai_plan_
+/// band`) instead of a turn that streaming text could push around and
+/// scroll away, per the issue's own complaint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptTurnKind {
     /// An ordinary `ai_messages[idx]` turn (user/assistant/thought-notice).
     Message(usize),
     /// A tool-call card, keyed by [`AcpToolCall::id`].
     ToolCall(String),
-    /// The trailing plan-checklist turn (`AcpSession::plan`).
-    Plan,
 }
 
 /// One ACP conversation: its own agent process (or none yet), its own

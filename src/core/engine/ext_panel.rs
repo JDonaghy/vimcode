@@ -3450,6 +3450,9 @@ impl Engine {
         // #1464: manually attached files/images are composed content too,
         // same reasoning as `acp_pending_attachment` immediately above.
         self.acp_manual_attachments.clear();
+        // #1513: staged `@symbol` mentions are composed content too, same
+        // reasoning.
+        self.acp_pending_symbol_mentions.clear();
         // #955 (ACP-4): tool calls and any open change-review surface are
         // session-scoped too — closing the conversation without deciding
         // still discards the surface itself (same "closing the session
@@ -3617,13 +3620,24 @@ impl Engine {
                     break;
                 }
                 let Ok(entry) = entry else { continue };
-                if !entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+                // #1513: `@dir` mentions — a directory entry is a candidate
+                // too, not just files, marked with a trailing `/` so it's
+                // unambiguous at accept/send time (`acp_mention_content_
+                // blocks` branches on exactly that suffix). Depth 0 is the
+                // walk root itself (`self.cwd`) — never offered as `@.` /
+                // `@` (empty relative path).
+                let is_dir = entry.file_type().map(|f| f.is_dir()).unwrap_or(false);
+                let is_file = entry.file_type().map(|f| f.is_file()).unwrap_or(false);
+                if !(is_file || (is_dir && entry.depth() > 0)) {
                     continue;
                 }
                 let Ok(rel) = entry.path().strip_prefix(&self.cwd) else {
                     continue;
                 };
-                let display = rel.to_string_lossy().into_owned();
+                let mut display = rel.to_string_lossy().into_owned();
+                if is_dir {
+                    display.push('/');
+                }
                 if display.to_lowercase().contains(&query_lower) && seen.insert(display.clone()) {
                     file_matches.push(display);
                 }
@@ -3631,11 +3645,47 @@ impl Engine {
             file_matches.sort();
         }
 
+        // #1513: `@symbol` candidates — from `self.ai_mention_symbol_cache`
+        // (last `workspace/symbol` response `Engine::ai_mention_tick`
+        // fetched for this query; see that method's doc for why the
+        // request itself can't happen from this `&self` method). Formatted
+        // `@path#Name` — unambiguous at both accept time (`ai_mention_
+        // accept_selected` branches on the `#`) and send time
+        // (`Engine::acp_mention_content_blocks` skips any mention
+        // containing `#`, since the range only exists in `ai_mention_
+        // symbol_cache`, not in anything re-derivable from the text
+        // alone). Appended after files/dirs, same ordering rationale
+        // (buffers, then files, then the broader/fuzzier symbol search).
+        let mut symbol_matches: Vec<String> = Vec::new();
+        let workspace_cwd = self.acp_workspace_cwd();
+        for sym in &self.ai_mention_symbol_cache {
+            if symbol_matches.len() + file_matches.len() + buffer_matches.len() >= MAX_CANDIDATES {
+                break;
+            }
+            if !sym.name.to_lowercase().contains(&query_lower) {
+                continue;
+            }
+            let Some(path) = sym.path.as_ref() else {
+                continue;
+            };
+            let display = crate::core::acp::workspace_relative_display(path, &workspace_cwd);
+            let candidate = format!("{display}#{}", sym.name);
+            if seen.insert(candidate.clone()) {
+                symbol_matches.push(candidate);
+            }
+        }
+
         let candidates: Vec<String> = buffer_matches
             .into_iter()
             .chain(file_matches)
             .take(MAX_CANDIDATES)
             .map(|display| format!("@{display}"))
+            .chain(
+                symbol_matches
+                    .into_iter()
+                    .map(|display| format!("@{display}")),
+            )
+            .take(MAX_CANDIDATES)
             .collect();
         if candidates.is_empty() {
             return None;
@@ -3678,6 +3728,38 @@ impl Engine {
             return false;
         };
         self.acp_mut().mention_completion_idx = 0;
+        // #1513: a `@symbol` candidate (`@path#Name`, see `ai_mention_
+        // completions`' doc for the format) stages an `AcpSymbolMention`
+        // right now, while `ai_mention_symbol_cache` still has the entry
+        // it was built from — `acp_mention_content_blocks` (send time)
+        // deliberately can't re-derive a line number from the literal text
+        // alone, so this is the one moment the range is actually known.
+        if let Some(rest) = chosen.strip_prefix('@') {
+            if let Some((path_display, name)) = rest.split_once('#') {
+                if let Some(sym) = self
+                    .ai_mention_symbol_cache
+                    .iter()
+                    .find(|s| s.name == name)
+                    .cloned()
+                {
+                    // `sym.path` is always `Some` for a `workspace/symbol`
+                    // response (`parse_symbol_information` requires
+                    // `location.uri`) — the `self.cwd`-joined fallback below
+                    // only matters if that ever changes.
+                    let path = sym
+                        .path
+                        .clone()
+                        .unwrap_or_else(|| self.cwd.join(path_display));
+                    self.acp_pending_symbol_mentions
+                        .push(crate::core::acp::AcpSymbolMention {
+                            path,
+                            name: sym.name.clone(),
+                            line: sym.line,
+                            detail: sym.detail.clone(),
+                        });
+                }
+            }
+        }
         let mut new_input = input[..start].to_string();
         new_input.push_str(&chosen);
         new_input.push(' ');
@@ -3685,6 +3767,55 @@ impl Engine {
         chat.clear_input();
         chat.input_insert_str(&new_input);
         true
+    }
+
+    /// Keep `ai_mention_symbol_cache` fresh for `@symbol` completion
+    /// (#1513) — called once per frame from `poll_idle`, mirroring `tick_
+    /// ai_completion`'s "debounce counter checked every tick" shape but
+    /// simpler: no counter, just "did the trailing `@`-mention query
+    /// change since the last fetch". `ai_mention_completions` is `&self`
+    /// (read-only, called from the paint path) and can't itself fire an
+    /// LSP request, which is why this exists as a separate `&mut self`
+    /// step instead of living inside that method.
+    ///
+    /// A no-op whenever: the AI panel doesn't have keyboard focus; the
+    /// trailing word isn't a `@`-mention in progress; the query is shorter
+    /// than 2 chars (same floor the Command Center's `#`-prefixed
+    /// workspace-symbol picker mode uses — a 1-char workspace-wide symbol
+    /// query is rarely useful and every keystroke would refire); the query
+    /// contains `/` (almost certainly a file/dir mention, not a symbol
+    /// name — skips a pointless LSP round trip on every path the user
+    /// types); or the query hasn't changed since the last fetch already
+    /// covering it.
+    pub fn ai_mention_tick(&mut self) {
+        if !self.ai_has_focus {
+            return;
+        }
+        let input = self.ai_chat.borrow().input_text().to_string();
+        let Some((_, query)) = crate::core::acp::trailing_at_mention_query(&input) else {
+            self.ai_mention_symbol_query.clear();
+            return;
+        };
+        if query.len() < 2 || query.contains('/') {
+            return;
+        }
+        if query == self.ai_mention_symbol_query || self.lsp_pending_ai_mention_symbols.is_some() {
+            return;
+        }
+        if !self.settings.lsp_enabled {
+            return;
+        }
+        self.ensure_lsp_manager();
+        let Some(path) = self.active_buffer_path() else {
+            return;
+        };
+        let query = query.to_string();
+        if let Some(mgr) = &mut self.lsp_manager {
+            if let Some(id) = mgr.request_workspace_symbols(&path, &query) {
+                self.lsp_pending_ai_mention_symbols = Some(id);
+                self.ai_mention_symbol_query = query;
+            }
+        }
     }
 
     /// Intercept a plain, unmodified character key that might be starting,
@@ -3924,8 +4055,7 @@ impl Engine {
     ///   the way it would for unwrapped text, so "first location" is the
     ///   honest, unsurprising behaviour rather than a heuristic that's right
     ///   most of the time and silently wrong the rest.
-    /// - An ordinary message turn or the trailing plan checklist has no
-    ///   collapse state at all — ignored.
+    /// - An ordinary message turn has no collapse state at all — ignored.
     pub fn ai_chat_turn_clicked(&mut self, turn_idx: usize, row_in_turn: usize) {
         use crate::core::acp_session::TranscriptTurnKind;
         let Some(kind) = self
@@ -3956,7 +4086,6 @@ impl Engine {
                     self.ai_open_tool_call_location(&loc.0, loc.1);
                 }
             }
-            TranscriptTurnKind::Plan => {}
         }
     }
 
@@ -3992,7 +4121,6 @@ impl Engine {
                     self.acp_mut().tool_call_expanded.insert(id);
                 }
             }
-            TranscriptTurnKind::Plan => {}
         }
     }
 
@@ -4634,5 +4762,141 @@ mod ai_leader_toggle_key_tests {
             "an abandoned partial match must be discarded, not replayed, \
              into an input the user is walking away from"
         );
+    }
+}
+
+#[cfg(test)]
+mod issue_1513_at_symbol_and_at_dir_mentions {
+    use crate::core::Engine;
+
+    /// #1513: a workspace-symbol candidate from `ai_mention_symbol_cache`
+    /// must show up in `ai_mention_completions` formatted `@path#Name`
+    /// (the unambiguous-at-send-time convention `acp_mention_content_
+    /// blocks`/`ai_mention_accept_selected` both rely on), filtered by the
+    /// query, and appear after any file/dir matches.
+    #[test]
+    fn symbol_candidates_are_offered_formatted_path_hash_name() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(engine.cwd.clone());
+        engine.ai_mention_symbol_cache = vec![
+            crate::core::lsp::SymbolInfo {
+                name: "MyStruct".to_string(),
+                kind: crate::core::lsp::SymbolKind::Struct,
+                detail: Some("struct MyStruct".to_string()),
+                container: None,
+                path: Some(engine.cwd.join("src/lib.rs")),
+                line: 41,
+                character: 0,
+                children: Vec::new(),
+            },
+            crate::core::lsp::SymbolInfo {
+                name: "unrelated_fn".to_string(),
+                kind: crate::core::lsp::SymbolKind::Function,
+                detail: None,
+                container: None,
+                path: Some(engine.cwd.join("src/lib.rs")),
+                line: 5,
+                character: 0,
+                children: Vec::new(),
+            },
+        ];
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @MyStr");
+
+        let menu = engine
+            .ai_mention_completions()
+            .expect("a matching symbol query should show mention completions");
+        assert!(
+            menu.candidates.iter().any(|c| c == "@src/lib.rs#MyStruct"),
+            "expected a @path#Name symbol candidate: {:?}",
+            menu.candidates
+        );
+        assert!(
+            !menu.candidates.iter().any(|c| c.contains("unrelated_fn")),
+            "a non-matching symbol must be filtered out: {:?}",
+            menu.candidates
+        );
+    }
+
+    /// #1513: accepting a `@path#Name` symbol candidate stages an
+    /// `AcpSymbolMention` (`Engine::acp_pending_symbol_mentions`) carrying
+    /// the exact line the cached `SymbolInfo` reported, and splices the
+    /// literal `@path#Name ` text into the input — the same "chosen text
+    /// verbatim, plus a trailing space" contract `ai_mention_accept_
+    /// selected` already has for files.
+    ///
+    /// RED verified: with the `chosen.strip_prefix('@')`/`split_once('#')`
+    /// staging block removed from `ai_mention_accept_selected`, `acp_
+    /// pending_symbol_mentions` stays empty and the second assertion below
+    /// fails.
+    #[test]
+    fn accepting_a_symbol_candidate_stages_a_symbol_mention_and_splices_the_text() {
+        let mut engine = Engine::new_for_test();
+        engine.cwd = std::env::temp_dir();
+        engine.workspace_root = Some(engine.cwd.clone());
+        engine.ai_mention_symbol_cache = vec![crate::core::lsp::SymbolInfo {
+            name: "MyStruct".to_string(),
+            kind: crate::core::lsp::SymbolKind::Struct,
+            detail: Some("struct MyStruct".to_string()),
+            container: None,
+            path: Some(engine.cwd.join("src/lib.rs")),
+            line: 41,
+            character: 0,
+            children: Vec::new(),
+        }];
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @MyStr");
+
+        assert!(engine.ai_mention_accept_selected());
+
+        assert_eq!(
+            engine.ai_chat.borrow().input_text(),
+            "look at @src/lib.rs#MyStruct ",
+            "the literal @path#Name text must be spliced in verbatim"
+        );
+        assert_eq!(
+            engine.acp_pending_symbol_mentions.len(),
+            1,
+            "accepting a symbol candidate must stage an AcpSymbolMention"
+        );
+        assert_eq!(engine.acp_pending_symbol_mentions[0].name, "MyStruct");
+        assert_eq!(engine.acp_pending_symbol_mentions[0].line, 41);
+    }
+
+    /// #1513: a directory entry is offered as an `@`-mention candidate too,
+    /// marked with a trailing `/` — `ai_mention_completions`' unambiguous
+    /// marker for "this resolves to a directory, not a file" that `acp_
+    /// mention_content_blocks` branches on at send time.
+    #[test]
+    fn directory_candidates_are_offered_with_a_trailing_slash() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1513_dir_candidate_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(workspace.join("subdir")).expect("create test dir");
+        std::fs::write(workspace.join("subdir/a.rs"), "").expect("write file");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+
+        engine
+            .ai_chat
+            .borrow_mut()
+            .input_insert_str("look at @subd");
+        let menu = engine
+            .ai_mention_completions()
+            .expect("typing @ with a matching dir prefix should show mention completions");
+        assert!(
+            menu.candidates.contains(&"@subdir/".to_string()),
+            "expected a trailing-slash directory candidate: {:?}",
+            menu.candidates
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

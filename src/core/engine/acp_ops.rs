@@ -1294,28 +1294,138 @@ impl Engine {
         Some((block, format!("\u{29c9} {display}")))
     }
 
+    /// Cap on how many files a single `@dir/` mention (#1513) expands into
+    /// individual `resource_link` blocks — the same order of magnitude
+    /// `ai_mention_completions`' `MAX_CANDIDATES` already uses for the
+    /// completion popup, so "how much can one mention pull in" stays
+    /// consistent whether it's the popup listing candidates or a directory
+    /// mention expanding at send time.
+    const ACP_MAX_DIR_MENTION_FILES: usize = 25;
+
     /// Resolve one `@`-mention query (the raw text after `@`, as typed —
     /// relative paths are joined onto the first workspace root, same
-    /// convention `fs/read_text_file` uses) into a `resource_link` content
-    /// block, or `None` if it doesn't resolve to a real path inside the
-    /// workspace. A mention of a file that doesn't exist, or that resolves
-    /// outside the workspace, is silently dropped from the wire content —
+    /// convention `fs/read_text_file` uses) into its `session/prompt`
+    /// content block(s) (#1513 extends this from "one file" to three
+    /// shapes):
+    ///
+    /// * A mention accepted from the `@symbol` completion popup (`ai_
+    ///   mention_accept_selected` stages it into `self.acp_pending_symbol_
+    ///   mentions` instead of relying on this function) carries a literal
+    ///   `path#Name` in the typed text — this function skips it (`None`,
+    ///   `Vec::new()` at the call site below) rather than trying to resolve
+    ///   `"path#Name"` as a filesystem path, which would just fail anyway.
+    /// * A `@dir/` mention (trailing slash — `ai_mention_completions`'
+    ///   directory-candidate marker) expands into one `resource_link` per
+    ///   contained file (workspace-ignore-aware, same walk the completion
+    ///   popup uses), capped at [`Self::ACP_MAX_DIR_MENTION_FILES`]. A
+    ///   directory with more files than the cap gets a single synthetic
+    ///   `text` block listing (a capped prefix of) its relative file paths
+    ///   instead of individually attaching every one of them.
+    /// * Anything else resolves as a single `resource_link`, same as
+    ///   before #1513.
+    ///
+    /// A mention that doesn't resolve to a real path inside the workspace
+    /// — file or directory — is silently dropped from the wire content;
     /// the literal `@path` text the user typed stays in the message either
     /// way (see [`Self::acp_prompt_content_blocks`]).
-    fn acp_mention_resource_link(&self, mention: &str) -> Option<serde_json::Value> {
+    fn acp_mention_content_blocks(&self, mention: &str) -> Vec<serde_json::Value> {
+        if mention.contains('#') {
+            return Vec::new();
+        }
         let roots = self.acp_workspace_roots();
         let root = roots.first().cloned().unwrap_or_else(|| self.cwd.clone());
+        if let Some(dir_mention) = mention.strip_suffix('/') {
+            let candidate = root.join(dir_mention);
+            let Ok(resolved) = crate::core::acp::resolve_path_within_roots(&candidate, &roots)
+            else {
+                return Vec::new();
+            };
+            if !resolved.is_dir() {
+                return Vec::new();
+            }
+            return self.acp_dir_mention_content_blocks(&resolved);
+        }
         let candidate = root.join(mention);
-        let resolved = crate::core::acp::resolve_path_within_roots(&candidate, &roots).ok()?;
+        let Ok(resolved) = crate::core::acp::resolve_path_within_roots(&candidate, &roots) else {
+            return Vec::new();
+        };
+        if !resolved.is_file() {
+            return Vec::new();
+        }
         let name = resolved
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| mention.to_string());
-        Some(serde_json::json!({
+        vec![serde_json::json!({
             "type": "resource_link",
             "uri": crate::core::lsp::path_to_uri(&resolved),
             "name": name,
-        }))
+        })]
+    }
+
+    /// The `@dir/` half of [`Self::acp_mention_content_blocks`]: walk
+    /// `dir` (ignore-aware, same convention `ai_mention_completions`'s
+    /// walker uses) and either return one `resource_link` per contained
+    /// file, or — once the walk exceeds [`Self::ACP_MAX_DIR_MENTION_
+    /// FILES`] — a single `text` block listing the relative paths found so
+    /// far instead (never both; a huge directory shouldn't silently
+    /// attach 25 arbitrary files *and* a listing of the rest).
+    fn acp_dir_mention_content_blocks(&self, dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let show_hidden = self.settings.show_hidden_files;
+        let exclude = self.settings.explorer_exclude.clone();
+        let walker = ignore::WalkBuilder::new(dir)
+            .hidden(!show_hidden)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .filter_entry(move |entry| {
+                !super::explorer_ops::walk_entry_is_excluded(entry, &exclude)
+            })
+            .build();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut overflowed = false;
+        for entry in walker {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if files.len() >= Self::ACP_MAX_DIR_MENTION_FILES {
+                overflowed = true;
+                break;
+            }
+            files.push(entry.path().to_path_buf());
+        }
+        if overflowed {
+            let workspace_cwd = self.acp_workspace_cwd();
+            let listing: Vec<String> = files
+                .iter()
+                .map(|p| crate::core::acp::workspace_relative_display(p, &workspace_cwd))
+                .collect();
+            let dir_display = crate::core::acp::workspace_relative_display(dir, &workspace_cwd);
+            return vec![serde_json::json!({
+                "type": "text",
+                "text": format!(
+                    "{dir_display}/ contains more than {} files — showing the first {}:\n{}",
+                    Self::ACP_MAX_DIR_MENTION_FILES,
+                    listing.len(),
+                    listing.join("\n"),
+                ),
+            })];
+        }
+        files
+            .iter()
+            .map(|resolved| {
+                let name = resolved
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| resolved.display().to_string());
+                serde_json::json!({
+                    "type": "resource_link",
+                    "uri": crate::core::lsp::path_to_uri(resolved),
+                    "name": name,
+                })
+            })
+            .collect()
     }
 
     /// Build the ACP `session/prompt` content-block array for `text`
@@ -1345,9 +1455,17 @@ impl Engine {
             blocks.push(block);
         }
         for mention in crate::core::acp::parse_at_mentions(text) {
-            if let Some(block) = self.acp_mention_resource_link(&mention) {
-                blocks.push(block);
-            }
+            blocks.extend(self.acp_mention_content_blocks(&mention));
+        }
+        // #1513: every `@symbol` mention accepted from the completion
+        // popup since the last send — staged by `ai_mention_accept_
+        // selected` rather than re-resolved from the literal `path#Name`
+        // text (there's nothing in that text to re-derive a line range
+        // from; see `AcpSymbolMention`'s own doc). `drain(..)` for the same
+        // one-shot-per-send reason `acp_manual_attachments` below uses.
+        let symbol_mention_caps = self.acp_mut().prompt_capabilities;
+        for symbol in self.acp_pending_symbol_mentions.drain(..) {
+            blocks.push(symbol.content_block(symbol_mention_caps));
         }
         if let Some(attachment) = self.acp_pending_attachment.take() {
             blocks.extend(attachment.content_blocks(self.acp_mut().prompt_capabilities));
@@ -2993,6 +3111,109 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    // ── #1513: `@dir/` mentions ───────────────────────────────────────────
+
+    /// A `@dir/` mention under the file cap expands into one
+    /// `resource_link` per contained file — no ACP agent needed, this is
+    /// pure `Engine::acp_prompt_content_blocks` state, same tier as
+    /// `ai_mention_completions_lists_open_buffer_before_workspace_only_
+    /// file` above.
+    #[test]
+    fn at_dir_mention_expands_into_one_resource_link_per_contained_file() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1513_dir_small_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(workspace.join("sub")).expect("create test dir");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+        std::fs::write(workspace.join("sub/a.rs"), "").expect("write a.rs");
+        std::fs::write(workspace.join("sub/b.rs"), "").expect("write b.rs");
+
+        let blocks = engine.acp_prompt_content_blocks("please review @sub/");
+        let links: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter(|b| b["type"] == "resource_link")
+            .collect();
+        assert_eq!(
+            links.len(),
+            2,
+            "expected one resource_link per file under the dir: {blocks:?}"
+        );
+        let expected_uri = crate::core::lsp::path_to_uri(
+            &workspace
+                .join("sub/a.rs")
+                .canonicalize()
+                .expect("file exists"),
+        );
+        assert!(
+            links.iter().any(|b| b["uri"] == expected_uri),
+            "expected a resource_link for sub/a.rs: {blocks:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// A `@dir/` mention with more files than
+    /// `Engine::ACP_MAX_DIR_MENTION_FILES` gets a single synthetic `text`
+    /// listing block instead of individually attaching every file.
+    #[test]
+    fn at_dir_mention_over_the_cap_becomes_a_single_listing_block() {
+        let mut engine = Engine::new_for_test();
+        let workspace = std::env::temp_dir().join(format!(
+            "vimcode_test_1513_dir_large_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(workspace.join("many")).expect("create test dir");
+        engine.cwd = workspace.clone();
+        engine.workspace_root = Some(workspace.clone());
+        for i in 0..30 {
+            std::fs::write(workspace.join(format!("many/f{i}.rs")), "").expect("write file");
+        }
+
+        let blocks = engine.acp_prompt_content_blocks("please review @many/");
+        let links: Vec<&serde_json::Value> = blocks
+            .iter()
+            .filter(|b| b["type"] == "resource_link")
+            .collect();
+        assert!(
+            links.is_empty(),
+            "a directory over the cap must not attach any individual files: {blocks:?}"
+        );
+        let listing = blocks
+            .iter()
+            .find(|b| b["type"] == "text" && b["text"] != "please review @many/")
+            .unwrap_or_else(|| panic!("expected a listing text block: {blocks:?}"));
+        assert!(
+            listing["text"]
+                .as_str()
+                .unwrap()
+                .contains("more than 25 files"),
+            "listing block: {listing:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// A `@path#Name` symbol-mention token (the literal text `ai_mention_
+    /// accept_selected` splices in for a `@symbol` completion) must never
+    /// be resolved as a filesystem path — its content block comes from
+    /// `Engine::acp_pending_symbol_mentions` instead (tested separately in
+    /// `ext_panel.rs`'s `issue_1513_at_symbol_and_at_dir_mentions` module).
+    #[test]
+    fn at_symbol_mention_token_is_never_resolved_as_a_file_path() {
+        let mut engine = Engine::new_for_test();
+        let blocks = engine.acp_prompt_content_blocks("see @src/lib.rs#MyStruct please");
+        assert!(
+            !blocks
+                .iter()
+                .any(|b| b["type"] == "resource_link" || b["type"] == "resource"),
+            "a bare @path#Name token with nothing staged must add no \
+             resource block: {blocks:?}"
+        );
     }
 
     // ── #1450: Visual selection / `:{range}AI` range attachment ──────────

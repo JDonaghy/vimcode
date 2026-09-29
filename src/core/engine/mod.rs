@@ -3742,6 +3742,34 @@ pub struct Engine {
     /// content, not agent state — but `Engine::ai_clear` drops it anyway,
     /// same reasoning as `acp_pending_attachment`.
     pub acp_manual_attachments: Vec<crate::core::acp::AcpManualAttachment>,
+    /// `@symbol` mentions accepted from the AI panel's `@`-completion popup
+    /// since the last send (#1513) — a `Vec`, same "more than one can ride
+    /// on the same prompt" reasoning as `acp_manual_attachments` above.
+    /// Staged by `Engine::ai_mention_accept_selected`, drained by
+    /// `Engine::acp_prompt_content_blocks` into `AcpSymbolMention::
+    /// content_block` calls. Not session-scoped — composed content, not
+    /// agent state — but `Engine::ai_clear` drops it anyway, same
+    /// reasoning as the other pending-attachment fields.
+    pub acp_pending_symbol_mentions: Vec<crate::core::acp::AcpSymbolMention>,
+    /// In-flight `workspace/symbol` request id for `@symbol` mention
+    /// completion (#1513) — distinct from `lsp_pending_workspace_symbols`
+    /// (the Command Center's own `#query` picker) so the AI panel's
+    /// mention popup and an open picker can never clobber each other's
+    /// in-flight request.
+    pub lsp_pending_ai_mention_symbols: Option<i64>,
+    /// The query [`Self::lsp_pending_ai_mention_symbols`]/`ai_mention_
+    /// symbol_cache` currently corresponds to — `Engine::ai_mention_tick`
+    /// only fires a fresh request when the trailing `@`-mention query
+    /// actually changed, so a keystroke that doesn't touch it (a cursor
+    /// move, an unrelated redraw) doesn't refire on every frame.
+    pub ai_mention_symbol_query: String,
+    /// Last `workspace/symbol` results for `@symbol` mention completion
+    /// (#1513) — `Engine::ai_mention_completions` filters this by the
+    /// current query to build symbol candidates; `Engine::ai_mention_
+    /// accept_selected` looks a chosen candidate back up here to stage its
+    /// `AcpSymbolMention` (the response is the only place a symbol's line
+    /// number lives — see that type's own doc).
+    pub ai_mention_symbol_cache: Vec<crate::core::lsp::SymbolInfo>,
     /// One-shot "the sidebar band should take the keyboard" request (#1450),
     /// raised by a programmatic panel reveal that happens *inside*
     /// `Engine::handle_key` (currently only the AI panel's
@@ -4407,6 +4435,28 @@ pub struct Engine {
     /// Cached rect from last render frame — used by `route_ai_chat_event` so
     /// keyboard/mouse dispatch computes the same layout `render()` painted.
     pub ai_chat_rect: std::cell::Cell<quadraui::Rect>,
+    /// Whether the pinned plan block (#1513) is expanded to its full
+    /// checklist, or collapsed to just the current in-progress entry (the
+    /// default). Toggled by clicking the block's header — see
+    /// `render::route_ai_plan_band_click`. Deliberately outside
+    /// `AcpSession`: it's a *view* preference, not agent state, so it
+    /// survives `Engine::ai_clear`/a session switch instead of resetting —
+    /// consistent with `ai_chat_rect` immediately above it, which is also
+    /// paint-derived UI state rather than conversation state.
+    pub ai_plan_expanded: bool,
+    /// Cached rect the plan block was last painted into — `render::
+    /// route_ai_plan_band_click`'s hit-test needs the *exact* rect
+    /// `paint_ai_plan_band` used, same "re-derive, don't recompute" contract
+    /// `ai_chat_rect` already has. Zero-height when no plan is pinned (the
+    /// band takes no space and nothing routes to it).
+    pub ai_plan_rect: std::cell::Cell<quadraui::Rect>,
+    /// The `quadraui::MultiSectionViewLayout` `paint_ai_plan_band` last
+    /// computed — read back by `route_ai_plan_band_click`'s hit-test so a
+    /// click resolves against the identical chrome geometry that frame
+    /// actually painted, rather than a second, potentially-drifted
+    /// recomputation (the #544/#582/#646 lesson every other cached-layout
+    /// field in this struct already encodes).
+    pub ai_plan_layout: std::cell::RefCell<Option<quadraui::MultiSectionViewLayout>>,
 
     // --- AI inline completions (ghost text) ---
     /// Ghost text currently shown at the cursor (first/current alternative).
@@ -5043,6 +5093,10 @@ impl Engine {
             acp_startup_reopen_attempted: false,
             acp_pending_attachment: None,
             acp_manual_attachments: Vec::new(),
+            acp_pending_symbol_mentions: Vec::new(),
+            lsp_pending_ai_mention_symbols: None,
+            ai_mention_symbol_query: String::new(),
+            ai_mention_symbol_cache: Vec::new(),
             sidebar_focus_requested: false,
             change_review: None,
             change_review_diff_rect: std::cell::Cell::new(quadraui::Rect::default()),
@@ -5210,6 +5264,9 @@ impl Engine {
                 "vimcode:ai",
             ))),
             ai_chat_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            ai_plan_expanded: false,
+            ai_plan_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
+            ai_plan_layout: std::cell::RefCell::new(None),
             md_preview_links: HashMap::new(),
             swap_write_needed: HashSet::new(),
             swap_last_write: std::time::Instant::now(),
@@ -5442,6 +5499,7 @@ impl Engine {
         redraw |= self.poll_editor_hover();
         redraw |= self.poll_blame();
         redraw |= self.tick_ai_completion();
+        self.ai_mention_tick();
         redraw |= self.tick_syntax_debounce();
         redraw |= self.tick_keymap_timeout();
         self.tick_swap_files();
