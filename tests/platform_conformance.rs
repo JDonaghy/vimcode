@@ -554,7 +554,10 @@ fn exit_contract_capable_but_skipped_lane_is_exit_3_coverage_gap() {
     );
 
     let line = summary_line(&stdout);
-    assert_eq!(line.get("verdict").map(String::as_str), Some("coverage-gap"));
+    assert_eq!(
+        line.get("verdict").map(String::as_str),
+        Some("coverage-gap")
+    );
     assert_eq!(line.get("exit").map(String::as_str), Some("3"));
 
     let summary = summary.expect("a --summary file must be written on a coverage-gap run");
@@ -647,6 +650,45 @@ fn summary_records_lanes_this_host_never_probed_as_not_in_scope() {
         summary_line(&stdout)["lanes"].contains("gtk:not-in-scope"),
         "the one-line summary must carry the uncovered lanes too"
     );
+}
+
+/// `--print-plan` is never a gate result: nothing ran, so nothing is proven
+/// either way. It must say so with its own verdict rather than borrowing
+/// `pass` — a release step that accidentally passed `--print-plan` and read
+/// exit 0 as "the lanes are green" would be the same vacuous-green class of
+/// bug this whole script exists to prevent. The capable-but-skipped lane
+/// here also proves plan mode does NOT raise the coverage-gap code: you
+/// cannot have a coverage gap in a run that was never going to cover
+/// anything.
+#[test]
+fn print_plan_reports_verdict_plan_not_pass() {
+    let (stdout, stderr, code, summary) = run_with_summary(
+        "print_plan_verdict",
+        &["--print-plan"],
+        &[
+            (
+                "PLATCONF_OVERRIDE_GTK",
+                "capable=1;auto=0;reason=stubbed: opt-in on Darwin",
+            ),
+            (
+                "PLATCONF_OVERRIDE_MACOS",
+                "capable=0;auto=0;reason=stubbed: not darwin",
+            ),
+            (
+                "PLATCONF_OVERRIDE_WIN",
+                "capable=0;auto=0;reason=stubbed: no cargo-xwin",
+            ),
+        ],
+    );
+    assert_eq!(code, EXIT_PASS, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let line = summary_line(&stdout);
+    assert_eq!(line.get("verdict").map(String::as_str), Some("plan"));
+    assert_eq!(line.get("mode").map(String::as_str), Some("plan"));
+
+    let summary = summary.expect("summary file");
+    assert_eq!(summary["verdict"], "plan");
+    assert_eq!(summary["mode"], "plan");
+    assert_eq!(lane_status(&summary, "tui"), "plan:run");
 }
 
 /// `--summary -` emits the same document on stdout after a marker line, for
