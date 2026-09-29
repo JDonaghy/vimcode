@@ -1190,6 +1190,51 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // :AiConfig               — list the agent's declared config options
+        //                           and each one's current value
+        // :AiConfig <id>          — show one option's declared values and
+        //                           which is current
+        // :AiConfig <id> <value>  — switch it (matched by id or name) via
+        //                           `session/set_config_option` (#1520 —
+        //                           ACP v1's generic session-config knob,
+        //                           the mechanism `:AiModel` below is sugar
+        //                           over)
+        if cmd == "AiConfig" {
+            self.message = self.acp_config_status_line();
+            return EngineAction::None;
+        }
+        if let Some(rest) = cmd.strip_prefix("AiConfig ").map(|s| s.trim()) {
+            if !rest.is_empty() {
+                match rest.split_once(char::is_whitespace) {
+                    Some((id, value)) if !value.trim().is_empty() => {
+                        self.acp_set_config_option(id, value.trim());
+                    }
+                    _ => {
+                        self.message = self.acp_config_option_status_line(rest);
+                    }
+                }
+            }
+            return EngineAction::None;
+        }
+
+        // :AiModel          — show the agent's declared model choices and
+        //                     which is current (sugar for the config
+        //                     option whose `category` is "model" — ACP v1
+        //                     has no dedicated `session/set_model`, so this
+        //                     is the only model picker the spec offers)
+        // :AiModel <name>   — switch model, matched by id or name, via
+        //                     `session/set_config_option` (#1520)
+        if cmd == "AiModel" {
+            self.message = self.acp_model_status_line();
+            return EngineAction::None;
+        }
+        if let Some(target) = cmd.strip_prefix("AiModel ").map(|s| s.trim()) {
+            if !target.is_empty() {
+                self.acp_set_model(target);
+            }
+            return EngineAction::None;
+        }
+
         // :AiAgent          — list configured agents (settings.acp_agents)
         //                     and which is active (#958, ACP-7)
         // :AiAgent <name>   — switch the active agent; takes effect on the

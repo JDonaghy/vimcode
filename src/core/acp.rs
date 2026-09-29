@@ -118,6 +118,10 @@ pub enum AcpEvent {
     SessionLoaded {
         request_id: i64,
         modes: Option<serde_json::Value>,
+        /// (#1520) same optional `configOptions` field as
+        /// [`AcpEvent::SessionCreated`] — a resumed session re-declares its
+        /// config options exactly like a fresh one.
+        config_options: Option<serde_json::Value>,
     },
     /// Response to our `session/prompt` request — the turn has ended.
     PromptStopped {
@@ -679,6 +683,129 @@ pub fn parse_current_mode_update(update: &serde_json::Value) -> Option<String> {
         .get("currentModeId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// configOptions / config_option_update / session/set_config_option (#1520)
+// ---------------------------------------------------------------------------
+
+/// One value a config option can be set to (`session/new`'s
+/// `configOptions[].values[]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpConfigOptionValue {
+    pub id: String,
+    pub name: String,
+}
+
+/// One config option an agent exposes (`session/new`'s `configOptions`,
+/// #1520). Unlike [`AcpSessionMode`] — one agent-wide "current mode" shared
+/// across a fixed `availableModes` list — each option carries its **own**
+/// current value, since an agent may declare several independent knobs
+/// (model, reasoning effort, ...) at once. `category`, when present, is how
+/// `:AiModel` finds "the" model option among however many an agent
+/// declares (`category == "model"`) — ACP v1 has no dedicated
+/// `session/set_model`; a `category: "model"` config option is the only
+/// model picker the spec offers at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    pub category: Option<String>,
+    pub current_value_id: Option<String>,
+    pub values: Vec<AcpConfigOptionValue>,
+}
+
+impl AcpConfigOption {
+    /// The current value's display name, falling back to its raw id if it
+    /// doesn't match any declared `values` entry, falling back to `"?"` if
+    /// there is no current value at all — never silently drop something a
+    /// user could otherwise act on, same policy [`parse_session_modes`]'s
+    /// name fallback uses.
+    pub fn current_value_label(&self) -> &str {
+        let Some(id) = self.current_value_id.as_deref() else {
+            return "?";
+        };
+        self.values
+            .iter()
+            .find(|v| v.id == id)
+            .map(|v| v.name.as_str())
+            .unwrap_or(id)
+    }
+}
+
+/// Parse `session/new`/`session/load`'s `configOptions` result field
+/// (#1520): `[{"id", "name"?, "category"?, "currentValueId"?, "values":
+/// [{"id", "name"?}]}]`. Absent/malformed input yields an empty list — like
+/// `modes`, config options are an optional agent capability, not a
+/// required one. An entry missing `id` is dropped outright (nothing a
+/// `session/set_config_option` call could target); a missing `name` falls
+/// back to the `id`, matching every other name-fallback in this module.
+pub fn parse_config_options(value: &serde_json::Value) -> Vec<AcpConfigOption> {
+    let Some(options) = value.as_array() else {
+        return Vec::new();
+    };
+    options
+        .iter()
+        .filter_map(|o| {
+            let id = o.get("id")?.as_str()?.to_string();
+            let name = o
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let category = o
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let current_value_id = o
+                .get("currentValueId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let values = o
+                .get("values")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let vid = v.get("id")?.as_str()?.to_string();
+                            let vname = v
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or(&vid)
+                                .to_string();
+                            Some(AcpConfigOptionValue {
+                                id: vid,
+                                name: vname,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AcpConfigOption {
+                id,
+                name,
+                category,
+                current_value_id,
+                values,
+            })
+        })
+        .collect()
+}
+
+/// Parse a `session/update`'s `config_option_update` variant (#1520):
+/// `{"sessionUpdate": "config_option_update", "configOptionId": "...",
+/// "currentValueId": "..."}`. Returns `(config_option_id, current_value_id)`
+/// on a well-formed match. This is the **only** thing that should ever
+/// change a config option's displayed current value — a
+/// `session/set_config_option` request succeeding is not itself
+/// sufficient, mirroring [`parse_current_mode_update`]'s own contract.
+pub fn parse_config_option_update(update: &serde_json::Value) -> Option<(String, String)> {
+    if update.get("sessionUpdate").and_then(|v| v.as_str()) != Some("config_option_update") {
+        return None;
+    }
+    let id = update.get("configOptionId")?.as_str()?.to_string();
+    let value_id = update.get("currentValueId")?.as_str()?.to_string();
+    Some((id, value_id))
 }
 
 /// Token/cost telemetry from a `session/update`'s `usage_update` variant.
@@ -2247,6 +2374,28 @@ impl AcpClient {
         )
     }
 
+    /// Send `session/set_config_option` (#1520) — ACP v1's only model
+    /// picker; there is no dedicated `session/set_mode`-style method for a
+    /// model. Like [`Self::set_mode`], the displayed value does not change
+    /// from this call's response — only from the agent's own
+    /// `config_option_update` notification afterward; see
+    /// `Engine::acp_set_config_option`'s doc for why.
+    pub fn set_config_option(
+        &mut self,
+        session_id: &str,
+        config_option_id: &str,
+        value_id: &str,
+    ) -> i64 {
+        self.send_request(
+            "session/set_config_option",
+            serde_json::json!({
+                "sessionId": session_id,
+                "configOptionId": config_option_id,
+                "valueId": value_id,
+            }),
+        )
+    }
+
     /// Send `session/cancel` (a notification — no response expected).
     pub fn cancel(&self, session_id: &str) {
         self.send_notification(
@@ -2491,6 +2640,7 @@ fn reader_thread_main(
                     Some("session/load") => Some(AcpEvent::SessionLoaded {
                         request_id: id,
                         modes: result.get("modes").cloned(),
+                        config_options: result.get("configOptions").cloned(),
                     }),
                     Some("session/prompt") => Some(AcpEvent::PromptStopped {
                         request_id: id,
@@ -2964,6 +3114,88 @@ mod tests {
         assert_eq!(parse_current_mode_update(&update), Some("plan".to_string()));
         assert_eq!(
             parse_current_mode_update(&serde_json::json!({"sessionUpdate": "plan"})),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_config_options_reads_id_name_category_current_and_values() {
+        let options = serde_json::json!([
+            {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "currentValueId": "sonnet",
+                "values": [
+                    {"id": "sonnet", "name": "Claude Sonnet"},
+                    {"id": "opus", "name": "Claude Opus"},
+                ],
+            },
+            {"id": "effort", "currentValueId": "high", "values": [{"id": "high"}]},
+        ]);
+        let parsed = parse_config_options(&options);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "model");
+        assert_eq!(parsed[0].name, "Model");
+        assert_eq!(parsed[0].category, Some("model".to_string()));
+        assert_eq!(parsed[0].current_value_id, Some("sonnet".to_string()));
+        assert_eq!(parsed[0].values.len(), 2);
+        assert_eq!(parsed[0].current_value_label(), "Claude Sonnet");
+        // Missing `name`/`category` fall back sensibly: name defaults to
+        // id, category stays None (not a fabricated value).
+        assert_eq!(parsed[1].name, "effort");
+        assert_eq!(parsed[1].category, None);
+        assert_eq!(parsed[1].values[0].name, "high");
+    }
+
+    #[test]
+    fn parse_config_options_absent_yields_empty_not_an_error() {
+        assert!(parse_config_options(&serde_json::json!(null)).is_empty());
+        assert!(parse_config_options(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_config_options_drops_entries_missing_id() {
+        let options = serde_json::json!([{"name": "No id here"}]);
+        assert!(parse_config_options(&options).is_empty());
+    }
+
+    #[test]
+    fn config_option_current_value_label_falls_back_to_id_then_question_mark() {
+        let option = AcpConfigOption {
+            id: "model".to_string(),
+            name: "Model".to_string(),
+            category: Some("model".to_string()),
+            current_value_id: Some("unknown-value".to_string()),
+            values: vec![AcpConfigOptionValue {
+                id: "sonnet".to_string(),
+                name: "Claude Sonnet".to_string(),
+            }],
+        };
+        // Current value id doesn't match any declared value -> falls back
+        // to the raw id, not a panic or empty string.
+        assert_eq!(option.current_value_label(), "unknown-value");
+
+        let no_current = AcpConfigOption {
+            current_value_id: None,
+            ..option
+        };
+        assert_eq!(no_current.current_value_label(), "?");
+    }
+
+    #[test]
+    fn parse_config_option_update_reads_id_and_value() {
+        let update = serde_json::json!({
+            "sessionUpdate": "config_option_update",
+            "configOptionId": "model",
+            "currentValueId": "opus",
+        });
+        assert_eq!(
+            parse_config_option_update(&update),
+            Some(("model".to_string(), "opus".to_string()))
+        );
+        assert_eq!(
+            parse_config_option_update(&serde_json::json!({"sessionUpdate": "plan"})),
             None
         );
     }
