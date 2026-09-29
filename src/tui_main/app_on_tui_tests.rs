@@ -7763,6 +7763,229 @@ mod tests {
         }
     }
 
+    /// #1517: in-buffer review of agent hunks — a virtual `[a] keep  [r]
+    /// reject` action row painted right after each hunk in the *normal*
+    /// editor view (no full-viewport modal), `<leader>ak`/`<leader>ar`
+    /// acting on the hunk under the cursor, freely editable in between.
+    /// GTK twin: `gtk::testing::issue_1517_acp_inline_review`.
+    mod issue_1517_acp_inline_review {
+        use super::*;
+
+        /// Opens `path` in the active window under `badge` mode after a
+        /// single agent write — the shared setup every scenario below
+        /// starts from. Returns `(engine, buf_id)`.
+        fn engine_with_buffer_open(
+            dir: &std::path::Path,
+            path: &std::path::Path,
+        ) -> crate::core::Engine {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.settings.acp_review_on_turn_end =
+                crate::core::settings::AcpReviewOnTurnEnd::Badge;
+            engine.settings.line_numbers = crate::core::settings::LineNumberMode::Absolute;
+            engine.workspace_root = Some(dir.to_path_buf());
+            engine
+                .acp_write_text_file(path, "one\nTWO CHANGED\nthree\nfour\n")
+                .unwrap();
+            engine.acp_end_turn();
+            let buf_id = engine.buffer_manager.open_file(path).unwrap();
+            let win_id = engine.active_window_id();
+            engine.windows.get_mut(&win_id).unwrap().buffer_id = buf_id;
+            engine
+        }
+
+        /// The virtual action row paints right in the normal buffer view
+        /// — no modal, no full-viewport "Change 1/" surface — and the
+        /// status message left by `Engine::acp_end_turn` invites `:AiReview`
+        /// / `ga` as the alternative full-review path.
+        ///
+        /// RED verified: with the `render.rs` "#1517: in-buffer inline
+        /// review" action-row block removed, neither "keep hunk" nor
+        /// "reject hunk" appears anywhere on screen.
+        #[test]
+        fn virtual_action_row_paints_in_the_normal_buffer_view_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1517_tui_row_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+
+            let engine = engine_with_buffer_open(&dir, &a);
+            assert!(
+                engine.message.contains("1 agent hunk"),
+                "unexpected message: {}",
+                engine.message
+            );
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 30);
+            h.driver.render();
+            let screen = h.driver.screen();
+
+            assert!(
+                !screen.contains("Change 1/"),
+                "the in-buffer surface must never open the full-viewport \
+                 modal; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("keep hunk") && screen.contains("reject hunk"),
+                "the virtual action row must paint in the normal editor \
+                 view; screen:\n{screen}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `<leader>ar` on the hunk under the cursor reverts it on disk
+        /// and the action row disappears from the screen (nothing left to
+        /// decide) — driven through the real key-dispatch path
+        /// (`Engine::handle_leader_key`), not by calling the engine method
+        /// directly.
+        ///
+        /// RED verified: with the `"ar"` leader-sequence arm removed from
+        /// `keys.rs`, `<leader>ar` falls through as an unknown sequence and
+        /// the on-disk content assertion below fails (still "TWO CHANGED").
+        #[test]
+        fn leader_ar_reverts_the_hunk_under_the_cursor_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1517_tui_ar_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+
+            let mut engine = engine_with_buffer_open(&dir, &a);
+            engine.view_mut().cursor.line = 1; // the "TWO CHANGED" line
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 30);
+            h.driver.render();
+            assert!(
+                h.driver.screen().contains("reject hunk"),
+                "setup: the action row must be visible before rejecting"
+            );
+
+            h.driver.type_char(' '); // leader
+            h.driver.type_char('a');
+            h.driver.type_char('r');
+            h.driver.render();
+
+            let on_disk = std::fs::read_to_string(&a).unwrap();
+            assert_eq!(
+                on_disk, "one\ntwo\nthree\nfour\n",
+                "the hunk must be reverted to its pre-turn content on disk"
+            );
+            assert!(
+                !h.driver.screen().contains("reject hunk"),
+                "the action row must disappear once the only hunk is \
+                 resolved; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `<leader>ak` keeps the hunk under the cursor — the file the
+        /// agent already wrote is left untouched on disk, and the action
+        /// row disappears the same way rejecting one does.
+        #[test]
+        fn leader_ak_keeps_the_hunk_under_the_cursor_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1517_tui_ak_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+
+            let mut engine = engine_with_buffer_open(&dir, &a);
+            engine.view_mut().cursor.line = 1;
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 30);
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('k');
+            h.driver.render();
+
+            let on_disk = std::fs::read_to_string(&a).unwrap();
+            assert_eq!(
+                on_disk, "one\nTWO CHANGED\nthree\nfour\n",
+                "keep must never touch disk — the agent's write is already correct"
+            );
+            assert!(
+                !h.driver.screen().contains("keep hunk"),
+                "the action row must disappear once the only hunk is \
+                 resolved; screen:\n{}",
+                h.driver.screen()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// "Edit before accept" (#1517's own words): a human edit made to
+        /// the hunk's range before deciding is what `<leader>ak` keeps —
+        /// the action row's label switches to "(edited)" and disk ends up
+        /// with the human's text, not the agent's original write.
+        #[test]
+        fn editing_a_hunk_before_keep_labels_it_edited_and_keeps_the_edit_via_shell_app() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1517_tui_edit_{:?}",
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let a = dir.join("a.txt");
+            std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+
+            let mut engine = engine_with_buffer_open(&dir, &a);
+            engine.view_mut().cursor.line = 1;
+
+            let mut h = crate::tui_main::testing::conformance_harness(engine, 120, 30);
+            h.driver.render();
+            assert!(
+                !h.driver.screen().contains("(edited)"),
+                "setup: the hunk must not start out labelled edited"
+            );
+
+            // Human edits the agent's line in place, then saves — same
+            // buffer-first contract every other turn-review read relies on.
+            h.driver.type_char('A'); // append at end of "TWO CHANGED"
+            for c in " BY HUMAN".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Escape);
+            for c in ":w".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Enter);
+            h.driver.render();
+
+            assert!(
+                h.driver.screen().contains("(edited)"),
+                "the action row must relabel an edited hunk; screen:\n{}",
+                h.driver.screen()
+            );
+
+            h.driver.type_char(' ');
+            h.driver.type_char('a');
+            h.driver.type_char('k');
+            h.driver.render();
+
+            let on_disk = std::fs::read_to_string(&a).unwrap();
+            assert_eq!(
+                on_disk, "one\nTWO CHANGED BY HUMAN\nthree\nfour\n",
+                "keeping an edited hunk must keep the human's edit, not the \
+                 agent's original write"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// #1516: hunk-level Keep/Reject on the ACP turn-review surface — `a`/
     /// `r` act on the hunk under the cursor, not the whole file. GTK twin:
     /// `gtk::testing::issue_1516_hunk_level_review`.

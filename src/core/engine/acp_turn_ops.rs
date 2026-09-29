@@ -91,9 +91,50 @@ impl Engine {
         let entries = std::mem::take(&mut self.acp_current_turn_entries);
         self.acp_turn_checkpoints
             .push(AcpTurnCheckpoint { id, entries });
-        if self.settings.acp_review_on_turn_end == crate::core::settings::AcpReviewOnTurnEnd::Auto {
-            self.acp_open_turn_review(id);
+        match self.settings.acp_review_on_turn_end {
+            crate::core::settings::AcpReviewOnTurnEnd::Auto => self.acp_open_turn_review(id),
+            // #1517: `badge`'s in-buffer-review counterpart to `auto`'s
+            // modal auto-open — see `Self::acp_set_inline_review_status_
+            // message`'s own doc.
+            crate::core::settings::AcpReviewOnTurnEnd::Badge => {
+                self.acp_set_inline_review_status_message(id)
+            }
+            crate::core::settings::AcpReviewOnTurnEnd::Off => {}
         }
+    }
+
+    /// #1517: a one-line status hint naming how many agent hunks are still
+    /// pending across every file `checkpoint_id` touched, and the two
+    /// existing affordances to act on them — `:AiReview` (still opens the
+    /// full modal, #1460/#1515) and, once there, `ga` (keep every
+    /// remaining hunk, #1516). The in-buffer `<leader>ak`/`<leader>ar`
+    /// keys act on individual hunks directly without needing either; this
+    /// message is purely informational, the same "look-around" spirit
+    /// `Self::cmd_ai_review` documents for `:AiReview` itself. A no-op
+    /// when the checkpoint turns out to have zero actual hunks (every
+    /// touched file's diff against its pre-turn content is empty —
+    /// shouldn't happen for a checkpoint that was just recorded, but stays
+    /// silent rather than announcing "0 agent hunks").
+    fn acp_set_inline_review_status_message(&mut self, checkpoint_id: usize) {
+        let Some(checkpoint) = self
+            .acp_turn_checkpoints
+            .iter()
+            .find(|c| c.id == checkpoint_id)
+        else {
+            return;
+        };
+        let paths: Vec<String> = checkpoint.entries.iter().map(|e| e.path.clone()).collect();
+        let total: usize = paths
+            .iter()
+            .map(|p| self.acp_inline_review_hunks(p).len())
+            .sum();
+        if total == 0 {
+            return;
+        }
+        self.message = format!(
+            "{total} agent hunk{} \u{b7} keep all (ga) \u{b7} review (:AiReview)",
+            if total == 1 { "" } else { "s" }
+        );
     }
 
     /// The most recent still-outstanding checkpoint's summary for the
@@ -270,6 +311,194 @@ impl Engine {
             return;
         };
         self.acp_open_turn_review(id);
+    }
+
+    // ── in-buffer inline review (#1517) ─────────────────────────────────
+    //
+    // The "Zed-style" alternative to the full-viewport modal above: hunks
+    // reviewed directly in the normal buffer, gutter marks + a virtual
+    // `[a] keep  [r] reject` row under each hunk (`render.rs`'s
+    // `build_rendered_window`), freely editable in between. Gated on
+    // `badge` (the default `acp_review_on_turn_end` setting) the same way
+    // the existing `acp_turn_status` gutter overlay is (`render.rs` line
+    // ~21645) — `auto` already shows the full modal, which auto-closes
+    // once every hunk is decided (nothing would ever be "pending" for
+    // this surface to show afterward), and `off`'s contract is nothing
+    // until an explicit `:AiReview`. See `crate::core::acp_turn`'s own
+    // "in-buffer inline review" doc for why this operates on
+    // `AcpTurnFileEntry::pre_turn_content` directly rather than through
+    // `ChangeReviewState`.
+
+    /// The most recent outstanding checkpoint entry for `path`, if any —
+    /// same most-recent-wins lookup [`Self::acp_turn_pre_content_for_
+    /// path`] does, but returning the whole entry so callers can also
+    /// reach `agent_written_content` (the "edited by you" comparison).
+    fn acp_turn_entry_for_path(
+        &self,
+        path: &str,
+    ) -> Option<&crate::core::acp_turn::AcpTurnFileEntry> {
+        self.acp_turn_checkpoints
+            .iter()
+            .rev()
+            .find_map(|cp| cp.entries.iter().find(|e| e.path == path))
+    }
+
+    /// Overwrite the most recent outstanding checkpoint entry's
+    /// `pre_turn_content` for `path` — the mutation a "keep" decision
+    /// makes (see `crate::core::acp_turn::keep_hunk`'s doc).
+    fn acp_set_checkpoint_pre_content(&mut self, path: &str, new_pre: String) {
+        for cp in self.acp_turn_checkpoints.iter_mut().rev() {
+            if let Some(entry) = cp.entries.iter_mut().find(|e| e.path == path) {
+                entry.pre_turn_content = Some(new_pre);
+                return;
+            }
+        }
+    }
+
+    /// In-buffer review hunks for `path` (#1517): the outstanding
+    /// checkpoint entry's `pre_turn_content` diffed against the buffer's
+    /// *live* content (buffer-first, same read every other turn-review
+    /// surface in this module uses) — empty when `path` isn't part of any
+    /// outstanding checkpoint, or `acp_review_on_turn_end` isn't `badge`
+    /// (see this section's own doc for why).
+    pub(crate) fn acp_inline_review_hunks(&self, path: &str) -> Vec<quadraui::DiffHunk> {
+        if self.settings.acp_review_on_turn_end != crate::core::settings::AcpReviewOnTurnEnd::Badge
+        {
+            return Vec::new();
+        }
+        let Some(entry) = self.acp_turn_entry_for_path(path) else {
+            return Vec::new();
+        };
+        let now = self
+            .acp_current_file_content(std::path::Path::new(path))
+            .unwrap_or_else(|_| entry.agent_written_content.clone());
+        crate::core::acp_turn::hunks_for(entry.pre_turn_content.as_deref(), &now)
+    }
+
+    /// Whether `hunk` (one of [`Self::acp_inline_review_hunks`]'s own
+    /// return for `path`) differs from the agent's own last write —
+    /// the in-buffer "(edited)" label on the virtual action row, same
+    /// comparison [`Self::current_turn_hunk_edited_by_human`] makes for
+    /// the modal.
+    pub(crate) fn acp_inline_review_hunk_edited(
+        &self,
+        path: &str,
+        hunk: &quadraui::DiffHunk,
+    ) -> bool {
+        let Some(entry) = self.acp_turn_entry_for_path(path) else {
+            return false;
+        };
+        !crate::core::acp_turn::hunk_matches_agents_last_write(
+            entry.pre_turn_content.as_deref(),
+            &entry.agent_written_content,
+            hunk.left_start,
+            &hunk.rows,
+        )
+    }
+
+    /// `<leader>ak` on the in-buffer hunk containing 1-based buffer `line`:
+    /// keep it (pure decision, no write — `crate::core::acp_turn::
+    /// keep_hunk`), forgetting the checkpoint's bookkeeping for `path` once
+    /// every hunk in it is resolved (same tail
+    /// [`Self::acp_forget_reverted_checkpoint_paths`] already gives the
+    /// modal's own hunk sweep). Returns `None` when `line` isn't inside any
+    /// outstanding hunk — the caller degrades to a status message.
+    pub(crate) fn acp_inline_review_keep_hunk_at_line(
+        &mut self,
+        path: &str,
+        line: usize,
+    ) -> Option<String> {
+        let hunks = self.acp_inline_review_hunks(path);
+        let hunk = hunks
+            .iter()
+            .find(|h| crate::core::acp_turn::hunk_contains_right_line(h, line))?
+            .clone();
+        let now = self
+            .acp_current_file_content(std::path::Path::new(path))
+            .ok()?;
+        let pre = self.acp_turn_entry_for_path(path)?.pre_turn_content.clone();
+        let new_pre = crate::core::acp_turn::keep_hunk(pre.as_deref(), &now, &hunk);
+        let fully_resolved = crate::core::acp_turn::hunks_for(Some(&new_pre), &now).is_empty();
+        self.acp_set_checkpoint_pre_content(path, new_pre);
+        if fully_resolved {
+            self.acp_forget_reverted_checkpoint_paths(0, std::slice::from_ref(&path.to_string()));
+        }
+        Some(format!("Kept hunk in {path}"))
+    }
+
+    /// `<leader>ar` on the in-buffer hunk containing 1-based buffer `line`:
+    /// revert its range in the *current* buffer content back to the
+    /// pre-turn text (`crate::core::acp_turn::revert_hunk`), one undo
+    /// group, saved to disk — mirrors the modal's own `r` key
+    /// ([`crate::core::engine::review_ops::Engine::change_review_reject_
+    /// current_hunk`]). A brand-new path (`pre_turn_content: None`) always
+    /// has exactly one hunk covering the whole file (see `crate::core::
+    /// acp_turn::hunks_for`'s doc), so rejecting it deletes the file
+    /// outright rather than writing an empty one back. Returns `None` when
+    /// `line` isn't inside any outstanding hunk.
+    pub(crate) fn acp_inline_review_reject_hunk_at_line(
+        &mut self,
+        path: &str,
+        line: usize,
+    ) -> Option<String> {
+        let hunks = self.acp_inline_review_hunks(path);
+        let hunk = hunks
+            .iter()
+            .find(|h| crate::core::acp_turn::hunk_contains_right_line(h, line))?
+            .clone();
+        let now = self
+            .acp_current_file_content(std::path::Path::new(path))
+            .ok()?;
+        let pre_turn_content = self.acp_turn_entry_for_path(path)?.pre_turn_content.clone();
+        let is_new_file = pre_turn_content.is_none();
+        let reverted = crate::core::acp_turn::revert_hunk(&now, &hunk);
+        let result = if is_new_file {
+            self.acp_delete_file_untracked(std::path::Path::new(path))
+        } else {
+            self.acp_write_file_untracked(std::path::Path::new(path), &reverted)
+        };
+        if let Err(msg) = result {
+            return Some(format!("Failed to revert hunk in {path}: {msg}"));
+        }
+        let fresh_now = if is_new_file {
+            String::new()
+        } else {
+            self.acp_current_file_content(std::path::Path::new(path))
+                .unwrap_or(reverted)
+        };
+        if crate::core::acp_turn::hunks_for(pre_turn_content.as_deref(), &fresh_now).is_empty() {
+            self.acp_forget_reverted_checkpoint_paths(0, std::slice::from_ref(&path.to_string()));
+        }
+        Some(format!("Reverted hunk in {path}"))
+    }
+
+    /// `<leader>ak` normal-mode entry point (`keys.rs`): resolve the
+    /// active buffer's path + cursor line and keep the hunk there, or
+    /// leave a status message when there isn't one.
+    pub(crate) fn acp_inline_review_keep_at_cursor(&mut self) {
+        let Some(path) = self.active_buffer_state().file_path.clone() else {
+            self.message = "No agent hunk here to keep".to_string();
+            return;
+        };
+        let line = self.view().cursor.line + 1; // 1-based
+        let path = path.to_string_lossy().to_string();
+        self.message = self
+            .acp_inline_review_keep_hunk_at_line(&path, line)
+            .unwrap_or_else(|| "No agent hunk here to keep".to_string());
+    }
+
+    /// `<leader>ar` normal-mode entry point — the reject twin of
+    /// [`Self::acp_inline_review_keep_at_cursor`].
+    pub(crate) fn acp_inline_review_reject_at_cursor(&mut self) {
+        let Some(path) = self.active_buffer_state().file_path.clone() else {
+            self.message = "No agent hunk here to reject".to_string();
+            return;
+        };
+        let line = self.view().cursor.line + 1; // 1-based
+        let path = path.to_string_lossy().to_string();
+        self.message = self
+            .acp_inline_review_reject_hunk_at_line(&path, line)
+            .unwrap_or_else(|| "No agent hunk here to reject".to_string());
     }
 
     /// `:AiRestore [id]` — revert every file touched by checkpoint `id` (or
@@ -1172,5 +1401,173 @@ mod tests {
         let action = engine.execute_command("AiRestore notanumber");
         assert_eq!(action, EngineAction::Error);
         assert!(engine.message.contains("Usage: AiRestore"));
+    }
+
+    // ── in-buffer inline review (#1517) ─────────────────────────────────
+
+    /// Badge-mode engine setup shared by the tests below: a real file
+    /// with one agent-written hunk on disk, the checkpoint recorded, and
+    /// the buffer open in the active window (so the cursor-based
+    /// `<leader>ak`/`<leader>ar` entry points have something to resolve
+    /// against). Returns `(engine, dir, path)`.
+    fn engine_with_one_pending_inline_hunk(
+        tag: &str,
+    ) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+        let dir = unique_temp_dir(tag);
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let mut engine = Engine::new_for_test();
+        // `Badge` is already the default, but set explicitly — this
+        // module's other tests opt into `Auto` via `engine_for_turn_
+        // review_tests`, so nothing upstream can be relied on here.
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Badge;
+        engine.workspace_root = Some(dir.clone());
+        engine
+            .acp_write_text_file(&path, "one\nTWO CHANGED\nthree\n")
+            .unwrap();
+        engine.acp_end_turn();
+        assert!(
+            engine.change_review.is_none(),
+            "badge mode must never populate the full-viewport modal"
+        );
+
+        let buf_id = engine.buffer_manager.open_file(&path).unwrap();
+        let win_id = engine.active_window_id();
+        engine.windows.get_mut(&win_id).unwrap().buffer_id = buf_id;
+        engine.view_mut().cursor.line = 1; // the "TWO CHANGED" line
+
+        (engine, dir, path)
+    }
+
+    #[test]
+    fn acp_end_turn_under_badge_sets_an_agent_hunks_status_message() {
+        let (engine, dir, _path) = engine_with_one_pending_inline_hunk("status-message");
+        assert!(
+            engine.message.contains("1 agent hunk"),
+            "unexpected message: {}",
+            engine.message
+        );
+        assert!(engine.message.contains("keep all (ga)"));
+        assert!(engine.message.contains(":AiReview"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acp_inline_review_hunks_lists_the_pending_hunk_under_badge() {
+        let (engine, dir, path) = engine_with_one_pending_inline_hunk("hunks-list");
+        let hunks = engine.acp_inline_review_hunks(&path.to_string_lossy());
+        assert_eq!(hunks.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acp_inline_review_hunks_is_empty_outside_badge_mode() {
+        let (mut engine, dir, path) = engine_with_one_pending_inline_hunk("hunks-gated");
+        engine.settings.acp_review_on_turn_end = crate::core::settings::AcpReviewOnTurnEnd::Off;
+        assert!(engine
+            .acp_inline_review_hunks(&path.to_string_lossy())
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `<leader>ak` (keep) is a pure decision: the file the agent already
+    /// wrote is left untouched on disk, but the hunk stops showing as
+    /// pending and the checkpoint's bookkeeping for this (now fully
+    /// resolved) path is forgotten.
+    #[test]
+    fn leader_ak_keeps_the_hunk_under_the_cursor_without_touching_disk() {
+        let (mut engine, dir, path) = engine_with_one_pending_inline_hunk("keep-cursor");
+
+        engine.acp_inline_review_keep_at_cursor();
+
+        assert!(
+            engine.message.contains("Kept hunk"),
+            "unexpected message: {}",
+            engine.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\nTWO CHANGED\nthree\n",
+            "keep must never touch disk — the agent's write is already correct"
+        );
+        assert!(
+            engine
+                .acp_inline_review_hunks(&path.to_string_lossy())
+                .is_empty(),
+            "the kept hunk must stop showing as pending"
+        );
+        assert!(
+            engine.acp_turn_checkpoints.is_empty(),
+            "the only outstanding entry is now fully resolved, so the \
+             checkpoint itself must be forgotten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `<leader>ar` (reject) reverts the hunk's range on disk back to its
+    /// pre-turn content, one undo group, and likewise forgets the now-
+    /// resolved checkpoint bookkeeping.
+    #[test]
+    fn leader_ar_reverts_the_hunk_under_the_cursor_on_disk() {
+        let (mut engine, dir, path) = engine_with_one_pending_inline_hunk("reject-cursor");
+
+        engine.acp_inline_review_reject_at_cursor();
+
+        assert!(
+            engine.message.contains("Reverted hunk"),
+            "unexpected message: {}",
+            engine.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\ntwo\nthree\n",
+            "reject must restore the pre-turn text for the hunk's range"
+        );
+        assert!(
+            engine.acp_turn_checkpoints.is_empty(),
+            "a fully-reverted file's checkpoint entry must be forgotten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hunk the human edits before deciding is still resolvable — the
+    /// live diff (`pre_turn_content` vs the buffer's *current* content,
+    /// buffer-first) picks up the edit, so keeping it keeps the edited
+    /// text, not the agent's original write (#1517's "edit before
+    /// accept").
+    #[test]
+    fn a_hunk_edited_before_keep_is_kept_as_edited_not_as_the_agents_original_write() {
+        let (mut engine, dir, path) = engine_with_one_pending_inline_hunk("edit-before-keep");
+        // A human edit on top of the agent's write, saved to disk — same
+        // "buffer-first" contract every other turn-review read in this
+        // module already relies on.
+        std::fs::write(&path, "one\nTWO EDITED BY HUMAN\nthree\n").unwrap();
+        let buf_id = engine
+            .windows
+            .get(&engine.active_window_id())
+            .unwrap()
+            .buffer_id;
+        let state = engine.buffer_manager.get_mut(buf_id).unwrap();
+        state.buffer =
+            crate::core::buffer::Buffer::from_text(buf_id, "one\nTWO EDITED BY HUMAN\nthree\n");
+
+        assert!(
+            engine.acp_inline_review_hunk_edited(
+                &path.to_string_lossy(),
+                &engine.acp_inline_review_hunks(&path.to_string_lossy())[0],
+            ),
+            "the hunk must be flagged as edited by the human, not the agent's own write"
+        );
+
+        engine.acp_inline_review_keep_at_cursor();
+
+        assert!(
+            engine
+                .acp_inline_review_hunks(&path.to_string_lossy())
+                .is_empty(),
+            "keeping the edited hunk must resolve it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
