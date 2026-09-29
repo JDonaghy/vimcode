@@ -8618,6 +8618,169 @@ second line here
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #1512: AI panel queues a message typed while the agent is busy.
+    // TUI twin: `tui_main::app_on_tui_tests::tests::
+    // issue_1512_queue_message_while_busy`.
+    // ─────────────────────────────────────────────────────────────────────
+    mod issue_1512_queue_message_while_busy {
+        use super::*;
+
+        /// Same shape as `issue_1509_ai_chat_submit_on_enter_and_stop_
+        /// segment::configure_fixture_agent` — a fresh copy per module,
+        /// matching this file's convention of each `mod issue_*` block
+        /// owning its own fixture-agent setup.
+        fn configure_fixture_agent(h: &Harness<impl AppLogic>, extra_env: &[&str]) {
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            let mut engine = h.engine.borrow_mut();
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: extra_env.iter().map(|s| s.to_string()).collect(),
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+        }
+
+        /// #1512 acceptance, GTK twin of `tui_main::app_on_tui_tests::
+        /// tests::issue_1512_queue_message_while_busy::
+        /// queue_discard_and_send_now_via_shell_app`: a message submitted
+        /// while the agent is busy paints as a dimmed `"(queued) ..."`
+        /// transcript turn plus a `"queued (1"` status-strip segment
+        /// (never a silent no-op — the pre-#1512 behaviour); Ctrl+R
+        /// discards it (relabels it `"(discarded)"`, drops the status
+        /// segment); a message queued again and sent with Ctrl+G ("send
+        /// now") cancels the busy turn (`"[cancelled by user]"` painted,
+        /// same as clicking the Stop segment / Ctrl+C above) and flips the
+        /// queued turn to a plain, undimmed line — all read from the
+        /// *painted* surface, not engine state.
+        ///
+        /// `queued (1` (no trailing paren): `ChatController::render`
+        /// overlays a separate busy `Spinner` icon at a fixed position at
+        /// the right end of the status strip, painted on top of whatever
+        /// status text lands under it — at this harness's width, that's
+        /// this segment's own closing paren. Pre-existing widget
+        /// behaviour, unrelated to #1512 (same accommodation the TUI twin
+        /// makes).
+        ///
+        /// RED verified: reverting `ai_send_message` to the pre-#1512 `if
+        /// text.is_empty() || self.acp_mut().ai_streaming { return; }`
+        /// early return (dropping the Ctrl+R/Ctrl+G arms along with it)
+        /// makes this fail at the very first assertion — "second" never
+        /// reaches the transcript at all as a queued turn; the painted
+        /// surface shows no `"(queued)"` text and no `"queued (1"`
+        /// segment anywhere.
+        #[cfg(unix)]
+        #[test]
+        fn queue_discard_and_send_now_via_gtk_driver() {
+            let mut h = panel_harness(PANEL_AI);
+            configure_fixture_agent(&h, &["ACP_FAKE_TOOL_CALL_HANGS=1"]);
+
+            let sb = h.painted_sidebar_bounds.get().unwrap();
+            h.driver.click(sb.x + 20.0, sb.y + 20.0);
+            assert!(
+                h.engine.borrow().ai_has_focus,
+                "setup: a click in the panel body must focus it"
+            );
+
+            for c in "first".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.ctrl_char('s');
+            h.driver.render();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while !h.driver.screen_contains("execute: Run the tests \u{b7}")
+                && std::time::Instant::now() < deadline
+            {
+                h.engine.borrow_mut().poll_idle();
+                h.driver.render();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                h.driver.screen_contains("execute: Run the tests \u{b7}"),
+                "setup: the first turn must be genuinely busy on the wire \
+                 before submitting a second message; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // ── Queue a second message while busy ───────────────────────
+            for c in "second".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.ctrl_char('s');
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("(queued) second"),
+                "a message submitted while busy must paint as a dimmed \
+                 queued turn, not vanish silently; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("queued (1"),
+                "the status strip must show the queued count; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            // ── Ctrl+R discards it ───────────────────────────────────────
+            h.driver.ctrl_char('r');
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("(queued) second (discarded)"),
+                "Ctrl+R must relabel the queued turn as discarded, not \
+                 remove it outright; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("queued (1"),
+                "the queued-count segment must clear once nothing is \
+                 queued"
+            );
+
+            // ── Queue again, then Ctrl+G ("send now") ───────────────────
+            for c in "third".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.ctrl_char('s');
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("(queued) third"),
+                "sanity: the second queue must also paint before Ctrl+G; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            h.driver.ctrl_char('g');
+            h.driver.render();
+            assert!(
+                h.driver.screen_contains("[cancelled by user]"),
+                "Ctrl+G must cancel the current turn first, same as \
+                 clicking Stop / Ctrl+C while streaming; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("(queued) third"),
+                "the sent turn must no longer paint as queued/dimmed; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                h.driver.screen_contains("third"),
+                "the message itself must still be on screen, just no \
+                 longer marked queued; painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("queued (1"),
+                "nothing should still be queued after send-now consumed it"
+            );
+        }
+    }
 }
 
 /// #669: the five editor-anchored popups (completion, LSP hover, editor

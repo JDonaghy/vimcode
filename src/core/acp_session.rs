@@ -90,6 +90,29 @@ pub struct AcpSession {
     pub session_id: Option<String>,
     pub pending_prompt: Option<String>,
     pub pending_prompt_display: Option<String>,
+    /// #1512: a message submitted while this session already had a turn
+    /// in flight (`ai_streaming`), instead of the silent no-op
+    /// `Engine::ai_send_message` used to do in that case. Mirrors
+    /// `pending_prompt`'s "hold the text, send it once the right event
+    /// fires" shape, but a deliberately separate field rather than the
+    /// same one — `pending_prompt` is consumed the moment the
+    /// *handshake* finishes (`AcpEvent::SessionCreated`/`SessionLoaded`),
+    /// while this is consumed the moment the *in-flight turn* finishes
+    /// (`AcpEvent::PromptStopped`, `Engine::ai_dispatch_queued_message`)
+    /// or immediately on "send now" (`Engine::ai_send_queued_now`,
+    /// Ctrl+G — cancels the current turn first). The two triggers can
+    /// never overlap in practice (queuing only ever starts once
+    /// `ai_streaming` was already `true`, which implies the handshake
+    /// already finished), but keeping them as separate fields avoids one
+    /// consumer accidentally stealing the other's text.
+    pub queued_prompt: Option<String>,
+    /// Index into `ai_messages` of the dimmed "(queued)" turn
+    /// `Engine::ai_queue_message` pushed for `queued_prompt` — flipped
+    /// back to a plain `"user"` turn the moment the queued message is
+    /// actually dispatched (`Engine::ai_dispatch_queued_message`), or
+    /// relabelled "(discarded)" if the user drops it instead
+    /// (`Engine::ai_discard_queued_message`, Ctrl+R).
+    pub queued_prompt_idx: Option<usize>,
     pub streaming_turn: Option<(usize, AcpChunkKind)>,
     pub pending_permission: Option<(i64, AcpPermissionRequest)>,
     pub remembered_decisions: HashMap<String, bool>,

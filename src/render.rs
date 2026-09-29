@@ -20410,6 +20410,24 @@ pub fn populate_ai_chat_controller(
                 timestamp_unix: None,
                 line_scales: Vec::new(),
             },
+            // #1512: a message submitted while a turn was already in
+            // flight — queued rather than dropped (`Engine::
+            // ai_queue_message`). Dimmed (`thought_fg`, the same tone
+            // `assistant-thought` turns use) and literally prefixed
+            // `"(queued) "` on the painted text, not just a colour: a
+            // colour alone isn't something a black-box test (or a
+            // low-color terminal) can reliably read back, unlike a
+            // substring. Flips back to plain `"user"` the moment it's
+            // actually sent (`Engine::ai_dispatch_queued_message`), or
+            // gets a `" (discarded)"` suffix if dropped instead
+            // (`Engine::ai_discard_queued_message`) while staying on this
+            // same dimmed role — it never became a real turn either way.
+            "user-queued" => quadraui::ChatTurn {
+                role: quadraui::ChatRole::User,
+                text: quadraui::StyledText::colored(format!("(queued) {}", m.content), thought_fg),
+                timestamp_unix: None,
+                line_scales: Vec::new(),
+            },
             "assistant-thought" => {
                 let (text, line_scales) = markdown_turn_styled_cached(
                     &acp.markdown_turn_cache,
@@ -20625,6 +20643,15 @@ pub fn populate_ai_chat_controller(
     for attachment in &engine.acp_manual_attachments {
         header.push_str(&format!("  \u{b7} {}", attachment.chip()));
     }
+    // #1512: "queued (1)" while a message submitted mid-turn is waiting to
+    // be sent (`AcpSession::queued_prompt`) — same always-repainted,
+    // focus-safe status line as every other chip/suffix here. Only ever
+    // one slot (`Engine::ai_queue_message` replaces rather than stacks),
+    // so the count is always literally `1` while this segment shows at
+    // all.
+    if engine.acp().queued_prompt.is_some() {
+        header.push_str("  \u{b7} queued (1)");
+    }
     // #1515: `badge` mode's "Edited N files · +a -r" segment — the
     // replacement for the pre-#1515 always-auto-open full-viewport turn
     // review (`acp_review_on_turn_end` setting, `Engine::acp_end_turn`).
@@ -20642,7 +20669,11 @@ pub fn populate_ai_chat_controller(
     }
     chat.set_status(quadraui::StyledText::colored(header, header_fg));
     chat.set_hint(Some(quadraui::StyledText::colored(
-        ai_chat_hint_line(backend, engine.settings.ai_chat_submit_on_enter),
+        ai_chat_hint_line(
+            backend,
+            engine.settings.ai_chat_submit_on_enter,
+            engine.acp().queued_prompt.is_some(),
+        ),
         theme.comment,
     )));
 }
@@ -20749,7 +20780,16 @@ fn ai_busy_status_text(engine: &Engine) -> String {
 /// available) still send, matching `ChatController::handle`'s "in both
 /// modes" bindings — but the hint only needs to name the *primary* gesture
 /// for whichever mode is active, not every equivalent chord.
-fn ai_chat_hint_line(backend: &dyn quadraui::Backend, submit_on_enter: bool) -> String {
+fn ai_chat_hint_line(
+    backend: &dyn quadraui::Backend,
+    submit_on_enter: bool,
+    // #1512: whether a message is currently queued
+    // (`AcpSession::queued_prompt`) — when it is, the hint grows the
+    // `^G send now \u{b7} ^R discard` pair so the two new gestures are
+    // discoverable exactly while they're actually relevant, rather than
+    // permanently lengthening this line for every AI-panel frame.
+    has_queued: bool,
+) -> String {
     let caps = backend.backend_caps();
     let send_keys = if caps.generic_font_families {
         "Ctrl+Enter".to_string()
@@ -20767,7 +20807,12 @@ fn ai_chat_hint_line(backend: &dyn quadraui::Backend, submit_on_enter: bool) -> 
     } else {
         format!("\u{23ce} newline \u{b7} {send_keys} send")
     };
-    format!("{entry_line} \u{b7} ^C stop \u{b7} Esc/<leader>ai editor")
+    let queued_hint = if has_queued {
+        " \u{b7} ^G send now \u{b7} ^R discard"
+    } else {
+        ""
+    };
+    format!("{entry_line} \u{b7} ^C stop{queued_hint} \u{b7} Esc/<leader>ai editor")
 }
 
 /// Paint the slash-command or `@`-mention completion popup above the AI
