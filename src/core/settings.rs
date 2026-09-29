@@ -823,6 +823,22 @@ pub struct Settings {
     #[serde(default)]
     pub acp_permission_default: AcpPermissionDefault,
 
+    /// Advertise `clientCapabilities.terminal` (#1522) so an ACP agent may
+    /// call `terminal/create`/`terminal/output`/`terminal/wait_for_exit`/
+    /// `terminal/kill`/`terminal/release` and embed live `{type:
+    /// "terminal"}` content in its tool calls, instead of falling back to
+    /// opaque in-agent execution with no visible output. Default **true**
+    /// — unlike `acp_follow_agent`'s "off by default, would otherwise yank
+    /// the editor around" caution, an agent must *already* declare an
+    /// `execute`-kind tool call to reach this at all, and rendering that
+    /// tool call's live output is strictly more informative than the
+    /// pre-#1522 alternative (a one-line "(terminal output omitted)"
+    /// placeholder). Read by `AcpClient::initialize` (whether to send the
+    /// capability at all) and `Engine::acp_dispatch_events` (whether to
+    /// actually serve `terminal/*` if an agent calls it regardless).
+    #[serde(default = "default_true")]
+    pub acp_terminal_enabled: bool,
+
     // ── Explorer ──────────────────────────────────────────────────────────────
     /// Show hidden files (dotfiles) in the file explorer. Default **true**
     /// (#1545), matching VS Code — dotfiles like `.vscode`, `.github` and
@@ -1894,6 +1910,7 @@ impl Default for Settings {
             acp_review_on_turn_end: AcpReviewOnTurnEnd::default(),
             acp_follow_agent: false,
             acp_permission_default: AcpPermissionDefault::default(),
+            acp_terminal_enabled: default_true(),
             show_hidden_files: default_true(),
             explorer_sort_case_insensitive: true,
             explorer_exclude: default_explorer_exclude(),
@@ -3919,6 +3936,7 @@ impl Settings {
                 AcpPermissionDefault::AllowEdits => "allow_edits".to_string(),
                 AcpPermissionDefault::AllowAll => "allow_all".to_string(),
             },
+            "acp_terminal_enabled" => self.acp_terminal_enabled.to_string(),
             "showhiddenfiles" | "shf" | "show_hidden_files" => self.show_hidden_files.to_string(),
             "explorersortcaseinsensitive" | "esci" | "explorer_sort_case_insensitive" => {
                 self.explorer_sort_case_insensitive.to_string()
@@ -4096,6 +4114,7 @@ impl Settings {
                     _ => return Err(format!("Unknown acp_permission_default value: {value}")),
                 };
             }
+            "acp_terminal_enabled" => self.acp_terminal_enabled = value == "true",
             "showhiddenfiles" | "shf" | "show_hidden_files" => {
                 self.show_hidden_files = value == "true"
             }
@@ -4735,6 +4754,13 @@ pub static SETTING_DEFS: &[SettingDef] = &[
         setting_type: SettingType::Enum(&["ask", "allow_edits", "allow_all"]),
     },
     SettingDef {
+        key: "acp_terminal_enabled",
+        label: "ACP Terminal Capability",
+        description: "Let an ACP agent run terminal/create commands via this client and show their live output in a tool-call card, instead of opaque in-agent execution (on by default)",
+        category: "AI",
+        setting_type: SettingType::Bool,
+    },
+    SettingDef {
         key: "indent_guides",
         label: "Indent Guides",
         description: "Show vertical lines at each indentation level",
@@ -5369,6 +5395,23 @@ mod tests {
         assert!(SETTING_DEFS
             .iter()
             .any(|d| d.key == "acp_permission_default"));
+    }
+
+    /// #1522's `acp_terminal_enabled` setting: defaults to `true` (unlike
+    /// `acp_follow_agent`'s off-by-default caution — see the field's own
+    /// doc for why) and round-trips via the same `:set` / Settings-UI seam
+    /// every other bool setting here uses.
+    #[test]
+    fn acp_terminal_enabled_defaults_to_true_and_round_trips_via_settings_ui() {
+        let mut s = Settings::default();
+        assert!(s.acp_terminal_enabled);
+        assert_eq!(s.get_value_str("acp_terminal_enabled"), "true");
+
+        s.set_value_str("acp_terminal_enabled", "false").unwrap();
+        assert!(!s.acp_terminal_enabled);
+        assert_eq!(s.get_value_str("acp_terminal_enabled"), "false");
+
+        assert!(SETTING_DEFS.iter().any(|d| d.key == "acp_terminal_enabled"));
     }
 
     /// #1515's `acp_review_on_turn_end` setting: defaults to `"badge"` (not

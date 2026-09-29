@@ -20379,7 +20379,11 @@ pub fn populate_ai_chat_controller(
                 // on the word-wrapped flat path, same as before #1511.
                 let text = if expanded {
                     quadraui::StyledText::colored(
-                        crate::core::acp::tool_call_expanded_text(call),
+                        crate::core::acp::tool_call_expanded_text(call, |terminal_id| {
+                            acp.acp_terminals
+                                .get(terminal_id)
+                                .map(|record| record.view())
+                        }),
                         thought_fg,
                     )
                 } else {

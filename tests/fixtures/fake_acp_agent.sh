@@ -260,7 +260,27 @@
 #                           `session_info_update` notification carrying
 #                           that title after the usual message chunks, so a
 #                           test can confirm `:AiSessions`' picker shows it
-#                           instead of the first prompt.
+#                           instead of the first prompt. With
+#                           $ACP_FAKE_TERMINAL set (#1522): announces a
+#                           "tool_call" (id "tc-1", kind "execute",
+#                           pending), sends a `terminal/create` request
+#                           (fixed id 9040, command "echo", args
+#                           ["acp-terminal-output"], cwd "/tmp"), BLOCKS
+#                           until the client answers it with a
+#                           `terminalId`, emits a "tool_call_update" moving
+#                           the call to in_progress and attaching
+#                           `{type:"terminal",terminalId:<id>}` content,
+#                           sends `terminal/wait_for_exit` (fixed id 9041)
+#                           for that terminal id and BLOCKS until answered,
+#                           emits a second "tool_call_update" moving the
+#                           call to completed, then sends `terminal/
+#                           release` (fixed id 9042) for the same terminal
+#                           id and BLOCKS until answered, before finally
+#                           replying end_turn — so a test can drive the
+#                           whole client-served-terminal round trip
+#                           (creation, live content reference, completion,
+#                           release) against a real spawned process, not a
+#                           mock.
 #   - session/cancel     -> notification, silently acknowledged (no reply).
 #   - session/set_mode   -> replies with an empty result, then emits a
 #                           current_mode_update notification carrying the
@@ -741,6 +761,23 @@ while IFS= read -r line; do
         # the usual message chunks — so a test can confirm `:AiSessions`'
         # picker shows it instead of the first prompt.
         printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"session_info_update","title":"%s"}}}\n' "$ACP_FAKE_SESSION_TITLE"
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      elif [ -n "$ACP_FAKE_TERMINAL" ]; then
+        # #1522: the full client-served-terminal round trip against a real
+        # spawned process — see this file's top-of-file doc for the exact
+        # sequence. Every request below BLOCKS on its own `read` until the
+        # client answers it out of band, same pattern as the fs/* park/
+        # reply round trips above.
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"tc-1","title":"Run a command","kind":"execute","status":"pending"}}}\n'
+        printf '{"jsonrpc":"2.0","id":9040,"method":"terminal/create","params":{"sessionId":"sess-1","command":"echo","args":["acp-terminal-output"],"cwd":"/tmp"}}\n'
+        read -r create_reply
+        terminal_id=$(printf '%s' "$create_reply" | sed -n 's/.*"terminalId":"\([^"]*\)".*/\1/p')
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"in_progress","content":[{"type":"terminal","terminalId":"%s"}]}}}\n' "$terminal_id"
+        printf '{"jsonrpc":"2.0","id":9041,"method":"terminal/wait_for_exit","params":{"sessionId":"sess-1","terminalId":"%s"}}\n' "$terminal_id"
+        read -r _wait_reply
+        printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"tc-1","status":"completed"}}}\n'
+        printf '{"jsonrpc":"2.0","id":9042,"method":"terminal/release","params":{"sessionId":"sess-1","terminalId":"%s"}}\n' "$terminal_id"
+        read -r _release_reply
         printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
       else
         printf '{"jsonrpc":"2.0","id":9001,"method":"fs/read_text_file","params":{"sessionId":"sess-1","path":"/tmp/fake.txt"}}\n'

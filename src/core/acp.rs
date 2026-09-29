@@ -62,7 +62,17 @@
 //! - Capabilities advertised in `initialize` are **only** what later slices
 //!   actually implement. Omitted means unsupported. As of #954 (ACP-3) that
 //!   is `fs.readTextFile` and `fs.writeTextFile` — see [`AcpClient::initialize`].
-//! - `terminal/*` is out of scope (optional in v1, removed in the v2 draft).
+//! - `terminal/*` (#1522): served when `settings.acp_terminal_enabled` is on
+//!   (default), via `Engine::acp_terminal_create`/`acp_terminal_refresh`
+//!   (`src/core/engine/terminal_ops.rs`) — see that module's doc for how a
+//!   served terminal reuses the same "spawn an interactive shell, inject the
+//!   real command as PTY input" technique `acp_launch_terminal_login`
+//!   already uses for `auth.terminal`, and [`AcpTerminalRecord`]
+//!   (`crate::core::acp_session`) for what's tracked per terminal. Optional
+//!   in v1 and removed in the v2 draft, same as `fs/*` — this client still
+//!   implements it because it is what lets an agent's `execute`-kind tool
+//!   calls show live output instead of vanishing into opaque in-agent
+//!   execution.
 //! - No async runtime: everything here is sync threads + `mpsc`, matching
 //!   `lsp.rs`/`dap.rs` and vimcode's <=250ms sync tick.
 
@@ -1907,10 +1917,13 @@ impl AcpToolCallStatus {
 /// empty-string block, so it's visibly absent instead of a confusing
 /// blank line. `{type: "diff", path, oldText, newText}` is the shape
 /// #955 exists for — it opens the shared change-review surface
-/// (`crate::core::review`). `{type: "terminal"}` is out of scope for the
-/// whole ACP track (see this module's top doc, "Skip `terminal/*`") but
-/// still parses to a variant (rather than being dropped) so a tool call
-/// that is entirely terminal content still round-trips as "has content".
+/// (`crate::core::review`). `{type: "terminal", terminalId}` (#1522)
+/// references a terminal the agent previously opened with
+/// `terminal/create` — the client renders its live output by looking
+/// `terminal_id` up in `AcpSession::acp_terminals`
+/// (see [`tool_call_expanded_text`]'s `terminal_view` parameter), not from
+/// anything carried in the content block itself (the block is just a
+/// pointer).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcpToolCallContentBlock {
     Text(String),
@@ -1919,7 +1932,9 @@ pub enum AcpToolCallContentBlock {
         old_text: Option<String>,
         new_text: String,
     },
-    Terminal,
+    Terminal {
+        terminal_id: String,
+    },
 }
 
 fn parse_tool_call_content_block(block: &serde_json::Value) -> Option<AcpToolCallContentBlock> {
@@ -1941,7 +1956,10 @@ fn parse_tool_call_content_block(block: &serde_json::Value) -> Option<AcpToolCal
                 new_text,
             })
         }
-        "terminal" => Some(AcpToolCallContentBlock::Terminal),
+        "terminal" => {
+            let terminal_id = block.get("terminalId")?.as_str()?.to_string();
+            Some(AcpToolCallContentBlock::Terminal { terminal_id })
+        }
         _ => None,
     }
 }
@@ -2133,13 +2151,24 @@ pub fn tool_call_summary_line(call: &AcpToolCall) -> String {
 ///   patch — the diff itself already opened the change-review surface when
 ///   this call streamed in (see [`tool_call_summary_line`]'s doc), so
 ///   repeating it here would just be noise.
-/// - [`AcpToolCallContentBlock::Terminal`] — a one-line placeholder;
-///   terminal content is out of scope for the whole ACP track (this
-///   module's top doc).
+/// - [`AcpToolCallContentBlock::Terminal`] — a live card (#1522) built by
+///   [`terminal_card_text`] from whatever `terminal_view(terminal_id)`
+///   returns; a `None` (the terminal was never created by this session, or
+///   `settings.acp_terminal_enabled` was off when the agent tried) falls
+///   back to a one-line placeholder instead of panicking or going blank.
 ///
 /// then `rawInput`/`rawOutput`, each pretty-printed into its own fenced
 /// `json` block when the agent sent one.
-pub fn tool_call_expanded_text(call: &AcpToolCall) -> String {
+///
+/// `terminal_view` is a lookup callback rather than a `&HashMap` so this
+/// otherwise-pure module never needs a `quadraui::terminal_engine`
+/// dependency of its own — the live `TerminalSession`/PTY handle stays
+/// owned by `AcpTerminalRecord` (`crate::core::acp_session`), which builds
+/// the read-only [`AcpTerminalView`] this function actually renders.
+pub fn tool_call_expanded_text(
+    call: &AcpToolCall,
+    terminal_view: impl Fn(&str) -> Option<AcpTerminalView>,
+) -> String {
     let mut out = tool_call_summary_line(call);
     for block in &call.content {
         out.push_str("\n\n");
@@ -2161,9 +2190,10 @@ pub fn tool_call_expanded_text(call: &AcpToolCall) -> String {
                     crate::core::acp_turn::count_changed_lines(old_text.as_deref(), new_text);
                 out.push_str(&format!("+{added} -{removed} {path}"));
             }
-            AcpToolCallContentBlock::Terminal => {
-                out.push_str("(terminal output omitted)");
-            }
+            AcpToolCallContentBlock::Terminal { terminal_id } => match terminal_view(terminal_id) {
+                Some(view) => out.push_str(&terminal_card_text(&view)),
+                None => out.push_str(&format!("$ (terminal {terminal_id} — no longer available)")),
+            },
         }
     }
     if let Some(input) = &call.raw_input {
@@ -2176,6 +2206,221 @@ pub fn tool_call_expanded_text(call: &AcpToolCall) -> String {
         out.push_str(&serde_json::to_string_pretty(output).unwrap_or_default());
         out.push_str("\n```");
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// terminal/create, terminal/output, terminal/wait_for_exit, terminal/kill,
+// terminal/release — wire-shape parsing + result builders (#1522)
+// ---------------------------------------------------------------------------
+
+/// A parsed `terminal/create` request: `{sessionId, command, args?, env?,
+/// cwd?, outputByteLimit?}` per the ACP v1 schema. `env` is `[{name,
+/// value}]` on the wire, collapsed here to plain pairs — the same shape
+/// `AcpAgentProfile::env` already uses elsewhere in this crate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalCreateParams {
+    pub session_id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: Option<String>,
+    pub output_byte_limit: Option<usize>,
+}
+
+/// Parse a `terminal/create` request's `params`. Returns `None` for a
+/// malformed request (missing `sessionId`/`command`) — the caller must
+/// still answer such a request with a JSON-RPC error, never silence, same
+/// policy as [`parse_read_text_file_params`].
+pub fn parse_terminal_create_params(params: &serde_json::Value) -> Option<TerminalCreateParams> {
+    let session_id = params.get("sessionId")?.as_str()?.to_string();
+    let command = params.get("command")?.as_str()?.to_string();
+    let args = params
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env = params
+        .get("env")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|entry| {
+                    let name = entry.get("name")?.as_str()?.to_string();
+                    let value = entry.get("value")?.as_str()?.to_string();
+                    Some((name, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = params
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let output_byte_limit = params
+        .get("outputByteLimit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    Some(TerminalCreateParams {
+        session_id,
+        command,
+        args,
+        env,
+        cwd,
+        output_byte_limit,
+    })
+}
+
+/// Build the `result` value for a `terminal/create` reply: `{terminalId}`.
+pub fn terminal_create_result(terminal_id: &str) -> serde_json::Value {
+    serde_json::json!({"terminalId": terminal_id})
+}
+
+/// A parsed `terminal/output` / `terminal/wait_for_exit` / `terminal/kill`
+/// / `terminal/release` request — all four share the same
+/// `{sessionId, terminalId}` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalIdParams {
+    pub session_id: String,
+    pub terminal_id: String,
+}
+
+/// Parse the shared `{sessionId, terminalId}` shape. Returns `None` for a
+/// malformed request (missing either field).
+pub fn parse_terminal_id_params(params: &serde_json::Value) -> Option<TerminalIdParams> {
+    let session_id = params.get("sessionId")?.as_str()?.to_string();
+    let terminal_id = params.get("terminalId")?.as_str()?.to_string();
+    Some(TerminalIdParams {
+        session_id,
+        terminal_id,
+    })
+}
+
+/// One terminal's exit status — the pure wire shape `{exitCode?, signal?}`
+/// ACP uses both for `terminal/output`'s optional `exitStatus` field and as
+/// the whole `terminal/wait_for_exit` result. Distinct from
+/// `crate::core::acp_session::AcpTerminalRecord`, which additionally owns
+/// the live `TerminalSession`/PTY handle — this type is just the
+/// protocol-level fact of "did it exit, and how".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AcpTerminalExitStatus {
+    pub exit_code: Option<i64>,
+    pub signal: Option<String>,
+}
+
+/// Build the `{exitCode?, signal?}` wire value for `status` — omits each
+/// field the ACP spec marks optional when unknown, rather than sending an
+/// explicit `null` for it.
+pub fn terminal_exit_status_result(status: &AcpTerminalExitStatus) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(code) = status.exit_code {
+        map.insert("exitCode".to_string(), serde_json::json!(code));
+    }
+    if let Some(signal) = &status.signal {
+        map.insert("signal".to_string(), serde_json::json!(signal));
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Build the `result` value for a `terminal/output` reply: `{output,
+/// truncated, exitStatus?}` — `exitStatus` is present only once the
+/// terminal has actually exited (`None` while still running, matching the
+/// ACP spec's "omit while running" contract).
+pub fn terminal_output_result(
+    output: &str,
+    truncated: bool,
+    exit_status: Option<&AcpTerminalExitStatus>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("output".to_string(), serde_json::json!(output));
+    map.insert("truncated".to_string(), serde_json::json!(truncated));
+    if let Some(status) = exit_status {
+        map.insert(
+            "exitStatus".to_string(),
+            terminal_exit_status_result(status),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+/// Read-only snapshot of a served `terminal/create` terminal's live state,
+/// for rendering only (#1522) — built by
+/// `crate::core::acp_session::AcpTerminalRecord::view`, the type that
+/// actually owns the live `TerminalSession`/PTY. Kept as a separate,
+/// narrower type so this module (pure ACP wire parsing) never needs a
+/// `quadraui::terminal_engine` dependency of its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcpTerminalView {
+    /// `"cmd arg1 arg2"` — the shell-quoted command line, for the card
+    /// header.
+    pub command_display: String,
+    pub cwd: Option<String>,
+    /// Wall-clock time since `terminal/create` — frozen at the value it
+    /// had when `terminal/release` was served, so a released terminal's
+    /// card doesn't keep counting up forever (see this issue's "persists
+    /// after release" acceptance bar).
+    pub elapsed: std::time::Duration,
+    /// `None` while still running.
+    pub exit_status: Option<AcpTerminalExitStatus>,
+    /// `true` once `terminal/kill` was served (the process may or may not
+    /// have actually stopped yet — see `Engine::acp_terminal_kill`'s doc
+    /// for why this is best-effort).
+    pub killed: bool,
+    /// `true` once `terminal/release` was served — the card still renders
+    /// (this issue's acceptance bar), just from the frozen snapshot rather
+    /// than a live PTY.
+    pub released: bool,
+    pub output_tail: String,
+    pub truncated: bool,
+}
+
+/// Render one live/finished ACP terminal as the card body #1522 asks for:
+/// the command line, its cwd, elapsed time, exit status once known, a
+/// truncation note, then the captured output fenced as a code block.
+pub fn terminal_card_text(view: &AcpTerminalView) -> String {
+    let mut out = format!("$ {}", view.command_display);
+    if let Some(cwd) = &view.cwd {
+        out.push_str(&format!("\ncwd: {cwd}"));
+    }
+    let elapsed_secs = view.elapsed.as_secs();
+    match &view.exit_status {
+        Some(status) => {
+            let code_display = match status.exit_code {
+                Some(code) => format!("exit code {code}"),
+                None => "exited".to_string(),
+            };
+            let signal_display = status
+                .signal
+                .as_deref()
+                .map(|s| format!(" (signal {s})"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "\n{code_display}{signal_display} \u{b7} {elapsed_secs}s"
+            ));
+        }
+        None if view.killed => {
+            out.push_str(&format!("\nkilled, waiting to exit \u{b7} {elapsed_secs}s"));
+        }
+        None => {
+            out.push_str(&format!("\nrunning \u{b7} {elapsed_secs}s"));
+        }
+    }
+    if view.released && view.exit_status.is_none() {
+        out.push_str("\n(released)");
+    }
+    if view.truncated {
+        out.push_str("\n(output truncated)");
+    }
+    out.push_str("\n```\n");
+    out.push_str(&view.output_tail);
+    if !view.output_tail.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("```");
     out
 }
 
@@ -2388,20 +2633,32 @@ impl AcpClient {
     /// section). `terminal/*` — the unrelated *client-served* terminal
     /// methods — is still never advertised (out of scope for the whole
     /// track).
-    pub fn initialize(&mut self) -> i64 {
+    /// `terminal_enabled` gates the `terminal` capability (#1522,
+    /// `settings.acp_terminal_enabled` — default on): when `false`, the
+    /// wire request omits `clientCapabilities.terminal` entirely (never
+    /// sends `false` — same "omitted means unsupported" convention as
+    /// every other capability here), so an agent never offers a
+    /// `{type: "terminal"}` tool-content block or calls `terminal/*` in
+    /// the first place, matching `Engine::acp_dispatch_events`'s own gate
+    /// on actually serving those methods.
+    pub fn initialize(&mut self, terminal_enabled: bool) -> i64 {
+        let mut client_capabilities = serde_json::json!({
+            "fs": {
+                "readTextFile": true,
+                "writeTextFile": true,
+            },
+            "auth": {
+                "terminal": true,
+            },
+        });
+        if terminal_enabled {
+            client_capabilities["terminal"] = serde_json::json!(true);
+        }
         self.send_request(
             "initialize",
             serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "clientCapabilities": {
-                    "fs": {
-                        "readTextFile": true,
-                        "writeTextFile": true,
-                    },
-                    "auth": {
-                        "terminal": true,
-                    },
-                },
+                "clientCapabilities": client_capabilities,
                 "clientInfo": {
                     "name": "vimcode",
                     "version": env!("CARGO_PKG_VERSION"),
@@ -3631,7 +3888,12 @@ mod tests {
                 new_text: "new\n".to_string(),
             }
         );
-        assert_eq!(call.content[2], AcpToolCallContentBlock::Terminal);
+        assert_eq!(
+            call.content[2],
+            AcpToolCallContentBlock::Terminal {
+                terminal_id: "t1".to_string()
+            }
+        );
     }
 
     #[test]
@@ -3844,6 +4106,199 @@ mod tests {
             read_text_file_result("hello"),
             serde_json::json!({"content": "hello"})
         );
+    }
+
+    // ---- terminal/* wire-shape parsing + result builders (#1522) ----
+
+    #[test]
+    fn parse_terminal_create_params_reads_every_field() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "command": "echo",
+            "args": ["hello", "world"],
+            "env": [{"name": "FOO", "value": "bar"}],
+            "cwd": "/tmp",
+            "outputByteLimit": 1024,
+        });
+        let req = parse_terminal_create_params(&params).expect("should parse");
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.command, "echo");
+        assert_eq!(req.args, vec!["hello".to_string(), "world".to_string()]);
+        assert_eq!(req.env, vec![("FOO".to_string(), "bar".to_string())]);
+        assert_eq!(req.cwd, Some("/tmp".to_string()));
+        assert_eq!(req.output_byte_limit, Some(1024));
+    }
+
+    #[test]
+    fn parse_terminal_create_params_defaults_optional_fields() {
+        let params = serde_json::json!({
+            "sessionId": "sess-1",
+            "command": "echo",
+        });
+        let req = parse_terminal_create_params(&params).expect("should parse");
+        assert!(req.args.is_empty());
+        assert!(req.env.is_empty());
+        assert_eq!(req.cwd, None);
+        assert_eq!(req.output_byte_limit, None);
+    }
+
+    #[test]
+    fn parse_terminal_create_params_rejects_missing_session_id_or_command() {
+        assert!(parse_terminal_create_params(&serde_json::json!({"command": "echo"})).is_none());
+        assert!(parse_terminal_create_params(&serde_json::json!({"sessionId": "s"})).is_none());
+    }
+
+    #[test]
+    fn parse_terminal_id_params_reads_both_fields_and_rejects_either_missing() {
+        let req = parse_terminal_id_params(&serde_json::json!({
+            "sessionId": "sess-1",
+            "terminalId": "term-1",
+        }))
+        .expect("should parse");
+        assert_eq!(req.session_id, "sess-1");
+        assert_eq!(req.terminal_id, "term-1");
+
+        assert!(parse_terminal_id_params(&serde_json::json!({"sessionId": "sess-1"})).is_none());
+        assert!(parse_terminal_id_params(&serde_json::json!({"terminalId": "term-1"})).is_none());
+    }
+
+    #[test]
+    fn terminal_create_result_matches_the_acp_v1_wire_shape() {
+        assert_eq!(
+            terminal_create_result("term-1"),
+            serde_json::json!({"terminalId": "term-1"})
+        );
+    }
+
+    #[test]
+    fn terminal_exit_status_result_omits_absent_fields_rather_than_sending_null() {
+        assert_eq!(
+            terminal_exit_status_result(&AcpTerminalExitStatus::default()),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            terminal_exit_status_result(&AcpTerminalExitStatus {
+                exit_code: Some(0),
+                signal: None,
+            }),
+            serde_json::json!({"exitCode": 0})
+        );
+        assert_eq!(
+            terminal_exit_status_result(&AcpTerminalExitStatus {
+                exit_code: None,
+                signal: Some("SIGTERM".to_string()),
+            }),
+            serde_json::json!({"signal": "SIGTERM"})
+        );
+    }
+
+    #[test]
+    fn terminal_output_result_includes_exit_status_only_once_present() {
+        assert_eq!(
+            terminal_output_result("hi", false, None),
+            serde_json::json!({"output": "hi", "truncated": false})
+        );
+        assert_eq!(
+            terminal_output_result(
+                "hi",
+                true,
+                Some(&AcpTerminalExitStatus {
+                    exit_code: Some(1),
+                    signal: None,
+                })
+            ),
+            serde_json::json!({"output": "hi", "truncated": true, "exitStatus": {"exitCode": 1}})
+        );
+    }
+
+    #[test]
+    fn terminal_card_text_renders_command_cwd_elapsed_and_running_status() {
+        let view = AcpTerminalView {
+            command_display: "echo hi".to_string(),
+            cwd: Some("/tmp".to_string()),
+            elapsed: std::time::Duration::from_secs(3),
+            exit_status: None,
+            killed: false,
+            released: false,
+            output_tail: "hi".to_string(),
+            truncated: false,
+        };
+        let text = terminal_card_text(&view);
+        assert!(text.contains("$ echo hi"));
+        assert!(text.contains("cwd: /tmp"));
+        assert!(text.contains("running \u{b7} 3s"));
+        assert!(text.contains("hi"));
+    }
+
+    #[test]
+    fn terminal_card_text_shows_exit_status_and_truncation_note() {
+        let view = AcpTerminalView {
+            command_display: "cargo test".to_string(),
+            cwd: None,
+            elapsed: std::time::Duration::from_secs(12),
+            exit_status: Some(AcpTerminalExitStatus {
+                exit_code: Some(1),
+                signal: None,
+            }),
+            killed: false,
+            released: true,
+            output_tail: "...truncated tail...".to_string(),
+            truncated: true,
+        };
+        let text = terminal_card_text(&view);
+        assert!(text.contains("exit code 1"));
+        assert!(text.contains("(output truncated)"));
+        // A terminal that finished normally (has an exit status) doesn't
+        // need the released-only "(released)" note — that note exists for
+        // the "released while still running" case only.
+        assert!(!text.contains("(released)"));
+    }
+
+    #[test]
+    fn terminal_card_text_notes_release_while_still_running() {
+        let view = AcpTerminalView {
+            command_display: "sleep 100".to_string(),
+            cwd: None,
+            elapsed: std::time::Duration::from_secs(1),
+            exit_status: None,
+            killed: false,
+            released: true,
+            output_tail: String::new(),
+            truncated: false,
+        };
+        assert!(terminal_card_text(&view).contains("(released)"));
+    }
+
+    #[test]
+    fn tool_call_expanded_text_renders_terminal_content_via_the_lookup_and_falls_back_when_missing()
+    {
+        let call = AcpToolCall {
+            id: "tc-1".to_string(),
+            title: "Run a command".to_string(),
+            kind: "execute".to_string(),
+            status: AcpToolCallStatus::Completed,
+            locations: Vec::new(),
+            content: vec![AcpToolCallContentBlock::Terminal {
+                terminal_id: "term-1".to_string(),
+            }],
+            raw_input: None,
+            raw_output: None,
+        };
+        let view = AcpTerminalView {
+            command_display: "echo hi".to_string(),
+            cwd: None,
+            elapsed: std::time::Duration::from_secs(0),
+            exit_status: None,
+            killed: false,
+            released: false,
+            output_tail: String::new(),
+            truncated: false,
+        };
+        let found = tool_call_expanded_text(&call, |id| (id == "term-1").then(|| view.clone()));
+        assert!(found.contains("$ echo hi"));
+
+        let missing = tool_call_expanded_text(&call, |_| None);
+        assert!(missing.contains("no longer available"));
     }
 
     #[test]
@@ -4414,7 +4869,7 @@ mod tests {
         // never lands, this test times out instead of passing).
         let mut client = spawn_fixture(&[]);
 
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
         match &events[0] {
@@ -4522,7 +4977,7 @@ mod tests {
         )
         .expect("fixture agent should spawn with recording enabled");
 
-        client.initialize();
+        client.initialize(true);
         poll_until(&mut client, TEST_DEADLINE);
         client.new_session(&std::env::temp_dir(), vec![]);
         poll_until(&mut client, TEST_DEADLINE);
@@ -4592,7 +5047,7 @@ mod tests {
     #[test]
     fn initialize_advertises_fs_capabilities_the_agent_actually_receives() {
         let mut client = spawn_fixture(&[]);
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
         match &events[0] {
@@ -4621,7 +5076,7 @@ mod tests {
     #[test]
     fn initialize_advertises_auth_terminal_capability_the_agent_actually_receives() {
         let mut client = spawn_fixture(&[]);
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
         match &events[0] {
@@ -4647,7 +5102,7 @@ mod tests {
     #[test]
     fn initialize_auth_methods_includes_terminal_method_when_capability_advertised() {
         let mut client = spawn_fixture(&[("ACP_FAKE_AUTH_METHODS", "1")]);
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
         match &events[0] {
@@ -4704,7 +5159,7 @@ mod tests {
     #[test]
     fn agent_death_mid_session_surfaces_as_event_no_panic() {
         let mut client = spawn_fixture(&[("ACP_FAKE_DIE_AFTER_INIT", "1")]);
-        client.initialize();
+        client.initialize(true);
 
         // The fixture answers `initialize` and exits in the same breath, so
         // `Initialized` and the `AgentExited` its EOF produces may be drained
@@ -4757,7 +5212,7 @@ mod tests {
         // right before its real `initialize` response. Neither should
         // prevent the real response from parsing correctly.
         let mut client = spawn_fixture(&[("ACP_FAKE_EMIT_GARBAGE", "1")]);
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert_eq!(
             events.len(),
@@ -4775,7 +5230,7 @@ mod tests {
         // recognize (anything other than session/update) doesn't wedge the
         // stream — the next real message still comes through.
         let mut client = spawn_fixture(&[]);
-        client.initialize();
+        client.initialize(true);
         let events = poll_until(&mut client, TEST_DEADLINE);
         assert!(matches!(events.first(), Some(AcpEvent::Initialized { .. })));
         // session/cancel is a fire-and-forget notification the fixture

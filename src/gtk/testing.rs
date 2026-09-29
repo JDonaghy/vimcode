@@ -6231,7 +6231,7 @@ second line here
                 &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             // Only needs to be non-empty: routing checks emptiness to pick
             // the transport, but the client above already exists, so
@@ -6326,7 +6326,7 @@ second line here
                 &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -6461,7 +6461,7 @@ second line here
                 &[("ACP_FAKE_REQUEST_PERMISSION_EXECUTE", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -6544,7 +6544,7 @@ second line here
                 &[("ACP_FAKE_REQUEST_PERMISSION_DIFF", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
             engine.settings.acp_permission_default =
@@ -6622,7 +6622,7 @@ second line here
                 &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
             )
             .expect("fixture agent should spawn");
-            client_a.initialize();
+            client_a.initialize(true);
             engine.acp_mut().client = Some(client_a);
             engine.acp_mut().label = "claude".to_string();
 
@@ -6639,7 +6639,7 @@ second line here
                 &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
             )
             .expect("fixture agent should spawn");
-            client_b.initialize();
+            client_b.initialize(true);
             engine.acp_mut().client = Some(client_b);
             engine.acp_mut().label = "gemini".to_string();
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
@@ -6769,7 +6769,7 @@ second line here
                 &[("ACP_FAKE_FS_READ_PATH", path_str.as_str())],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -6840,7 +6840,7 @@ second line here
                 &[("ACP_FAKE_SESSION_MODES", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -6921,7 +6921,7 @@ second line here
                 &[("ACP_FAKE_SESSION_CONFIG_OPTIONS", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -7712,7 +7712,7 @@ second line here
                 &[("ACP_FAKE_NO_TOOL_REQUEST", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -7846,7 +7846,7 @@ second line here
                 &[("ACP_FAKE_TOOL_CALL_STATUS_ONLY", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -7922,7 +7922,7 @@ second line here
                 ],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -8091,7 +8091,7 @@ second line here
                 &[("ACP_FAKE_AUTH_METHODS", "1")],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -8198,7 +8198,7 @@ second line here
             &[("ACP_FAKE_REQUEST_PERMISSION", "1")],
         )
         .expect("fixture agent should spawn");
-        client.initialize();
+        client.initialize(true);
         engine.acp_mut().client = Some(client);
         engine.settings.acp_agent_command = "already-spawned-above".to_string();
         assert!(
@@ -8277,7 +8277,7 @@ second line here
                 ],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             engine.settings.acp_agent_command = "already-spawned-above".to_string();
         }
@@ -8405,7 +8405,7 @@ second line here
                 ],
             )
             .expect("fixture agent should spawn");
-            client.initialize();
+            client.initialize(true);
             engine.acp_mut().client = Some(client);
             // Read directly by `acp_launch_terminal_login` — distinct from
             // (and independent of) the NDJSON client spawned above. Quoted
@@ -22345,6 +22345,126 @@ mod issue_1511_ai_panel_tool_call_cards {
             "the tool call must paint before the second reply that \
              followed it over the wire — not after the whole \
              conversation; painted: {texts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod issue_1522_acp_terminal_cards {
+    use super::*;
+    use quadraui::testing::ConformanceDriver;
+
+    /// An `Engine` with the AI panel shown and a fixture agent configured
+    /// to reply via `$ACP_FAKE_TERMINAL` — see that env var's doc in
+    /// `tests/fixtures/fake_acp_agent.sh` for the exact `terminal/create`
+    /// -> `terminal/wait_for_exit` -> `terminal/release` sequence it
+    /// drives.
+    fn acp_terminal_engine() -> Engine {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/fake_acp_agent.sh"
+        );
+        let mut engine = Engine::new_for_test();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_AI,
+        ));
+        engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+            name: "alpha".to_string(),
+            command: format!("sh \"{fixture}\""),
+            cwd: String::new(),
+            env: vec!["ACP_FAKE_TERMINAL=1".to_string()],
+            mcp_servers: Vec::new(),
+        }];
+        engine.settings.acp_active_agent = "alpha".to_string();
+        engine
+    }
+
+    /// #1522 acceptance, GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1522_acp_terminal_cards::terminal_tool_content_renders_a_
+    /// live_card_that_persists_after_release_via_shell_app`: `{type:
+    /// "terminal"}` tool content expands into a live card showing the
+    /// command line, its `cwd`, and its exit status/output, and that card
+    /// keeps painting after the agent calls `terminal/release`.
+    ///
+    /// RED verified (same revert as the TUI twin — `AcpToolCallContentBlock::
+    /// Terminal`'s render arm in `tool_call_expanded_text` reverted to the
+    /// pre-#1522 `"(terminal output omitted)"` placeholder): none of
+    /// `cwd:`/`exit code 0`/the captured `acp-terminal-output` text ever
+    /// paint, expanded or not.
+    #[cfg(unix)]
+    #[test]
+    fn terminal_tool_content_renders_a_live_card_that_persists_after_release_via_gtk_driver() {
+        let mut h = harness(acp_terminal_engine(), 1200, 800);
+        for c in ":AI hi".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.press_named(quadraui::NamedKey::Enter);
+        h.driver.render();
+
+        // Wait for the fixture's scripted round trip to fully finish —
+        // `terminal/create` -> `terminal/wait_for_exit` ->
+        // `terminal/release`. Polling engine state here only decides when
+        // to stop driving the event loop; every actual assertion below
+        // reads painted text, never this state, per this repo's "rendered
+        // output, not state" rule.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut released = false;
+        while !released && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            released = h
+                .engine
+                .borrow()
+                .acp()
+                .acp_terminals
+                .values()
+                .next()
+                .map(|r| r.released)
+                .unwrap_or(false);
+            if !released {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert!(
+            released,
+            "setup: the fixture's terminal/release round trip must \
+             complete within 5s"
+        );
+
+        assert!(
+            h.driver.screen_contains("[x] execute: Run a command"),
+            "the tool call must reach its completed collapsed summary \
+             line; painted: {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.click_text("execute: Run a command");
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("$ echo acp-terminal-output"),
+            "expanding the card must show the terminal's command line; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("cwd: /tmp"),
+            "expanding the card must show the terminal's cwd; \
+             painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("exit code 0"),
+            "expanding the card must show the terminal's exit status, \
+             read after terminal/release dropped the live PTY — proving \
+             the card's snapshot survives release; painted: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("acp-terminal-output"),
+            "expanding the card must show the command's own captured \
+             output; painted: {:?}",
+            h.driver.painted_texts()
         );
     }
 }
