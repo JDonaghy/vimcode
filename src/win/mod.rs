@@ -323,20 +323,17 @@
 //! `docs/PENDING_QUADRAUI_ISSUES.md` (new entry) rather than built in this
 //! crate.
 //!
-//! **Update (#1614):** the title-bar/command-centre fix landed upstream as
-//! quadraui#1199 (`WinBackend::backend_caps()` declares `window_chrome:
-//! true`, `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`),
-//! and `App::render_content`'s existing three-way branch needed no change
-//! to pick it up, confirming the analysis above. **The pin was not
-//! bumped**, though: the quadraui rev containing #1199 also contains
-//! #1200 (native menu bar), and real-hardware verification on dell64 found
-//! #1200 crashes `vimcode.exe` on every startup before any window shows
-//! (`RefCell already borrowed` panic inside `win::run`'s `wndproc`,
-//! reentered synchronously from `SetMenu`). Full repro and a fix sketch
-//! are drafted as a new `docs/PENDING_QUADRAUI_ISSUES.md` entry. Leave
-//! this item of #1562 open behind that regression, not behind the
-//! original `window_chrome` gap — the status-segment item still separately
-//! needs its own real-hardware re-check once Win-GUI can start again.
+//! **Update (#1618):** the pin now includes quadraui#1199
+//! (`WinBackend::backend_caps()` declares `window_chrome: true`,
+//! `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`) and the
+//! `JDonaghy/quadraui#1213` reentrancy fix that unblocked bumping past it
+//! (see the `Cargo.toml` pin comment). `App::render_content`'s existing
+//! three-way branch needed no vimcode-side change to pick it up, confirming
+//! the analysis above. Real-hardware verification on dell64 (see this
+//! issue's tracking notes) confirms the custom title bar and command
+//! centre now render instead of falling into the TUI-shaped hidden arm —
+//! the status-segment item still separately needs its own real-hardware
+//! re-check now that Win-GUI can start again.
 //!
 //! # #1582: no menu bar at startup on Win-GUI — the same `backend_caps`
 //! # gap #1562 found, but the narrower `native_menu` half of it
@@ -379,21 +376,17 @@
 //! `#1562`'s separate `window_chrome` entry — either can land
 //! independently, and #1582 needs only this one.
 //!
-//! **Update (#1614):** `WinBackend::install_menu_bar`/`native_menu: true`
-//! landed upstream as quadraui#1200, and confirmed the prediction above —
+//! **Update (#1618):** `WinBackend::install_menu_bar`/`native_menu: true`
+//! landed upstream as quadraui#1200, confirming the prediction above —
 //! `App::setup`'s existing `native_menu` arm and `App::handle_event`'s
-//! existing `MenuActivated` match need no vimcode-side change. But
-//! real-hardware verification on dell64 found #1200 itself is broken:
-//! `install_menu_bar_now`'s `SetMenu` call re-enters `win::run`'s
-//! `wndproc` with a nested `WM_SIZE` while the outer call already holds
-//! `ws.state.borrow_mut()`, panicking (`RefCell already borrowed`) and
-//! aborting the process — 100% reproducible, every launch, confirmed at
-//! both `cc2b80d` and `928f2b5`. Isolated to #1200 specifically (the
-//! immediately-prior pin, `db92e46`, launches cleanly; adding #1199's
-//! `window_chrome` on top makes no difference to the crash). **The pin
-//! was not bumped.** Full repro, isolation table and a fix sketch are in
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — file that on quadraui
-//! and get a fix merged before #1582 can be verified, let alone closed.
+//! existing `MenuActivated` match needed no vimcode-side change. #1614
+//! found #1200 itself crashed `vimcode.exe` on every startup
+//! (`RefCell already borrowed`, `JDonaghy/quadraui#1213`); that fix landed
+//! upstream as `ce1c763` (a `ModalPumpGuard` around the reentrant `SetMenu`
+//! call) plus a regression test in `6e14d8a`, and the pin now includes
+//! both. Real-hardware verification on dell64 confirms `vimcode.exe`
+//! launches cleanly with a real, clickable native menu bar present at
+//! startup.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -700,5 +693,76 @@ mod win_driver_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── #1618: `WinBackend::backend_caps().native_menu` adoption ────────
+    //
+    // Bodies mirror `src/macos/mod.rs::mac_driver_tests::native_menu_
+    // backend_suppresses_the_drawn_menu_row` /
+    // `command_center_paints_on_a_native_menu_backend` exactly (the same
+    // `App::setup`/`App::render_content` three-way `backend_caps()` branch
+    // both backends share — see this module's own top-of-file `#1562`/
+    // `#1582` doc sections). Those two macOS tests have covered this exact
+    // branch since #901/#939; this pair only newly applies it to
+    // `WinBackend` now that the quadraui pin includes #1199/#1200 (see
+    // `Cargo.toml`'s pin comment) and `WinBackend::backend_caps()`
+    // (target_os = "windows"-gated, `quadraui::win::backend`) reports
+    // `native_menu: true` for the first time. Like the rest of this
+    // module, only registered as an actual `#[test]` on real Windows —
+    // see the `win_driver_tests` module doc above for why.
+
+    /// #1618/quadraui#1200: `WinBackend` now declares `BackendCaps::
+    /// native_menu`, so `App::setup` must install the real `HMENU` and
+    /// suppress the in-window drawn menu row rather than painting both —
+    /// the same #901 rule macOS's `MacBackend` already exercises.
+    #[cfg_attr(target_os = "windows", test)]
+    fn native_menu_backend_suppresses_the_drawn_menu_row() {
+        let h = conformance_harness(plain_engine(), 1400, 900);
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "the in-window menu row must not paint when WinBackend declares \
+             a native menu bar; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// #1618/quadraui#1199+#1200: the Command Center must still paint in
+    /// the title-bar band on `WinBackend` even though the drawn menu row
+    /// sharing that band is suppressed by `native_menu` — the same #939
+    /// coupling macOS's sibling test pins, now newly reachable on Windows
+    /// because `backend_caps().window_chrome`/`native_menu` were both
+    /// `false` before this pin bump (see `Cargo.toml`'s pin comment).
+    #[cfg_attr(target_os = "windows", test)]
+    fn command_center_paints_on_a_native_menu_backend() {
+        use quadraui::Backend;
+
+        let mut engine = plain_engine();
+        // A distinctive, non-default `cwd` so the Command Center's "🔍
+        // <project>" search label is unmistakable in `painted_texts()` —
+        // mirrors the macOS sibling test's identical fixture.
+        engine.cwd = PathBuf::from("omnibar-fixture-1618");
+
+        let h = conformance_harness(engine, 1400, 900);
+
+        assert!(
+            h.driver.backend().backend_caps().native_menu,
+            "precondition: WinBackend must declare native_menu on real \
+             Windows now that the pin includes quadraui#1200"
+        );
+
+        assert!(
+            !h.driver.screen_contains("File"),
+            "sibling assertion to native_menu_backend_suppresses_the_drawn_menu_row \
+             -- the drawn menu row must stay suppressed; painted text was {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("omnibar-fixture-1618"),
+            "the Command Center's search label must paint in the title-bar \
+             band even though the drawn menu row sharing that band is \
+             suppressed; painted text was {:?}",
+            h.driver.painted_texts()
+        );
     }
 }
