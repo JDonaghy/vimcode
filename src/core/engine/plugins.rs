@@ -1,9 +1,410 @@
 use super::*;
 
+/// Upper bound on nested plugin events queued during one dispatch. A plugin
+/// whose edit fires an event whose handler edits again could otherwise cascade
+/// without end; past this point the queue stops growing and the extra events
+/// are dropped rather than wedging the editor.
+const MAX_DEFERRED_PLUGIN_EVENTS: usize = 64;
+
+/// Upper bound on drain rounds, for the same reason: each round may enqueue
+/// more events.
+const MAX_DEFERRED_DRAIN_ROUNDS: usize = 8;
+
 impl Engine {
     // =========================================================================
     // Plugin system
     // =========================================================================
+
+    /// Install a plugin manager. Wraps it in the `Rc` the dispatch path needs:
+    /// dispatch clones the `Rc` out rather than `take()`ing the manager, so the
+    /// field stays populated for the duration of a Lua call (#1214) — that is
+    /// what lets nested code still see "there is a plugin manager" and what
+    /// makes loaning `&mut Engine` to Lua sound (no outstanding borrow of
+    /// `self.plugin_manager` is held across the call).
+    pub fn set_plugin_manager(&mut self, mgr: plugin::PluginManager) {
+        self.plugin_manager = Some(std::rc::Rc::new(mgr));
+    }
+
+    /// Whether a Lua dispatch could actually run right now — plugins enabled, a
+    /// manager installed, and no dispatch already in flight. Callers use this to
+    /// skip building a [`plugin::PluginCallContext`] (which snapshots registers,
+    /// marks and settings) on hot paths such as the per-keystroke plugin-keymap
+    /// fallback.
+    pub(crate) fn can_dispatch_to_plugins(&self) -> bool {
+        self.settings.plugins_enabled
+            && self.plugin_dispatch_depth == 0
+            && self.plugin_manager.is_some()
+    }
+
+    /// Run one Lua dispatch with a live `&mut Engine` loan installed.
+    ///
+    /// `f` receives the plugin manager and returns whatever the dispatch
+    /// produced (typically the updated [`plugin::PluginCallContext`]).
+    ///
+    /// Returns `None` — meaning "nothing was dispatched" — when plugins are
+    /// disabled, when there is no manager, or when a dispatch is already in
+    /// flight. That last case is the **reentrancy guard**: Lua must never be
+    /// re-entered while a `&mut Engine` is loaned out, so a plugin-triggered
+    /// edit that fires an event gets the event *deferred*
+    /// (see [`Engine::plugin_event`]) rather than recursing.
+    pub(crate) fn with_plugin_dispatch<R>(
+        &mut self,
+        f: impl FnOnce(&plugin::PluginManager) -> R,
+    ) -> Option<R> {
+        if !self.settings.plugins_enabled || self.plugin_dispatch_depth > 0 {
+            return None;
+        }
+        let pm = std::rc::Rc::clone(self.plugin_manager.as_ref()?);
+        self.plugin_dispatch_depth += 1;
+        let out = {
+            // The loan holds a `&mut` borrow of `*self` for this whole block,
+            // so nothing here can touch `self` directly while Lua may be
+            // mutating it through the loan.
+            let _loan = plugin::EngineLoan::new(self);
+            f(&pm)
+        };
+        self.plugin_dispatch_depth -= 1;
+        // Close any undo group the immediate API opened during the call, so a
+        // plugin's immediate edits collapse into one undo step per buffer —
+        // matching the single batch the queued replay path produces.
+        self.finish_plugin_undo_groups();
+        Some(out)
+    }
+
+    // =========================================================================
+    // Immediate ("live engine") plugin API — `vimcode.buffer.*` /
+    // `vimcode.window.*`. See `core::plugin`'s module docs for the conventions;
+    // the Lua wrappers in that file are thin and all logic lives here.
+    // =========================================================================
+
+    /// Resolve a Lua buffer handle (`0` = current) to a live [`BufferId`].
+    pub(crate) fn plugin_api_resolve_buf(&self, handle: i64) -> Option<BufferId> {
+        let id = if handle == 0 {
+            self.active_buffer_id()
+        } else if handle > 0 {
+            BufferId(handle as usize)
+        } else {
+            return None;
+        };
+        self.buffer_manager.get(id).map(|_| id)
+    }
+
+    /// Resolve a Lua window handle (`0` = current) to a live [`WindowId`].
+    pub(crate) fn plugin_api_resolve_win(&self, handle: i64) -> Option<WindowId> {
+        let id = if handle == 0 {
+            self.active_window_id()
+        } else if handle > 0 {
+            WindowId(handle as usize)
+        } else {
+            return None;
+        };
+        self.windows.get(&id).map(|_| id)
+    }
+
+    /// Logical line count: ropey reports a phantom trailing empty line for a
+    /// buffer that ends in a newline, which this excludes so that
+    /// `get_lines(0, line_count)` / `set_lines(0, line_count, …)` round-trip.
+    pub(crate) fn plugin_api_line_count(&self, buf: BufferId) -> usize {
+        let Some(state) = self.buffer_manager.get(buf) else {
+            return 0;
+        };
+        Self::plugin_api_logical_lines(&state.buffer.content)
+    }
+
+    fn plugin_api_logical_lines(rope: &ropey::Rope) -> usize {
+        let n = rope.len_lines();
+        if n > 1 && rope.line(n - 1).len_chars() == 0 {
+            n - 1
+        } else {
+            n
+        }
+    }
+
+    /// Clamp a Lua line index (0-based, negative counts from the end) into
+    /// `0..=len`.
+    fn plugin_api_clamp_index(idx: i64, len: usize) -> usize {
+        if idx < 0 {
+            (len as i64 + idx).max(0) as usize
+        } else {
+            (idx as usize).min(len)
+        }
+    }
+
+    /// Read lines `[start, end)` of `buf`, **without** trailing newlines.
+    pub(crate) fn plugin_api_get_lines(&self, buf: BufferId, start: i64, end: i64) -> Vec<String> {
+        let Some(state) = self.buffer_manager.get(buf) else {
+            return Vec::new();
+        };
+        let rope = &state.buffer.content;
+        let len = Self::plugin_api_logical_lines(rope);
+        let s = Self::plugin_api_clamp_index(start, len);
+        let e = Self::plugin_api_clamp_index(end, len);
+        if e <= s {
+            return Vec::new();
+        }
+        (s..e)
+            .map(|i| {
+                let line = rope.line(i).to_string();
+                let line = line.strip_suffix('\n').unwrap_or(&line);
+                line.strip_suffix('\r').unwrap_or(line).to_string()
+            })
+            .collect()
+    }
+
+    /// Replace lines `[start, end)` of `buf` with `lines`, immediately.
+    ///
+    /// Every inserted line is newline-terminated, matching the queued replay
+    /// path in [`Engine::apply_plugin_ctx`].
+    pub(crate) fn plugin_api_set_lines(
+        &mut self,
+        buf: BufferId,
+        start: i64,
+        end: i64,
+        lines: Vec<String>,
+    ) {
+        let Some(state) = self.buffer_manager.get(buf) else {
+            return;
+        };
+        let len = Self::plugin_api_logical_lines(&state.buffer.content);
+        let s = Self::plugin_api_clamp_index(start, len);
+        let e = Self::plugin_api_clamp_index(end, len).max(s);
+
+        // One undo group per buffer per dispatch (see
+        // `finish_plugin_undo_groups`) so a plugin that writes ten times
+        // leaves one undo step, not ten.
+        self.begin_plugin_undo_group(buf);
+
+        let Some(state) = self.buffer_manager.get_mut(buf) else {
+            return;
+        };
+        let raw_lines = state.buffer.len_lines();
+        let char_start = if s < raw_lines {
+            state.buffer.line_to_char(s)
+        } else {
+            state.buffer.len_chars()
+        };
+        let char_end = if e < len && e < raw_lines {
+            state.buffer.line_to_char(e)
+        } else {
+            state.buffer.len_chars()
+        };
+        if char_end > char_start {
+            let old: String = state.buffer.content.slice(char_start..char_end).to_string();
+            state.record_delete(char_start, &old);
+            state.buffer.delete_range(char_start, char_end);
+        }
+        if !lines.is_empty() {
+            let mut text = String::new();
+            for line in &lines {
+                text.push_str(line);
+                text.push('\n');
+            }
+            let insert_at = char_start.min(state.buffer.len_chars());
+            state.record_insert(insert_at, &text);
+            state.buffer.insert(insert_at, &text);
+        }
+        state.dirty = true;
+        state.mark_syntax_stale();
+        self.clamp_cursors_to_buffer(buf);
+    }
+
+    /// Create a new empty buffer and return its id.
+    ///
+    /// `scratch` marks it as not file-backed (shown in the tab bar under
+    /// `name`, never written to disk by `:w`-less flows); `name` sets that
+    /// display name.
+    pub(crate) fn plugin_api_create_buffer(
+        &mut self,
+        scratch: bool,
+        name: Option<String>,
+    ) -> BufferId {
+        let buf_id = self.buffer_manager.create();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.dirty = false;
+            state.file_path = None;
+            if scratch || name.is_some() {
+                state.scratch_name = Some(name.unwrap_or_else(|| format!("Scratch {}", buf_id.0)));
+            }
+        }
+        buf_id
+    }
+
+    /// Buffer currently shown in `win` (`0` = current window).
+    pub(crate) fn plugin_api_win_get_buf(&self, win: i64) -> Option<BufferId> {
+        let id = self.plugin_api_resolve_win(win)?;
+        self.windows.get(&id).map(|w| w.buffer_id)
+    }
+
+    /// Show `buf` in `win`. Returns false if either handle is invalid.
+    ///
+    /// Fires the existing `BufEnter` event for the newly shown buffer — the
+    /// same event `lsp_did_open` fires when a file is opened, so a
+    /// plugin-driven buffer switch is observable to extensions the same way a
+    /// user-driven one is. Because this necessarily runs *while* a plugin
+    /// callback is executing, it is the deferred-event path in action: the
+    /// event is queued and dispatched as soon as the outer callback returns
+    /// (pre-#1214 a nested event silently vanished).
+    pub(crate) fn plugin_api_win_set_buf(&mut self, win: i64, buf: i64) -> bool {
+        let Some(win_id) = self.plugin_api_resolve_win(win) else {
+            return false;
+        };
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
+            return false;
+        };
+        let switched = match self.windows.get_mut(&win_id) {
+            Some(w) => {
+                let changed = w.buffer_id != buf_id;
+                w.buffer_id = buf_id;
+                w.view.cursor = crate::core::cursor::Cursor::default();
+                w.view.scroll_top = 0;
+                changed
+            }
+            None => return false,
+        };
+        if switched {
+            let arg = self
+                .buffer_manager
+                .get(buf_id)
+                .map(|s| match s.file_path.as_ref() {
+                    Some(p) => p.to_string_lossy().into_owned(),
+                    None => s.display_name(),
+                })
+                .unwrap_or_default();
+            self.plugin_event("BufEnter", &arg);
+        }
+        true
+    }
+
+    /// Cursor of `win` as 1-indexed `(line, col)`.
+    pub(crate) fn plugin_api_win_get_cursor(&self, win: i64) -> Option<(usize, usize)> {
+        let id = self.plugin_api_resolve_win(win)?;
+        let w = self.windows.get(&id)?;
+        Some((w.view.cursor.line + 1, w.view.cursor.col + 1))
+    }
+
+    /// Move `win`'s cursor to 1-indexed `(line, col)`, clamped to the buffer.
+    pub(crate) fn plugin_api_win_set_cursor(&mut self, win: i64, line: usize, col: usize) -> bool {
+        let Some(id) = self.plugin_api_resolve_win(win) else {
+            return false;
+        };
+        let Some(buf_id) = self.windows.get(&id).map(|w| w.buffer_id) else {
+            return false;
+        };
+        let max_line = self
+            .buffer_manager
+            .get(buf_id)
+            .map(|s| s.buffer.len_lines().saturating_sub(1))
+            .unwrap_or(0);
+        let target_line = line.saturating_sub(1).min(max_line);
+        let max_col = self.max_cursor_col_in_buffer(buf_id, target_line);
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.view.cursor.line = target_line;
+            w.view.cursor.col = col.saturating_sub(1).min(max_col);
+            return true;
+        }
+        false
+    }
+
+    /// Keep every window showing `buf` inside its (possibly shrunken) bounds
+    /// after an immediate edit.
+    fn clamp_cursors_to_buffer(&mut self, buf: BufferId) {
+        let Some(state) = self.buffer_manager.get(buf) else {
+            return;
+        };
+        let max_line = state.buffer.len_lines().saturating_sub(1);
+        let win_ids: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|(_, w)| w.buffer_id == buf)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in win_ids {
+            let line = self
+                .windows
+                .get(&id)
+                .map(|w| w.view.cursor.line.min(max_line))
+                .unwrap_or(0);
+            let max_col = self.max_cursor_col_in_buffer(buf, line);
+            if let Some(w) = self.windows.get_mut(&id) {
+                w.view.cursor.line = line;
+                w.view.cursor.col = w.view.cursor.col.min(max_col);
+            }
+        }
+    }
+
+    /// Longest valid cursor column on `line` of `buf` (0-indexed), for
+    /// clamping a cursor that belongs to a buffer other than the active one —
+    /// the buffer-agnostic twin of [`Engine::get_max_cursor_col`], with the
+    /// same trailing-newline handling.
+    fn max_cursor_col_in_buffer(&self, buf: BufferId, line: usize) -> usize {
+        let Some(state) = self.buffer_manager.get(buf) else {
+            return 0;
+        };
+        let len = state.buffer.line_len_chars(line);
+        if len == 0 {
+            return 0;
+        }
+        let ends_with_newline = state.buffer.content.line(line).chars().last() == Some('\n');
+        if ends_with_newline {
+            len.saturating_sub(2)
+        } else {
+            len - 1
+        }
+    }
+
+    /// Open an undo group for `buf` unless the current dispatch already did.
+    fn begin_plugin_undo_group(&mut self, buf: BufferId) {
+        if self.plugin_undo_groups.contains(&buf) {
+            return;
+        }
+        let cursor = if buf == self.active_buffer_id() {
+            *self.cursor()
+        } else {
+            crate::core::cursor::Cursor::default()
+        };
+        if let Some(state) = self.buffer_manager.get_mut(buf) {
+            state.start_undo_group(cursor);
+            self.plugin_undo_groups.push(buf);
+        }
+    }
+
+    /// Commit every undo group the immediate API opened during this dispatch.
+    fn finish_plugin_undo_groups(&mut self) {
+        if self.plugin_undo_groups.is_empty() {
+            return;
+        }
+        let active = self.active_buffer_id();
+        let active_cursor = *self.cursor();
+        for buf in std::mem::take(&mut self.plugin_undo_groups) {
+            let cursor = if buf == active {
+                active_cursor
+            } else {
+                crate::core::cursor::Cursor::default()
+            };
+            if let Some(state) = self.buffer_manager.get_mut(buf) {
+                state.finish_undo_group(cursor);
+            }
+        }
+    }
+
+    /// Drain events that were deferred because they fired from inside a plugin
+    /// dispatch (see [`Engine::plugin_event`]).
+    fn drain_deferred_plugin_events(&mut self) {
+        if self.deferred_plugin_events.is_empty() || self.plugin_events_draining {
+            return;
+        }
+        self.plugin_events_draining = true;
+        for _ in 0..MAX_DEFERRED_DRAIN_ROUNDS {
+            if self.deferred_plugin_events.is_empty() {
+                break;
+            }
+            for (event, arg) in std::mem::take(&mut self.deferred_plugin_events) {
+                self.plugin_event(&event, &arg);
+            }
+        }
+        self.deferred_plugin_events.clear();
+        self.plugin_events_draining = false;
+    }
 
     /// Initialize the plugin manager: load all `.lua` files / `init.lua` dirs
     /// from `~/.config/vimcode/plugins/`.
@@ -67,7 +468,7 @@ impl Engine {
                     self.ext_panel_help_bindings
                         .insert(panel_name.clone(), bindings.clone());
                 }
-                self.plugin_manager = Some(mgr);
+                self.set_plugin_manager(mgr);
                 // Load per-extension settings for installed extensions
                 let installed_names: Vec<String> = self
                     .extension_state
@@ -590,6 +991,12 @@ impl Engine {
         for url in ctx.open_urls {
             self.open_url(&url);
         }
+        // A dispatch's queued output is now applied, so this is the end of that
+        // dispatch: flush any event that fired from inside it (#1214). Doing it
+        // here rather than at each of the four dispatch entry points keeps the
+        // "deferred events run once the outer callback's effects have landed"
+        // ordering in one place.
+        self.drain_deferred_plugin_events();
     }
 
     /// Poll for completed async shell tasks spawned by plugins.
@@ -655,20 +1062,36 @@ impl Engine {
     }
 
     /// Fire an event hook (e.g. "save", "open") for all registered listeners.
+    ///
+    /// **Reentrancy (#1214).** An event that fires *while a plugin callback is
+    /// running* — e.g. a plugin's own immediate `vimcode.buffer.set_lines`
+    /// triggering a buffer-change event — cannot dispatch straight away,
+    /// because Lua must not be re-entered while `&mut Engine` is loaned to it.
+    /// Such an event is pushed onto `deferred_plugin_events` and dispatched by
+    /// [`Engine::drain_deferred_plugin_events`] the moment the outer dispatch
+    /// finishes, so it fires for real instead of the pre-#1214 silent no-op
+    /// (the old code `take()`-ed the manager for the duration of the call, so a
+    /// nested event found `None` and vanished).
     pub fn plugin_event(&mut self, event: &str, arg: &str) {
         if !self.settings.plugins_enabled {
             return;
         }
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return,
-        };
         // Skip the potentially O(N_lines) context construction if no hooks are
         // registered for this event.  For cursor_move this avoids building
         // Vec<String> of all buffer lines on every keystroke when no extension
         // has registered a cursor_move listener.
-        if !pm.has_event_hooks(event) {
-            self.plugin_manager = Some(pm);
+        let has_hooks = self
+            .plugin_manager
+            .as_ref()
+            .is_some_and(|pm| pm.has_event_hooks(event));
+        if !has_hooks {
+            return;
+        }
+        if self.plugin_dispatch_depth > 0 {
+            if self.deferred_plugin_events.len() < MAX_DEFERRED_PLUGIN_EVENTS {
+                self.deferred_plugin_events
+                    .push((event.to_string(), arg.to_string()));
+            }
             return;
         }
         // For cursor_move on clean buffers, skip the O(N) buf_lines build.
@@ -681,8 +1104,10 @@ impl Engine {
                 .map(|s| s.dirty)
                 .unwrap_or(false);
         let ctx = self.make_plugin_ctx(skip);
-        let ctx = pm.call_event(event, arg, ctx);
-        self.plugin_manager = Some(pm);
+        let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_event(event, arg, ctx)) else {
+            return;
+        };
+        // `apply_plugin_ctx` drains the deferred-event queue on the way out.
         self.apply_plugin_ctx(ctx);
     }
 

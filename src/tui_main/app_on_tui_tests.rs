@@ -9738,4 +9738,107 @@ mod tests {
             );
         }
     }
+    // ─────────────────────────────────────────────────────────────────────────
+    // Immediate plugin API (#1214) — the live engine seam, painted
+    // ─────────────────────────────────────────────────────────────────────────
+    mod live_plugin_api {
+        use super::*;
+
+        /// An engine with one Lua plugin loaded from a temp dir, named so
+        /// concurrent runs cannot collide.
+        fn engine_with_plugin(unique: &str, code: &str) -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vc_app_on_tui_live_api_{unique}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{unique}.lua")), code).unwrap();
+            let mut engine = plain_engine();
+            let mut mgr =
+                crate::core::plugin::PluginManager::new().expect("PluginManager::new must succeed");
+            mgr.load_plugins_dir(&dir, &[]);
+            assert!(
+                mgr.plugins[0].error.is_none(),
+                "plugin must load cleanly: {:?}",
+                mgr.plugins[0].error
+            );
+            engine.set_plugin_manager(mgr);
+            let _ = std::fs::remove_dir_all(&dir);
+            engine
+        }
+
+        /// #1214's acceptance scenario, driven through the real key pipeline and
+        /// asserted on **painted output**: a `:`-command whose Lua callback
+        /// creates a scratch buffer, writes it with the immediate API, reads it
+        /// back in the same callback, and shows it with `vimcode.window.set_buf`.
+        ///
+        /// Three separate things have to work for the screen to be right, and
+        /// each shows up as different painted text:
+        ///
+        /// * `ZQ_LIVE_ONE`/`ZQ_LIVE_TWO` paint only if `buffer.create` returned
+        ///   a usable handle, the immediate `set_lines` landed in that buffer,
+        ///   and `window.set_buf` put it on screen.
+        /// * `ZQ_READ=ZQ_LIVE_TWO/11` paints only if the read-after-write inside
+        ///   the same callback saw the write (the whole point of the seam — the
+        ///   legacy `vimcode.buf.get_lines` would have read the pre-call
+        ///   snapshot of the *old* buffer) **and** stripped the trailing
+        ///   newline: `#("ZQ_LIVE_TWO")` is 11, a terminator would make it 12.
+        /// * `[ZQSCRATCH]` on the tab row proves the created buffer is the one
+        ///   being displayed, not a coincidentally-similar edit of the original.
+        ///
+        /// RED-verified against unfixed `develop`: there is no `vimcode.buffer`
+        /// table there, so the callback errors at the first call and the screen
+        /// keeps showing the original buffer — none of the three markers appear.
+        #[test]
+        fn immediate_api_scratch_buffer_paints_after_plugin_command_via_shell_app() {
+            let engine = engine_with_plugin(
+                "live_scratch",
+                r#"
+                vimcode.command("ZqLive", function(_)
+                    local b = vimcode.buffer.create({ scratch = true, name = "ZQSCRATCH" })
+                    vimcode.buffer.set_lines(b, 0, -1, { "ZQ_LIVE_ONE", "ZQ_LIVE_TWO" })
+                    local back = vimcode.buffer.get_lines(b, 0, 2)
+                    local n = vimcode.buffer.line_count(b)
+                    vimcode.buffer.set_lines(b, n, n, { "ZQ_READ=" .. back[2] .. "/" .. #back[2] })
+                    vimcode.window.set_buf(0, b)
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                !before.contains("ZQ_LIVE_ONE"),
+                "precondition: nothing is painted before the command runs; \
+                 screen:\n{before}"
+            );
+
+            driver.type_char(':');
+            for c in "ZqLive".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_LIVE_ONE") && screen.contains("ZQ_LIVE_TWO"),
+                "the immediately-written scratch buffer must paint after \
+                 window.set_buf; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_READ=ZQ_LIVE_TWO/11"),
+                "the in-callback read-after-write must have returned the \
+                 just-written line without its newline terminator (length 11, \
+                 not 12); screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("[ZQSCRATCH]"),
+                "the created scratch buffer must be the one on display, named \
+                 as the plugin asked; screen:\n{screen}"
+            );
+        }
+    }
 }

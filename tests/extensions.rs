@@ -1675,7 +1675,7 @@ fn engine_with_plugin(text: &str, plugin_name: &str, lua_code: &str) -> vimcode_
     match vimcode_core::core::plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            e.plugin_manager = Some(mgr);
+            e.set_plugin_manager(mgr);
         }
         Err(_) => panic!("failed to create PluginManager"),
     }
@@ -2082,7 +2082,7 @@ fn plugin_vim_enter_fires_on_init() {
     match vimcode_core::core::plugin::PluginManager::new() {
         Ok(mut mgr) => {
             mgr.load_plugins_dir(&dir, &[]);
-            e.plugin_manager = Some(mgr);
+            e.set_plugin_manager(mgr);
             // Fire VimEnter like init_plugins does
             e.plugin_event("VimEnter", "");
         }
@@ -4436,4 +4436,344 @@ fn acquire_terraform_ls_live_smoke() {
     );
 
     let _ = std::fs::remove_dir_all(&data_home);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #1214 — the live engine seam: immediate `vimcode.buffer.*` /
+// `vimcode.window.*`, handles, reentrancy, undo grouping.
+//
+// The legacy `vimcode.buf.*` surface is snapshot-in / queue-out: reads come
+// from a rope clone taken before the callback ran, writes replay afterwards.
+// The tests below pin the *immediate* surface (reads and writes go straight
+// through a live `&mut Engine`) and, alongside it, pin that the legacy
+// semantics did not move.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The kill test, native form: a `set_lines` followed by a `get_lines` in the
+/// *same* callback must read back what was just written — and without the
+/// trailing newline ropey's `Rope::line()` would carry.
+///
+/// RED against unfixed `develop`: there is no `vimcode.buffer` table at all
+/// there, so the callback errors out and `message` stays empty.
+#[test]
+fn immediate_set_lines_then_get_lines_reads_back_the_write() {
+    let mut e = engine_with_plugin(
+        "alpha\nbeta\ngamma\n",
+        "live_read_after_write",
+        r#"
+        vimcode.command("LiveRoundTrip", function(_)
+            vimcode.buffer.set_lines(0, 0, 1, { "REWRITTEN" })
+            local back = vimcode.buffer.get_lines(0, 0, 1)
+            vimcode.message("read=[" .. back[1] .. "] len=" .. #back[1])
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveRoundTrip");
+    assert_eq!(
+        e.message, "read=[REWRITTEN] len=9",
+        "get_lines must observe the immediate write and strip the terminator"
+    );
+    assert_eq!(
+        buf(&e),
+        "REWRITTEN\nbeta\ngamma\n",
+        "the immediate write must have landed in the buffer"
+    );
+}
+
+/// Negative indices count from the end and `line_count` is the *logical* line
+/// count (no phantom trailing empty line), so a full-buffer read/write
+/// round-trips.
+#[test]
+fn immediate_line_count_and_negative_indices_round_trip() {
+    let mut e = engine_with_plugin(
+        "one\ntwo\nthree\n",
+        "live_indices",
+        r#"
+        vimcode.command("LiveIdx", function(_)
+            local n = vimcode.buffer.line_count(0)
+            local last = vimcode.buffer.get_lines(0, -1, n)
+            local all = vimcode.buffer.get_lines(0, 0, n)
+            vimcode.buffer.set_lines(0, 0, n, all)
+            vimcode.message("n=" .. n .. " last=" .. last[1] .. " all=" .. #all)
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveIdx");
+    assert_eq!(
+        e.message, "n=3 last=three all=3",
+        "line_count must exclude ropey's phantom trailing line"
+    );
+    assert_eq!(
+        buf(&e),
+        "one\ntwo\nthree\n",
+        "writing back everything get_lines returned must be a no-op"
+    );
+}
+
+/// `vimcode.buffer.create{scratch=true}` returns a handle that can be written,
+/// read back, and shown with `vimcode.window.set_buf` — all inside one
+/// callback, on a buffer the plugin did not open.
+#[test]
+fn immediate_created_scratch_buffer_can_be_written_read_and_shown() {
+    let mut e = engine_with_plugin(
+        "original\n",
+        "live_scratch",
+        r#"
+        vimcode.command("LiveScratch", function(_)
+            local b = vimcode.buffer.create({ scratch = true, name = "ZQSCRATCH" })
+            vimcode.buffer.set_lines(b, 0, -1, { "scratch one", "scratch two" })
+            local back = vimcode.buffer.get_lines(b, 0, 2)
+            local shown = vimcode.window.set_buf(0, b)
+            vimcode.message(
+                "b=" .. b
+                .. " valid=" .. tostring(vimcode.buffer.is_valid(b))
+                .. " back=" .. back[2]
+                .. " shown=" .. tostring(shown)
+                .. " cur=" .. vimcode.buffer.current()
+            )
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveScratch");
+    let msg = e.message.clone();
+    assert!(
+        msg.contains("valid=true")
+            && msg.contains("back=scratch two")
+            && msg.contains("shown=true"),
+        "scratch buffer must be writable, readable and showable: {msg}"
+    );
+    // `current()` is read *before* the window switch is visible to Lua? No —
+    // set_buf is immediate, so the current buffer is already the new one.
+    let handle = e.active_buffer_id().0;
+    assert!(
+        msg.contains(&format!("b={handle} ")) && msg.contains(&format!("cur={handle}")),
+        "window.set_buf must have made the created buffer current: {msg}"
+    );
+    assert_eq!(
+        buf(&e),
+        "scratch one\nscratch two\n",
+        "the window must now show the scratch buffer's immediate content"
+    );
+}
+
+/// A Lua function stashed in a table at plugin-load time and invoked from a
+/// *later* event can use the immediate API. This is the constraint that decided
+/// the seam's design (a `Lua::scope`-based mechanism cannot express it), and
+/// the shape a timer or UI event handler will have.
+#[test]
+fn stored_lua_callback_invoked_from_a_later_event_uses_the_immediate_api() {
+    let mut e = engine_with_plugin(
+        "before\n",
+        "live_stored_cb",
+        r#"
+        local M = {}
+        M.handlers = {}
+        M.handlers.on_insert = function()
+            vimcode.buffer.set_lines(0, 0, 1, { "written by stored callback" })
+            local back = vimcode.buffer.get_lines(0, 0, 1)
+            vimcode.message("stored=" .. back[1])
+        end
+        vimcode.on("InsertEnter", function(_) M.handlers.on_insert() end)
+        "#,
+    );
+    assert_eq!(e.message, "", "precondition: nothing has run yet");
+    // A genuinely later event, fired through production code.
+    e.set_mode(vimcode_core::Mode::Insert);
+    assert_eq!(
+        e.message, "stored=written by stored callback",
+        "a callback stored at load time must reach the live engine when \
+         invoked from a later event"
+    );
+    assert_eq!(buf(&e), "written by stored callback\n");
+}
+
+/// A plugin-triggered buffer switch fires `BufEnter` *from inside* the plugin
+/// callback. Pre-#1214 that nested event silently vanished (`plugin_event`
+/// `take()`-ed the manager for the duration of the call, so the nested
+/// dispatch found `None`); now it is deferred and dispatched as soon as the
+/// outer callback returns.
+#[test]
+fn plugin_triggered_buffer_switch_fires_a_nested_event() {
+    let mut e = engine_with_plugin(
+        "original\n",
+        "live_nested_event",
+        r#"
+        vimcode.on("BufEnter", function(name)
+            local n = vimcode.buffer.line_count(0)
+            vimcode.buffer.set_lines(0, n, n, { "BufEnter saw " .. name })
+        end)
+        vimcode.command("LiveSwitch", function(_)
+            local b = vimcode.buffer.create({ scratch = true, name = "ZQNEST" })
+            vimcode.buffer.set_lines(b, 0, -1, { "created" })
+            vimcode.window.set_buf(0, b)
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveSwitch");
+    assert_eq!(
+        buf(&e),
+        "created\nBufEnter saw [ZQNEST]\n",
+        "the nested BufEnter must actually run (deferred, after the outer \
+         callback), not silently no-op"
+    );
+}
+
+/// Undo grouping must not regress: the queued path replays a plugin's edits as
+/// one batch, and the immediate path must behave the same way — ten immediate
+/// writes leave one undo step, and one `u` restores the original text.
+#[test]
+fn immediate_multi_line_plugin_edit_is_a_single_undo_step() {
+    let mut e = engine_with_plugin(
+        "L0\nL1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\n",
+        "live_undo",
+        r#"
+        vimcode.command("LiveEditAll", function(_)
+            for i = 0, 9 do
+                vimcode.buffer.set_lines(0, i, i + 1, { "E" .. i })
+            end
+        end)
+        "#,
+    );
+    let before = buf(&e);
+    // Force the undo tree's root node to exist before measuring, so the count
+    // below reflects only what the plugin committed (the first
+    // `start_undo_group` on a buffer seeds the root, which also bumps the
+    // commit counter).
+    e.start_undo_group();
+    e.finish_undo_group();
+    let commits_before = e.active_buffer_state().undo_commit_count();
+    exec(&mut e, "LiveEditAll");
+    assert_eq!(buf(&e), "E0\nE1\nE2\nE3\nE4\nE5\nE6\nE7\nE8\nE9\n");
+    let committed = e.active_buffer_state().undo_commit_count() - commits_before;
+    assert_eq!(
+        committed, 1,
+        "ten immediate writes in one callback must commit exactly one undo \
+         step, not ten"
+    );
+    e.undo();
+    assert_eq!(
+        buf(&e),
+        before,
+        "a single undo must restore the whole plugin edit"
+    );
+}
+
+/// Scope item 4: the legacy queued surface keeps its old semantics exactly —
+/// reads inside the callback are stale (they come from the pre-call snapshot)
+/// *and* they still carry ropey's trailing newline. Extensions in
+/// `JDonaghy/vimcode-ext` depend on both.
+#[test]
+fn legacy_buf_api_stays_stale_and_keeps_its_terminator() {
+    let mut e = engine_with_plugin(
+        "alpha\nbeta\n",
+        "legacy_unchanged",
+        r#"
+        vimcode.command("LegacyRoundTrip", function(_)
+            vimcode.buf.set_lines(0, 1, { "LEGACY" })
+            local back = vimcode.buf.get_lines(0, 1)
+            vimcode.message("read=[" .. back[1] .. "] len=" .. #back[1])
+        end)
+        "#,
+    );
+    exec(&mut e, "LegacyRoundTrip");
+    assert_eq!(
+        e.message, "read=[alpha\n] len=6",
+        "the legacy read must stay stale and keep its trailing newline"
+    );
+    assert_eq!(
+        buf(&e),
+        "LEGACY\nbeta\n",
+        "the legacy write must still be replayed after the callback returns"
+    );
+}
+
+/// Mixing the two tiers in one callback: the queued write is applied *after*
+/// the callback returns, so it lands last and wins — documented order, pinned.
+#[test]
+fn queued_write_is_applied_after_an_immediate_write_to_the_same_line() {
+    let mut e = engine_with_plugin(
+        "alpha\n",
+        "live_mixed_order",
+        r#"
+        vimcode.command("LiveMixed", function(_)
+            vimcode.buf.set_lines(0, 1, { "from queued API" })
+            vimcode.buffer.set_lines(0, 0, 1, { "from immediate API" })
+            local back = vimcode.buffer.get_lines(0, 0, 1)
+            vimcode.message("during=" .. back[1])
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveMixed");
+    assert_eq!(
+        e.message, "during=from immediate API",
+        "during the callback the immediate write is what is visible"
+    );
+    assert_eq!(
+        buf(&e),
+        "from queued API\n",
+        "the queued write replays afterwards and therefore wins"
+    );
+}
+
+/// Window handles: `0` means "current", cursor reads/writes are 1-indexed and
+/// clamped, and both the named and positional table shapes are accepted.
+#[test]
+fn immediate_window_cursor_is_one_indexed_and_clamped() {
+    let mut e = engine_with_plugin(
+        "one\ntwo\nthree\n",
+        "live_window_cursor",
+        r#"
+        vimcode.command("LiveCursor", function(_)
+            local w = vimcode.window.current()
+            vimcode.window.set_cursor(w, { line = 2, col = 2 })
+            local c = vimcode.window.get_cursor(0)
+            vimcode.window.set_cursor(0, { 3, 99 })
+            local d = vimcode.window.get_cursor(w)
+            vimcode.message(
+                "w=" .. w
+                .. " named=" .. c.line .. "," .. c.col
+                .. " pos=" .. d[1] .. "," .. d[2]
+                .. " buf=" .. vimcode.window.get_buf(0)
+            )
+        end)
+        "#,
+    );
+    exec(&mut e, "LiveCursor");
+    let expect = format!(
+        "w={} named=2,2 pos=3,5 buf={}",
+        e.active_window_id().0,
+        e.active_buffer_id().0
+    );
+    assert_eq!(
+        e.message, expect,
+        "cursor must be 1-indexed, clamped to the line, and readable in both \
+         table shapes"
+    );
+    assert_eq!(e.cursor().line, 2, "engine cursor line (0-indexed)");
+    assert_eq!(e.cursor().col, 4, "engine cursor col clamped to 'three'");
+}
+
+/// The immediate API is only valid while a callback is running. Called at
+/// plugin *load* time there is no live engine, and the call must raise a clear
+/// Lua error rather than silently doing nothing (or worse).
+#[test]
+fn immediate_api_outside_a_callback_is_a_clear_lua_error() {
+    let dir = std::env::temp_dir().join("vc_plugin_api_live_no_engine");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("noengine.lua"),
+        "vimcode.buffer.set_lines(0, 0, 1, { \"nope\" })\n",
+    )
+    .unwrap();
+    let mut mgr = vimcode_core::core::plugin::PluginManager::new().unwrap();
+    mgr.load_plugins_dir(&dir, &[]);
+    let err = mgr.plugins[0]
+        .error
+        .clone()
+        .expect("calling the immediate API at load time must be an error");
+    assert!(
+        err.contains("no live editor"),
+        "the error must say the immediate API needs a running callback: {err}"
+    );
 }

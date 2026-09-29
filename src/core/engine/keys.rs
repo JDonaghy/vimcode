@@ -10299,47 +10299,58 @@ impl Engine {
     }
 
     /// Try to run a named plugin command. Returns `true` if the command was found.
+    ///
+    /// Returns `false` when called from inside a plugin callback — unlike an
+    /// event (which `Engine::plugin_event` defers), a command dispatch has to
+    /// answer "was it found?" synchronously, and Lua cannot be re-entered while
+    /// the engine is loaned to it (#1214, see `Engine::with_plugin_dispatch`).
     pub fn plugin_run_command(&mut self, name: &str, args: &str) -> bool {
-        if !self.settings.plugins_enabled {
+        if !self.can_dispatch_to_plugins() {
             return false;
         }
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_command(name, args, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) = self.with_plugin_dispatch(|pm| pm.call_command(name, args, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }
 
     /// Try to run a plugin keymap. Returns `true` if a mapping was found and executed.
+    ///
+    /// Also `false` from inside a plugin callback — see
+    /// [`Engine::plugin_run_command`].
     pub fn plugin_run_keymap(&mut self, mode: &str, key: &str) -> bool {
-        if !self.settings.plugins_enabled {
+        // Cheap bail-out before the (snapshot-building) context construction:
+        // this runs as the fallback for *every* unhandled normal-mode key.
+        if !self.can_dispatch_to_plugins() {
             return false;
         }
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_keymap(mode, key, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) = self.with_plugin_dispatch(|pm| pm.call_keymap(mode, key, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }
 
     /// Run the user-defined operatorfunc (g@) with the given motion type.
     /// Returns `true` if an operatorfunc was registered and executed.
+    ///
+    /// Also `false` from inside a plugin callback — see
+    /// [`Engine::plugin_run_command`].
     pub(crate) fn plugin_run_operatorfunc(&mut self, motion_type: &str) -> bool {
-        let pm = match self.plugin_manager.take() {
-            Some(p) => p,
-            None => return false,
-        };
+        if !self.can_dispatch_to_plugins() {
+            return false;
+        }
         let ctx = self.make_plugin_ctx(false);
-        let (found, ctx) = pm.call_operatorfunc(motion_type, ctx);
-        self.plugin_manager = Some(pm);
+        let Some((found, ctx)) =
+            self.with_plugin_dispatch(|pm| pm.call_operatorfunc(motion_type, ctx))
+        else {
+            return false;
+        };
         self.apply_plugin_ctx(ctx);
         found
     }

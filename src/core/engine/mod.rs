@@ -3289,7 +3289,29 @@ pub struct Engine {
 
     // --- Plugin system ---
     /// Manages loaded Lua plugins. `None` if no plugins dir or plugins disabled.
-    pub plugin_manager: Option<plugin::PluginManager>,
+    ///
+    /// Behind an `Rc` so a dispatch can clone the handle out instead of
+    /// `take()`ing the manager (#1214): the field stays populated for the whole
+    /// Lua call, which is both what lets a nested event see that plugins exist
+    /// (rather than silently no-op'ing) and what makes loaning `&mut Engine` to
+    /// Lua sound — no borrow of this field is held across the call. Install one
+    /// with [`Engine::set_plugin_manager`].
+    pub plugin_manager: Option<std::rc::Rc<plugin::PluginManager>>,
+    /// Non-zero while a Lua plugin callback is executing. The reentrancy guard:
+    /// Lua must not be re-entered while `&mut Engine` is loaned to it, so a
+    /// plugin-triggered event is deferred (see `deferred_plugin_events`) and a
+    /// plugin-triggered command/keymap dispatch reports "not found".
+    pub(crate) plugin_dispatch_depth: u32,
+    /// `(event, arg)` pairs that fired during a plugin dispatch and will be
+    /// dispatched once it finishes. Bounded; see `MAX_DEFERRED_PLUGIN_EVENTS`.
+    pub(crate) deferred_plugin_events: Vec<(String, String)>,
+    /// Set while draining `deferred_plugin_events`, so the drain is not itself
+    /// re-entered by the events it dispatches.
+    pub(crate) plugin_events_draining: bool,
+    /// Buffers with an undo group opened by the immediate API during the
+    /// current dispatch. Committed when the dispatch ends, so a plugin's
+    /// immediate edits collapse into one undo step per buffer.
+    pub(crate) plugin_undo_groups: Vec<BufferId>,
 
     // --- Comment toggling ---
     /// Runtime overrides for comment styles, keyed by LSP language ID.
@@ -4981,6 +5003,10 @@ impl Engine {
             sc_branch_create_input: String::new(),
             sc_help_open: false,
             plugin_manager: None,
+            plugin_dispatch_depth: 0,
+            deferred_plugin_events: Vec::new(),
+            plugin_events_draining: false,
+            plugin_undo_groups: Vec::new(),
             comment_overrides: HashMap::new(),
             highlight_overrides: HashMap::new(),
             cwd,
