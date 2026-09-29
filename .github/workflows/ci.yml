@@ -8,6 +8,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # #639: the Rust toolchain every job installs, kept identical to the
+  # `channel` in `rust-toolchain.toml` (which is what local builds use).
+  # Pinned because ci.yml gates on `clippy -- -D warnings` and every Rust
+  # stable release ships new lints -- with `@stable` here, a Rust release
+  # could redden CI with zero code changes. `tests/toolchain_pin.rs` fails
+  # the build if this drifts from rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.97.1"
   # #865: the Neovim that tests/nvim_conformance.rs uses as its oracle. Must be
   # >= `MIN_NVIM_VERSION` in that file (0.12), and should match the fleet
   # standard installed on every agent host so CI and the fleet judge Vim
@@ -49,7 +56,10 @@ jobs:
       run: nvim --version | head -1
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: clippy, rustfmt
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -132,7 +142,10 @@ jobs:
       run: nvim --version | head -1
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: clippy, rustfmt
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -185,8 +198,9 @@ jobs:
     # the comment on the `test` job above.
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
         components: clippy, rustfmt
 
     - name: Cache cargo registry
@@ -254,7 +268,10 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: clippy, rustfmt
 
     - name: Cache cargo registry
       uses: actions/cache@v4
@@ -318,7 +335,10 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+        components: clippy, rustfmt
 
     - name: Cache cargo registry
       uses: actions/cache@v4
