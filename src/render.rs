@@ -20103,6 +20103,16 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
     })
 }
 
+/// True if `span` asks for any per-span presentation of its own — a
+/// foreground/background colour, bold, italic, or underline — as opposed to
+/// inheriting the row's role colour like ordinary body text does. Used by
+/// [`markdown_turn_styled_cached`] to decide whether a rendered message has
+/// anything worth handing to quadraui's styled (char-wrapped) transcript
+/// path at all; see that function's doc.
+fn span_carries_styling(span: &quadraui::StyledSpan) -> bool {
+    span.fg.is_some() || span.bg.is_some() || span.bold || span.italic || span.underline
+}
+
 /// Render `content` as markdown into a single joined [`quadraui::StyledText`]
 /// (`\n`-separated spans, one per source line, matching
 /// [`quadraui::ChatController::push_turn_markdown`]'s own join) plus its
@@ -20113,6 +20123,25 @@ fn build_ext_panel_data(engine: &Engine) -> Option<ExtPanelData> {
 /// [`populate_ai_chat_controller`] builds a whole `Vec<ChatTurn>` to hand to
 /// `set_transcript` in one shot, not one turn at a time onto the live
 /// controller.
+///
+/// # Plain content keeps the word-wrapped flat path
+///
+/// When the render comes back with *nothing to style* — every line at
+/// scale `1.0` and every span carrying no fg/bg/bold/italic/underline,
+/// i.e. the message contained no markdown at all — this returns the
+/// rendered text as a single unstyled span and an **empty** `line_scales`.
+/// That is not a micro-optimisation: `ChatController::
+/// build_transcript_rows` picks its wrap policy off exactly that field —
+/// turns with per-line scales wrap with `WrapPolicy::Char` (mid-word, at
+/// the display-width budget), turns without them go down the flat path and
+/// word-wrap via `text_util::word_wrap`. Handing quadraui styled rows for
+/// a message that has no styling would therefore turn *every* plain agent
+/// reply in a narrow AI panel into mid-word breaks (`"Hello world ANSWE"`
+/// / `"RED1519"`) for zero rendering gain. Messages that genuinely carry
+/// markdown still take the styled/char-wrapped path — word-wrapping those
+/// is a quadraui-side follow-up (`ChatController`'s own doc flags the
+/// policy switch at that call site as quadraui#821), not something vimcode
+/// may fix with per-backend code here.
 fn markdown_turn_styled_cached(
     cache: &std::cell::RefCell<
         std::collections::HashMap<usize, crate::core::acp_session::MarkdownTurnCacheEntry>,
@@ -20127,6 +20156,14 @@ fn markdown_turn_styled_cached(
         }
     }
     let rendered = quadraui::render_markdown_to_styled(content, theme);
+    let has_styling = rendered
+        .line_scales
+        .iter()
+        .any(|s| (*s - 1.0).abs() > f32::EPSILON)
+        || rendered
+            .lines
+            .iter()
+            .any(|line| line.spans.iter().any(span_carries_styling));
     let mut spans: Vec<quadraui::StyledSpan> = Vec::new();
     for (i, line) in rendered.lines.into_iter().enumerate() {
         if i > 0 {
@@ -20135,7 +20172,13 @@ fn markdown_turn_styled_cached(
         spans.extend(line.spans);
     }
     let text = quadraui::StyledText { spans };
-    let line_scales = rendered.line_scales;
+    // See this function's "Plain content keeps the word-wrapped flat path"
+    // doc section: empty `line_scales` is what selects word wrapping.
+    let line_scales = if has_styling {
+        rendered.line_scales
+    } else {
+        Vec::new()
+    };
     cache
         .borrow_mut()
         .insert(idx, (content.len(), text.clone(), line_scales.clone()));
@@ -20290,6 +20333,7 @@ pub fn populate_ai_chat_controller(
         });
     }
 
+    let turns_len = turns.len();
     let mut chat = engine.ai_chat.borrow_mut();
     chat.set_transcript(turns);
     // #1510: thought turns collapse to a one-line "Thinking..." summary by
@@ -20309,12 +20353,28 @@ pub fn populate_ai_chat_controller(
     // `poll_acp`'s failed-request/protocol-mismatch warnings, ...).
     // Collapsing those into "Thinking..." would hide the one thing the
     // user most needs to see right after the turn ended abnormally.
+    //
+    // Every index in the *current* transcript is written on every frame,
+    // the `false`/`None` case included, because `ChatController` keeps
+    // collapsed/summary state in its own maps **keyed by transcript
+    // index**, and `set_transcript` deliberately does not clear them (see
+    // its doc). Only setting the `true` case would therefore leak a
+    // previous conversation's collapse onto whatever later lands at the
+    // same index: after `:AiClear` + `:AiSessions` resume, index 1 was a
+    // thought turn before the clear and the replayed *assistant* reply
+    // after it, so the reply painted as a collapsed "Thinking…" card with
+    // its text nowhere on screen — the bug
+    // `ai_sessions_picker_resumes_a_past_session_and_rebuilds_the_
+    // transcript` catches. The loop also covers the trailing tool-call /
+    // attachment turns appended past `ai_messages`' length, which must
+    // never inherit a stale collapse either.
     let ai_messages = &engine.acp().ai_messages;
-    for (idx, m) in ai_messages.iter().enumerate() {
-        if m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, idx) {
-            chat.set_turn_collapsed(idx, true);
-            chat.set_turn_summary(idx, Some("Thinking\u{2026}".to_string()));
-        }
+    for idx in 0..turns_len {
+        let is_thought = ai_messages.get(idx).is_some_and(|m| {
+            m.role == "assistant-thought" && is_genuine_thought_chunk(ai_messages, idx)
+        });
+        chat.set_turn_collapsed(idx, is_thought);
+        chat.set_turn_summary(idx, is_thought.then(|| "Thinking\u{2026}".to_string()));
     }
     chat.set_busy(engine.acp().ai_streaming);
     // #1509: plumb the `ai_chat_submit_on_enter` setting straight through to
