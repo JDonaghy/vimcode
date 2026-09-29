@@ -5566,6 +5566,85 @@ mod tests {
             );
         }
 
+        /// #1518 acceptance: `acp_permission_default = allow_all` must
+        /// auto-answer a `session/request_permission` request with the
+        /// first `allow_*` option *without ever painting the dialog at
+        /// all* — `Engine::acp_permission_default_option`'s own unit tests
+        /// already cover the internal-state half (`engine.dialog.is_none()`
+        /// after the turn settles); this covers the black-box half the
+        /// #1518 review found missing, driving a real turn through the
+        /// same `$ACP_FAKE_REQUEST_PERMISSION_DIFF` fixture request
+        /// `permission_dialog_previews_the_proposed_diff_via_shell_app`
+        /// above uses to prove the dialog *does* open under the default
+        /// `ask` setting — here `Tool kind:` (that dialog's own body text)
+        /// must never paint, for the whole real subprocess round trip, and
+        /// the turn must still resume to completion on its own.
+        ///
+        /// RED verified: with the `acp_permission_default` gate in
+        /// `Engine::acp_handle_permission_request` deleted (falling
+        /// straight through to `show_dialog`/parking, the pre-#1518
+        /// behaviour), the loop below observes "Tool kind: edit" paint and
+        /// fails immediately instead of waiting out the full 5s with it
+        /// absent.
+        #[cfg(unix)]
+        #[test]
+        fn acp_permission_default_allow_all_skips_the_dialog_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.check_settings_reload();
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_AI,
+            ));
+
+            let fixture = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/fake_acp_agent.sh"
+            );
+            engine.settings.acp_agents = vec![crate::core::acp::AcpAgentProfile {
+                name: "alpha".to_string(),
+                command: format!("sh \"{fixture}\""),
+                cwd: String::new(),
+                env: vec!["ACP_FAKE_REQUEST_PERMISSION_DIFF=1".to_string()],
+                mcp_servers: Vec::new(),
+            }];
+            engine.settings.acp_active_agent = "alpha".to_string();
+            engine.settings.acp_permission_default =
+                crate::core::settings::AcpPermissionDefault::AllowAll;
+
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            driver.type_char(':');
+            for c in "AI please edit".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.engine.borrow().acp().ai_streaming && Instant::now() < deadline {
+                driver.tick();
+                let screen = driver.screen();
+                assert!(
+                    !screen.contains("Tool kind:"),
+                    "allow_all must never paint the permission dialog; \
+                     screen:\n{screen}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                !h.engine.borrow().acp().ai_streaming,
+                "the auto-approved request must let the turn resume to \
+                 completion within 5s, not hang waiting for a human who is \
+                 never asked"
+            );
+            let screen = driver.screen();
+            assert!(
+                !screen.contains("Tool kind:"),
+                "the permission dialog must never have painted at all \
+                 under allow_all; final screen:\n{screen}"
+            );
+        }
+
         /// #1519 acceptance, fix 3: `session/cancel` must mark every
         /// still-unfinished tool call `Cancelled`, painted as the `[-]`
         /// glyph, not left showing `[~]` (in-progress) forever. The

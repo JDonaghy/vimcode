@@ -6505,6 +6505,87 @@ second line here
         );
     }
 
+    /// #1518 acceptance: `acp_permission_default = allow_all` must
+    /// auto-answer a `session/request_permission` request with the first
+    /// `allow_*` option *without ever opening the dialog* — on GTK that
+    /// means no native dialog is ever queued and no in-canvas dialog layout
+    /// is ever painted, not just that `Engine::dialog` reads `None`
+    /// (`Engine::acp_permission_default_option`'s own unit tests already
+    /// cover the internal-state half; this covers the black-box half the
+    /// #1518 review found missing). GTK twin of `tui_main::
+    /// app_on_tui_tests::tests::issue_1519_acp_conformance::
+    /// acp_permission_default_allow_all_skips_the_dialog_via_shell_app`.
+    ///
+    /// RED verified: with the `acp_permission_default` gate in
+    /// `Engine::acp_handle_permission_request` deleted (falling straight
+    /// through to `show_dialog`/parking, the pre-#1518 behaviour), the
+    /// "must never queue a native dialog" assertion below fails — a
+    /// buttons-only dialog with no text input goes native on GTK (#727), so
+    /// `h.pending_native_dialog` would hold `Some(_)` instead of staying
+    /// `None` for the whole 5s wait.
+    #[cfg(unix)]
+    #[test]
+    fn acp_permission_default_allow_all_skips_the_dialog_via_gtk_driver() {
+        let mut h = panel_harness(PANEL_AI);
+        {
+            let mut engine = h.engine.borrow_mut();
+            let argv = vec![
+                "sh".to_string(),
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/fake_acp_agent.sh"
+                )
+                .to_string(),
+            ];
+            let cwd = std::env::temp_dir();
+            let mut client = crate::core::acp::AcpClient::spawn_with_env(
+                &argv,
+                &cwd,
+                &[("ACP_FAKE_REQUEST_PERMISSION_DIFF", "1")],
+            )
+            .expect("fixture agent should spawn");
+            client.initialize();
+            engine.acp_mut().client = Some(client);
+            engine.settings.acp_agent_command = "already-spawned-above".to_string();
+            engine.settings.acp_permission_default =
+                crate::core::settings::AcpPermissionDefault::AllowAll;
+        }
+
+        let sb = h.painted_sidebar_bounds.get().unwrap();
+        h.driver.click(sb.x + 20.0, sb.y + 20.0);
+        for c in "please edit".chars() {
+            h.driver.type_char(c);
+        }
+        h.driver.ctrl_char('s');
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while h.engine.borrow().acp().ai_streaming && std::time::Instant::now() < deadline {
+            h.engine.borrow_mut().poll_acp();
+            h.driver.render();
+            assert!(
+                h.pending_native_dialog.take().is_none(),
+                "allow_all must never queue a native permission dialog"
+            );
+            assert!(
+                h.dialog_layout.borrow().is_none(),
+                "allow_all must never paint an in-canvas permission dialog \
+                 either"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !h.engine.borrow().acp().ai_streaming,
+            "the auto-approved request must let the turn resume to \
+             completion within 5s, not hang waiting for a human who is \
+             never asked"
+        );
+        assert!(
+            h.pending_native_dialog.take().is_none(),
+            "no native dialog should ever have been queued for the whole \
+             turn"
+        );
+    }
+
     /// #1463 (multiple concurrent ACP sessions), GTK twin of `tui_main::
     /// shell_app::tests::
     /// ai_panel_session_tab_strip_badges_background_permission_and_ainext_switches_to_it_via_shell_app`.

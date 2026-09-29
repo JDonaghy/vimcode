@@ -2655,7 +2655,7 @@ impl Engine {
             body.push(String::new());
             body.push("Command:".to_string());
             let pretty = serde_json::to_string_pretty(raw_input).unwrap_or_default();
-            body.extend(pretty.lines().map(str::to_string));
+            body.extend(Self::acp_permission_raw_input_preview_lines(&pretty));
         }
         // Hotkeys must be unique across this dialog's own buttons — a naive
         // "first letter of the name" pick collides for common ACP option
@@ -2692,33 +2692,54 @@ impl Engine {
         (title, body, buttons)
     }
 
-    /// Cap on how many formatted diff lines
-    /// [`Self::acp_permission_diff_preview_lines`] shows per `diff` content
-    /// block before truncating — a permission dialog is meant to be
-    /// skimmed in a few seconds before deciding, not a full-viewport review
-    /// surface (`crate::core::review::ChangeReviewState`'s job); an agent
-    /// proposing a rewrite of a thousand-line file must not turn "approve
-    /// this edit" into scrolling through a wall of text with no way to
-    /// jump around it (this dialog has no scroll/hunk-nav keys of its
-    /// own).
-    const PERMISSION_DIFF_PREVIEW_LINE_CAP: usize = 60;
+    /// Cap on how many lines either half of
+    /// [`Self::acp_permission_dialog_parts`]'s body preview shows — the
+    /// `diff`-block branch ([`Self::acp_permission_diff_preview_lines`]) or
+    /// the `rawInput` fallback
+    /// ([`Self::acp_permission_raw_input_preview_lines`]) — before
+    /// truncating. A permission dialog is meant to be skimmed in a few
+    /// seconds before deciding, not a full-viewport review surface
+    /// (`crate::core::review::ChangeReviewState`'s job); an agent proposing
+    /// a rewrite of a thousand-line file (the diff case) or stuffing a large
+    /// payload into `rawInput` (the fallback case — nothing in the ACP spec
+    /// bounds its size, and it's arbitrary JSON, not just a short shell
+    /// command) must not turn "approve this" into scrolling through a wall
+    /// of text with no way to jump around it (this dialog has no
+    /// scroll/hunk-nav keys of its own).
+    const PERMISSION_BODY_PREVIEW_LINE_CAP: usize = 60;
 
-    /// Format one `diff` content block's proposed change as plain
-    /// unified-diff text (`crate::core::review::unified_diff_preview_lines`),
-    /// truncated to [`Self::PERMISSION_DIFF_PREVIEW_LINE_CAP`] lines with a
-    /// trailing "N more lines" marker rather than growing the dialog
-    /// without bound (#1518).
-    fn acp_permission_diff_preview_lines(old_text: Option<&str>, new_text: &str) -> Vec<String> {
-        let mut lines = crate::core::review::unified_diff_preview_lines(old_text, new_text);
-        if lines.len() > Self::PERMISSION_DIFF_PREVIEW_LINE_CAP {
-            let omitted = lines.len() - Self::PERMISSION_DIFF_PREVIEW_LINE_CAP;
-            lines.truncate(Self::PERMISSION_DIFF_PREVIEW_LINE_CAP);
+    /// Truncate `lines` to [`Self::PERMISSION_BODY_PREVIEW_LINE_CAP`],
+    /// appending a trailing "N more lines" marker instead of growing the
+    /// dialog body without bound (#1518). Shared by the `diff`-block and
+    /// `rawInput`-fallback preview branches of
+    /// [`Self::acp_permission_dialog_parts`].
+    fn acp_permission_preview_cap(mut lines: Vec<String>) -> Vec<String> {
+        if lines.len() > Self::PERMISSION_BODY_PREVIEW_LINE_CAP {
+            let omitted = lines.len() - Self::PERMISSION_BODY_PREVIEW_LINE_CAP;
+            lines.truncate(Self::PERMISSION_BODY_PREVIEW_LINE_CAP);
             lines.push(format!(
                 "... ({omitted} more line{})",
                 if omitted == 1 { "" } else { "s" }
             ));
         }
         lines
+    }
+
+    /// Format one `diff` content block's proposed change as plain
+    /// unified-diff text (`crate::core::review::unified_diff_preview_lines`),
+    /// capped via [`Self::acp_permission_preview_cap`].
+    fn acp_permission_diff_preview_lines(old_text: Option<&str>, new_text: &str) -> Vec<String> {
+        Self::acp_permission_preview_cap(crate::core::review::unified_diff_preview_lines(
+            old_text, new_text,
+        ))
+    }
+
+    /// Format a pretty-printed `rawInput` fallback body, capped via
+    /// [`Self::acp_permission_preview_cap`] — same bound as the diff-preview
+    /// branch, since `rawInput` is arbitrary agent-supplied JSON with no
+    /// size guarantee, not just a short shell command (#1518 review).
+    fn acp_permission_raw_input_preview_lines(pretty: &str) -> Vec<String> {
+        Self::acp_permission_preview_cap(pretty.lines().map(str::to_string).collect())
     }
 
     /// Reply `cancelled` to a parked `session/request_permission` and close
@@ -4727,6 +4748,59 @@ mod tests {
         assert!(
             body.contains("+ new line"),
             "the added line must be previewed in the dialog body: {body:?}"
+        );
+    }
+
+    /// #1518 review (non-blocking concern): the `rawInput` fallback branch
+    /// of `acp_permission_dialog_parts` must cap its preview the same way
+    /// the `diff`-block branch already does — an agent putting a large
+    /// payload in `rawInput` (arbitrary JSON, not just a short shell
+    /// command) must not be able to grow the dialog body without bound.
+    /// Calls the private `acp_permission_dialog_parts` directly (no
+    /// subprocess needed — this is pure data shaping, already exercised
+    /// end-to-end by `request_permission_execute_with_no_diff_shows_raw_
+    /// input` below and its shell_app/GtkDriver twins).
+    ///
+    /// RED verified: reverting `acp_permission_raw_input_preview_lines` to
+    /// `pretty.lines().map(str::to_string).collect()` (the pre-fix, uncapped
+    /// behaviour) makes this fail — the body would contain all 200 "line N"
+    /// entries instead of being truncated to
+    /// `Engine::PERMISSION_BODY_PREVIEW_LINE_CAP` lines plus the "more
+    /// lines" marker.
+    #[test]
+    fn request_permission_raw_input_fallback_is_capped_like_the_diff_preview() {
+        let long_items: Vec<String> = (0..200).map(|i| format!("\"line {i}\"")).collect();
+        let raw_input: serde_json::Value =
+            serde_json::from_str(&format!("{{\"items\":[{}]}}", long_items.join(","))).unwrap();
+        let req = crate::core::acp::AcpPermissionRequest {
+            session_id: "sess-1".to_string(),
+            tool_call: crate::core::acp::AcpToolCallInfo {
+                kind: "execute".to_string(),
+                title: "Run something huge".to_string(),
+                locations: Vec::new(),
+                content: Vec::new(),
+                raw_input: Some(raw_input),
+            },
+            options: Vec::new(),
+        };
+
+        let (_, body, _) = Engine::acp_permission_dialog_parts(&req);
+        let cap = Engine::PERMISSION_BODY_PREVIEW_LINE_CAP;
+        assert!(
+            body.len() <= cap + 5,
+            "the rawInput fallback body must be capped, not grow \
+             unbounded with the payload: {} lines",
+            body.len()
+        );
+        assert!(
+            body.iter().any(|l| l.contains("more line")),
+            "a truncated rawInput preview must say so, same as the diff \
+             preview does: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|l| l.contains("\"line 199\"")),
+            "the tail of a 200-entry payload must have been truncated \
+             away: {body:?}"
         );
     }
 
