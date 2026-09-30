@@ -5436,6 +5436,42 @@ fn poll_until(
     }
 }
 
+/// Absolute path to a standard POSIX utility, found by scanning the
+/// conventional system `bin` directories instead of consulting `PATH`.
+///
+/// **A spawn test in this file must never let a shell resolve a utility via
+/// `PATH`.** `cargo test` runs one test binary's tests as parallel threads of
+/// a *single* process, and several tests in this very file deliberately
+/// mutate the process-global `PATH` while they run: the `#1345`
+/// managed-tool-resolver group sets it to `""` (see
+/// `resolve_command_finds_managed_tool_binary_with_empty_path` and friends)
+/// and the `#917` Homebrew group sets it to `/usr/bin:/bin`. Their
+/// `EnvVarGuard`s restore it afterwards and their own mutex serializes them
+/// against each other, but neither can stop an *unrelated* concurrent test
+/// from spawning a child inside that window — and the child inherits the
+/// emptied `PATH`.
+///
+/// That is exactly how
+/// `spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks` failed
+/// in a full-suite run while passing in isolation (#1627 test stage): with
+/// `PATH=""` its `/bin/sh -c "head -c … | tr …"` child died instantly with
+/// `head: not found`, exit 127, zero bytes of stdout — so the test then
+/// polled fruitlessly for its whole 20s deadline. Baking absolute paths into
+/// the shell snippet removes the dependency, and with it the flake.
+#[cfg(unix)]
+fn posix_tool(name: &str) -> String {
+    for dir in ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    panic!(
+        "this test needs the POSIX utility `{name}`, which was not found in \
+         any standard system bin directory"
+    );
+}
+
 #[test]
 fn loop_timer_fires_repeatedly_and_stop_prevents_further_calls() {
     let mut e = engine_with_plugin(
@@ -5596,25 +5632,49 @@ fn concurrent_spawns_stream_independent_output_and_exit_codes() {
 #[test]
 #[cfg(unix)]
 fn spawn_kill_delivers_nonzero_or_signalled_exit() {
+    // Absolute `sleep`, not a `PATH` lookup: with a concurrent test's
+    // `PATH=""` in effect the child would exit 127 immediately instead of
+    // living long enough to be killed, and this would pass for the wrong
+    // reason (127 is "nonzero") — see `posix_tool`.
+    let sleep = posix_tool("sleep");
+    // `exec` matters, and is the second half of this test's flake fix
+    // (#1627 test stage): `/bin/sh -c "sleep 30"` *forks* a grandchild for
+    // the `sleep` on the shells this runs on, and `h.kill()` signals only
+    // the direct child. If the kill lands after that fork — which is
+    // exactly what a loaded machine makes likely — the orphaned `sleep`
+    // keeps the child's stdout pipe write end open, so the reader threads
+    // never see EOF, `execute::finish_and_send_exit` is never reached and
+    // *no* `Exit` event is ever sent: this test then burned its full 15s
+    // deadline and failed ("kill() must eventually deliver an exit"), which
+    // reproduced in ~half of 15 loaded runs of this binary. `exec` makes
+    // the shell *become* `sleep`, so there is exactly one process to kill.
+    //
+    // NOTE: that a grandchild survives `handle.kill()` (and with it
+    // suppresses `on_exit` for good) is a real limitation of
+    // `vimcode.loop.spawn` — it kills a pid, not a process group. Worth a
+    // follow-up issue; deliberately *not* papered over here beyond keeping
+    // this test about the single-child case it was written for.
     let mut e = engine_with_plugin(
         "",
         "spawn_kill_1624",
-        r#"
+        &format!(
+            r#"
         _G.exit_code = nil
         _G.exit_signal = nil
         vimcode.command("RunAndKill", function(_)
-            local h = vimcode.loop.spawn("/bin/sh", { "-c", "sleep 30" }, {
+            local h = vimcode.loop.spawn("/bin/sh", {{ "-c", "exec {sleep} 30" }}, {{
                 on_exit = function(code, signal)
                     _G.exit_code = code
                     _G.exit_signal = signal
                 end,
-            })
+            }})
             h.kill()
         end)
         vimcode.command("ReadExit", function(_)
             vimcode.message(tostring(_G.exit_code) .. "/" .. tostring(_G.exit_signal))
         end)
-        "#,
+        "#
+        ),
     );
     exec(&mut e, "RunAndKill");
 
@@ -5688,18 +5748,26 @@ fn async_shell_reimplemented_on_spawn_keeps_legacy_behaviour_and_gains_exit_stat
 #[cfg(unix)]
 fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
     let big_stdin = "A".repeat(256 * 1024);
+    // Absolute `sleep`/`cat` — under a concurrent test's `PATH=""` the shell
+    // would fail to find either, exit 127 and echo nothing back, failing the
+    // `len=` assertion below for a reason that has nothing to do with where
+    // the stdin write runs. See `posix_tool`.
+    let sleep = posix_tool("sleep");
+    let cat = posix_tool("cat");
     let mut e = engine_with_plugin(
         "",
         "async_shell_big_stdin_1624",
-        r#"
+        &format!(
+            r#"
         _G.big_stdin = string.rep("A", 256 * 1024)
         vimcode.command("RunBigStdin", function(_)
-            vimcode.async_shell("sleep 0.5 && cat", "big_stdin_done_1624", { stdin = _G.big_stdin })
+            vimcode.async_shell("{sleep} 0.5 && {cat}", "big_stdin_done_1624", {{ stdin = _G.big_stdin }})
         end)
         vimcode.on("big_stdin_done_1624", function(output)
             vimcode.message("len=" .. #output)
         end)
-        "#,
+        "#
+        ),
     );
 
     let before = std::time::Instant::now();
@@ -5729,19 +5797,26 @@ fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
 #[test]
 #[cfg(unix)]
 fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
+    // Absolute `sleep` — a `PATH=""` window from a concurrent test would
+    // make this child die with `sleep: not found` before the unload, so the
+    // "no callbacks after unload" assertion would no longer be testing the
+    // liveness check it exists for. See `posix_tool`.
+    let sleep = posix_tool("sleep");
     let mut e = engine_with_plugin(
         "",
         "unload_cancels_1624",
-        r#"
+        &format!(
+            r#"
         vimcode.command("StartAll", function(_)
             vimcode.loop.timer(5, function()
                 vimcode.message("tick")
-            end, { ["repeat"] = true })
-            vimcode.loop.spawn("/bin/sh", { "-c", "sleep 30" }, {
+            end, {{ ["repeat"] = true }})
+            vimcode.loop.spawn("/bin/sh", {{ "-c", "exec {sleep} 30" }}, {{
                 on_stdout = function(chunk) vimcode.message("spawn:" .. chunk) end,
-            })
+            }})
         end)
-        "#,
+        "#
+        ),
     );
     exec(&mut e, "StartAll");
 
@@ -5928,6 +6003,11 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
 fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
     const EXPECTED_BYTES: usize = 2_000_000;
 
+    // Absolute paths, never `PATH` lookups — see `posix_tool`'s doc comment
+    // for the concurrent-`PATH=""` flake this avoids (#1627 test stage).
+    let head = posix_tool("head");
+    let tr = posix_tool("tr");
+
     let mut e = engine_with_plugin(
         "",
         "spawn_flood_1624",
@@ -5937,7 +6017,7 @@ fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
             _G.exit_code = nil
             vimcode.command("RunFlood", function(_)
                 vimcode.loop.spawn("/bin/sh",
-                    {{ "-c", "head -c {bytes} /dev/zero | tr '\\0' x" }}, {{
+                    {{ "-c", "{head} -c {bytes} /dev/zero | {tr} '\\0' x" }}, {{
                     on_stdout = function(chunk) _G.total = _G.total + #chunk end,
                     on_exit = function(code, _signal) _G.exit_code = code end,
                 }})
