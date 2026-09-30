@@ -76,11 +76,18 @@ fn default_schema_version() -> u32 {
     VIEW_SCHEMA_VERSION
 }
 
-/// One plugin-declared view: a vertical stack of fields.
+/// One plugin-declared view: either a vertical stack of fields (the
+/// original #146 shape) or a single [`ViewBody`] widget (#1631).
 ///
-/// This is the whole tree in schema version 1. Nested containers are a
-/// deliberate non-goal for now — `quadraui::Form` is itself a flat field stack,
-/// and every widget the vocabulary exposes maps onto one of its rows.
+/// A view with `body: None` is a field stack — `fields` is the whole tree,
+/// as in schema version 1. Nested containers inside a field stack are still
+/// a deliberate non-goal — `quadraui::Form` is itself a flat field stack.
+/// A view with `body: Some(_)` is instead one list/tree/table/text-view
+/// widget filling the whole panel; `fields` is ignored in that case. The
+/// two are mutually exclusive per view (a Lua `render()` returns one shape
+/// or the other), not layered — #147's headers/params table and response
+/// text view are two *separate* registered views, not two widgets sharing
+/// one panel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginView {
     /// Plugin-chosen id for the tree as a whole (used as the form's id).
@@ -90,6 +97,10 @@ pub struct PluginView {
     pub schema_version: u32,
     #[serde(default)]
     pub fields: Vec<ViewField>,
+    /// #1631: an alternative single-widget body. `None` keeps the original
+    /// #146 field-stack shape; additive, so no `VIEW_SCHEMA_VERSION` bump.
+    #[serde(default)]
+    pub body: Option<ViewBody>,
 }
 
 impl Default for PluginView {
@@ -98,6 +109,7 @@ impl Default for PluginView {
             id: String::new(),
             schema_version: VIEW_SCHEMA_VERSION,
             fields: Vec::new(),
+            body: None,
         }
     }
 }
@@ -115,6 +127,132 @@ impl PluginView {
             .iter()
             .position(|f| f.is_interactive() && !f.disabled)
     }
+}
+
+// ─── List / Tree / Table / TextView bodies (#1631) ──────────────────────────
+
+/// A single-widget view body: what #1631 adds on top of #146's field stack
+/// to cover "lists, trees, tables, text views" (#1403's Phase 1 goal).
+///
+/// The serde tag is the Lua-facing `kind = "..."` key on the table a
+/// `render()` callback returns, exactly like [`ViewFieldKind`]'s `type` tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewBody {
+    /// Selectable rows with an optional title and per-row detail text.
+    List {
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        items: Vec<ViewListItem>,
+    },
+    /// Expandable nodes.
+    Tree {
+        #[serde(default)]
+        nodes: Vec<ViewTreeNode>,
+    },
+    /// Columns + rows, optionally with editable cells.
+    Table {
+        #[serde(default)]
+        columns: Vec<ViewTableColumn>,
+        #[serde(default)]
+        rows: Vec<ViewTableRow>,
+    },
+    /// Multi-line read-only text with scrolling. An optional `filetype`
+    /// hint enables syntax highlighting (e.g. `"json"`).
+    TextView {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        filetype: Option<String>,
+    },
+}
+
+impl ViewBody {
+    /// The `kind = "..."` string this variant is authored as.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            ViewBody::List { .. } => "list",
+            ViewBody::Tree { .. } => "tree",
+            ViewBody::Table { .. } => "table",
+            ViewBody::TextView { .. } => "text_view",
+        }
+    }
+}
+
+/// One row in a [`ViewBody::List`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewListItem {
+    /// Plugin-authored row id, namespaced the same way a field id is.
+    pub id: String,
+    #[serde(default)]
+    pub text: String,
+    /// Optional right-aligned secondary text.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// One node in a [`ViewBody::Tree`]. Nesting is real here (unlike the field
+/// stack) because a tree's whole point is hierarchy; `children` is walked
+/// recursively to build the flattened `quadraui::TreeView` rows a frame
+/// paints, and a `TreePath` (index chain) addresses back into it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewTreeNode {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    /// Whether this node is currently drawn open. Plugin-owned: vimcode
+    /// emits `Expanded`/`Collapsed` on toggle and expects the next
+    /// `render()` to reflect the plugin's own updated state, exactly like
+    /// `ViewFieldKind::Toggle`'s `value`.
+    #[serde(default)]
+    pub expanded: bool,
+    #[serde(default)]
+    pub children: Vec<ViewTreeNode>,
+}
+
+impl ViewTreeNode {
+    /// A branch (has a chevron) iff it declares any children — a leaf never
+    /// shows one, matching `quadraui::TreeRow`'s `is_expanded: Option<bool>`
+    /// convention (`None` = leaf).
+    pub fn is_branch(&self) -> bool {
+        !self.children.is_empty()
+    }
+
+    /// Resolve a `quadraui::TreePath` (`Vec<u16>`) index chain back to the
+    /// node it addresses, or `None` if the path is stale (out of range).
+    /// Takes `&[u16]` rather than re-exporting `quadraui::TreePath` here —
+    /// this module stays free of quadraui types (#146's ABI decision).
+    pub fn resolve<'a>(nodes: &'a [ViewTreeNode], path: &[u16]) -> Option<&'a ViewTreeNode> {
+        let (&first, rest) = path.split_first()?;
+        let node = nodes.get(first as usize)?;
+        if rest.is_empty() {
+            Some(node)
+        } else {
+            ViewTreeNode::resolve(&node.children, rest)
+        }
+    }
+}
+
+/// One column in a [`ViewBody::Table`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewTableColumn {
+    #[serde(default)]
+    pub title: String,
+    /// Whether cells in this column may be edited in place (#1627's
+    /// text-entry model, keyed by `"r{row}c{col}"` instead of a field id).
+    #[serde(default)]
+    pub editable: bool,
+}
+
+/// One row in a [`ViewBody::Table`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewTableRow {
+    /// Plugin-authored row id.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub cells: Vec<String>,
 }
 
 /// A single row: a label plus an input.
@@ -267,12 +405,55 @@ pub struct ViewToggle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ViewEventKind {
     ButtonClicked,
-    ToggleChanged { value: bool },
-    DropdownChanged { selected: usize },
-    SegmentedChanged { selected: usize },
-    TextChanged { value: String },
-    TextCommitted { value: String },
+    ToggleChanged {
+        value: bool,
+    },
+    DropdownChanged {
+        selected: usize,
+    },
+    SegmentedChanged {
+        selected: usize,
+    },
+    TextChanged {
+        value: String,
+    },
+    TextCommitted {
+        value: String,
+    },
     FocusChanged,
+    // ── ViewBody events (#1631) ──────────────────────────────────────────
+    /// A `List`/`Table` row moved into selection (index into
+    /// `items`/`rows`).
+    ItemSelected {
+        index: usize,
+    },
+    /// A `List`/`Table` row was activated (Enter or double-click).
+    ItemActivated {
+        index: usize,
+    },
+    /// A `Tree` node moved into selection, named by its declared id (a flat
+    /// index would be unstable across expand/collapse).
+    NodeSelected {
+        id: String,
+    },
+    /// A `Tree` node was activated (Enter or double-click).
+    NodeActivated {
+        id: String,
+    },
+    /// A `Tree` node's chevron was opened.
+    Expanded {
+        id: String,
+    },
+    /// A `Tree` node's chevron was closed.
+    Collapsed {
+        id: String,
+    },
+    /// An editable `Table` cell was committed to a new value.
+    CellEdited {
+        row: usize,
+        col: usize,
+        value: String,
+    },
 }
 
 impl ViewEventKind {
@@ -287,8 +468,31 @@ impl ViewEventKind {
             ViewEventKind::TextChanged { .. } => "TextChanged",
             ViewEventKind::TextCommitted { .. } => "TextCommitted",
             ViewEventKind::FocusChanged => "FocusChanged",
+            ViewEventKind::ItemSelected { .. } => "ItemSelected",
+            ViewEventKind::ItemActivated { .. } => "ItemActivated",
+            ViewEventKind::NodeSelected { .. } => "NodeSelected",
+            ViewEventKind::NodeActivated { .. } => "NodeActivated",
+            ViewEventKind::Expanded { .. } => "Expanded",
+            ViewEventKind::Collapsed { .. } => "Collapsed",
+            ViewEventKind::CellEdited { .. } => "CellEdited",
         }
     }
+}
+
+/// Encode a `(row, col)` table-cell address as the `field_id` carried on
+/// [`PluginViewTextEditState`], so an editable table cell reuses #1627's
+/// text-entry model verbatim instead of a parallel one.
+pub fn table_cell_field_id(row: usize, col: usize) -> String {
+    format!("r{row}c{col}")
+}
+
+/// Inverse of [`table_cell_field_id`]. Returns `None` for any string that
+/// isn't one of its outputs (defensive — a stray field id must never be
+/// misread as a cell address).
+pub fn parse_table_cell_field_id(field_id: &str) -> Option<(usize, usize)> {
+    let rest = field_id.strip_prefix('r')?;
+    let (row, rest) = rest.split_once('c')?;
+    Some((row.parse().ok()?, rest.parse().ok()?))
 }
 
 /// One widget event, already resolved to the plugin view that owns it.
@@ -370,6 +574,7 @@ mod tests {
         let view = PluginView {
             id: "main-form".into(),
             schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
             fields: vec![
                 ViewField {
                     id: "url".into(),
@@ -427,6 +632,7 @@ mod tests {
         let view = PluginView {
             id: "v".into(),
             schema_version: VIEW_SCHEMA_VERSION,
+            body: None,
             fields: vec![
                 inert("hdr", ViewFieldKind::Label),
                 inert(
@@ -440,6 +646,146 @@ mod tests {
         };
         assert_eq!(view.first_focusable(), Some(2));
         assert_eq!(view.field_index("go"), Some(2));
+    }
+
+    // ── ViewBody (#1631) ────────────────────────────────────────────────
+
+    #[test]
+    fn view_body_list_round_trips_and_tags_as_list() {
+        let json = r#"{"kind":"list","title":"Items","items":[
+            {"id":"a","text":"Alpha","detail":"1"},
+            {"id":"b","text":"Bravo"}
+        ]}"#;
+        let body: ViewBody = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(body.kind_name(), "list");
+        match &body {
+            ViewBody::List { title, items } => {
+                assert_eq!(title.as_deref(), Some("Items"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].detail.as_deref(), Some("1"));
+                assert_eq!(items[1].detail, None);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+        let back: ViewBody = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn view_body_unknown_kind_is_a_parse_error() {
+        let json = r#"{"kind":"grid","rows":[]}"#;
+        let err = serde_json::from_str::<ViewBody>(json).unwrap_err();
+        // Not asserting exact wording (serde's own), just that an unknown
+        // `kind` is rejected rather than silently defaulting to some variant.
+        assert!(err.to_string().contains("grid") || err.to_string().contains("kind"));
+    }
+
+    #[test]
+    fn view_tree_node_resolve_walks_a_path() {
+        let nodes = vec![ViewTreeNode {
+            id: "root".into(),
+            label: "Root".into(),
+            expanded: true,
+            children: vec![
+                ViewTreeNode {
+                    id: "child-a".into(),
+                    label: "A".into(),
+                    expanded: false,
+                    children: vec![],
+                },
+                ViewTreeNode {
+                    id: "child-b".into(),
+                    label: "B".into(),
+                    expanded: false,
+                    children: vec![ViewTreeNode {
+                        id: "grandchild".into(),
+                        label: "GC".into(),
+                        expanded: false,
+                        children: vec![],
+                    }],
+                },
+            ],
+        }];
+        assert_eq!(
+            ViewTreeNode::resolve(&nodes, &[0]).map(|n| n.id.as_str()),
+            Some("root")
+        );
+        assert_eq!(
+            ViewTreeNode::resolve(&nodes, &[0, 1]).map(|n| n.id.as_str()),
+            Some("child-b")
+        );
+        assert_eq!(
+            ViewTreeNode::resolve(&nodes, &[0, 1, 0]).map(|n| n.id.as_str()),
+            Some("grandchild")
+        );
+        assert_eq!(ViewTreeNode::resolve(&nodes, &[0, 9]), None);
+        assert_eq!(ViewTreeNode::resolve(&nodes, &[]), None);
+        assert!(nodes[0].is_branch());
+        assert!(!nodes[0].children[0].is_branch());
+    }
+
+    #[test]
+    fn view_body_table_round_trips() {
+        let body = ViewBody::Table {
+            columns: vec![
+                ViewTableColumn {
+                    title: "Key".into(),
+                    editable: true,
+                },
+                ViewTableColumn {
+                    title: "Value".into(),
+                    editable: true,
+                },
+            ],
+            rows: vec![ViewTableRow {
+                id: "row-1".into(),
+                cells: vec!["Content-Type".into(), "application/json".into()],
+            }],
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let back: ViewBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(body, back);
+        assert_eq!(back.kind_name(), "table");
+    }
+
+    #[test]
+    fn view_body_text_view_defaults_filetype_to_none() {
+        let json = r#"{"kind":"text_view","text":"hello"}"#;
+        let body: ViewBody = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            body,
+            ViewBody::TextView {
+                text: "hello".into(),
+                filetype: None,
+            }
+        );
+    }
+
+    #[test]
+    fn table_cell_field_id_round_trips() {
+        let id = table_cell_field_id(3, 7);
+        assert_eq!(id, "r3c7");
+        assert_eq!(parse_table_cell_field_id(&id), Some((3, 7)));
+        assert_eq!(parse_table_cell_field_id("not-a-cell"), None);
+        assert_eq!(parse_table_cell_field_id("r3"), None);
+        assert_eq!(parse_table_cell_field_id("rXc7"), None);
+    }
+
+    #[test]
+    fn plugin_view_with_body_ignores_fields_by_convention() {
+        let view = PluginView {
+            id: "resp".into(),
+            schema_version: VIEW_SCHEMA_VERSION,
+            fields: vec![],
+            body: Some(ViewBody::TextView {
+                text: "{}".into(),
+                filetype: Some("json".into()),
+            }),
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        let back: PluginView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, back);
+        assert!(back.body.is_some());
     }
 
     #[test]

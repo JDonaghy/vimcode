@@ -4704,6 +4704,42 @@ pub struct Engine {
     /// because `open_plugin_view_tab` runs through the immediate
     /// (`live_engine`) API, which has no `PluginCallContext` to queue into.
     pub(crate) plugin_view_tab_pending_refresh: Vec<String>,
+    /// The shared `quadraui::TreeController` a `ViewBody::Tree`-kind plugin
+    /// view is painted through in the sidebar (#1631) — the `Tree` twin of
+    /// `plugin_view_form_controller`. Selection is a `TreePath` (an index
+    /// chain into the plugin-declared `ViewTreeNode` hierarchy), resolved
+    /// back to the node's own id via `ViewTreeNode::resolve` rather than a
+    /// flat index, which would be unstable across expand/collapse.
+    pub plugin_view_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// Tab twin of `plugin_view_tree_controller`, kept separate for the same
+    /// reason `plugin_view_tab_form_controller` is kept separate from
+    /// `plugin_view_form_controller`.
+    pub plugin_view_tab_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
+    /// The `Backend::list_layout` cached from the last frame that painted a
+    /// `ViewBody::List`-kind plugin view in the sidebar (#1631), alongside
+    /// the rect it was resolved against — same "paint caches, click reads"
+    /// split as `Engine::ext_panel_tree_layout` / `Engine::board_layout`.
+    /// `selected_idx`/`scroll_offset` are *not* re-derived from here; they
+    /// live on `ext_panel_selected`/`ext_panel_scroll_top`, reused verbatim
+    /// from the field-stack view (both are "vimcode-owned flat interaction
+    /// state for whichever body the active view currently has").
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_list_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// Tab twin of `plugin_view_list_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_tab_list_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::ListViewLayout)>>,
+    /// The `Backend::data_table_layout` cached from the last frame that
+    /// painted a `ViewBody::Table`-kind plugin view in the sidebar (#1631).
+    /// Tab twin is `plugin_view_tab_table_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_table_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// Tab twin of `plugin_view_table_layout`.
+    #[allow(clippy::type_complexity)]
+    pub plugin_view_tab_table_layout:
+        std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5493,6 +5529,16 @@ impl Engine {
                 0.0, 0.0, 0.0, 0.0,
             )),
             plugin_view_tab_pending_refresh: Vec::new(),
+            plugin_view_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
+                quadraui::TreeController::new("plugin-view-tree"),
+            )),
+            plugin_view_tab_tree_controller: std::rc::Rc::new(std::cell::RefCell::new(
+                quadraui::TreeController::new("plugin-view-tab-tree"),
+            )),
+            plugin_view_list_layout: std::cell::RefCell::new(None),
+            plugin_view_tab_list_layout: std::cell::RefCell::new(None),
+            plugin_view_table_layout: std::cell::RefCell::new(None),
+            plugin_view_tab_table_layout: std::cell::RefCell::new(None),
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
