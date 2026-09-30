@@ -3987,6 +3987,7 @@ dependencies = [
  "tree-sitter-toml-ng",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+ "vt100",
  "zip",
 ]
 

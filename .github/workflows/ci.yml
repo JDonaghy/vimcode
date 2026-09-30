@@ -330,6 +330,14 @@ jobs:
     - name: Run tests/conpty_idle_flicker.rs (#1634, real ConPTY on windows-latest)
       run: cargo test --release --test conpty_idle_flicker --no-default-features
 
+    # #1636: the real-ConPTY activity-bar click regression test — sends real
+    # SGR mouse-click bytes into the `vcd.exe` just built and asserts each
+    # activity-bar icon actually switches panels, over the same real Win32
+    # pseudo console as the #1634 step above. Scoped to this one integration
+    # test, per this job's own header comment.
+    - name: Run tests/conpty_activity_bar_click.rs (#1636, real ConPTY on windows-latest)
+      run: cargo test --release --test conpty_activity_bar_click --no-default-features
+
   # #1554: no job before this one ever compiled the Windows *GUI* build
   # (`--features win --bin vimcode`), so a whole class of loader failures
   # (this one included) shipped unnoticed until a real Windows host tried to
