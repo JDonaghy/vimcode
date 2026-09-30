@@ -745,6 +745,44 @@ pub(crate) struct App {
     /// `GtkPlatformServices` itself), leaving only the change-detection use
     /// below.
     pub(crate) last_colorscheme: String,
+    /// #1634: the OS/terminal window title as of the last tick that actually
+    /// wrote it via `WindowControl::set_title` (`render::run_shared_tick_
+    /// chores`). `None` until the first write. Every other cached-value
+    /// guard `handle_poll_tick`'s chores use (`last_colorscheme` right
+    /// above, `last_caret_shape` below) compares before writing; this one
+    /// didn't, so `run_shared_tick_chores` called `w.set_title(&win_title)`
+    /// unconditionally on *every* tick — on TUI, `TuiBackend::set_title`
+    /// writes a real OSC 0/2 escape sequence straight to `std::io::
+    /// stdout()` (bypassing the `ratatui::Terminal`'s buffered `Write`
+    /// entirely), so an idle session wrote a fresh title-set escape every
+    /// poll cycle (`quadraui::runtime::IDLE_POLL_CEILING`, ~250ms) even
+    /// though the title text never changed — real waste on every idle tick,
+    /// invisible to #1583's in-process idle-stability test since it only
+    /// inspects the `TestBackend`/vt100 buffer `Terminal::draw` writes to,
+    /// and `set_title`'s direct-to-stdout write never goes through that
+    /// sink at all (live or test-driven `TuiBackend` alike).
+    ///
+    /// **Not confirmed as #1634's flicker cause.** A raw-ConPTY capture
+    /// (`tests/conpty_idle_flicker.rs`, on real Windows 11 hardware) of an
+    /// idle session showed the byte stream silent at this window's output
+    /// *both* with this guard reverted and with it in place — i.e. whatever
+    /// downstream consumes the pseudo console (ConPTY itself, and/or a real
+    /// terminal emulator) already appears to suppress a redundant OSC 0/2
+    /// title write before it reaches a reader on the other end, so this
+    /// guard's fix is a real, worthwhile efficiency win (a syscall + a
+    /// write vimcode no longer makes 4×/second for nothing) but is not
+    /// shown to be what the operator saw flicker. See that test file's
+    /// module doc for the full finding and what it rules out.
+    pub(crate) last_window_title: Option<String>,
+    /// #1634: same guard, for `Backend::set_caret_shape` — see `last_window_
+    /// title`'s doc just above for the shared reasoning (including the "not
+    /// confirmed as the flicker cause" caveat). `tick_dispatch`'s `self.live`
+    /// gate (real terminal only, never a test driver) already keeps this one
+    /// out of `cargo test`'s stdout, but it still repainted the identical
+    /// DECSCUSR cursor-style escape (`ratatui::crossterm::cursor::
+    /// SetCursorStyle`, via `TuiBackend::set_caret_shape`) every idle tick in
+    /// a real session, with no change-detection of its own.
+    pub(crate) last_caret_shape: Option<quadraui::EditorCursorShape>,
     /// A second, standalone `quadraui::Backend`-impl handle, distinct from
     /// the `&mut dyn quadraui::Backend` the `ShellApp` runner hands
     /// `setup`/`handle`/`tick` — owned outright by `App` for the callers that
@@ -1537,6 +1575,8 @@ impl App {
             editor_hover_link_rects: Rc::new(RefCell::new(Vec::new())),
             editor_hover_scrollbar: Rc::new(Cell::new(None)),
             last_colorscheme,
+            last_window_title: None,
+            last_caret_shape: None,
             backend,
             units,
             // #1064: seeded to `None` rather than the active panel — GTK
@@ -8580,11 +8620,23 @@ impl App {
         // (`Backend::set_caret_shape`'s trait default), so gating this
         // costs nothing there.
         if self.live {
-            let engine = self.engine.borrow();
-            backend.set_caret_shape(render::caret_shape_for_mode(
-                &engine,
-                engine.sidebar_has_focus(),
-            ));
+            let shape = {
+                let engine = self.engine.borrow();
+                render::caret_shape_for_mode(&engine, engine.sidebar_has_focus())
+            };
+            // #1634: only write when the shape actually changed since the
+            // last tick — see `last_caret_shape`'s own doc (including its
+            // "not confirmed as the flicker cause" caveat). Without this,
+            // `TuiBackend::set_caret_shape` re-emitted the identical
+            // DECSCUSR escape (`ratatui::crossterm::cursor::SetCursorStyle`)
+            // to the real terminal on every idle poll cycle
+            // (`quadraui::runtime::IDLE_POLL_CEILING`, ~250ms) for no reason
+            // — real waste, independent of whether it's what the operator
+            // saw flicker.
+            if self.last_caret_shape != Some(shape) {
+                self.last_caret_shape = Some(shape);
+                backend.set_caret_shape(shape);
+            }
         }
 
         // Keep cached metrics up to date.

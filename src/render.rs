@@ -6139,7 +6139,21 @@ pub(crate) fn run_shared_tick_chores(
     // backend.
     let win_title = window_title(engine);
     if let Some(w) = backend.window() {
-        let _ = w.set_title(&win_title);
+        // #1634: only write when the title actually changed since the last
+        // tick — see `App::last_window_title`'s own doc (including its "not
+        // confirmed as the flicker cause" caveat). `window_title` is stable
+        // at idle (derived only from the active buffer's name), so before
+        // this guard every idle tick re-issued the identical `WindowControl
+        // ::set_title` call for no reason; on TUI that is a real OSC 0/2
+        // escape sequence written straight to `std::io::stdout()`
+        // (`TuiBackend::set_title` bypasses the `ratatui::Terminal`'s
+        // buffered `Write` entirely) — invisible to #1583's in-process
+        // idle-stability test, which only inspects the `TestBackend`/vt100
+        // sink `Terminal::draw` writes to.
+        if app.last_window_title.as_deref() != Some(win_title.as_str()) {
+            let _ = w.set_title(&win_title);
+            app.last_window_title = Some(win_title.clone());
+        }
         // Refresh the session-restore maximized cache (#1529) unconditionally
         // — unlike size/position below, this is exactly the one moment those
         // freeze, so it must always be current.
