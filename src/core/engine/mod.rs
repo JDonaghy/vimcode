@@ -1967,6 +1967,15 @@ pub enum UserKeymapAction {
     /// Key sequence to feed back through `Engine::handle_key`, in the same
     /// encoded-token form as `UserKeymap::keys` (e.g. `["<Esc>"]`).
     Keys(Vec<String>),
+    /// A Lua callback registered via `vimcode.keymap.set` (#1623), identified
+    /// by an opaque id into `plugin::PluginManager`'s callback table (the
+    /// registry key itself can't live here — this enum has no `Lua`
+    /// dependency and derives `PartialEq`, which `mlua::RegistryKey` does
+    /// not). Consulted through the same before-built-ins path as a config
+    /// keymap, which is what lets a plugin own a key with a built-in meaning
+    /// (`s`, `ys`, `gc`, …). Dispatch lives in
+    /// `Engine::dispatch_lua_keymap`.
+    Lua(u64),
 }
 
 impl std::fmt::Display for UserKeymapAction {
@@ -1974,11 +1983,15 @@ impl std::fmt::Display for UserKeymapAction {
         match self {
             UserKeymapAction::Ex(cmd) => write!(f, ":{cmd}"),
             UserKeymapAction::Keys(keys) => write!(f, "{}", keys.join("")),
+            UserKeymapAction::Lua(id) => write!(f, "<lua:{id}>"),
         }
     }
 }
 
-/// A parsed user-defined key mapping from settings.json.
+/// A parsed user-defined key mapping from settings.json, or a Lua keymap
+/// registered via `vimcode.keymap.set` (#1623) — both are consulted through
+/// the same before-built-ins path (`Engine::try_user_keymap`), which is what
+/// lets a Lua map own a key with a built-in meaning.
 #[derive(Debug, Clone)]
 pub struct UserKeymap {
     /// Mode: "n", "v", "x", "o", "i", "c", "s" (vim's `:map-modes` letters;
@@ -1988,12 +2001,22 @@ pub struct UserKeymap {
     /// `true` for a `noremap`-family definition: the rhs is fed through
     /// `handle_key` with user-keymap matching disabled, so it cannot recurse
     /// into another mapping. `false` (`map`-family) allows recursion, guarded
-    /// by [`MAXMAPDEPTH`].
+    /// by [`MAXMAPDEPTH`]. Always `true` for a Lua keymap (there is no
+    /// recursive-rhs concept for a callback).
     pub noremap: bool,
     /// Parsed key sequence, e.g. `["g", "c", "c"]` or `["<C-/>"]`.
     pub keys: Vec<String>,
     /// What firing this mapping does.
     pub action: UserKeymapAction,
+    /// `None` for a global mapping (every config keymap, and a Lua keymap
+    /// registered without `{buffer = ...}`); `Some(id)` restricts matching to
+    /// that one buffer (#1623, `vimcode.keymap.set(mode, lhs, fn, {buffer =
+    /// handle})`).
+    pub buffer: Option<BufferId>,
+    /// Human-readable description (`opts.desc` on a Lua keymap), surfaced by
+    /// keymap enumeration (`vimcode.keymap.list()`, #1623) for a which-key
+    /// style extension. Always `None` for a config keymap.
+    pub desc: Option<String>,
 }
 
 /// Normalize one `<...>` key-notation token to vimcode's canonical encoded
@@ -2065,7 +2088,7 @@ pub(crate) fn expand_leader_tokens(toks: Vec<String>, leader: &str) -> Vec<Strin
 /// `"gcc"` → `["g", "c", "c"]`; `"<C-/>x"` → `["<C-/>", "x"]`.
 /// Recognises vim's `<Esc> <CR> <Tab> <C-x> <A-x> <leader> <Plug>` notation
 /// (case-insensitively) via [`normalize_key_token`] (#1151).
-fn parse_key_sequence(s: &str) -> Vec<String> {
+pub(crate) fn parse_key_sequence(s: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
@@ -2134,6 +2157,8 @@ fn parse_keymap_def(s: &str) -> Option<UserKeymap> {
         noremap,
         keys,
         action,
+        buffer: None,
+        desc: None,
     })
 }
 
@@ -3194,6 +3219,13 @@ pub struct Engine {
 
     /// Set when cursor moves; backends flush the actual hook after a debounce delay (150ms).
     pub cursor_move_pending: Option<std::time::Instant>,
+    /// Set when the cursor moves, in *any* mode (#1623) — independent of
+    /// `cursor_move_pending` above, which is the legacy `cursor_move` hook and
+    /// is deliberately Normal-mode-only; this one drives the new
+    /// `CursorMoved`/`CursorMovedI` events and must not change that legacy
+    /// hook's firing scope. Flushed the same way, via
+    /// `Engine::flush_cursor_moved_event`.
+    pub cursor_moved_event_pending: Option<std::time::Instant>,
 
     /// Language IDs for which a background install is in progress.
     lsp_installing: std::collections::HashSet<String>,
@@ -4952,6 +4984,7 @@ impl Engine {
             lsp_show_code_action_popup_pending: false,
             pending_code_action_choices: Vec::new(),
             cursor_move_pending: None,
+            cursor_moved_event_pending: None,
             lsp_installing: std::collections::HashSet::new(),
             lsp_lookup_in_flight: std::collections::HashSet::new(),
             leader_partial: None,
@@ -5527,6 +5560,7 @@ impl Engine {
         let mut redraw = false;
         redraw |= self.process_pending_sidebar();
         redraw |= self.flush_cursor_move_hook();
+        redraw |= self.flush_cursor_moved_event();
         self.lsp_flush_changes();
         redraw |= self.poll_lsp();
         redraw |= self.poll_acp();

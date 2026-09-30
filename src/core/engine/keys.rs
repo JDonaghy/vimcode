@@ -711,6 +711,20 @@ impl Engine {
             }
             self.set_dirty(true);
 
+            // #1623: TextChanged (any mode but Insert/Replace) or
+            // TextChangedI (while typing). `plugin_event` itself is the cheap
+            // gate — it bails out before building any context when no hook
+            // is registered for the event name, so this costs one HashMap
+            // lookup on every keystroke that changes the buffer when no
+            // plugin subscribes.
+            let text_changed_event = if matches!(self.mode, Mode::Insert | Mode::Replace) {
+                "TextChangedI"
+            } else {
+                "TextChanged"
+            };
+            let text_changed_buf = self.active_buffer_id().0.to_string();
+            self.plugin_event(text_changed_event, &text_changed_buf);
+
             let t1 = std::time::Instant::now();
             // Always do a full re-parse + highlight extraction so byte
             // offsets stay correct.  Tree-sitter incremental parsing is fast
@@ -768,6 +782,18 @@ impl Engine {
             };
             if cur_line != pre_cursor_line || cur_col != pre_cursor_col {
                 self.cursor_move_pending = Some(std::time::Instant::now());
+            }
+        }
+
+        // #1623: CursorMoved/CursorMovedI debounce — independent of the
+        // legacy Normal-mode-only tracking just above, which must keep its
+        // exact firing scope. Covers every mode a cursor motion makes sense
+        // in, including Insert (typing moves the cursor every keystroke,
+        // hence CursorMovedI).
+        if !matches!(self.mode, Mode::Command | Mode::Search) {
+            let cur = self.cursor();
+            if cur.line != pre_cursor_line || cur.col != pre_cursor_col {
+                self.cursor_moved_event_pending = Some(std::time::Instant::now());
             }
         }
 
@@ -4893,10 +4919,34 @@ impl Engine {
                 self.command_cursor = self.command_buffer.chars().count();
             }
             '@' => {
-                // g@: call user-defined operatorfunc (charwise)
+                // g@: call user-defined operatorfunc (charwise). #1623: set
+                // '[ / '] to the motion's span first, so the callback can
+                // query it via `vimcode.state.mark("[")` / `("]")` (matching
+                // Neovim's own `operatorfunc` contract) instead of having to
+                // re-derive the range from the cursor and motion type alone.
                 let start_line = self.buffer().content.char_to_line(start);
+                let start_col = start - self.buffer().line_to_char(start_line);
+                let end_pos = end.saturating_sub(1).max(start);
+                let end_line = self.buffer().content.char_to_line(end_pos);
+                let end_col = end_pos - self.buffer().line_to_char(end_line);
+                let buf_id = self.active_buffer_id();
+                let marks = self.marks.entry(buf_id).or_default();
+                marks.insert(
+                    '[',
+                    Cursor {
+                        line: start_line,
+                        col: start_col,
+                    },
+                );
+                marks.insert(
+                    ']',
+                    Cursor {
+                        line: end_line,
+                        col: end_col,
+                    },
+                );
                 self.view_mut().cursor.line = start_line;
-                self.view_mut().cursor.col = start - self.buffer().line_to_char(start_line);
+                self.view_mut().cursor.col = start_col;
                 self.plugin_run_operatorfunc("char");
             }
             _ => {}
@@ -5058,8 +5108,27 @@ impl Engine {
                 self.command_cursor = self.command_buffer.chars().count();
             }
             '@' => {
-                // g@: call user-defined operatorfunc (linewise)
-                // Set '[ and '] marks for the range, then call the plugin
+                // g@: call user-defined operatorfunc (linewise). #1623:
+                // set '[ / '] to the motion's range first (see the charwise
+                // '@' arm in `apply_charwise_operator` for why) — '[ at the
+                // first line's start, '] at the last line's last column.
+                let buf_id = self.active_buffer_id();
+                let end_col = self.buffer().line_len_chars(end_line).saturating_sub(1);
+                let marks = self.marks.entry(buf_id).or_default();
+                marks.insert(
+                    '[',
+                    Cursor {
+                        line: start_line,
+                        col: 0,
+                    },
+                );
+                marks.insert(
+                    ']',
+                    Cursor {
+                        line: end_line,
+                        col: end_col,
+                    },
+                );
                 self.view_mut().cursor.line = start_line;
                 self.view_mut().cursor.col = 0;
                 self.plugin_run_operatorfunc("line");
@@ -9903,6 +9972,18 @@ impl Engine {
     /// both the lhs and any key-to-keys rhs (#1151).
     pub fn rebuild_user_keymaps(&mut self) {
         let leader = self.settings.leader.to_string();
+        // #1623: a `vimcode.keymap.set` entry isn't derived from
+        // `settings.keymaps` at all (load-time ones are merged in by
+        // `Engine::set_plugin_manager`; runtime ones are pushed directly by
+        // the immediate API) — rebuilding from settings alone would silently
+        // drop every Lua keymap the moment anything calls this (`:nnoremap`,
+        // `:unmap`, saving the Keymaps editor buffer, …). Carry them across.
+        let lua_keymaps: Vec<UserKeymap> = self
+            .user_keymaps
+            .iter()
+            .filter(|km| matches!(km.action, UserKeymapAction::Lua(_)))
+            .cloned()
+            .collect();
         self.user_keymaps = self
             .settings
             .keymaps
@@ -9915,6 +9996,7 @@ impl Engine {
                 }
                 km
             })
+            .chain(lua_keymaps)
             .collect();
     }
 
@@ -10064,8 +10146,14 @@ impl Engine {
         let mut exact_match: Option<(UserKeymapAction, bool)> = None;
         let mut has_prefix = false;
 
+        let active_buffer = self.active_buffer_id();
         for km in &self.user_keymaps {
             if !active_modes.contains(&km.mode.as_str()) {
+                continue;
+            }
+            // #1623: a buffer-local Lua keymap (`vimcode.keymap.set(..., {buffer
+            // = handle})`) only matches while that buffer is active.
+            if km.buffer.is_some_and(|b| b != active_buffer) {
                 continue;
             }
             if km.keys == self.keymap_buf {
@@ -10108,6 +10196,7 @@ impl Engine {
                     feed.extend(rhs);
                     self.feed_keymap_rhs(&feed, noremap)
                 }
+                UserKeymapAction::Lua(id) => self.dispatch_lua_keymap(id),
             });
         }
 
@@ -10224,10 +10313,14 @@ impl Engine {
 
         while let Some(first) = queue.front().cloned() {
             let active_modes = self.active_keymap_modes();
+            let active_buffer = self.active_buffer_id();
             let mut best: Option<(usize, UserKeymapAction, bool)> = None;
             if !active_modes.is_empty() {
                 for km in &self.user_keymaps {
                     if !active_modes.contains(&km.mode.as_str()) {
+                        continue;
+                    }
+                    if km.buffer.is_some_and(|b| b != active_buffer) {
                         continue;
                     }
                     if km.keys.is_empty() || km.keys.len() > queue.len() {
@@ -10274,9 +10367,37 @@ impl Engine {
                         }
                     }
                 }
+                UserKeymapAction::Lua(id) => {
+                    last = self.dispatch_lua_keymap(id);
+                }
             }
         }
         last
+    }
+
+    /// Invoke a Lua keymap registered via `vimcode.keymap.set` (#1623),
+    /// identified by its `UserKeymapAction::Lua` id. Applies whatever the
+    /// callback did through the queued/immediate plugin APIs, then — for an
+    /// `expr` map whose callback returned a string — feeds that string back
+    /// through the normal key path (literally, like a `noremap` `Keys` rhs;
+    /// an expr map has no notion of "recursive" expansion).
+    fn dispatch_lua_keymap(&mut self, id: u64) -> EngineAction {
+        if !self.can_dispatch_to_plugins() {
+            return EngineAction::None;
+        }
+        let ctx = self.make_plugin_ctx(false);
+        let Some((expr_result, ctx)) = self.with_plugin_dispatch(|pm| pm.call_lua_keymap(id, ctx))
+        else {
+            return EngineAction::None;
+        };
+        self.apply_plugin_ctx(ctx);
+        match expr_result {
+            Some(feed) if !feed.is_empty() => {
+                let toks = parse_key_sequence(&feed);
+                self.replay_keys_literal(&toks)
+            }
+            _ => EngineAction::None,
+        }
     }
 
     /// Replay a fixed list of already-resolved keys through `handle_key` with

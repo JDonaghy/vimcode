@@ -520,12 +520,31 @@ impl Engine {
         if self.active_buffer_state().review_verdict.is_some() {
             return self.save_review_verdict_buffer();
         }
+        // Plugin-owned write (`BufWriteCmd` shape, #1623): a plugin claimed
+        // this buffer's writes via `vimcode.buffer.set_write_handler` (the
+        // oil.nvim pattern — a scratch buffer whose ":w" means "apply my
+        // edits", not "write these lines to a file"). The plugin owns
+        // persistence entirely; the normal disk-write path below never runs.
+        let active_id = self.active_buffer_id();
+        if self
+            .plugin_manager
+            .as_ref()
+            .is_some_and(|pm| pm.has_write_handler(active_id.0 as i64))
+        {
+            return self.run_plugin_write_handler(active_id);
+        }
 
         // Promote preview on save
-        let active_id = self.active_buffer_id();
         self.preview_tab_promote(active_id);
         let state = self.active_buffer_state_mut();
         if let Some(ref path) = state.file_path.clone() {
+            let path_str = path.to_string_lossy().into_owned();
+            // #1623: BufWritePre fires *before* the write — unlike `save`/
+            // `BufWrite` below, which both fire after (kept exactly as-is
+            // for back-compat: shipped extensions rely on "the file is
+            // already on disk" at that point).
+            self.plugin_event("BufWritePre", &path_str);
+            let state = self.active_buffer_state_mut();
             match state.save() {
                 Ok(line_count) => {
                     let rel = self.copy_relative_path(path);
@@ -538,7 +557,6 @@ impl Engine {
                     // Delete swap file — content is safely on disk now.
                     self.swap_delete_for_buffer(id);
                     self.swap_write_needed.remove(&id);
-                    let path_str = path.to_string_lossy().into_owned();
                     self.plugin_event("save", &path_str);
                     self.plugin_event("BufWrite", &path_str);
                     Ok(())
@@ -550,6 +568,40 @@ impl Engine {
             }
         } else {
             self.message = "No file name".to_string();
+            Err(self.message.clone())
+        }
+    }
+
+    /// Run a plugin's `vimcode.buffer.set_write_handler` callback instead of
+    /// writing `buf_id` to disk (#1623). Fires `BufWritePre` first, same as
+    /// the normal disk-write path, so a `BufWritePre` hook sees the same
+    /// "about to be written" moment either way. On success, clears `dirty`
+    /// (there is no `vim.bo.modified`-equivalent Lua setter yet for the
+    /// callback to do this itself) and leaves `self.message` for the
+    /// callback to set via `vimcode.message`.
+    fn run_plugin_write_handler(&mut self, buf_id: BufferId) -> Result<(), String> {
+        let path_str = self
+            .buffer_manager
+            .get(buf_id)
+            .and_then(|s| s.file_path.clone())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.plugin_event("BufWritePre", &path_str);
+        let ctx = self.make_plugin_ctx(false);
+        let Some((found, ctx)) =
+            self.with_plugin_dispatch(|pm| pm.call_write_handler(buf_id.0 as i64, ctx))
+        else {
+            self.message = "no live editor for plugin write handler".to_string();
+            return Err(self.message.clone());
+        };
+        self.apply_plugin_ctx(ctx);
+        if found {
+            if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+                state.dirty = false;
+            }
+            Ok(())
+        } else {
+            self.message = "plugin write handler vanished".to_string();
             Err(self.message.clone())
         }
     }

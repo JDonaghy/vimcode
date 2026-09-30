@@ -4777,3 +4777,625 @@ fn immediate_api_outside_a_callback_is_a_clear_lua_error() {
         "the error must say the immediate API needs a running callback: {err}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Native Extension API — Phase 2 (#1623): new events, keymaps consulted
+// before built-ins (expr / buffer-local / o / x), g@ marks, keymap
+// enumeration, and a BufWriteCmd-style write hook.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── New events ──────────────────────────────────────────────────────────────
+
+#[test]
+fn text_changed_fires_on_normal_mode_edit_with_buffer_handle() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "text_changed",
+        r#"
+        vimcode.on("TextChanged", function(buf)
+            vimcode.message("TextChanged:" .. buf)
+        end)
+        "#,
+    );
+    let buf = e.active_buffer_id().0;
+    // 'x' deletes a char in Normal mode — a real buffer edit outside Insert.
+    press(&mut e, 'x');
+    assert_eq!(
+        e.message,
+        format!("TextChanged:{buf}"),
+        "TextChanged must fire once, delivering the buffer handle"
+    );
+}
+
+#[test]
+fn text_changed_does_not_fire_for_a_non_editing_key() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "text_changed_quiet",
+        r#"
+        vimcode.on("TextChanged", function(buf)
+            vimcode.message("TextChanged:" .. buf)
+        end)
+        "#,
+    );
+    // 'l' just moves the cursor — no buffer mutation.
+    press(&mut e, 'l');
+    assert_eq!(
+        e.message, "",
+        "TextChanged must not fire for a key that didn't change the buffer"
+    );
+}
+
+#[test]
+fn text_changed_i_fires_while_typing_in_insert_mode() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "text_changed_i",
+        r#"
+        vimcode.on("TextChangedI", function(buf)
+            vimcode.message("TextChangedI:" .. buf)
+        end)
+        vimcode.on("TextChanged", function(buf)
+            vimcode.message("TextChanged:" .. buf)
+        end)
+        "#,
+    );
+    let buf = e.active_buffer_id().0;
+    press(&mut e, 'i');
+    press(&mut e, 'X');
+    assert_eq!(
+        e.message,
+        format!("TextChangedI:{buf}"),
+        "typing in Insert mode must fire TextChangedI, not TextChanged"
+    );
+}
+
+#[test]
+fn cursor_moved_fires_with_window_handle_after_flush() {
+    let mut e = engine_with_plugin(
+        "one\ntwo\nthree\n",
+        "cursor_moved",
+        r#"
+        vimcode.on("CursorMoved", function(win)
+            vimcode.message("CursorMoved:" .. win)
+        end)
+        "#,
+    );
+    let win = e.active_window_id().0;
+    press(&mut e, 'j'); // move down a line
+    assert!(
+        e.cursor_moved_event_pending.is_some(),
+        "moving the cursor must arm the CursorMoved debounce"
+    );
+    // Force the debounce to have elapsed instead of sleeping in a test.
+    e.cursor_moved_event_pending =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(200));
+    let redrew = e.flush_cursor_moved_event();
+    assert!(redrew, "flush must report the event fired");
+    assert_eq!(
+        e.message,
+        format!("CursorMoved:{win}"),
+        "CursorMoved must deliver the window handle"
+    );
+}
+
+#[test]
+fn cursor_moved_i_fires_while_typing() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "cursor_moved_i",
+        r#"
+        vimcode.on("CursorMovedI", function(win)
+            vimcode.message("CursorMovedI:" .. win)
+        end)
+        "#,
+    );
+    let win = e.active_window_id().0;
+    press(&mut e, 'i');
+    press(&mut e, 'X'); // typing moves the cursor forward
+    e.cursor_moved_event_pending =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(200));
+    e.flush_cursor_moved_event();
+    assert_eq!(
+        e.message,
+        format!("CursorMovedI:{win}"),
+        "cursor movement while typing must fire CursorMovedI, not CursorMoved"
+    );
+}
+
+#[test]
+fn buf_leave_fires_with_old_buffer_handle_on_window_set_buf() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "buf_leave",
+        r#"
+        vimcode.on("BufLeave", function(buf)
+            vimcode.message("BufLeave:" .. buf)
+        end)
+        vimcode.command("SwitchAway", function(_)
+            local b = vimcode.buffer.create({scratch = true})
+            vimcode.window.set_buf(0, b)
+        end)
+        "#,
+    );
+    let old_buf = e.active_buffer_id().0;
+    exec(&mut e, "SwitchAway");
+    assert_eq!(
+        e.message,
+        format!("BufLeave:{old_buf}"),
+        "BufLeave must fire for the window's previous buffer"
+    );
+    assert_ne!(
+        e.active_buffer_id().0,
+        old_buf,
+        "the window must actually have switched buffers"
+    );
+}
+
+#[test]
+fn buf_write_pre_fires_before_the_file_is_actually_written() {
+    let tmp = std::env::temp_dir().join("vc_plugin_bufwritepre_test.txt");
+    std::fs::write(&tmp, "old\n").ok();
+
+    let mut e = engine_with_plugin(
+        "",
+        "buf_write_pre",
+        r#"
+        vimcode.on("BufWritePre", function(path)
+            local f = io.open(path, "r")
+            PRE_CONTENT = f and f:read("*a") or "MISSING"
+            if f then f:close() end
+        end)
+        vimcode.command("GetPre", function(_)
+            vimcode.message("pre=" .. (PRE_CONTENT or "nil"))
+        end)
+        "#,
+    );
+    e.open_file_in_tab(&tmp);
+    set_content(&mut e, "new\n");
+    assert!(e.save().is_ok(), "save must still succeed");
+    exec(&mut e, "GetPre");
+    assert_eq!(
+        e.message, "pre=old\n",
+        "BufWritePre must see the file's content before this write landed"
+    );
+    let on_disk = std::fs::read_to_string(&tmp).unwrap();
+    assert_eq!(
+        on_disk, "new\n",
+        "the write itself must still have happened"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn win_enter_and_win_leave_fire_on_window_focus_change() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "win_focus",
+        r#"
+        vimcode.on("WinEnter", function(win)
+            vimcode.message("enter:" .. win)
+        end)
+        vimcode.on("WinLeave", function(win)
+            vimcode.message("leave:" .. win)
+        end)
+        "#,
+    );
+    let win_a = e.active_window_id().0;
+    e.split_window(vimcode_core::core::window::SplitDirection::Horizontal, None);
+    let win_b = e.active_window_id().0;
+    assert_ne!(win_a, win_b, "split must create and focus a new window");
+    // The split itself doesn't go through the focus-change helper (it's not
+    // "switching focus", it's "creating and seeding a new window") — focus
+    // the other window explicitly to exercise WinEnter/WinLeave.
+    e.focus_prev_window();
+    // Both fire (WinLeave for win_b, then WinEnter for win_a) — WinEnter
+    // fires last, so it's the one still in `message`. The counted variant
+    // below confirms WinLeave fired too.
+    assert_eq!(
+        e.message,
+        format!("enter:{win_a}"),
+        "WinEnter must fire for the window gaining focus"
+    );
+}
+
+#[test]
+fn win_enter_and_win_leave_both_fire_exactly_once() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "win_focus_counted",
+        r#"
+        ENTER_COUNT = 0
+        LEAVE_COUNT = 0
+        vimcode.on("WinEnter", function(_) ENTER_COUNT = ENTER_COUNT + 1 end)
+        vimcode.on("WinLeave", function(_) LEAVE_COUNT = LEAVE_COUNT + 1 end)
+        vimcode.command("Counts", function(_)
+            vimcode.message("enter=" .. ENTER_COUNT .. " leave=" .. LEAVE_COUNT)
+        end)
+        "#,
+    );
+    e.split_window(vimcode_core::core::window::SplitDirection::Horizontal, None);
+    e.focus_prev_window();
+    exec(&mut e, "Counts");
+    assert_eq!(
+        e.message, "enter=1 leave=1",
+        "each focus change must fire WinEnter/WinLeave exactly once"
+    );
+}
+
+#[test]
+fn file_type_fires_with_the_detected_language_on_open() {
+    let tmp = std::env::temp_dir().join("vc_plugin_filetype_test.rs");
+    std::fs::write(&tmp, "fn main() {}\n").ok();
+
+    let mut e = engine_with_plugin(
+        "",
+        "file_type",
+        r#"
+        vimcode.on("FileType", function(ft)
+            SEEN_FILETYPE = ft
+        end)
+        vimcode.command("GetFiletype", function(_)
+            vimcode.message("filetype:" .. (SEEN_FILETYPE or "nil"))
+        end)
+        "#,
+    );
+    // `open_file_in_tab` fires FileType but also kicks off LSP bookkeeping
+    // that overwrites `e.message` afterwards (e.g. "no LSP server found") —
+    // capture the event's arg into a Lua global instead of reading `message`
+    // straight after, same as the `BufWritePre` test above.
+    e.open_file_in_tab(&tmp);
+    exec(&mut e, "GetFiletype");
+    assert_eq!(
+        e.message, "filetype:rust",
+        "FileType must fire with the detected language id"
+    );
+
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn colorscheme_fires_with_the_new_scheme_name() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "colorscheme_event",
+        r#"
+        vimcode.on("ColorScheme", function(name)
+            vimcode.message("scheme:" .. name)
+        end)
+        "#,
+    );
+    exec(&mut e, "colorscheme gruvbox-dark");
+    assert_eq!(
+        e.message, "scheme:gruvbox-dark",
+        "ColorScheme must fire with the new scheme's canonical name"
+    );
+}
+
+#[test]
+fn user_event_fires_via_fire_event_with_the_given_name() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "user_event",
+        r#"
+        vimcode.on("User", function(name)
+            vimcode.message("user:" .. name)
+        end)
+        vimcode.command("Fire", function(_)
+            vimcode.fire_event("MyPluginReady")
+        end)
+        "#,
+    );
+    exec(&mut e, "Fire");
+    assert_eq!(
+        e.message, "user:MyPluginReady",
+        "vimcode.fire_event must deliver the caller-chosen name via the User event"
+    );
+}
+
+#[test]
+fn user_event_does_not_fire_for_an_unrelated_trigger() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "user_event_quiet",
+        r#"
+        vimcode.on("User", function(name)
+            vimcode.message("user:" .. name)
+        end)
+        "#,
+    );
+    press(&mut e, 'x'); // an ordinary edit, no fire_event call anywhere
+    assert_eq!(
+        e.message, "",
+        "User must never fire unless a plugin explicitly calls vimcode.fire_event"
+    );
+}
+
+// ── Keymaps consulted before built-ins (#1623) ─────────────────────────────
+
+#[test]
+fn lua_keymap_set_beats_the_built_in_substitute_s() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "keymap_precedence",
+        r#"
+        vimcode.keymap.set("n", "s", function()
+            vimcode.message("plugin owns s")
+        end)
+        "#,
+    );
+    press(&mut e, 's');
+    assert_eq!(
+        e.message, "plugin owns s",
+        "a vimcode.keymap.set map must be consulted before the built-in 's' \
+         (substitute) handler"
+    );
+    assert_eq!(
+        e.mode,
+        vimcode_core::Mode::Normal,
+        "the built-in 's' (which enters Insert mode) must never have run"
+    );
+    assert_eq!(
+        buf(&e),
+        "hello\n",
+        "the built-in 's' must never have deleted a char"
+    );
+}
+
+#[test]
+fn lua_keymap_survives_rebuild_user_keymaps() {
+    // `rebuild_user_keymaps` re-derives `user_keymaps` from
+    // `settings.keymaps` alone (`:nnoremap`, `:unmap`, saving the Keymaps
+    // editor buffer all call it) — a Lua `vimcode.keymap.set` entry isn't
+    // sourced from settings at all, so a naive rebuild would silently drop
+    // it. This is a regression test for that: the map must still fire after
+    // a rebuild triggered for an unrelated reason.
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "keymap_survives_rebuild",
+        r#"
+        vimcode.keymap.set("n", "s", function()
+            vimcode.message("plugin owns s")
+        end)
+        "#,
+    );
+    // Something else entirely (e.g. `:nnoremap`) triggers a rebuild.
+    exec(&mut e, "nnoremap gx :join");
+    press(&mut e, 's');
+    assert_eq!(
+        e.message, "plugin owns s",
+        "a Lua keymap must survive a rebuild triggered by unrelated config \
+         keymap changes"
+    );
+}
+
+#[test]
+fn lua_keymap_set_multi_key_sequence_beats_built_in_prefix() {
+    // nvim-surround's actual shape: a plugin owns "ys" while 'y' alone keeps
+    // its built-in (yank operator) meaning.
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "keymap_ys",
+        r#"
+        vimcode.keymap.set("n", "ys", function()
+            vimcode.message("ys fired")
+        end)
+        "#,
+    );
+    press(&mut e, 'y');
+    press(&mut e, 's');
+    assert_eq!(e.message, "ys fired", "the two-key Lua mapping must fire");
+}
+
+#[test]
+fn lua_keymap_expr_map_feeds_returned_keys() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\n",
+        "keymap_expr",
+        r#"
+        vimcode.keymap.set("n", "Q", function()
+            return "dd"
+        end, {expr = true})
+        "#,
+    );
+    press(&mut e, 'Q');
+    assert_eq!(
+        buf(&e),
+        "line two\n",
+        "an expr map's returned key notation must be fed back through the \
+         normal key path"
+    );
+}
+
+#[test]
+fn lua_keymap_buffer_local_only_matches_its_own_buffer() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "keymap_buffer_local",
+        r#"
+        vimcode.command("Setup", function(_)
+            local a = vimcode.buffer.current()
+            vimcode.keymap.set("n", "Q", function()
+                vimcode.message("Q on A")
+            end, {buffer = a})
+            BUF_A = a
+            local b = vimcode.buffer.create({scratch = true})
+            vimcode.window.set_buf(0, b)
+        end)
+        vimcode.command("SwitchBack", function(_)
+            vimcode.window.set_buf(0, BUF_A)
+        end)
+        "#,
+    );
+    exec(&mut e, "Setup");
+    // Now on the scratch buffer B — the map is bound to A only.
+    press(&mut e, 'Q');
+    assert_eq!(
+        e.message, "",
+        "a buffer-local map must not fire while a different buffer is active"
+    );
+    exec(&mut e, "SwitchBack");
+    press(&mut e, 'Q');
+    assert_eq!(
+        e.message, "Q on A",
+        "a buffer-local map must fire once its buffer is active again"
+    );
+}
+
+#[test]
+fn lua_keymap_operator_pending_o_mode_fires() {
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "keymap_o_mode",
+        r#"
+        vimcode.keymap.set("o", "Q", function()
+            vimcode.message("o-mode Q fired")
+        end)
+        "#,
+    );
+    press(&mut e, 'd'); // enter operator-pending (delete)
+    press(&mut e, 'Q'); // Lua o-mode map, not a built-in motion
+    assert_eq!(
+        e.message, "o-mode Q fired",
+        "an 'o' mode map must be consulted while an operator is pending"
+    );
+}
+
+#[test]
+fn lua_keymap_visual_x_mode_fires() {
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "keymap_x_mode",
+        r#"
+        vimcode.keymap.set("x", "Q", function()
+            vimcode.message("x-mode Q fired")
+        end)
+        "#,
+    );
+    press(&mut e, 'v'); // enter Visual mode
+    press(&mut e, 'Q');
+    assert_eq!(
+        e.message, "x-mode Q fired",
+        "an 'x' mode map must fire in Visual mode"
+    );
+}
+
+#[test]
+fn lua_keymap_list_enumerates_mode_lhs_buffer_and_desc() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "keymap_list",
+        r#"
+        vimcode.keymap.set("n", "gy", function() end, {desc = "yank stuff"})
+        vimcode.command("ListIt", function(_)
+            for _, m in ipairs(vimcode.keymap.list()) do
+                if m.lhs == "gy" then
+                    vimcode.message(
+                        "mode=" .. m.mode
+                        .. " desc=" .. (m.desc or "nil")
+                        .. " buffer=" .. tostring(m.buffer)
+                    )
+                end
+            end
+        end)
+        "#,
+    );
+    exec(&mut e, "ListIt");
+    assert_eq!(
+        e.message, "mode=n desc=yank stuff buffer=nil",
+        "vimcode.keymap.list() must surface mode, lhs, desc and buffer-locality"
+    );
+}
+
+// ── g@ operator marks (#1623) ───────────────────────────────────────────────
+
+#[test]
+fn g_at_operator_sets_open_and_close_marks_charwise() {
+    let mut e = engine_with_plugin(
+        "hello world\n",
+        "g_at_charwise",
+        r#"
+        vimcode.set_operatorfunc(function(_)
+            local a = vimcode.state.mark("[")
+            local b = vimcode.state.mark("]")
+            vimcode.message(
+                "open=" .. a.line .. "," .. a.col
+                .. " close=" .. b.line .. "," .. b.col
+            )
+        end)
+        "#,
+    );
+    // g@w: operate on a charwise "word" motion from the start of the buffer.
+    e.feed_keys("g@w");
+    assert_eq!(
+        e.message, "open=1,1 close=1,6",
+        "g@ must set '[ / '] to the motion's charwise span before calling \
+         the operatorfunc"
+    );
+}
+
+#[test]
+fn g_at_operator_sets_open_and_close_marks_linewise() {
+    let mut e = engine_with_plugin(
+        "line one\nline two\nline three\n",
+        "g_at_linewise",
+        r#"
+        vimcode.set_operatorfunc(function(_)
+            local a = vimcode.state.mark("[")
+            local b = vimcode.state.mark("]")
+            vimcode.message(
+                "open=" .. a.line .. "," .. a.col
+                .. " close=" .. b.line .. "," .. b.col
+            )
+        end)
+        "#,
+    );
+    // g@j: linewise motion spanning the first two lines.
+    e.feed_keys("g@j");
+    assert_eq!(
+        e.message, "open=1,1 close=2,9",
+        "g@ must set '[ / '] to the motion's linewise span (first line's \
+         start, last line's last column) before calling the operatorfunc"
+    );
+}
+
+// ── Buffer write hook (#1623, oil.nvim shape) ───────────────────────────────
+
+#[test]
+fn buffer_write_handler_takes_over_save_and_clears_dirty() {
+    let mut e = engine_with_plugin(
+        "hello\n",
+        "write_handler",
+        r#"
+        vimcode.command("SetupOil", function(_)
+            local b = vimcode.buffer.create({scratch = true, name = "oil"})
+            vimcode.buffer.set_lines(b, 0, -1, {"line-from-plugin"})
+            vimcode.buffer.set_write_handler(b, function(buf)
+                vimcode.message("wrote:" .. buf)
+            end)
+            vimcode.window.set_buf(0, b)
+        end)
+        "#,
+    );
+    exec(&mut e, "SetupOil");
+    let buf_id = e.active_buffer_id();
+    assert!(
+        e.buffer_manager.get(buf_id).unwrap().dirty,
+        "set_lines must have left the scratch buffer dirty"
+    );
+    assert!(
+        e.save().is_ok(),
+        "save() must succeed via the write handler"
+    );
+    assert_eq!(
+        e.message,
+        format!("wrote:{}", buf_id.0),
+        "the write handler must run with the buffer's own handle, instead of \
+         vimcode writing to disk"
+    );
+    assert!(
+        !e.buffer_manager.get(buf_id).unwrap().dirty,
+        "a successful plugin write must clear the dirty flag"
+    );
+}
