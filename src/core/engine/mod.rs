@@ -3466,6 +3466,13 @@ pub struct Engine {
     /// [`Engine::open_picker`] like every other picker-session field, so a
     /// plain `<leader>fg`/Command-Center grep never inherits a stale scope.
     pub picker_grep_scope: Option<std::path::PathBuf>,
+    /// `vimcode.picker.open(...):set_loading(bool)` (#1630): a plugin-fed
+    /// picker's "still fetching" flag. Purely state today — no renderer
+    /// paints it yet (out of scope: `render.rs`/backends weren't touched
+    /// beyond the one `has_preview` line #1630 needed, see that method's
+    /// doc) — so this must not be read as user-visible until a follow-up
+    /// wires a spinner/hint into the picker header.
+    pub picker_loading: bool,
 
     // --- Find/Replace overlay (Ctrl+F) ---
     /// Whether the find/replace overlay is open.
@@ -4518,6 +4525,14 @@ pub struct Engine {
     /// `PluginManager::register_spawn_callbacks` handed out. Polled from
     /// `poll_idle` via [`Self::poll_plugin_spawns`].
     plugin_spawns: HashMap<u64, execute::PluginSpawnHandle>,
+    /// Live `vimcode.picker.open` handles (#1630), keyed by the id
+    /// `PluginManager::register_picker` handed out — `PickerSource::
+    /// Custom("plugin:<id>")` names the same id. `Weak` for the same
+    /// unload-detection reason as `PluginTimerEntry::manager`: when
+    /// `Engine::set_plugin_manager` replaces the manager, `Self::
+    /// reap_stale_plugin_timers_and_spawns` closes any of these whose
+    /// `upgrade()` now fails.
+    plugin_pickers: HashMap<u64, std::rc::Weak<plugin::PluginManager>>,
 
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
@@ -5182,6 +5197,7 @@ impl Engine {
             picker_history_index: None,
             picker_history_typing_buffer: String::new(),
             picker_grep_scope: None,
+            picker_loading: false,
             breadcrumb_focus: false,
             breadcrumb_selected: 0,
             breadcrumb_segments: Vec::new(),
@@ -5428,6 +5444,7 @@ impl Engine {
             plugin_timers: HashMap::new(),
             plugin_timer_seq: 0,
             plugin_spawns: HashMap::new(),
+            plugin_pickers: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,

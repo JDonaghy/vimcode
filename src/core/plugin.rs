@@ -506,11 +506,17 @@ pub struct PluginManager {
     /// The process/pipes/receiver live on `Engine::plugin_spawns`, keyed by
     /// the same id.
     spawn_callbacks: RefCell<HashMap<u64, SpawnCallbacks>>,
-    /// Next id [`Self::register_timer_callback`]/[`Self::register_spawn_callbacks`]
-    /// hand out. Shared between timers and spawns — they land in disjoint
-    /// `Engine`-side maps, so there is no collision risk, and one counter is
-    /// simpler than two.
+    /// Next id [`Self::register_timer_callback`]/[`Self::register_spawn_callbacks`]/
+    /// [`Self::register_picker`]/[`Self::register_picker_item`] hand out.
+    /// Shared across all four — they land in disjoint `Engine`-side maps (or,
+    /// for picker items, a disjoint per-picker map), so there is no collision
+    /// risk, and one counter is simpler than several.
     next_handle_id: Cell<u64>,
+    /// Live `vimcode.picker.open` registrations (#1630), keyed by the id
+    /// [`Self::register_picker`] handed out. `RefCell` for the same reason as
+    /// `spawn_callbacks`: `set_items`/`append`/`close` reach here through the
+    /// immediate API, with only `&PluginManager` available.
+    pickers: RefCell<HashMap<u64, PluginPicker>>,
 }
 
 /// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
@@ -520,6 +526,51 @@ struct SpawnCallbacks {
     on_stdout: Option<LuaRegistryKey>,
     on_stderr: Option<LuaRegistryKey>,
     on_exit: Option<LuaRegistryKey>,
+}
+
+/// A live `vimcode.picker.open` registration (#1630): the three optional
+/// callbacks plus every item currently in the list, keyed by an id private to
+/// this picker (assigned by [`PluginManager::register_picker_item`]) so
+/// `PickerAction::Custom("plugin_item:<picker_id>:<item_id>")` can look the
+/// item back up when the user confirms it.
+struct PluginPicker {
+    on_select: Option<LuaRegistryKey>,
+    on_cancel: Option<LuaRegistryKey>,
+    on_query: Option<LuaRegistryKey>,
+    items: HashMap<u64, PluginPickerItemEntry>,
+}
+
+/// One item's plugin-owned payload: the opaque `data` value handed back to
+/// `on_select` verbatim, and where its preview content comes from (if any).
+struct PluginPickerItemEntry {
+    data: Option<LuaRegistryKey>,
+    preview: Option<PluginPickerPreview>,
+}
+
+/// Where a `vimcode.picker.open` item's preview content comes from (#1630).
+/// Plain data (no Lua registry involved), so `Engine::picker_load_preview`
+/// can read it without calling back into Lua.
+#[derive(Debug, Clone)]
+pub(crate) enum PluginPickerPreview {
+    /// A file path (resolved against `Engine::cwd` if relative) and an
+    /// optional 1-indexed line to center on, mirroring `PickerAction::
+    /// OpenFileAtLine`'s convention.
+    File(PathBuf, Option<usize>),
+    /// A buffer handle (as given to Lua — `0` means "current", matching
+    /// every other immediate-API handle) and an optional 1-indexed line.
+    Buffer(i64, Option<usize>),
+}
+
+/// One `vimcode.picker.open`/`:set_items`/`:append` item, parsed from Lua but
+/// not yet registered with a picker (that needs `&PluginManager`, done by
+/// `Engine::plugin_api_picker_set_items`).
+pub(crate) struct PluginPickerItemSpec {
+    pub display: String,
+    pub filter_text: Option<String>,
+    pub detail: Option<String>,
+    pub icon: Option<String>,
+    pub(crate) data: Option<LuaRegistryKey>,
+    pub(crate) preview: Option<PluginPickerPreview>,
 }
 
 /// A registered `vimcode.keymap.set` callback (#1623), looked up by the
@@ -677,6 +728,103 @@ struct PluginRegistrations {
     lua_keymaps: Vec<PendingLuaKeymap>,
 }
 
+// ─── Lua → picker vocabulary (#1630) ─────────────────────────────────────────
+
+/// Parse a `vimcode.picker.open`/`:set_items`/`:append` item's optional
+/// `preview` table: `{ file = "path", line = 3 }` or `{ buffer = 0, line = 3 }`
+/// (`file` wins if both are somehow present). `line` is 1-indexed, matching
+/// every other line convention this API surface uses (module doc).
+fn lua_table_to_picker_preview(t: &LuaTable) -> Option<PluginPickerPreview> {
+    let line: Option<usize> = t.get::<_, i64>("line").ok().map(|n| n.max(1) as usize);
+    if let Ok(file) = t.get::<_, String>("file") {
+        if !file.is_empty() {
+            return Some(PluginPickerPreview::File(PathBuf::from(file), line));
+        }
+    }
+    if let Ok(buf) = t.get::<_, i64>("buffer") {
+        return Some(PluginPickerPreview::Buffer(buf, line));
+    }
+    None
+}
+
+/// Parse one item table into a [`PluginPickerItemSpec`]. `data` is stashed in
+/// the Lua registry as-is (any value, including `nil`/absent) so `on_select`
+/// gets back exactly what the plugin put in, unmodified.
+fn lua_table_to_picker_item_spec(lua: &Lua, t: &LuaTable) -> LuaResult<PluginPickerItemSpec> {
+    let display: String = t.get("display").unwrap_or_default();
+    let filter_text: Option<String> = t.get::<_, String>("filter_text").ok();
+    let detail: Option<String> = t.get::<_, String>("detail").ok();
+    let icon: Option<String> = t.get::<_, String>("icon").ok();
+    let data = match t.get::<_, LuaValue>("data") {
+        Ok(LuaValue::Nil) | Err(_) => None,
+        Ok(v) => Some(lua.create_registry_value(v)?),
+    };
+    let preview = match t.get::<_, LuaTable>("preview") {
+        Ok(pt) => lua_table_to_picker_preview(&pt),
+        Err(_) => None,
+    };
+    Ok(PluginPickerItemSpec {
+        display,
+        filter_text,
+        detail,
+        icon,
+        data,
+        preview,
+    })
+}
+
+/// Parse a whole `items` array-table into specs, in order.
+fn lua_table_to_picker_items(lua: &Lua, items: &LuaTable) -> LuaResult<Vec<PluginPickerItemSpec>> {
+    items
+        .clone()
+        .sequence_values::<LuaTable>()
+        .map(|row| lua_table_to_picker_item_spec(lua, &row?))
+        .collect()
+}
+
+/// Build the handle `vimcode.picker.open` returns: `id` plus the four
+/// live-update methods, every one an immediate-API call keyed by `id` —
+/// mirrors `vimcode.loop.spawn`'s handle (`write`/`close_stdin`/`kill`).
+fn make_picker_handle(lua: &Lua, id: u64) -> LuaResult<LuaTable<'_>> {
+    let handle = lua.create_table()?;
+    handle.set("id", id)?;
+    handle.set(
+        "set_items",
+        lua.create_function(move |lua, (_self, items): (LuaValue, LuaTable)| {
+            let specs = lua_table_to_picker_items(lua, &items)?;
+            live_engine("vimcode.picker:set_items", move |e| {
+                e.plugin_api_picker_set_items(id, specs, true)
+            })
+        })?,
+    )?;
+    handle.set(
+        "append",
+        lua.create_function(move |lua, (_self, items): (LuaValue, LuaTable)| {
+            let specs = lua_table_to_picker_items(lua, &items)?;
+            live_engine("vimcode.picker:append", move |e| {
+                e.plugin_api_picker_set_items(id, specs, false)
+            })
+        })?,
+    )?;
+    handle.set(
+        "set_loading",
+        lua.create_function(move |_, (_self, loading): (LuaValue, bool)| {
+            live_engine("vimcode.picker:set_loading", move |e| {
+                e.plugin_api_picker_set_loading(id, loading)
+            })
+        })?,
+    )?;
+    handle.set(
+        "close",
+        lua.create_function(move |_, _self: LuaValue| {
+            live_engine("vimcode.picker:close", move |e| {
+                e.plugin_api_picker_close(id)
+            })
+        })?,
+    )?;
+    Ok(handle)
+}
+
 // ─── PluginManager implementation ────────────────────────────────────────────
 
 impl PluginManager {
@@ -700,6 +848,7 @@ impl PluginManager {
             timer_callbacks: RefCell::new(HashMap::new()),
             spawn_callbacks: RefCell::new(HashMap::new()),
             next_handle_id: Cell::new(0),
+            pickers: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1184,6 +1333,154 @@ impl PluginManager {
                 code.map(i64::from),
                 signal.map(i64::from),
             ));
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
+
+    /// Register a new picker's callbacks and return its id. Called from
+    /// `Engine::plugin_api_picker_open` while a live engine is loaned, so the
+    /// returned id can be embedded into a fresh `PickerSource::Custom
+    /// ("plugin:<id>")` in the same call.
+    pub(crate) fn register_picker(
+        &self,
+        on_select: Option<LuaRegistryKey>,
+        on_cancel: Option<LuaRegistryKey>,
+        on_query: Option<LuaRegistryKey>,
+    ) -> u64 {
+        let id = self.next_handle_id();
+        self.pickers.borrow_mut().insert(
+            id,
+            PluginPicker {
+                on_select,
+                on_cancel,
+                on_query,
+                items: HashMap::new(),
+            },
+        );
+        id
+    }
+
+    /// Drop picker `id`'s callbacks and every item it currently holds (on
+    /// select, on cancel, on an explicit `:close()`, or when the owning
+    /// plugin is unloaded) — a single `HashMap::remove` releases the whole
+    /// per-item `data`/preview map with it.
+    pub(crate) fn remove_picker(&self, id: u64) {
+        self.pickers.borrow_mut().remove(&id);
+    }
+
+    /// Drop picker `id`'s current items without touching its callbacks —
+    /// `Engine::plugin_api_picker_set_items`'s `replace = true` case (a fresh
+    /// `:set_items()` call) uses this before registering the new list.
+    pub(crate) fn clear_picker_items(&self, id: u64) {
+        if let Some(p) = self.pickers.borrow_mut().get_mut(&id) {
+            p.items.clear();
+        }
+    }
+
+    /// Register one item's `data`/preview under picker `id` and return its
+    /// item id. A no-op (item id still returned, just never stored) if `id`
+    /// names a picker that no longer exists — defensive only: callers reach
+    /// here after `Engine::plugin_picker_is_active` already confirmed the
+    /// picker is live, so this should not normally happen.
+    pub(crate) fn register_picker_item(
+        &self,
+        id: u64,
+        data: Option<LuaRegistryKey>,
+        preview: Option<PluginPickerPreview>,
+    ) -> u64 {
+        let item_id = self.next_handle_id();
+        if let Some(p) = self.pickers.borrow_mut().get_mut(&id) {
+            p.items
+                .insert(item_id, PluginPickerItemEntry { data, preview });
+        }
+        item_id
+    }
+
+    /// Read back item `item_id`'s preview source, if it declared one.
+    pub(crate) fn picker_item_preview(&self, id: u64, item_id: u64) -> Option<PluginPickerPreview> {
+        self.pickers
+            .borrow()
+            .get(&id)?
+            .items
+            .get(&item_id)?
+            .preview
+            .clone()
+    }
+
+    /// Fire picker `id`'s `on_select` callback with item `item_id`'s `data`
+    /// value (`nil` if the item declared none, or if the item/picker is
+    /// somehow gone by the time this runs).
+    pub(crate) fn call_picker_select(
+        &self,
+        id: u64,
+        item_id: u64,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let (on_select, data) = {
+            let pickers = self.pickers.borrow();
+            let on_select = pickers
+                .get(&id)
+                .and_then(|p| p.on_select.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok());
+            let data = pickers
+                .get(&id)
+                .and_then(|p| p.items.get(&item_id))
+                .and_then(|e| e.data.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaValue>(k).ok())
+                .unwrap_or(LuaValue::Nil);
+            (on_select, data)
+        };
+        if let Some(f) = on_select {
+            let _ = f.call::<LuaValue, ()>(data);
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire picker `id`'s `on_cancel` callback with no arguments.
+    pub(crate) fn call_picker_cancel(&self, id: u64, ctx: PluginCallContext) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let on_cancel = {
+            let pickers = self.pickers.borrow();
+            pickers
+                .get(&id)
+                .and_then(|p| p.on_cancel.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = on_cancel {
+            let _ = f.call::<(), ()>(());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire picker `id`'s `on_query` callback with the current query text —
+    /// a no-op if the picker declared none (plain fuzzy-filtering is enough
+    /// for most pickers; `on_query` is only for a dynamic source that wants
+    /// to re-run per keystroke, e.g. live grep).
+    pub(crate) fn call_picker_query(
+        &self,
+        id: u64,
+        query: &str,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let on_query = {
+            let pickers = self.pickers.borrow();
+            pickers
+                .get(&id)
+                .and_then(|p| p.on_query.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = on_query {
+            let _ = f.call::<String, ()>(query.to_string());
         }
         self.lua
             .remove_app_data::<PluginCallContext>()
@@ -3058,6 +3355,61 @@ impl PluginManager {
         )?;
 
         vimcode.set("ui", ui_tbl)?;
+
+        // ── vimcode.picker (#1630) ──────────────────────────────────────────
+        //
+        // `vimcode.picker.open({title, items, on_select, on_cancel, on_query})`
+        // opens the built-in fuzzy picker (`src/core/engine/picker.rs`) fed by
+        // plugin data instead of a built-in `PickerSource` — the telescope-
+        // style seam #1212's epic asks for. Items are `{display, filter_text?,
+        // detail?, icon?, data?, preview?}`; `data` is an opaque value handed
+        // back to `on_select` verbatim (any Lua value, including `nil`).
+        // `preview` is `{file=path, line=n}` or `{buffer=handle, line=n}`
+        // (`line` optional and 1-indexed either way).
+        //
+        // The returned handle supports live updates, for an async source fed
+        // by e.g. `vimcode.loop.spawn`'s streamed stdout: `:set_items(items)`
+        // replaces the whole list, `:append(items)` adds to it (re-filtering
+        // against the current query without resetting the selection),
+        // `:set_loading(bool)` marks it still-fetching, `:close()` closes it
+        // early. All four are immediate-API calls, like `vimcode.loop.spawn`'s
+        // handle methods — and, like those, callable with `.` or `:` (the
+        // first parameter is an ignored `self`).
+        let picker_tbl = lua.create_table()?;
+        picker_tbl.set(
+            "open",
+            lua.create_function(|lua, opts: LuaTable| {
+                let title: String = opts.get("title").unwrap_or_default();
+                let on_select = match opts.get::<_, LuaFunction>("on_select") {
+                    Ok(f) => Some(lua.create_registry_value(f)?),
+                    Err(_) => None,
+                };
+                let on_cancel = match opts.get::<_, LuaFunction>("on_cancel") {
+                    Ok(f) => Some(lua.create_registry_value(f)?),
+                    Err(_) => None,
+                };
+                let on_query = match opts.get::<_, LuaFunction>("on_query") {
+                    Ok(f) => Some(lua.create_registry_value(f)?),
+                    Err(_) => None,
+                };
+                let id = live_engine("vimcode.picker.open", move |e| {
+                    e.plugin_api_picker_open(title, on_select, on_cancel, on_query)
+                })?;
+                let Some(id) = id else {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.picker.open: no live plugin manager".to_string(),
+                    ));
+                };
+                if let Ok(items) = opts.get::<_, LuaTable>("items") {
+                    let specs = lua_table_to_picker_items(lua, &items)?;
+                    live_engine("vimcode.picker.open", move |e| {
+                        e.plugin_api_picker_set_items(id, specs, true)
+                    })?;
+                }
+                make_picker_handle(lua, id)
+            })?,
+        )?;
+        vimcode.set("picker", picker_tbl)?;
 
         // ── vimcode.editor subtable ────────────────────────────────────────
         let editor_tbl = lua.create_table()?;

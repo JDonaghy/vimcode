@@ -6044,3 +6044,258 @@ fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
         e.message
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — Phase 4 (#1630): `vimcode.picker.open` — open the built-in
+// picker from Lua with plugin items, stored-callback actions (`on_select`/
+// `on_cancel`), live/async item updates (`:append`), and file/buffer
+// preview. Maps to `PickerSource::Custom("plugin:<id>")` /
+// `PickerAction::Custom("plugin_item:<id>:<item_id>")` under the hood — see
+// `src/core/engine/plugins.rs`'s `plugin_api_picker_*` methods.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// #1630 acceptance: opening with a static item list must populate the
+/// picker's title and items immediately — no callback round-trip needed for
+/// the simplest case.
+///
+/// RED-verified against unfixed `develop`: there is no `vimcode.picker`
+/// table there, so the `Open` command errors at its first line and
+/// `e.picker_open` stays `false`.
+#[test]
+fn picker_open_with_static_items_shows_them() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_open_1630",
+        r#"
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({
+                title = "My Picker",
+                items = {
+                    { display = "alpha", data = "A" },
+                    { display = "beta", data = "B" },
+                },
+            })
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert!(
+        e.picker_open,
+        "vimcode.picker.open must open the unified picker"
+    );
+    assert_eq!(e.picker_title, "My Picker");
+    let displays: Vec<&str> = e.picker_items.iter().map(|i| i.display.as_str()).collect();
+    assert_eq!(displays, vec!["alpha", "beta"]);
+}
+
+/// #1630 acceptance: confirming an item fires `on_select` with that item's
+/// `data`, unmodified, and closes the picker.
+///
+/// RED-verified against unfixed `develop`: same as above — `on_select`
+/// never registers, so `_G.selected` stays `nil` and `Read` reports `nil`.
+#[test]
+fn picker_select_invokes_on_select_with_item_data() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_select_1630",
+        r#"
+        _G.selected = nil
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({
+                items = { { display = "alpha", data = "payload-A" } },
+                on_select = function(data) _G.selected = data end,
+            })
+        end)
+        vimcode.command("Read", function(_)
+            vimcode.message(tostring(_G.selected))
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert!(e.picker_open, "precondition: the picker is open");
+
+    press_key(&mut e, "Return");
+
+    assert!(!e.picker_open, "confirming an item must close the picker");
+    exec(&mut e, "Read");
+    assert_eq!(
+        e.message, "payload-A",
+        "on_select must receive the confirmed item's `data` verbatim"
+    );
+}
+
+/// #1630 acceptance: pressing Escape on a plugin-owned picker fires
+/// `on_cancel` (and only `on_cancel` — `on_select` must not also fire).
+///
+/// RED-verified against unfixed `develop`: `on_cancel` never registers, so
+/// `_G.cancelled` stays `false` and `Read` reports `"false"`.
+#[test]
+fn picker_cancel_invokes_on_cancel() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_cancel_1630",
+        r#"
+        _G.cancelled = false
+        _G.selected = false
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({
+                items = { { display = "alpha" } },
+                on_select = function(_data) _G.selected = true end,
+                on_cancel = function() _G.cancelled = true end,
+            })
+        end)
+        vimcode.command("Read", function(_)
+            vimcode.message(tostring(_G.cancelled) .. "/" .. tostring(_G.selected))
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+
+    press_key(&mut e, "Escape");
+
+    assert!(!e.picker_open, "Escape must close the picker");
+    exec(&mut e, "Read");
+    assert_eq!(
+        e.message, "true/false",
+        "Escape must fire on_cancel, never on_select"
+    );
+}
+
+/// #1630 acceptance: `:append(items)` on a still-open picker extends the
+/// item list and re-filters against whatever query the user has already
+/// typed — a streamed source (e.g. one fed by a `vimcode.loop.spawn`
+/// `on_stdout`) can grow the list live without the user's typing being
+/// interrupted or the match set going stale.
+///
+/// RED-verified against unfixed `develop`: `vimcode.picker` doesn't exist,
+/// so `Open` errors immediately and `e.picker_items` stays empty.
+#[test]
+fn picker_append_while_open_extends_the_filtered_list() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_append_1630",
+        r#"
+        _G.handle = nil
+        vimcode.command("Open", function(_)
+            _G.handle = vimcode.picker.open({
+                items = {
+                    { display = "apple" },
+                    { display = "apricot" },
+                    { display = "banana" },
+                },
+            })
+        end)
+        vimcode.command("Append", function(_)
+            _G.handle:append({ { display = "grape" } })
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+
+    // Filter to "ap" — matches "apple"/"apricot" (subsequence a-then-p);
+    // "banana" has no 'p' at all and must stay filtered out throughout.
+    type_chars(&mut e, "ap");
+    let before: Vec<&str> = e.picker_items.iter().map(|i| i.display.as_str()).collect();
+    assert_eq!(
+        before,
+        vec!["apple", "apricot"],
+        "precondition: typing must fuzzy-filter the static items first"
+    );
+
+    exec(&mut e, "Append");
+
+    let after: Vec<&str> = e.picker_items.iter().map(|i| i.display.as_str()).collect();
+    assert!(
+        after.contains(&"grape"),
+        "append must extend the list and re-filter the new item against the \
+         current query (\"grape\" is a-then-p subsequence match for \"ap\"): {after:?}"
+    );
+    assert!(
+        !after.contains(&"banana"),
+        "an item that doesn't match the current query must stay filtered \
+         out after append: {after:?}"
+    );
+}
+
+/// #1630 acceptance: an item whose `preview` names a buffer handle (+ line)
+/// populates the picker's preview pane from that buffer's *live* content —
+/// not disk — windowed around the given line the same way a file-based
+/// preview centers on a match.
+///
+/// RED-verified against unfixed `develop`: `vimcode.picker` doesn't exist,
+/// so `e.picker_preview` stays `None`.
+#[test]
+fn picker_preview_shows_buffer_handle_content_at_the_given_line() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_preview_buf_1630",
+        r#"
+        vimcode.command("Open", function(_)
+            local b = vimcode.buffer.create({ scratch = true, name = "PREVBUF" })
+            vimcode.buffer.set_lines(b, 0, -1, { "first", "second", "third" })
+            vimcode.picker.open({
+                items = {
+                    { display = "item one", preview = { buffer = b, line = 2 } },
+                },
+            })
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert!(e.picker_open, "precondition: the picker is open");
+
+    let preview = e
+        .picker_preview
+        .as_ref()
+        .expect("a buffer-preview item must populate the preview pane");
+    let texts: Vec<&str> = preview.lines.iter().map(|(_, t, _)| t.as_str()).collect();
+    assert!(
+        texts.contains(&"second"),
+        "the previewed buffer's live content must appear in the preview \
+         pane: {texts:?}"
+    );
+    assert!(
+        preview
+            .lines
+            .iter()
+            .any(|(lineno, _, is_match)| *lineno == 2 && *is_match),
+        "line 2 (1-indexed, as declared) must be marked as the match line: \
+         {:?}",
+        preview.lines
+    );
+}
+
+/// #1630 acceptance: unloading the plugin that owns an open picker (a fresh
+/// `Engine::set_plugin_manager`, the same mechanism `:PluginDisable`/
+/// extension uninstall use) closes it — the same "no calls into an
+/// unloaded plugin, and no stray UI left behind" contract #1624 already
+/// gives timers and spawns.
+///
+/// RED-verified against unfixed `develop`: `vimcode.picker` doesn't exist
+/// (so this would panic on `Open` before ever reaching the unload half);
+/// on a `develop` with just `PickerSource::Custom` still unused, nothing
+/// would ever close a stale picker on unload since there is no reap logic
+/// wired to it at all.
+#[test]
+fn picker_unload_closes_open_picker() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_unload_1630",
+        r#"
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({ items = { { display = "alpha" } } })
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert!(e.picker_open, "precondition: the picker is open");
+
+    let empty =
+        vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new must succeed");
+    e.set_plugin_manager(empty);
+
+    assert!(
+        !e.picker_open,
+        "unloading the owning plugin must close its still-open picker"
+    );
+}
