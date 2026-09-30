@@ -496,6 +496,30 @@ pub struct PluginManager {
     /// `lua_keymap_callbacks`: registration happens through the immediate
     /// API, with only `&PluginManager` available.
     write_handlers: RefCell<HashMap<i64, LuaRegistryKey>>,
+    /// `id -> callback` for every live `vimcode.loop.timer`/`vimcode.schedule`/
+    /// `vimcode.defer` registration (#1624). The scheduling bookkeeping
+    /// (interval, next-due, repeat) lives on `Engine::plugin_timers`, keyed
+    /// by the same id — this map only holds the Lua side (the callback
+    /// itself), mirroring `write_handlers`/`lua_keymap_callbacks`.
+    timer_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
+    /// `id -> callbacks` for every live `vimcode.loop.spawn` handle (#1624).
+    /// The process/pipes/receiver live on `Engine::plugin_spawns`, keyed by
+    /// the same id.
+    spawn_callbacks: RefCell<HashMap<u64, SpawnCallbacks>>,
+    /// Next id [`Self::register_timer_callback`]/[`Self::register_spawn_callbacks`]
+    /// hand out. Shared between timers and spawns — they land in disjoint
+    /// `Engine`-side maps, so there is no collision risk, and one counter is
+    /// simpler than two.
+    next_handle_id: Cell<u64>,
+}
+
+/// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
+/// three may be absent — a plugin that only cares about the exit status need
+/// not pass `on_stdout`/`on_stderr`.
+struct SpawnCallbacks {
+    on_stdout: Option<LuaRegistryKey>,
+    on_stderr: Option<LuaRegistryKey>,
+    on_exit: Option<LuaRegistryKey>,
 }
 
 /// A registered `vimcode.keymap.set` callback (#1623), looked up by the
@@ -673,6 +697,9 @@ impl PluginManager {
             lua_keymap_callbacks: RefCell::new(HashMap::new()),
             lua_keymap_next_id: Cell::new(0),
             write_handlers: RefCell::new(HashMap::new()),
+            timer_callbacks: RefCell::new(HashMap::new()),
+            spawn_callbacks: RefCell::new(HashMap::new()),
+            next_handle_id: Cell::new(0),
         })
     }
 
@@ -1026,6 +1053,141 @@ impl PluginManager {
             .remove_app_data::<PluginCallContext>()
             .unwrap_or_default();
         (found, ctx)
+    }
+
+    // ─── `vimcode.loop`/`vimcode.schedule`/`vimcode.defer` (#1624) ─────────
+
+    fn next_handle_id(&self) -> u64 {
+        let id = self.next_handle_id.get();
+        self.next_handle_id.set(id + 1);
+        id
+    }
+
+    /// Register a timer/schedule/defer callback and return its id. Called
+    /// from `Engine::plugin_api_register_timer` while a live engine is
+    /// loaned, so the returned id can be inserted into
+    /// `Engine::plugin_timers` in the same call.
+    pub(crate) fn register_timer_callback(&self, callback: LuaRegistryKey) -> u64 {
+        let id = self.next_handle_id();
+        self.timer_callbacks.borrow_mut().insert(id, callback);
+        id
+    }
+
+    /// Drop a timer's stored callback (on `stop()`, on fire-once completion,
+    /// or when the owning plugin is unloaded).
+    pub(crate) fn remove_timer_callback(&self, id: u64) {
+        self.timer_callbacks.borrow_mut().remove(&id);
+    }
+
+    /// Fire timer/schedule/defer id `id`'s callback with no arguments.
+    pub(crate) fn call_timer_callback(&self, id: u64, ctx: PluginCallContext) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = self
+            .timer_callbacks
+            .borrow()
+            .get(&id)
+            .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok());
+        if let Some(f) = f {
+            let _ = f.call::<(), ()>(());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Register a `vimcode.loop.spawn` handle's callbacks and return its id.
+    pub(crate) fn register_spawn_callbacks(
+        &self,
+        on_stdout: Option<LuaRegistryKey>,
+        on_stderr: Option<LuaRegistryKey>,
+        on_exit: Option<LuaRegistryKey>,
+    ) -> u64 {
+        let id = self.next_handle_id();
+        self.spawn_callbacks.borrow_mut().insert(
+            id,
+            SpawnCallbacks {
+                on_stdout,
+                on_stderr,
+                on_exit,
+            },
+        );
+        id
+    }
+
+    /// Drop a spawn handle's stored callbacks (on exit, on `kill()`-then-exit,
+    /// or when the owning plugin is unloaded).
+    pub(crate) fn remove_spawn_callbacks(&self, id: u64) {
+        self.spawn_callbacks.borrow_mut().remove(&id);
+    }
+
+    fn call_spawn_str_callback(
+        &self,
+        id: u64,
+        text: &str,
+        ctx: PluginCallContext,
+        which: impl Fn(&SpawnCallbacks) -> Option<&LuaRegistryKey>,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.spawn_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(which)
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = f {
+            let _ = f.call::<String, ()>(text.to_string());
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
+    /// Fire spawn `id`'s `on_stdout` callback with one streamed chunk.
+    pub(crate) fn call_spawn_stdout(
+        &self,
+        id: u64,
+        chunk: &str,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.call_spawn_str_callback(id, chunk, ctx, |c| c.on_stdout.as_ref())
+    }
+
+    /// Fire spawn `id`'s `on_stderr` callback with one streamed chunk.
+    pub(crate) fn call_spawn_stderr(
+        &self,
+        id: u64,
+        chunk: &str,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.call_spawn_str_callback(id, chunk, ctx, |c| c.on_stderr.as_ref())
+    }
+
+    /// Fire spawn `id`'s `on_exit` callback with `(code, signal)` — exactly
+    /// one of the two is non-nil (a normal exit carries a code, a
+    /// signal/kill death carries a signal number; see `execute::spawn_piped`).
+    pub(crate) fn call_spawn_exit(
+        &self,
+        id: u64,
+        code: Option<i32>,
+        signal: Option<i32>,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let cbs = self.spawn_callbacks.borrow();
+            cbs.get(&id)
+                .and_then(|c| c.on_exit.as_ref())
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        if let Some(f) = f {
+            let _ = f.call::<(Option<i64>, Option<i64>), ()>((
+                code.map(i64::from),
+                signal.map(i64::from),
+            ));
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
     }
 
     // ─── Plugin-declared UI views (#146) ───────────────────────────────────
@@ -1460,6 +1622,163 @@ impl PluginManager {
                 Ok(())
             })?,
         )?;
+
+        // vimcode.async_shell_exit_code(callback_event) → integer | nil (#1624)
+        //
+        // `async_shell`'s callback signature is frozen (`function(output)`),
+        // so the exit status this issue adds is surfaced out of band instead
+        // of as a second argument: read it from inside (or after) the
+        // callback for `callback_event` using the same live-engine seam
+        // every other runtime accessor uses. `nil` means "no result has
+        // landed yet" (or never will — the event name was never used).
+        vimcode.set(
+            "async_shell_exit_code",
+            lua.create_function(|_, event: String| {
+                live_engine("vimcode.async_shell_exit_code", move |e| {
+                    e.async_shell_last_exit.get(&event).copied().flatten()
+                })
+            })?,
+        )?;
+
+        // vimcode.schedule(fn) — run `fn` once, on the next idle tick (#1624).
+        // Implemented as a zero-delay, non-repeating `vimcode.loop.timer`:
+        // "next idle tick" is exactly what an already-due, non-repeating
+        // timer entry gives for free from `Engine::poll_plugin_timers`.
+        vimcode.set(
+            "schedule",
+            lua.create_function(|lua, cb: LuaFunction| {
+                let key = lua.create_registry_value(cb)?;
+                live_engine("vimcode.schedule", move |e| {
+                    e.plugin_api_register_timer(0, false, key);
+                })
+            })?,
+        )?;
+
+        // vimcode.defer(ms, fn) — run `fn` once, after `ms` milliseconds (#1624).
+        vimcode.set(
+            "defer",
+            lua.create_function(|lua, (ms, cb): (i64, LuaFunction)| {
+                let key = lua.create_registry_value(cb)?;
+                live_engine("vimcode.defer", move |e| {
+                    e.plugin_api_register_timer(ms, false, key);
+                })
+            })?,
+        )?;
+
+        // ── vimcode.loop (#1624) ─────────────────────────────────────────────
+        let loop_tbl = lua.create_table()?;
+
+        // vimcode.loop.timer(ms, fn, {repeat=bool}) → handle with :stop()
+        //
+        // Note for plugin authors: `repeat` is a reserved word in Lua, so it
+        // cannot appear as a bare `{ repeat = true }` table-constructor key
+        // (that is a Lua *syntax* error, not a vimcode limitation) — write
+        // `{ ["repeat"] = true }` instead. Reading it from Rust as the plain
+        // string key `"repeat"` below is unaffected either way.
+        loop_tbl.set(
+            "timer",
+            lua.create_function(
+                |lua, (ms, cb, opts): (i64, LuaFunction, Option<LuaTable>)| {
+                    let repeat = opts
+                        .as_ref()
+                        .and_then(|o| o.get::<_, bool>("repeat").ok())
+                        .unwrap_or(false);
+                    let key = lua.create_registry_value(cb)?;
+                    let id = live_engine("vimcode.loop.timer", move |e| {
+                        e.plugin_api_register_timer(ms, repeat, key)
+                    })?;
+                    let handle = lua.create_table()?;
+                    handle.set("id", id)?;
+                    handle.set(
+                        "stop",
+                        lua.create_function(move |_, _self: LuaValue| {
+                            live_engine("vimcode.loop.timer:stop", move |e| {
+                                e.plugin_api_stop_timer(id);
+                            })
+                        })?,
+                    )?;
+                    Ok(handle)
+                },
+            )?,
+        )?;
+
+        // vimcode.loop.spawn(cmd, args, {cwd, env, on_stdout, on_stderr, on_exit})
+        // → handle with :write(data), :close_stdin(), :kill()
+        //
+        // `on_stdout`/`on_stderr` are called with one streamed chunk each time
+        // data arrives (not necessarily line-buffered); `on_exit` is called
+        // once with `(code, signal)` — see `PluginManager::call_spawn_exit`.
+        loop_tbl.set(
+            "spawn",
+            lua.create_function(
+                |lua, (cmd, args, opts): (String, Option<Vec<String>>, Option<LuaTable>)| {
+                    let args = args.unwrap_or_default();
+                    let mut cwd = None;
+                    let mut env: Vec<(String, String)> = Vec::new();
+                    let mut on_stdout = None;
+                    let mut on_stderr = None;
+                    let mut on_exit = None;
+                    if let Some(ref o) = opts {
+                        if let Ok(c) = o.get::<_, String>("cwd") {
+                            if !c.is_empty() {
+                                cwd = Some(PathBuf::from(c));
+                            }
+                        }
+                        if let Ok(e) = o.get::<_, LuaTable>("env") {
+                            for pair in e.pairs::<String, String>().flatten() {
+                                env.push(pair);
+                            }
+                        }
+                        if let Ok(f) = o.get::<_, LuaFunction>("on_stdout") {
+                            on_stdout = Some(lua.create_registry_value(f)?);
+                        }
+                        if let Ok(f) = o.get::<_, LuaFunction>("on_stderr") {
+                            on_stderr = Some(lua.create_registry_value(f)?);
+                        }
+                        if let Ok(f) = o.get::<_, LuaFunction>("on_exit") {
+                            on_exit = Some(lua.create_registry_value(f)?);
+                        }
+                    }
+                    let id = live_engine("vimcode.loop.spawn", move |e| {
+                        e.plugin_api_spawn(cmd, args, cwd, env, on_stdout, on_stderr, on_exit)
+                    })?;
+                    let Some(id) = id else {
+                        return Err(LuaError::RuntimeError(
+                            "vimcode.loop.spawn: failed to start process".to_string(),
+                        ));
+                    };
+                    let handle = lua.create_table()?;
+                    handle.set("id", id)?;
+                    handle.set(
+                        "write",
+                        lua.create_function(move |_, (_self, data): (LuaValue, String)| {
+                            live_engine("vimcode.loop.spawn:write", move |e| {
+                                e.plugin_api_spawn_write(id, &data)
+                            })
+                        })?,
+                    )?;
+                    handle.set(
+                        "close_stdin",
+                        lua.create_function(move |_, _self: LuaValue| {
+                            live_engine("vimcode.loop.spawn:close_stdin", move |e| {
+                                e.plugin_api_spawn_close_stdin(id)
+                            })
+                        })?,
+                    )?;
+                    handle.set(
+                        "kill",
+                        lua.create_function(move |_, _self: LuaValue| {
+                            live_engine("vimcode.loop.spawn:kill", move |e| {
+                                e.plugin_api_spawn_kill(id)
+                            })
+                        })?,
+                    )?;
+                    Ok(handle)
+                },
+            )?,
+        )?;
+
+        vimcode.set("loop", loop_tbl)?;
 
         // ── vimcode.buf subtable ────────────────────────────────────────────
         let buf = lua.create_table()?;

@@ -1,5 +1,202 @@
 use super::*;
 
+// ─── Native loop API: shared process-spawning core (#1624) ─────────────────
+//
+// `vimcode.loop.spawn` and the legacy `vimcode.async_shell` (see
+// `Engine::plugin_api_spawn` / `Engine::poll_async_shells` in
+// `engine/plugins.rs`) are both built on [`spawn_piped`] so a future change
+// to argv construction, reader chunking, or exit/signal decoding has one
+// call site to fix instead of two independently-hand-rolled ones (the
+// pre-#1624 state: `async_shell`'s thread called `Command::output()`/
+// `wait_with_output()` directly and had no streaming and no exit status at
+// all).
+
+use std::io::Read;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+/// One streamed event from a spawned child: a chunk of stdout/stderr as it
+/// arrives, or the final exit status. `code`/`signal` on `Exit` are mutually
+/// exclusive in practice — a normal exit carries a code, a signal death
+/// (`kill()`, on unix) carries a signal number — but both are `Option` so a
+/// platform/error case that has neither still has something to send.
+pub(crate) enum PluginSpawnEvent {
+    Stdout(String),
+    Stderr(String),
+    Exit {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+}
+
+/// Live state for one `vimcode.loop.spawn` handle (#1624): the child (shared
+/// with the background exit-watcher thread so `kill()` can reach it), the
+/// writable stdin half (shared so `write`/`close_stdin` can reach it without
+/// blocking on the reader threads), and the event stream.
+pub(crate) struct PluginSpawnHandle {
+    /// Weak so an unloaded owning plugin (`Engine::set_plugin_manager`
+    /// replacing the `Rc`) is detectable without `Engine` tracking ownership
+    /// separately — see `Engine::poll_plugin_spawns`.
+    pub(crate) manager: std::rc::Weak<plugin::PluginManager>,
+    pub(crate) child: Arc<Mutex<Child>>,
+    pub(crate) stdin: Arc<Mutex<Option<ChildStdin>>>,
+    pub(crate) rx: Receiver<PluginSpawnEvent>,
+}
+
+/// Live state for one `vimcode.async_shell` task (#1624): same event stream
+/// as [`PluginSpawnHandle`], but accumulated into a single buffer rather
+/// than streamed to Lua per chunk — see `Engine::poll_async_shells`.
+pub(crate) struct AsyncShellTask {
+    pub(crate) rx: Receiver<PluginSpawnEvent>,
+    pub(crate) stdout_buf: String,
+}
+
+/// [`spawn_piped`]'s return shape: the child (shared with its exit-watcher
+/// thread), the writable stdin half, and the event stream. Named purely to
+/// satisfy `clippy::type_complexity` — see the two structs above for what
+/// each piece means.
+type SpawnPipes = (
+    Arc<Mutex<Child>>,
+    Arc<Mutex<Option<ChildStdin>>>,
+    Receiver<PluginSpawnEvent>,
+);
+
+/// Poll `child` with `try_wait()` (never a blocking `wait()`, which would
+/// hold the child's mutex indefinitely and starve a concurrent `kill()`)
+/// until it exits, then send the single `Exit` event.
+fn finish_and_send_exit(child: Arc<Mutex<Child>>, tx: Sender<PluginSpawnEvent>) {
+    loop {
+        let status = match child.lock() {
+            Ok(mut guard) => guard.try_wait(),
+            Err(_) => return,
+        };
+        match status {
+            Ok(Some(status)) => {
+                let code = status.code();
+                #[cfg(unix)]
+                let signal = {
+                    use std::os::unix::process::ExitStatusExt;
+                    status.signal()
+                };
+                #[cfg(not(unix))]
+                let signal = None;
+                let _ = tx.send(PluginSpawnEvent::Exit { code, signal });
+                return;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(15)),
+            Err(_) => {
+                let _ = tx.send(PluginSpawnEvent::Exit {
+                    code: None,
+                    signal: None,
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// Launch `command`, piping stdin/stdout/stderr and starting the background
+/// threads that turn its output into a stream of [`PluginSpawnEvent`]s:
+/// - one thread reads stdout in up-to-4KiB chunks, sending each as it arrives;
+/// - one thread does the same for stderr;
+/// - whichever of those two reader threads hits EOF *last* then calls
+///   [`finish_and_send_exit`] and sends the single `Exit` event.
+///
+/// The last-reader-sends-`Exit` handoff (`pending_readers`) matters: a child
+/// can terminate while its pipes still hold unread, already-written bytes,
+/// so a naive third thread polling `try_wait()` independently can observe
+/// the exit and send `Exit` *before* a reader thread gets scheduled to drain
+/// the last chunk — reordering `on_exit` ahead of `on_stdout`/`on_stderr` for
+/// a fast, short-lived child. Gating `Exit` on both readers reaching EOF
+/// first makes that reordering impossible. (Found via this issue's own
+/// `concurrent_spawns_stream_independent_output_and_exit_codes` test, which
+/// flaked under parallel `cargo test` load before this fix — a `printf`
+/// child exits fast enough that the race window was real, not theoretical.)
+///
+/// `stdin_data`, when given, is written to the child's stdin and the pipe is
+/// then closed (EOF) before returning — the legacy `vimcode.async_shell`
+/// `stdin` option's shape (write-then-close, no interactive follow-up).
+/// `vimcode.loop.spawn` passes `None` and drives stdin interactively through
+/// the returned handle's `write`/`close_stdin` instead.
+pub(crate) fn spawn_piped(
+    mut command: Command,
+    stdin_data: Option<String>,
+) -> std::io::Result<SpawnPipes> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdin = child.stdin.take();
+    if let Some(data) = stdin_data {
+        if let Some(pipe) = stdin.as_mut() {
+            use std::io::Write;
+            let _ = pipe.write_all(data.as_bytes());
+        }
+        stdin = None;
+    }
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::channel();
+    let child = Arc::new(Mutex::new(child));
+    // `Stdio::piped()` is always set for both above, so both are always
+    // `Some` in practice — the count still starts from how many reader
+    // threads actually get spawned below, so this stays correct even if
+    // that ever changes.
+    let pending_readers = Arc::new(AtomicUsize::new(
+        stdout.is_some() as usize + stderr.is_some() as usize,
+    ));
+
+    if let Some(mut out) = stdout {
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending_readers);
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match out.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if tx.send(PluginSpawnEvent::Stdout(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                finish_and_send_exit(child, tx);
+            }
+        });
+    }
+    if let Some(mut err) = stderr {
+        let tx = tx.clone();
+        let pending = Arc::clone(&pending_readers);
+        let child = Arc::clone(&child);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match err.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if tx.send(PluginSpawnEvent::Stderr(chunk)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+                finish_and_send_exit(child, tx);
+            }
+        });
+    }
+
+    Ok((child, Arc::new(Mutex::new(stdin)), rx))
+}
+
 impl Engine {
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Save for @: repeat (before normalization, using trimmed original).

@@ -5399,3 +5399,315 @@ fn buffer_write_handler_takes_over_save_and_clears_dirty() {
         "a successful plugin write must clear the dirty flag"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — Phase 3 (#1624): loop timers, schedule/defer, callback
+// registry, spawn with streamed output + exit status + kill.
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Timers/schedule/defer are driven purely by `Engine::poll_idle()` — there is
+// no background thread involved, so polling in a tight loop with a small
+// bounded sleep (never a fixed-duration sleep-then-assert-once) is both
+// deterministic and fast. `loop.spawn` genuinely does run a real child
+// process on background threads, so those tests use the same poll-until-
+// condition-or-timeout shape with a generous (but bounded) deadline rather
+// than depending on wall-clock timing to land a specific chunk count.
+
+/// Poll `e.poll_idle()` (and let `cond` run its own `:Command` reads against
+/// the same `&mut Engine`) until `cond(e)` is true or `timeout` elapses.
+/// Returns whether the condition was met — callers still assert on the
+/// *result*, per this repo's "assert on rendered/observed output" rule; this
+/// is purely a scheduling helper, never itself the assertion.
+fn poll_until(
+    e: &mut vimcode_core::Engine,
+    timeout: std::time::Duration,
+    mut cond: impl FnMut(&mut vimcode_core::Engine) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        e.poll_idle();
+        if cond(e) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return cond(e);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn loop_timer_fires_repeatedly_and_stop_prevents_further_calls() {
+    let mut e = engine_with_plugin(
+        "",
+        "timer_repeat_1624",
+        r#"
+        _G.count = 0
+        vimcode.command("StartTimer", function(_)
+            _G.handle = vimcode.loop.timer(5, function()
+                _G.count = _G.count + 1
+                vimcode.message("ticks=" .. _G.count)
+            end, { ["repeat"] = true })
+        end)
+        vimcode.command("StopTimer", function(_)
+            _G.handle.stop()
+        end)
+        "#,
+    );
+    exec(&mut e, "StartTimer");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(2), |e| {
+        e.message == "ticks=3"
+    });
+    assert!(
+        reached,
+        "a repeating 5ms timer must have fired at least 3 times within 2s; \
+         last message: {:?}",
+        e.message
+    );
+
+    exec(&mut e, "StopTimer");
+    let msg_at_stop = e.message.clone();
+    // No further ticks should land, however long we keep polling — this is
+    // the RED-able half: without `stop()` actually removing the entry, this
+    // loop would see `ticks=4`, `ticks=5`, ... within the same window.
+    for _ in 0..30 {
+        e.poll_idle();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(
+        e.message, msg_at_stop,
+        "stop() must prevent any further ticks from landing"
+    );
+}
+
+#[test]
+fn schedule_and_defer_run_in_registration_and_delay_order() {
+    let mut e = engine_with_plugin(
+        "",
+        "schedule_order_1624",
+        r#"
+        _G.order = {}
+        vimcode.command("RunSchedule", function(_)
+            vimcode.schedule(function() table.insert(_G.order, "a") end)
+            vimcode.schedule(function() table.insert(_G.order, "b") end)
+            vimcode.defer(30, function() table.insert(_G.order, "d") end)
+            vimcode.schedule(function() table.insert(_G.order, "c") end)
+        end)
+        vimcode.command("ReadOrder", function(_)
+            vimcode.message(table.concat(_G.order, ","))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunSchedule");
+
+    // All three `schedule()`s are due "now"; the very next idle tick must
+    // run them in the order they were registered, before the later-due
+    // `defer()`. RED-able: a `HashMap`-iteration-order implementation (no
+    // explicit tie-break) would flake between "a,b,c" and any permutation.
+    e.poll_idle();
+    exec(&mut e, "ReadOrder");
+    assert_eq!(
+        e.message, "a,b,c",
+        "schedule() callbacks must fire in registration order on the next \
+         idle tick, before defer()'s later-due callback"
+    );
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(2), |e| {
+        exec(e, "ReadOrder");
+        e.message == "a,b,c,d"
+    });
+    assert_eq!(
+        e.message, "a,b,c,d",
+        "defer() must run after its own delay, after every schedule()"
+    );
+    assert!(reached);
+}
+
+#[test]
+fn timer_callback_edits_buffer_via_immediate_api() {
+    let mut e = engine_with_plugin(
+        "original\n",
+        "timer_edit_buffer_1624",
+        r#"
+        vimcode.command("ScheduleEdit", function(_)
+            vimcode.defer(5, function()
+                local b = vimcode.buffer.create({ scratch = true, name = "ZQ1624TIMER" })
+                vimcode.buffer.set_lines(b, 0, -1, { "EDITED_BY_TIMER_1624" })
+                vimcode.window.set_buf(0, b)
+            end)
+        end)
+        "#,
+    );
+    exec(&mut e, "ScheduleEdit");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(2), |e| {
+        e.buffer().to_string().contains("EDITED_BY_TIMER_1624")
+    });
+    assert!(
+        reached,
+        "a deferred callback must be able to use the immediate \
+         vimcode.buffer API (create/set_lines/window.set_buf); buffer: {:?}",
+        e.buffer().to_string()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn concurrent_spawns_stream_independent_output_and_exit_codes() {
+    let mut e = engine_with_plugin(
+        "",
+        "spawn_concurrent_1624",
+        r#"
+        _G.out_a = ""
+        _G.out_b = ""
+        _G.exit_a = nil
+        _G.exit_b = nil
+        vimcode.command("RunSpawns", function(_)
+            vimcode.loop.spawn("/bin/sh", { "-c", "printf AAA" }, {
+                on_stdout = function(chunk) _G.out_a = _G.out_a .. chunk end,
+                on_exit = function(code, _signal) _G.exit_a = code end,
+            })
+            vimcode.loop.spawn("/bin/sh", { "-c", "printf BBB" }, {
+                on_stdout = function(chunk) _G.out_b = _G.out_b .. chunk end,
+                on_exit = function(code, _signal) _G.exit_b = code end,
+            })
+        end)
+        vimcode.command("ReadSpawns", function(_)
+            vimcode.message(_G.out_a .. "|" .. _G.out_b .. "|"
+                .. tostring(_G.exit_a) .. "|" .. tostring(_G.exit_b))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunSpawns");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+        exec(e, "ReadSpawns");
+        e.message == "AAA|BBB|0|0"
+    });
+    assert!(
+        reached,
+        "each spawn must receive its own streamed stdout and exit code, \
+         unclobbered by the other; last message: {:?}",
+        e.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn spawn_kill_delivers_nonzero_or_signalled_exit() {
+    let mut e = engine_with_plugin(
+        "",
+        "spawn_kill_1624",
+        r#"
+        _G.exit_code = nil
+        _G.exit_signal = nil
+        vimcode.command("RunAndKill", function(_)
+            local h = vimcode.loop.spawn("/bin/sh", { "-c", "sleep 30" }, {
+                on_exit = function(code, signal)
+                    _G.exit_code = code
+                    _G.exit_signal = signal
+                end,
+            })
+            h.kill()
+        end)
+        vimcode.command("ReadExit", function(_)
+            vimcode.message(tostring(_G.exit_code) .. "/" .. tostring(_G.exit_signal))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunAndKill");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+        exec(e, "ReadExit");
+        e.message != "nil/nil"
+    });
+    assert!(reached, "kill() must eventually deliver an exit to on_exit");
+    assert_ne!(
+        e.message, "0/nil",
+        "a killed process must not report a clean, unsignalled exit; got {:?}",
+        e.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn async_shell_reimplemented_on_spawn_keeps_legacy_behaviour_and_gains_exit_status() {
+    let mut e = engine_with_plugin(
+        "",
+        "async_shell_exit_1624",
+        r#"
+        vimcode.command("RunShell", function(_)
+            vimcode.async_shell("printf hello", "shell_done_1624")
+        end)
+        vimcode.on("shell_done_1624", function(output)
+            local code = vimcode.async_shell_exit_code("shell_done_1624")
+            vimcode.message(output .. "/" .. tostring(code))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunShell");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+        e.message == "hello/0"
+    });
+    assert!(
+        reached,
+        "async_shell must still deliver its output via plugin_event (the \
+         frozen legacy contract), and vimcode.async_shell_exit_code must see \
+         the just-landed exit code from inside the very callback the event \
+         fires; last message: {:?}",
+        e.message
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
+    let mut e = engine_with_plugin(
+        "",
+        "unload_cancels_1624",
+        r#"
+        vimcode.command("StartAll", function(_)
+            vimcode.loop.timer(5, function()
+                vimcode.message("tick")
+            end, { ["repeat"] = true })
+            vimcode.loop.spawn("/bin/sh", { "-c", "sleep 30" }, {
+                on_stdout = function(chunk) vimcode.message("spawn:" .. chunk) end,
+            })
+        end)
+        "#,
+    );
+    exec(&mut e, "StartAll");
+
+    // Confirm the timer is actually live before unloading (otherwise "no
+    // more ticks after unload" would trivially pass for the wrong reason).
+    let ticking = poll_until(&mut e, std::time::Duration::from_secs(2), |e| {
+        e.message == "tick"
+    });
+    assert!(ticking, "setup: the timer must be running before unload");
+
+    // "Unload" = install a fresh `PluginManager` (`Engine::
+    // set_plugin_manager`'s doc: this is the mechanism, an `Rc` swap that
+    // drops the old plugin's Lua state and every registry key it owned).
+    let fresh = vimcode_core::core::plugin::PluginManager::new().unwrap();
+    e.set_plugin_manager(fresh);
+
+    // `message` is engine-level (Rust) state, untouched by the manager swap
+    // itself, so any further change to it can only come from a callback
+    // that actually ran — which must not happen once its owning manager is
+    // gone. RED-able: without the `Weak`/liveness check in
+    // `poll_plugin_timers`/`poll_plugin_spawns`, this would panic (calling
+    // into a `LuaRegistryKey` that belongs to a dropped `Lua` state) or, if
+    // it merely leaked, would still print "tick"/"spawn:..." here.
+    e.message = "SENTINEL_1624".to_string();
+    for _ in 0..40 {
+        e.poll_idle();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        e.message, "SENTINEL_1624",
+        "no timer/spawn callback belonging to the unloaded plugin may fire \
+         after it is replaced"
+    );
+}
