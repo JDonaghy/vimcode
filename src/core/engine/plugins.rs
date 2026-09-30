@@ -1617,18 +1617,24 @@ impl Engine {
                 }
                 continue;
             }
-            while let Some(event) = self
-                .plugin_spawns
-                .get(&id)
-                .and_then(|h| h.rx.try_recv().ok())
-            {
+            loop {
+                // Bounded per-tick drain (#1624 review): check the budget
+                // *before* touching the channel. `try_recv()` removes the
+                // message the moment it returns `Ok`, so testing the cap
+                // after the receive would pop an event and then drop it on
+                // the `break` — losing a stdout chunk, or worse an `Exit`,
+                // for good. Leaving it queued means the next `poll_idle`
+                // tick picks it up: nothing is dropped, only deferred.
                 if events_this_tick >= MAX_SPAWN_EVENTS_PER_TICK {
-                    // Bounded per-tick drain (#1624 review, non-blocking):
-                    // leave the rest for the next `poll_idle` tick instead
-                    // of starving the main thread on a high-throughput
-                    // producer.
                     break 'handles;
                 }
+                let Some(event) = self
+                    .plugin_spawns
+                    .get(&id)
+                    .and_then(|h| h.rx.try_recv().ok())
+                else {
+                    break;
+                };
                 events_this_tick += 1;
                 let mut exited = false;
                 let ctx = self.make_plugin_ctx(true);
