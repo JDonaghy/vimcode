@@ -3383,6 +3383,101 @@ mod tests {
             );
         }
 
+        /// #1635 investigation: measures app-side wall-clock time from a
+        /// right-press to the context menu's first painted frame, against
+        /// the issue's ≤ 50ms one-frame budget.
+        ///
+        /// The issue names three in-process candidates for the reported
+        /// "long delay" before a Windows-TUI right-click menu appears:
+        /// event-loop polling/batching, synchronous I/O inside context-menu
+        /// construction, and the frame scheduler not requesting an
+        /// immediate frame. All three are ruled out by inspection before
+        /// this test was written:
+        ///
+        /// - `App::handle_dispatch`'s `MouseButton::Right` arm (`src/
+        ///   app.rs`) unconditionally sets `draw_needed` and the bottom of
+        ///   that method returns `quadraui::Reaction::Redraw` whenever it
+        ///   is — no debounce, no deferred scheduling.
+        /// - `Engine::open_explorer_context_menu` (`src/core/engine/
+        ///   windows.rs`) only pushes `ContextMenuItem` literals onto a
+        ///   `Vec` — no filesystem, git, or LSP query.
+        /// - `quadraui::tui::run::TuiRunner::run_one` (the same loop
+        ///   `run_with_shell` drives) repaints at the *top* of its very
+        ///   next iteration whenever `needs_redraw` is set, which
+        ///   `dispatch_and_map` does the instant `EventOutcome::Redraw`
+        ///   comes back from this event.
+        ///
+        /// This test is the executable confirmation: `TuiDriver::
+        /// right_click`'s `dispatch` renders synchronously the moment
+        /// `App::handle` returns `Redraw`, so the elapsed wall-clock time
+        /// it measures *is* that whole in-process path (event dispatch +
+        /// menu construction + paint), with no real terminal or ConPTY in
+        /// the loop at all.
+        ///
+        /// Not a RED-first bug-fix test (this module's own "No production
+        /// code here" header, and CLAUDE.md's black-box-coverage rule): no
+        /// `src/app.rs`/`src/core/`/`src/tui_main/` behaviour changes
+        /// alongside it, because the investigation above found nothing in
+        /// vimcode's own dispatch/render path to fix. It is a perf-budget
+        /// regression guard — if this ever goes red, the regression is
+        /// in-process (re-open the investigation above); if it stays green
+        /// while the operator still observes a real delay on Windows, that
+        /// is further evidence for #1634's own open finding that the
+        /// remaining latency is downstream, on the real terminal/ConPTY
+        /// side, invisible to any in-process or byte-stream test (see that
+        /// issue's `tests/conpty_idle_flicker.rs` module doc for the
+        /// identical shape of conclusion it already reached for idle
+        /// flicker).
+        #[test]
+        fn right_click_context_menu_appears_within_one_frame_budget() {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1635_rc_latency_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("rc_marker.txt"), "hello").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir);
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            let mut h = harness(engine);
+            let driver = &mut h.driver;
+
+            let (x, y) = driver
+                .find("rc_marker.txt")
+                .expect("the populated explorer row must paint its file name");
+            assert!(
+                !driver.screen_has("Open to the Side"),
+                "precondition: no context menu is open yet"
+            );
+
+            let start = std::time::Instant::now();
+            driver.right_click(x, y);
+            let elapsed = start.elapsed();
+
+            assert!(
+                driver.screen_has("Open to the Side"),
+                "right-click must open the file context menu on the very \
+                 next frame; screen:\n{}",
+                driver.screen()
+            );
+            assert!(
+                elapsed <= std::time::Duration::from_millis(50),
+                "#1635: right-press -> menu-visible app-side latency budget \
+                 (<=50ms) exceeded: took {elapsed:?}. This is the in-process \
+                 half of the reported delay (event dispatch + menu \
+                 construction + paint) — see this test's own doc for what \
+                 to re-check if it ever regresses.",
+            );
+        }
+
         /// #1580 acceptance: right-clicking in the Explorer opens the
         /// painted menu, clicking an item runs its command, and Escape
         /// dismisses it — driven entirely through mouse/keyboard events
