@@ -4710,6 +4710,16 @@ pub struct Engine {
     /// chain into the plugin-declared `ViewTreeNode` hierarchy), resolved
     /// back to the node's own id via `ViewTreeNode::resolve` rather than a
     /// flat index, which would be unstable across expand/collapse.
+    ///
+    /// Its own `WidgetId` (set once at construction, `"plugin-view-tree"`)
+    /// deliberately names the *sidebar's plugin-tree host slot*, not
+    /// whichever view currently occupies it — unlike `render::plugin_view_
+    /// to_list`/`_to_table`/`_to_text_display`, which rebuild a fresh,
+    /// per-view-namespaced widget every paint, this controller is one
+    /// long-lived object reused across whichever `Tree`-kind view is
+    /// active, so a per-view id would have to change out from under a
+    /// live, possibly-retained widget identity every time the active view
+    /// switched.
     pub plugin_view_tree_controller: std::rc::Rc<std::cell::RefCell<quadraui::TreeController>>,
     /// Tab twin of `plugin_view_tree_controller`, kept separate for the same
     /// reason `plugin_view_tab_form_controller` is kept separate from
@@ -4740,6 +4750,19 @@ pub struct Engine {
     #[allow(clippy::type_complexity)]
     pub plugin_view_tab_table_layout:
         std::cell::RefCell<Option<(quadraui::Rect, quadraui::DataTableLayout)>>,
+    /// The selected *column* within a `ViewBody::Table`-kind view's selected
+    /// row, in the sidebar (#1631). Separate from `ext_panel_selected`
+    /// (which is the row) because a table author may mark more than one
+    /// column `editable` (e.g. #147's "Key"/"Value" pair) — without this,
+    /// `Enter` could only ever reach the *first* editable column, since
+    /// there was nothing else to disambiguate which one the user meant.
+    /// Clamped to a valid editable column on every row/view change by
+    /// `Engine::plugin_view_table_col` rather than stored pre-clamped, the
+    /// same "read-time clamp" contract `Engine::plugin_view_selected` uses.
+    pub ext_panel_table_col: usize,
+    /// Tab twin of `ext_panel_table_col`, kept separate for the same reason
+    /// `plugin_view_tab_selected` is kept separate from `ext_panel_selected`.
+    pub plugin_view_tab_table_col: usize,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5539,6 +5562,8 @@ impl Engine {
             plugin_view_tab_list_layout: std::cell::RefCell::new(None),
             plugin_view_table_layout: std::cell::RefCell::new(None),
             plugin_view_tab_table_layout: std::cell::RefCell::new(None),
+            ext_panel_table_col: 0,
+            plugin_view_tab_table_col: 0,
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),

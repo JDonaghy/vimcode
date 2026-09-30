@@ -360,7 +360,8 @@ fn lua_table_to_view_body(
 
     match kind {
         "list" => {
-            let title: Option<String> = tbl.get::<_, String>("title").ok().filter(|s| !s.is_empty());
+            let title: Option<String> =
+                tbl.get::<_, String>("title").ok().filter(|s| !s.is_empty());
             let mut items = Vec::new();
             if let Ok(items_tbl) = tbl.get::<_, LuaTable>("items") {
                 for (idx, row) in items_tbl.sequence_values::<LuaTable>().enumerate() {

@@ -185,8 +185,26 @@ impl Engine {
             Ok(view) => {
                 let changed = self.plugin_views.get(name) != Some(&view);
                 if changed {
-                    // A shorter tree must not leave the selection past its end.
-                    if self.ext_panel_active.as_deref() == Some(name)
+                    // A shorter field stack must not leave the selection past
+                    // its end. `view.body.is_none()` guards this to
+                    // field-stack views only (#1631 review) — a body-kind
+                    // view's `fields` is *always* empty
+                    // (`Some(body)` ⟹ `fields: Vec::new()`, `core::plugin::
+                    // parse_view_body`), so `ext_panel_selected >= view.
+                    // fields.len()` was `>= 0`, always true: every dispatch
+                    // that changed the view's painted output (e.g. a List's
+                    // own `ItemSelected`, which this fixture's `on_event`
+                    // re-tags on every selection move) reset the selection
+                    // straight back to `0` immediately after
+                    // `navigate_flat_selection`/`route_plugin_view_list_
+                    // click` had just set it — the exact reason repeated
+                    // `Down` never accumulated past index 1 before this
+                    // fix. Each body-kind handler already clamps its own
+                    // selection against the live row/item count at every
+                    // read site (`Engine::plugin_view_selected(host).min(len
+                    // - 1)`), so it needs no clamp here.
+                    if view.body.is_none()
+                        && self.ext_panel_active.as_deref() == Some(name)
                         && self.ext_panel_selected >= view.fields.len()
                     {
                         self.ext_panel_selected = view.first_focusable().unwrap_or(0);
@@ -324,10 +342,37 @@ impl Engine {
         }
     }
 
+    /// Read the raw selected-column index for `host`'s `Table`-kind view
+    /// (#1631). "Raw" — callers that need it clamped to an actually-
+    /// editable column (`render::handle_plugin_view_table_key`'s
+    /// `current_col`) do that themselves, the same "read-time clamp"
+    /// contract `Engine::plugin_view_selected` uses for a stale row index.
+    pub(crate) fn plugin_view_table_col(&self, host: PluginViewHost) -> usize {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_table_col,
+            PluginViewHost::Tab => self.plugin_view_tab_table_col,
+        }
+    }
+
+    /// Write the selected-column index for `host`'s `Table`-kind view.
+    pub(crate) fn set_plugin_view_table_col(&mut self, host: PluginViewHost, col: usize) {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_table_col = col,
+            PluginViewHost::Tab => self.plugin_view_tab_table_col = col,
+        }
+    }
+
     /// Nudge `host`'s scroll offset so its selection stays visible — the
     /// tab twin of `Engine::ext_panel_ensure_visible` (fixed 20-row viewport
     /// guess, same as that method's own fallback).
-    fn plugin_view_ensure_visible(&mut self, host: PluginViewHost) {
+    ///
+    /// `pub(crate)` (not just used from this module) since `render::
+    /// navigate_flat_selection` — the `List`/`Table` body-kind keyboard
+    /// navigation (#1631) — calls this after every selection move, the same
+    /// way the field-stack navigation just below does; without it a
+    /// `Down`/`End`/`G` press could move `selected` out of the visible
+    /// scroll window with nothing to compensate.
+    pub(crate) fn plugin_view_ensure_visible(&mut self, host: PluginViewHost) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_ensure_visible(0),
             PluginViewHost::Tab => {
