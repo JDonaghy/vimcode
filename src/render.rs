@@ -1138,6 +1138,14 @@ pub struct RenderedWindow {
     pub cursorline: bool,
     /// Per-window status line (Vim-style), or `None` when the setting is off.
     pub status_line: Option<WindowStatusLine>,
+    /// Set when this window's buffer hosts a `vimcode.ui.register_view` view
+    /// as an editor-area tab (`BufferState::plugin_view`, #1627), naming the
+    /// view. `lines`/`cursor`/every other buffer-content field is left at its
+    /// `build_rendered_window`-`empty()` default when this is `Some` — the
+    /// window's content is a `Form`, painted by
+    /// `App::paint_editor_windows_rung` instead of `Surface::Editor`, not
+    /// buffer text.
+    pub plugin_view: Option<String>,
 }
 
 // ─── CommandLineData ──────────────────────────────────────────────────────────
@@ -20045,14 +20053,23 @@ pub fn handle_settings_form_ui_event(
 /// [`handle_plugin_view_ui_event`] can tell a plugin field from a Settings one.
 ///
 /// `selected` / `scroll_top` / `has_focus` are vimcode-owned interaction state
-/// (the existing `ext_panel_*` fields), *not* plugin-declared: a re-render must
-/// not move the user's cursor.
+/// (the existing `ext_panel_*` fields, or their editor-tab twins), *not*
+/// plugin-declared: a re-render must not move the user's cursor.
+///
+/// `text_edit` is `Engine::plugin_view_text_edit` — when it names a field in
+/// `view`, that field's *live* (possibly uncommitted) value/cursor/selection
+/// paint instead of the plugin's declared value, with a real caret
+/// (`cursor: Some(_)`, #1627). Every other field — including every field when
+/// `text_edit` is `None` — keeps painting read-only (`cursor: None`), exactly
+/// as before #1627: the plugin's declared value is authoritative whenever
+/// vimcode isn't actively editing it.
 pub fn plugin_view_to_form(
     view_name: &str,
     view: &crate::core::plugin_ui::PluginView,
     selected: usize,
     scroll_top: usize,
     has_focus: bool,
+    text_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
 ) -> quadraui::Form {
     use crate::core::plugin_ui::{namespaced_widget_id, ViewFieldKind};
     use quadraui::{
@@ -20061,6 +20078,7 @@ pub fn plugin_view_to_form(
     };
 
     let wid = |field: &str| WidgetId::new(namespaced_widget_id(view_name, field));
+    let live = |field_id: &str| text_edit.filter(|e| e.view == view_name && e.field_id == field_id);
 
     let fields: Vec<FormField> = view
         .fields
@@ -20068,31 +20086,57 @@ pub fn plugin_view_to_form(
         .map(|f| {
             let kind = match &f.kind {
                 ViewFieldKind::Label => FieldKind::Label,
-                ViewFieldKind::Text { value, placeholder } => FieldKind::TextInput {
-                    value: value.clone(),
-                    placeholder: placeholder.clone(),
-                    // `cursor: None` renders read-only (no caret). Text *entry*
-                    // into a plugin view is Phase 2 (#1403); the value a plugin
-                    // declares still paints, and click/keyboard activation of
-                    // buttons, toggles and choices works today.
-                    cursor: None,
-                    selection_anchor: None,
-                },
-                ViewFieldKind::Password { value, placeholder } => FieldKind::PasswordInput {
-                    value: value.clone(),
-                    placeholder: placeholder.clone(),
-                    cursor: None,
-                    mask_char: '•',
+                ViewFieldKind::Text { value, placeholder } => {
+                    // `cursor: None` renders read-only (no caret) — the
+                    // plugin's own declared value, whenever vimcode isn't
+                    // actively editing this field. `Some(live)` (#1627) paints
+                    // the live buffer with a real caret instead.
+                    match live(&f.id) {
+                        Some(e) => FieldKind::TextInput {
+                            value: e.value.clone(),
+                            placeholder: placeholder.clone(),
+                            cursor: Some(e.cursor),
+                            selection_anchor: e.selection_anchor,
+                        },
+                        None => FieldKind::TextInput {
+                            value: value.clone(),
+                            placeholder: placeholder.clone(),
+                            cursor: None,
+                            selection_anchor: None,
+                        },
+                    }
+                }
+                ViewFieldKind::Password { value, placeholder } => match live(&f.id) {
+                    Some(e) => FieldKind::PasswordInput {
+                        value: e.value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: Some(e.cursor),
+                        mask_char: '•',
+                    },
+                    None => FieldKind::PasswordInput {
+                        value: value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: None,
+                        mask_char: '•',
+                    },
                 },
                 ViewFieldKind::TextArea {
                     value,
                     placeholder,
                     rows,
-                } => FieldKind::TextArea {
-                    value: value.clone(),
-                    placeholder: placeholder.clone(),
-                    cursor: None,
-                    visible_rows: (*rows).max(1),
+                } => match live(&f.id) {
+                    Some(e) => FieldKind::TextArea {
+                        value: e.value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: Some(e.cursor),
+                        visible_rows: (*rows).max(1),
+                    },
+                    None => FieldKind::TextArea {
+                        value: value.clone(),
+                        placeholder: placeholder.clone(),
+                        cursor: None,
+                        visible_rows: (*rows).max(1),
+                    },
                 },
                 ViewFieldKind::Toggle { value } => FieldKind::Toggle { value: *value },
                 ViewFieldKind::Button => FieldKind::Button,
@@ -20177,11 +20221,44 @@ pub fn populate_plugin_view_form_controller(engine: &Engine) -> bool {
         engine.ext_panel_selected,
         engine.ext_panel_scroll_top,
         engine.ext_panel_has_focus,
+        engine.plugin_view_text_edit.as_ref(),
     );
     let mut fc = engine.plugin_view_form_controller.borrow_mut();
     fc.set_form(form);
     fc.set_scroll_offset(engine.ext_panel_scroll_top);
     fc.set_has_focus(engine.ext_panel_has_focus);
+    true
+}
+
+/// Populate `Engine::plugin_view_tab_form_controller` from the named plugin
+/// view — the editor-tab twin of [`populate_plugin_view_form_controller`],
+/// which instead resolves the view name from `Engine::ext_panel_active` (the
+/// sidebar's active panel) and reads `ext_panel_*` interaction state. A tab
+/// has no activity-bar panel id to read the name from, so the caller
+/// (`App::paint_editor_windows_rung`) passes it explicitly — the
+/// `RenderedWindow::plugin_view` field set by `build_rendered_window`.
+///
+/// Returns `false` when `name` isn't a registered view.
+pub fn populate_plugin_view_tab_form_controller(
+    engine: &Engine,
+    name: &str,
+    has_focus: bool,
+) -> bool {
+    let Some(view) = engine.plugin_views.get(name) else {
+        return false;
+    };
+    let form = plugin_view_to_form(
+        name,
+        view,
+        engine.plugin_view_tab_selected,
+        engine.plugin_view_tab_scroll_top,
+        has_focus,
+        engine.plugin_view_text_edit.as_ref(),
+    );
+    let mut fc = engine.plugin_view_tab_form_controller.borrow_mut();
+    fc.set_form(form);
+    fc.set_scroll_offset(engine.plugin_view_tab_scroll_top);
+    fc.set_has_focus(has_focus);
     true
 }
 
@@ -20240,12 +20317,18 @@ pub fn handle_plugin_view_ui_event(
     let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
         return true;
     };
-    // Selection follows the click, so j/k continues from where the user clicked.
+    // Selection follows the click, so j/k continues from where the user
+    // clicked, and a click on a `Text`/`Password`/`TextArea` field primes it
+    // for typing (#1627) exactly as keyboard navigation does.
     if let Some(view) = engine.plugin_views.get(&view_name) {
         // `field_id` may name a sub-widget (a `buttons`/`toggles` entry) that is
         // not itself a row; only move the selection when it *is* a row.
         if let Some(idx) = view.field_index(&field_id) {
-            engine.ext_panel_selected = idx;
+            engine.plugin_view_focus_field(
+                &view_name,
+                crate::core::engine::PluginViewHost::Sidebar,
+                idx,
+            );
         }
     }
     engine.ext_panel_has_focus = true;
@@ -20253,6 +20336,80 @@ pub fn handle_plugin_view_ui_event(
         // A plain focus move is not something a plugin needs to hear about on
         // every click; it is reported only so a handler can track selection.
         // Keep it, but don't re-render for it beyond the selection change above.
+        return true;
+    }
+    engine.dispatch_plugin_view_event(PluginViewEvent {
+        view: view_name,
+        widget_id: field_id,
+        kind,
+    });
+    true
+}
+
+/// Route a pointer event over an editor-tab-hosted plugin view — the tab
+/// twin of [`handle_plugin_view_ui_event`] (#1627). `name` is the view name
+/// (`RenderedWindow::plugin_view`), since a tab has no `ext_panel_active` to
+/// resolve it from; `rect` must be the same rect
+/// `App::paint_editor_windows_rung` last painted this window's `Form` into
+/// (cached in `Engine::plugin_view_tab_form_rect`).
+///
+/// Returns `true` when the event was consumed.
+pub fn handle_plugin_view_tab_ui_event(
+    engine: &mut Engine,
+    name: &str,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+) -> bool {
+    use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+
+    if !populate_plugin_view_tab_form_controller(engine, name, true) {
+        return false;
+    }
+    let probe = match event {
+        quadraui::UiEvent::DoubleClick { widget, position } => quadraui::UiEvent::MouseDown {
+            widget: widget.clone(),
+            button: quadraui::MouseButton::Left,
+            position: *position,
+            modifiers: quadraui::Modifiers::default(),
+        },
+        other => other.clone(),
+    };
+    let result = engine
+        .plugin_view_tab_form_controller
+        .borrow_mut()
+        .handle_cached(&probe, rect);
+
+    let sync_scroll = |engine: &mut Engine| {
+        let offset = engine
+            .plugin_view_tab_form_controller
+            .borrow()
+            .scroll_offset();
+        engine.plugin_view_tab_scroll_top = offset;
+    };
+
+    let action = match result {
+        quadraui::FormControllerEvent::Ignored => return false,
+        quadraui::FormControllerEvent::ScrollChanged | quadraui::FormControllerEvent::Consumed => {
+            sync_scroll(engine);
+            return true;
+        }
+        quadraui::FormControllerEvent::FormAction(action) => action,
+    };
+    sync_scroll(engine);
+
+    let Some((view_name, field_id, kind)) = plugin_view_event_from_form_event(&action) else {
+        return true;
+    };
+    if let Some(view) = engine.plugin_views.get(&view_name) {
+        if let Some(idx) = view.field_index(&field_id) {
+            engine.plugin_view_focus_field(
+                &view_name,
+                crate::core::engine::PluginViewHost::Tab,
+                idx,
+            );
+        }
+    }
+    if matches!(kind, ViewEventKind::FocusChanged) {
         return true;
     }
     engine.dispatch_plugin_view_event(PluginViewEvent {
@@ -21893,6 +22050,7 @@ fn build_rendered_window(
         tabstop: engine.settings.tabstop.max(1) as usize,
         cursorline: engine.settings.cursorline,
         status_line: None,
+        plugin_view: None,
     };
 
     let window = match engine.windows.get(&window_id) {
@@ -21903,6 +22061,16 @@ fn build_rendered_window(
         Some(s) => s,
         None => return empty(window_id),
     };
+    // #1627: an editor-tab-hosted plugin view's window paints a `Form`
+    // (`App::paint_editor_windows_rung`), never buffer text — short-circuit
+    // before any of the syntax/diagnostic/fold work below, all of which is
+    // meaningless against the tiny scratch buffer backing it.
+    if let Some(name) = &buffer_state.plugin_view {
+        return RenderedWindow {
+            plugin_view: Some(name.clone()),
+            ..empty(window_id)
+        };
+    }
 
     let buffer = &buffer_state.buffer;
     let view = &window.view;
@@ -23100,6 +23268,7 @@ fn build_rendered_window(
         },
         cursorline: engine.settings.cursorline,
         status_line: None,
+        plugin_view: None,
     }
 }
 
@@ -31141,6 +31310,7 @@ mod tests {
             tabstop: 4,
             cursorline: false,
             status_line: None,
+            plugin_view: None,
         }
     }
 
@@ -36713,7 +36883,7 @@ mod slice7_router_tests {
 
     #[test]
     fn plugin_view_form_namespaces_every_widget_id() {
-        let form = plugin_view_to_form("my-ext", &fixture_view(), 1, 0, true);
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 1, 0, true, None);
         let ids: Vec<String> = form
             .fields
             .iter()
@@ -36742,7 +36912,7 @@ mod slice7_router_tests {
         // plugin set them is how you get a caret mid-codepoint. #146's ABI
         // decision keeps them out of the vocabulary entirely — assert the
         // adapter does not invent one either.
-        let form = plugin_view_to_form("my-ext", &fixture_view(), 0, 0, false);
+        let form = plugin_view_to_form("my-ext", &fixture_view(), 0, 0, false, None);
         match &form.fields[1].kind {
             quadraui::FieldKind::TextInput {
                 cursor,
@@ -36803,7 +36973,7 @@ mod slice7_router_tests {
                 },
             }],
         };
-        let form = plugin_view_to_form("my-ext", &view, 0, 0, false);
+        let form = plugin_view_to_form("my-ext", &view, 0, 0, false, None);
         let inner = match &form.fields[0].kind {
             quadraui::FieldKind::ToggleGroup { toggles } => toggles[0].id.clone(),
             other => panic!("expected a ToggleGroup, got {other:?}"),

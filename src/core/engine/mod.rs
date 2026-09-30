@@ -4647,6 +4647,48 @@ pub struct Engine {
     /// Recursion bound for `Engine::refresh_plugin_view` — a `render` callback
     /// may call `vimcode.ui.refresh`, which re-enters it.
     pub(crate) plugin_view_render_depth: u32,
+    /// Local text-edit state for whichever plugin-view `Text`/`Password`/
+    /// `TextArea` field currently has keyboard focus (#1627) — in the
+    /// sidebar or in an editor-area tab, never both: only one surface can
+    /// hold keyboard focus at a time, so one field suffices. vimcode owns
+    /// cursor/selection here; Lua sees only the committed value
+    /// (`ViewEventKind::TextChanged`/`TextCommitted`) — see `core::plugin_ui`'s
+    /// module doc for why the ABI never hands a plugin a cursor offset.
+    /// Primed on focus (`Engine::plugin_view_focus_field`) from the field's
+    /// then-current declared value; cleared on blur.
+    pub plugin_view_text_edit: Option<crate::core::plugin_ui::PluginViewTextEditState>,
+    /// Flat selection index for a `vimcode.ui.register_view` view hosted as
+    /// an editor-area tab (#1627, `Engine::open_plugin_view_tab`) — the tab
+    /// twin of `ext_panel_selected`. Kept separate from `ext_panel_selected`
+    /// (rather than shared) because the sidebar and a tab can be showing
+    /// *different* views at once; only one may hold keyboard focus, but both
+    /// may be painted in the same frame, and sharing one index would let
+    /// moving the sidebar's selection visibly move the tab's highlighted row
+    /// (or vice versa) even when the two views differ.
+    pub plugin_view_tab_selected: usize,
+    /// Scroll offset for a plugin view hosted as an editor-area tab — the tab
+    /// twin of `ext_panel_scroll_top`, kept separate for the same reason as
+    /// `plugin_view_tab_selected`.
+    pub plugin_view_tab_scroll_top: usize,
+    /// The `quadraui::FormController` an editor-tab-hosted plugin view is
+    /// painted through — kept separate from `plugin_view_form_controller`
+    /// (the sidebar's) so a simultaneously-visible sidebar view and tab view
+    /// don't overwrite each other's cached click-routing geometry.
+    pub plugin_view_tab_form_controller: std::cell::RefCell<quadraui::FormController>,
+    /// The exact rect the last frame painted the editor-tab-hosted plugin
+    /// view's form into (tab twin of `plugin_view_form_rect`).
+    pub plugin_view_tab_form_rect: std::cell::Cell<quadraui::Rect>,
+    /// View names `Engine::open_plugin_view_tab` couldn't refresh immediately
+    /// (`plugin_dispatch_depth > 0` — it always runs nested inside the
+    /// `vimcode.ui.open_view` Lua call that triggered it, since that call is
+    /// only reachable from within another live callback, #1627). Drained by
+    /// `Engine::with_plugin_dispatch` the moment depth returns to `0`, the
+    /// same "defer until the outer call returns" fix `vimcode.ui.refresh`
+    /// already uses for the identical reentrancy problem via
+    /// `PluginCallContext::plugin_view_refresh` — this field exists only
+    /// because `open_plugin_view_tab` runs through the immediate
+    /// (`live_engine`) API, which has no `PluginCallContext` to queue into.
+    pub(crate) plugin_view_tab_pending_refresh: Vec<String>,
     /// Per-panel section expanded state.
     pub ext_panel_sections_expanded: HashMap<String, Vec<bool>>,
     /// Per-panel tree item expand state: (panel_name, item_id) → expanded.
@@ -5424,6 +5466,16 @@ impl Engine {
             )),
             plugin_view_form_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             plugin_view_render_depth: 0,
+            plugin_view_text_edit: None,
+            plugin_view_tab_selected: 0,
+            plugin_view_tab_scroll_top: 0,
+            plugin_view_tab_form_controller: std::cell::RefCell::new(
+                quadraui::FormController::new("plugin-view-tab".to_string()),
+            ),
+            plugin_view_tab_form_rect: std::cell::Cell::new(quadraui::Rect::new(
+                0.0, 0.0, 0.0, 0.0,
+            )),
+            plugin_view_tab_pending_refresh: Vec::new(),
             ext_panel_sections_expanded: HashMap::new(),
             ext_panel_tree_expanded: HashMap::new(),
             ext_panel_input_text: HashMap::new(),
@@ -6584,6 +6636,7 @@ mod motions;
 mod panels;
 mod picker;
 mod plugins;
+pub(crate) use plugins::PluginViewHost;
 mod search;
 pub use search::{find_word_boundaries, SearchKeyResult};
 mod review_comment_ops;

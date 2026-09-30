@@ -660,6 +660,18 @@ pub struct BufferState {
     pub detected_indent: Option<u8>,
     /// Line ending format (LF or CRLF). Detected on file open, default LF.
     pub line_ending: LineEnding,
+    /// Set when this buffer's window hosts a `vimcode.ui.register_view` view
+    /// as an editor-area tab (`Engine::open_plugin_view_tab`, #1627), naming
+    /// the view. `None` for every ordinary buffer. The buffer's own content
+    /// is never read for such a window — `render::build_rendered_window`
+    /// short-circuits before touching it, and `App::paint_editor_windows_rung`
+    /// paints the view's `Form` in the window's rect instead of buffer text —
+    /// so it exists only to piggyback on the pre-existing `Tab`/`Window`/
+    /// `BufferId` lifecycle (open, close, split, move-between-groups) rather
+    /// than inventing a parallel one; `scratch_name` (set alongside this,
+    /// `Engine::open_plugin_view_tab`) is the pre-existing tab-title mechanism
+    /// this reuses rather than adds a second.
+    pub plugin_view: Option<String>,
 }
 
 impl std::fmt::Debug for BufferState {
@@ -712,6 +724,7 @@ impl BufferState {
             file_change_warned: false,
             detected_indent: None,
             line_ending: LineEnding::LF,
+            plugin_view: None,
         };
         state.update_syntax();
         state
@@ -760,6 +773,7 @@ impl BufferState {
             file_change_warned: false,
             detected_indent: None,
             line_ending,
+            plugin_view: None,
         };
         state.detect_indent();
         state.update_syntax();

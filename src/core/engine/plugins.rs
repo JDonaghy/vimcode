@@ -25,6 +25,24 @@ const MAX_SPAWN_EVENTS_PER_TICK: usize = 256;
 /// `Engine::record_async_shell_exit`'s doc for why this exists.
 const MAX_ASYNC_SHELL_LAST_EXIT_ENTRIES: usize = 256;
 
+/// Which surface currently owns a `vimcode.ui.register_view` view's keyboard
+/// focus / selection index — the sidebar body or an editor-area tab
+/// (`Engine::open_plugin_view_tab`, #1627).
+///
+/// The two never hold keyboard focus at once (`Engine::handle_key`'s
+/// `ext_panel_has_focus` check always wins over a plugin-view tab's own key
+/// routing — see `keys.rs`), but both may be *painted* in the same frame,
+/// hosting different views, so each keeps its own selection/scroll index and
+/// `FormController` rather than sharing `ext_panel_selected`/
+/// `ext_panel_scroll_top`/`plugin_view_form_controller` — see
+/// `Engine::plugin_view_tab_selected`'s doc for why sharing would be wrong,
+/// not just redundant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginViewHost {
+    Sidebar,
+    Tab,
+}
+
 impl Engine {
     // =========================================================================
     // Plugin system
@@ -183,22 +201,223 @@ impl Engine {
                 .get(name)
                 .and_then(|v| v.first_focusable())
                 .unwrap_or(0);
-            self.ext_panel_selected = first;
+            self.plugin_view_focus_field(name, PluginViewHost::Sidebar, first);
         }
     }
 
-    /// Keyboard handling for a view-backed sidebar panel.
+    // ── In-panel text entry / editor-tab hosting (#1627) ────────────────────
+
+    /// Whether `name` names the view currently hosted as an editor-area tab
+    /// in the *active* window, if any (`Engine::open_plugin_view_tab`).
+    pub fn active_plugin_view_tab(&self) -> Option<String> {
+        let buf = self.windows.get(&self.active_window_id())?.buffer_id;
+        self.buffer_manager.get(buf)?.plugin_view.clone()
+    }
+
+    /// Open `name` (a `vimcode.ui.register_view` view) as a new tab in the
+    /// active editor group, the way `vimcode.ui.open_view(name, {location =
+    /// "tab"})` is wired (#1627).
     ///
-    /// Returns `true` when the key was consumed. Keys this returns `false` for
-    /// fall through to `Engine::handle_ext_panel_key`'s generic panel bindings
-    /// (`q`/`Escape` to unfocus, `h`/`Left` back to the activity bar, `?` help),
-    /// so a plugin view keeps the same panel chrome bindings every other sidebar
-    /// panel has.
+    /// Reuses `Engine::new_tab`'s existing scratch-buffer-in-a-new-tab
+    /// machinery verbatim — the resulting tab is a genuine `Tab`/`Window`/
+    /// `BufferId` triple, so closing it, splitting its window and moving it
+    /// between editor groups all already work with zero new code (#1627's
+    /// "closes like any tab, survives split and group moves"). The buffer is
+    /// flagged `BufferState::plugin_view` so `render::build_rendered_window`
+    /// paints the view's `Form` instead of buffer text (`app.rs`'s
+    /// `paint_editor_windows_rung`) — see that field's doc for the rest of
+    /// the wiring. `scratch_name` is the pre-existing tab-title mechanism
+    /// (`render.rs`'s tab-title fallback already reads it), so no new
+    /// tab-title plumbing is needed either.
+    pub fn open_plugin_view_tab(&mut self, name: &str) -> bool {
+        if !self.is_plugin_view(name) {
+            return false;
+        }
+        let title = self
+            .ext_panels
+            .get(name)
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| name.to_string());
+        self.new_tab(None);
+        let buf_id = self.active_buffer_id();
+        if let Some(state) = self.buffer_manager.get_mut(buf_id) {
+            state.read_only = true;
+            state.dirty = false;
+            state.scratch_name = Some(title);
+            state.plugin_view = Some(name.to_string());
+        }
+        // `open_plugin_view_tab` runs via the immediate (`live_engine`) API,
+        // which is only reachable from within an already-running plugin
+        // callback (`vimcode.ui.open_view`'s own doc) — so
+        // `plugin_dispatch_depth` is always `> 0` here in practice, and
+        // `refresh_plugin_view`'s own `with_plugin_dispatch` call would just
+        // no-op (its reentrancy guard, for good reason: Lua cannot be
+        // re-entered while the outer call hasn't returned). Deferring to
+        // `plugin_view_tab_pending_refresh` — drained by
+        // `with_plugin_dispatch` the moment depth returns to `0` — is the
+        // same fix `vimcode.ui.refresh` already applies to the identical
+        // problem via `PluginCallContext::plugin_view_refresh`.
+        if self.plugin_dispatch_depth == 0 {
+            self.refresh_plugin_view(name);
+        } else {
+            self.plugin_view_tab_pending_refresh.push(name.to_string());
+        }
+        let first = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.first_focusable())
+            .unwrap_or(0);
+        self.plugin_view_focus_field(name, PluginViewHost::Tab, first);
+        true
+    }
+
+    /// Read the selection index for `host`.
+    pub(crate) fn plugin_view_selected(&self, host: PluginViewHost) -> usize {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_selected,
+            PluginViewHost::Tab => self.plugin_view_tab_selected,
+        }
+    }
+
+    /// Write the selection index for `host`.
+    fn set_plugin_view_selected(&mut self, host: PluginViewHost, idx: usize) {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_selected = idx,
+            PluginViewHost::Tab => self.plugin_view_tab_selected = idx,
+        }
+    }
+
+    /// Nudge `host`'s scroll offset so its selection stays visible — the
+    /// tab twin of `Engine::ext_panel_ensure_visible` (fixed 20-row viewport
+    /// guess, same as that method's own fallback).
+    fn plugin_view_ensure_visible(&mut self, host: PluginViewHost) {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_ensure_visible(0),
+            PluginViewHost::Tab => {
+                const ROWS: usize = 20;
+                let sel = self.plugin_view_tab_selected;
+                if sel < self.plugin_view_tab_scroll_top {
+                    self.plugin_view_tab_scroll_top = sel;
+                } else if sel >= self.plugin_view_tab_scroll_top + ROWS {
+                    self.plugin_view_tab_scroll_top = sel.saturating_sub(ROWS - 1);
+                }
+            }
+        }
+    }
+
+    /// Move `host`'s keyboard focus to field `idx` of view `name`: blurs
+    /// whatever text edit was in progress on the previously-focused field
+    /// (committing it first if it was a `TextArea`, discarding otherwise —
+    /// see [`Self::blur_plugin_view_text_edit`]), moves the selection, and
+    /// primes [`Engine::plugin_view_text_edit`] if the newly-focused field is
+    /// a `Text`/`Password`/`TextArea` kind.
+    ///
+    /// The single entry point for changing which field a plugin view's
+    /// keyboard focus is on — every navigation path (initial panel/tab focus,
+    /// `j`/`k`/`Tab`/`BackTab`, a mouse click) routes through this so blur/
+    /// prime can never be skipped on one path and not another.
+    pub(crate) fn plugin_view_focus_field(&mut self, name: &str, host: PluginViewHost, idx: usize) {
+        self.blur_plugin_view_text_edit(name, host);
+        self.set_plugin_view_selected(host, idx);
+        self.prime_plugin_view_text_edit(name, idx);
+    }
+
+    /// Commit-or-discard whatever [`Engine::plugin_view_text_edit`] holds for
+    /// `host`'s currently-focused field in view `name`, then clear it.
+    ///
+    /// A `TextArea` commits on blur (fires `TextCommitted` with the buffer's
+    /// current value); `Text`/`Password` do not — #1627 scopes single-line
+    /// blur-commit out (only Enter commits those), so leaving one without
+    /// pressing Enter discards the in-progress edit and the next paint shows
+    /// whatever the plugin last declared. This mirrors the existing
+    /// `Engine::explorer_rename`/`handle_settings_key` precedent of
+    /// vimcode-owned, plugin-invisible edit buffers.
+    fn blur_plugin_view_text_edit(&mut self, name: &str, host: PluginViewHost) {
+        let Some(state) = self.plugin_view_text_edit.take() else {
+            return;
+        };
+        // Only this (view, host)'s own field, identified by the selection
+        // index it was primed from — a stale `Some` here (e.g. a full
+        // `ui.refresh` mid-edit that dropped fields) is simply discarded.
+        if state.view != name {
+            return;
+        }
+        let selected = self.plugin_view_selected(host);
+        let Some(field) = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.fields.get(selected))
+        else {
+            return;
+        };
+        if field.id != state.field_id {
+            return;
+        }
+        if matches!(
+            field.kind,
+            crate::core::plugin_ui::ViewFieldKind::TextArea { .. }
+        ) {
+            self.dispatch_plugin_view_event(crate::core::plugin_ui::PluginViewEvent {
+                view: name.to_string(),
+                widget_id: state.field_id,
+                kind: crate::core::plugin_ui::ViewEventKind::TextCommitted { value: state.value },
+            });
+        }
+    }
+
+    /// Populate [`Engine::plugin_view_text_edit`] from field `idx` of view
+    /// `name`'s *declared* value (cursor at the end, no selection) — or clear
+    /// it when that field isn't a `Text`/`Password`/`TextArea` kind.
+    fn prime_plugin_view_text_edit(&mut self, name: &str, idx: usize) {
+        use crate::core::plugin_ui::{PluginViewTextEditState, ViewFieldKind};
+        let value = match self.plugin_views.get(name).and_then(|v| v.fields.get(idx)) {
+            Some(f) => match &f.kind {
+                ViewFieldKind::Text { value, .. }
+                | ViewFieldKind::Password { value, .. }
+                | ViewFieldKind::TextArea { value, .. } => Some((f.id.clone(), value.clone())),
+                _ => None,
+            },
+            None => None,
+        };
+        self.plugin_view_text_edit = value.map(|(field_id, value)| {
+            let cursor = value.len();
+            PluginViewTextEditState {
+                view: name.to_string(),
+                field_id,
+                value,
+                cursor,
+                selection_anchor: None,
+            }
+        });
+    }
+
+    /// Keyboard handling for a view-backed sidebar panel or editor-area tab.
+    ///
+    /// Returns `true` when the key was consumed. For the sidebar, keys this
+    /// returns `false` for fall through to `Engine::handle_ext_panel_key`'s
+    /// generic panel bindings (`q`/`Escape` to unfocus, `h`/`Left` back to the
+    /// activity bar, `?` help), so a plugin view keeps the same panel chrome
+    /// bindings every other sidebar panel has; for a tab there is no such
+    /// chrome to fall through to (`keys.rs`'s caller just drops the key).
     ///
     /// Navigation skips rows that cannot emit events (`label`, `read_only`,
-    /// `disabled`), so `j`/`k` never parks the selection somewhere `Enter` does
-    /// nothing.
-    pub(crate) fn handle_plugin_view_key(&mut self, name: &str, key: &str) -> bool {
+    /// `disabled`), so `j`/`k`/`Tab`/`BackTab` never park the selection
+    /// somewhere `Enter` does nothing.
+    ///
+    /// When the focused row is a `Text`/`Password`/`TextArea` field, every key
+    /// except `Tab`/`BackTab` (field-to-field navigation always wins, so a
+    /// view is never a keyboard trap) is handed to
+    /// [`Self::handle_plugin_view_text_key`] instead — typed characters must
+    /// insert into the field rather than double as `j`/`k` navigation once a
+    /// field can actually take text (#1627).
+    pub(crate) fn handle_plugin_view_key(
+        &mut self,
+        name: &str,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+        host: PluginViewHost,
+    ) -> bool {
         use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind, ViewFieldKind};
 
         let Some(view) = self.plugin_views.get(name) else {
@@ -211,18 +430,62 @@ impl Engine {
             .filter(|(_, f)| f.is_interactive() && !f.disabled)
             .map(|(i, _)| i)
             .collect();
+        let selected = self.plugin_view_selected(host);
+        let is_text_field = view.fields.get(selected).is_some_and(|f| {
+            !f.disabled
+                && matches!(
+                    f.kind,
+                    ViewFieldKind::Text { .. }
+                        | ViewFieldKind::Password { .. }
+                        | ViewFieldKind::TextArea { .. }
+                )
+        });
 
+        // Field-to-field navigation always wins, text field or not.
         match key {
-            "j" | "Down" | "Tab" => {
+            "Tab" => {
                 let next = focusable
                     .iter()
                     .copied()
-                    .find(|i| *i > self.ext_panel_selected)
+                    .find(|i| *i > selected)
                     .or_else(|| focusable.first().copied());
                 if let Some(i) = next {
-                    self.ext_panel_selected = i;
+                    self.plugin_view_focus_field(name, host, i);
                 }
-                self.ext_panel_ensure_visible(0);
+                self.plugin_view_ensure_visible(host);
+                return true;
+            }
+            "BackTab" => {
+                let prev = focusable
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|i| *i < selected)
+                    .or_else(|| focusable.last().copied());
+                if let Some(i) = prev {
+                    self.plugin_view_focus_field(name, host, i);
+                }
+                self.plugin_view_ensure_visible(host);
+                return true;
+            }
+            _ => {}
+        }
+
+        if is_text_field {
+            return self.handle_plugin_view_text_key(name, host, selected, key, ctrl, unicode);
+        }
+
+        match key {
+            "j" | "Down" => {
+                let next = focusable
+                    .iter()
+                    .copied()
+                    .find(|i| *i > selected)
+                    .or_else(|| focusable.first().copied());
+                if let Some(i) = next {
+                    self.plugin_view_focus_field(name, host, i);
+                }
+                self.plugin_view_ensure_visible(host);
                 true
             }
             "k" | "Up" => {
@@ -230,30 +493,36 @@ impl Engine {
                     .iter()
                     .rev()
                     .copied()
-                    .find(|i| *i < self.ext_panel_selected)
+                    .find(|i| *i < selected)
                     .or_else(|| focusable.last().copied());
                 if let Some(i) = prev {
-                    self.ext_panel_selected = i;
+                    self.plugin_view_focus_field(name, host, i);
                 }
-                self.ext_panel_ensure_visible(0);
+                self.plugin_view_ensure_visible(host);
                 true
             }
             "g" => {
                 if let Some(i) = focusable.first().copied() {
-                    self.ext_panel_selected = i;
+                    self.plugin_view_focus_field(name, host, i);
                 }
-                self.ext_panel_scroll_top = 0;
+                match host {
+                    PluginViewHost::Sidebar => self.ext_panel_scroll_top = 0,
+                    PluginViewHost::Tab => self.plugin_view_tab_scroll_top = 0,
+                }
                 true
             }
             "G" => {
                 if let Some(i) = focusable.last().copied() {
-                    self.ext_panel_selected = i;
+                    self.plugin_view_focus_field(name, host, i);
                 }
-                self.ext_panel_ensure_visible(0);
+                self.plugin_view_ensure_visible(host);
                 true
             }
             "Return" | "Enter" | "Space" | " " => {
-                let Some(field) = view.fields.get(self.ext_panel_selected) else {
+                let Some(view) = self.plugin_views.get(name) else {
+                    return true;
+                };
+                let Some(field) = view.fields.get(selected) else {
                     return true;
                 };
                 if field.disabled {
@@ -301,18 +570,14 @@ impl Engine {
                             ViewEventKind::SegmentedChanged { selected: next },
                         )
                     }
-                    ViewFieldKind::Text { value, .. }
-                    | ViewFieldKind::Password { value, .. }
-                    | ViewFieldKind::TextArea { value, .. } => (
-                        field.id.clone(),
-                        // Text *entry* into a plugin view is #1403 Phase 2; Enter
-                        // on a text row commits the value the plugin declared, so
-                        // "type in a real buffer, press Enter here" already works
-                        // as a submit affordance.
-                        ViewEventKind::TextCommitted {
-                            value: value.clone(),
-                        },
-                    ),
+                    ViewFieldKind::Text { .. }
+                    | ViewFieldKind::Password { .. }
+                    | ViewFieldKind::TextArea { .. } => {
+                        // Unreachable: `is_text_field` routes every text-kind
+                        // field to `handle_plugin_view_text_key` above, which
+                        // owns Enter for these kinds (commit).
+                        return true;
+                    }
                     ViewFieldKind::Label | ViewFieldKind::ReadOnly { .. } => return true,
                 };
                 self.dispatch_plugin_view_event(PluginViewEvent {
@@ -324,6 +589,294 @@ impl Engine {
             }
             _ => false,
         }
+    }
+
+    /// Keyboard handling for a focused `Text`/`Password`/`TextArea` row —
+    /// insert/delete, cursor movement, selection and clipboard paste, all
+    /// vimcode-owned (#1627). Mirrors `Engine::handle_explorer_rename_key`'s
+    /// shape (byte-offset cursor/selection, the same key set) since that is
+    /// the existing precedent for a vimcode-owned inline text editor; kept as
+    /// a separate implementation rather than a shared helper because that
+    /// method lives in `buffers.rs`, outside this issue's file list, and its
+    /// `ExplorerRenameState` has no plugin/view/commit-event concept to
+    /// generalize over.
+    ///
+    /// `TextArea` additionally supports a literal newline (plain Enter) and
+    /// multi-line `Up`/`Down` cursor movement by logical line; `Text`/
+    /// `Password` treat `Up`/`Down` as field-to-field navigation, same as a
+    /// non-text row, since a single-line value has no "next line". Only
+    /// `TextArea` commits on blur/Ctrl-Enter — see
+    /// `Self::blur_plugin_view_text_edit`'s doc for why `Text`/`Password`
+    /// don't.
+    fn handle_plugin_view_text_key(
+        &mut self,
+        name: &str,
+        host: PluginViewHost,
+        field_idx: usize,
+        key: &str,
+        ctrl: bool,
+        unicode: Option<char>,
+    ) -> bool {
+        use crate::core::plugin_ui::{
+            PluginViewEvent, PluginViewTextEditState, ViewEventKind, ViewFieldKind,
+        };
+
+        let Some(field) = self
+            .plugin_views
+            .get(name)
+            .and_then(|v| v.fields.get(field_idx))
+        else {
+            return true;
+        };
+        let field_id = field.id.clone();
+        let is_textarea = matches!(field.kind, ViewFieldKind::TextArea { .. });
+
+        // Defensive re-prime: normally already true via
+        // `Engine::plugin_view_focus_field`, but a `ui.refresh` mid-edit can
+        // in principle replace the field the selection points at.
+        if !matches!(&self.plugin_view_text_edit, Some(s) if s.view == name && s.field_id == field_id)
+        {
+            self.prime_plugin_view_text_edit(name, field_idx);
+        }
+        let Some(mut state) = self.plugin_view_text_edit.take() else {
+            return true;
+        };
+
+        // Escape: leave the field entirely (falls through to whatever "leave
+        // this view" means for `host` — unfocus the sidebar panel, or a no-op
+        // for a tab) rather than being swallowed here. `blur_plugin_view_text_
+        // edit` (run when the caller actually changes focus/host state)
+        // discards a `Text`/`Password` edit at that point, so this already
+        // has "Escape cancels the edit" behaviour, just folded into "leave".
+        if key == "Escape" {
+            self.plugin_view_text_edit = Some(state);
+            return false;
+        }
+
+        fn delete_selection(s: &mut PluginViewTextEditState) -> bool {
+            if let Some(anchor) = s.selection_anchor.take() {
+                let lo = anchor.min(s.cursor);
+                let hi = anchor.max(s.cursor);
+                if lo != hi {
+                    s.value.drain(lo..hi);
+                    s.cursor = lo;
+                    return true;
+                }
+            }
+            false
+        }
+        // Byte range `[start, end)` of the logical line containing `cursor`
+        // (split on `\n`; a single-line value is its own one line).
+        fn line_bounds(value: &str, cursor: usize) -> (usize, usize) {
+            let start = value[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let end = value[cursor..]
+                .find('\n')
+                .map(|i| cursor + i)
+                .unwrap_or(value.len());
+            (start, end)
+        }
+
+        let mut changed = false;
+        let mut committed = false;
+        match key {
+            "BackSpace" => {
+                if !delete_selection(&mut state) && state.cursor > 0 {
+                    let prev = state.value[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    state.value.remove(prev);
+                    state.cursor = prev;
+                }
+                changed = true;
+            }
+            "Delete" => {
+                if !delete_selection(&mut state) && state.cursor < state.value.len() {
+                    state.value.remove(state.cursor);
+                }
+                changed = true;
+            }
+            "Left" => {
+                if state.cursor > 0 {
+                    state.cursor = state.value[..state.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                state.selection_anchor = None;
+            }
+            "Right" => {
+                if state.cursor < state.value.len() {
+                    let rest = &state.value[state.cursor..];
+                    state.cursor = rest
+                        .char_indices()
+                        .nth(1)
+                        .map(|(i, _)| state.cursor + i)
+                        .unwrap_or(state.value.len());
+                }
+                state.selection_anchor = None;
+            }
+            "Home" => {
+                state.cursor = if is_textarea {
+                    line_bounds(&state.value, state.cursor).0
+                } else {
+                    0
+                };
+                state.selection_anchor = None;
+            }
+            "End" => {
+                state.cursor = if is_textarea {
+                    line_bounds(&state.value, state.cursor).1
+                } else {
+                    state.value.len()
+                };
+                state.selection_anchor = None;
+            }
+            "Up" if is_textarea => {
+                let (line_start, _) = line_bounds(&state.value, state.cursor);
+                if line_start > 0 {
+                    let col = state.cursor - line_start;
+                    let (prev_start, prev_end) = line_bounds(&state.value, line_start - 1);
+                    state.cursor = (prev_start + col).min(prev_end);
+                }
+                state.selection_anchor = None;
+            }
+            "Down" if is_textarea => {
+                let (_, line_end) = line_bounds(&state.value, state.cursor);
+                if line_end < state.value.len() {
+                    let (line_start, _) = line_bounds(&state.value, state.cursor);
+                    let col = state.cursor - line_start;
+                    let next_start = line_end + 1;
+                    let (_, next_end) = line_bounds(&state.value, next_start);
+                    state.cursor = (next_start + col).min(next_end);
+                }
+                state.selection_anchor = None;
+            }
+            "Up" | "Down" => {
+                // Text/Password: no vertical concept — behaves like a
+                // non-text row's Up/Down, moving focus to the next field.
+                self.plugin_view_text_edit = Some(state);
+                let focusable: Vec<usize> = self
+                    .plugin_views
+                    .get(name)
+                    .map(|v| {
+                        v.fields
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, f)| f.is_interactive() && !f.disabled)
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let target = if key == "Down" {
+                    focusable
+                        .iter()
+                        .copied()
+                        .find(|i| *i > field_idx)
+                        .or_else(|| focusable.first().copied())
+                } else {
+                    focusable
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|i| *i < field_idx)
+                        .or_else(|| focusable.last().copied())
+                };
+                if let Some(i) = target {
+                    self.plugin_view_focus_field(name, host, i);
+                }
+                self.plugin_view_ensure_visible(host);
+                return true;
+            }
+            "Return" | "Enter" if is_textarea && !ctrl => {
+                delete_selection(&mut state);
+                state.value.insert(state.cursor, '\n');
+                state.cursor += 1;
+                changed = true;
+            }
+            "Return" | "Enter" => {
+                committed = true;
+            }
+            _ if ctrl => match key {
+                "a" => {
+                    state.selection_anchor = Some(0);
+                    state.cursor = state.value.len();
+                }
+                "c" => {
+                    if let Some((lo, hi)) = state.selection_range() {
+                        if lo != hi {
+                            let text = state.value[lo..hi].to_string();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                        }
+                    }
+                }
+                "x" => {
+                    if let Some((lo, hi)) = state.selection_range() {
+                        if lo != hi {
+                            let text = state.value[lo..hi].to_string();
+                            if let Some(ref cb) = self.clipboard_write {
+                                let _ = cb(&text);
+                            }
+                            delete_selection(&mut state);
+                            changed = true;
+                        }
+                    }
+                }
+                "v" => {
+                    delete_selection(&mut state);
+                    let paste = if let Some(ref cb) = self.clipboard_read {
+                        cb().unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let text = if is_textarea {
+                        paste
+                    } else {
+                        paste.lines().next().unwrap_or("").to_string()
+                    };
+                    state.value.insert_str(state.cursor, &text);
+                    state.cursor += text.len();
+                    changed = true;
+                }
+                _ => {}
+            },
+            _ => {
+                if let Some(ch) = unicode {
+                    if !ch.is_control() {
+                        delete_selection(&mut state);
+                        state.value.insert(state.cursor, ch);
+                        state.cursor += ch.len_utf8();
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        if committed {
+            let value = state.value.clone();
+            self.plugin_view_text_edit = None;
+            self.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: field_id,
+                kind: ViewEventKind::TextCommitted { value },
+            });
+            return true;
+        }
+
+        let value_for_event = changed.then(|| state.value.clone());
+        self.plugin_view_text_edit = Some(state);
+        if let Some(value) = value_for_event {
+            self.dispatch_plugin_view_event(PluginViewEvent {
+                view: name.to_string(),
+                widget_id: field_id,
+                kind: ViewEventKind::TextChanged { value },
+            });
+        }
+        true
     }
 
     /// Route one resolved widget event to the owning view's `on_event` callback.
@@ -385,6 +938,32 @@ impl Engine {
         // plugin's immediate edits collapse into one undo step per buffer —
         // matching the single batch the queued replay path produces.
         self.finish_plugin_undo_groups();
+        // #1627: now that depth is genuinely back to `0`, it's safe to run
+        // any `Engine::open_plugin_view_tab` refresh that had to defer
+        // itself while nested inside this very call — see
+        // `plugin_view_tab_pending_refresh`'s doc for why it can't just run
+        // eagerly. Drained here (the one place every dispatch, immediate or
+        // queued, funnels back through) rather than at `open_plugin_view_
+        // tab`'s own call site, since that site has no way to know when the
+        // *outermost* call will actually finish.
+        if self.plugin_dispatch_depth == 0 && !self.plugin_view_tab_pending_refresh.is_empty() {
+            let pending = std::mem::take(&mut self.plugin_view_tab_pending_refresh);
+            for name in pending {
+                self.refresh_plugin_view(&name);
+                // The seeded-empty view had no focusable field yet when
+                // `open_plugin_view_tab` first parked the selection; now that
+                // real fields exist, re-park it properly.
+                if let Some(first) = self
+                    .plugin_views
+                    .get(&name)
+                    .and_then(|v| v.first_focusable())
+                {
+                    if self.active_plugin_view_tab().as_deref() == Some(name.as_str()) {
+                        self.plugin_view_focus_field(&name, PluginViewHost::Tab, first);
+                    }
+                }
+            }
+        }
         Some(out)
     }
 
