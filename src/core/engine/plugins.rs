@@ -21,12 +21,23 @@ impl Engine {
     /// what lets nested code still see "there is a plugin manager" and what
     /// makes loaning `&mut Engine` to Lua sound (no outstanding borrow of
     /// `self.plugin_manager` is held across the call).
-    pub fn set_plugin_manager(&mut self, mgr: plugin::PluginManager) {
+    pub fn set_plugin_manager(&mut self, mut mgr: plugin::PluginManager) {
         // #146: seed `plugin_views` so a `vimcode.ui.register_view` panel is
         // recognisable as view-backed before its `render` callback has ever run
         // (the sidebar has to pick a body *shape* on the first frame it paints).
         for name in mgr.view_names() {
             self.plugin_views.entry(name).or_default();
+        }
+        // #1623: merge load-time `vimcode.keymap.set` registrations into
+        // `user_keymaps` so they are consulted through the same
+        // before-built-ins path as a config keymap (`Engine::try_user_keymap`).
+        // `<leader>` is expanded here — the free-standing harvest inside
+        // `PluginManager` has no `Settings` access — mirroring
+        // `Engine::rebuild_user_keymaps`.
+        let leader = self.settings.leader.to_string();
+        for mut km in mgr.take_raw_lua_keymaps() {
+            km.keys = expand_leader_tokens(km.keys, &leader);
+            self.user_keymaps.push(km);
         }
         self.plugin_manager = Some(std::rc::Rc::new(mgr));
     }
@@ -495,6 +506,7 @@ impl Engine {
         let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
             return false;
         };
+        let old_buf_id = self.windows.get(&win_id).map(|w| w.buffer_id);
         let switched = match self.windows.get_mut(&win_id) {
             Some(w) => {
                 let changed = w.buffer_id != buf_id;
@@ -506,6 +518,11 @@ impl Engine {
             None => return false,
         };
         if switched {
+            // #1623: BufLeave for the window's previous buffer, delivering
+            // its handle — fired before BufEnter, same ordering vim uses.
+            if let Some(old) = old_buf_id {
+                self.plugin_event("BufLeave", &old.0.to_string());
+            }
             let arg = self
                 .buffer_manager
                 .get(buf_id)
@@ -1395,6 +1412,51 @@ impl Engine {
         // Proactively request code actions for the new cursor position (lightbulb).
         self.lsp_request_code_actions_for_line();
         true
+    }
+
+    /// Fire `CursorMoved` (or `CursorMovedI` in Insert/Replace mode) for the
+    /// active window (#1623). Arg is the active window handle, matching the
+    /// immediate API's integer-handle convention (a plugin reads the actual
+    /// position back via `vimcode.window.get_cursor`).
+    fn fire_cursor_moved_event(&mut self) {
+        let event = if matches!(self.mode, Mode::Insert | Mode::Replace) {
+            "CursorMovedI"
+        } else {
+            "CursorMoved"
+        };
+        let win = self.active_window_id().0.to_string();
+        self.plugin_event(event, &win);
+    }
+
+    /// Flush the `CursorMoved`/`CursorMovedI` debounce (#1623) — a sibling of
+    /// [`Self::flush_cursor_move_hook`], kept on its own timestamp
+    /// (`cursor_moved_event_pending`) precisely so it cannot alter that
+    /// method's legacy Normal-mode-only firing scope. Called from the same
+    /// `poll_idle` tick. Returns `true` when the event fired (needs redraw).
+    pub fn flush_cursor_moved_event(&mut self) -> bool {
+        let Some(when) = self.cursor_moved_event_pending else {
+            return false;
+        };
+        if when.elapsed() < std::time::Duration::from_millis(150) {
+            return false;
+        }
+        self.cursor_moved_event_pending = None;
+        self.fire_cursor_moved_event();
+        true
+    }
+
+    /// Fire `WinLeave`/`WinEnter` for a window-focus change (#1623). Handles
+    /// are the (decimal) window id, matching the immediate API's convention.
+    /// No-op — including no event-hook lookup — when the window didn't
+    /// actually change, so callers can call this unconditionally after every
+    /// "make this window active" operation without worrying about the
+    /// common case (already-active window) being expensive.
+    pub(crate) fn fire_win_focus_change(&mut self, old: WindowId, new: WindowId) {
+        if old == new {
+            return;
+        }
+        self.plugin_event("WinLeave", &old.0.to_string());
+        self.plugin_event("WinEnter", &new.0.to_string());
     }
 }
 

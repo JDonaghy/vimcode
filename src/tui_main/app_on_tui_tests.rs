@@ -9840,5 +9840,72 @@ mod tests {
                  as the plugin asked; screen:\n{screen}"
             );
         }
+
+        // ─────────────────────────────────────────────────────────────────
+        // Native Extension API — Phase 2 (#1623): a Lua `ys{motion}`
+        // operator, built entirely from `vimcode.*` (keymap.set +
+        // set_operatorfunc + the '[/'] marks + the immediate buffer API) —
+        // the same shape a real nvim-surround-style extension uses.
+        // ─────────────────────────────────────────────────────────────────
+
+        /// #1623 acceptance: a Lua `n`-mode map on `ys` registers an
+        /// operatorfunc and feeds `g@` (entering operator-pending, same as
+        /// vim's own `g@`), so the *next* keystroke supplies the motion —
+        /// exactly nvim-surround's `ys{motion}` shape. The operatorfunc reads
+        /// the motion's span via `'[`/`']` (set by `g@`, #1623) and wraps it
+        /// in quotes through the immediate `vimcode.buffer.*` API. Asserted
+        /// on the painted screen, not engine state.
+        ///
+        /// RED-verified against unfixed `develop`: `vimcode.keymap` is a
+        /// bare function there (no `.set`/`.list` table), so the first line
+        /// of the plugin script errors at load and `ys` keeps its built-in
+        /// meaning (nothing — `y` alone would start a yank operator instead,
+        /// and 's' is a completely unrelated bare keystroke); the screen
+        /// never shows the wrapped word.
+        #[test]
+        fn lua_ys_operator_wraps_motion_text_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "ys_surround",
+                r#"
+                vimcode.keymap.set("n", "ys", function()
+                    vimcode.set_operatorfunc(function(_)
+                        local a = vimcode.state.mark("[")
+                        local b = vimcode.state.mark("]")
+                        local buf = vimcode.buffer.current()
+                        local line = vimcode.buffer.get_lines(buf, a.line - 1, a.line)[1]
+                        local before = line:sub(1, a.col - 1)
+                        local middle = line:sub(a.col, b.col)
+                        local after = line:sub(b.col + 1)
+                        vimcode.buffer.set_lines(buf, a.line - 1, a.line, {
+                            before .. "\"" .. middle .. "\"" .. after,
+                        })
+                    end)
+                    vimcode.feedkeys("g@")
+                end)
+                "#,
+            );
+            engine.buffer_mut().insert(0, "hello world\n");
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                before.contains("hello world"),
+                "precondition: the unwrapped word is on screen; screen:\n{before}"
+            );
+
+            driver.type_char('y');
+            driver.type_char('s');
+            driver.type_char('e'); // motion: to the end of "hello"
+            driver.render();
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("\"hello\" world"),
+                "ys + a motion must wrap that motion's text in quotes, via a \
+                 Lua operatorfunc reading '[/'] and vimcode.buffer.set_lines; \
+                 screen:\n{screen}"
+            );
+        }
     }
 }

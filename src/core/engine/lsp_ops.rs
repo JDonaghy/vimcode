@@ -128,11 +128,22 @@ impl Engine {
     pub(crate) fn lsp_did_open(&mut self, buffer_id: BufferId) {
         // Fire plugin "open" hook regardless of LSP enabled state
         if let Some(state) = self.buffer_manager.get(buffer_id) {
-            if let Some(path) = state.file_path.clone() {
+            let path = state.file_path.clone();
+            let ft = state.lsp_language_id.clone();
+            if let Some(path) = path {
                 let path_str = path.to_string_lossy().into_owned();
                 self.plugin_event("open", &path_str);
                 self.plugin_event("BufNew", &path_str);
                 self.plugin_event("BufEnter", &path_str);
+                // #1623: FileType, once the language id is known (set by
+                // `buffer_manager::open_file`'s path-based detection before
+                // this runs). Arg is the filetype name — the whole point of
+                // this event is `vimcode.on("FileType", function(ft) if ft
+                // == "rust" then ... end end)`-style per-language setup,
+                // matching vim's own `<amatch>` convention for it.
+                if let Some(ft) = ft {
+                    self.plugin_event("FileType", &ft);
+                }
             }
         }
         // Fire cursor_move so position-aware plugins (e.g. git-insights blame) annotate

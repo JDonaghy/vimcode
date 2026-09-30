@@ -654,12 +654,16 @@ impl Engine {
 
     /// Move focus to the next window in the current tab.
     pub fn focus_next_window(&mut self) {
+        let old = self.active_window_id();
         self.active_tab_mut().cycle_next_window();
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// Move focus to the previous window in the current tab.
     pub fn focus_prev_window(&mut self) {
+        let old = self.active_window_id();
         self.active_tab_mut().cycle_prev_window();
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// Move focus to a window in the given direction.
@@ -686,8 +690,10 @@ impl Engine {
                 }
             });
             if let Some(next_group) = adjacent {
+                let old = self.active_window_id();
                 self.prev_active_group = Some(self.active_group);
                 self.active_group = next_group;
+                self.fire_win_focus_change(old, self.active_window_id());
             } else {
                 // No adjacent group → signal overflow to TUI/GTK
                 self.window_nav_overflow = Some(forward);
@@ -740,10 +746,12 @@ impl Engine {
     /// (`Engine::mouse_click`); this is the first that needs the activation
     /// alone.
     pub(crate) fn activate_window(&mut self, window_id: WindowId) {
+        let old = self.active_window_id();
         self.focus_group_for_window(window_id);
         if self.windows.contains_key(&window_id) {
             self.active_tab_mut().focus_window(window_id);
         }
+        self.fire_win_focus_change(old, self.active_window_id());
     }
 
     /// The window occupying the screen's top-left (`last == false`) or
@@ -781,7 +789,9 @@ impl Engine {
     pub fn set_cursor_for_window(&mut self, window_id: WindowId, line: usize, col: usize) {
         // Make the window active
         if self.windows.contains_key(&window_id) {
+            let old = self.active_window_id();
             self.active_tab_mut().focus_window(window_id);
+            self.fire_win_focus_change(old, self.active_window_id());
 
             // Get buffer and clamp line
             let buffer = self.buffer();

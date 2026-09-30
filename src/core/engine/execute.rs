@@ -1765,6 +1765,9 @@ impl Engine {
                 } else {
                     self.message = format!("Theme: {canonical}");
                 }
+                // #1623: ColorScheme, arg = the new scheme name (matches
+                // vim's own `<amatch>` convention for this autocmd).
+                self.plugin_event("ColorScheme", canonical);
             } else {
                 let mut available: Vec<String> = builtin.iter().map(|s| s.to_string()).collect();
                 available.extend(custom);

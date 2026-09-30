@@ -58,12 +58,14 @@
 //!   either shape.
 
 use mlua::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use super::engine::Engine;
+use super::engine::{
+    expand_leader_tokens, parse_key_sequence, Engine, UserKeymap, UserKeymapAction,
+};
 
 /// A request from Lua to open a scratch buffer with content.
 pub struct ScratchBufferRequest {
@@ -474,6 +476,49 @@ pub struct PluginManager {
     pub help_bindings: HashMap<String, Vec<(String, String)>>,
     /// `vimcode.ui.register_view` registrations, by view name (#146).
     views: HashMap<String, StoredView>,
+    /// `vimcode.keymap.set` registrations harvested at load time (#1623),
+    /// leader-expanded and merged into `Engine::user_keymaps` by
+    /// `Engine::set_plugin_manager` (via [`Self::take_raw_lua_keymaps`]) so
+    /// they are consulted through the same before-built-ins path as a config
+    /// keymap.
+    raw_lua_keymaps: Vec<UserKeymap>,
+    /// `id -> callback` for every Lua keymap, assigned by
+    /// [`Self::register_lua_keymap`] — both the load-time entries above and
+    /// ones registered at runtime (from inside a callback, via
+    /// `vimcode.keymap.set(..., {buffer = ...})`, where only `&PluginManager`
+    /// is available). `RefCell` for that runtime case.
+    lua_keymap_callbacks: RefCell<HashMap<u64, LuaKeymapCallback>>,
+    /// Next id [`Self::register_lua_keymap`] hands out.
+    lua_keymap_next_id: Cell<u64>,
+    /// Per-buffer `BufWriteCmd`-style write-override callbacks (#1623),
+    /// registered via `vimcode.buffer.set_write_handler` and keyed by the
+    /// buffer's handle. `RefCell` for the same reason as
+    /// `lua_keymap_callbacks`: registration happens through the immediate
+    /// API, with only `&PluginManager` available.
+    write_handlers: RefCell<HashMap<i64, LuaRegistryKey>>,
+}
+
+/// A registered `vimcode.keymap.set` callback (#1623), looked up by the
+/// opaque id a [`UserKeymapAction::Lua`] carries.
+struct LuaKeymapCallback {
+    callback: LuaRegistryKey,
+    /// `opts.expr == true`: the callback's return value (a key-notation
+    /// string) is fed back through the normal key path instead of the
+    /// callback being expected to act directly.
+    expr: bool,
+}
+
+/// A `vimcode.keymap.set` call harvested during load-time script execution,
+/// before an id has been assigned (that needs `&mut PluginManager`, not
+/// available from inside the Lua closure that runs during `exec()`).
+struct PendingLuaKeymap {
+    mode: String,
+    /// Tokenized lhs, with a literal `"<leader>"` marker left unexpanded
+    /// (see [`PluginManager::raw_lua_keymaps`]'s doc comment).
+    keys: Vec<String>,
+    callback: LuaRegistryKey,
+    expr: bool,
+    desc: Option<String>,
 }
 
 /// Metadata about a single plugin file / directory.
@@ -605,6 +650,7 @@ struct PluginRegistrations {
     panels: Vec<PanelRegistration>,
     help_bindings: Vec<(String, Vec<(String, String)>)>,
     views: Vec<ViewRegistration>,
+    lua_keymaps: Vec<PendingLuaKeymap>,
 }
 
 // ─── PluginManager implementation ────────────────────────────────────────────
@@ -623,6 +669,10 @@ impl PluginManager {
             panels: HashMap::new(),
             help_bindings: HashMap::new(),
             views: HashMap::new(),
+            raw_lua_keymaps: Vec::new(),
+            lua_keymap_callbacks: RefCell::new(HashMap::new()),
+            lua_keymap_next_id: Cell::new(0),
+            write_handlers: RefCell::new(HashMap::new()),
         })
     }
 
@@ -718,6 +768,22 @@ impl PluginManager {
                         on_event: view.on_event,
                     },
                 );
+            }
+            // #1623: `vimcode.keymap.set` calls made at load time. Assign
+            // each an id now (needs `&mut self`, unavailable from inside the
+            // Lua closure that ran during `exec()` above) and stash the
+            // resulting `UserKeymap` for `Engine::set_plugin_manager` to
+            // leader-expand and merge into `user_keymaps`.
+            for pending in reg.lua_keymaps {
+                let id = self.register_lua_keymap(pending.callback, pending.expr);
+                self.raw_lua_keymaps.push(UserKeymap {
+                    mode: pending.mode,
+                    noremap: true,
+                    keys: pending.keys,
+                    action: UserKeymapAction::Lua(id),
+                    buffer: None,
+                    desc: pending.desc,
+                });
             }
         }
 
@@ -840,6 +906,126 @@ impl PluginManager {
             .remove_app_data::<PluginCallContext>()
             .unwrap_or_default();
         (true, ctx)
+    }
+
+    // ─── `vimcode.keymap.set` keymaps (#1623) ──────────────────────────────
+
+    /// Take every load-time `vimcode.keymap.set` registration, for
+    /// `Engine::set_plugin_manager` to leader-expand and merge into
+    /// `user_keymaps`. Leaves `raw_lua_keymaps` empty — called exactly once,
+    /// right after `PluginManager::new`'s plugin-loading is done.
+    pub(crate) fn take_raw_lua_keymaps(&mut self) -> Vec<UserKeymap> {
+        std::mem::take(&mut self.raw_lua_keymaps)
+    }
+
+    /// Register a Lua keymap callback and return the id a
+    /// [`UserKeymapAction::Lua`] carries. Called both at load-time harvest
+    /// (`&mut self`, coerces fine) and at runtime from the immediate API
+    /// (only `&PluginManager` available, hence the `RefCell`).
+    fn register_lua_keymap(&self, callback: LuaRegistryKey, expr: bool) -> u64 {
+        let id = self.lua_keymap_next_id.get();
+        self.lua_keymap_next_id.set(id + 1);
+        self.lua_keymap_callbacks
+            .borrow_mut()
+            .insert(id, LuaKeymapCallback { callback, expr });
+        id
+    }
+
+    /// Fire the Lua keymap `id` names. Returns `(expr_result, updated_ctx)`:
+    /// `expr_result` is `Some(keys)` only for an `expr` map whose callback
+    /// returned a string — the caller (`Engine::dispatch_lua_keymap`) feeds
+    /// it back through the normal key path, same as a `UserKeymapAction::Keys`
+    /// rhs.
+    pub fn call_lua_keymap(
+        &self,
+        id: u64,
+        ctx: PluginCallContext,
+    ) -> (Option<String>, PluginCallContext) {
+        self.lua.set_app_data(ctx);
+        // Look the function up and drop the borrow before calling it — the
+        // callback might itself call `vimcode.keymap.set` (a fresh
+        // registration), which needs to `borrow_mut()` the same `RefCell`.
+        let (f, expr) = {
+            let callbacks = self.lua_keymap_callbacks.borrow();
+            match callbacks.get(&id) {
+                Some(entry) => (
+                    self.lua.registry_value::<LuaFunction>(&entry.callback).ok(),
+                    entry.expr,
+                ),
+                None => (None, false),
+            }
+        };
+        let result = match f {
+            Some(f) if expr => f.call::<(), Option<String>>(()).unwrap_or(None),
+            Some(f) => {
+                let _ = f.call::<(), ()>(());
+                None
+            }
+            None => None,
+        };
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (result, ctx)
+    }
+
+    /// List every active keymap — config-defined and Lua-registered alike —
+    /// as `(mode, lhs, buffer_handle, desc)`, for `vimcode.keymap.list()`
+    /// (#1623), the enumeration a which-key style extension renders from.
+    /// `buffer_handle` is `None` for a global mapping.
+    pub(crate) fn list_keymaps_from(
+        keymaps: &[UserKeymap],
+    ) -> Vec<(String, String, Option<i64>, Option<String>)> {
+        keymaps
+            .iter()
+            .map(|km| {
+                (
+                    km.mode.clone(),
+                    km.keys.join(""),
+                    km.buffer.map(|b| b.0 as i64),
+                    km.desc.clone(),
+                )
+            })
+            .collect()
+    }
+
+    // ─── `vimcode.buffer.set_write_handler` (#1623) ────────────────────────
+
+    /// Register `callback` as the write-override for buffer `buf` (a handle,
+    /// already resolved — never `0`/"current").
+    pub(crate) fn set_write_handler(&self, buf: i64, callback: LuaRegistryKey) {
+        self.write_handlers.borrow_mut().insert(buf, callback);
+    }
+
+    /// Whether `buf` has a registered write-override.
+    pub fn has_write_handler(&self, buf: i64) -> bool {
+        self.write_handlers.borrow().contains_key(&buf)
+    }
+
+    /// Fire `buf`'s write-override callback with the buffer handle as its
+    /// sole argument. Returns `(found, updated_ctx)`.
+    pub fn call_write_handler(
+        &self,
+        buf: i64,
+        ctx: PluginCallContext,
+    ) -> (bool, PluginCallContext) {
+        self.lua.set_app_data(ctx);
+        let f = {
+            let handlers = self.write_handlers.borrow();
+            handlers
+                .get(&buf)
+                .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok())
+        };
+        let found = f.is_some();
+        if let Some(f) = f {
+            let _ = f.call::<i64, ()>(buf);
+        }
+        let ctx = self
+            .lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default();
+        (found, ctx)
     }
 
     // ─── Plugin-declared UI views (#146) ───────────────────────────────────
@@ -996,15 +1182,124 @@ impl PluginManager {
             })?,
         )?;
 
-        // vimcode.keymap(mode, key, fn)
-        vimcode.set(
-            "keymap",
-            lua.create_function(|lua, (mode, k, f): (String, String, LuaFunction)| {
-                let key = lua.create_registry_value(f)?;
-                if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
-                    reg.keymaps.insert((mode, k), key);
+        // vimcode.keymap(mode, key, fn) — legacy (unchanged, #1214-and-earlier
+        // back-compat): dispatched *after* built-ins, via
+        // `Engine::plugin_run_keymap` / `PluginManager::call_keymap`.
+        //
+        // vimcode.keymap.set(mode, lhs, fn, opts) / vimcode.keymap.list() —
+        // the new API (#1623): a table with a `__call` metamethod keeps the
+        // legacy call form working (`vimcode.keymap("v", "Q", fn)` calls the
+        // table, invoking `legacy_call` below with the table as the extra
+        // first argument Lua's `t(...)` sugar passes to `__call`).
+        //
+        // `.set` maps are consulted *before* built-ins (`Engine::user_keymaps`
+        // / `try_user_keymap`), which is what lets a plugin own a key with a
+        // built-in meaning (`s`, `ys`, `gc`, …). `opts` (all optional):
+        // `expr` (bool — the callback's return value is fed back through the
+        // key path instead of being expected to act directly), `buffer`
+        // (handle — restricts the map to one buffer; only meaningful when
+        // `.set` is called from inside a callback, where a live buffer
+        // exists), `desc` (string — surfaced by `.list()`).
+        let keymap_tbl = lua.create_table()?;
+        let keymap_mt = lua.create_table()?;
+        keymap_mt.set(
+            "__call",
+            lua.create_function(
+                |lua, (_self, mode, k, f): (LuaValue, String, String, LuaFunction)| {
+                    let key = lua.create_registry_value(f)?;
+                    if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
+                        reg.keymaps.insert((mode, k), key);
+                    }
+                    Ok(())
+                },
+            )?,
+        )?;
+        keymap_tbl.set_metatable(Some(keymap_mt));
+
+        keymap_tbl.set(
+            "set",
+            lua.create_function(
+                |lua, (mode, lhs, cb, opts): (String, String, LuaFunction, Option<LuaTable>)| {
+                    let expr = opts
+                        .as_ref()
+                        .and_then(|o| o.get::<_, bool>("expr").ok())
+                        .unwrap_or(false);
+                    let desc = opts.as_ref().and_then(|o| o.get::<_, String>("desc").ok());
+                    let buffer_handle: Option<i64> =
+                        opts.as_ref().and_then(|o| o.get::<_, i64>("buffer").ok());
+                    let keys = parse_key_sequence(&lhs);
+                    let key = lua.create_registry_value(cb)?;
+                    // Load time: accumulate for harvest, like every other
+                    // `vimcode.*` registration call. `buffer` is ignored here
+                    // — there is no live buffer yet to resolve it against; a
+                    // plugin wanting a buffer-local map registers it from
+                    // inside a callback instead (e.g. `BufEnter`), which
+                    // takes the runtime path below.
+                    if let Some(mut reg) = lua.app_data_mut::<PluginRegistrations>() {
+                        reg.lua_keymaps.push(PendingLuaKeymap {
+                            mode,
+                            keys,
+                            callback: key,
+                            expr,
+                            desc,
+                        });
+                        return Ok(());
+                    }
+                    // Runtime: resolve `buffer` against the live engine and
+                    // push directly onto `user_keymaps` — there is no later
+                    // harvest step for a call made after load time.
+                    live_engine("vimcode.keymap.set", move |e| {
+                        let buffer = buffer_handle.and_then(|h| e.plugin_api_resolve_buf(h));
+                        let leader = e.settings.leader.to_string();
+                        let keys = expand_leader_tokens(keys, &leader);
+                        if let Some(pm) = e.plugin_manager.clone() {
+                            let id = pm.register_lua_keymap(key, expr);
+                            e.user_keymaps.push(UserKeymap {
+                                mode,
+                                noremap: true,
+                                keys,
+                                action: UserKeymapAction::Lua(id),
+                                buffer,
+                                desc,
+                            });
+                        }
+                    })?;
+                    Ok(())
+                },
+            )?,
+        )?;
+
+        keymap_tbl.set(
+            "list",
+            lua.create_function(|lua, ()| {
+                let entries = live_engine("vimcode.keymap.list", |e| {
+                    PluginManager::list_keymaps_from(&e.user_keymaps)
+                })?;
+                let t = lua.create_table()?;
+                for (i, (mode, lhs, buf, desc)) in entries.into_iter().enumerate() {
+                    let row = lua.create_table()?;
+                    row.set("mode", mode)?;
+                    row.set("lhs", lhs)?;
+                    row.set("buffer", buf)?;
+                    row.set("desc", desc)?;
+                    t.set(i + 1, row)?;
                 }
-                Ok(())
+                Ok(t)
+            })?,
+        )?;
+
+        vimcode.set("keymap", keymap_tbl)?;
+
+        // vimcode.fire_event(name) — fire a plugin-defined "User" event
+        // (#1623), the escape hatch for a plugin to signal its own
+        // lifecycle points to other plugins: `vimcode.on("User", function(name)
+        // if name == "MyPluginReady" then ... end end)`.
+        vimcode.set(
+            "fire_event",
+            lua.create_function(|_, name: String| {
+                live_engine("vimcode.fire_event", move |e| {
+                    e.plugin_event("User", &name);
+                })
             })?,
         )?;
 
@@ -2553,6 +2848,29 @@ impl PluginManager {
                 }
                 live_engine("vimcode.buffer.create", move |e| {
                     e.plugin_api_create_buffer(scratch, name).0 as i64
+                })
+            })?,
+        )?;
+
+        // vimcode.buffer.set_write_handler(buf, fn) — claim `buf`'s writes
+        // (#1623, the oil.nvim `BufWriteCmd` shape): `:w`/`save()` on `buf`
+        // calls `fn(buf)` instead of writing to disk. `fn` is responsible for
+        // whatever persistence makes sense; the buffer is marked clean
+        // afterwards (there is no `vim.bo.modified`-equivalent setter yet for
+        // it to do that itself). Returns `false` when `buf` doesn't name a
+        // live buffer.
+        buffer.set(
+            "set_write_handler",
+            lua.create_function(|lua, (handle, cb): (i64, LuaFunction)| {
+                let key = lua.create_registry_value(cb)?;
+                live_engine("vimcode.buffer.set_write_handler", move |e| {
+                    match (e.plugin_api_resolve_buf(handle), e.plugin_manager.clone()) {
+                        (Some(buf), Some(pm)) => {
+                            pm.set_write_handler(buf.0 as i64, key);
+                            true
+                        }
+                        _ => false,
+                    }
                 })
             })?,
         )?;
