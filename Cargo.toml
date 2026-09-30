@@ -416,6 +416,19 @@ image = { version = "0.25.10", default-features = false, features = ["png"] }
 # time.
 [target.'cfg(windows)'.dev-dependencies]
 portable-pty = "=0.9.0"
+# #1636: `tests/conpty_activity_bar_click.rs` — the real-ConPTY activity-bar
+# click regression test. Same target-gating rationale as `portable-pty`
+# above (only meaningful as a real Win32 ConPTY host). `vt100` parses the
+# raw ANSI byte stream that test captures back into a screen model (cell
+# contents + position) so it can locate each activity-bar icon's actual
+# rendered column/row and send a real SGR mouse click at that exact spot,
+# rather than hand-rolling a second ANSI parser — quadraui's own
+# `tui::vt_testing`/`TuiVtDriver` already depends on this exact crate for
+# the same reason (see that module's doc). Pinned to `=0.16.2`, the version
+# already resolved in `Cargo.lock` via quadraui's `terminal` feature (always
+# enabled — see the `quadraui = {...}` dependency line above), so this adds
+# no new crate version to the graph.
+vt100 = "=0.16.2"
 
 [build-dependencies]
 cc = "1.0"
