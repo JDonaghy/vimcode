@@ -6415,3 +6415,680 @@ fn close_picker_cancelling_plugin_fires_on_cancel_and_releases_registration() {
         "dismissing must release the picker's registration, not leak it"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Plugin API — Phase 2 (#1632): vimcode.http (async, curl-subprocess-backed,
+// callback via poll_idle), vimcode.json, plugin-scoped storage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Local loopback HTTP fixture server ────────────────────────────────────
+//
+// `vimcode.http.request` genuinely shells out to `curl` on a background
+// thread (see `execute::spawn_http_request`), so exercising it end-to-end
+// needs a real socket on the other end — 127.0.0.1-only, an ephemeral port,
+// nothing that reaches an external host. Same shape as `registry_liveness.rs`'s
+// `spawn_head_fixture_server`, generalized to method/path/headers/body in and
+// status/headers/body out so one server serves every scenario below.
+
+use std::io::{Read as _, Write as _};
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Read one HTTP/1.1 request off `stream`: method, path, headers, and the
+/// body (drained per `Content-Length`, defaulting to none).
+fn read_http_fixture_request(
+    stream: &mut std::net::TcpStream,
+) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+        if buf.len() > 1_000_000 {
+            return None;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            }
+            headers.push((k, v));
+        }
+    }
+    let mut body = buf[header_end + 4..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+    Some((method, path, headers, body))
+}
+
+fn http_fixture_reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    }
+}
+
+/// Bind an ephemeral loopback port and serve up to `expected_requests`
+/// connections, each answered by `handler(method, path, headers, body) ->
+/// (status, headers, body)`. Returns the server's base URL immediately; the
+/// server itself runs on a detached background thread bounded by a 30s
+/// deadline (never joined — a test that cancels before the server responds
+/// deliberately leaves it to finish out its own delay in the background,
+/// same as `spawn_head_fixture_server`'s comment on why a wall-clock cap
+/// matters more than a joinable handle here).
+fn spawn_http_fixture_server(
+    expected_requests: usize,
+    handler: impl Fn(&str, &str, &[(String, String)], &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>)
+        + Send
+        + 'static,
+) -> String {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+    listener
+        .set_nonblocking(true)
+        .expect("set fixture listener nonblocking");
+    let addr = listener.local_addr().expect("resolve bound local_addr");
+    let base_url = format!("http://{addr}");
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut served = 0;
+        while served < expected_requests && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                Err(_) => break,
+            };
+            let _ = stream.set_nonblocking(false);
+            let Some((method, path, headers, body)) = read_http_fixture_request(&mut stream) else {
+                continue;
+            };
+            let (status, resp_headers, resp_body) = handler(&method, &path, &headers, &body);
+            let mut resp = format!(
+                "HTTP/1.1 {status} {}\r\n",
+                http_fixture_reason_phrase(status)
+            );
+            for (k, v) in &resp_headers {
+                resp.push_str(&format!("{k}: {v}\r\n"));
+            }
+            resp.push_str(&format!("Content-Length: {}\r\n", resp_body.len()));
+            resp.push_str("Connection: close\r\n\r\n");
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&resp_body);
+            let _ = stream.flush();
+            served += 1;
+        }
+    });
+    base_url
+}
+
+// ─── `vimcode.http.request` ─────────────────────────────────────────────────
+
+#[test]
+fn http_request_get_returns_status_body_headers_and_elapsed_ms() {
+    let base_url = spawn_http_fixture_server(1, |method, path, _headers, _body| {
+        assert_eq!(method, "GET");
+        assert_eq!(path, "/hello");
+        (
+            200,
+            vec![("X-Foo".to_string(), "bar".to_string())],
+            b"hello world".to_vec(),
+        )
+    });
+
+    let mut e = engine_with_plugin(
+        "",
+        "http_get_1632",
+        &format!(
+            r#"
+            _G.done = false
+            vimcode.command("DoRequest", function(_)
+                vimcode.http.request({{ method = "GET", url = "{base_url}/hello" }}, function(resp)
+                    _G.status = resp.status
+                    _G.body = resp.body
+                    _G.foo = resp.headers["X-Foo"]
+                    _G.elapsed_is_number = type(resp.elapsed_ms) == "number"
+                    _G.has_error = resp.error ~= nil
+                    _G.done = true
+                end)
+            end)
+            vimcode.command("ReadResult", function(_)
+                vimcode.message(table.concat({{
+                    tostring(_G.done), tostring(_G.status), _G.body or "", _G.foo or "",
+                    tostring(_G.elapsed_is_number), tostring(_G.has_error),
+                }}, "|"))
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "DoRequest");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadResult");
+        e.message.starts_with("true|")
+    });
+    assert!(
+        reached,
+        "the response callback must eventually fire; last message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.message, "true|200|hello world|bar|true|false",
+        "status/body/headers/elapsed_ms must all be delivered, and no error \
+         field on a successful response"
+    );
+}
+
+#[test]
+fn http_request_post_sends_headers_and_body_the_server_receives() {
+    let base_url = spawn_http_fixture_server(1, |method, path, headers, body| {
+        assert_eq!(method, "POST");
+        assert_eq!(path, "/echo");
+        let got_header = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("x-plugin"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let resp = format!("{got_header}|{}", String::from_utf8_lossy(body));
+        (200, vec![], resp.into_bytes())
+    });
+
+    let mut e = engine_with_plugin(
+        "",
+        "http_post_1632",
+        &format!(
+            r#"
+            _G.done = false
+            vimcode.command("DoRequest", function(_)
+                vimcode.http.request({{
+                    method = "POST",
+                    url = "{base_url}/echo",
+                    headers = {{ ["X-Plugin"] = "vc1632" }},
+                    body = "payload-data",
+                }}, function(resp)
+                    _G.body = resp.body
+                    _G.done = true
+                end)
+            end)
+            vimcode.command("ReadResult", function(_)
+                vimcode.message(tostring(_G.done) .. "|" .. (_G.body or ""))
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "DoRequest");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadResult");
+        e.message.starts_with("true|")
+    });
+    assert!(
+        reached,
+        "response must arrive; last message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.message, "true|vc1632|payload-data",
+        "the server must receive exactly the header and body the plugin sent"
+    );
+}
+
+#[test]
+fn http_request_timeout_surfaces_as_an_error_not_a_response() {
+    let base_url = spawn_http_fixture_server(1, |_, _, _, _| {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        (200, vec![], b"too-late".to_vec())
+    });
+
+    let mut e = engine_with_plugin(
+        "",
+        "http_timeout_1632",
+        &format!(
+            r#"
+            _G.done = false
+            vimcode.command("DoRequest", function(_)
+                vimcode.http.request({{
+                    method = "GET", url = "{base_url}/slow", timeout_ms = 100,
+                }}, function(resp)
+                    _G.has_error = resp.error ~= nil and resp.error ~= ""
+                    _G.has_status = resp.status ~= nil
+                    _G.done = true
+                end)
+            end)
+            vimcode.command("ReadResult", function(_)
+                vimcode.message(table.concat({{
+                    tostring(_G.done), tostring(_G.has_error), tostring(_G.has_status),
+                }}, "|"))
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "DoRequest");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadResult");
+        e.message.starts_with("true|")
+    });
+    assert!(
+        reached,
+        "the timeout must resolve; last message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.message, "true|true|false",
+        "a 100ms timeout against a handler that sleeps 800ms must deliver \
+         {{error=...}}, never a {{status=...}} response"
+    );
+}
+
+/// `cancel()` must not merely drop `Engine`'s bookkeeping for the handle
+/// (which on its own would already stop the callback from firing, since
+/// `poll_plugin_http` only drains ids still present in the map) — it must
+/// actually kill the `curl` child. This test's assertion has to be sensitive
+/// to *that* distinction specifically, or reverting the `child.kill()` call
+/// inside `Engine::plugin_api_http_cancel` back to a bookkeeping-only removal
+/// would leave it green: a fixture server that delays its response and then
+/// checks whether its delayed write to the peer socket still succeeds is
+/// what tells the two apart — a killed `curl` process has already closed its
+/// end of the connection, so the write fails; a merely-forgotten one is
+/// still there to receive it.
+///
+/// RED-verified: with `Engine::plugin_api_http_cancel`'s `child.kill()` call
+/// removed (leaving only the map removal), this fails — the fixture's
+/// delayed write to the still-open socket succeeds.
+#[test]
+fn http_request_cancel_kills_the_curl_child_not_just_the_handle() {
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral loopback port");
+    let addr = listener.local_addr().expect("resolve bound local_addr");
+    let base_url = format!("http://{addr}");
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            // `curl` was killed before it ever connected — also proof the
+            // process is gone, so this counts as "write did not succeed".
+            let _ = tx.send(false);
+            return;
+        };
+        let _ = read_http_fixture_request(&mut stream);
+        // Give `cancel()` (called immediately after `Start`, well before
+        // this elapses) plenty of time to have already killed the process.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let body = b"too-late";
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let write_ok = stream.write_all(resp.as_bytes()).is_ok() && stream.write_all(body).is_ok();
+        let _ = tx.send(write_ok);
+    });
+
+    let mut e = engine_with_plugin(
+        "",
+        "http_cancel_kill_1632",
+        &format!(
+            r#"
+            _G.done = false
+            vimcode.command("Start", function(_)
+                _G.handle = vimcode.http.request({{
+                    method = "GET", url = "{base_url}/never", timeout_ms = 30000,
+                }}, function(_resp) _G.done = true end)
+            end)
+            vimcode.command("Cancel", function(_)
+                _G.cancel_result = _G.handle.cancel()
+            end)
+            vimcode.command("Read", function(_)
+                vimcode.message(tostring(_G.done) .. "|" .. tostring(_G.cancel_result))
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "Start");
+    exec(&mut e, "Cancel");
+    exec(&mut e, "Read");
+    assert_eq!(
+        e.message, "false|true",
+        "cancel() must report success and the callback must not have fired yet"
+    );
+
+    let write_ok = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(false);
+    assert!(
+        !write_ok,
+        "the curl child must actually be killed on cancel() — the fixture \
+         server's delayed write to the connection succeeded, meaning the \
+         process was still alive and reading on the other end"
+    );
+
+    // The callback still must never fire, however long we keep polling.
+    for _ in 0..25 {
+        e.poll_idle();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    exec(&mut e, "Read");
+    assert_eq!(
+        e.message, "false|true",
+        "no response callback may fire for a cancelled request, ever"
+    );
+}
+
+#[test]
+fn http_response_callback_edits_buffer_via_immediate_api() {
+    let base_url =
+        spawn_http_fixture_server(1, |_, _, _, _| (200, vec![], b"FROM_SERVER_1632".to_vec()));
+
+    let mut e = engine_with_plugin(
+        "",
+        "http_edit_buffer_1632",
+        &format!(
+            r#"
+            vimcode.command("DoRequest", function(_)
+                vimcode.http.request({{ method = "GET", url = "{base_url}/data" }}, function(resp)
+                    local b = vimcode.buffer.create({{ scratch = true, name = "ZQ1632HTTP" }})
+                    vimcode.buffer.set_lines(b, 0, -1, {{ resp.body }})
+                    vimcode.window.set_buf(0, b)
+                end)
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "DoRequest");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        e.buffer().to_string().contains("FROM_SERVER_1632")
+    });
+    assert!(
+        reached,
+        "the HTTP response callback must be able to use the immediate \
+         vimcode.buffer API; buffer: {:?}",
+        e.buffer().to_string()
+    );
+}
+
+// ─── `vimcode.json` ──────────────────────────────────────────────────────────
+
+#[test]
+fn json_encode_decode_round_trips_and_distinguishes_empty_array_from_empty_object() {
+    let mut e = engine_with_plugin(
+        "",
+        "json_roundtrip_1632",
+        r#"
+        vimcode.command("RunJson", function(_)
+            local arr = vimcode.json.encode({1, 2, 3})
+            local obj = vimcode.json.encode({foo = "bar"})
+            local empty_arr = vimcode.json.encode({})
+            local empty_obj = vimcode.json.encode(vimcode.json.empty_object)
+            local decoded = vimcode.json.decode('{"x":1,"y":[1,2,3],"z":null}')
+            local roundtrip_empty_obj = vimcode.json.encode(vimcode.json.decode("{}"))
+            local roundtrip_empty_arr = vimcode.json.encode(vimcode.json.decode("[]"))
+            local is_null = decoded.z == vimcode.json.null
+            local ok, err = pcall(vimcode.json.decode, "not json")
+            local err_mentions_decode = tostring(err):find("vimcode.json.decode", 1, true) ~= nil
+            vimcode.message(table.concat({
+                arr, obj, empty_arr, empty_obj,
+                tostring(decoded.x), tostring(decoded.y[2]),
+                roundtrip_empty_obj, roundtrip_empty_arr,
+                tostring(is_null), tostring(ok), tostring(err_mentions_decode),
+            }, "|"))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunJson");
+    assert_eq!(
+        e.message, "[1,2,3]|{\"foo\":\"bar\"}|[]|{}|1|2|{}|[]|true|false|true",
+        "arrays/objects must round-trip, an unmarked empty table must default \
+         to '[]', vimcode.json.empty_object must force '{{}}', JSON null must \
+         decode to the vimcode.json.null sentinel, and a decode error must be \
+         pcall-catchable with a message naming the failing function"
+    );
+}
+
+#[test]
+fn json_encode_pretty_option_adds_newlines() {
+    let mut e = engine_with_plugin(
+        "",
+        "json_pretty_1632",
+        r#"
+        vimcode.command("RunJson", function(_)
+            local compact = vimcode.json.encode({a = 1})
+            local pretty = vimcode.json.encode({a = 1}, { pretty = true })
+            vimcode.message(tostring(compact:find("\n") == nil) .. "|"
+                .. tostring(pretty:find("\n") ~= nil))
+        end)
+        "#,
+    );
+    exec(&mut e, "RunJson");
+    assert_eq!(
+        e.message, "true|true",
+        "pretty=false (default) must be single-line; pretty=true must contain newlines"
+    );
+}
+
+// ─── plugin-scoped storage ───────────────────────────────────────────────────
+
+#[test]
+fn storage_persists_across_plugin_reload() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_storage_persist_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let lua_code = r#"
+        vimcode.command("Save", function(_)
+            vimcode.storage.set("count", 42)
+        end)
+        vimcode.command("Load", function(_)
+            vimcode.message(tostring(vimcode.storage.get("count")))
+        end)
+    "#;
+    let mut e = engine_with_plugin("", "storage_persist_1632", lua_code);
+    exec(&mut e, "Save");
+
+    // Simulate a plugin reload: a fresh `PluginManager`, loaded from the
+    // exact same plugin file `engine_with_plugin` wrote, installed in place
+    // of the old one — same shape as #1624's `manager_swap_...` tests.
+    let dir = std::env::temp_dir().join("vc_plugin_api_storage_persist_1632");
+    let mut mgr2 = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
+    mgr2.load_plugins_dir(&dir, &[]);
+    e.set_plugin_manager(mgr2);
+
+    exec(&mut e, "Load");
+    assert_eq!(
+        e.message, "42",
+        "storage must survive a plugin manager reload — it is disk-backed, \
+         not held only in the (replaced) PluginManager"
+    );
+}
+
+#[test]
+fn storage_namespaces_by_plugin_so_plugins_cannot_read_each_others_data() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_storage_ns_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let dir =
+        std::env::temp_dir().join(format!("vc_plugin_storage_ns_1632_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Both plugins use the *same* key name deliberately — the point of
+    // namespacing is that this doesn't collide.
+    std::fs::write(
+        dir.join("ns_a.lua"),
+        r#"
+        vimcode.command("SetA", function(_) vimcode.storage.set("secret", "A-VALUE") end)
+        vimcode.command("ReadA", function(_) vimcode.message(tostring(vimcode.storage.get("secret"))) end)
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ns_b.lua"),
+        r#"
+        vimcode.command("SetB", function(_) vimcode.storage.set("secret", "B-VALUE") end)
+        vimcode.command("ReadB", function(_) vimcode.message(tostring(vimcode.storage.get("secret"))) end)
+        "#,
+    )
+    .unwrap();
+
+    let mut e = engine_with("");
+    let mut mgr = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
+    mgr.load_plugins_dir(&dir, &[]);
+    e.set_plugin_manager(mgr);
+
+    exec(&mut e, "SetA");
+    exec(&mut e, "SetB");
+    exec(&mut e, "ReadA");
+    assert_eq!(
+        e.message, "A-VALUE",
+        "plugin A must read back its own value for a key plugin B also used"
+    );
+    exec(&mut e, "ReadB");
+    assert_eq!(
+        e.message, "B-VALUE",
+        "plugin B must read back its own value, unclobbered by plugin A's \
+         write to the same key name"
+    );
+}
+
+#[test]
+fn storage_workspace_scope_is_independent_of_global_scope() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_storage_scope_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let mut e = engine_with_plugin(
+        "",
+        "storage_scope_1632",
+        r#"
+        vimcode.command("SetGlobal", function(_) vimcode.storage.set("k", "global-value") end)
+        vimcode.command("SetWorkspace", function(_)
+            vimcode.storage.set("k", "workspace-value", { workspace = true })
+        end)
+        vimcode.command("ReadGlobal", function(_)
+            vimcode.message(tostring(vimcode.storage.get("k")))
+        end)
+        vimcode.command("ReadWorkspace", function(_)
+            vimcode.message(tostring(vimcode.storage.get("k", { workspace = true })))
+        end)
+        "#,
+    );
+    exec(&mut e, "SetGlobal");
+    exec(&mut e, "SetWorkspace");
+    exec(&mut e, "ReadGlobal");
+    assert_eq!(
+        e.message, "global-value",
+        "the global scope must be unaffected by a workspace-scoped write"
+    );
+    exec(&mut e, "ReadWorkspace");
+    assert_eq!(
+        e.message, "workspace-value",
+        "the workspace scope must be unaffected by the global write"
+    );
+}
+
+#[test]
+fn storage_delete_and_keys_reflect_current_contents() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_storage_keys_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let mut e = engine_with_plugin(
+        "",
+        "storage_keys_1632",
+        r#"
+        vimcode.command("Populate", function(_)
+            vimcode.storage.set("a", 1)
+            vimcode.storage.set("b", 2)
+        end)
+        vimcode.command("ReadKeys", function(_)
+            vimcode.message(table.concat(vimcode.storage.keys(), ","))
+        end)
+        vimcode.command("DeleteA", function(_)
+            _G.first_delete = vimcode.storage.delete("a")
+            _G.second_delete = vimcode.storage.delete("a")
+        end)
+        vimcode.command("ReadDeleteResult", function(_)
+            vimcode.message(tostring(_G.first_delete) .. "|" .. tostring(_G.second_delete)
+                .. "|" .. tostring(vimcode.storage.get("a")))
+        end)
+        "#,
+    );
+    exec(&mut e, "Populate");
+    exec(&mut e, "ReadKeys");
+    assert_eq!(
+        e.message, "a,b",
+        "keys() must list every stored key, sorted"
+    );
+
+    exec(&mut e, "DeleteA");
+    exec(&mut e, "ReadDeleteResult");
+    assert_eq!(
+        e.message, "true|false|nil",
+        "delete() must report true the first time, false when the key is \
+         already gone, and the value must read back as nil afterwards"
+    );
+
+    exec(&mut e, "ReadKeys");
+    assert_eq!(
+        e.message, "b",
+        "the deleted key must no longer appear in keys()"
+    );
+}

@@ -654,6 +654,11 @@ pub struct PluginManager {
     /// any latent registry-growth cost from that pattern far more visible
     /// than it was for a handful of timer/spawn callbacks (#1630 review).
     pickers: RefCell<HashMap<u64, PluginPicker>>,
+    /// `id -> callback` for every in-flight `vimcode.http.request` handle
+    /// (#1632). The child process/receiver live on `Engine::
+    /// plugin_http_requests`, keyed by the same id — mirrors `spawn_callbacks`
+    /// exactly, minus the "three callbacks" shape (HTTP has exactly one).
+    http_callbacks: RefCell<HashMap<u64, LuaRegistryKey>>,
 }
 
 /// A `vimcode.loop.spawn` handle's registered callbacks (#1624). Any of the
@@ -968,6 +973,292 @@ fn make_picker_handle(lua: &Lua, id: u64) -> LuaResult<LuaTable<'_>> {
     Ok(handle)
 }
 
+// ─── `vimcode.json` (#1632) ───────────────────────────────────────────────────
+//
+// Hand-rolled `LuaValue <-> serde_json::Value` conversion rather than mlua's
+// optional `serialize` feature (as `lua_table_to_view` above already does for
+// the same reason): the errors are the ones a plugin author needs, the empty-
+// table array/object ambiguity below needs an explicit decision this repo
+// controls, and the parse can't be perturbed by an `mlua` feature flag.
+//
+// Lua has one table type for both JSON arrays and objects, so an *empty*
+// table is genuinely ambiguous — `vimcode.json.encode({})` defaults to `"[]"`
+// (Lua's `{}` is idiomatically "empty list" far more often than "empty
+// object" in practice), and `vimcode.json.empty_object` is a sentinel value a
+// plugin can pass instead (in place of, or as a table field's value) to force
+// `"{}"`. `vimcode.json.null` is the parallel sentinel for a JSON `null`
+// living *inside* a table — a bare Lua `nil` can't be stored as a table value
+// at all (it deletes the key), so a real `nil`/`null` distinction needs its
+// own marker, the same problem `vim.NIL` solves in Neovim. Both sentinels are
+// plain empty tables created once per `Lua` and compared by reference
+// (`Table`'s `PartialEq` is `rawequal`) — nothing else in this Lua state can
+// construct a table `==` to them.
+
+const JSON_NULL_REGISTRY_KEY: &str = "vimcode_json_null_sentinel";
+const JSON_EMPTY_OBJECT_REGISTRY_KEY: &str = "vimcode_json_empty_object_sentinel";
+
+/// Convert a Lua value into a [`serde_json::Value`], honouring the `null`/
+/// `empty_object` sentinels described above.
+fn lua_value_to_json(lua: &Lua, v: LuaValue) -> LuaResult<serde_json::Value> {
+    if let LuaValue::Table(ref t) = v {
+        if let Ok(null_sentinel) = lua.named_registry_value::<LuaTable>(JSON_NULL_REGISTRY_KEY) {
+            if *t == null_sentinel {
+                return Ok(serde_json::Value::Null);
+            }
+        }
+        if let Ok(empty_obj) = lua.named_registry_value::<LuaTable>(JSON_EMPTY_OBJECT_REGISTRY_KEY)
+        {
+            if *t == empty_obj {
+                return Ok(serde_json::Value::Object(serde_json::Map::new()));
+            }
+        }
+    }
+    match v {
+        LuaValue::Nil => Ok(serde_json::Value::Null),
+        LuaValue::Boolean(b) => Ok(serde_json::Value::Bool(b)),
+        LuaValue::Integer(i) => Ok(serde_json::Value::Number(i.into())),
+        LuaValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(LuaError::RuntimeError(
+                    "vimcode.json.encode: cannot encode NaN/Infinity".to_string(),
+                ));
+            }
+            Ok(serde_json::Number::from_f64(n)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null))
+        }
+        LuaValue::String(s) => Ok(serde_json::Value::String(s.to_str()?.to_string())),
+        LuaValue::Table(t) => json_encode_table(lua, &t),
+        other => Err(LuaError::RuntimeError(format!(
+            "vimcode.json.encode: cannot encode a Lua {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Encode a plain (non-sentinel) Lua table: a 1..n contiguous integer-keyed
+/// table becomes a JSON array, anything else (including an empty table —
+/// see the module doc above) becomes a JSON object.
+fn json_encode_table(lua: &Lua, t: &LuaTable) -> LuaResult<serde_json::Value> {
+    let len = t.raw_len();
+    if len > 0 {
+        let mut is_array = true;
+        for pair in t.clone().pairs::<LuaValue, LuaValue>() {
+            let (k, _) = pair?;
+            let in_range = match k {
+                LuaValue::Integer(i) => i >= 1 && (i as usize) <= len,
+                LuaValue::Number(n) => n.fract() == 0.0 && n >= 1.0 && (n as usize) <= len,
+                _ => false,
+            };
+            if !in_range {
+                is_array = false;
+                break;
+            }
+        }
+        if is_array {
+            let mut items = Vec::with_capacity(len);
+            for i in 1..=len {
+                let v: LuaValue = t.get(i)?;
+                items.push(lua_value_to_json(lua, v)?);
+            }
+            return Ok(serde_json::Value::Array(items));
+        }
+    }
+    if len == 0 && t.clone().pairs::<LuaValue, LuaValue>().next().is_none() {
+        // Ambiguous empty table, no explicit sentinel — see module doc.
+        return Ok(serde_json::Value::Array(Vec::new()));
+    }
+    let mut map = serde_json::Map::new();
+    for pair in t.clone().pairs::<LuaValue, LuaValue>() {
+        let (k, v) = pair?;
+        let key = match k {
+            LuaValue::String(s) => s.to_str()?.to_string(),
+            LuaValue::Integer(i) => i.to_string(),
+            LuaValue::Number(n) => n.to_string(),
+            other => {
+                return Err(LuaError::RuntimeError(format!(
+                    "vimcode.json.encode: unsupported table key type {}",
+                    other.type_name()
+                )))
+            }
+        };
+        map.insert(key, lua_value_to_json(lua, v)?);
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+/// Convert a [`serde_json::Value`] into a Lua value, the inverse of
+/// [`lua_value_to_json`] (including the `null`/`empty_object` sentinels, so
+/// `encode(decode(s))` round-trips `"{}"` and `"null"` back to themselves).
+fn json_to_lua_value<'lua>(lua: &'lua Lua, v: &serde_json::Value) -> LuaResult<LuaValue<'lua>> {
+    match v {
+        serde_json::Value::Null => Ok(LuaValue::Table(
+            lua.named_registry_value::<LuaTable>(JSON_NULL_REGISTRY_KEY)?,
+        )),
+        serde_json::Value::Bool(b) => Ok(LuaValue::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(LuaValue::Integer(i))
+            } else {
+                Ok(LuaValue::Number(n.as_f64().unwrap_or(0.0)))
+            }
+        }
+        serde_json::Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
+        serde_json::Value::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                t.set(i + 1, json_to_lua_value(lua, item)?)?;
+            }
+            Ok(LuaValue::Table(t))
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return Ok(LuaValue::Table(lua.named_registry_value::<LuaTable>(
+                    JSON_EMPTY_OBJECT_REGISTRY_KEY,
+                )?));
+            }
+            let t = lua.create_table()?;
+            for (k, val) in map {
+                t.set(k.clone(), json_to_lua_value(lua, val)?)?;
+            }
+            Ok(LuaValue::Table(t))
+        }
+    }
+}
+
+// ─── Plugin-scoped storage (#1632) ────────────────────────────────────────────
+//
+// One JSON file per (plugin, scope): `<vimcode data dir>/plugin_storage/
+// <plugin>/store.json` for the global scope, `.../<plugin>/workspaces/
+// <hash of cwd>/store.json` for the per-workspace scope (`{workspace = true}`
+// in `get`/`set`/`delete`/`keys`'s optional `opts`). Values round-trip through
+// the exact same `lua_value_to_json`/`json_to_lua_value` `vimcode.json` uses,
+// so "values are JSON-serialisable" is enforced for free, with the same
+// errors. Writes go through a temp-file-then-rename so a crash mid-write
+// can't leave a torn/partial file — `std::fs::rename` replaces the
+// destination atomically on every platform vimcode ships for (Windows'
+// `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` behind `std::fs::rename` included).
+//
+// Namespacing (`plugins can't read each other's data`) is resolved from the
+// Lua *call stack*, not a separately-tracked "current plugin" field: see
+// [`current_plugin_chunk_name`]'s doc for why that works even from inside a
+// callback fired long after load time, with no changes needed to any of
+// `PluginManager`'s existing registration paths.
+
+/// Identify which plugin's Lua chunk is calling right now by walking the
+/// interpreter's call stack (`Lua::inspect_stack`) up from the native
+/// `vimcode.storage.*` function currently executing (level 0) until a Lua
+/// (or "main" chunk) frame is found. That frame's `source` is exactly the
+/// chunk name `PluginManager::load_one_plugin` set via `.set_name(name)` —
+/// the plugin's own file/directory stem — because a Lua closure's `source`
+/// is fixed at the point it was *defined*, not where/when it is *called*.
+///
+/// This is what makes storage calls "just work" identically whether they
+/// happen at top-level load time (no `PluginCallContext`/live engine exists
+/// yet) or from inside a command/timer/spawn/http callback fired much later:
+/// no separate bookkeeping is needed across any of `PluginManager`'s existing
+/// registration kinds, because the answer is derived fresh from wherever the
+/// call is actually coming from.
+fn current_plugin_chunk_name(lua: &Lua) -> Option<String> {
+    for level in 1..16 {
+        let dbg = lua.inspect_stack(level)?;
+        let src = dbg.source();
+        if src.what == "Lua" || src.what == "main" {
+            return src.source.map(|s| s.into_owned());
+        }
+    }
+    None
+}
+
+fn storage_no_plugin_err() -> LuaError {
+    LuaError::RuntimeError("vimcode.storage: must be called from plugin code".to_string())
+}
+
+fn storage_opt_workspace(opts: &Option<LuaTable>) -> bool {
+    opts.as_ref()
+        .and_then(|o| o.get::<_, bool>("workspace").ok())
+        .unwrap_or(false)
+}
+
+/// Turn an arbitrary plugin name into a safe single path component —
+/// defensive only (plugin names already come from `file_stem()`/`file_name()`
+/// in `load_plugins_dir`, so they can't contain a path separator in
+/// practice), but cheap enough to apply unconditionally rather than trust it.
+fn sanitize_storage_component(name: &str) -> String {
+    if name.is_empty() {
+        return "_".to_string();
+    }
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A short, filesystem-safe key derived from the current working directory,
+/// used to shard `{workspace = true}` storage by workspace. `std::env::
+/// current_dir()` (not `Engine::cwd`) so this resolves identically whether
+/// called at plugin-load time (no live engine loaned yet) or from any later
+/// callback — vimcode's own `:cd` already calls `std::env::set_current_dir`
+/// (`Engine::buffers.rs`), so the two never disagree in practice.
+fn workspace_storage_key() -> String {
+    use sha2::{Digest, Sha256};
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let digest = Sha256::digest(cwd.to_string_lossy().as_bytes());
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+}
+
+fn plugin_storage_path(plugin: &str, workspace: bool) -> PathBuf {
+    let base = crate::core::paths::vimcode_data_dir()
+        .join("plugin_storage")
+        .join(sanitize_storage_component(plugin));
+    if workspace {
+        base.join("workspaces")
+            .join(workspace_storage_key())
+            .join("store.json")
+    } else {
+        base.join("store.json")
+    }
+}
+
+/// Read `path`'s JSON object into a map. Missing file, unreadable file, or a
+/// file that isn't a JSON object (corrupt/foreign content) all fall back to
+/// an empty map rather than erroring — `get`/`keys` degrade to "nothing
+/// stored yet", and a subsequent `set` self-heals the file on its next write.
+fn load_storage_map(path: &Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Write `map` to `path` atomically: serialize to a sibling `.tmp` file, then
+/// `rename` it over `path`. The rename is what makes this atomic — a reader
+/// (or a crash) never observes a partially-written file.
+fn save_storage_map(
+    path: &Path,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec(map).map_err(std::io::Error::other)?;
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, &data)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 // ─── PluginManager implementation ────────────────────────────────────────────
 
 impl PluginManager {
@@ -992,6 +1283,7 @@ impl PluginManager {
             spawn_callbacks: RefCell::new(HashMap::new()),
             next_handle_id: Cell::new(0),
             pickers: RefCell::new(HashMap::new()),
+            http_callbacks: RefCell::new(HashMap::new()),
         })
     }
 
@@ -1482,6 +1774,62 @@ impl PluginManager {
             .unwrap_or_default()
     }
 
+    // ─── `vimcode.http` (#1632) ─────────────────────────────────────────────
+
+    /// Register a `vimcode.http.request` handle's callback and return its id.
+    pub(crate) fn register_http_callback(&self, callback: LuaRegistryKey) -> u64 {
+        let id = self.next_handle_id();
+        self.http_callbacks.borrow_mut().insert(id, callback);
+        id
+    }
+
+    /// Drop a request's stored callback (on response, on `cancel()`, or when
+    /// the owning plugin is unloaded).
+    pub(crate) fn remove_http_callback(&self, id: u64) {
+        self.http_callbacks.borrow_mut().remove(&id);
+    }
+
+    /// Fire request `id`'s callback with its result, converted to the
+    /// `{status, headers, body, elapsed_ms}` / `{error}` table shape the
+    /// issue's `vimcode.http.request` callback signature promises.
+    pub(crate) fn call_http_response(
+        &self,
+        id: u64,
+        result: crate::core::engine::execute::HttpResult,
+        ctx: PluginCallContext,
+    ) -> PluginCallContext {
+        self.lua.set_app_data(ctx);
+        let f = self
+            .http_callbacks
+            .borrow()
+            .get(&id)
+            .and_then(|k| self.lua.registry_value::<LuaFunction>(k).ok());
+        if let Some(f) = f {
+            if let Ok(resp_table) = self.lua.create_table() {
+                match result {
+                    crate::core::engine::execute::HttpResult::Ok(resp) => {
+                        let _ = resp_table.set("status", resp.status);
+                        if let Ok(headers_tbl) = self.lua.create_table() {
+                            for (k, v) in &resp.headers {
+                                let _ = headers_tbl.set(k.as_str(), v.as_str());
+                            }
+                            let _ = resp_table.set("headers", headers_tbl);
+                        }
+                        let _ = resp_table.set("body", resp.body);
+                        let _ = resp_table.set("elapsed_ms", resp.elapsed_ms);
+                    }
+                    crate::core::engine::execute::HttpResult::Err(msg) => {
+                        let _ = resp_table.set("error", msg);
+                    }
+                }
+                let _ = f.call::<LuaTable, ()>(resp_table);
+            }
+        }
+        self.lua
+            .remove_app_data::<PluginCallContext>()
+            .unwrap_or_default()
+    }
+
     // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
 
     /// Register a new picker's callbacks and return its id. Called from
@@ -1780,6 +2128,118 @@ impl PluginManager {
     /// `PluginCallContext` stored in app_data during dispatch.
     fn setup_vimcode_api(lua: &Lua) -> LuaResult<()> {
         let vimcode = lua.create_table()?;
+
+        // ── vimcode.json (#1632) ─────────────────────────────────────────────
+        //
+        // The `null`/`empty_object` sentinels are created once here (not
+        // lazily inside `encode`/`decode`) so every comparison in
+        // `lua_value_to_json`/`json_to_lua_value` sees the exact same table
+        // for the lifetime of this `Lua` — see that section's module doc.
+        lua.set_named_registry_value(JSON_NULL_REGISTRY_KEY, lua.create_table()?)?;
+        lua.set_named_registry_value(JSON_EMPTY_OBJECT_REGISTRY_KEY, lua.create_table()?)?;
+
+        let json_tbl = lua.create_table()?;
+        json_tbl.set(
+            "encode",
+            lua.create_function(|lua, (value, opts): (LuaValue, Option<LuaTable>)| {
+                let json_val = lua_value_to_json(lua, value)?;
+                let pretty = opts
+                    .and_then(|o| o.get::<_, bool>("pretty").ok())
+                    .unwrap_or(false);
+                let s = if pretty {
+                    serde_json::to_string_pretty(&json_val)
+                } else {
+                    serde_json::to_string(&json_val)
+                }
+                .map_err(|e| LuaError::RuntimeError(format!("vimcode.json.encode: {e}")))?;
+                Ok(s)
+            })?,
+        )?;
+        json_tbl.set(
+            "decode",
+            lua.create_function(|lua, s: String| {
+                let json_val: serde_json::Value = serde_json::from_str(&s)
+                    .map_err(|e| LuaError::RuntimeError(format!("vimcode.json.decode: {e}")))?;
+                json_to_lua_value(lua, &json_val)
+            })?,
+        )?;
+        json_tbl.set(
+            "null",
+            lua.named_registry_value::<LuaTable>(JSON_NULL_REGISTRY_KEY)?,
+        )?;
+        json_tbl.set(
+            "empty_object",
+            lua.named_registry_value::<LuaTable>(JSON_EMPTY_OBJECT_REGISTRY_KEY)?,
+        )?;
+        vimcode.set("json", json_tbl)?;
+
+        // ── vimcode.storage (#1632) ──────────────────────────────────────────
+        let storage_tbl = lua.create_table()?;
+        storage_tbl.set(
+            "get",
+            lua.create_function(
+                |lua, (key, opts): (String, Option<LuaTable>)| -> LuaResult<LuaValue> {
+                    let plugin =
+                        current_plugin_chunk_name(lua).ok_or_else(storage_no_plugin_err)?;
+                    let path = plugin_storage_path(&plugin, storage_opt_workspace(&opts));
+                    match load_storage_map(&path).get(&key) {
+                        Some(v) => json_to_lua_value(lua, v),
+                        None => Ok(LuaValue::Nil),
+                    }
+                },
+            )?,
+        )?;
+        storage_tbl.set(
+            "set",
+            lua.create_function(
+                |lua,
+                 (key, value, opts): (String, LuaValue, Option<LuaTable>)|
+                 -> LuaResult<bool> {
+                    let plugin =
+                        current_plugin_chunk_name(lua).ok_or_else(storage_no_plugin_err)?;
+                    let path = plugin_storage_path(&plugin, storage_opt_workspace(&opts));
+                    let mut map = load_storage_map(&path);
+                    let json_val = lua_value_to_json(lua, value)?;
+                    map.insert(key, json_val);
+                    save_storage_map(&path, &map)
+                        .map_err(|e| LuaError::RuntimeError(format!("vimcode.storage.set: {e}")))?;
+                    Ok(true)
+                },
+            )?,
+        )?;
+        storage_tbl.set(
+            "delete",
+            lua.create_function(
+                |lua, (key, opts): (String, Option<LuaTable>)| -> LuaResult<bool> {
+                    let plugin =
+                        current_plugin_chunk_name(lua).ok_or_else(storage_no_plugin_err)?;
+                    let path = plugin_storage_path(&plugin, storage_opt_workspace(&opts));
+                    let mut map = load_storage_map(&path);
+                    let existed = map.remove(&key).is_some();
+                    if existed {
+                        save_storage_map(&path, &map).map_err(|e| {
+                            LuaError::RuntimeError(format!("vimcode.storage.delete: {e}"))
+                        })?;
+                    }
+                    Ok(existed)
+                },
+            )?,
+        )?;
+        storage_tbl.set(
+            "keys",
+            lua.create_function(|lua, opts: Option<LuaTable>| -> LuaResult<LuaTable> {
+                let plugin = current_plugin_chunk_name(lua).ok_or_else(storage_no_plugin_err)?;
+                let path = plugin_storage_path(&plugin, storage_opt_workspace(&opts));
+                let mut keys: Vec<String> = load_storage_map(&path).keys().cloned().collect();
+                keys.sort();
+                let t = lua.create_table()?;
+                for (i, k) in keys.into_iter().enumerate() {
+                    t.set(i + 1, k)?;
+                }
+                Ok(t)
+            })?,
+        )?;
+        vimcode.set("storage", storage_tbl)?;
 
         // ── Registration callbacks ──────────────────────────────────────────
 
@@ -2242,6 +2702,69 @@ impl PluginManager {
         )?;
 
         vimcode.set("loop", loop_tbl)?;
+
+        // ── vimcode.http (#1632) ─────────────────────────────────────────────
+        let http_tbl = lua.create_table()?;
+
+        // vimcode.http.request({method, url, headers, body, timeout_ms}, cb)
+        // → handle with :cancel(). `cb` is called exactly once, on the main
+        // thread via `Engine::poll_plugin_http`, with `{status, headers,
+        // body, elapsed_ms}` on success or `{error}` on failure — never both,
+        // never neither. Delivered the same way as every other stored
+        // callback (#1624's `PluginCallContext`/`EngineLoan` machinery), so
+        // it can use the immediate `vimcode.buffer`/`vimcode.window` API and
+        // `vimcode.ui.refresh` just like a timer or spawn callback can.
+        http_tbl.set(
+            "request",
+            lua.create_function(|lua, (opts, cb): (LuaTable, LuaFunction)| {
+                let method: String = opts
+                    .get::<_, String>("method")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "GET".to_string());
+                let url: String = opts.get::<_, String>("url").unwrap_or_default();
+                if url.is_empty() {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.http.request: 'url' is required".to_string(),
+                    ));
+                }
+                let mut headers = Vec::new();
+                if let Ok(h) = opts.get::<_, LuaTable>("headers") {
+                    for pair in h.pairs::<String, String>().flatten() {
+                        headers.push(pair);
+                    }
+                }
+                let body: Option<String> = opts.get::<_, String>("body").ok();
+                let timeout_ms: u64 = opts
+                    .get::<_, i64>("timeout_ms")
+                    .ok()
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| ms as u64)
+                    .unwrap_or(30_000);
+                let key = lua.create_registry_value(cb)?;
+                let id = live_engine("vimcode.http.request", move |e| {
+                    e.plugin_api_http_request(method, url, headers, body, timeout_ms, key)
+                })?;
+                let Some(id) = id else {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.http.request: failed to start request".to_string(),
+                    ));
+                };
+                let handle = lua.create_table()?;
+                handle.set("id", id)?;
+                handle.set(
+                    "cancel",
+                    lua.create_function(move |_, _self: LuaValue| {
+                        live_engine("vimcode.http.request:cancel", move |e| {
+                            e.plugin_api_http_cancel(id)
+                        })
+                    })?,
+                )?;
+                Ok(handle)
+            })?,
+        )?;
+
+        vimcode.set("http", http_tbl)?;
 
         // ── vimcode.buf subtable ────────────────────────────────────────────
         let buf = lua.create_table()?;

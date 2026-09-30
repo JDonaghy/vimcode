@@ -4533,6 +4533,14 @@ pub struct Engine {
     /// reap_stale_plugin_timers_and_spawns` closes any of these whose
     /// `upgrade()` now fails.
     plugin_pickers: HashMap<u64, std::rc::Weak<plugin::PluginManager>>,
+    /// Live `vimcode.http.request` handles (#1632), keyed by the id
+    /// `PluginManager::register_http_callback` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_http`]. Same "spawn a background
+    /// worker, deliver the result through `poll_idle`'s `mpsc` drain" shape
+    /// as `plugin_spawns` — the worker here runs a single `curl` child
+    /// (`execute::spawn_http_request`) instead of a streamed one, and
+    /// delivers exactly one `HttpResult` instead of a stream of events.
+    plugin_http_requests: HashMap<u64, execute::PluginHttpHandle>,
 
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
@@ -5504,6 +5512,7 @@ impl Engine {
             plugin_timer_seq: 0,
             plugin_spawns: HashMap::new(),
             plugin_pickers: HashMap::new(),
+            plugin_http_requests: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,
@@ -5779,6 +5788,7 @@ impl Engine {
         redraw |= self.poll_async_shells();
         redraw |= self.poll_plugin_timers();
         redraw |= self.poll_plugin_spawns();
+        redraw |= self.poll_plugin_http();
         redraw |= self.poll_panel_hover();
         redraw |= self.poll_editor_hover();
         redraw |= self.poll_blame();
@@ -6715,7 +6725,12 @@ mod digraph_ops;
 mod document_ops;
 mod explorer_ops;
 pub use explorer_ops::ExplorerKeyResult;
-mod execute;
+// `pub(crate)` (not the plain `mod` every sibling here uses): `vimcode.http`'s
+// response-delivery path (`PluginManager::call_http_response`, #1632) lives in
+// `plugin.rs` — a sibling of `engine`, not a descendant — so it needs to name
+// `execute::HttpResult` directly rather than through an `Engine` method
+// signature the way every other `execute` type stays engine-private today.
+pub(crate) mod execute;
 mod ext_panel;
 pub use ext_panel::ExtSidebarKeyResult;
 mod keys;
