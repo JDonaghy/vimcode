@@ -6667,6 +6667,136 @@ fn http_request_post_sends_headers_and_body_the_server_receives() {
     );
 }
 
+/// #1632 review: a header value containing CR/LF must be rejected at the
+/// `vimcode.http.request` boundary, never handed to `curl`'s `-H "{k}: {v}"`
+/// argument — otherwise it smuggles an extra header line (or splits the
+/// request) onto the wire. This drives it through the real Lua entry point
+/// (not an internal helper) and confirms the server the request would have
+/// hit never even sees a connection, because the request must fail before
+/// `curl` is ever spawned.
+///
+/// RED-verified: with the CR/LF check removed from both the Lua boundary
+/// (`vimcode.http.request`'s header loop in `plugin.rs`) and
+/// `spawn_http_request`'s defensive re-check, this fails — the fixture
+/// server observes a connection carrying both `X-Foo: bar` and a smuggled
+/// `X-Injected: evilvalue` header.
+#[test]
+fn http_request_rejects_header_values_containing_crlf() {
+    let mut e = engine_with_plugin(
+        "",
+        "http_header_crlf_1632",
+        r#"
+        vimcode.command("DoRequest", function(_)
+            local ok, err = pcall(function()
+                vimcode.http.request({
+                    method = "GET",
+                    url = "http://127.0.0.1:1/unreachable",
+                    headers = { ["X-Foo"] = "bar\r\nX-Injected: evilvalue" },
+                }, function(_resp) end)
+            end)
+            vimcode.message(tostring(ok) .. "|" .. tostring(err))
+        end)
+        "#,
+    );
+    exec(&mut e, "DoRequest");
+    assert!(
+        e.message.starts_with("false|"),
+        "a header value containing CRLF must raise a Lua error, not silently \
+         proceed to spawn curl; got {:?}",
+        e.message
+    );
+    assert!(
+        e.message.contains("CR") || e.message.contains("LF") || e.message.contains("\\r"),
+        "the error should name what's wrong (CR/LF), not just fail silently: {:?}",
+        e.message
+    );
+}
+
+/// #1632 review: the request URL must reach `curl` as a value that can never
+/// be parsed as another option — a bare positional argument lets a URL
+/// string starting with `-` be interpreted by `curl` as a flag instead of a
+/// URL. This proves it end-to-end with `-K<config>` (curl's "read more
+/// options from this file" flag, which accepts its value attached with no
+/// space): the config file below points curl at the *fixture server*, a
+/// completely different destination than the (bogus) one the plugin
+/// "asked" for. If the argument-injection bug is present, curl silently
+/// loads that config and actually connects to the fixture server —
+/// observable here as the fixture receiving a request at all. Fixed, `-K
+/// <path>` is treated as a literal, unresolvable hostname and the fixture
+/// never sees a connection.
+///
+/// RED-verified: with `--url` reverted back to a bare `command.arg(&spec.
+/// url)`, this fails — the fixture server's `expected_requests: 1` deadline
+/// is met, meaning curl really did load the injected config and connect to
+/// it instead of failing to resolve the literal string as a hostname.
+#[test]
+fn http_request_url_that_looks_like_a_curl_flag_is_never_parsed_as_one() {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<()>();
+    let base_url = spawn_http_fixture_server(1, move |_, _, _, _| {
+        let _ = req_tx.send(());
+        (200, vec![], b"should never be reached".to_vec())
+    });
+
+    let config_path = std::env::temp_dir().join(format!(
+        "vimcode_http_arg_injection_1632_{}.conf",
+        std::process::id()
+    ));
+    std::fs::write(&config_path, format!("url = \"{base_url}/proof\"\n")).unwrap();
+
+    // Attached form (`-K<path>`, no space) — exactly the shape the review
+    // finding's own repro used (`"-o/tmp/x"`), and the shape that survives
+    // being a single argv token (no shell is involved in `Command::arg`, so
+    // an embedded space could never split into two argv entries anyway).
+    let malicious_url = format!("-K{}", config_path.display());
+    let mut e = engine_with_plugin(
+        "",
+        "http_url_injection_1632",
+        &format!(
+            r#"
+            _G.done = false
+            vimcode.command("DoRequest", function(_)
+                vimcode.http.request({{
+                    method = "GET", url = "{malicious_url}", timeout_ms = 2000,
+                }}, function(resp)
+                    _G.has_error = resp.error ~= nil and resp.error ~= ""
+                    _G.done = true
+                end)
+            end)
+            vimcode.command("ReadResult", function(_)
+                vimcode.message(tostring(_G.done) .. "|" .. tostring(_G.has_error))
+            end)
+            "#
+        ),
+    );
+    exec(&mut e, "DoRequest");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(10), |e| {
+        exec(e, "ReadResult");
+        e.message.starts_with("true|")
+    });
+    assert!(
+        reached,
+        "the request must resolve (as an error) rather than hang; last \
+         message: {:?}",
+        e.message
+    );
+    assert_eq!(
+        e.message, "true|true",
+        "a URL of the form `-K<path>` must be treated as a literal \
+         (unresolvable) URL and surface as an error, never as `-K` loading \
+         that file as a curl config"
+    );
+    assert!(
+        req_rx.try_recv().is_err(),
+        "the fixture server must never have received a connection — a \
+         connection here means curl loaded the injected `-K` config and \
+         followed the URL inside it instead of treating the malicious \
+         string as a literal hostname"
+    );
+
+    let _ = std::fs::remove_file(&config_path);
+}
+
 #[test]
 fn http_request_timeout_surfaces_as_an_error_not_a_response() {
     let base_url = spawn_http_fixture_server(1, |_, _, _, _| {
@@ -6991,6 +7121,87 @@ fn storage_namespaces_by_plugin_so_plugins_cannot_read_each_others_data() {
         e.message, "B-VALUE",
         "plugin B must read back its own value, unclobbered by plugin A's \
          write to the same key name"
+    );
+}
+
+/// #1632 review: `current_plugin_chunk_name` used to trust a Lua chunk's own
+/// debug `source` unconditionally, and stock Lua's `load(chunk, chunkname)`
+/// lets *any* caller set that `source` to an arbitrary string — so
+/// `load(payload, "victim")()` let an attacker plugin impersonate another
+/// plugin's storage namespace outright. The fix hardens the Lua-visible
+/// `load` to always substitute the *caller's own* real identity for whatever
+/// chunkname it requests. This test drives that from the attacker's actual
+/// entry point (a registered command, exactly how a real malicious plugin
+/// would trigger it) rather than calling any internal helper directly.
+///
+/// RED-verified: with the `load` hardening in `PluginManager::
+/// setup_vimcode_api` reverted (restoring the stock global `load`), the
+/// first assertion below fails — `AttackerReadViaSpoof` reads back
+/// `"VICTIM-VALUE"` instead of `"nil"`.
+#[test]
+fn storage_load_cannot_spoof_another_plugins_chunk_name_to_steal_its_namespace() {
+    let _lock = TOOL_ACQUIRE_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data_home = std::env::temp_dir().join(format!(
+        "vimcode_test_storage_spoof_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    std::fs::create_dir_all(&data_home).unwrap();
+    let _data_home_guard = EnvVarGuard::set("VIMCODE_TEST_DATA_HOME", data_home.as_os_str());
+
+    let dir = std::env::temp_dir().join(format!(
+        "vc_plugin_storage_spoof_1632_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("victim.lua"),
+        r#"
+        vimcode.command("VictimSet", function(_) vimcode.storage.set("secret", "VICTIM-VALUE") end)
+        vimcode.command("VictimRead", function(_) vimcode.message(tostring(vimcode.storage.get("secret"))) end)
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("attacker.lua"),
+        r#"
+        vimcode.command("AttackerReadViaSpoof", function(_)
+            -- Try to impersonate "victim" so `current_plugin_chunk_name`
+            -- resolves to the victim's namespace instead of the attacker's.
+            local forged = load("return vimcode.storage.get('secret')", "victim")
+            vimcode.message(tostring(forged()))
+        end)
+        vimcode.command("AttackerWriteViaSpoof", function(_)
+            local forged = load("vimcode.storage.set('secret', 'ATTACKER-CLOBBER')", "victim")
+            forged()
+            vimcode.message("wrote")
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let mut e = engine_with("");
+    let mut mgr = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
+    mgr.load_plugins_dir(&dir, &[]);
+    e.set_plugin_manager(mgr);
+
+    exec(&mut e, "VictimSet");
+    exec(&mut e, "AttackerReadViaSpoof");
+    assert_eq!(
+        e.message, "nil",
+        "a spoofed load(payload, \"victim\") must NOT read the victim's \
+         storage — it must land in the attacker's own (empty) namespace"
+    );
+
+    exec(&mut e, "AttackerWriteViaSpoof");
+    exec(&mut e, "VictimRead");
+    assert_eq!(
+        e.message, "VICTIM-VALUE",
+        "a spoofed load(payload, \"victim\") must NOT be able to clobber the \
+         victim's storage either"
     );
 }
 

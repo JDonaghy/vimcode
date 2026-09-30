@@ -235,7 +235,8 @@ pub(crate) fn spawn_piped(
 // past its deadline.
 
 /// One `vimcode.http.request` call's parameters, already validated/defaulted
-/// on the Lua side (`method` non-empty, `url` non-empty).
+/// on the Lua side (`method` non-empty, `url` non-empty, headers free of
+/// CR/LF — [`spawn_http_request`] re-checks the last one defensively).
 pub(crate) struct HttpRequestSpec {
     pub(crate) method: String,
     pub(crate) url: String,
@@ -339,6 +340,44 @@ fn parse_curl_response(bytes: &[u8], elapsed_ms: u64) -> HttpResult {
 /// `spawn_piped`/`Engine::plugin_api_spawn`'s split the same way.
 type HttpPipes = (Arc<Mutex<Child>>, Receiver<HttpResult>);
 
+/// Maximum response body [`spawn_http_request`] will buffer from curl's
+/// stdout (headers + body together — curl's `-i` combines them into one
+/// stream) before giving up and failing the request. Without this, an
+/// unbounded `read_to_end` lets a large/slow-but-"successful" response — or
+/// a malicious/misbehaving server — grow memory without bound (review
+/// finding, #1632).
+const HTTP_MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
+
+/// Read at most `cap` bytes from `r`, returning `(bytes, exceeded)`.
+/// `exceeded` is true if `r` still had more data once `cap` was reached
+/// (i.e. reading stopped early rather than hitting EOF) — the caller uses
+/// this to fail the request instead of silently truncating it.
+fn read_capped(mut r: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        if buf.len() >= cap {
+            return match r.read(&mut chunk) {
+                Ok(0) | Err(_) => (buf, false),
+                Ok(_) => (buf, true),
+            };
+        }
+        match r.read(&mut chunk) {
+            Ok(0) | Err(_) => return (buf, false),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// A header key or value is rejected if it contains `\r` or `\n`: curl
+/// writes `-H "{k}: {v}"` verbatim onto the wire as one argument, so an
+/// embedded CR/LF would let a caller smuggle extra header lines or split the
+/// request (review finding, #1632) — e.g. a header value built from
+/// response data, a template, or other less-trusted input.
+fn header_is_safe(s: &str) -> bool {
+    !s.contains('\r') && !s.contains('\n')
+}
+
 /// Launch `spec` as a `curl` child and return the shared child handle (for
 /// `cancel()`) plus the one-shot result channel, polled by `Engine::
 /// poll_plugin_http`.
@@ -348,6 +387,14 @@ type HttpPipes = (Arc<Mutex<Child>>, Receiver<HttpResult>);
 /// reading them sequentially risks a deadlock if the child fills the *other*
 /// pipe's OS buffer while this thread is still blocked on the first one.
 pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpPipes> {
+    for (k, v) in &spec.headers {
+        if !header_is_safe(k) || !header_is_safe(v) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "vimcode.http.request: header name/value must not contain CR or LF",
+            ));
+        }
+    }
     let mut command = crate::core::git::hidden_command("curl");
     let timeout_secs = (spec.timeout_ms.max(1) as f64) / 1000.0;
     command.args([
@@ -355,6 +402,12 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
         "-i",
         "--max-time",
         &format!("{timeout_secs:.3}"),
+        // Restrict curl to http/https regardless of what scheme the URL
+        // string carries — without this, a `file://`, `smb://`, or other
+        // scheme would be followed too (review finding, #1632), widening
+        // the blast radius of any URL an attacker can influence.
+        "--proto",
+        "-all,+http,+https",
         "-X",
         &spec.method,
     ]);
@@ -372,7 +425,12 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
     if let Some(body) = &spec.body {
         command.arg("--data-raw").arg(body);
     }
-    command.arg(&spec.url);
+    // `--url` (rather than a bare positional argument) so a URL string that
+    // itself looks like a curl flag — e.g. `-o /home/user/.ssh/
+    // authorized_keys` or `-K <config>` — is always parsed as the literal
+    // URL value, never as another option (review finding, #1632: verified
+    // `curl -X GET "-o/tmp/x"` without `--url` is parsed as the `-o` flag).
+    command.arg("--url").arg(&spec.url);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -385,13 +443,8 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
     let child_thread = Arc::clone(&child);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let out_reader = stdout.map(|mut out| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = out.read_to_end(&mut buf);
-                buf
-            })
-        });
+        let out_reader =
+            stdout.map(|out| std::thread::spawn(move || read_capped(out, HTTP_MAX_RESPONSE_BYTES)));
         let err_reader = stderr.map(|mut err| {
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
@@ -399,24 +452,39 @@ pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpP
                 buf
             })
         });
-        let out_buf = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        let (out_buf, out_exceeded) = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
         let err_buf = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        if out_exceeded {
+            // The child may still be blocked writing to a stdout pipe
+            // nothing further drains — kill it before `wait()` so this
+            // thread (and the request) doesn't hang.
+            if let Ok(mut guard) = child_thread.lock() {
+                let _ = guard.kill();
+            }
+        }
         let status = match child_thread.lock() {
             Ok(mut guard) => guard.wait(),
             Err(poisoned) => poisoned.into_inner().wait(),
         };
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let result = match status {
-            Ok(status) if status.success() => parse_curl_response(&out_buf, elapsed_ms),
-            Ok(_) => {
-                let msg = String::from_utf8_lossy(&err_buf).trim().to_string();
-                HttpResult::Err(if msg.is_empty() {
-                    "curl request failed".to_string()
-                } else {
-                    msg
-                })
+        let result = if out_exceeded {
+            HttpResult::Err(format!(
+                "response exceeds maximum size ({} MiB)",
+                HTTP_MAX_RESPONSE_BYTES / (1024 * 1024)
+            ))
+        } else {
+            match status {
+                Ok(status) if status.success() => parse_curl_response(&out_buf, elapsed_ms),
+                Ok(_) => {
+                    let msg = String::from_utf8_lossy(&err_buf).trim().to_string();
+                    HttpResult::Err(if msg.is_empty() {
+                        "curl request failed".to_string()
+                    } else {
+                        msg
+                    })
+                }
+                Err(e) => HttpResult::Err(e.to_string()),
             }
-            Err(e) => HttpResult::Err(e.to_string()),
         };
         // A `cancel()` that dropped this handle (and its `Receiver`) races
         // harmlessly with this send — `send` just returns `Err`, ignored.
