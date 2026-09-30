@@ -2775,6 +2775,26 @@ pub(crate) struct JumpEntry {
 /// varying length instead of the (shorter) column `$` happened to land on.
 pub(crate) const CURSWANT_EOL: usize = usize::MAX;
 
+/// Scheduling state for one live `vimcode.loop.timer`/`vimcode.schedule`/
+/// `vimcode.defer` registration (#1624). The Lua callback itself lives in
+/// `PluginManager::timer_callbacks`, keyed by the same id — see that map's
+/// doc for why the split.
+struct PluginTimerEntry {
+    /// Weak so a plugin-manager replacement (the unload mechanism —
+    /// `Engine::set_plugin_manager` installs a fresh `Rc`, dropping the old
+    /// one once every strong reference is gone) makes this entry's owner
+    /// unreachable without `Engine` having to know which timers belonged to
+    /// which manager. `Self::manager.upgrade()` failing is exactly "the
+    /// owning plugin was unloaded" — see `Engine::poll_plugin_timers`.
+    manager: std::rc::Weak<plugin::PluginManager>,
+    interval: std::time::Duration,
+    repeat: bool,
+    next_due: std::time::Instant,
+    /// Tie-breaker for timers due at the same instant (`plugin_timer_seq`'s
+    /// doc).
+    seq: u64,
+}
+
 pub struct Engine {
     // --- Multi-buffer/window state ---
     pub buffer_manager: BufferManager,
@@ -4465,8 +4485,34 @@ pub struct Engine {
 
     // --- Async shell tasks (plugin background commands) ---
     /// Background shell tasks spawned by plugins via `vimcode.async_shell()`.
-    /// Keyed by callback_event name (last-writer-wins: new request replaces old).
-    async_shell_tasks: HashMap<String, std::sync::mpsc::Receiver<(bool, String)>>,
+    /// Keyed by callback_event name (last-writer-wins: new request replaces
+    /// old). Built on the same [`execute::spawn_piped`]/[`execute::
+    /// PluginSpawnEvent`] core `vimcode.loop.spawn` uses (#1624) — the
+    /// stdout chunks are accumulated here until `Exit` arrives, matching
+    /// `async_shell`'s frozen "deliver the whole output at exit" contract,
+    /// rather than streamed to Lua per chunk the way `loop.spawn` streams.
+    async_shell_tasks: HashMap<String, execute::AsyncShellTask>,
+    /// Last known exit code per `async_shell` callback_event (#1624), read by
+    /// `vimcode.async_shell_exit_code(event)`. `None` inside the map means
+    /// the process was killed/errored without a code (e.g. a signal death);
+    /// absent means no result has landed yet for that event.
+    pub(crate) async_shell_last_exit: HashMap<String, Option<i32>>,
+
+    // --- Plugin loop API: timers/schedule/defer/spawn (#1624) ---
+    /// Live `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer`
+    /// registrations, keyed by the id `PluginManager::register_timer_
+    /// callback` handed out. Polled from `poll_idle` via
+    /// [`Self::poll_plugin_timers`].
+    plugin_timers: HashMap<u64, PluginTimerEntry>,
+    /// Monotonic counter for `PluginTimerEntry::seq`, breaking ties between
+    /// timers/schedules due at the same instant so `schedule(a); schedule(b)`
+    /// always fires `a` before `b` — a plain `HashMap` iteration order gives
+    /// no such guarantee.
+    plugin_timer_seq: u64,
+    /// Live `vimcode.loop.spawn` child processes, keyed by the id
+    /// `PluginManager::register_spawn_callbacks` handed out. Polled from
+    /// `poll_idle` via [`Self::poll_plugin_spawns`].
+    plugin_spawns: HashMap<u64, execute::PluginSpawnHandle>,
 
     // --- AI assistant panel ---
     /// Whether the AI sidebar has keyboard focus.
@@ -5330,6 +5376,10 @@ impl Engine {
             blame_annotations_active: false,
             blame_rx: None,
             async_shell_tasks: HashMap::new(),
+            async_shell_last_exit: HashMap::new(),
+            plugin_timers: HashMap::new(),
+            plugin_timer_seq: 0,
+            plugin_spawns: HashMap::new(),
             ai_ghost_text: None,
             ai_ghost_alternatives: Vec::new(),
             ai_ghost_alt_idx: 0,
@@ -5581,6 +5631,8 @@ impl Engine {
         redraw |= self.poll_board_action();
         redraw |= self.poll_ai();
         redraw |= self.poll_async_shells();
+        redraw |= self.poll_plugin_timers();
+        redraw |= self.poll_plugin_spawns();
         redraw |= self.poll_panel_hover();
         redraw |= self.poll_editor_hover();
         redraw |= self.poll_blame();

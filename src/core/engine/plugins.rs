@@ -1079,55 +1079,48 @@ impl Engine {
         for keys in ctx.feedkeys_sequences {
             self.feed_keys(&keys);
         }
-        // Spawn background threads for async shell requests.
+        // Launch async shell requests, built on the same `spawn_piped` core
+        // `vimcode.loop.spawn` uses (#1624) — see `execute::AsyncShellTask`
+        // and `Self::poll_async_shells` for how the streamed events are
+        // accumulated back into `async_shell`'s frozen single-string,
+        // deliver-at-exit contract.
+        //
+        // #948 review (non-blocking): no dedicated regression test for this
+        // call site specifically — it goes through the shared `shell_cmd()`
+        // construction point (#1492) already covered by `:!`'s tests
+        // (`tests/new_vim_features.rs`'s `test_bang_command_honours_shell_
+        // env_var` and `src/tui_main/shell_app.rs`'s `bang_command_shell_
+        // output_paints_on_command_line_via_shell_app`), so a future
+        // divergence here (e.g. someone hand-rolling a shell string again
+        // for "just this one" call site) isn't caught by this PR's tests.
         for req in ctx.async_shell_requests {
-            let (tx, rx) = std::sync::mpsc::channel();
+            let mut cmd = crate::core::terminal::shell_cmd(&req.command);
+            if let Some(ref cwd) = req.cwd {
+                cmd.current_dir(cwd);
+            }
+            let task = match execute::spawn_piped(cmd, req.stdin) {
+                Ok((_child, _stdin, rx)) => execute::AsyncShellTask {
+                    rx,
+                    stdout_buf: String::new(),
+                },
+                Err(_) => {
+                    // Match the old behaviour's immediate `(false, "")`
+                    // failure result: deliver a synthetic exit on the very
+                    // next `poll_async_shells` tick rather than dropping the
+                    // request silently.
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let _ = tx.send(execute::PluginSpawnEvent::Exit {
+                        code: None,
+                        signal: None,
+                    });
+                    execute::AsyncShellTask {
+                        rx,
+                        stdout_buf: String::new(),
+                    }
+                }
+            };
             // Last-writer-wins: replace any pending task for the same callback event.
-            self.async_shell_tasks.insert(req.callback_event, rx);
-            std::thread::spawn(move || {
-                use std::process::Stdio;
-                // #948 review (non-blocking): no dedicated regression test
-                // for this call site specifically — it goes through the
-                // shared `shell_cmd()` construction point (#1492) already
-                // covered by `:!`'s tests (`tests/new_vim_features.rs`'s
-                // `test_bang_command_honours_shell_env_var` and
-                // `src/tui_main/shell_app.rs`'s
-                // `bang_command_shell_output_paints_on_command_line_via_shell_app`),
-                // so a future divergence here (e.g. someone hand-rolling a
-                // shell string again for "just this one" call site) isn't
-                // caught by this PR's tests.
-                let mut cmd = crate::core::terminal::shell_cmd(&req.command);
-                if let Some(ref cwd) = req.cwd {
-                    cmd.current_dir(cwd);
-                }
-                if req.stdin.is_some() {
-                    cmd.stdin(Stdio::piped());
-                }
-                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-                let result = if let Some(ref input) = req.stdin {
-                    match cmd.spawn() {
-                        Ok(mut child) => {
-                            if let Some(ref mut stdin_pipe) = child.stdin.take() {
-                                use std::io::Write;
-                                let _ = stdin_pipe.write_all(input.as_bytes());
-                            }
-                            child.wait_with_output()
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    cmd.output()
-                };
-                match result {
-                    Ok(out) => {
-                        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                        let _ = tx.send((out.status.success(), stdout));
-                    }
-                    Err(_) => {
-                        let _ = tx.send((false, String::new()));
-                    }
-                }
-            });
+            self.async_shell_tasks.insert(req.callback_event, task);
         }
         // Open scratch buffers requested by plugins
         for req in ctx.scratch_buffers {
@@ -1267,22 +1260,311 @@ impl Engine {
     }
 
     /// Poll for completed async shell tasks spawned by plugins.
+    ///
+    /// Drains every [`execute::PluginSpawnEvent`] pending for each live task,
+    /// accumulating stdout chunks and firing `plugin_event(event, output)`
+    /// only once `Exit` arrives — preserving `async_shell`'s frozen "deliver
+    /// the whole output at exit" contract even though the underlying process
+    /// is now spawned through the same streaming core `vimcode.loop.spawn`
+    /// uses (#1624). `Engine::async_shell_last_exit` is updated first, so a
+    /// handler reading `vimcode.async_shell_exit_code(event)` from inside the
+    /// very callback this fires sees the code that just landed.
+    ///
     /// Returns `true` if any results were delivered (caller should redraw).
     pub fn poll_async_shells(&mut self) -> bool {
-        let mut completed = Vec::new();
-        for (event, rx) in &self.async_shell_tasks {
-            if let Ok(result) = rx.try_recv() {
-                completed.push((event.clone(), result));
+        let mut completed: Vec<(String, String, Option<i32>)> = Vec::new();
+        for (event, task) in self.async_shell_tasks.iter_mut() {
+            while let Ok(ev) = task.rx.try_recv() {
+                match ev {
+                    execute::PluginSpawnEvent::Stdout(chunk) => task.stdout_buf.push_str(&chunk),
+                    execute::PluginSpawnEvent::Stderr(_) => {}
+                    execute::PluginSpawnEvent::Exit { code, .. } => {
+                        completed.push((event.clone(), std::mem::take(&mut task.stdout_buf), code));
+                    }
+                }
             }
         }
         if completed.is_empty() {
             return false;
         }
-        for (event, (_success, output)) in &completed {
-            self.async_shell_tasks.remove(event.as_str());
-            self.plugin_event(event, output);
+        for (event, output, code) in completed {
+            self.async_shell_tasks.remove(&event);
+            self.async_shell_last_exit.insert(event.clone(), code);
+            self.plugin_event(&event, &output);
         }
         true
+    }
+
+    // ─── `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer` (#1624) ────
+
+    /// Register a timer/schedule/defer callback, due `ms` milliseconds from
+    /// now (repeating every `ms` if `repeat`). Returns the handle id as an
+    /// `i64` for the Lua boundary (`-1` if there is no live plugin manager,
+    /// which cannot happen when called through `live_engine` from inside a
+    /// dispatch, but keeps the method total).
+    pub(crate) fn plugin_api_register_timer(
+        &mut self,
+        ms: i64,
+        repeat: bool,
+        callback: mlua::RegistryKey,
+    ) -> i64 {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return -1;
+        };
+        let id = pm.register_timer_callback(callback);
+        let interval = std::time::Duration::from_millis(ms.max(0) as u64);
+        let seq = self.plugin_timer_seq;
+        self.plugin_timer_seq += 1;
+        self.plugin_timers.insert(
+            id,
+            PluginTimerEntry {
+                manager: std::rc::Rc::downgrade(&pm),
+                interval,
+                repeat,
+                next_due: std::time::Instant::now() + interval,
+                seq,
+            },
+        );
+        id as i64
+    }
+
+    /// `vimcode.loop.timer(...):stop()` — cancel a timer before it (next)
+    /// fires. A no-op if `id` already fired (non-repeating) or was already
+    /// stopped.
+    pub(crate) fn plugin_api_stop_timer(&mut self, id: i64) {
+        if id < 0 {
+            return;
+        }
+        if let Some(entry) = self.plugin_timers.remove(&(id as u64)) {
+            if let Some(pm) = entry.manager.upgrade() {
+                pm.remove_timer_callback(id as u64);
+            }
+        }
+    }
+
+    /// Fire every timer/schedule/defer whose `next_due` has passed. Called
+    /// from `poll_idle`. Returns `true` if any callback fired.
+    ///
+    /// Due entries are processed in `(next_due, seq)` order — a `HashMap`'s
+    /// iteration order is unspecified, so without the explicit tie-break
+    /// `vimcode.schedule(a); vimcode.schedule(b)` (both due "now") would have
+    /// no guaranteed ordering, breaking the "schedule/defer ordering"
+    /// acceptance bar.
+    pub fn poll_plugin_timers(&mut self) -> bool {
+        if self.plugin_timers.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let mut due: Vec<(std::time::Instant, u64, u64)> = self
+            .plugin_timers
+            .iter()
+            .filter(|(_, t)| t.next_due <= now)
+            .map(|(id, t)| (t.next_due, t.seq, *id))
+            .collect();
+        if due.is_empty() {
+            return false;
+        }
+        due.sort();
+        let mut fired = false;
+        for (_, _, id) in due {
+            // A callback earlier in this same batch may have stopped a later
+            // one (or itself, for a repeating timer) — re-check liveness.
+            let Some(entry) = self.plugin_timers.get(&id) else {
+                continue;
+            };
+            if entry.manager.upgrade().is_none() {
+                // The owning plugin was unloaded since this became due
+                // (`Engine::set_plugin_manager` replaced it) — drop the
+                // stale entry without ever calling into the dead Lua state.
+                self.plugin_timers.remove(&id);
+                continue;
+            }
+            let repeat = entry.repeat;
+            if repeat {
+                let interval = entry.interval;
+                if let Some(e) = self.plugin_timers.get_mut(&id) {
+                    e.next_due = now + interval;
+                }
+            } else {
+                // Drop the *scheduling* entry now (so a callback that calls
+                // `stop()` on its own already-fired, non-repeating handle is
+                // a harmless no-op), but keep the Lua callback registered
+                // until after it actually runs below — removing it first
+                // would make `call_timer_callback` find nothing to call.
+                self.plugin_timers.remove(&id);
+            }
+            let ctx = self.make_plugin_ctx(true);
+            let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_timer_callback(id, ctx)) else {
+                continue;
+            };
+            self.apply_plugin_ctx(ctx);
+            fired = true;
+            if !repeat {
+                if let Some(pm) = self.plugin_manager.clone() {
+                    pm.remove_timer_callback(id);
+                }
+            }
+        }
+        fired
+    }
+
+    // ─── `vimcode.loop.spawn` (#1624) ───────────────────────────────────────
+
+    /// `vimcode.loop.spawn(cmd, args, opts)`: launch a child process and wire
+    /// its streamed stdout/stderr and exit status to the given (optional)
+    /// callbacks. Returns the handle id, or `None` if the process could not
+    /// be started (the Lua binding surfaces that as a runtime error) or
+    /// there is no live plugin manager.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plugin_api_spawn(
+        &mut self,
+        cmd: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        env: Vec<(String, String)>,
+        on_stdout: Option<mlua::RegistryKey>,
+        on_stderr: Option<mlua::RegistryKey>,
+        on_exit: Option<mlua::RegistryKey>,
+    ) -> Option<i64> {
+        let pm = self.plugin_manager.clone()?;
+        let mut command = std::process::Command::new(&cmd);
+        command.args(&args);
+        if let Some(dir) = cwd {
+            command.current_dir(dir);
+        }
+        for (k, v) in &env {
+            command.env(k, v);
+        }
+        let (child, stdin, rx) = execute::spawn_piped(command, None).ok()?;
+        let id = pm.register_spawn_callbacks(on_stdout, on_stderr, on_exit);
+        self.plugin_spawns.insert(
+            id,
+            execute::PluginSpawnHandle {
+                manager: std::rc::Rc::downgrade(&pm),
+                child,
+                stdin,
+                rx,
+            },
+        );
+        Some(id as i64)
+    }
+
+    /// `vimcode.loop.spawn(...):write(data)` — write to the child's stdin.
+    /// Returns `false` if the handle is unknown, its stdin was already
+    /// closed, or the write failed.
+    pub(crate) fn plugin_api_spawn_write(&mut self, id: i64, data: &str) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let Some(handle) = self.plugin_spawns.get(&(id as u64)) else {
+            return false;
+        };
+        let Ok(mut guard) = handle.stdin.lock() else {
+            return false;
+        };
+        match guard.as_mut() {
+            Some(stdin) => std::io::Write::write_all(stdin, data.as_bytes()).is_ok(),
+            None => false,
+        }
+    }
+
+    /// `vimcode.loop.spawn(...):close_stdin()` — close the child's stdin
+    /// (EOF), so a filter-style child that reads until EOF can proceed.
+    pub(crate) fn plugin_api_spawn_close_stdin(&mut self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let Some(handle) = self.plugin_spawns.get(&(id as u64)) else {
+            return false;
+        };
+        let Ok(mut guard) = handle.stdin.lock() else {
+            return false;
+        };
+        *guard = None;
+        true
+    }
+
+    /// `vimcode.loop.spawn(...):kill()` — send a kill signal to the child.
+    /// The resulting exit (signal death, on unix) is delivered to `on_exit`
+    /// on a later `poll_plugin_spawns` tick, same as a natural exit.
+    pub(crate) fn plugin_api_spawn_kill(&mut self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let Some(handle) = self.plugin_spawns.get(&(id as u64)) else {
+            return false;
+        };
+        let Ok(mut child) = handle.child.lock() else {
+            return false;
+        };
+        child.kill().is_ok()
+    }
+
+    /// Deliver every pending [`execute::PluginSpawnEvent`] for every live
+    /// `vimcode.loop.spawn` handle, in arrival order per handle, through the
+    /// plugin dispatch loan so `on_stdout`/`on_stderr`/`on_exit` can use the
+    /// immediate API. Called from `poll_idle`.
+    ///
+    /// A handle whose owning plugin manager was unloaded (`Engine::
+    /// set_plugin_manager` replaced it) is killed and dropped here instead
+    /// of having its callbacks invoked — #1624's "unloading a plugin cancels
+    /// its timers and spawns" with "no calls into an unloaded plugin".
+    ///
+    /// Returns `true` if any callback fired (caller should redraw).
+    pub fn poll_plugin_spawns(&mut self) -> bool {
+        if self.plugin_spawns.is_empty() {
+            return false;
+        }
+        let ids: Vec<u64> = self.plugin_spawns.keys().copied().collect();
+        let mut redraw = false;
+        for id in ids {
+            let alive = self
+                .plugin_spawns
+                .get(&id)
+                .map(|h| h.manager.upgrade().is_some())
+                .unwrap_or(false);
+            if !alive {
+                if let Some(handle) = self.plugin_spawns.remove(&id) {
+                    if let Ok(mut child) = handle.child.lock() {
+                        let _ = child.kill();
+                    }
+                }
+                continue;
+            }
+            while let Some(event) = self
+                .plugin_spawns
+                .get(&id)
+                .and_then(|h| h.rx.try_recv().ok())
+            {
+                let mut exited = false;
+                let ctx = self.make_plugin_ctx(true);
+                let applied =
+                    match event {
+                        execute::PluginSpawnEvent::Stdout(chunk) => self
+                            .with_plugin_dispatch(move |pm| pm.call_spawn_stdout(id, &chunk, ctx)),
+                        execute::PluginSpawnEvent::Stderr(chunk) => self
+                            .with_plugin_dispatch(move |pm| pm.call_spawn_stderr(id, &chunk, ctx)),
+                        execute::PluginSpawnEvent::Exit { code, signal } => {
+                            exited = true;
+                            self.with_plugin_dispatch(move |pm| {
+                                pm.call_spawn_exit(id, code, signal, ctx)
+                            })
+                        }
+                    };
+                if let Some(ctx) = applied {
+                    self.apply_plugin_ctx(ctx);
+                    redraw = true;
+                }
+                if exited {
+                    self.plugin_spawns.remove(&id);
+                    if let Some(pm) = self.plugin_manager.clone() {
+                        pm.remove_spawn_callbacks(id);
+                    }
+                    break;
+                }
+            }
+        }
+        redraw
     }
 
     /// Set the editor mode with autocmd event firing.
