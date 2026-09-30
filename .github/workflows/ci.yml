@@ -334,7 +334,12 @@ jobs:
     # SGR mouse-click bytes into the `vcd.exe` just built and asserts each
     # activity-bar icon actually switches panels, over the same real Win32
     # pseudo console as the #1634 step above. Scoped to this one integration
-    # test, per this job's own header comment.
+    # test, per this job's own header comment. A hard (non-`continue-on-
+    # error`) gate: RED/GREEN-verified by hand on real `dell64` Windows
+    # hardware (three consecutive green runs) before landing — see the
+    # file's own module doc for the full investigation — so, unlike a test
+    # that was only ever cross-compiled and never actually executed, a red
+    # result here is a real signal worth blocking on.
     - name: Run tests/conpty_activity_bar_click.rs (#1636, real ConPTY on windows-latest)
       run: cargo test --release --test conpty_activity_bar_click --no-default-features
 
