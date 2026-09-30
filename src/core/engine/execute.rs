@@ -70,7 +70,12 @@ fn finish_and_send_exit(child: Arc<Mutex<Child>>, tx: Sender<PluginSpawnEvent>) 
     loop {
         let status = match child.lock() {
             Ok(mut guard) => guard.try_wait(),
-            Err(_) => return,
+            // A prior panic while the lock was held elsewhere (e.g. inside
+            // `kill()`) poisons it — recover the guard via `into_inner()`
+            // rather than giving up here, so this thread still reaps the
+            // child and sends its `Exit` event instead of leaking both
+            // silently (#1624 review, non-blocking).
+            Err(poisoned) => poisoned.into_inner().try_wait(),
         };
         match status {
             Ok(Some(status)) => {
@@ -131,11 +136,28 @@ pub(crate) fn spawn_piped(
     let mut child = command.spawn()?;
     let mut stdin = child.stdin.take();
     if let Some(data) = stdin_data {
-        if let Some(pipe) = stdin.as_mut() {
-            use std::io::Write;
-            let _ = pipe.write_all(data.as_bytes());
+        // Write on a dedicated background thread rather than inline here
+        // (#1624 review): this runs synchronously on the caller's thread —
+        // the main/engine thread for `vimcode.async_shell`'s legacy
+        // `stdin` option — and `data` can exceed the OS pipe buffer
+        // (commonly 64KiB on Linux) or be written to a child that doesn't
+        // promptly drain stdin. Either blocks a `write_all` indefinitely,
+        // which previously stalled the whole editor; the pre-#1624 code
+        // avoided this by running spawn+write+wait inside its own
+        // `std::thread::spawn`. Taking the pipe out and moving it into a
+        // thread (rather than writing through the shared `Arc<Mutex<..>>`
+        // below) keeps that same off-thread guarantee while still handing
+        // back `None` for `stdin` here, matching this option's frozen
+        // write-then-close, no-interactive-follow-up shape.
+        if let Some(pipe) = stdin.take() {
+            std::thread::spawn(move || {
+                let mut pipe = pipe;
+                use std::io::Write;
+                let _ = pipe.write_all(data.as_bytes());
+                // `pipe` drops here, closing stdin (EOF) once the write
+                // completes — same as the previous inline `stdin = None`.
+            });
         }
-        stdin = None;
     }
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();

@@ -9907,5 +9907,99 @@ mod tests {
                  screen:\n{screen}"
             );
         }
+
+        // ─────────────────────────────────────────────────────────────────
+        // Native Extension API — Phase 3 (#1624): `vimcode.loop.spawn`'s
+        // streamed output, driven through the real event loop and asserted
+        // on **painted** output — the issue's own acceptance bar ("A
+        // `TuiDriver` black-box test: a plugin spawns a process that prints
+        // over time, appends each chunk to a scratch buffer, and the
+        // painted buffer shows the streamed lines").
+        // ─────────────────────────────────────────────────────────────────
+
+        /// #1624 acceptance: a `:`-command spawns `/bin/sh` printing two
+        /// markers with a real delay between them, appending each streamed
+        /// `on_stdout` chunk to a scratch buffer via the immediate
+        /// `vimcode.buffer` API and displaying it with `window.set_buf`.
+        /// Both markers must reach the painted screen — not just engine
+        /// state — proving the whole path (background reader thread ->
+        /// `Engine::poll_plugin_spawns` -> `with_plugin_dispatch` ->
+        /// `vimcode.buffer.set_lines` -> repaint) actually shows up on
+        /// screen, and that `on_stdout` really fires per chunk over time
+        /// rather than only once, in bulk, at exit.
+        ///
+        /// RED-verified against unfixed `develop`: there is no
+        /// `vimcode.loop` table there, so `vimcode.loop.spawn` errors on
+        /// its first call and neither marker — nor the scratch buffer
+        /// itself — ever appears on screen.
+        #[test]
+        #[cfg(unix)]
+        fn loop_spawn_streams_output_into_scratch_buffer_paints_via_shell_app() {
+            use std::time::{Duration, Instant};
+
+            let engine = engine_with_plugin(
+                "spawn_stream_1624",
+                r#"
+                vimcode.command("ZqSpawnStream", function(_)
+                    local b = vimcode.buffer.create({ scratch = true, name = "ZQSPAWNSTREAM" })
+                    vimcode.buffer.set_lines(b, 0, -1, {})
+                    vimcode.window.set_buf(0, b)
+                    vimcode.loop.spawn(
+                        "/bin/sh",
+                        { "-c", "echo ZQ_STREAM_ONE; sleep 0.05; echo ZQ_STREAM_TWO" },
+                        {
+                            on_stdout = function(chunk)
+                                for line in chunk:gmatch("[^\r\n]+") do
+                                    local n = vimcode.buffer.line_count(b)
+                                    vimcode.buffer.set_lines(b, n, n, { line })
+                                end
+                            end,
+                        }
+                    )
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqSpawnStream".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            // The child prints its second marker only after a real 50ms
+            // sleep, so this must poll the real event loop rather than
+            // asserting once right after `Enter` — `driver.tick()` is what
+            // drives `App::tick_dispatch` -> `Engine::poll_idle` ->
+            // `poll_plugin_spawns`, same as the ACP terminal tests above.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !(screen.contains("ZQ_STREAM_ONE") && screen.contains("ZQ_STREAM_TWO"))
+                && Instant::now() < deadline
+            {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+
+            assert!(
+                screen.contains("ZQSPAWNSTREAM"),
+                "the streamed-into scratch buffer must be the one on \
+                 display; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_STREAM_ONE"),
+                "the first streamed chunk must land in the painted buffer \
+                 within 5s; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_STREAM_TWO"),
+                "the second, later-arriving streamed chunk must also land \
+                 in the painted buffer, proving on_stdout fires per chunk \
+                 over time rather than only once at exit; screen:\n{screen}"
+            );
+        }
     }
 }
