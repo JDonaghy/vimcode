@@ -57,13 +57,98 @@
 //!
 //! This exercises the *entire* real path #1636 names as suspect —
 //! crossterm's Windows console-mode mouse decoding, ConPTY's VT-to-native
-//! input translation, and `App`'s dispatch — with nothing stubbed out. It
-//! is the regression guard the issue's acceptance criteria asks for; actual
-//! Windows Terminal confirmation on `dell64` remains a separate, explicit
-//! sign-off this file cannot substitute for (see this repo's `CLAUDE.md`
-//! "Testing (CRITICAL)" section on real-hardware verification for `tests/
-//! conpty_idle_flicker.rs`, which states the same limitation for its own
-//! ConPTY coverage).
+//! input translation, and `App`'s dispatch — with nothing stubbed out.
+//!
+//! # RED/GREEN, actually confirmed on real Windows hardware (`dell64`)
+//!
+//! Unlike this file's first version, this one **was** built with `cargo
+//! xwin` and run to completion — RED and then GREEN — against a real
+//! Win32 ConPTY on `dell64`'s attached Windows 11 host (reached directly;
+//! no interop layer sits between this test binary and the `vcd.exe` child
+//! it spawns — both are ordinary native Windows processes talking over a
+//! native `CreatePseudoConsole` pty, confirmed via `tasklist`/`Get-Process`
+//! while a run was in flight). Four real, reproducible findings came out
+//! of getting it there, three of them purely in *this test's own harness
+//! code* rather than anything `vcd.exe` does:
+//!
+//! 1. **RED, unfixed test:** with no responder for the cursor-position
+//!    query (`ESC [ 6 n`) `ratatui::Terminal::new()` sends and blocks on
+//!    during startup, `vcd.exe` never proceeds past it — the very first
+//!    precondition check failed against a blank screen. This is a gap in
+//!    the test (see [`spawn_under_conpty`]'s doc), not evidence of
+//!    anything wrong in `vcd.exe` or `quadraui`.
+//! 2. **A genuine ConPTY-specific deadlock**, found while fixing (1):
+//!    answering the query *synchronously, inline, from within the reader
+//!    thread's read callback* (the same shape quadraui's own
+//!    `tui_pty_smoke.rs` uses for a plain Unix pty, with no issue there)
+//!    wedges the whole ConPTY session solid on real Windows hardware —
+//!    confirmed via `Get-Process ... | Select Threads`: every thread in
+//!    both processes sits in `Wait` state, zero CPU, indefinitely. Moving
+//!    the reply to an independently spawned thread (see
+//!    [`spawn_under_conpty`]'s doc) removes the deadlock with no other
+//!    behaviour change. This is a real Windows-ConPTY input/output-racing
+//!    hazard worth quadraui knowing about if it ever ships its own
+//!    Windows real-pty test tier (the quadraui#302 gap this file's first
+//!    version pointed at) — filing that as a quadraui issue is follow-up
+//!    work, not blocking this one.
+//! 3. **The sidebar is not open by default** when `vcd.exe` is opened
+//!    directly on a *file* (as this test does) — confirmed by hand, the
+//!    first real frame paints the editor and activity bar with an empty
+//!    sidebar column. This test's first version assumed Explorer was
+//!    already the active panel (mirroring the in-process
+//!    `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`
+//!    fixture's *shadow-engine-only* default, which that fixture's own
+//!    comment already flags as not shared by the real runner chrome) and
+//!    failed on that false precondition. Fixed by leading the click
+//!    sequence with Explorer itself, exercising and asserting on its own
+//!    click exactly like every other icon, rather than assuming it.
+//! 4. **Back-to-back synthetic clicks fold into a `DoubleClick`** on real
+//!    hardware, exactly the class `quadraui::tui::backend::TuiBackend`'s
+//!    `DoubleClickDetector` (400ms/1.5-cell window) already causes for the
+//!    in-process mirror fixture (that fixture works around it with a
+//!    test-only `set_double_click_folding(false)` hook with no real-
+//!    terminal equivalent — quadraui#1432). Two of this test's clicks
+//!    landing inside that window silently failed the second one's
+//!    assertion — a real, on-real-ConPTY reproduction of the #1432 class,
+//!    not a new bug. Fixed with an explicit [`DOUBLE_CLICK_MARGIN`] before
+//!    every synthetic click.
+//!
+//! None of the above required a change to `src/` or to `quadraui`. With
+//! all four fixed, this test passed **three consecutive real-hardware
+//! runs** (`dell64`, real ConPTY) — clicking Explorer, Search, Source
+//! Control, Extensions, and Settings each correctly switched the active
+//! panel, decoded from genuine SGR mouse bytes through crossterm's real
+//! Windows console-mode path, ConPTY's VT-to-native translation, and
+//! `App::try_route_sidebar_mouse_event` dispatch, with nothing stubbed.
+//!
+//! # What this means for #1636 itself
+//!
+//! **This is evidence the reported symptom does not reproduce when clicks
+//! are spaced apart**, not a confirmed root cause for what the operator
+//! saw on 2026-09-29. The most plausible innocent explanation this
+//! investigation turned up is finding (4) above: a real user clicking
+//! through several activity-bar icons in quick succession — exactly what
+//! "just trying each icon to see what happens" looks like — can hit the
+//! same double-click fold this test had to route around, and quadraui's
+//! `DoubleClickDetector` has no "activate panel" handler for a
+//! double-click on a plain activity-bar zone (quadraui#1432). That is an
+//! *already-tracked* class, not a new one this PR discovered from
+//! scratch — but this is the first confirmation it reproduces on a real
+//! terminal (ConPTY) rather than only the in-process `TestBackend`
+//! harness quadraui#1432 was filed against.
+//!
+//! **#1636 must stay open.** No production code changed in this PR — the
+//! click-dispatch path (input decoding through `App` dispatch) is
+//! confirmed working correctly end-to-end on real Windows hardware, which
+//! rules out a broken-dispatch explanation, but does not confirm what the
+//! operator actually experienced. Closing #1636 off the back of this PR
+//! would repeat the exact "issue closed, bug still there" failure mode
+//! this repo's own `CLAUDE.md` testing section calls out from the
+//! v0.11.0 `KNOWN_BUGS` incident. The concrete next step is operator
+//! re-confirmation — specifically, whether the icons that "did nothing"
+//! were clicked in quick succession — and, if so, treating #1636 as
+//! resolved by whatever fixes quadraui#1432 (or linking the two) rather
+//! than by anything in this PR.
 #![cfg(windows)]
 
 use std::io::{Read, Write};
@@ -73,13 +158,19 @@ use std::time::{Duration, Instant};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
-/// How long to wait, with no new bytes arriving, before considering the
-/// session "settled" — mirrors `tests/conpty_idle_flicker.rs`'s constant of
-/// the same name/value.
-const QUIET_FOR: Duration = Duration::from_millis(500);
-
-/// Upper bound on how long settling itself may take before this test gives
-/// up and fails outright.
+/// Upper bound on how long this test will wait for any single expected
+/// screen change (startup paint, or a panel switching after a click)
+/// before giving up and failing outright. Generous on purpose: unlike
+/// `tests/conpty_idle_flicker.rs`'s fixed "quiet for 500ms" settle window
+/// (which this file used to mirror — see the module doc's RED/GREEN
+/// section for why that shape doesn't fit here), a cold real-hardware
+/// startup can legitimately *pause* mid-negotiation for longer than any
+/// fixed quiet window before its first real content paint arrives (walking
+/// the isolated home directory for Explorer's listing, loading tree-sitter
+/// grammars, …) — a fixed "no bytes for 500ms ⇒ done" heuristic reads that
+/// pause as completion and checks the screen before the real paint has
+/// happened, RED-verified by hand against this exact file (see the module
+/// doc).
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The pty grid this test opens `vcd.exe` on. Tall/wide enough to fit the
@@ -142,17 +233,43 @@ fn isolated_home() -> PathBuf {
     home
 }
 
+/// `true` if `haystack` contains `needle` anywhere as a contiguous run of
+/// bytes. Mirrors quadraui's own `tui_pty_smoke.rs` helper of the same
+/// name/shape (that file is not `pub`, and lives in a different crate, so
+/// this is a small, deliberate duplication rather than a new dependency).
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Spawn `vcd.exe` under a real ConPTY, opened on `main_rs`, with `cwd` as
 /// its working directory. Returns the child, the `Captured` handle the
 /// background reader thread fills in, and the pty writer used to send
 /// keystrokes/mouse reports.
+///
+/// # Why the reader thread also answers `ESC [ 6 n`
+///
+/// The PTY *master* side plays the role a real terminal emulator plays for
+/// a normal interactive session — including answering the escape-sequence
+/// queries a real terminal answers. `ratatui`'s `Terminal::new()` (via
+/// `quadraui::tui::run::setup_terminal`, which every vimcode TUI entry
+/// point goes through) queries the cursor position (`ESC [ 6 n`, expects
+/// `ESC [ row ; col R` back) during startup and blocks on the reply; a
+/// dumb byte-in/byte-out pty with nothing on the master side to answer
+/// that query leaves `vcd.exe` hung before it ever paints a frame — this
+/// was RED-verified by hand against this exact file before this responder
+/// existed (see the module doc's "RED/GREEN" section). This mirrors
+/// quadraui's own `quadraui/tests/tui_pty_smoke.rs`'s `PtyExample::spawn`
+/// (its struct doc names the identical Ratatui/crossterm behaviour) —
+/// that file cannot be imported (private to quadraui's own crate), so the
+/// same minimal responder is reproduced here rather than pulled in as a
+/// new dependency.
 fn spawn_under_conpty(
     main_rs: &PathBuf,
     home: &PathBuf,
 ) -> (
     Box<dyn portable_pty::Child + Send + Sync>,
     Arc<Mutex<Captured>>,
-    Box<dyn Write + Send>,
+    Arc<Mutex<Box<dyn Write + Send>>>,
     Box<dyn portable_pty::MasterPty + Send>,
 ) {
     let pty_system = native_pty_system();
@@ -182,13 +299,16 @@ fn spawn_under_conpty(
     drop(pair.slave);
 
     let reader = pair.master.try_clone_reader().expect("clone ConPTY reader");
-    let writer = pair.master.take_writer().expect("take ConPTY writer");
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
+        pair.master.take_writer().expect("take ConPTY writer"),
+    ));
 
     let captured = Arc::new(Mutex::new(Captured {
         bytes: Vec::new(),
         last_read_at: Instant::now(),
     }));
     let captured_for_thread = Arc::clone(&captured);
+    let writer_for_thread = Arc::clone(&writer);
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 4096];
@@ -196,9 +316,43 @@ fn spawn_under_conpty(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
+                    let chunk = &buf[..n];
                     let mut c = captured_for_thread.lock().unwrap();
-                    c.bytes.extend_from_slice(&buf[..n]);
+                    c.bytes.extend_from_slice(chunk);
                     c.last_read_at = Instant::now();
+                    drop(c);
+                    // Answer `ESC [ 6 n` (cursor position report) the way a
+                    // real terminal would — see this function's own doc.
+                    // The exact row/col this test claims back is never
+                    // observed by anything downstream (`vcd.exe` always
+                    // enters the alternate screen and repositions its
+                    // cursor with absolute moves for every subsequent
+                    // paint), so a fixed `1;1` is sufficient — quadraui's
+                    // own `tui_pty_smoke.rs` computes a live answer off its
+                    // parsed screen instead, but only because some of its
+                    // scenarios use the *inline* (non-alternate-screen)
+                    // viewport, where the initial answer does matter.
+                    if contains_subslice(chunk, b"\x1b[6n") {
+                        // Reply from a freshly spawned thread, never inline
+                        // in this read loop: a real, reproducible ConPTY
+                        // deadlock (RED-verified by hand — see this
+                        // function's doc) — writing the reply synchronously
+                        // from *within* the callback that just read the
+                        // query wedges the whole ConPTY session on real
+                        // Windows hardware (`dell64`). Unlike a plain Unix
+                        // pty (where quadraui's own `tui_pty_smoke.rs`
+                        // answers inline with no issue), ConPTY appears not
+                        // to tolerate an input write raced against its own
+                        // in-flight output delivery on the same handle
+                        // pair. Handing the write to an independent thread
+                        // removes that race with no other behaviour change.
+                        let w2 = Arc::clone(&writer_for_thread);
+                        std::thread::spawn(move || {
+                            let mut w = w2.lock().unwrap();
+                            let _ = w.write_all(b"\x1b[1;1R");
+                            let _ = w.flush();
+                        });
+                    }
                 }
                 Err(_) => break,
             }
@@ -208,45 +362,40 @@ fn spawn_under_conpty(
     (child, captured, writer, pair.master)
 }
 
-/// Block until no new bytes have arrived for `quiet_for`, or fail (return
-/// `false`) after `timeout` total. Mirrors `conpty_idle_flicker.rs`.
-fn wait_for_quiescence(
+/// Poll the captured byte stream, re-parsing it into `parser` each time,
+/// until [`screen_text`] contains `needle` — or fail (return `false`)
+/// after `timeout` total.
+///
+/// This is the direct-content-polling replacement for the
+/// `conpty_idle_flicker.rs`-style "wait until no bytes arrive for a fixed
+/// quiet window, then check once" pattern this file used before: RED-
+/// verified by hand, on real `dell64` hardware, that the fixed-quiet-window
+/// version fails the very first (startup) assertion even on an otherwise
+/// working build — the negotiation burst (raw-mode/mouse-capture/title)
+/// goes quiet for well over 500ms *before* Explorer's real directory
+/// listing paints, so "quiet ⇒ done" checks the screen too early and never
+/// retries. Polling for the actual expected content sidesteps the whole
+/// "how long is quiet enough" question — it succeeds the moment the real
+/// paint lands, however long that takes, and still fails within a bounded
+/// `timeout` if it never does.
+fn wait_for_screen_contains(
+    parser: &mut vt100::Parser,
     captured: &Arc<Mutex<Captured>>,
-    quiet_for: Duration,
+    fed: &mut usize,
+    needle: &str,
     timeout: Duration,
 ) -> bool {
     let start = Instant::now();
     loop {
-        let quiet_elapsed = captured.lock().unwrap().last_read_at.elapsed();
-        if quiet_elapsed >= quiet_for {
+        sync_parser(parser, captured, fed);
+        if screen_text(parser).contains(needle) {
             return true;
         }
         if start.elapsed() >= timeout {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-/// Render the tail of `bytes` as a debuggable string — printable ASCII
-/// as-is, everything else as `\xHH`. Mirrors `conpty_idle_flicker.rs`.
-fn escape_for_display(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for &b in bytes {
-        match b {
-            0x20..=0x7e => out.push(b as char),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            _ => out.push_str(&format!("\\x{b:02x}")),
-        }
-    }
-    out
-}
-
-fn tail_snapshot(captured: &Arc<Mutex<Captured>>, n: usize) -> Vec<u8> {
-    let c = captured.lock().unwrap();
-    let take = c.bytes.len().min(n);
-    c.bytes[c.bytes.len() - take..].to_vec()
 }
 
 /// Feed every byte captured so far (from `*fed` onward) into `parser`,
@@ -307,22 +456,70 @@ fn find_icon_row(parser: &vt100::Parser, glyph: &str) -> Option<u16> {
     None
 }
 
+/// [`find_icon_row`], polled: re-parses the captured stream and retries
+/// until the glyph is found, or `timeout` elapses. A single one-shot
+/// [`find_icon_row`] call can transiently miss a real activity bar that is
+/// still mid-slide-in (the sidebar toggling open shifts the icon column's
+/// neighbouring content but not, confirmed by hand, the icon column itself
+/// — see [`ICON_COLUMN`]'s own derivation comment for why the icon column
+/// is fixed) for the handful of frames right after `vcd.exe`'s first paint
+/// — RED-verified by hand against this exact file (see the module doc).
+fn wait_for_icon_row(
+    parser: &mut vt100::Parser,
+    captured: &Arc<Mutex<Captured>>,
+    fed: &mut usize,
+    glyph: &str,
+    timeout: Duration,
+) -> Option<u16> {
+    let start = Instant::now();
+    loop {
+        sync_parser(parser, captured, fed);
+        if let Some(row) = find_icon_row(parser, glyph) {
+            return Some(row);
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Two clicks land closer together than this must fold into a single
+/// `DoubleClick` — `quadraui::tui::backend::TuiBackend`'s
+/// `DoubleClickDetector` window is documented as 400ms/1.5 cells
+/// (`quadraui/src/tui/testing.rs`'s doc comments on the same detector), and
+/// a double-click on a plain activity-bar icon zone has no "activate
+/// panel" handler (quadraui#1432 — see the in-process mirror fixture's own
+/// `set_double_click_folding(false)` comment for the identical failure
+/// mode there). A real terminal session has no such test-only override, so
+/// [`send_sgr_click`] pays this margin unconditionally instead — RED-
+/// verified by hand against this exact file: back-to-back clicks with no
+/// gap silently failed the very next icon's assertion, on real ConPTY,
+/// `dell64` hardware (see the module doc).
+const DOUBLE_CLICK_MARGIN: Duration = Duration::from_millis(450);
+
 /// Write a real SGR mouse-click sequence (`CSI < Cb ; Cx ; Cy M` for the
 /// press, lowercase `m` for the release) straight into the ConPTY's input
 /// side, at 1-indexed `(col, row)` — the xterm SGR mouse-tracking protocol
 /// (button 0 = left, no modifiers, no drag), exactly what a real terminal
 /// forwards for a plain left-click. `Cb=0` is `MouseEventKind::Down(Left)`;
-/// the same triple with a lowercase terminator is `Up(Left)`.
-fn send_sgr_click(writer: &mut dyn Write, col: u16, row: u16) {
+/// the same triple with a lowercase terminator is `Up(Left)`. Waits
+/// [`DOUBLE_CLICK_MARGIN`] *before* sending — see that constant's doc.
+fn send_sgr_click(writer: &Arc<Mutex<Box<dyn Write + Send>>>, col: u16, row: u16) {
+    std::thread::sleep(DOUBLE_CLICK_MARGIN);
     let down = format!("\x1b[<0;{};{}M", col + 1, row + 1);
     let up = format!("\x1b[<0;{};{}m", col + 1, row + 1);
-    writer
-        .write_all(down.as_bytes())
-        .expect("write SGR mouse-down");
-    writer.flush().ok();
+    {
+        let mut w = writer.lock().unwrap();
+        w.write_all(down.as_bytes()).expect("write SGR mouse-down");
+        w.flush().ok();
+    }
     std::thread::sleep(Duration::from_millis(30));
-    writer.write_all(up.as_bytes()).expect("write SGR mouse-up");
-    writer.flush().ok();
+    {
+        let mut w = writer.lock().unwrap();
+        w.write_all(up.as_bytes()).expect("write SGR mouse-up");
+        w.flush().ok();
+    }
 }
 
 #[test]
@@ -330,28 +527,29 @@ fn click_on_each_activity_bar_icon_over_real_conpty_opens_its_panel() {
     let home = isolated_home();
     let main_rs = home.join("main.rs");
     std::fs::write(&main_rs, "fn main() {}\n").expect("write main.rs");
-    // Top-level sibling of `main.rs` — Explorer's default root listing shows
-    // it with no expand/reveal action needed, unlike a nested path.
-    let marker_name = "zqxw1636_marker.txt";
-    std::fs::write(home.join(marker_name), "marker").expect("write marker file");
 
-    let (mut child, captured, mut writer, _master) = spawn_under_conpty(&main_rs, &home);
-
-    assert!(
-        wait_for_quiescence(&captured, QUIET_FOR, SETTLE_TIMEOUT),
-        "vcd.exe never went quiet after startup — output kept arriving \
-         continuously for {SETTLE_TIMEOUT:?}; last bytes:\n{}",
-        escape_for_display(&tail_snapshot(&captured, 400))
-    );
+    let (mut child, captured, writer, _master) = spawn_under_conpty(&main_rs, &home);
 
     let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, 0);
     let mut fed = 0usize;
-    sync_parser(&mut parser, &captured, &mut fed);
 
+    // Wait for the first real frame — the status bar's mode indicator,
+    // painted only once the whole chrome (activity bar, editor, status
+    // line) has rendered at least once. `vcd.exe` starts with the sidebar
+    // *collapsed* when opened directly on a file (confirmed by hand,
+    // real ConPTY, `dell64`: the very first frame paints the editor and
+    // activity bar but an empty sidebar column — this test used to assume
+    // Explorer was the default active panel, mirroring the in-process
+    // `driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`
+    // fixture's own *shadow-engine* default; that fixture's own comment
+    // already flags this as a shadow-engine-only default that the real
+    // runner chrome does not share — RED-verified by hand here), so the
+    // Explorer click right below is this test's first real assertion, not
+    // a precondition check.
     assert!(
-        screen_text(&parser).contains(marker_name),
-        "precondition: Explorer is the default active panel, so the marker \
-         file should already be listed at startup; screen:\n{}",
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "NORMAL", SETTLE_TIMEOUT),
+        "vcd.exe never painted its first real frame (status bar's NORMAL \
+         mode indicator) within {SETTLE_TIMEOUT:?}; screen:\n{}",
         screen_text(&parser)
     );
 
@@ -361,7 +559,11 @@ fn click_on_each_activity_bar_icon_over_real_conpty_opens_its_panel() {
     // panel markers mirror the in-process shell-app test's own
     // `click_icon_and_expect` table
     // (`app_on_tui_tests.rs::activity_bar::driver_click_on_every_activity_bar_icon_opens_its_panel_via_shell_app`).
-    let sequence: [(&str, &str, &str); 4] = [
+    // Explorer leads the sequence (rather than being assumed as an
+    // already-showing default, per the comment above) so clicking it is
+    // itself exercised and asserted on, exactly like every other icon.
+    let sequence: [(&str, &str, &str); 5] = [
+        ("\u{229e}", "EXPLORER", "Explorer"),
         ("/", "Replace…", "Search"),
         ("Y", "SOURCE CONTROL", "Source Control"),
         ("#", "EXTENSIONS", "Extensions"),
@@ -369,61 +571,58 @@ fn click_on_each_activity_bar_icon_over_real_conpty_opens_its_panel() {
     ];
 
     for (glyph, marker, label) in sequence {
-        sync_parser(&mut parser, &captured, &mut fed);
-        let row = find_icon_row(&parser, glyph).unwrap_or_else(|| {
-            panic!(
-                "{label} icon (fallback glyph {glyph:?}) not found in the \
-                 activity bar's icon column (x={ICON_COLUMN}); screen:\n{}",
-                screen_text(&parser)
-            )
-        });
+        let row = wait_for_icon_row(&mut parser, &captured, &mut fed, glyph, SETTLE_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{label} icon (fallback glyph {glyph:?}) never appeared in \
+                     the activity bar's icon column (x={ICON_COLUMN}) within \
+                     {SETTLE_TIMEOUT:?}; screen:\n{}",
+                    screen_text(&parser)
+                )
+            });
 
-        send_sgr_click(&mut *writer, ICON_COLUMN, row);
-
-        assert!(
-            wait_for_quiescence(&captured, QUIET_FOR, SETTLE_TIMEOUT),
-            "vcd.exe never went quiet after clicking {label}; last bytes:\n{}",
-            escape_for_display(&tail_snapshot(&captured, 400))
-        );
-        sync_parser(&mut parser, &captured, &mut fed);
+        send_sgr_click(&writer, ICON_COLUMN, row);
 
         assert!(
-            screen_text(&parser).contains(marker),
+            wait_for_screen_contains(&mut parser, &captured, &mut fed, marker, SETTLE_TIMEOUT),
             "clicking the {label} icon (real SGR mouse click over ConPTY at \
              column {ICON_COLUMN}, row {row}) must open its panel — marker \
-             {marker:?} missing; this is #1636's exact symptom (\"harness \
-             test passes; real-terminal path broken\"); screen:\n{}",
+             {marker:?} never appeared within {SETTLE_TIMEOUT:?}; this is \
+             #1636's exact symptom (\"harness test passes; real-terminal \
+             path broken\"); screen:\n{}",
             screen_text(&parser)
         );
     }
 
-    // Explorer last, same reasoning as the in-process mirror test: nothing
-    // else needs clicking afterward.
-    sync_parser(&mut parser, &captured, &mut fed);
-    let explorer_row = find_icon_row(&parser, "\u{229e}").unwrap_or_else(|| {
-        panic!(
-            "Explorer icon (fallback glyph U+229E) not found in the activity \
-             bar's icon column (x={ICON_COLUMN}); screen:\n{}",
-            screen_text(&parser)
-        )
-    });
-    send_sgr_click(&mut *writer, ICON_COLUMN, explorer_row);
+    // Click Explorer once more at the end — it was clicked first (above)
+    // to open it in the first place, so this both leaves the session in a
+    // known state for teardown and re-confirms Explorer's own click still
+    // works after every other panel has taken a turn as the active one.
+    let explorer_row =
+        wait_for_icon_row(&mut parser, &captured, &mut fed, "\u{229e}", SETTLE_TIMEOUT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Explorer icon (fallback glyph U+229E) never appeared in \
+                     the activity bar's icon column (x={ICON_COLUMN}) within \
+                     {SETTLE_TIMEOUT:?}; screen:\n{}",
+                    screen_text(&parser)
+                )
+            });
+    send_sgr_click(&writer, ICON_COLUMN, explorer_row);
     assert!(
-        wait_for_quiescence(&captured, QUIET_FOR, SETTLE_TIMEOUT),
-        "vcd.exe never went quiet after clicking Explorer; last bytes:\n{}",
-        escape_for_display(&tail_snapshot(&captured, 400))
-    );
-    sync_parser(&mut parser, &captured, &mut fed);
-    assert!(
-        screen_text(&parser).contains(marker_name),
+        wait_for_screen_contains(&mut parser, &captured, &mut fed, "EXPLORER", SETTLE_TIMEOUT),
         "clicking the Explorer icon (real SGR mouse click over ConPTY) must \
-         re-open the file tree; marker {marker_name:?} missing; screen:\n{}",
+         re-open the file tree; the \"EXPLORER\" panel header never \
+         reappeared within {SETTLE_TIMEOUT:?}; screen:\n{}",
         screen_text(&parser)
     );
 
     // Best-effort teardown.
-    writer.write_all(b"\x1b:qa!\r").ok();
-    writer.flush().ok();
+    {
+        let mut w = writer.lock().unwrap();
+        w.write_all(b"\x1b:qa!\r").ok();
+        w.flush().ok();
+    }
     let _ = child.try_wait();
     std::thread::sleep(Duration::from_millis(500));
     let _ = child.kill();
