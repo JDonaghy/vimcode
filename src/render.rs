@@ -20425,6 +20425,87 @@ pub fn handle_plugin_view_tab_ui_event(
     true
 }
 
+/// Route a `UiEvent` over a body-kind (`List`/`Tree`/`Table`/`TextView`)
+/// plugin view at `host`, through the matching primitive's click/scroll
+/// resolution instead of `FormController` (#1631). `rect` is the rect the
+/// view was last painted into for this host — only the `Tree` arm needs it
+/// live (a `TreeController` needs a real rect + backend to `handle` against);
+/// `List`/`Table` resolve through their own cached layouts
+/// (`route_plugin_view_list_click`/`route_plugin_view_table_click`) instead.
+///
+/// Shared by both hosts: the sidebar's `ExtPanel` click router and
+/// [`handle_plugin_view_tab_ui_event`]'s caller both dispatch here first —
+/// see `paint_sidebar_panel_rung`'s `ext:` arm and `paint_editor_windows_
+/// rung`'s tab arm for the matching *paint*-side kind branch.
+///
+/// Returns `None` when `name` isn't a body-kind view at all (i.e. it's a
+/// field-stack `Form`), so the caller falls back to the `Form` routing path;
+/// `Some(bool)` otherwise, `true` when the event was consumed.
+pub(crate) fn route_plugin_view_body_event(
+    engine: &mut Engine,
+    name: &str,
+    host: PluginViewHost,
+    event: &quadraui::UiEvent,
+    rect: quadraui::Rect,
+    backend: &mut dyn quadraui::Backend,
+) -> Option<bool> {
+    let kind = engine
+        .plugin_views
+        .get(name)
+        .and_then(|v| v.body.as_ref())
+        .map(|b| b.kind_name());
+    // Positive `delta.y` = scroll content up (toward the top) — the same
+    // convention the sidebar's fallback `Scroll` arm documents.
+    let scroll_step = |delta: &quadraui::ScrollDelta| -> i32 {
+        let step = (delta.y.abs() * 3.0).round().max(1.0) as i32;
+        if delta.y > 0.0 {
+            -step
+        } else {
+            step
+        }
+    };
+    match kind {
+        Some("list") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => route_plugin_view_list_click(engine, name, host, *position, false),
+            quadraui::UiEvent::DoubleClick { position, .. } => {
+                route_plugin_view_list_click(engine, name, host, *position, true)
+            }
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_flat_selection_list(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        Some("tree") => Some(route_plugin_view_tree_event(
+            engine, name, host, true, event, rect, backend,
+        )),
+        Some("table") => Some(match event {
+            quadraui::UiEvent::MouseDown {
+                position,
+                button: quadraui::MouseButton::Left,
+                ..
+            } => route_plugin_view_table_click(engine, name, host, *position, false),
+            quadraui::UiEvent::DoubleClick { position, .. } => {
+                route_plugin_view_table_click(engine, name, host, *position, true)
+            }
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_flat_selection_table(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        Some("text_view") => Some(match event {
+            quadraui::UiEvent::Scroll { delta, .. } => {
+                scroll_plugin_view_text(engine, name, host, scroll_step(delta))
+            }
+            _ => false,
+        }),
+        _ => None,
+    }
+}
+
 /// Decompose a `quadraui::FormEvent` into `(view, plugin-authored field id,
 /// event kind)`, or `None` when the event's widget is not in the plugin
 /// namespace (a Settings field, say) or carries no plugin meaning.
@@ -20509,15 +20590,24 @@ fn plugin_view_body<'a>(engine: &'a Engine, name: &str) -> Option<&'a ViewBody> 
 // ── List ─────────────────────────────────────────────────────────────────
 
 fn plugin_view_to_list(
+    view: &str,
     title: &Option<String>,
     items: &[ViewListItem],
     selected: usize,
     scroll_top: usize,
     has_focus: bool,
 ) -> quadraui::ListView {
+    use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{Decoration, ListItem, ListView, StyledText, WidgetId};
     ListView {
-        id: WidgetId::new("plugin-view-list"),
+        // #1631 review: namespaced like every other plugin-owned id (#146
+        // invariant 4) — a view-scoped body widget, not a shared
+        // long-lived controller like `Engine::plugin_view_tree_controller`
+        // (whose own fixed id names the *host slot*, not the currently
+        // active view; see that field's construction for why it's
+        // different). This `ListView` is rebuilt fresh every paint, so
+        // there is no retained-identity reason to keep it un-namespaced.
+        id: WidgetId::new(namespaced_widget_id(view, "list")),
         title: title.as_deref().map(StyledText::plain),
         items: items
             .iter()
@@ -20554,7 +20644,7 @@ pub(crate) fn paint_plugin_view_list(
     };
     let selected = engine.plugin_view_selected(host);
     let scroll_top = engine.plugin_view_scroll_top(host);
-    let list = plugin_view_to_list(title, items, selected, scroll_top, has_focus);
+    let list = plugin_view_to_list(name, title, items, selected, scroll_top, has_focus);
     backend.draw_list(rect, &list);
     let layout = backend.list_layout(rect, &list);
     let cache = match host {
@@ -20636,6 +20726,10 @@ fn navigate_flat_selection(
     };
     if let Some(new_sel) = new_sel {
         engine.set_plugin_view_selected(host, new_sel);
+        // #1631: without this, `Down`/`End`/`G` can walk `selected` out of
+        // the visible scroll window on a list/table with more rows than fit
+        // the viewport — see `Engine::plugin_view_ensure_visible`'s doc.
+        engine.plugin_view_ensure_visible(host);
         engine.dispatch_plugin_view_event(PluginViewEvent {
             view: name.to_string(),
             widget_id: String::new(),
@@ -20876,9 +20970,15 @@ pub(crate) fn handle_plugin_view_tree_key(
     };
     if let Some(new_idx) = new_idx {
         let path = rows[new_idx].path.clone();
-        controller
-            .borrow_mut()
-            .set_selected_path(Some(path.clone()));
+        // #1631: fixed 20-row viewport guess, same fallback
+        // `Engine::plugin_view_ensure_visible`/`ext_panel_ensure_visible`
+        // use for the List/Table/field-stack cases — without this a
+        // `Down`/`End`/`G` press can walk the selection out of the visible
+        // scroll window with nothing to compensate.
+        let mut tc = controller.borrow_mut();
+        tc.set_selected_path(Some(path.clone()));
+        tc.scroll_to_visible(new_idx, 20);
+        drop(tc);
         let Some(ViewBody::Tree { nodes }) = plugin_view_body(engine, name) else {
             return true;
         };
@@ -20925,6 +21025,7 @@ pub(crate) fn handle_plugin_view_tree_key(
 // ── Table ────────────────────────────────────────────────────────────────
 
 fn plugin_view_to_table(
+    view: &str,
     columns: &[ViewTableColumn],
     rows: &[ViewTableRow],
     selected: usize,
@@ -20932,6 +21033,7 @@ fn plugin_view_to_table(
     has_focus: bool,
     cell_edit: Option<&crate::core::plugin_ui::PluginViewTextEditState>,
 ) -> quadraui::DataTable {
+    use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{Column, ColumnWidth, DataRow, DataTable, Decoration, StyledText, WidgetId};
     let q_columns: Vec<Column> = columns
         .iter()
@@ -20965,7 +21067,10 @@ fn plugin_view_to_table(
         })
         .collect();
     DataTable {
-        id: WidgetId::new("plugin-view-table"),
+        // #1631 review: see `plugin_view_to_list`'s matching comment —
+        // rebuilt fresh every paint, so it's namespaced like every other
+        // plugin-owned id rather than the shared controllers.
+        id: WidgetId::new(namespaced_widget_id(view, "table")),
         columns: q_columns,
         rows: q_rows,
         selected_idx: (!rows.is_empty()).then(|| selected.min(rows.len().saturating_sub(1))),
@@ -21000,7 +21105,9 @@ pub(crate) fn paint_plugin_view_table(
         .plugin_view_text_edit
         .as_ref()
         .filter(|e| e.view == name);
-    let table = plugin_view_to_table(columns, rows, selected, scroll_top, has_focus, cell_edit);
+    let table = plugin_view_to_table(
+        name, columns, rows, selected, scroll_top, has_focus, cell_edit,
+    );
     let layout = backend.draw_data_table(rect, &table, None);
     let cache = match host {
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
@@ -21025,23 +21132,41 @@ pub(crate) fn route_plugin_view_table_click(
         PluginViewHost::Sidebar => &engine.plugin_view_table_layout,
         PluginViewHost::Tab => &engine.plugin_view_tab_table_layout,
     };
-    let Some(ViewBody::Table { rows, .. }) = plugin_view_body(engine, name) else {
+    let Some(ViewBody::Table { columns, rows }) = plugin_view_body(engine, name) else {
         return false;
     };
     let total_rows = rows.len();
     let scroll_offset = engine.plugin_view_scroll_top(host);
-    let idx = {
+    // #1631 review: `DataTableHit` (the pinned quadraui rev's hit-test
+    // result) only ever reports `Row { idx }` — no column component — so a
+    // click's column is resolved separately here from the same per-column
+    // `x`/`width` (`ResolvedColumn`) the layout already carries for
+    // painting, rather than a hand-rolled backend-specific hit-test. Only
+    // an `editable` column is worth recording; a click on a read-only
+    // column leaves the last editable selection alone rather than clearing
+    // it to a column `Enter` could never open anyway.
+    let (idx, col) = {
         let borrowed = cache.borrow();
         let Some((rect, layout)) = borrowed.as_ref() else {
             return false;
         };
-        match layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows) {
+        let idx = match layout.hit_test(pos.x - rect.x, pos.y - rect.y, scroll_offset, total_rows) {
             quadraui::DataTableHit::Row { idx } => Some(idx),
             _ => None,
-        }
+        };
+        let local_x = pos.x - rect.x;
+        let col = layout
+            .columns
+            .iter()
+            .position(|c| local_x >= c.x && local_x < c.x + c.width)
+            .filter(|&c| columns.get(c).is_some_and(|c| c.editable));
+        (idx, col)
     };
     let Some(idx) = idx else { return false };
     engine.set_plugin_view_selected(host, idx);
+    if let Some(col) = col {
+        engine.set_plugin_view_table_col(host, col);
+    }
     engine.dispatch_plugin_view_event(PluginViewEvent {
         view: name.to_string(),
         widget_id: String::new(),
@@ -21062,11 +21187,14 @@ pub(crate) fn route_plugin_view_table_click(
 /// key`/`handle_plugin_view_text_key` (`"Escape"`, `"BackSpace"`, ... — not
 /// `quadraui::Key`), since it is called from the former.
 ///
-/// Not editing: `j`/`k`/arrows move the row selection, `Enter` on a row with
-/// at least one editable column starts editing that column (reusing
-/// `Engine::plugin_view_text_edit`, #1627's model, keyed by
-/// [`table_cell_field_id`]) — a row with no editable column instead emits
-/// `ItemActivated`.
+/// Not editing: `j`/`k`/Up/Down move the row selection, `Left`/`Right` move
+/// the *column* selection among the row's editable columns (when there is
+/// more than one — e.g. #147's "Key"/"Value" pair — so a second `editable`
+/// column is actually reachable, not just accepted by the vocabulary), and
+/// `Enter` on a row with at least one editable column starts editing the
+/// currently-selected one (reusing `Engine::plugin_view_text_edit`, #1627's
+/// model, keyed by [`table_cell_field_id`]) — a row with no editable column
+/// instead emits `ItemActivated`.
 ///
 /// Editing: character keys insert, `BackSpace`/`Left`/`Right` edit/move the
 /// cursor, `Enter` commits (`CellEdited`) and ends editing, `Escape` cancels
@@ -21091,13 +21219,35 @@ pub(crate) fn handle_plugin_view_table_key(
     // call `engine.dispatch_plugin_view_event`/`navigate_flat_selection`,
     // which need `&mut Engine`.
     let rows_len = rows.len();
-    let editable_col = columns.iter().position(|c| c.editable);
+    // Every column marked `editable`, in declaration order — not just the
+    // first one (#1631 review: a table author who marks two columns
+    // editable could previously never reach the second).
+    let editable_cols: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.editable)
+        .map(|(i, _)| i)
+        .collect();
+    // The engine's stored column selection, clamped to the nearest actually-
+    // editable column — a stale value (a `ui.refresh` that dropped a column,
+    // or the field's untouched `0` default when column 0 isn't editable)
+    // never panics or points at a non-editable column, it just falls back to
+    // `editable_cols[0]`.
+    let current_col = |engine: &Engine| -> Option<usize> {
+        let raw = engine.plugin_view_table_col(host);
+        if editable_cols.contains(&raw) {
+            Some(raw)
+        } else {
+            editable_cols.first().copied()
+        }
+    };
     let cell_value = |sel: usize, col: usize| -> String {
         rows.get(sel)
             .and_then(|r| r.cells.get(col))
             .cloned()
             .unwrap_or_default()
     };
+    let editable_col = current_col(engine);
     let cell_value = if let Some(col) = editable_col {
         let sel = engine
             .plugin_view_selected(host)
@@ -21166,11 +21316,19 @@ pub(crate) fn handle_plugin_view_table_key(
                 true
             }
         }
-    } else if let (true, Some(col)) = (matches!(key, "Return" | "Enter"), editable_col) {
+    } else if let (true, true, Some(col)) = (
+        rows_len > 0,
+        matches!(key, "Return" | "Enter"),
+        editable_col,
+    ) {
         // Checked *before* `navigate_flat_selection` (which also treats
         // `Enter` as `ItemActivated`) — a row with an editable column starts
         // editing on Enter instead of activating, and `navigate_flat_
         // selection`'s own `Enter` arm would otherwise always win first.
+        // `rows_len > 0` guards a table with an editable column but zero
+        // rows (#1631 review) — without it, `sel`'s `saturating_sub(1)`
+        // clamp let Enter "edit" a row 0 that was never declared, which
+        // could later dispatch `CellEdited { row: 0, .. }` for it.
         let sel = engine
             .plugin_view_selected(host)
             .min(rows_len.saturating_sub(1));
@@ -21182,6 +21340,21 @@ pub(crate) fn handle_plugin_view_table_key(
             selection_anchor: None,
             value,
         });
+        true
+    } else if matches!(key, "Left" | "Right") && editable_cols.len() > 1 {
+        // Column selection among the row's editable columns — checked
+        // before `navigate_flat_selection` (which doesn't handle Left/Right
+        // at all, so this can't shadow anything there). A single (or zero)
+        // editable column has nothing to move between, so the key falls
+        // through unconsumed rather than becoming a no-op `true`.
+        let cur = editable_col.and_then(|c| editable_cols.iter().position(|&x| x == c));
+        let cur = cur.unwrap_or(0);
+        let next = if key == "Left" {
+            cur.saturating_sub(1)
+        } else {
+            (cur + 1).min(editable_cols.len() - 1)
+        };
+        engine.set_plugin_view_table_col(host, editable_cols[next]);
         true
     } else {
         navigate_flat_selection(engine, name, host, rows_len, key)
@@ -21209,10 +21382,12 @@ pub(crate) fn scroll_plugin_view_flat_selection_table(
 // ── TextView ─────────────────────────────────────────────────────────────
 
 fn plugin_view_to_text_display(
+    view: &str,
     text: &str,
     scroll_top: usize,
     has_focus: bool,
 ) -> quadraui::TextDisplay {
+    use crate::core::plugin_ui::namespaced_widget_id;
     use quadraui::{StyledSpan, TextDisplay, TextDisplayLine, WidgetId};
     let lines: Vec<TextDisplayLine> = text
         .split('\n')
@@ -21223,7 +21398,8 @@ fn plugin_view_to_text_display(
         })
         .collect();
     TextDisplay {
-        id: WidgetId::new("plugin-view-text"),
+        // #1631 review: see `plugin_view_to_list`'s matching comment.
+        id: WidgetId::new(namespaced_widget_id(view, "text")),
         lines,
         scroll_offset: scroll_top,
         auto_scroll: false,
@@ -21248,7 +21424,7 @@ pub(crate) fn paint_plugin_view_text(
         return false;
     };
     let scroll_top = engine.plugin_view_scroll_top(host);
-    let display = plugin_view_to_text_display(text, scroll_top, has_focus);
+    let display = plugin_view_to_text_display(name, text, scroll_top, has_focus);
     backend.draw_text_display(rect, &display);
     true
 }

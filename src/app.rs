@@ -1891,6 +1891,39 @@ impl App {
         if self.route_and_apply_editor_hover_popup(backend, x, y) {
             return;
         }
+        // ── Editor-tab-hosted plugin view double-click (#1631) ─────────
+        //
+        // Mirrors `handle_mouse_click_msg`'s tab-hosted press routing: a
+        // body-kind view's `List`/`Table` row activates (`ItemActivated`)
+        // rather than just selecting, and a field-stack `Form` falls back
+        // to `render::handle_plugin_view_tab_ui_event` exactly as the press
+        // handler does (that function's own `DoubleClick` arm probes it as
+        // a `MouseDown` for `FormController`).
+        if let Some((name, rect)) = self.plugin_view_tab_hit(x, y) {
+            let mut engine = self.engine.borrow_mut();
+            engine.clear_sidebar_focus();
+            let event = quadraui::UiEvent::DoubleClick {
+                widget: None,
+                position: quadraui::Point::new(x as f32, y as f32),
+            };
+            let backend_rc = self.backend.clone();
+            let mut b = backend_rc.borrow_mut();
+            let consumed = render::route_plugin_view_body_event(
+                &mut engine,
+                &name,
+                PluginViewHost::Tab,
+                &event,
+                rect,
+                &mut **b,
+            );
+            drop(b);
+            if consumed.is_none() {
+                render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+            }
+            drop(engine);
+            self.draw_needed.set(true);
+            return;
+        }
         let mut engine = self.engine.borrow_mut();
         if engine.picker_open {
             let in_tree_mode = engine.picker_source
@@ -1980,6 +2013,47 @@ impl App {
             drop(engine);
             self.draw_needed.set(true);
             return;
+        }
+        // ── Editor-tab-hosted plugin view scroll (#1631) ───────────────
+        //
+        // Mirrors the press/double-click tab routing in
+        // `handle_mouse_click_msg`/`handle_mouse_double_click_msg`: a wheel
+        // notch over a body-kind view's window scrolls its own content
+        // instead of falling through to the generic per-window viewport
+        // scroll below, and a field-stack `Form` falls back to
+        // `render::handle_plugin_view_tab_ui_event` the same way those two
+        // handlers do. `delta_y` is negated back to quadraui's polarity —
+        // see this function's own doc comment — since `route_plugin_view_
+        // body_event`'s `Scroll` arm (shared with the sidebar's already-
+        // quadraui-polarity `UiEvent`s) expects it.
+        if delta_y.abs() > 0.01 {
+            if let Some((px, py)) = self.last_editor_pointer.get() {
+                if let Some((name, rect)) = self.plugin_view_tab_hit(px, py) {
+                    engine.clear_sidebar_focus();
+                    let event = quadraui::UiEvent::Scroll {
+                        widget: None,
+                        position: quadraui::Point::new(px as f32, py as f32),
+                        delta: quadraui::ScrollDelta::new(delta_x as f32, -(delta_y as f32)),
+                    };
+                    let backend_rc = self.backend.clone();
+                    let mut b = backend_rc.borrow_mut();
+                    let consumed = render::route_plugin_view_body_event(
+                        &mut engine,
+                        &name,
+                        PluginViewHost::Tab,
+                        &event,
+                        rect,
+                        &mut **b,
+                    );
+                    drop(b);
+                    if consumed.is_none() {
+                        render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    }
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
+                }
+            }
         }
         // Route scroll through dispatch_scroll using cached scroll surfaces.
         if let Some((px, py)) = self.last_editor_pointer.get() {
@@ -3065,6 +3139,27 @@ impl App {
             .get()
             .map(|(r, _)| r.x)
             .unwrap_or(0.0)
+    }
+
+    /// Resolve `(x, y)` against the currently-painted `screen.windows`,
+    /// returning the name and rect of the editor-tab-hosted plugin view
+    /// under it, if any (#1627, #1631).
+    ///
+    /// Shared by every mouse route that needs to know whether a pixel
+    /// belongs to a `vimcode.ui.register_view` view opened as an editor-area
+    /// tab (`Engine::open_plugin_view_tab`) — press, double-click and wheel
+    /// alike — so the three routes can't disagree about which window a
+    /// pixel landed in. Walks the same `screen.windows` rects `click.rs`
+    /// itself resolves clicks against.
+    fn plugin_view_tab_hit(&self, x: f64, y: f64) -> Option<(String, quadraui::Rect)> {
+        self.cached_screen_layout.borrow().as_ref().and_then(|l| {
+            l.windows.iter().find_map(|w| {
+                let name = w.plugin_view.clone()?;
+                let rect: quadraui::Rect = w.rect.into();
+                rect.contains(quadraui::Point::new(x as f32, y as f32))
+                    .then_some((name, rect))
+            })
+        })
     }
 
     /// Both divider lists for the frame just painted, plus whether `(x, y)`
@@ -5363,29 +5458,25 @@ impl App {
                     }
                 }
 
-                // ── Editor-tab-hosted plugin view click (#1627) ────────────
+                // ── Editor-tab-hosted plugin view click (#1627, #1631) ─────
                 //
                 // A `vimcode.ui.register_view` view opened as an editor-area
-                // tab (`Engine::open_plugin_view_tab`) paints a `Form`, not
-                // buffer text (`App::paint_editor_windows_rung`) — a click
-                // inside its window rect has no buffer-click meaning for
-                // `click::handle_mouse_click` to resolve (no cursor to place,
-                // no file to reveal), so it's routed through the same
-                // `FormController` path the sidebar uses
-                // (`render::handle_plugin_view_tab_ui_event`) instead, before
-                // falling into the generic buffer-click block below. Walks
-                // the same `screen.windows` rects `click.rs` itself resolves
-                // clicks against, so the two can't disagree about which
-                // window a click landed in.
-                let plugin_view_hit = self.cached_screen_layout.borrow().as_ref().and_then(|l| {
-                    l.windows.iter().find_map(|w| {
-                        let name = w.plugin_view.clone()?;
-                        let rect: quadraui::Rect = w.rect.into();
-                        rect.contains(quadraui::Point::new(x as f32, y as f32))
-                            .then_some((name, rect))
-                    })
-                });
-                if let Some((name, rect)) = plugin_view_hit {
+                // tab (`Engine::open_plugin_view_tab`) paints either a
+                // `Form` or a body-kind primitive (`List`/`Tree`/`Table`/
+                // `TextView`), not buffer text (`App::paint_editor_windows_
+                // rung`) — a click inside its window rect has no
+                // buffer-click meaning for `click::handle_mouse_click` to
+                // resolve (no cursor to place, no file to reveal), so it's
+                // routed through `render::route_plugin_view_body_event`
+                // first (the same body-kind router the sidebar's `ExtPanel`
+                // arm uses) and, when that reports the view is a
+                // field-stack `Form` instead (`None`), through
+                // `render::handle_plugin_view_tab_ui_event` — before falling
+                // into the generic buffer-click block below.
+                // `Self::plugin_view_tab_hit` walks the same `screen.windows`
+                // rects `click.rs` itself resolves clicks against, so the
+                // two can't disagree about which window a click landed in.
+                if let Some((name, rect)) = self.plugin_view_tab_hit(x, y) {
                     let mut engine = self.engine.borrow_mut();
                     engine.clear_sidebar_focus();
                     let event = quadraui::UiEvent::MouseDown {
@@ -5394,7 +5485,20 @@ impl App {
                         position: quadraui::Point::new(x as f32, y as f32),
                         modifiers: quadraui::Modifiers::default(),
                     };
-                    render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    let backend_rc = self.backend.clone();
+                    let mut b = backend_rc.borrow_mut();
+                    let consumed = render::route_plugin_view_body_event(
+                        &mut engine,
+                        &name,
+                        PluginViewHost::Tab,
+                        &event,
+                        rect,
+                        &mut **b,
+                    );
+                    drop(b);
+                    if consumed.is_none() {
+                        render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    }
                     drop(engine);
                     self.draw_needed.set(true);
                     return;
@@ -6749,122 +6853,26 @@ impl App {
                 match event {
                     // #1631: a `ViewBody`-kind view routes through its own
                     // matching primitive's click/scroll resolution instead
-                    // of `FormController` — see the paint arm
-                    // (`paint_sidebar_panel_rung`'s `ext:` case) for the
-                    // matching kind branch.
+                    // of `FormController` — `render::route_plugin_view_body_
+                    // event`, shared with the tab-hosted arm below. See the
+                    // paint arm (`paint_sidebar_panel_rung`'s `ext:` case)
+                    // for the matching kind branch.
                     _ if is_view => {
                         let name = engine.ext_panel_active.clone().unwrap_or_default();
-                        let kind = engine
-                            .plugin_views
-                            .get(&name)
-                            .and_then(|v| v.body.as_ref())
-                            .map(|b| b.kind_name());
-                        // Positive `delta.y` = scroll content up (toward the
-                        // top) — the same convention the fallback `Scroll`
-                        // arm below documents.
-                        let scroll_step = |delta: &quadraui::ScrollDelta| -> i32 {
-                            let step = (delta.y.abs() * 3.0).round().max(1.0) as i32;
-                            if delta.y > 0.0 {
-                                -step
-                            } else {
-                                step
-                            }
-                        };
-                        match kind {
-                            Some("list") => match event {
-                                UiEvent::MouseDown {
-                                    position,
-                                    button: quadraui::MouseButton::Left,
-                                    ..
-                                } => {
-                                    render::route_plugin_view_list_click(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        *position,
-                                        false,
-                                    );
-                                }
-                                UiEvent::DoubleClick { position, .. } => {
-                                    render::route_plugin_view_list_click(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        *position,
-                                        true,
-                                    );
-                                }
-                                UiEvent::Scroll { delta, .. } => {
-                                    render::scroll_plugin_view_flat_selection_list(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        scroll_step(delta),
-                                    );
-                                }
-                                _ => {}
-                            },
-                            Some("tree") => {
-                                let rect = engine.plugin_view_form_rect.get();
-                                let backend_rc = self.backend.clone();
-                                let mut b = backend_rc.borrow_mut();
-                                render::route_plugin_view_tree_event(
-                                    &mut engine,
-                                    &name,
-                                    PluginViewHost::Sidebar,
-                                    true,
-                                    event,
-                                    rect,
-                                    &mut **b,
-                                );
-                            }
-                            Some("table") => match event {
-                                UiEvent::MouseDown {
-                                    position,
-                                    button: quadraui::MouseButton::Left,
-                                    ..
-                                } => {
-                                    render::route_plugin_view_table_click(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        *position,
-                                        false,
-                                    );
-                                }
-                                UiEvent::DoubleClick { position, .. } => {
-                                    render::route_plugin_view_table_click(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        *position,
-                                        true,
-                                    );
-                                }
-                                UiEvent::Scroll { delta, .. } => {
-                                    render::scroll_plugin_view_flat_selection_table(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        scroll_step(delta),
-                                    );
-                                }
-                                _ => {}
-                            },
-                            Some("text_view") => {
-                                if let UiEvent::Scroll { delta, .. } = event {
-                                    render::scroll_plugin_view_text(
-                                        &mut engine,
-                                        &name,
-                                        PluginViewHost::Sidebar,
-                                        scroll_step(delta),
-                                    );
-                                }
-                            }
-                            _ => {
-                                let rect = engine.plugin_view_form_rect.get();
-                                render::handle_plugin_view_ui_event(&mut engine, event, rect);
-                            }
+                        let rect = engine.plugin_view_form_rect.get();
+                        let backend_rc = self.backend.clone();
+                        let mut b = backend_rc.borrow_mut();
+                        let consumed = render::route_plugin_view_body_event(
+                            &mut engine,
+                            &name,
+                            PluginViewHost::Sidebar,
+                            event,
+                            rect,
+                            &mut **b,
+                        );
+                        drop(b);
+                        if consumed.is_none() {
+                            render::handle_plugin_view_ui_event(&mut engine, event, rect);
                         }
                     }
                     UiEvent::Scroll { delta, .. } => {

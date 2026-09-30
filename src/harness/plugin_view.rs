@@ -81,6 +81,16 @@ pub const LIST_ROW1_IDLE: &str = "Lr1idl1631";
 /// detail span "when there isn't room past the main text" (`tui::list`'s
 /// module doc), and the sidebar body in this fixture's viewport is narrow.
 pub const LIST_DETAIL: &str = "D1";
+/// Row count of the `List` fixture — deliberately more than any real
+/// viewport (sidebar or tab) fits, so a keyboard walk to the last row
+/// (#1631 review: selection must scroll to stay visible) actually needs a
+/// scroll to see it, rather than coincidentally already fitting on screen
+/// the way the original 2-item fixture always did.
+pub const LIST_OVERFLOW_COUNT: usize = 80;
+/// The last row's painted text — the fixture's `render` gives every row
+/// from index 2 onward a generic `"Lx{{i}}1631"` label except the very
+/// last one, which gets this distinctive tag instead.
+pub const LIST_LAST_ROW: &str = "LlastROW1631";
 
 /// `Tree` fixture needles.
 pub const TREE_FOLDER_CLOSED: &str = "Fd1631CLS";
@@ -95,6 +105,13 @@ pub const TABLE_ROW0_VALUE: &str = "Hv01631";
 pub const TABLE_ROW1_KEY: &str = "Hk11631";
 pub const TABLE_ROW1_VALUE: &str = "Hv11631";
 pub const TABLE_EDITED: &str = "EDITED1631";
+/// Painted when `CellEdited{{row: 0, col: 1, ...}}` reaches the plugin — the
+/// *second* editable column (#1631 review: without column selection, Enter
+/// could only ever reach column 0).
+/// Short on purpose — same column-budget trap `LIST_DETAIL`'s doc comment
+/// names (`TABLE_EDITED`'s own "Key"/"Value" column is narrow enough that a
+/// longer needle gets ellipsis-truncated and never matches exactly).
+pub const TABLE_EDITED_COL1: &str = "EDC1631";
 
 /// `TextView` fixture needles — first and last of 50 generated lines, far
 /// enough apart that only one is visible at a time on a narrow viewport.
@@ -115,13 +132,20 @@ vimcode.ui.register_view("{LIST_VIEW}", {{
     local function tag(i)
       if i == list_sel then return "SEL" else return "idl" end
     end
+    local items = {{
+      {{ id = "r0", text = "Lr0" .. tag(0) .. "1631" }},
+      {{ id = "r1", text = "Lr1" .. tag(1) .. "1631", detail = "{LIST_DETAIL}" }},
+    }}
+    -- #1631 review: more rows than any real viewport fits, so a keyboard
+    -- walk to the last row needs an actual scroll to see it.
+    for i = 2, {LIST_OVERFLOW_COUNT} - 2 do
+      items[#items + 1] = {{ id = "r" .. i, text = "Lx" .. i .. "1631" }}
+    end
+    items[#items + 1] = {{ id = "rlast", text = "{LIST_LAST_ROW}" }}
     return {{
       kind = "list",
       title = "{LIST_TITLE}",
-      items = {{
-        {{ id = "r0", text = "Lr0" .. tag(0) .. "1631" }},
-        {{ id = "r1", text = "Lr1" .. tag(1) .. "1631", detail = "{LIST_DETAIL}" }},
-      }},
+      items = items,
     }}
   end,
   on_event = function(ctx, event)
@@ -160,7 +184,8 @@ vimcode.ui.register_view("{TABLE_VIEW}", {{
         {{ title = "{TABLE_COL_VALUE}", editable = true }},
       }},
       rows = {{
-        {{ id = "h0", cells = {{ "{TABLE_ROW0_KEY}",
+        {{ id = "h0", cells = {{
+           last_edit == "0:1" and "{TABLE_EDITED_COL1}" or "{TABLE_ROW0_KEY}",
            last_edit == "0:0" and "{TABLE_EDITED}" or "{TABLE_ROW0_VALUE}" }} }},
         {{ id = "h1", cells = {{ "{TABLE_ROW1_KEY}", "{TABLE_ROW1_VALUE}" }} }},
       }},
@@ -183,6 +208,14 @@ vimcode.ui.register_view("{TEXT_VIEW}", {{
     return {{ kind = "text_view", text = table.concat(lines, "\n"), filetype = "json" }}
   end,
 }})
+
+-- #1631 review: a real `:Command` around `vimcode.ui.open_view` for the
+-- `List`-kind view, mirroring `Zq146OpenTab` above — exercises the
+-- editor-tab-hosted body-kind click/scroll routing this review round added
+-- (`render::route_plugin_view_body_event`), not just the sidebar's.
+vimcode.command("Zq1631ListOpenTab", function()
+  vimcode.ui.open_view("{LIST_VIEW}", {{ location = "tab" }})
+end)
 "#
     )
 }
@@ -406,6 +439,31 @@ pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
     (engine, dir)
 }
 
+/// Tab twin of [`engine_with_plugin_view_tab`] for a body-kind view (#1631
+/// review) — `command` is the fixture's own `:Command` name for opening
+/// `view` as a tab (e.g. `"Zq1631ListOpenTab"` for [`LIST_VIEW`]).
+pub fn engine_with_named_plugin_view_tab(view: &str, command: &str) -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    let before_tabs = engine.active_group().tabs.len();
+    assert!(
+        engine.plugin_run_command(command, ""),
+        "fixture plugin must register the {command:?} command"
+    );
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        before_tabs + 1,
+        "{command:?} must open {view:?} as a new tab"
+    );
+    (engine, dir)
+}
+
 // ── Shared scenario bodies ──────────────────────────────────────────────
 
 /// Every painted text run, for failure messages — a missing needle is nearly
@@ -577,6 +635,38 @@ pub fn tab_paints_and_click_reaches_the_plugin_handler(driver: &mut impl Conform
     );
 }
 
+/// Scenario 5b (#1631 review) — a body-kind (`List`) view opened as an
+/// editor-area tab reaches mouse clicks exactly like its sidebar twin
+/// ([`list_paints_and_click_selects_the_right_index`]) does: a click on a
+/// row selects it, reaching the plugin as `ItemSelected{{index}}`.
+///
+/// Fails against a `develop` without the review fix: `handle_mouse_click_
+/// msg`'s tab-hosted arm called `render::handle_plugin_view_tab_ui_event`
+/// unconditionally, which builds a field-stack `Form` with zero fields for
+/// a body-kind view (`view.fields` is empty whenever `body` is `Some`) —
+/// every click on the tab would be silently swallowed and
+/// [`LIST_ROW1_SEL`] would never paint.
+pub fn list_tab_click_selects_the_right_index(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[LIST_TITLE, LIST_ROW0_SEL, LIST_ROW1_IDLE],
+        "the editor-tab-hosted list-kind view's initial paint",
+    );
+    driver.click_text(LIST_ROW1_IDLE);
+    assert!(
+        driver.screen_has(LIST_ROW1_SEL),
+        "clicking row 1 in the editor-tab-hosted list must select it \
+         (ItemSelected{{index: 1}}); painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(LIST_ROW0_IDLE),
+        "row 0 must no longer be selected after row 1 was clicked; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+}
+
 /// Scenario 6 (#1627) — closing an editor-tab-hosted plugin view's tab
 /// removes it, exactly like any other tab.
 ///
@@ -639,6 +729,34 @@ pub fn list_key_navigation_selects_the_right_index(driver: &mut impl Conformance
         driver.screen_has(LIST_ROW1_SEL),
         "Down must select row 1 (ItemSelected{{index: 1}}); painted runs were \
          {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 8b (#1631 review) — walking the selection all the way to the
+/// last of [`LIST_OVERFLOW_COUNT`] rows (far more than any real viewport
+/// fits) must scroll the list to keep the selection visible.
+///
+/// Fails against a `develop` without the review fix: `navigate_flat_
+/// selection` moved `selected` on every `Down` but never adjusted
+/// `scroll_top`/called `Engine::plugin_view_ensure_visible`, so the
+/// highlighted row would walk off the bottom of the viewport with nothing
+/// to compensate — [`LIST_LAST_ROW`] would never scroll into view.
+pub fn list_down_key_navigation_keeps_selection_visible(driver: &mut impl ConformanceDriver) {
+    assert!(driver.screen_has(LIST_ROW0_SEL));
+    assert!(
+        !driver.screen_has(LIST_LAST_ROW),
+        "precondition: with {LIST_OVERFLOW_COUNT} rows in a narrow viewport, \
+         the last row must not already be visible; painted runs were {:?}",
+        painted(driver)
+    );
+    for _ in 0..LIST_OVERFLOW_COUNT - 1 {
+        driver.press_named(quadraui::NamedKey::Down);
+    }
+    assert!(
+        driver.screen_has(LIST_LAST_ROW),
+        "walking Down to the last row must scroll the list to keep the \
+         selection visible; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -706,6 +824,42 @@ pub fn table_paints_and_enter_commits_a_cell_edit(driver: &mut impl ConformanceD
         !driver.screen_has(TABLE_ROW0_VALUE),
         "the stale cell value must not still be painted after the commit; \
          painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 10b (#1631 review) — a table author who marks *more than one*
+/// column `editable` (e.g. #147's "Key"/"Value" pair, which this fixture's
+/// `{TABLE_VIEW}` mirrors exactly) can reach the second editable column
+/// too, not just the first: `Right` moves the column selection before
+/// `Enter` starts editing.
+///
+/// Fails against a `develop` without the review fix: `handle_plugin_view_
+/// table_key` resolved `editable_col` as `columns.iter().position(|c|
+/// c.editable)` unconditionally — always column 0 — with no `Left`/`Right`
+/// handling at all, so `Right` would be a no-op and the following two
+/// `Enter`s would edit column 0 again, never painting
+/// [`TABLE_EDITED_COL1`].
+pub fn table_right_key_reaches_the_second_editable_column(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[TABLE_ROW0_KEY, TABLE_ROW0_VALUE],
+        "the table-kind view's initial paint",
+    );
+    driver.press_named(quadraui::NamedKey::Right);
+    driver.press_named(quadraui::NamedKey::Enter);
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(TABLE_EDITED_COL1),
+        "Right then two Enters must start and commit an edit on column 1 \
+         (the second editable column), reaching the plugin as \
+         CellEdited{{row: 0, col: 1, ...}}; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TABLE_EDITED),
+        "column 0 must be untouched — only column 1 was ever selected for \
+         editing; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -796,6 +950,22 @@ mod tests {
         (h, dir)
     }
 
+    /// #1631 review: editor-tab fixture for a named body-kind view (TUI arm).
+    fn tui_named_tab(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view_tab(view, command);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
     #[test]
     fn plugin_view_list_paints_and_click_selects_the_right_index_on_tui() {
         let (mut h, _dir) = tui_named(LIST_VIEW);
@@ -809,6 +979,18 @@ mod tests {
     }
 
     #[test]
+    fn plugin_view_list_down_key_navigation_keeps_selection_visible_on_tui() {
+        let (mut h, _dir) = tui_named(LIST_VIEW);
+        list_down_key_navigation_keeps_selection_visible(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_list_tab_click_selects_the_right_index_on_tui() {
+        let (mut h, _dir) = tui_named_tab(LIST_VIEW, "Zq1631ListOpenTab");
+        list_tab_click_selects_the_right_index(&mut h.driver);
+    }
+
+    #[test]
     fn plugin_view_tree_paints_collapsed_and_enter_expands_it_on_tui() {
         let (mut h, _dir) = tui_named(TREE_VIEW);
         tree_paints_collapsed_and_enter_expands_it(&mut h.driver);
@@ -818,6 +1000,12 @@ mod tests {
     fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_tui() {
         let (mut h, _dir) = tui_named(TABLE_VIEW);
         table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_table_right_key_reaches_the_second_editable_column_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_right_key_reaches_the_second_editable_column(&mut h.driver);
     }
 
     #[test]
@@ -904,6 +1092,23 @@ mod tests {
         (h, dir)
     }
 
+    /// #1631 review: editor-tab fixture for a named body-kind view (GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_named_tab(
+        view: &str,
+        command: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view_tab(view, command);
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
     #[cfg(feature = "gui")]
     #[test]
     fn plugin_view_list_paints_and_click_selects_the_right_index_on_gtk() {
@@ -920,6 +1125,20 @@ mod tests {
 
     #[cfg(feature = "gui")]
     #[test]
+    fn plugin_view_list_down_key_navigation_keeps_selection_visible_on_gtk() {
+        let (mut h, _dir) = gtk_named(LIST_VIEW);
+        list_down_key_navigation_keeps_selection_visible(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_list_tab_click_selects_the_right_index_on_gtk() {
+        let (mut h, _dir) = gtk_named_tab(LIST_VIEW, "Zq1631ListOpenTab");
+        list_tab_click_selects_the_right_index(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
     fn plugin_view_tree_paints_collapsed_and_enter_expands_it_on_gtk() {
         let (mut h, _dir) = gtk_named(TREE_VIEW);
         tree_paints_collapsed_and_enter_expands_it(&mut h.driver);
@@ -930,6 +1149,13 @@ mod tests {
     fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_gtk() {
         let (mut h, _dir) = gtk_named(TABLE_VIEW);
         table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_right_key_reaches_the_second_editable_column_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_right_key_reaches_the_second_editable_column(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]
