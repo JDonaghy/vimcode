@@ -3953,6 +3953,7 @@ dependencies = [
  "notify",
  "pangocairo",
  "png",
+ "portable-pty",
  "pulldown-cmark",
  "quadraui",
  "ratatui",
