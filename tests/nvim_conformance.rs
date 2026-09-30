@@ -295,6 +295,66 @@ const RPC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// to miss 250ms would fail the surrounding test suite on its own.
 const RPC_KEY_BARRIER: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Fold one `msg_show` UI notification into the echo-area text accumulated so
+/// far, honouring the event's own `append` flag.
+///
+/// `parts` is the event exactly as it arrives on the wire — `["msg_show",
+/// [args…], [args…], …]`, one trailing array per batched call, the same
+/// batching `win_viewport` uses (see [`NvimRpc::absorb_notification`]). Each
+/// call's args, confirmed against this suite's own oracle via
+/// `vim.fn.api_info().ui_events` on nvim 0.12.5, are:
+///
+/// ```text
+/// [kind, content, replace_last, history, append, id, trigger]
+/// ```
+///
+/// `content` is an array of `[attr_id, text, hl_id]` triples — one per
+/// *highlight run*, not one per line, so a multi-line listing's own `\n`s are
+/// already inside the triples' text (`:digraphs` arrives as ~2,700 triples).
+///
+/// **`append` is load-bearing, and ignoring it is what #1635's test stage
+/// tripped over.** Neovim accumulates a message's chunks in `msg_ext_chunks`
+/// and emits them on the next `ui_flush()`, which normally lands after the
+/// whole command has finished — so nearly every case in [`CASES_MESSAGE`]
+/// arrives as a single `msg_show` with `append = false`, and "last write
+/// wins" was indistinguishable from correct. But a command whose output is
+/// long enough to hit a `ui_flush()` *part-way through* (via the periodic
+/// `os_breakcheck` on the output path) emits its message split across several
+/// `msg_show` calls, every one after the first carrying `append = true`,
+/// meaning "this continues the message the previous call started" rather than
+/// "this is a new message". Whether that split happens is a function of how
+/// busy the machine is, so the biggest message in the suite — the
+/// ~19KB `:digraphs` table — passes on an idle box and reports a *truncated*
+/// table under load, which reads as a digraph-table conformance deviation
+/// that no amount of staring at `src/core/digraphs.rs` can explain.
+///
+/// `replace_last = true` ("replace the most recent `msg_show`") and the
+/// default `append = false` both mean "start over", which is precisely
+/// `engine.message`'s own last-write-wins model on the vimcode side; only
+/// `append` needs to concatenate. `id`/`trigger` are ignored: within one
+/// probe there is never more than one message in flight for them to
+/// disambiguate.
+fn fold_msg_show(last: &mut String, parts: &[Value]) {
+    for call in parts.iter().skip(1) {
+        let Value::Array(args) = call else { continue };
+        let Some(Value::Array(content)) = args.get(1) else {
+            continue;
+        };
+        let mut text = String::new();
+        for chunk in content {
+            let Value::Array(chunk) = chunk else { continue };
+            if let Some(t) = chunk.get(1).and_then(Value::as_str) {
+                text.push_str(t);
+            }
+        }
+        if args.get(4).and_then(Value::as_bool).unwrap_or(false) {
+            last.push_str(&text);
+        } else {
+            *last = text;
+        }
+    }
+}
+
 /// A minimal synchronous msgpack-RPC client for one `nvim --embed` process.
 ///
 /// msgpack-RPC has exactly three frame shapes and this speaks all three:
@@ -326,13 +386,9 @@ struct NvimRpc {
     /// `msg_clear` — only populated when [`NvimRpc::spawn`] requested the
     /// `ext_messages` capability (#1282, [`oracle_probe_message`]).
     ///
-    /// `msg_show`'s wire shape (batched the same way `win_viewport` is, see
-    /// [`NvimRpc::absorb_notification`]) is `[kind, content, replace_last,
-    /// history, append, ...]`, where `content` is an array of `[attr_id,
-    /// text, hl_id]` triples — one per highlight run, **not** one per line
-    /// (a `:marks`-style multi-line listing arrives as a handful of triples
-    /// whose own text already contains `\n`). Concatenating every triple's
-    /// text in order, replacing the whole thing on each new event, mirrors
+    /// See [`fold_msg_show`] for the wire shape and for why a new event
+    /// usually *replaces* this text but an `append`-flagged one must extend
+    /// it. Concatenating every content triple's text in order mirrors
     /// `engine.message`'s own "last write wins, no highlight spans" model on
     /// the vimcode side exactly — confirmed against a live
     /// `nvim --headless -u NONE -i NONE` for `ga`, `g8`, `<C-g>`, `:ls`,
@@ -480,22 +536,7 @@ impl NvimRpc {
             // own doc comment for the wire shape and why this concatenation
             // is right.
             match parts.first().and_then(Value::as_str) {
-                Some("msg_show") => {
-                    for call in parts.iter().skip(1) {
-                        let Value::Array(args) = call else { continue };
-                        let Some(Value::Array(content)) = args.get(1) else {
-                            continue;
-                        };
-                        let mut text = String::new();
-                        for chunk in content {
-                            let Value::Array(chunk) = chunk else { continue };
-                            if let Some(t) = chunk.get(1).and_then(Value::as_str) {
-                                text.push_str(t);
-                            }
-                        }
-                        self.last_message = text;
-                    }
-                }
+                Some("msg_show") => fold_msg_show(&mut self.last_message, parts),
                 Some("msg_clear") => self.last_message.clear(),
                 _ => {}
             }
@@ -1533,17 +1574,260 @@ fn run_message_case(case: &MessageCase) -> Outcome {
         return Outcome::Pass;
     }
     Outcome::Fail(format!(
-        "[{}] keys={:?} start={:?}@({},{})\n  message: nvim={:?} vimcode={:?}\n  normalized: nvim={:?} vimcode={:?}",
+        "[{}] keys={:?} start={:?}@({},{})\n{}",
         case.label,
         case.keys,
         case.lines,
         case.cursor_line,
         case.cursor_col,
-        nvim_msg,
-        vc_msg,
-        nvim_norm,
-        vc_norm,
+        describe_message_diff(&nvim_msg, &vc_msg, &nvim_norm, &vc_norm),
     ))
+}
+
+/// Above this many characters a normalized message is reported as a
+/// line-oriented diff rather than dumped whole.
+///
+/// The short cases this suite is mostly made of (`ga`, `<C-g>`, `:pwd`) are
+/// clearest read in full, so the threshold is well above them; the point is
+/// only to stop the handful of *listing* commands from burying their own
+/// verdict. `:digraphs` alone normalizes to ~19KB, and reporting a
+/// single-line difference in it as four `{:?}`-escaped 19KB blobs on one
+/// line — which is what this function replaced — is why #1635's test stage
+/// could report "the digraph-table check failed" and nothing more.
+const MESSAGE_DIFF_INLINE_LIMIT: usize = 400;
+
+/// Human-readable account of *how* two message probes disagree.
+///
+/// Small messages are dumped whole, raw and normalized, exactly as before.
+/// Large ones get their shape (line and character counts) plus the first
+/// differing line from each side and, when the difference is a truncation
+/// rather than a rewrite, an explicit note saying so — the two failure modes
+/// need completely different follow-up (a real formatting deviation in
+/// `src/core/` versus a harness/oracle transport problem like the split
+/// `msg_show` [`fold_msg_show`] documents), and telling them apart must not
+/// require re-running the suite by hand.
+fn describe_message_diff(nvim_msg: &str, vc_msg: &str, nvim_norm: &str, vc_norm: &str) -> String {
+    if nvim_norm.chars().count() <= MESSAGE_DIFF_INLINE_LIMIT
+        && vc_norm.chars().count() <= MESSAGE_DIFF_INLINE_LIMIT
+    {
+        return format!(
+            "  message: nvim={nvim_msg:?} vimcode={vc_msg:?}\n  normalized: nvim={nvim_norm:?} vimcode={vc_norm:?}"
+        );
+    }
+    let nvim_lines: Vec<&str> = nvim_norm.lines().collect();
+    let vc_lines: Vec<&str> = vc_norm.lines().collect();
+    let first_diff = nvim_lines
+        .iter()
+        .zip(vc_lines.iter())
+        .position(|(a, b)| a != b);
+    let mut out = format!(
+        "  normalized shape: nvim={} lines/{} chars  vimcode={} lines/{} chars\n",
+        nvim_lines.len(),
+        nvim_norm.chars().count(),
+        vc_lines.len(),
+        vc_norm.chars().count(),
+    );
+    match first_diff {
+        Some(i) => {
+            out.push_str(&format!(
+                "  first differing line (0-based {i} of {} common):\n    nvim   ={:?}\n    vimcode={:?}\n",
+                nvim_lines.len().min(vc_lines.len()),
+                nvim_lines[i],
+                vc_lines[i],
+            ));
+        }
+        None => {
+            // Every line they have in common matches, so one side simply
+            // stops early. That is the signature of a truncated capture, not
+            // of a formatting deviation.
+            let (longer, shorter, who) = if nvim_lines.len() > vc_lines.len() {
+                (&nvim_lines, &vc_lines, "vimcode")
+            } else {
+                (&vc_lines, &nvim_lines, "nvim")
+            };
+            out.push_str(&format!(
+                "  no line differs in the {} they share — {who}'s message stops {} line(s) early, i.e. one side is TRUNCATED, not formatted differently. First missing line: {:?}\n",
+                shorter.len(),
+                longer.len() - shorter.len(),
+                longer.get(shorter.len()).copied().unwrap_or(""),
+            ));
+            out.push_str(
+                "  A truncated *nvim* capture is a harness/transport fault, not a vimcode deviation — see `fold_msg_show`.\n",
+            );
+        }
+    }
+    out.push_str(&format!(
+        "  (full text suppressed above {MESSAGE_DIFF_INLINE_LIMIT} chars; re-run with PROBE_VERBOSE=1 and PROBE_FILTER=<label> to see the case alone)"
+    ));
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Message-probe transport self-tests (#1635). These assert on the two pieces
+// of the echo-area probe that sit *between* the two editors and so cannot be
+// checked by any conformance case: how a `msg_show` notification is folded
+// into the captured message, and what a mismatch actually reports. A bug in
+// either is indistinguishable, from the outside, from a real Vim-compat
+// deviation in `src/core/` — which is exactly the trap #1635's test stage
+// fell into when a split `:digraphs` message read as a digraph-table
+// deviation.
+// ---------------------------------------------------------------------------
+
+/// Build a `msg_show` notification frame's event part: `["msg_show", [args…]]`
+/// with a single-chunk `content`, for the folding tests below.
+fn msg_show_event(text: &str, replace_last: bool, append: bool) -> Vec<Value> {
+    vec![
+        Value::from("msg_show"),
+        Value::Array(vec![
+            Value::from(""), // kind
+            Value::Array(vec![Value::Array(vec![
+                Value::from(0u64),
+                Value::from(text),
+                Value::from(0u64),
+            ])]),
+            Value::Boolean(replace_last),
+            Value::Boolean(false), // history
+            Value::Boolean(append),
+        ]),
+    ]
+}
+
+/// The bug behind #1635's reported "digraph-table conformance check" failure:
+/// Neovim splits a long enough message across several `msg_show` calls, every
+/// one after the first flagged `append`, and a fold that treats each call as
+/// a fresh message keeps only the **last fragment** — a silently truncated
+/// oracle capture that reads as a formatting deviation.
+///
+/// Fails against the pre-fix fold (`self.last_message = text` unconditionally)
+/// with only `"CD 3    "` captured.
+#[test]
+fn an_append_flagged_msg_show_continues_the_previous_message() {
+    let mut last = String::new();
+    fold_msg_show(&mut last, &msg_show_event("AB 1    ", false, false));
+    fold_msg_show(&mut last, &msg_show_event("CD 3    ", false, true));
+    assert_eq!(
+        last, "AB 1    CD 3    ",
+        "an `append`-flagged msg_show must extend the message in flight, not \
+         replace it — otherwise a long listing (`:digraphs`) is captured \
+         truncated whenever the machine is busy enough to make Neovim flush \
+         part-way through the output"
+    );
+}
+
+/// The same split arriving batched inside **one** notification (the wire
+/// shape `absorb_notification`'s "one trailing array per batched call"
+/// comment describes) must fold identically.
+#[test]
+fn a_batched_append_split_folds_the_same_as_separate_notifications() {
+    let mut batched = vec![Value::from("msg_show")];
+    batched.push(msg_show_event("first ", false, false).remove(1));
+    batched.push(msg_show_event("second", false, true).remove(1));
+    let mut last = String::new();
+    fold_msg_show(&mut last, &batched);
+    assert_eq!(last, "first second");
+}
+
+/// The flip side, so the fix cannot be "always concatenate": with `append`
+/// false a new message *replaces* the old one, which is `engine.message`'s
+/// own last-write-wins model and what every single-message case in
+/// [`CASES_MESSAGE`] relies on. `replace_last` means the same thing here.
+#[test]
+fn msg_show_without_append_replaces_the_previous_message() {
+    let mut last = String::new();
+    fold_msg_show(&mut last, &msg_show_event("stale message", false, false));
+    fold_msg_show(&mut last, &msg_show_event("fresh message", false, false));
+    assert_eq!(last, "fresh message");
+    fold_msg_show(&mut last, &msg_show_event("corrected", true, false));
+    assert_eq!(last, "corrected");
+}
+
+/// A `msg_show` whose args are too short to carry an `append` field (an older
+/// oracle, or a future reshuffle) must degrade to the old replace behaviour
+/// rather than panic on the missing index.
+#[test]
+fn msg_show_missing_the_append_field_falls_back_to_replacing() {
+    let mut last = "previous".to_string();
+    let short = vec![
+        Value::from("msg_show"),
+        Value::Array(vec![
+            Value::from(""),
+            Value::Array(vec![Value::Array(vec![
+                Value::from(0u64),
+                Value::from("only"),
+            ])]),
+        ]),
+    ];
+    fold_msg_show(&mut last, &short);
+    assert_eq!(last, "only");
+}
+
+/// A mismatch on a listing-sized message must report a *bounded, readable*
+/// verdict. The pre-fix report was four `{:?}`-escaped copies of two ~19KB
+/// blobs on a single line, which is why #1635's test stage could say no more
+/// than "the digraph-table check failed".
+#[test]
+fn a_large_message_mismatch_reports_the_first_differing_line_not_two_blobs() {
+    let nvim: String = (0..600)
+        .map(|i| format!("row {i} value\n"))
+        .collect::<String>();
+    let mut vc_lines: Vec<String> = (0..600).map(|i| format!("row {i} value")).collect();
+    vc_lines[417] = "row 417 WRONG".to_string();
+    let vc = vc_lines.join("\n") + "\n";
+    let report = describe_message_diff(&nvim, &vc, &nvim, &vc);
+    assert!(
+        report.contains("first differing line (0-based 417"),
+        "must name where they diverge: {report}"
+    );
+    assert!(
+        report.contains("row 417 WRONG"),
+        "must show the offending line itself: {report}"
+    );
+    assert!(
+        report.chars().count() < 1000,
+        "a {}-char message must not be reported as a multi-KB blob; got {} chars",
+        nvim.chars().count(),
+        report.chars().count()
+    );
+}
+
+/// A truncated capture and a formatting deviation demand different follow-up,
+/// so the report must distinguish them by name — the missing signpost that
+/// sent #1635's test stage looking for a digraph-table bug that was not
+/// there.
+#[test]
+fn a_truncated_large_message_is_reported_as_truncation_not_deviation() {
+    let full: String = (0..600)
+        .map(|i| format!("row {i} value\n"))
+        .collect::<String>();
+    let cut: String = (0..420)
+        .map(|i| format!("row {i} value\n"))
+        .collect::<String>();
+    let report = describe_message_diff(&cut, &full, &cut, &full);
+    assert!(
+        report.contains("TRUNCATED"),
+        "must say the difference is a truncation: {report}"
+    );
+    assert!(
+        report.contains("180 line(s) early"),
+        "must quantify the shortfall: {report}"
+    );
+    assert!(
+        report.contains("fold_msg_show"),
+        "must point at the transport, not at src/core: {report}"
+    );
+}
+
+/// Short cases — the great majority — keep the full raw + normalized dump
+/// they have always had, since reading them whole is strictly clearer than
+/// any diff of them.
+#[test]
+fn a_small_message_mismatch_is_still_dumped_in_full() {
+    let report = describe_message_diff("<hello> 5", "<hello> 6", "<hello> 5", "<hello> 6");
+    assert!(report.contains("message: nvim=\"<hello> 5\""), "{report}");
+    assert!(
+        report.contains("normalized: nvim=\"<hello> 5\" vimcode=\"<hello> 6\""),
+        "{report}"
+    );
 }
 
 // One real case per id from #1282's echo-area/message-list list. Each `keys`
