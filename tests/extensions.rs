@@ -5661,6 +5661,71 @@ fn async_shell_reimplemented_on_spawn_keeps_legacy_behaviour_and_gains_exit_stat
     );
 }
 
+/// #1624 review (blocking): `vimcode.async_shell`'s optional `stdin` write
+/// must not block the calling thread — the engine/main thread when this
+/// runs for real, and this test's own thread here, since `exec()` dispatches
+/// the command (and, inline within the same call, `Engine::apply_plugin_ctx`
+/// -> `execute::spawn_piped`) synchronously.
+///
+/// The child (`sleep 0.5 && cat`) deliberately does not read a single byte
+/// of stdin for 500ms, and the written payload (256KiB) is comfortably
+/// larger than the ~64KiB default Linux pipe buffer — so a `write_all` that
+/// ran inline on the caller's thread would block for a large fraction of
+/// that 500ms waiting for the child to start draining. `exec()` returning
+/// in well under that (a generous 200ms budget) is only possible if the
+/// write happens on its own background thread instead.
+///
+/// RED-verified against `execute::spawn_piped` reverted to write inline
+/// (`pipe.write_all` called directly on `stdin.as_mut()` before returning,
+/// instead of moving the pipe into a spawned thread): this does not merely
+/// run slower, it **deadlocks outright** and had to be killed after
+/// exceeding a 120s bound — the inline write blocks this thread before the
+/// stdout/stderr reader threads further down `spawn_piped` ever get spawned,
+/// so `cat`'s own stdout pipe fills up with nowhere to drain to, and `cat`
+/// blocks writing it while we're blocked writing its stdin. Exactly the
+/// classic pipe deadlock the review named, reproduced for real.
+#[test]
+#[cfg(unix)]
+fn async_shell_large_stdin_write_does_not_block_the_calling_thread() {
+    let big_stdin = "A".repeat(256 * 1024);
+    let mut e = engine_with_plugin(
+        "",
+        "async_shell_big_stdin_1624",
+        r#"
+        _G.big_stdin = string.rep("A", 256 * 1024)
+        vimcode.command("RunBigStdin", function(_)
+            vimcode.async_shell("sleep 0.5 && cat", "big_stdin_done_1624", { stdin = _G.big_stdin })
+        end)
+        vimcode.on("big_stdin_done_1624", function(output)
+            vimcode.message("len=" .. #output)
+        end)
+        "#,
+    );
+
+    let before = std::time::Instant::now();
+    exec(&mut e, "RunBigStdin");
+    let dispatch_elapsed = before.elapsed();
+    assert!(
+        dispatch_elapsed < std::time::Duration::from_millis(200),
+        "dispatching :RunBigStdin must return promptly — the {}-byte stdin \
+         write must happen off the calling thread, not block it while the \
+         child (which sleeps 500ms before reading anything) drains it; \
+         actual elapsed: {dispatch_elapsed:?}",
+        big_stdin.len()
+    );
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(15), |e| {
+        e.message == format!("len={}", big_stdin.len())
+    });
+    assert!(
+        reached,
+        "the large stdin payload must still fully reach the child and be \
+         echoed back once it starts draining, even though the write ran \
+         off-thread; last message: {:?}",
+        e.message
+    );
+}
+
 #[test]
 #[cfg(unix)]
 fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
@@ -5710,4 +5775,140 @@ fn unloading_plugin_stops_its_timers_and_spawns_from_calling_back() {
         "no timer/spawn callback belonging to the unloaded plugin may fire \
          after it is replaced"
     );
+}
+
+/// Whether the process named `pid` is still alive, probed with `kill -0`
+/// through `/bin/sh` (same reasoning as this file's other spawn tests
+/// already depending on `/bin/sh` being present) rather than pulling in a
+/// signals crate just for this one check.
+#[cfg(unix)]
+fn pid_is_alive(pid: i32) -> bool {
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build a bare [`vimcode_core::core::plugin::PluginManager`] (not yet
+/// installed on any `Engine`) with `lua_code` loaded from a temp dir named
+/// `plugin_name`. Companion to [`engine_with_plugin`] for tests that need to
+/// control exactly when the manager is installed (here: to land it and its
+/// very first `vimcode.loop.spawn` registration with nothing — not even one
+/// `poll_idle` tick — in between).
+#[cfg(unix)]
+fn plugin_manager_with(
+    plugin_name: &str,
+    lua_code: &str,
+) -> vimcode_core::core::plugin::PluginManager {
+    let dir = std::env::temp_dir().join(format!("vc_plugin_api_{plugin_name}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{plugin_name}.lua")), lua_code).unwrap();
+    let mut mgr = vimcode_core::core::plugin::PluginManager::new().expect("PluginManager::new");
+    mgr.load_plugins_dir(&dir, &[]);
+    mgr
+}
+
+/// #1624 review (blocking): a manager swap must not let the id-0 collision
+/// between the outgoing and incoming `PluginManager` generations
+/// (`PluginManager::next_handle_id` restarts at 0 for every fresh manager,
+/// while `Engine::plugin_spawns` is one `HashMap` that outlives any single
+/// generation) silently drop a still-live `vimcode.loop.spawn` handle
+/// without ever calling `child.kill()` on it.
+///
+/// Reproduces the exact sequence the review describes: manager A registers
+/// a spawn (getting id 0), then — with **no intervening `poll_idle` tick**,
+/// so the old purely-lazy `Weak`-upgrade cleanup in `poll_plugin_timers`/
+/// `poll_plugin_spawns` never gets a chance to run first — manager B is
+/// installed and immediately registers its own first spawn, which also
+/// gets id 0 and lands in the very same `HashMap` slot.
+///
+/// Manager A's child is a `while :; do :; done` busy-loop built entirely of
+/// shell builtins: it never forks a separate grandchild (so `kill()`ing the
+/// direct child genuinely stops everything — a plain PID-liveness probe is
+/// the correct black-box signal here) and, unlike a child blocked reading
+/// its own stdin, it does not exit merely because the engine-held
+/// `ChildStdin` end happens to get dropped when its `PluginSpawnHandle` is
+/// overwritten — it only stops when actually killed, which is exactly the
+/// distinction this test needs to catch a silent map-slot overwrite. If the
+/// id-0 slot is silently overwritten instead of reaped first, that child is
+/// never killed and keeps running for as long as this whole test process
+/// does.
+///
+/// RED-verified: with `Engine::set_plugin_manager`'s synchronous
+/// `reap_stale_plugin_timers_and_spawns` call removed (restoring the
+/// purely-lazy, poll-tick-only cleanup this issue's review flagged), this
+/// fails — manager A's child is still alive at the end of the bounded wait,
+/// because manager B's spawn insert silently replaced the map slot before
+/// anything ever reaped A's entry.
+#[test]
+#[cfg(unix)]
+fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
+    let pidfile =
+        std::env::temp_dir().join(format!("vc_1624_collision_pid_{}", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+
+    let mut e = engine_with_plugin(
+        "",
+        "spawn_collision_a_1624",
+        &format!(
+            r#"
+            vimcode.command("StartOrphan", function(_)
+                vimcode.loop.spawn("/bin/sh", {{ "-c", "echo $$ > {path}; while :; do :; done" }})
+            end)
+            "#,
+            path = pidfile.display()
+        ),
+    );
+    exec(&mut e, "StartOrphan");
+
+    let wrote = poll_until(&mut e, std::time::Duration::from_secs(5), |_| {
+        pidfile.exists()
+    });
+    assert!(
+        wrote,
+        "setup: manager A's spawned child must record its own pid before \
+         the manager swap"
+    );
+    let pid: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("child must have written a plain integer pid");
+    assert!(
+        pid_is_alive(pid),
+        "setup: manager A's spawned child must actually be running before \
+         the swap"
+    );
+
+    // Install manager B and have it register its own first spawn (id 0,
+    // colliding with A's still-live id-0 entry) with *no* `e.poll_idle()`
+    // call anywhere in between — the exact window the review's finding
+    // describes.
+    let mgr_b = plugin_manager_with(
+        "spawn_collision_b_1624",
+        r#"
+        vimcode.command("StartNew", function(_)
+            vimcode.loop.spawn("/bin/sh", { "-c", "true" })
+        end)
+        "#,
+    );
+    e.set_plugin_manager(mgr_b);
+    exec(&mut e, "StartNew");
+
+    // `kill()` itself is synchronous, but the OS reaping a signalled
+    // process is not instantaneous — bounded poll, not a fixed sleep.
+    let dead = poll_until(&mut e, std::time::Duration::from_secs(2), |_| {
+        !pid_is_alive(pid)
+    });
+    assert!(
+        dead,
+        "manager A's spawned child (pid {pid}) must be killed when its \
+         owning plugin manager is replaced, even though manager B's own \
+         first spawn reused the exact same handle id"
+    );
+
+    let _ = std::fs::remove_file(&pidfile);
 }

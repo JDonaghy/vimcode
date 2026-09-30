@@ -4497,6 +4497,11 @@ pub struct Engine {
     /// the process was killed/errored without a code (e.g. a signal death);
     /// absent means no result has landed yet for that event.
     pub(crate) async_shell_last_exit: HashMap<String, Option<i32>>,
+    /// Insertion-order FIFO of `async_shell_last_exit`'s keys, so that map
+    /// can be bounded (`Engine::record_async_shell_exit`) instead of growing
+    /// for the life of the session when a plugin uses a unique/dynamic
+    /// callback_event name per `async_shell` call.
+    async_shell_last_exit_order: VecDeque<String>,
 
     // --- Plugin loop API: timers/schedule/defer/spawn (#1624) ---
     /// Live `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer`
@@ -5377,6 +5382,7 @@ impl Engine {
             blame_rx: None,
             async_shell_tasks: HashMap::new(),
             async_shell_last_exit: HashMap::new(),
+            async_shell_last_exit_order: VecDeque::new(),
             plugin_timers: HashMap::new(),
             plugin_timer_seq: 0,
             plugin_spawns: HashMap::new(),

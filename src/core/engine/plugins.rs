@@ -10,6 +10,21 @@ const MAX_DEFERRED_PLUGIN_EVENTS: usize = 64;
 /// more events.
 const MAX_DEFERRED_DRAIN_ROUNDS: usize = 8;
 
+/// Upper bound on [`Engine::PluginSpawnEvent`]s drained per
+/// `poll_plugin_spawns` tick, across every live `vimcode.loop.spawn` handle
+/// combined (#1624 review, non-blocking). Without this, a child that
+/// produces output faster than its `on_stdout` Lua callback can be invoked
+/// (e.g. a plugin spawning `yes`, or any high-throughput producer) could
+/// make a single tick drain an unbounded backlog, starving the main thread —
+/// same reasoning as [`MAX_DEFERRED_DRAIN_ROUNDS`] above. Any events left in
+/// a handle's channel past the cap are simply picked up on the next tick —
+/// nothing is dropped, only deferred.
+const MAX_SPAWN_EVENTS_PER_TICK: usize = 256;
+
+/// Upper bound on `Engine::async_shell_last_exit`'s size — see
+/// `Engine::record_async_shell_exit`'s doc for why this exists.
+const MAX_ASYNC_SHELL_LAST_EXIT_ENTRIES: usize = 256;
+
 impl Engine {
     // =========================================================================
     // Plugin system
@@ -39,7 +54,54 @@ impl Engine {
             km.keys = expand_leader_tokens(km.keys, &leader);
             self.user_keymaps.push(km);
         }
+        // Replace the manager, then drop the outgoing `Rc` before reaping —
+        // see `Self::reap_stale_plugin_timers_and_spawns`'s doc for why this
+        // ordering (rather than the previous purely-lazy, poll-tick-driven
+        // cleanup) is what closes the #1624 review's id-collision finding.
+        let old_manager = self.plugin_manager.take();
         self.plugin_manager = Some(std::rc::Rc::new(mgr));
+        drop(old_manager);
+        self.reap_stale_plugin_timers_and_spawns();
+    }
+
+    /// Remove (and, for spawns, kill) every `plugin_timers`/`plugin_spawns`
+    /// entry whose owning `PluginManager` is no longer reachable. Called
+    /// synchronously from [`Self::set_plugin_manager`], right after
+    /// installing the new manager and dropping the old one.
+    ///
+    /// #1624 review (blocking): `PluginManager::next_handle_id` restarts at
+    /// 0 for every fresh manager, while `plugin_timers`/`plugin_spawns` are
+    /// single `HashMap`s that persist across manager generations. Cleanup
+    /// used to be entirely lazy — done only inside `poll_plugin_timers`/
+    /// `poll_plugin_spawns` on the *next* `poll_idle` tick — so a plugin
+    /// reload (`plugin_init()`, called mid-session by extension
+    /// install/uninstall and `:PluginEnable`/`:PluginDisable`) could install
+    /// a manager whose very first `vimcode.loop.timer`/`vimcode.loop.spawn`
+    /// call reused id 0 *before* that next tick ran, silently overwriting
+    /// (via `HashMap::insert`) the previous generation's still-live id-0
+    /// entry — for a spawn, dropping its `PluginSpawnHandle` (and the
+    /// `Arc<Mutex<Child>>` inside it) without ever calling `child.kill()`,
+    /// leaking an orphaned child process. Reaping here, before any new
+    /// registration can happen (nothing in `mgr.load_plugins_dir` above can
+    /// call the immediate API — there is no live engine loan yet — so the
+    /// earliest a fresh manager can register anything is *after* this
+    /// method returns), closes the race instead of merely narrowing it.
+    fn reap_stale_plugin_timers_and_spawns(&mut self) {
+        self.plugin_timers
+            .retain(|_, entry| entry.manager.upgrade().is_some());
+        let dead_spawns: Vec<u64> = self
+            .plugin_spawns
+            .iter()
+            .filter(|(_, handle)| handle.manager.upgrade().is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_spawns {
+            if let Some(handle) = self.plugin_spawns.remove(&id) {
+                if let Ok(mut child) = handle.child.lock() {
+                    let _ = child.kill();
+                }
+            }
+        }
     }
 
     // ── Plugin-declared UI views (#146) ────────────────────────────────────
@@ -1289,10 +1351,33 @@ impl Engine {
         }
         for (event, output, code) in completed {
             self.async_shell_tasks.remove(&event);
-            self.async_shell_last_exit.insert(event.clone(), code);
+            self.record_async_shell_exit(event.clone(), code);
             self.plugin_event(&event, &output);
         }
         true
+    }
+
+    /// Record `event`'s exit code for `vimcode.async_shell_exit_code`,
+    /// bounding `Engine::async_shell_last_exit`'s size (#1624 review,
+    /// non-blocking). Without a cap, a plugin that generates a unique or
+    /// otherwise ever-changing `callback_event` name per `async_shell` call
+    /// would grow this map unboundedly for the life of the session — every
+    /// entry is only ever overwritten by a later run of the *same* event
+    /// name, never pruned. `async_shell_last_exit_order` tracks insertion
+    /// order (a plain FIFO, not a true LRU: re-recording an existing event
+    /// does not move it to the back) purely so *some* bound exists; exactly
+    /// which entry gets evicted once at the cap is not a contract plugins
+    /// should rely on.
+    fn record_async_shell_exit(&mut self, event: String, code: Option<i32>) {
+        if !self.async_shell_last_exit.contains_key(&event) {
+            self.async_shell_last_exit_order.push_back(event.clone());
+            while self.async_shell_last_exit_order.len() > MAX_ASYNC_SHELL_LAST_EXIT_ENTRIES {
+                if let Some(oldest) = self.async_shell_last_exit_order.pop_front() {
+                    self.async_shell_last_exit.remove(&oldest);
+                }
+            }
+        }
+        self.async_shell_last_exit.insert(event, code);
     }
 
     // ─── `vimcode.loop.timer`/`vimcode.schedule`/`vimcode.defer` (#1624) ────
@@ -1517,7 +1602,8 @@ impl Engine {
         }
         let ids: Vec<u64> = self.plugin_spawns.keys().copied().collect();
         let mut redraw = false;
-        for id in ids {
+        let mut events_this_tick = 0usize;
+        'handles: for id in ids {
             let alive = self
                 .plugin_spawns
                 .get(&id)
@@ -1536,6 +1622,14 @@ impl Engine {
                 .get(&id)
                 .and_then(|h| h.rx.try_recv().ok())
             {
+                if events_this_tick >= MAX_SPAWN_EVENTS_PER_TICK {
+                    // Bounded per-tick drain (#1624 review, non-blocking):
+                    // leave the rest for the next `poll_idle` tick instead
+                    // of starving the main thread on a high-throughput
+                    // producer.
+                    break 'handles;
+                }
+                events_this_tick += 1;
                 let mut exited = false;
                 let ctx = self.make_plugin_ctx(true);
                 let applied =
