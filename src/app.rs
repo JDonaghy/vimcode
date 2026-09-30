@@ -4659,7 +4659,11 @@ impl App {
             }
             render::PickerRoute::Consume => {}
             render::PickerRoute::Dismiss => {
-                self.engine.borrow_mut().close_picker();
+                // #1630 review: clicking away from a `vimcode.picker.open`
+                // picker is a user-initiated cancel exactly like Escape —
+                // use the same helper so `on_cancel` fires and the plugin's
+                // registration is released instead of leaking forever.
+                self.engine.borrow_mut().close_picker_cancelling_plugin();
                 backend.modal_stack_handle().borrow_mut().pop(&picker_id);
             }
         }

@@ -6299,3 +6299,119 @@ fn picker_unload_closes_open_picker() {
         "unloading the owning plugin must close its still-open picker"
     );
 }
+
+/// #1630 review (blocking): a plugin calling `vimcode.picker.open` again
+/// while a previous handle from the same plugin is still open — the natural
+/// telescope-style pattern (a command re-invoked on every keystroke) — must
+/// not leave the old registration (`on_select`/`on_cancel`/`on_query` plus
+/// every item's `data`) registered forever. `open_picker` blows away
+/// `picker_all_items`/`picker_source` with no idea a plugin picker used to
+/// own them, so `plugin_api_picker_open` must tear the old one down itself
+/// before registering the new one.
+///
+/// RED-verified against this fix reverted (dropping the `plugin_picker_
+/// teardown` call `plugin_api_picker_open` now makes for its own previous
+/// registration): this fails with a registration count of `2` after the
+/// second `Open`, proving the first handle's callbacks/item `data` are
+/// still registered and permanently unreachable.
+#[test]
+fn picker_reopen_supersedes_without_leaking_old_registration() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_reopen_1630",
+        r#"
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({
+                items = { { display = "alpha" } },
+                on_cancel = function() end,
+            })
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert_eq!(
+        e.plugin_manager
+            .as_ref()
+            .unwrap()
+            .picker_registration_count(),
+        1,
+        "precondition: the first Open registers exactly one picker"
+    );
+
+    exec(&mut e, "Open");
+
+    assert!(e.picker_open, "the second Open must still open a picker");
+    assert_eq!(
+        e.plugin_manager
+            .as_ref()
+            .unwrap()
+            .picker_registration_count(),
+        1,
+        "a fresh vimcode.picker.open call must tear down the previous \
+         still-registered handle from the same plugin, not leak it \
+         alongside the new one"
+    );
+}
+
+/// #1630 review (blocking): a non-Escape path that dismisses a plugin-owned
+/// picker (GTK's click-outside-to-dismiss, `render::PickerRoute::Dismiss` in
+/// `src/app.rs`) must fire `on_cancel` and release the picker's registration
+/// exactly like Escape does, instead of calling `close_picker()` directly
+/// and leaking it forever. `Engine::close_picker_cancelling_plugin` is the
+/// shared helper both Escape's `handle_picker_key` arm and that GTK path now
+/// call through — exercised directly here since `tests/extensions.rs` has no
+/// GTK click harness.
+///
+/// RED-verified against this fix reverted (restoring `close_picker_
+/// cancelling_plugin` to a bare `self.close_picker()`): this fails on both
+/// assertions — `on_cancel` never fires (`_G.cancelled` stays `false`) and
+/// the registration count stays `1` instead of dropping to `0`.
+#[test]
+fn close_picker_cancelling_plugin_fires_on_cancel_and_releases_registration() {
+    let mut e = engine_with_plugin(
+        "",
+        "picker_dismiss_1630",
+        r#"
+        _G.cancelled = false
+        vimcode.command("Open", function(_)
+            vimcode.picker.open({
+                items = { { display = "alpha" } },
+                on_cancel = function() _G.cancelled = true end,
+            })
+        end)
+        vimcode.command("Read", function(_)
+            vimcode.message(tostring(_G.cancelled))
+        end)
+        "#,
+    );
+    exec(&mut e, "Open");
+    assert!(e.picker_open, "precondition: the picker is open");
+    assert_eq!(
+        e.plugin_manager
+            .as_ref()
+            .unwrap()
+            .picker_registration_count(),
+        1,
+        "precondition: the picker is registered"
+    );
+
+    // Simulates the GTK click-outside-to-dismiss path (`render::
+    // PickerRoute::Dismiss` in `src/app.rs`), which calls this exact
+    // method instead of `close_picker()` directly.
+    e.close_picker_cancelling_plugin();
+
+    assert!(!e.picker_open, "dismissing must close the picker");
+    exec(&mut e, "Read");
+    assert_eq!(
+        e.message, "true",
+        "a non-Escape dismiss must fire on_cancel exactly like Escape does"
+    );
+    assert_eq!(
+        e.plugin_manager
+            .as_ref()
+            .unwrap()
+            .picker_registration_count(),
+        0,
+        "dismissing must release the picker's registration, not leak it"
+    );
+}
