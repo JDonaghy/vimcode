@@ -73,6 +73,25 @@
 //! (#1622 fix round 1)" note (filed against the neighbouring #1562 entry)
 //! for the full capture-method write-up, which applies identically here.
 //!
+//! **Note (#1629):** the pin now also includes quadraui#1228, which
+//! reverts the `native_menu` half of #1200 (see the neighbouring `#1562`/
+//! `#1582` sections below) — unrelated to this cursor-glyph fix itself
+//! (`CursorShape::Block` re-painting the glyph is untouched by #1228), but
+//! it does change what a live vimcode.exe's chrome looks like around the
+//! editor pane during the next real-hardware re-check: a drawn menu row
+//! and title bar (`window_chrome`) rather than the native caption + native
+//! menu row this section's evidence was captured against. A fresh dell64
+//! session for this bump built and launched `vimcode.exe` cleanly (real
+//! `HWND`, `Responding: True`, no crash log — see `src/win/mod.rs`'s
+//! `#1562` "Real-hardware verification (#1629)" note for the full
+//! write-up) but found the interactive session locked again
+//! (`GetForegroundWindow()` returned `NULL`), the same blocker every prior
+//! attempt hit. #1559's cursor-glyph pixel check remains **UNVERIFIED** —
+//! not by lack of trying a fourth time, but by this host's interactive
+//! session relocking on every session that has attempted this check
+//! (#1558/#1561/#1622/#1629). A live, unlocked dell64 session is the only
+//! way to close it.
+//!
 //! # #1561: left-edge desktop strip — investigated, no fix here
 //!
 //! vimcode#1561's reported left-edge desktop strip was investigated against
@@ -105,7 +124,7 @@
 //! **Update (#1618):** the fix landed upstream as quadraui#1199
 //! (`WinBackend::backend_caps()` now declares `window_chrome: true`,
 //! `win::run`'s `wndproc` handles `WM_NCCALCSIZE`/`WM_NCHITTEST`), and the
-//! pin now includes it along with the `JDonaghy/quadraui#1213` reentrancy
+//! pin then included it along with the `JDonaghy/quadraui#1213` reentrancy
 //! fix that had blocked bumping past it (see the `Cargo.toml` pin comment
 //! and `src/win/mod.rs`'s `#1618` update).
 //!
@@ -113,52 +132,35 @@
 //! confirms the custom title bar and command centre now render" line above
 //! was wrong — #1618's dell64 session only re-drove #1582's menu bar
 //! check, not this one (see #1622's own body). Actually launching
-//! `vimcode.exe` on dell64 shows a stock native caption (icon, title, real
+//! `vimcode.exe` on dell64 showed a stock native caption (icon, title, real
 //! min/max/close) plus a separate native/owner-drawn Win32 menu row below
 //! it — not the single custom-drawn caption with an embedded command
 //! centre this issue asks for, and no command-centre search box anywhere
-//! in the band. Root cause: `WinBackend::backend_caps()` now declares
-//! *both* `native_menu: true` (#1200/#1582) and `window_chrome: true`
+//! in the band. Root cause: `WinBackend::backend_caps()` declared *both*
+//! `native_menu: true` (#1200/#1582) and `window_chrome: true`
 //! (#1199/#1562) — the same pair `MacBackend` has declared for a while —
 //! and `App::setup`'s `if native_menu {...} else if window_chrome {...}`
-//! (`src/app.rs`) always takes the `native_menu` arm first, so
-//! `window_chrome`'s arm (which is what sets `menu_bar_visible = true`
-//! and makes the drawn CSD row/command centre live) never runs for
-//! Win-GUI. `capture_window_and_apply_csd` (`src/app.rs`) also
-//! early-returns whenever `native_menu` is set, so `Backend::window()
-//! .set_decorated(false)` (the call that clears `WS_CAPTION` and hands
-//! the title strip to quadraui's own `WM_NCCALCSIZE`/`WM_NCHITTEST`
-//! handling) is never invoked either — Win-GUI keeps its stock decorated
-//! window exactly as if #1199 had never landed. This is a capability-
-//! modelling gap, not a vimcode branch-order bug safe to patch blind:
-//! `native_menu` means two different things across backends (macOS: a
-//! true OS-global menu bar with zero in-window footprint, so keeping the
-//! native caption is *correct*; Windows: a per-window `SetMenu` `HMENU`
-//! sitting directly under the caption, so keeping the native caption is
-//! exactly what defeats #1562) and neither `BackendCaps` nor `ShellConfig`
-//! expose a flag distinguishing the two — macOS's own
-//! `client_side_titlebar`/`titlebar_control_inset` mechanism is a
-//! separate, macOS-only hook of that shape that Win-GUI doesn't
-//! participate in. See `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for
-//! the drafted ask. `src/win/mod.rs`'s `#1562` doc section has the fuller
-//! write-up.
+//! (`src/app.rs`) always took the `native_menu` arm first, so
+//! `window_chrome`'s arm never ran for Win-GUI. Filed as the (now-struck)
+//! `BackendCaps::native_menu is overloaded` entry in
+//! `docs/PENDING_QUADRAUI_ISSUES.md`; `src/win/mod.rs`'s `#1562` doc
+//! section has the fuller write-up, including the "Reconciliation (#1622
+//! fix round 1)" note that retracted this correction's Command Center
+//! half (that rung's liveness was never actually gated on this branch —
+//! see #939).
 //!
-//! **Reconciliation (#1622 fix round 1):** the correction above's "the
-//! drawn CSD row/command centre never goes live" claim conflated two rungs
-//! #939 deliberately decoupled — `render::FramePresence::from_screen`
-//! (`src/render.rs`) computes `command_center` from `title_bar_band_live`
-//! alone, not from `menu_bar_visible`/this branch, and both
-//! `command_center_liveness_is_split_from_menu_bar_visible` (`src/
-//! render.rs`) and this module's own `command_center_paints_on_a_native_
-//! menu_backend` test below pin exactly that contract for `WinBackend`
-//! specifically. That half of the claim is retracted; see
-//! `docs/PENDING_QUADRAUI_ISSUES.md`'s "Correction (#1622 fix round 1)" for
-//! the full write-up, including a second dell64 session's evidence that the
-//! *entire* client area (not selectively the Command Center) was blank/
-//! black under the same locked-session Direct2D suspension #1559 above
-//! already discloses. The `WS_CAPTION`-not-cleared half of this correction
-//! (native caption + native menu row, no CSD) is unaffected and independently
-//! reproduced again this round.
+//! **Resolved (#1629):** quadraui#1228 (`bc92d47`/`d292a4c`) reverts the
+//! `native_menu` half of #1200 on Win-GUI instead of adding the capability
+//! split the pending-issue draft asked for: `WinBackend::backend_caps()`
+//! now declares only `window_chrome: true`. `App::setup`'s three-way
+//! branch needed no vimcode-side change to pick this up — a Win backend
+//! now takes the same `window_chrome` arm GTK does, and
+//! `capture_window_and_apply_csd`'s `!native_menu` gate now lets
+//! `set_decorated(false)` run, clearing `WS_CAPTION`. See
+//! `src/win/mod.rs`'s `#1562` doc section for the full mechanism and
+//! `win_driver_tests`' replacement tests. Real-hardware verification of
+//! the drawn title bar and command centre on dell64 is this issue's own
+//! acceptance item.
 //!
 //! # #1582: no menu bar at startup — the same `backend_caps` gap as #1562,
 //! # narrower fix (`native_menu`, not `window_chrome`)
@@ -181,9 +183,19 @@
 //! had found #1200 itself crashed `vimcode.exe` on every startup
 //! (`RefCell already borrowed`, `JDonaghy/quadraui#1213`) — that fix
 //! landed upstream as `ce1c763` (a `ModalPumpGuard` around the reentrant
-//! `SetMenu` call) plus a regression test in `6e14d8a`, and the pin now
-//! includes both (see the `Cargo.toml` pin comment). Real-hardware
-//! verification on dell64 confirms `vimcode.exe` launches cleanly with a
-//! real, clickable native menu bar present at startup.
+//! `SetMenu` call) plus a regression test in `6e14d8a`, and the pin then
+//! included both. Real-hardware verification on dell64 confirmed
+//! `vimcode.exe` launched cleanly with a real, clickable native menu bar
+//! present at startup — but `native_menu: true` also silently starved
+//! `#1562`'s `window_chrome` drawn-caption path (see that section above).
+//!
+//! **Resolved (#1629):** quadraui#1228 reverts the `native_menu` half of
+//! #1200 on Win-GUI (see the `#1562` section above for the full
+//! mechanism). #1582's "a menu bar is present and clickable" ask is now
+//! satisfied by the *drawn* menu row instead — the same row GTK already
+//! ships — reached through `App::setup`'s `window_chrome` arm with no
+//! vimcode-side change needed. Real-hardware re-verification that the
+//! drawn row opens File/Edit/View/... on dell64 is this issue's own
+//! acceptance item.
 
 pub use quadraui::win::WinBackend;
