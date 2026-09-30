@@ -5912,3 +5912,55 @@ fn manager_swap_id_collision_does_not_leak_orphaned_spawn_process() {
 
     let _ = std::fs::remove_file(&pidfile);
 }
+
+/// A child that floods stdout produces far more `PluginSpawnEvent`s than the
+/// `MAX_SPAWN_EVENTS_PER_TICK` budget one `poll_idle` tick will process. The
+/// budget must *defer* the overflow to the next tick, never drop it: the
+/// plugin has to observe every single byte the child wrote, plus the exit.
+///
+/// RED against the first version of the per-tick cap (which called
+/// `try_recv()` in the `while let` condition and only then checked the
+/// budget, so the event already popped off the channel was discarded by the
+/// `break`): that reported 1995904/0 instead of 2000000/0 — one lost 4KiB
+/// chunk per capped tick.
+#[test]
+#[cfg(unix)]
+fn spawn_flood_defers_overflow_to_next_tick_without_dropping_chunks() {
+    const EXPECTED_BYTES: usize = 2_000_000;
+
+    let mut e = engine_with_plugin(
+        "",
+        "spawn_flood_1624",
+        &format!(
+            r#"
+            _G.total = 0
+            _G.exit_code = nil
+            vimcode.command("RunFlood", function(_)
+                vimcode.loop.spawn("/bin/sh",
+                    {{ "-c", "head -c {bytes} /dev/zero | tr '\\0' x" }}, {{
+                    on_stdout = function(chunk) _G.total = _G.total + #chunk end,
+                    on_exit = function(code, _signal) _G.exit_code = code end,
+                }})
+            end)
+            vimcode.command("ReadFlood", function(_)
+                vimcode.message(string.format("%d/%s", _G.total,
+                    tostring(_G.exit_code)))
+            end)
+            "#,
+            bytes = EXPECTED_BYTES
+        ),
+    );
+    exec(&mut e, "RunFlood");
+
+    let reached = poll_until(&mut e, std::time::Duration::from_secs(20), |e| {
+        exec(e, "ReadFlood");
+        e.message == format!("{EXPECTED_BYTES}/0")
+    });
+    assert!(
+        reached,
+        "a spawn whose output exceeds one tick's event budget must have every \
+         chunk delivered on later ticks (and its exit delivered at all); \
+         expected {EXPECTED_BYTES}/0, last message: {:?}",
+        e.message
+    );
+}
