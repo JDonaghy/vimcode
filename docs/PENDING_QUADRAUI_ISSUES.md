@@ -32,7 +32,27 @@ zero cost instead.
 
 ---
 
-## `BackendCaps::native_menu` is overloaded across backends — Windows regressed its own `window_chrome` custom title bar (#1562) the moment it also declared `native_menu` (#1582/#1200)
+## ~~`BackendCaps::native_menu` is overloaded across backends — Windows regressed its own `window_chrome` custom title bar (#1562) the moment it also declared `native_menu` (#1582/#1200)~~ — **RESOLVED upstream, struck 2026-09-30 (#1629)**
+
+> **This entry is resolved.** Rather than add the capability split the
+> **Ask** below requested, quadraui#1228 (`bc92d47`/`d292a4c`) resolved the
+> conflict the other way: `WinBackend::backend_caps()` no longer declares
+> `native_menu` at all — a native `HMENU` lives in the non-client area,
+> which #1199's drawn caption permanently covers, so #1200's native menu
+> bar was unreachable regardless of this overload — and `install_menu_bar`
+> is back to the trait's no-op default on Win-GUI, matching
+> `GtkBackend`/`TuiBackend`. vimcode#1629 bumped the pin to `d292a4c`
+> (quadraui `develop` HEAD) to pick this up: `App::setup`'s existing
+> three-way `backend_caps()` branch needed no vimcode-side change — a Win
+> backend now falls into the same `window_chrome` arm GTK takes, and
+> `capture_window_and_apply_csd`'s `!native_menu` gate now lets
+> `set_decorated(false)` run on Windows too. The macOS `native_menu` arm
+> (`MacBackend`) is untouched by this change. `src/win/mod.rs`'s
+> `win_driver_tests` module replaces the two tests that pinned
+> `native_menu: true` on `WinBackend` with `window_chrome`-shaped ones.
+> Real-hardware re-verification of #1562/#1582 on dell64 is vimcode#1629's
+> own acceptance item. The original repro/isolation/ask below is left
+> intact for history.
 
 **Title:** `native_menu: true` means "an OS-global menu bar with zero in-window
 footprint" on macOS but "a per-window `SetMenu` `HMENU` sitting directly under

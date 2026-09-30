@@ -282,7 +282,34 @@ win = ["quadraui/win"]
 # in `src/app.rs`, unrelated to this bump) already handle whatever
 # `WinBackend::backend_caps()` reports, and picked these three flags up for
 # free purely from the pin moving.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "6e14d8a081929cb5c6792c91e15e5ffa26fc47da", features = ["tui", "terminal"] }
+#
+# #1629 bumps to `d292a4c` (quadraui `develop` HEAD) to pick up
+# quadraui#1228 (`bc92d47` + its doc-only follow-up `d292a4c`), which
+# reverts the `native_menu: true` half of quadraui#1200:
+# `WinBackend::backend_caps()` now declares only `window_chrome: true`
+# (matching `GtkBackend`), and `install_menu_bar` is back to the trait's
+# no-op default on Win-GUI. #1618's #1622 real-hardware follow-up found
+# `native_menu: true` and `window_chrome: true` together meant two
+# different things per backend (macOS: a true OS-global menu bar with zero
+# in-window footprint, so the native caption should stay; Windows: a
+# per-window `SetMenu` `HMENU` sitting directly under the caption) and
+# `App::setup`'s `if native_menu {…} else if window_chrome {…}` order
+# (correct for macOS) silently starved `window_chrome`'s drawn-caption path
+# on Windows — filed as the `BackendCaps::native_menu is overloaded` entry
+# in `docs/PENDING_QUADRAUI_ISSUES.md` (now struck, see that file). Rather
+# than add the asked-for capability split, quadraui#1228 resolved the
+# conflict the other way: Win-GUI drops `native_menu` and switches to the
+# same drawn-menu-row + `window_chrome`-doubles-as-titlebar shape GTK
+# already uses (a native `HMENU` lives in the non-client area, which
+# #1199's drawn caption permanently covers, so it was unreachable anyway).
+# `App::setup`'s three-way branch needed no vimcode-side change to pick
+# this up — a Win backend now falls into the same `window_chrome` arm GTK
+# takes, `capture_window_and_apply_csd`'s `!native_menu` gate now lets
+# `set_decorated(false)` run on Windows too, and the macOS `native_menu`
+# arm is untouched (`MacBackend` still declares it, unaffected by this
+# bump). See `src/win/mod.rs`/`src/win/backend.rs` for the doc-comment
+# corrections and the `WinDriver` test replacements this bump required.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "d292a4c503470ee596164c6df9b9022ea899b464", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole

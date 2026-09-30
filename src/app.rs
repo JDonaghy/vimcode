@@ -9234,14 +9234,17 @@ impl quadraui::ShellApp for App {
             // = MainThreadMarker::new() else { return }`), not hard
             // `.expect()`.
             //
-            // #1618: `WinBackend` (quadraui#1200) also declares
-            // `native_menu: true` and implements `install_menu_bar` now
-            // (a real Win32 `HMENU` via `SetMenu`), so `MacBackend` is no
-            // longer the *only* in-tree implementation — but Win32's
-            // `SetMenu`/`CreateMenu` calls carry no main-thread assertion
-            // the way AppKit's do, so `catch_unwind` here is a no-op on
-            // that path and this comment's panic-recovery rationale
-            // stays macOS-specific.
+            // #1618 found `WinBackend` (quadraui#1200) briefly also
+            // declared `native_menu: true` and implemented
+            // `install_menu_bar` (a real Win32 `HMENU` via `SetMenu`) —
+            // quadraui#1228 (#1629) reverted that: `WinBackend` no longer
+            // declares `native_menu`, `install_menu_bar` is back to the
+            // trait's no-op default on that backend, and Windows now
+            // takes the `window_chrome` arm below instead (a drawn menu
+            // row, matching GTK). `MacBackend` remains the only in-tree
+            // `native_menu` implementation this `catch_unwind` guards
+            // against, so its panic-recovery rationale stays
+            // macOS-specific again.
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 backend.install_menu_bar(&bar);
             }))
