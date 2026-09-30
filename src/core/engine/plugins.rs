@@ -120,6 +120,25 @@ impl Engine {
                 }
             }
         }
+        // #1630: same staleness pattern for `vimcode.picker.open` — a picker
+        // whose owning manager just went away is closed (if it's the one
+        // currently open) without calling into the dead Lua state, the same
+        // "clean up, don't call back" rule the spawns loop above follows.
+        // The manager itself is already gone (strong count 0, or this
+        // `upgrade()` would have succeeded), so there is no `PluginManager`
+        // side to clean up — only `Engine`'s own bookkeeping.
+        let dead_pickers: Vec<u64> = self
+            .plugin_pickers
+            .iter()
+            .filter(|(_, mgr)| mgr.upgrade().is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_pickers {
+            self.plugin_pickers.remove(&id);
+            if self.picker_open && self.picker_source == Self::plugin_picker_source(id) {
+                self.close_picker();
+            }
+        }
     }
 
     // ── Plugin-declared UI views (#146) ────────────────────────────────────
@@ -2244,6 +2263,187 @@ impl Engine {
             }
         }
         redraw
+    }
+
+    // ─── `vimcode.picker` (#1630) ───────────────────────────────────────────
+
+    /// `vimcode.picker.open(...)`: open the unified picker fed by plugin
+    /// data. Returns the handle id, or `None` if there is no live plugin
+    /// manager (the Lua binding surfaces that as a runtime error, matching
+    /// `plugin_api_spawn`'s "failed to start" convention).
+    pub(crate) fn plugin_api_picker_open(
+        &mut self,
+        title: String,
+        on_select: Option<mlua::RegistryKey>,
+        on_cancel: Option<mlua::RegistryKey>,
+        on_query: Option<mlua::RegistryKey>,
+    ) -> Option<u64> {
+        let pm = self.plugin_manager.clone()?;
+        let id = pm.register_picker(on_select, on_cancel, on_query);
+        self.plugin_pickers.insert(id, std::rc::Rc::downgrade(&pm));
+        self.open_picker(PickerSource::Custom(format!("plugin:{id}")));
+        self.picker_title = title;
+        Some(id)
+    }
+
+    /// The `PickerSource::Custom("plugin:<id>")` naming scheme both
+    /// directions of this feature share: encoding it once here (rather than
+    /// inlining `format!("plugin:{id}")` and `strip_prefix("plugin:")` at
+    /// every call site) is what makes the two ends impossible to typo out of
+    /// sync.
+    fn plugin_picker_source(id: u64) -> PickerSource {
+        PickerSource::Custom(format!("plugin:{id}"))
+    }
+
+    /// The id of the currently-open picker, if (and only if) it is a
+    /// `vimcode.picker.open` one — used to gate live-update calls (a
+    /// `set_items` from a stale/superseded handle must not touch whatever
+    /// picker is open *now*) and to fire `on_cancel`/`on_query` only for a
+    /// plugin-owned session.
+    pub(crate) fn plugin_picker_is_active(&self, id: u64) -> bool {
+        self.picker_open && self.picker_source == Self::plugin_picker_source(id)
+    }
+
+    /// The id of the currently-open picker, if it is a plugin one — read by
+    /// `handle_picker_key`'s `Escape` arm (fire `on_cancel`) before
+    /// `close_picker` clears `picker_open`.
+    pub(crate) fn plugin_picker_id(&self) -> Option<u64> {
+        match &self.picker_source {
+            PickerSource::Custom(key) if self.picker_open => {
+                key.strip_prefix("plugin:").and_then(|s| s.parse().ok())
+            }
+            _ => None,
+        }
+    }
+
+    /// Parse a `PickerAction::Custom("plugin_item:<picker_id>:<item_id>")`
+    /// key, as built by `plugin_api_picker_set_items`.
+    pub(crate) fn parse_plugin_item_key(key: &str) -> Option<(u64, u64)> {
+        let rest = key.strip_prefix("plugin_item:")?;
+        let (a, b) = rest.split_once(':')?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    }
+
+    /// Drop picker `id`'s bookkeeping on both sides: `Engine::plugin_
+    /// pickers` and `PluginManager::pickers` (which releases every item's
+    /// stored `data`/preview with it). Called on select, on cancel, on an
+    /// explicit `:close()`, and when the owning plugin unloads.
+    fn plugin_picker_teardown(&mut self, id: u64) {
+        self.plugin_pickers.remove(&id);
+        if let Some(pm) = self.plugin_manager.clone() {
+            pm.remove_picker(id);
+        }
+    }
+
+    /// `vimcode.picker.open(...):set_items(items)` /
+    /// `:append(items)` — `replace = true` for the former, `false` for the
+    /// latter. A no-op if `id` doesn't name the *currently open* picker (a
+    /// stale handle from a picker the user already closed, or one a later
+    /// `vimcode.picker.open` call superseded).
+    ///
+    /// `append` re-filters against the current query without resetting
+    /// `picker_selected`/`picker_scroll_top` — only clamping them if the
+    /// filtered list shrank — so a streamed source doesn't yank the cursor
+    /// out from under the user on every chunk (#1630's "without resetting
+    /// the cursor" acceptance bar).
+    pub(crate) fn plugin_api_picker_set_items(
+        &mut self,
+        id: u64,
+        items: Vec<plugin::PluginPickerItemSpec>,
+        replace: bool,
+    ) {
+        if !self.plugin_picker_is_active(id) {
+            return;
+        }
+        let Some(pm) = self.plugin_manager.clone() else {
+            return;
+        };
+        if replace {
+            pm.clear_picker_items(id);
+        }
+        let built: Vec<PickerItem> = items
+            .into_iter()
+            .map(|spec| {
+                let item_id = pm.register_picker_item(id, spec.data, spec.preview);
+                let filter_text = spec.filter_text.unwrap_or_else(|| spec.display.clone());
+                PickerItem {
+                    display: spec.display,
+                    filter_text,
+                    detail: spec.detail,
+                    action: PickerAction::Custom(format!("plugin_item:{id}:{item_id}")),
+                    icon: spec.icon,
+                    score: 0,
+                    match_positions: Vec::new(),
+                    depth: 0,
+                    expandable: false,
+                    expanded: false,
+                }
+            })
+            .collect();
+        if replace {
+            self.picker_all_items = built;
+            self.picker_selected = 0;
+            self.picker_scroll_top = 0;
+        } else {
+            self.picker_all_items.extend(built);
+        }
+        self.picker_filter();
+        let max = self.picker_items.len().saturating_sub(1);
+        self.picker_selected = self.picker_selected.min(max);
+        self.picker_scroll_top = self.picker_scroll_top.min(self.picker_selected);
+        self.picker_load_preview();
+    }
+
+    /// `vimcode.picker.open(...):set_loading(bool)`. State only — see
+    /// `Engine::picker_loading`'s doc for why this doesn't (yet) paint
+    /// anything.
+    pub(crate) fn plugin_api_picker_set_loading(&mut self, id: u64, loading: bool) {
+        if self.plugin_picker_is_active(id) {
+            self.picker_loading = loading;
+        }
+    }
+
+    /// `vimcode.picker.open(...):close()`.
+    pub(crate) fn plugin_api_picker_close(&mut self, id: u64) {
+        if self.plugin_picker_is_active(id) {
+            self.close_picker();
+        }
+        self.plugin_picker_teardown(id);
+    }
+
+    /// `PickerAction::Custom("plugin_item:<id>:<item_id>")` confirmed —
+    /// fire `on_select` with the item's `data`, then tear the picker down.
+    /// Called from `Engine::picker_confirm`, *after* it has already called
+    /// `close_picker()`.
+    pub(crate) fn run_plugin_picker_select(&mut self, id: u64, item_id: u64) {
+        let ctx = self.make_plugin_ctx(true);
+        if let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_picker_select(id, item_id, ctx)) {
+            self.apply_plugin_ctx(ctx);
+        }
+        self.plugin_picker_teardown(id);
+    }
+
+    /// The user pressed `Escape` on a plugin-owned picker — fire
+    /// `on_cancel`, then tear it down. Called from `Engine::
+    /// handle_picker_key`'s `Escape` arm, after `close_picker()`.
+    pub(crate) fn run_plugin_picker_cancel(&mut self, id: u64) {
+        let ctx = self.make_plugin_ctx(true);
+        if let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_picker_cancel(id, ctx)) {
+            self.apply_plugin_ctx(ctx);
+        }
+        self.plugin_picker_teardown(id);
+    }
+
+    /// The query text changed while a plugin-owned picker is open — fire
+    /// `on_query` (a no-op if the picker declared none). Called from
+    /// `Engine::picker_filter`. Does *not* tear the picker down; it stays
+    /// open regardless of what (if anything) `on_query` does.
+    pub(crate) fn fire_plugin_picker_query(&mut self, id: u64) {
+        let query = self.picker_query.clone();
+        let ctx = self.make_plugin_ctx(true);
+        if let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_picker_query(id, &query, ctx)) {
+            self.apply_plugin_ctx(ctx);
+        }
     }
 
     /// Set the editor mode with autocmd event firing.

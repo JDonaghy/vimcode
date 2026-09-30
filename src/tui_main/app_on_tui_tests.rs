@@ -10001,5 +10001,106 @@ mod tests {
                  over time rather than only once at exit; screen:\n{screen}"
             );
         }
+
+        // ─────────────────────────────────────────────────────────────────
+        // Native Extension API — Phase 4 (#1630): `vimcode.picker.open` fed
+        // by a `vimcode.loop.spawn`'s streamed stdout, driven through the
+        // real event loop and asserted on **painted** output — the issue's
+        // own acceptance bar ("a Lua plugin opens a picker fed by a spawned
+        // process that prints lines over time. The painted picker shows the
+        // streamed items, and typing filters them").
+        // ─────────────────────────────────────────────────────────────────
+
+        /// #1630 acceptance: a `:`-command opens an empty `vimcode.picker`
+        /// and spawns `/bin/sh` printing two markers with a real delay
+        /// between them, `:append`-ing each streamed `on_stdout` line as a
+        /// new item. Both markers must reach the painted screen (not just
+        /// engine state), proving the whole path (background reader thread
+        /// -> `Engine::poll_plugin_spawns` -> `with_plugin_dispatch` ->
+        /// `vimcode.picker.open(...):append` -> repaint) actually shows up
+        /// on screen — then typing a query that matches only the second
+        /// marker must filter the first one out of the painted list.
+        ///
+        /// RED-verified against unfixed `develop`: there is no
+        /// `vimcode.picker` table there, so `ZqPickerSpawn` errors on its
+        /// first line and neither the picker nor either marker ever
+        /// appears on screen.
+        #[test]
+        #[cfg(unix)]
+        fn picker_streamed_by_spawn_paints_and_filters_via_shell_app() {
+            use std::time::{Duration, Instant};
+
+            let engine = engine_with_plugin(
+                "picker_spawn_stream_1630",
+                r#"
+                vimcode.command("ZqPickerSpawn", function(_)
+                    local h = vimcode.picker.open({ title = "Streamed" })
+                    vimcode.loop.spawn(
+                        "/bin/sh",
+                        { "-c", "echo ZQ_PICK_ONE; sleep 0.05; echo ZQ_PICK_TWO" },
+                        {
+                            on_stdout = function(chunk)
+                                for line in chunk:gmatch("[^\r\n]+") do
+                                    h:append({ { display = line } })
+                                end
+                            end,
+                        }
+                    )
+                end)
+                "#,
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqPickerSpawn".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            // The child prints its second marker only after a real 50ms
+            // sleep, so this must poll the real event loop rather than
+            // asserting once right after `Enter` (same reasoning as the
+            // #1624 spawn-stream test above).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut screen = driver.screen();
+            while !(screen.contains("ZQ_PICK_ONE") && screen.contains("ZQ_PICK_TWO"))
+                && Instant::now() < deadline
+            {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("ZQ_PICK_ONE"),
+                "the first streamed item must land in the painted picker \
+                 within 5s; screen:\n{screen}"
+            );
+            assert!(
+                screen.contains("ZQ_PICK_TWO"),
+                "the second, later-arriving streamed item must also land \
+                 in the painted picker, proving `:append` fires per chunk \
+                 over time rather than only once at exit; screen:\n{screen}"
+            );
+
+            // Typing must reach `Engine::handle_picker_key` and fuzzy-filter
+            // the picker's items, same as any other picker source.
+            for c in "TWO".chars() {
+                driver.type_char(c);
+            }
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQ_PICK_TWO"),
+                "typing a query that matches the second item must keep it \
+                 visible; screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("ZQ_PICK_ONE"),
+                "typing a query that only matches the second item must \
+                 filter the first one out of the painted list; \
+                 screen:\n{screen}"
+            );
+        }
     }
 }

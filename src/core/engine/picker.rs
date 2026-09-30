@@ -21,6 +21,7 @@ impl Engine {
         self.picker_history_index = None;
         self.picker_history_typing_buffer.clear();
         self.picker_grep_scope = None;
+        self.picker_loading = false;
 
         match source {
             PickerSource::Files => {
@@ -173,6 +174,7 @@ impl Engine {
         self.picker_preview = None;
         self.breadcrumb_scoped_parent = None;
         self.breadcrumb_scoped_parent_line = None;
+        self.picker_loading = false;
     }
 
     /// Rebuild the cached breadcrumb segments from the active group's state.
@@ -795,6 +797,23 @@ impl Engine {
         // Command Center: dynamic prefix routing.
         if self.picker_source == PickerSource::CommandCenter {
             self.picker_filter_command_center();
+            return;
+        }
+
+        // `vimcode.picker.open` (#1630): still fuzzy-filter locally against
+        // whatever items the plugin has supplied so far, then let a dynamic
+        // source's `on_query` re-populate them for the new query (e.g. a
+        // live-grep extension re-spawning `rg`). Unlike Grep/CommandCenter
+        // above, this does *not* return early — the plugin may never call
+        // `on_query` at all (a static item list is a fully valid picker).
+        if let Some(id) = self.plugin_picker_id() {
+            Self::fuzzy_filter_items(
+                &self.picker_all_items,
+                &self.picker_query,
+                CAP,
+                &mut self.picker_items,
+            );
+            self.fire_plugin_picker_query(id);
             return;
         }
 
@@ -1856,7 +1875,88 @@ impl Engine {
                 let match_offset = match_line.saturating_sub(start);
                 self.picker_preview_scroll = match_offset.saturating_sub(3);
             }
+            PickerAction::Custom(key) => {
+                if let Some((picker_id, item_id)) = Self::parse_plugin_item_key(key) {
+                    self.load_plugin_picker_item_preview(picker_id, item_id);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// `vimcode.picker.open` item preview (#1630): a declared `preview`
+    /// table names either a file (+ optional line, windowed the same way
+    /// `PickerAction::OpenFileAtLine` is above) or a live buffer handle (+
+    /// optional line, read from the buffer's in-memory rope rather than
+    /// disk, so unsaved edits show up too).
+    fn load_plugin_picker_item_preview(&mut self, picker_id: u64, item_id: u64) {
+        let Some(pm) = self.plugin_manager.clone() else {
+            return;
+        };
+        let Some(preview) = pm.picker_item_preview(picker_id, item_id) else {
+            return;
+        };
+        match preview {
+            plugin::PluginPickerPreview::File(path, line) => {
+                let abs = if path.is_absolute() {
+                    path
+                } else {
+                    self.cwd.join(path)
+                };
+                let Ok(content) = std::fs::read_to_string(&abs) else {
+                    return;
+                };
+                self.load_preview_lines_from_text(&content, line);
+            }
+            plugin::PluginPickerPreview::Buffer(handle, line) => {
+                let Some(bid) = self.plugin_api_resolve_buf(handle) else {
+                    return;
+                };
+                let Some(state) = self.buffer_manager.get(bid) else {
+                    return;
+                };
+                let content = state.buffer.content.to_string();
+                self.load_preview_lines_from_text(&content, line);
+            }
+        }
+    }
+
+    /// Shared windowing logic between the file-preview and buffer-preview
+    /// branches of [`Self::load_plugin_picker_item_preview`]: with a target
+    /// `line` (1-indexed), center a context window on it like
+    /// `PickerAction::OpenFileAtLine`; without one, show the first 500
+    /// lines like `PickerAction::OpenFile`.
+    fn load_preview_lines_from_text(&mut self, content: &str, line: Option<usize>) {
+        let all_lines: Vec<&str> = content.lines().collect();
+        match line {
+            Some(line) => {
+                let match_line = line.saturating_sub(1);
+                let context = 50usize;
+                let start = match_line.saturating_sub(context);
+                let end = (match_line + context + 1).min(all_lines.len());
+                let lines: Vec<(usize, String, bool)> = all_lines[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let lineno = start + i + 1;
+                        let is_match = (start + i) == match_line;
+                        (lineno, text.to_string(), is_match)
+                    })
+                    .collect();
+                self.picker_preview = Some(PickerPreview { lines });
+                let match_offset = match_line.saturating_sub(start);
+                self.picker_preview_scroll = match_offset.saturating_sub(3);
+            }
+            None => {
+                let lines: Vec<(usize, String, bool)> = all_lines
+                    .into_iter()
+                    .take(500)
+                    .enumerate()
+                    .map(|(i, text)| (i + 1, text.to_string(), false))
+                    .collect();
+                self.picker_preview = Some(PickerPreview { lines });
+                self.picker_preview_scroll = 0;
+            }
         }
     }
 
@@ -2092,6 +2192,14 @@ impl Engine {
                 EngineAction::None
             }
             PickerAction::Custom(key) => {
+                // `vimcode.picker.open` item confirmed (#1630): fire the
+                // plugin's `on_select` with this item's `data`. `close_picker`
+                // already ran above, so this only needs to dispatch + tear
+                // down the picker's bookkeeping.
+                if let Some((picker_id, item_id)) = Self::parse_plugin_item_key(&key) {
+                    self.run_plugin_picker_select(picker_id, item_id);
+                    return EngineAction::None;
+                }
                 // Handle prefix selection from help mode
                 if let Some(prefix) = key.strip_prefix("prefix:") {
                     self.open_command_center();
@@ -2201,7 +2309,14 @@ impl Engine {
     ) -> EngineAction {
         match key_name {
             "Escape" => {
+                // #1630: a `vimcode.picker.open` picker fires `on_cancel` on
+                // user-initiated cancel — read the id *before* `close_picker`
+                // clears `picker_open`/`picker_source` state it reads.
+                let plugin_id = self.plugin_picker_id();
                 self.close_picker();
+                if let Some(id) = plugin_id {
+                    self.run_plugin_picker_cancel(id);
+                }
                 EngineAction::None
             }
             "Return" => {

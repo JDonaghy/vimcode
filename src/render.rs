@@ -17636,9 +17636,14 @@ pub fn build_screen_layout_with_breadcrumb_row(
         source_control,
         picker: engine.picker_open.then(|| {
             use crate::core::engine::PickerSource;
+            // `PickerSource::Custom` also covers `vimcode.picker.open`
+            // (#1630) — a plugin item may declare a file/buffer preview
+            // (`Engine::picker_load_preview`'s plugin branch), and gating it
+            // out here would leave that state populated but never painted,
+            // the exact "state vs. paint" bug class #587/#592 warn about.
             let has_preview = matches!(
                 engine.picker_source,
-                PickerSource::Files | PickerSource::Grep
+                PickerSource::Files | PickerSource::Grep | PickerSource::Custom(_)
             );
             PickerPanel {
                 title: engine.picker_title.clone(),
