@@ -110,6 +110,7 @@ use crate::core;
 use crate::render;
 
 use core::engine::EngineAction;
+use core::engine::PluginViewHost;
 use core::{Engine, WindowRect};
 use render::Theme;
 
@@ -3151,15 +3152,72 @@ impl App {
             if let Some(view_name) = &rw.plugin_view {
                 let engine = self.engine.borrow();
                 engine.plugin_view_tab_form_rect.set(rect);
-                if render::populate_plugin_view_tab_form_controller(
-                    &engine,
-                    view_name,
-                    rw.is_active,
-                ) {
-                    engine
-                        .plugin_view_tab_form_controller
-                        .borrow_mut()
-                        .render_and_cache(backend, rect);
+                // #1631: same body-kind branch as the sidebar arm
+                // (`paint_sidebar_panel_rung`'s `ext:` case) — see that
+                // arm's comment for why `plugin_view_tab_form_rect` is
+                // reused as "the rect the active body last painted into"
+                // for every body kind, not just the field-stack `Form`.
+                let kind = engine
+                    .plugin_views
+                    .get(view_name)
+                    .and_then(|v| v.body.as_ref())
+                    .map(|b| b.kind_name());
+                match kind {
+                    Some("list") => {
+                        render::paint_plugin_view_list(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    Some("tree") => {
+                        if render::populate_plugin_view_tree_controller(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                        ) {
+                            engine
+                                .plugin_view_tab_tree_controller
+                                .borrow()
+                                .render(backend, rect);
+                        }
+                    }
+                    Some("table") => {
+                        render::paint_plugin_view_table(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    Some("text_view") => {
+                        render::paint_plugin_view_text(
+                            &engine,
+                            view_name,
+                            PluginViewHost::Tab,
+                            rw.is_active,
+                            rect,
+                            backend,
+                        );
+                    }
+                    _ => {
+                        if render::populate_plugin_view_tab_form_controller(
+                            &engine,
+                            view_name,
+                            rw.is_active,
+                        ) {
+                            engine
+                                .plugin_view_tab_form_controller
+                                .borrow_mut()
+                                .render_and_cache(backend, rect);
+                        }
+                    }
                 }
                 drop(engine);
                 window_editors.push(editor);
@@ -3626,6 +3684,16 @@ impl App {
                 // uses, rather than as `ExtPanelItem` tree rows. This is the
                 // whole per-surface cost of plugin UI: one arm in the shared
                 // shell, zero lines in `src/gtk/` or `src/tui_main/`.
+                //
+                // #1631: a view whose `render()` returned a `kind = "..."`
+                // table instead of `fields` paints through the matching
+                // `ListView`/`TreeView`/`DataTable`/`TextDisplay` primitive
+                // instead — still one arm here, still zero lines in
+                // `src/gtk/`/`src/tui_main/`. `plugin_view_form_rect` is
+                // reused as "the rect the active body last painted into"
+                // regardless of which body kind is active (mutually
+                // exclusive per view, so there is no collision).
+                let name = id.strip_prefix("ext:").unwrap_or(id).to_string();
                 let panel = render::SidebarPanelBody {
                     background: Some(theme.tab_bar_bg),
                     chrome: render::SidebarPanelChrome::Header(format!(
@@ -3640,15 +3708,68 @@ impl App {
                 };
                 panel.render_with(backend, q_sb, |backend, body_rect| {
                     // Same contract as the Settings arm: cache the exact rect
-                    // painted, because `handle_plugin_view_ui_event` re-derives
-                    // row geometry from it.
+                    // painted, because the click routers re-derive row
+                    // geometry from it.
                     engine.plugin_view_form_rect.set(body_rect);
                     engine.ext_panel_content_rect.set(q_sb);
-                    if render::populate_plugin_view_form_controller(engine) {
-                        engine
-                            .plugin_view_form_controller
-                            .borrow_mut()
-                            .render_and_cache(backend, body_rect);
+                    let has_focus = engine.ext_panel_has_focus;
+                    let kind = engine
+                        .plugin_views
+                        .get(&name)
+                        .and_then(|v| v.body.as_ref())
+                        .map(|b| b.kind_name());
+                    match kind {
+                        Some("list") => {
+                            render::paint_plugin_view_list(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("tree") => {
+                            if render::populate_plugin_view_tree_controller(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                            ) {
+                                engine
+                                    .plugin_view_tree_controller
+                                    .borrow()
+                                    .render(backend, body_rect);
+                            }
+                        }
+                        Some("table") => {
+                            render::paint_plugin_view_table(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        Some("text_view") => {
+                            render::paint_plugin_view_text(
+                                engine,
+                                &name,
+                                PluginViewHost::Sidebar,
+                                has_focus,
+                                body_rect,
+                                backend,
+                            );
+                        }
+                        _ => {
+                            if render::populate_plugin_view_form_controller(engine) {
+                                engine
+                                    .plugin_view_form_controller
+                                    .borrow_mut()
+                                    .render_and_cache(backend, body_rect);
+                            }
+                        }
                     }
                 });
             }
@@ -6626,9 +6747,125 @@ impl App {
                 // empty panel padding belongs here rather than leaking to the
                 // editor underneath.
                 match event {
+                    // #1631: a `ViewBody`-kind view routes through its own
+                    // matching primitive's click/scroll resolution instead
+                    // of `FormController` — see the paint arm
+                    // (`paint_sidebar_panel_rung`'s `ext:` case) for the
+                    // matching kind branch.
                     _ if is_view => {
-                        let rect = engine.plugin_view_form_rect.get();
-                        render::handle_plugin_view_ui_event(&mut engine, event, rect);
+                        let name = engine.ext_panel_active.clone().unwrap_or_default();
+                        let kind = engine
+                            .plugin_views
+                            .get(&name)
+                            .and_then(|v| v.body.as_ref())
+                            .map(|b| b.kind_name());
+                        // Positive `delta.y` = scroll content up (toward the
+                        // top) — the same convention the fallback `Scroll`
+                        // arm below documents.
+                        let scroll_step = |delta: &quadraui::ScrollDelta| -> i32 {
+                            let step = (delta.y.abs() * 3.0).round().max(1.0) as i32;
+                            if delta.y > 0.0 {
+                                -step
+                            } else {
+                                step
+                            }
+                        };
+                        match kind {
+                            Some("list") => match event {
+                                UiEvent::MouseDown {
+                                    position,
+                                    button: quadraui::MouseButton::Left,
+                                    ..
+                                } => {
+                                    render::route_plugin_view_list_click(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        *position,
+                                        false,
+                                    );
+                                }
+                                UiEvent::DoubleClick { position, .. } => {
+                                    render::route_plugin_view_list_click(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        *position,
+                                        true,
+                                    );
+                                }
+                                UiEvent::Scroll { delta, .. } => {
+                                    render::scroll_plugin_view_flat_selection_list(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        scroll_step(delta),
+                                    );
+                                }
+                                _ => {}
+                            },
+                            Some("tree") => {
+                                let rect = engine.plugin_view_form_rect.get();
+                                let backend_rc = self.backend.clone();
+                                let mut b = backend_rc.borrow_mut();
+                                render::route_plugin_view_tree_event(
+                                    &mut engine,
+                                    &name,
+                                    PluginViewHost::Sidebar,
+                                    true,
+                                    event,
+                                    rect,
+                                    &mut **b,
+                                );
+                            }
+                            Some("table") => match event {
+                                UiEvent::MouseDown {
+                                    position,
+                                    button: quadraui::MouseButton::Left,
+                                    ..
+                                } => {
+                                    render::route_plugin_view_table_click(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        *position,
+                                        false,
+                                    );
+                                }
+                                UiEvent::DoubleClick { position, .. } => {
+                                    render::route_plugin_view_table_click(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        *position,
+                                        true,
+                                    );
+                                }
+                                UiEvent::Scroll { delta, .. } => {
+                                    render::scroll_plugin_view_flat_selection_table(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        scroll_step(delta),
+                                    );
+                                }
+                                _ => {}
+                            },
+                            Some("text_view") => {
+                                if let UiEvent::Scroll { delta, .. } = event {
+                                    render::scroll_plugin_view_text(
+                                        &mut engine,
+                                        &name,
+                                        PluginViewHost::Sidebar,
+                                        scroll_step(delta),
+                                    );
+                                }
+                            }
+                            _ => {
+                                let rect = engine.plugin_view_form_rect.get();
+                                render::handle_plugin_view_ui_event(&mut engine, event, rect);
+                            }
+                        }
                     }
                     UiEvent::Scroll { delta, .. } => {
                         let flat_len = engine.ext_panel_flat_len();

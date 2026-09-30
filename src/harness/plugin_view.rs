@@ -60,6 +60,133 @@ pub const ROW_TOGGLE: &str = "TgZQ146";
 /// already-too-long declared value. Starting empty leaves ample room.
 pub const ROW_EMPTY_TEXT_LABEL: &str = "EtZQ146";
 
+// ── #1631: ViewBody (list/tree/table/text_view) fixture needles ────────────
+
+/// Registered view names for each `ViewBody` kind's fixture.
+pub const LIST_VIEW: &str = "zqxw1631list";
+pub const TREE_VIEW: &str = "zqxw1631tree";
+pub const TABLE_VIEW: &str = "zqxw1631table";
+pub const TEXT_VIEW: &str = "zqxw1631text";
+
+/// `List` fixture needles. `LIST_ROW0`/`LIST_ROW1` carry a `SEL`/`idl` tag
+/// reflecting `Engine::ext_panel_selected` as of the last `on_event` —
+/// row 0 is selected by default, so `LIST_ROW0_SEL`/`LIST_ROW1_IDLE` are
+/// the fixture's initial painted state.
+pub const LIST_TITLE: &str = "LTtl1631";
+pub const LIST_ROW0_SEL: &str = "Lr0SEL1631";
+pub const LIST_ROW0_IDLE: &str = "Lr0idl1631";
+pub const LIST_ROW1_SEL: &str = "Lr1SEL1631";
+pub const LIST_ROW1_IDLE: &str = "Lr1idl1631";
+/// Short on purpose — `ListView`'s TUI rasteriser skips the right-aligned
+/// detail span "when there isn't room past the main text" (`tui::list`'s
+/// module doc), and the sidebar body in this fixture's viewport is narrow.
+pub const LIST_DETAIL: &str = "D1";
+
+/// `Tree` fixture needles.
+pub const TREE_FOLDER_CLOSED: &str = "Fd1631CLS";
+pub const TREE_FOLDER_OPEN: &str = "Fd1631OPN";
+pub const TREE_CHILD: &str = "Ch1631";
+
+/// `Table` fixture needles.
+pub const TABLE_COL_KEY: &str = "K1631";
+pub const TABLE_COL_VALUE: &str = "V1631";
+pub const TABLE_ROW0_KEY: &str = "Hk01631";
+pub const TABLE_ROW0_VALUE: &str = "Hv01631";
+pub const TABLE_ROW1_KEY: &str = "Hk11631";
+pub const TABLE_ROW1_VALUE: &str = "Hv11631";
+pub const TABLE_EDITED: &str = "EDITED1631";
+
+/// `TextView` fixture needles — first and last of 50 generated lines, far
+/// enough apart that only one is visible at a time on a narrow viewport.
+pub const TEXT_FIRST_LINE: &str = "Ln0X1631";
+pub const TEXT_LAST_LINE: &str = "Ln49X1631";
+
+/// Lua source registering one view per `ViewBody` kind (#1631), appended
+/// into the same fixture plugin the field-stack view above uses — one real
+/// `PluginManager` load exercises every kind's parse + paint + event round
+/// trip, per this module's "why a real `PluginManager`" doc.
+fn plugin_source_view_bodies() -> String {
+    format!(
+        r#"
+local list_sel = 0
+vimcode.ui.register_view("{LIST_VIEW}", {{
+  title = "Zq1631L", icon = "L", fallback_icon = "L",
+  render = function()
+    local function tag(i)
+      if i == list_sel then return "SEL" else return "idl" end
+    end
+    return {{
+      kind = "list",
+      title = "{LIST_TITLE}",
+      items = {{
+        {{ id = "r0", text = "Lr0" .. tag(0) .. "1631" }},
+        {{ id = "r1", text = "Lr1" .. tag(1) .. "1631", detail = "{LIST_DETAIL}" }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "ItemSelected" then list_sel = event.index end
+  end,
+}})
+
+local tree_open = false
+vimcode.ui.register_view("{TREE_VIEW}", {{
+  title = "Zq1631T", icon = "T", fallback_icon = "T",
+  render = function()
+    return {{
+      kind = "tree",
+      nodes = {{
+        {{ id = "folder1631",
+           label = tree_open and "{TREE_FOLDER_OPEN}" or "{TREE_FOLDER_CLOSED}",
+           expanded = tree_open,
+           children = {{ {{ id = "child1631", label = "{TREE_CHILD}" }} }} }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "Expanded" then tree_open = true end
+    if event.kind == "Collapsed" then tree_open = false end
+  end,
+}})
+
+local last_edit = "none"
+vimcode.ui.register_view("{TABLE_VIEW}", {{
+  title = "Zq1631B", icon = "B", fallback_icon = "B",
+  render = function()
+    return {{
+      kind = "table",
+      columns = {{
+        {{ title = "{TABLE_COL_KEY}", editable = true }},
+        {{ title = "{TABLE_COL_VALUE}", editable = true }},
+      }},
+      rows = {{
+        {{ id = "h0", cells = {{ "{TABLE_ROW0_KEY}",
+           last_edit == "0:0" and "{TABLE_EDITED}" or "{TABLE_ROW0_VALUE}" }} }},
+        {{ id = "h1", cells = {{ "{TABLE_ROW1_KEY}", "{TABLE_ROW1_VALUE}" }} }},
+      }},
+    }}
+  end,
+  on_event = function(ctx, event)
+    if event.kind == "CellEdited" then
+      last_edit = tostring(event.row) .. ":" .. tostring(event.col)
+    end
+  end,
+}})
+
+vimcode.ui.register_view("{TEXT_VIEW}", {{
+  title = "Zq1631X", icon = "X", fallback_icon = "X",
+  render = function()
+    local lines = {{}}
+    for i = 0, 49 do
+      lines[#lines + 1] = "Ln" .. i .. "X1631"
+    end
+    return {{ kind = "text_view", text = table.concat(lines, "\n"), filetype = "json" }}
+  end,
+}})
+"#
+    )
+}
+
 /// The counter row's painted text before any activation, and after one.
 ///
 /// Carried by a `label` row (not a value column) so the whole needle is
@@ -142,6 +269,8 @@ fn plugin_dir() -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create fixture plugin dir");
     std::fs::write(dir.join("zqxw146.lua"), plugin_source()).expect("write fixture plugin");
+    std::fs::write(dir.join("zqxw1631.lua"), plugin_source_view_bodies())
+        .expect("write #1631 fixture plugin");
     dir
 }
 
@@ -185,6 +314,12 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
         engine.is_plugin_view(VIEW),
         "fixture must register {VIEW:?} as a view-backed panel"
     );
+    for view in [LIST_VIEW, TREE_VIEW, TABLE_VIEW, TEXT_VIEW] {
+        assert!(
+            engine.is_plugin_view(view),
+            "fixture must register {view:?} as a view-backed panel"
+        );
+    }
 }
 
 /// Build the fixture engine: a genuine `vimcode.ui.register_view` registration
@@ -194,15 +329,22 @@ fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
 /// plugin is already loaded into the Lua state by the time this returns, so the
 /// files are only needed for diagnosis.
 pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
+    engine_with_named_plugin_view(VIEW)
+}
+
+/// Sidebar fixture for a `ViewBody`-kind view (#1631) — same construction as
+/// [`engine_with_plugin_view`], generalized to any of the fixture's
+/// registered view names so each kind's tests can pick its own.
+pub fn engine_with_named_plugin_view(view: &str) -> (Engine, PathBuf) {
     let dir = plugin_dir();
     let mut engine = Engine::new_for_test();
     load_fixture_plugin(&mut engine, &dir);
 
-    engine.ext_panel_active = Some(VIEW.to_string());
+    engine.ext_panel_active = Some(view.to_string());
     engine.ext_panel_has_focus = true;
     // The activation path a live activity-bar click takes (`panel_focus` hook +
     // first `render` + selection parked on something `Enter` can act on).
-    engine.on_ext_panel_focused(VIEW);
+    engine.on_ext_panel_focused(view);
 
     // Raw `AppShell::toggle_sidebar`, never `Engine::toggle_sidebar` — the
     // latter persists to the developer's real session file (same reason
@@ -461,6 +603,147 @@ pub fn closing_the_tab_removes_it(driver: &mut impl ConformanceDriver) {
     );
 }
 
+// ── #1631: ViewBody (list/tree/table/text_view) scenarios ──────────────────
+
+/// Scenario 7 — a `kind = "list"` view paints its title, items and detail
+/// text, and a click on a row reaches the plugin's `on_event` with that
+/// row's index (proved by the SEL/idl tag flipping to the clicked row,
+/// never the other one).
+pub fn list_paints_and_click_selects_the_right_index(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[LIST_TITLE, LIST_ROW0_SEL, LIST_ROW1_IDLE, LIST_DETAIL],
+        "the list-kind view's initial paint (row 0 selected by default)",
+    );
+    driver.click_text(LIST_ROW1_IDLE);
+    assert!(
+        driver.screen_has(LIST_ROW1_SEL),
+        "clicking row 1 must select it (ItemSelected{{index: 1}}); painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(LIST_ROW0_IDLE),
+        "row 0 must no longer be selected after row 1 was clicked; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 8 — keyboard `Down` on a list moves selection to the right
+/// index, exactly like a click does.
+pub fn list_key_navigation_selects_the_right_index(driver: &mut impl ConformanceDriver) {
+    assert!(driver.screen_has(LIST_ROW0_SEL));
+    driver.press_named(quadraui::NamedKey::Down);
+    assert!(
+        driver.screen_has(LIST_ROW1_SEL),
+        "Down must select row 1 (ItemSelected{{index: 1}}); painted runs were \
+         {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 9 — a `kind = "tree"` view paints its declared (collapsed)
+/// node and not its child; `Enter` on the selected branch toggles it open
+/// (`Expanded{{id}}`) and the child then paints.
+pub fn tree_paints_collapsed_and_enter_expands_it(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(TREE_FOLDER_CLOSED),
+        "precondition: the tree's root node paints collapsed; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TREE_CHILD),
+        "a collapsed branch's child must not be painted; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(TREE_FOLDER_OPEN),
+        "Enter on the selected branch must expand it (Expanded{{id}}); \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has(TREE_CHILD),
+        "the expanded branch's child must now be painted; painted runs were \
+         {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 10 — a `kind = "table"` view paints its columns and rows; two
+/// `Enter` presses on the default-selected, editable cell start and then
+/// commit an edit, reaching the plugin's `on_event` as `CellEdited{{row: 0,
+/// col: 0, ...}}` — the right cell, not some other one.
+pub fn table_paints_and_enter_commits_a_cell_edit(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[
+            TABLE_COL_KEY,
+            TABLE_COL_VALUE,
+            TABLE_ROW0_KEY,
+            TABLE_ROW0_VALUE,
+            TABLE_ROW1_KEY,
+            TABLE_ROW1_VALUE,
+        ],
+        "the table-kind view's initial paint",
+    );
+    // First Enter starts editing row 0 / col 0 (the first editable column);
+    // second Enter commits it unchanged, which is enough to prove the event
+    // named the right (row, col) — the fixture only paints `TABLE_EDITED`
+    // when `event.row == 0 and event.col == 0`.
+    driver.press_named(quadraui::NamedKey::Enter);
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has(TABLE_EDITED),
+        "committing the edit must reach the plugin as CellEdited{{row: 0, \
+         col: 0, ...}}; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TABLE_ROW0_VALUE),
+        "the stale cell value must not still be painted after the commit; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 11 — a `kind = "text_view"` with more lines than fit the
+/// viewport starts scrolled to the top and scrolls to the bottom on `End`.
+///
+/// Fails against a `develop` without #1631: there is no `text_view` kind at
+/// all, so the fixture's `render()` would error at parse time and neither
+/// needle would ever paint.
+pub fn text_view_scrolls_to_the_bottom_on_end(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(TEXT_FIRST_LINE),
+        "precondition: the text view starts scrolled to the top; painted \
+         runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TEXT_LAST_LINE),
+        "precondition: with 50 lines in a narrow viewport, the last line \
+         must not be visible before scrolling; painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::End);
+    assert!(
+        driver.screen_has(TEXT_LAST_LINE),
+        "End must scroll the text view to its last line; painted runs were \
+         {:?}",
+        painted(driver)
+    );
+    assert!(
+        !driver.screen_has(TEXT_FIRST_LINE),
+        "the first line must have scrolled out of view once the view jumped \
+         to the bottom; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,6 +779,51 @@ mod tests {
         let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
         h.driver.render();
         (h, dir)
+    }
+
+    /// #1631: sidebar fixture for a named `ViewBody`-kind view (TUI arm).
+    fn tui_named(
+        view: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view(view);
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[test]
+    fn plugin_view_list_paints_and_click_selects_the_right_index_on_tui() {
+        let (mut h, _dir) = tui_named(LIST_VIEW);
+        list_paints_and_click_selects_the_right_index(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_list_key_navigation_selects_the_right_index_on_tui() {
+        let (mut h, _dir) = tui_named(LIST_VIEW);
+        list_key_navigation_selects_the_right_index(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_tree_paints_collapsed_and_enter_expands_it_on_tui() {
+        let (mut h, _dir) = tui_named(TREE_VIEW);
+        tree_paints_collapsed_and_enter_expands_it(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_tui() {
+        let (mut h, _dir) = tui_named(TABLE_VIEW);
+        table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_text_view_scrolls_to_the_bottom_on_end_on_tui() {
+        let (mut h, _dir) = tui_named(TEXT_VIEW);
+        text_view_scrolls_to_the_bottom_on_end(&mut h.driver);
     }
 
     #[test]
@@ -558,6 +886,57 @@ mod tests {
         let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
         h.driver.render();
         (h, dir)
+    }
+
+    /// #1631: sidebar fixture for a named `ViewBody`-kind view (GTK arm).
+    #[cfg(feature = "gui")]
+    fn gtk_named(
+        view: &str,
+    ) -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_named_plugin_view(view);
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_list_paints_and_click_selects_the_right_index_on_gtk() {
+        let (mut h, _dir) = gtk_named(LIST_VIEW);
+        list_paints_and_click_selects_the_right_index(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_list_key_navigation_selects_the_right_index_on_gtk() {
+        let (mut h, _dir) = gtk_named(LIST_VIEW);
+        list_key_navigation_selects_the_right_index(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_tree_paints_collapsed_and_enter_expands_it_on_gtk() {
+        let (mut h, _dir) = gtk_named(TREE_VIEW);
+        tree_paints_collapsed_and_enter_expands_it(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_table_paints_and_enter_commits_a_cell_edit_on_gtk() {
+        let (mut h, _dir) = gtk_named(TABLE_VIEW);
+        table_paints_and_enter_commits_a_cell_edit(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_text_view_scrolls_to_the_bottom_on_end_on_gtk() {
+        let (mut h, _dir) = gtk_named(TEXT_VIEW);
+        text_view_scrolls_to_the_bottom_on_end(&mut h.driver);
     }
 
     #[cfg(feature = "gui")]

@@ -226,6 +226,20 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
     }
     let id: String = tbl.get("id").unwrap_or_default();
 
+    // #1631: a `kind = "list"/"tree"/"table"/"text_view"` table is a single
+    // `ViewBody` widget, not a field stack — parse it and return early,
+    // exactly the "one sibling translation per kind" the issue asks for,
+    // kept out of the `fields` loop below rather than interleaved with it.
+    if let Ok(kind) = tbl.get::<_, String>("kind") {
+        let body = lua_table_to_view_body(&kind, tbl)?;
+        return Ok(PluginView {
+            id,
+            schema_version,
+            fields: Vec::new(),
+            body: Some(body),
+        });
+    }
+
     let mut fields = Vec::new();
     if let Ok(fields_tbl) = tbl.get::<_, LuaTable>("fields") {
         for (idx, row) in fields_tbl.sequence_values::<LuaTable>().enumerate() {
@@ -331,7 +345,120 @@ fn lua_table_to_view(tbl: &LuaTable) -> LuaResult<crate::core::plugin_ui::Plugin
         id,
         schema_version,
         fields,
+        body: None,
     })
+}
+
+/// Parse a `kind = "..."` table into a [`crate::core::plugin_ui::ViewBody`]
+/// (#1631). Sibling of the field-stack loop in [`lua_table_to_view`], not
+/// interleaved with it — see that function's call site for why.
+fn lua_table_to_view_body(
+    kind: &str,
+    tbl: &LuaTable,
+) -> LuaResult<crate::core::plugin_ui::ViewBody> {
+    use crate::core::plugin_ui::{ViewBody, ViewListItem, ViewTableColumn, ViewTableRow};
+
+    match kind {
+        "list" => {
+            let title: Option<String> = tbl.get::<_, String>("title").ok().filter(|s| !s.is_empty());
+            let mut items = Vec::new();
+            if let Ok(items_tbl) = tbl.get::<_, LuaTable>("items") {
+                for (idx, row) in items_tbl.sequence_values::<LuaTable>().enumerate() {
+                    let row = row?;
+                    let id: String = row.get("id").map_err(|_| {
+                        LuaError::RuntimeError(format!("list item {}: missing id", idx + 1))
+                    })?;
+                    items.push(ViewListItem {
+                        id,
+                        text: row.get("text").unwrap_or_default(),
+                        detail: row
+                            .get::<_, String>("detail")
+                            .ok()
+                            .filter(|s| !s.is_empty()),
+                    });
+                }
+            }
+            Ok(ViewBody::List { title, items })
+        }
+        "tree" => {
+            let nodes_tbl: LuaTable = tbl.get("nodes").map_err(|_| {
+                LuaError::RuntimeError("tree view: missing \"nodes\" table".to_string())
+            })?;
+            Ok(ViewBody::Tree {
+                nodes: lua_table_to_tree_nodes(nodes_tbl)?,
+            })
+        }
+        "table" => {
+            let mut columns = Vec::new();
+            if let Ok(cols_tbl) = tbl.get::<_, LuaTable>("columns") {
+                for (idx, row) in cols_tbl.sequence_values::<LuaTable>().enumerate() {
+                    let row = row?;
+                    let title: String = row.get("title").map_err(|_| {
+                        LuaError::RuntimeError(format!("table column {}: missing title", idx + 1))
+                    })?;
+                    columns.push(ViewTableColumn {
+                        title,
+                        editable: row.get("editable").unwrap_or(false),
+                    });
+                }
+            }
+            let mut rows = Vec::new();
+            if let Ok(rows_tbl) = tbl.get::<_, LuaTable>("rows") {
+                for (idx, row) in rows_tbl.sequence_values::<LuaTable>().enumerate() {
+                    let row = row?;
+                    let cells: Vec<String> = row
+                        .get::<_, LuaTable>("cells")
+                        .map_err(|_| {
+                            LuaError::RuntimeError(format!(
+                                "table row {}: missing \"cells\" table",
+                                idx + 1
+                            ))
+                        })?
+                        .sequence_values::<String>()
+                        .collect::<LuaResult<_>>()?;
+                    rows.push(ViewTableRow {
+                        id: row.get("id").unwrap_or_default(),
+                        cells,
+                    });
+                }
+            }
+            Ok(ViewBody::Table { columns, rows })
+        }
+        "text_view" => Ok(ViewBody::TextView {
+            text: tbl.get("text").unwrap_or_default(),
+            filetype: tbl
+                .get::<_, String>("filetype")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        }),
+        other => Err(LuaError::RuntimeError(format!(
+            "view: unknown kind {other:?} (expected \"list\", \"tree\", \"table\", or \"text_view\")"
+        ))),
+    }
+}
+
+/// Recursively parse a `nodes` table into [`crate::core::plugin_ui::ViewTreeNode`]s.
+fn lua_table_to_tree_nodes(tbl: LuaTable) -> LuaResult<Vec<crate::core::plugin_ui::ViewTreeNode>> {
+    use crate::core::plugin_ui::ViewTreeNode;
+
+    let mut nodes = Vec::new();
+    for (idx, row) in tbl.sequence_values::<LuaTable>().enumerate() {
+        let row = row?;
+        let id: String = row
+            .get("id")
+            .map_err(|_| LuaError::RuntimeError(format!("tree node {}: missing id", idx + 1)))?;
+        let children = match row.get::<_, LuaTable>("children") {
+            Ok(children_tbl) => lua_table_to_tree_nodes(children_tbl)?,
+            Err(_) => Vec::new(),
+        };
+        nodes.push(ViewTreeNode {
+            id,
+            label: row.get("label").unwrap_or_default(),
+            expanded: row.get("expanded").unwrap_or(false),
+            children,
+        });
+    }
+    Ok(nodes)
 }
 
 // ─── Extension panel types ──────────────────────────────────────────────────
@@ -1623,6 +1750,18 @@ impl PluginManager {
             }
             ViewEventKind::TextChanged { value } | ViewEventKind::TextCommitted { value } => {
                 tbl.set("value", value.as_str())?
+            }
+            ViewEventKind::ItemSelected { index } | ViewEventKind::ItemActivated { index } => {
+                tbl.set("index", *index as i64)?
+            }
+            ViewEventKind::NodeSelected { id }
+            | ViewEventKind::NodeActivated { id }
+            | ViewEventKind::Expanded { id }
+            | ViewEventKind::Collapsed { id } => tbl.set("node_id", id.as_str())?,
+            ViewEventKind::CellEdited { row, col, value } => {
+                tbl.set("row", *row as i64)?;
+                tbl.set("col", *col as i64)?;
+                tbl.set("value", value.as_str())?;
             }
             ViewEventKind::ButtonClicked | ViewEventKind::FocusChanged => {}
         }
@@ -4048,6 +4187,265 @@ mod tests {
             err.contains("buton"),
             "the error must name the offending type: {err}"
         );
+    }
+
+    // ── #1631: `kind = "list"/"tree"/"table"/"text_view"` view bodies ────
+
+    #[test]
+    fn a_list_body_parses_its_items() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "list",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "list",
+                        title = "Requests",
+                        items = {
+                            { id = "r1", text = "GET /users", detail = "200" },
+                            { id = "r2", text = "POST /login" },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("list body") {
+            ViewBody::List { title, items } => {
+                assert_eq!(title.as_deref(), Some("Requests"));
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].id, "r1");
+                assert_eq!(items[0].detail.as_deref(), Some("200"));
+                assert_eq!(items[1].detail, None);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_list_item_missing_id_is_an_error_not_a_silent_drop() {
+        let pm = pm_with_view(
+            "list-badid",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { kind = "list", items = { { text = "no id" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a list item without an id must not be dropped");
+        assert!(err.contains("list item"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_tree_body_parses_nested_nodes() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "tree",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "tree",
+                        nodes = {
+                            { id = "folder", label = "src", expanded = true,
+                              children = {
+                                { id = "file", label = "main.rs" },
+                              } },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("tree body") {
+            ViewBody::Tree { nodes } => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].id, "folder");
+                assert!(nodes[0].expanded);
+                assert!(nodes[0].is_branch());
+                assert_eq!(nodes[0].children[0].id, "file");
+                assert!(!nodes[0].children[0].is_branch());
+            }
+            other => panic!("expected Tree, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tree_body_without_nodes_is_an_error() {
+        let pm = pm_with_view(
+            "tree-missing",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function() return { kind = "tree" } end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a tree view without \"nodes\" must not silently paint empty");
+        assert!(err.contains("nodes"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_table_body_parses_columns_and_rows() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "table",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return {
+                        kind = "table",
+                        columns = {
+                            { title = "Key", editable = true },
+                            { title = "Value", editable = true },
+                        },
+                        rows = {
+                            { id = "h1", cells = { "Content-Type", "application/json" } },
+                        },
+                    }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        match view.body.expect("table body") {
+            ViewBody::Table { columns, rows } => {
+                assert_eq!(columns.len(), 2);
+                assert!(columns[0].editable);
+                assert_eq!(rows[0].cells, vec!["Content-Type", "application/json"]);
+            }
+            other => panic!("expected Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_row_missing_cells_is_an_error() {
+        let pm = pm_with_view(
+            "table-badrow",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { kind = "table", rows = { { id = "r1" } } }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("a table row without cells must not be dropped");
+        assert!(err.contains("cells"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_text_view_body_parses_text_and_filetype() {
+        use crate::core::plugin_ui::ViewBody;
+        let pm = pm_with_view(
+            "textview",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function()
+                    return { kind = "text_view", text = "{}", filetype = "json" }
+                end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let view = view.expect("render must succeed");
+        assert_eq!(
+            view.body,
+            Some(ViewBody::TextView {
+                text: "{}".to_string(),
+                filetype: Some("json".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_view_kind_is_an_error_not_a_silent_drop() {
+        let pm = pm_with_view(
+            "badkind",
+            r#"
+            vimcode.ui.register_view("vext", {
+                render = function() return { kind = "grid" } end,
+            })
+            "#,
+        );
+        let (_ctx, view) = pm.render_view("vext", PluginCallContext::default());
+        let err = view.expect_err("an unknown view kind must not be dropped");
+        assert!(err.contains("grid"), "error was: {err}");
+    }
+
+    #[test]
+    fn item_activated_event_carries_the_index() {
+        use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+        let pm = pm_with_view(
+            "list-event",
+            r#"
+            local last = "none"
+            vimcode.ui.register_view("vext", {
+                render = function() return { kind = "list", items = {} } end,
+                on_event = function(ctx, event)
+                    last = event.kind .. "/" .. tostring(event.index)
+                end,
+            })
+            vimcode.command("Last", function() vimcode.message(last) end)
+            "#,
+        );
+        let ctx = pm.call_view_event(
+            &PluginViewEvent {
+                view: "vext".to_string(),
+                widget_id: String::new(),
+                kind: ViewEventKind::ItemActivated { index: 2 },
+            },
+            PluginCallContext::default(),
+        );
+        assert!(ctx.message.is_none());
+        let (found, ctx) = pm.call_command("Last", "", PluginCallContext::default());
+        assert!(found);
+        assert_eq!(ctx.message.as_deref(), Some("ItemActivated/2"));
+    }
+
+    #[test]
+    fn cell_edited_event_carries_row_col_and_value() {
+        use crate::core::plugin_ui::{PluginViewEvent, ViewEventKind};
+        let pm = pm_with_view(
+            "table-event",
+            r#"
+            local last = "none"
+            vimcode.ui.register_view("vext", {
+                render = function() return { kind = "table" } end,
+                on_event = function(ctx, event)
+                    last = event.kind .. "/" .. event.row .. "/" .. event.col
+                        .. "/" .. event.value
+                end,
+            })
+            vimcode.command("Last", function() vimcode.message(last) end)
+            "#,
+        );
+        let ctx = pm.call_view_event(
+            &PluginViewEvent {
+                view: "vext".to_string(),
+                widget_id: String::new(),
+                kind: ViewEventKind::CellEdited {
+                    row: 1,
+                    col: 0,
+                    value: "text/plain".to_string(),
+                },
+            },
+            PluginCallContext::default(),
+        );
+        assert!(ctx.message.is_none());
+        let (found, ctx) = pm.call_command("Last", "", PluginCallContext::default());
+        assert!(found);
+        assert_eq!(ctx.message.as_deref(), Some("CellEdited/1/0/text/plain"));
     }
 
     #[test]

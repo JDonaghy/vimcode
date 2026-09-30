@@ -299,10 +299,28 @@ impl Engine {
     }
 
     /// Write the selection index for `host`.
-    fn set_plugin_view_selected(&mut self, host: PluginViewHost, idx: usize) {
+    pub(crate) fn set_plugin_view_selected(&mut self, host: PluginViewHost, idx: usize) {
         match host {
             PluginViewHost::Sidebar => self.ext_panel_selected = idx,
             PluginViewHost::Tab => self.plugin_view_tab_selected = idx,
+        }
+    }
+
+    /// Read the scroll offset for `host` (#1631 — `List`/`Table`/`TextView`
+    /// body kinds reuse the same flat scroll state a field-stack view uses,
+    /// rather than a parallel field per body kind).
+    pub(crate) fn plugin_view_scroll_top(&self, host: PluginViewHost) -> usize {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_scroll_top,
+            PluginViewHost::Tab => self.plugin_view_tab_scroll_top,
+        }
+    }
+
+    /// Write the scroll offset for `host`.
+    pub(crate) fn set_plugin_view_scroll_top(&mut self, host: PluginViewHost, offset: usize) {
+        match host {
+            PluginViewHost::Sidebar => self.ext_panel_scroll_top = offset,
+            PluginViewHost::Tab => self.plugin_view_tab_scroll_top = offset,
         }
     }
 
@@ -442,6 +460,26 @@ impl Engine {
         let Some(view) = self.plugin_views.get(name) else {
             return false;
         };
+
+        // #1631: a `ViewBody`-kind view routes through its own kind's
+        // keyboard handling instead of the field-stack navigation below —
+        // see `render::paint_plugin_view_list`'s sibling doc comment for why
+        // this is "one sibling translation per kind" rather than a scattered
+        // `Form`-field encoding of list/tree/table semantics.
+        if let Some(body_kind) = view.body.as_ref().map(|b| b.kind_name()) {
+            return match body_kind {
+                "list" => crate::render::handle_plugin_view_list_key(self, name, host, key),
+                "tree" => crate::render::handle_plugin_view_tree_key(self, name, host, key),
+                "table" => {
+                    crate::render::handle_plugin_view_table_key(self, name, host, key, unicode)
+                }
+                "text_view" => {
+                    crate::render::handle_plugin_view_text_key(self, name, host, key, 10)
+                }
+                _ => false,
+            };
+        }
+
         let focusable: Vec<usize> = view
             .fields
             .iter()
