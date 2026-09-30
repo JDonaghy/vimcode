@@ -139,6 +139,23 @@ impl Engine {
                 self.close_picker();
             }
         }
+        // #1632: same staleness pattern for `vimcode.http.request` — an
+        // in-flight request whose owning manager just went away is killed
+        // (its `curl` child) and dropped without ever calling into the dead
+        // Lua state, same reasoning as the spawns loop above.
+        let dead_http: Vec<u64> = self
+            .plugin_http_requests
+            .iter()
+            .filter(|(_, handle)| handle.manager.upgrade().is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead_http {
+            if let Some(handle) = self.plugin_http_requests.remove(&id) {
+                if let Ok(mut child) = handle.child.lock() {
+                    let _ = child.kill();
+                }
+            }
+        }
     }
 
     // ── Plugin-declared UI views (#146) ────────────────────────────────────
@@ -2343,6 +2360,121 @@ impl Engine {
                     }
                     break;
                 }
+            }
+        }
+        redraw
+    }
+
+    // ─── `vimcode.http` (#1632) ─────────────────────────────────────────────
+
+    /// `vimcode.http.request(opts, cb)`: launch an async HTTP request on a
+    /// background thread and wire its eventual response (or error) to `cb`.
+    /// Returns the handle id, or `None` if the request could not be started
+    /// (failed to spawn `curl` — the Lua binding surfaces that as a runtime
+    /// error, matching `plugin_api_spawn`'s "failed to start" convention) or
+    /// there is no live plugin manager.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plugin_api_http_request(
+        &mut self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+        timeout_ms: u64,
+        on_response: mlua::RegistryKey,
+    ) -> Option<i64> {
+        let pm = self.plugin_manager.clone()?;
+        let spec = execute::HttpRequestSpec {
+            method,
+            url,
+            headers,
+            body,
+            timeout_ms,
+        };
+        let (child, rx) = execute::spawn_http_request(spec).ok()?;
+        let id = pm.register_http_callback(on_response);
+        self.plugin_http_requests.insert(
+            id,
+            execute::PluginHttpHandle {
+                manager: std::rc::Rc::downgrade(&pm),
+                child,
+                rx,
+            },
+        );
+        Some(id as i64)
+    }
+
+    /// `vimcode.http.request(...):cancel()` — kill the underlying `curl`
+    /// child and drop the handle immediately. No callback fires for a
+    /// cancelled request, whether or not `curl` had already produced a
+    /// response by the time this runs — the caller asked to stop caring, not
+    /// to be told the answer arrived a moment too late.
+    pub(crate) fn plugin_api_http_cancel(&mut self, id: i64) -> bool {
+        if id < 0 {
+            return false;
+        }
+        let id = id as u64;
+        let Some(handle) = self.plugin_http_requests.remove(&id) else {
+            return false;
+        };
+        if let Ok(mut child) = handle.child.lock() {
+            let _ = child.kill();
+        }
+        if let Some(pm) = self.plugin_manager.clone() {
+            pm.remove_http_callback(id);
+        }
+        true
+    }
+
+    /// Deliver every completed `vimcode.http.request` result, through the
+    /// plugin dispatch loan so the callback can use the immediate API.
+    /// Called from `poll_idle`.
+    ///
+    /// A handle whose owning plugin manager was unloaded is killed and
+    /// dropped here instead of having its callback invoked — same rule as
+    /// [`Self::poll_plugin_spawns`].
+    ///
+    /// Returns `true` if any callback fired (caller should redraw).
+    pub fn poll_plugin_http(&mut self) -> bool {
+        if self.plugin_http_requests.is_empty() {
+            return false;
+        }
+        let ids: Vec<u64> = self.plugin_http_requests.keys().copied().collect();
+        let mut redraw = false;
+        for id in ids {
+            let alive = self
+                .plugin_http_requests
+                .get(&id)
+                .map(|h| h.manager.upgrade().is_some())
+                .unwrap_or(false);
+            if !alive {
+                if let Some(handle) = self.plugin_http_requests.remove(&id) {
+                    if let Ok(mut child) = handle.child.lock() {
+                        let _ = child.kill();
+                    }
+                }
+                continue;
+            }
+            let Some(result) = self
+                .plugin_http_requests
+                .get(&id)
+                .and_then(|h| h.rx.try_recv().ok())
+            else {
+                continue;
+            };
+            // Exactly one result per handle — drop the handle the moment it
+            // arrives, before dispatching into Lua (mirrors the spawn
+            // `Exit` case's "remove, then call" ordering).
+            self.plugin_http_requests.remove(&id);
+            let ctx = self.make_plugin_ctx(true);
+            let applied =
+                self.with_plugin_dispatch(move |pm| pm.call_http_response(id, result, ctx));
+            if let Some(ctx) = applied {
+                self.apply_plugin_ctx(ctx);
+                redraw = true;
+            }
+            if let Some(pm) = self.plugin_manager.clone() {
+                pm.remove_http_callback(id);
             }
         }
         redraw

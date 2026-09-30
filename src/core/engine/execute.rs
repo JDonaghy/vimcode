@@ -219,6 +219,212 @@ pub(crate) fn spawn_piped(
     Ok((child, Arc::new(Mutex::new(stdin)), rx))
 }
 
+// ─── `vimcode.http` (#1632) ─────────────────────────────────────────────────
+//
+// Runs each request as a `curl` child process on its own background thread,
+// the same "shell out, don't vendor a TLS stack" choice `tool_acquire::
+// http_get_bytes` already made for LSP/DAP acquisition downloads — curl is
+// already an assumed runtime dependency on every platform vimcode ships for
+// (including the Windows `+crt-static` and musl `vcd` builds), so reusing it
+// here adds **zero** new compiled dependency: no `ureq`/`reqwest`, no new TLS
+// backend, no `Cargo.toml`/`Cargo.lock` change, no binary-size impact. `-i`
+// asks curl to prefix the body with the response's status line and headers
+// on stdout so a single read gives us everything; `--data-raw`/`-X` cover
+// method/body; `-H` covers headers; `--max-time` covers the timeout, enforced
+// by curl itself so a slow/unresponsive server can never wedge the request
+// past its deadline.
+
+/// One `vimcode.http.request` call's parameters, already validated/defaulted
+/// on the Lua side (`method` non-empty, `url` non-empty).
+pub(crate) struct HttpRequestSpec {
+    pub(crate) method: String,
+    pub(crate) url: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Option<String>,
+    pub(crate) timeout_ms: u64,
+}
+
+/// A successfully-completed request's response, exactly the shape
+/// `vimcode.http.request`'s callback receives.
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
+    /// Insertion order as received; a header repeated by the server keeps
+    /// only its last value (matching a plain Lua table's own "later
+    /// `t[k]=v` wins" semantics, so nothing is lost silently — it's simply
+    /// not representable as a `k -> single value` table).
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: String,
+    pub(crate) elapsed_ms: u64,
+}
+
+/// One request's outcome: a parsed response, or an error message (network
+/// failure, timeout, or a response curl could not parse) — surfaced to Lua
+/// as `{status, headers, body, elapsed_ms}` or `{error}` respectively.
+pub(crate) enum HttpResult {
+    Ok(HttpResponse),
+    Err(String),
+}
+
+/// Live state for one `vimcode.http.request` handle (#1632): the child
+/// (shared with the background thread so `cancel()` can reach it) and the
+/// one-shot result channel. Mirrors [`PluginSpawnHandle`] minus the stdin
+/// half (an HTTP request has no interactive stdin) and streams exactly one
+/// [`HttpResult`] instead of many [`PluginSpawnEvent`]s.
+pub(crate) struct PluginHttpHandle {
+    /// Weak so an unloaded owning plugin is detectable the same way
+    /// `PluginSpawnHandle::manager` is — see `Engine::poll_plugin_http`.
+    pub(crate) manager: std::rc::Weak<plugin::PluginManager>,
+    pub(crate) child: Arc<Mutex<Child>>,
+    pub(crate) rx: Receiver<HttpResult>,
+}
+
+/// Find the first occurrence of `needle` in `haystack`, or `None`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Split curl's `-i` output (status line + headers + blank line + body) into
+/// its header block and body. Looks for `\r\n\r\n` first (the wire format
+/// HTTP actually uses) and falls back to a bare `\n\n` so a test fixture that
+/// writes bare-`\n` line endings still parses.
+fn split_head_body(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    if let Some(pos) = find_subslice(bytes, b"\r\n\r\n") {
+        return Some((&bytes[..pos], &bytes[pos + 4..]));
+    }
+    if let Some(pos) = find_subslice(bytes, b"\n\n") {
+        return Some((&bytes[..pos], &bytes[pos + 2..]));
+    }
+    None
+}
+
+/// Parse curl's `-i` stdout into a structured [`HttpResponse`]. `elapsed_ms`
+/// is measured by the caller (wall-clock around the whole child lifetime),
+/// not parsed out of curl's own timing — simpler, and accurate for exactly
+/// what a plugin author means by "how long did this take".
+fn parse_curl_response(bytes: &[u8], elapsed_ms: u64) -> HttpResult {
+    let Some((head, body)) = split_head_body(bytes) else {
+        return HttpResult::Err("malformed HTTP response: no header/body boundary".to_string());
+    };
+    let head_str = String::from_utf8_lossy(head).replace("\r\n", "\n");
+    let mut lines = head_str.split('\n').filter(|l| !l.is_empty());
+    let Some(status_line) = lines.next() else {
+        return HttpResult::Err("malformed HTTP response: missing status line".to_string());
+    };
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+    HttpResult::Ok(HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(body).into_owned(),
+        elapsed_ms,
+    })
+}
+
+/// [`spawn_http_request`]'s return shape: the child (shared with its
+/// background thread, for `cancel()`) and the one-shot result channel.
+/// `Engine::plugin_api_http_request` wraps this into a [`PluginHttpHandle`]
+/// once it has the owning `Rc<PluginManager>` to downgrade — mirrors
+/// `spawn_piped`/`Engine::plugin_api_spawn`'s split the same way.
+type HttpPipes = (Arc<Mutex<Child>>, Receiver<HttpResult>);
+
+/// Launch `spec` as a `curl` child and return the shared child handle (for
+/// `cancel()`) plus the one-shot result channel, polled by `Engine::
+/// poll_plugin_http`.
+///
+/// stdout/stderr are drained on their own reader threads (rather than one
+/// `read_to_end` after another) for the same reason [`spawn_piped`] does:
+/// reading them sequentially risks a deadlock if the child fills the *other*
+/// pipe's OS buffer while this thread is still blocked on the first one.
+pub(crate) fn spawn_http_request(spec: HttpRequestSpec) -> std::io::Result<HttpPipes> {
+    let mut command = crate::core::git::hidden_command("curl");
+    let timeout_secs = (spec.timeout_ms.max(1) as f64) / 1000.0;
+    command.args([
+        "-sS",
+        "-i",
+        "--max-time",
+        &format!("{timeout_secs:.3}"),
+        "-X",
+        &spec.method,
+    ]);
+    for (k, v) in &spec.headers {
+        command.arg("-H").arg(format!("{k}: {v}"));
+    }
+    if spec.body.is_some() {
+        // Suppress curl's automatic `Expect: 100-continue` for a sizeable
+        // `--data-raw` body: an intermediate "HTTP/1.1 100 Continue" block
+        // ahead of the real response would otherwise defeat `split_head_
+        // body`'s "first blank line" framing, which assumes exactly one
+        // header block.
+        command.arg("-H").arg("Expect:");
+    }
+    if let Some(body) = &spec.body {
+        command.arg("--data-raw").arg(body);
+    }
+    command.arg(&spec.url);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let child = Arc::new(Mutex::new(child));
+    let (tx, rx) = mpsc::channel();
+    let child_thread = Arc::clone(&child);
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let out_reader = stdout.map(|mut out| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = out.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let err_reader = stderr.map(|mut err| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf);
+                buf
+            })
+        });
+        let out_buf = out_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        let err_buf = err_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+        let status = match child_thread.lock() {
+            Ok(mut guard) => guard.wait(),
+            Err(poisoned) => poisoned.into_inner().wait(),
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let result = match status {
+            Ok(status) if status.success() => parse_curl_response(&out_buf, elapsed_ms),
+            Ok(_) => {
+                let msg = String::from_utf8_lossy(&err_buf).trim().to_string();
+                HttpResult::Err(if msg.is_empty() {
+                    "curl request failed".to_string()
+                } else {
+                    msg
+                })
+            }
+            Err(e) => HttpResult::Err(e.to_string()),
+        };
+        // A `cancel()` that dropped this handle (and its `Receiver`) races
+        // harmlessly with this send — `send` just returns `Err`, ignored.
+        let _ = tx.send(result);
+    });
+    Ok((child, rx))
+}
+
 impl Engine {
     pub fn execute_command(&mut self, cmd: &str) -> EngineAction {
         // Save for @: repeat (before normalization, using trimmed original).
