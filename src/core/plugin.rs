@@ -3018,6 +3018,45 @@ impl PluginManager {
             })?,
         )?;
 
+        // vimcode.ui.open_view(name, {location = "tab"}) — open a registered
+        // view as an editor-area tab (#1627), the second of the two hosting
+        // surfaces #146 deferred ("Not yet supported" in EXTENSIONS.md).
+        // `"tab"` is the only supported `location` today; a call with any
+        // other value (or a `name` that isn't a registered view) is a Lua
+        // error rather than a silent no-op, matching `register_view`'s own
+        // "fail loudly at the Lua/Rust boundary" convention.
+        //
+        // Immediate ("live engine") API, like `vimcode.buffer.*`: opening a
+        // tab is a structural engine mutation (`Engine::
+        // open_plugin_view_tab` — a real `Tab`/`Window`/scratch `BufferId`,
+        // via the pre-existing `Engine::new_tab`), not queued output data, so
+        // it needs `live_engine` the way `vimcode.buffer.create` does rather
+        // than a `PluginCallContext` field `apply_plugin_ctx` applies later.
+        ui_tbl.set(
+            "open_view",
+            lua.create_function(|_, (name, opts): (String, Option<LuaTable>)| {
+                let location: String = opts
+                    .as_ref()
+                    .and_then(|t| t.get::<_, String>("location").ok())
+                    .unwrap_or_else(|| "tab".to_string());
+                if location != "tab" {
+                    return Err(LuaError::RuntimeError(format!(
+                        "vimcode.ui.open_view({name:?}): unsupported location {location:?} \
+                         (only \"tab\" is supported)"
+                    )));
+                }
+                let opened = live_engine("vimcode.ui.open_view", move |e| {
+                    e.open_plugin_view_tab(&name)
+                })?;
+                if !opened {
+                    return Err(LuaError::RuntimeError(
+                        "vimcode.ui.open_view: name is not a registered view".to_string(),
+                    ));
+                }
+                Ok(())
+            })?,
+        )?;
+
         vimcode.set("ui", ui_tbl)?;
 
         // ── vimcode.editor subtable ────────────────────────────────────────

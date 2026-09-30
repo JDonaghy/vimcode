@@ -3135,6 +3135,37 @@ impl App {
         for rw in &screen.windows {
             let editor = render::to_q_editor(rw);
             let rect = editor.rect;
+
+            // #1627: an editor-tab-hosted `vimcode.ui.register_view` view
+            // paints a `Form`, not buffer text — the same shared
+            // `quadraui::Form` primitive + adapter
+            // (`render::plugin_view_to_form`) the sidebar body already paints
+            // through, just routed through its own `FormController`/rect pair
+            // (`Engine::plugin_view_tab_form_controller`/`_tab_form_rect`) so
+            // a simultaneously-visible sidebar view can't clobber this one's
+            // cached click geometry. `window_editors` still gets `editor`
+            // (an empty placeholder — `rw.lines` is `vec![]` for a
+            // plugin-view window, see `render::build_rendered_window`'s
+            // short-circuit) so its indices stay 1:1 with `screen.windows`
+            // for `compose_editor_band_rungs`' later `FrameHitMap` build.
+            if let Some(view_name) = &rw.plugin_view {
+                let engine = self.engine.borrow();
+                engine.plugin_view_tab_form_rect.set(rect);
+                if render::populate_plugin_view_tab_form_controller(
+                    &engine,
+                    view_name,
+                    rw.is_active,
+                ) {
+                    engine
+                        .plugin_view_tab_form_controller
+                        .borrow_mut()
+                        .render_and_cache(backend, rect);
+                }
+                drop(engine);
+                window_editors.push(editor);
+                continue;
+            }
+
             let mut frame = QSL::new();
             frame.push(Surface::Editor {
                 rect,
@@ -5205,6 +5236,43 @@ impl App {
                         self.divider_grab = Some(grab);
                         return;
                     }
+                }
+
+                // ── Editor-tab-hosted plugin view click (#1627) ────────────
+                //
+                // A `vimcode.ui.register_view` view opened as an editor-area
+                // tab (`Engine::open_plugin_view_tab`) paints a `Form`, not
+                // buffer text (`App::paint_editor_windows_rung`) — a click
+                // inside its window rect has no buffer-click meaning for
+                // `click::handle_mouse_click` to resolve (no cursor to place,
+                // no file to reveal), so it's routed through the same
+                // `FormController` path the sidebar uses
+                // (`render::handle_plugin_view_tab_ui_event`) instead, before
+                // falling into the generic buffer-click block below. Walks
+                // the same `screen.windows` rects `click.rs` itself resolves
+                // clicks against, so the two can't disagree about which
+                // window a click landed in.
+                let plugin_view_hit = self.cached_screen_layout.borrow().as_ref().and_then(|l| {
+                    l.windows.iter().find_map(|w| {
+                        let name = w.plugin_view.clone()?;
+                        let rect: quadraui::Rect = w.rect.into();
+                        rect.contains(quadraui::Point::new(x as f32, y as f32))
+                            .then_some((name, rect))
+                    })
+                });
+                if let Some((name, rect)) = plugin_view_hit {
+                    let mut engine = self.engine.borrow_mut();
+                    engine.clear_sidebar_focus();
+                    let event = quadraui::UiEvent::MouseDown {
+                        widget: None,
+                        button: quadraui::MouseButton::Left,
+                        position: quadraui::Point::new(x as f32, y as f32),
+                        modifiers: quadraui::Modifiers::default(),
+                    };
+                    render::handle_plugin_view_tab_ui_event(&mut engine, &name, &event, rect);
+                    drop(engine);
+                    self.draw_needed.set(true);
+                    return;
                 }
 
                 {

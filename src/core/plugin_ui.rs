@@ -302,6 +302,42 @@ pub struct PluginViewEvent {
     pub kind: ViewEventKind,
 }
 
+// ─── In-panel text entry (#1627) ────────────────────────────────────────────
+
+/// vimcode-owned edit state for whichever `Text`/`Password`/`TextArea` field
+/// currently has keyboard focus, in either the sidebar or an editor-area tab.
+///
+/// This is `Engine`-side interaction state, never serialized across the
+/// Rust/Lua boundary — plugins see only the committed value, via
+/// [`ViewEventKind::TextChanged`]/[`ViewEventKind::TextCommitted`]. That split
+/// is exactly what #146's ABI decision (this module's doc comment, reason 1)
+/// exists to make possible: a plugin cannot park the cursor mid-codepoint or
+/// otherwise corrupt vimcode's own interaction state, because it never has a
+/// handle to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginViewTextEditState {
+    /// The view that owns the focused field.
+    pub view: String,
+    /// The plugin-authored field id (not the namespaced `quadraui::WidgetId`).
+    pub field_id: String,
+    /// The live, possibly-uncommitted text.
+    pub value: String,
+    /// Byte offset into `value`.
+    pub cursor: usize,
+    /// Byte offset into `value`; `Some(n)` with `n != cursor` means the range
+    /// between the two is selected. `None` means no selection.
+    pub selection_anchor: Option<usize>,
+}
+
+impl PluginViewTextEditState {
+    /// Sorted `(lo, hi)` selection byte range, or `None` when there is no
+    /// selection (matches `Engine::explorer_rename`'s identical helper).
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        self.selection_anchor
+            .map(|a| (a.min(self.cursor), a.max(self.cursor)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

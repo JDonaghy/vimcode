@@ -257,7 +257,7 @@ impl Engine {
 
     /// Handle keyboard input for an extension panel.
     /// Returns `true` if the key was consumed.
-    pub fn handle_ext_panel_key(&mut self, key: &str, _ctrl: bool, _unicode: Option<char>) -> bool {
+    pub fn handle_ext_panel_key(&mut self, key: &str, ctrl: bool, unicode: Option<char>) -> bool {
         let panel_name = match &self.ext_panel_active {
             Some(n) => n.clone(),
             None => {
@@ -272,10 +272,16 @@ impl Engine {
             return true;
         }
 
-        // #146: a `vimcode.ui.register_view` panel paints a `quadraui::Form`, so
-        // navigation/activation resolve against its fields, not the tree rows
-        // below. Keys the view doesn't own (`q`, `h`, `?`, …) fall through.
-        if self.is_plugin_view(&panel_name) && self.handle_plugin_view_key(&panel_name, key) {
+        // #146/#1627: a `vimcode.ui.register_view` panel paints a
+        // `quadraui::Form`, so navigation/activation/text-entry resolve
+        // against its fields, not the tree rows below. Keys the view doesn't
+        // own (`q`, `h`, `?`, …) fall through. `ctrl`/`unicode` are threaded
+        // through now that a focused `Text`/`Password`/`TextArea` field
+        // actually edits (#1627) — previously unused (`_ctrl`/`_unicode`)
+        // since navigation/activation only ever needed the key name.
+        if self.is_plugin_view(&panel_name)
+            && self.handle_plugin_view_key(&panel_name, key, ctrl, unicode, PluginViewHost::Sidebar)
+        {
             return true;
         }
 

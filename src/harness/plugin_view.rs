@@ -51,6 +51,14 @@ pub const ROW_TEXT_VALUE: &str = "vaZQ146";
 pub const ROW_BUTTON: &str = "SdZQ146";
 /// A `toggle`-kind row's label.
 pub const ROW_TOGGLE: &str = "TgZQ146";
+/// A second `text`-kind row, declared with an *empty* value — used by the
+/// typing scenario. Growing an already-long value (`ROW_TEXT_VALUE`) by even
+/// a couple of characters can cross the sidebar's label/value column split
+/// (`quadraui::tui::form`'s `start_col > label_end + 1` guard) and suppress
+/// the whole row's paint — the same column-budget trap this module's doc
+/// comment already names, just triggered by *editing* rather than by an
+/// already-too-long declared value. Starting empty leaves ample room.
+pub const ROW_EMPTY_TEXT_LABEL: &str = "EtZQ146";
 
 /// The counter row's painted text before any activation, and after one.
 ///
@@ -87,6 +95,8 @@ vimcode.ui.register_view("{VIEW}", {{
         {{ type = "toggle", id = "tls",  label = "{ROW_TOGGLE}",
            value = count % 2 == 1 }},
         {{ type = "button", id = "send", label = "{ROW_BUTTON}" }},
+        {{ type = "text",   id = "etx",  label = "{ROW_EMPTY_TEXT_LABEL}",
+           value = "" }},
       }},
     }}
   end,
@@ -95,9 +105,24 @@ vimcode.ui.register_view("{VIEW}", {{
       count = count + 1
     elseif event.widget_id == "tls" and event.kind == "ToggleChanged" then
       count = count + 1
+    elseif event.widget_id == "etx"
+        and (event.kind == "TextChanged" or event.kind == "TextCommitted") then
+      -- #1627: every keystroke into the focused text field reaches here as
+      -- a TextChanged event, and Enter reaches here once more as
+      -- TextCommitted with the same (by-then-final) value.
+      count = count + 1
     end
   end,
 }})
+
+-- #1627: a real `:Command` around `vimcode.ui.open_view`, so the editor-tab
+-- fixture exercises the actual Lua binding rather than reaching straight for
+-- `Engine::open_plugin_view_tab` — `open_view` needs a *live* engine loan
+-- (`live_engine`'s doc), which only exists while a callback like this one is
+-- running, not during the top-level load this whole file runs as.
+vimcode.command("Zq146OpenTab", function()
+  vimcode.ui.open_view("{VIEW}", {{ location = "tab" }})
+end)
 "#
     )
 }
@@ -120,15 +145,14 @@ fn plugin_dir() -> PathBuf {
     dir
 }
 
-/// Build the fixture engine: a genuine `vimcode.ui.register_view` registration
-/// loaded from real Lua, with its panel active and focused in the sidebar.
-///
-/// The `_dir` return keeps the temp directory alive for the caller's use; the
-/// plugin is already loaded into the Lua state by the time this returns, so the
-/// files are only needed for diagnosis.
-pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
-    let dir = plugin_dir();
-    let mut engine = Engine::new_for_test();
+/// Load the fixture plugin from `dir` into `engine`: a genuine
+/// `vimcode.ui.register_view` (+ `Zq146OpenTab` command) registration from
+/// real Lua, harvested the same way `Engine::init_plugins` harvests a real
+/// plugin directory. Shared by every fixture builder in this module — the
+/// sidebar one ([`engine_with_plugin_view`]) and the editor-tab one
+/// ([`engine_with_plugin_view_tab`]) — so the two can't drift on how the
+/// plugin gets loaded, only on what they do with it afterward.
+fn load_fixture_plugin(engine: &mut Engine, dir: &std::path::Path) {
     engine.settings.use_nerd_fonts = Some(false);
     crate::icons::set_nerd_fonts(false);
     engine.settings.plugins_enabled = true;
@@ -138,7 +162,7 @@ pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
     engine.plugin_views.clear();
 
     let mut pm = crate::core::plugin::PluginManager::new().expect("lua state");
-    pm.load_plugins_dir(&dir, &[]);
+    pm.load_plugins_dir(dir, &[]);
     assert!(
         pm.plugins.iter().all(|p| p.error.is_none()),
         "fixture plugin must load cleanly; errors: {:?}",
@@ -161,6 +185,18 @@ pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
         engine.is_plugin_view(VIEW),
         "fixture must register {VIEW:?} as a view-backed panel"
     );
+}
+
+/// Build the fixture engine: a genuine `vimcode.ui.register_view` registration
+/// loaded from real Lua, with its panel active and focused in the sidebar.
+///
+/// The `_dir` return keeps the temp directory alive for the caller's use; the
+/// plugin is already loaded into the Lua state by the time this returns, so the
+/// files are only needed for diagnosis.
+pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
 
     engine.ext_panel_active = Some(VIEW.to_string());
     engine.ext_panel_has_focus = true;
@@ -191,6 +227,40 @@ pub fn engine_with_plugin_view() -> (Engine, PathBuf) {
     engine.app_shell.show_panel(&quadraui::WidgetId::new(
         crate::core::engine::sidebar::PANEL_SETTINGS,
     ));
+    (engine, dir)
+}
+
+/// Build a fixture engine with the same registered view, opened as an
+/// **editor-area tab** instead of the sidebar (#1627's second hosting
+/// surface) — via the fixture's real `Zq146OpenTab` `:Command`, which calls
+/// `vimcode.ui.open_view(VIEW, {location = "tab"})`. Driving the real Lua
+/// command (rather than calling `Engine::open_plugin_view_tab` directly)
+/// keeps the Lua binding itself in the measured path, same rationale as this
+/// module's "why a real `PluginManager`" doc.
+pub fn engine_with_plugin_view_tab() -> (Engine, PathBuf) {
+    let dir = plugin_dir();
+    let mut engine = Engine::new_for_test();
+    load_fixture_plugin(&mut engine, &dir);
+
+    // `quadraui::AppShell::new` defaults `sidebar_visible: true` with the
+    // Explorer panel active, which on a narrow test viewport leaves no room
+    // for the editor column at all. Not part of what #1627 is testing — move
+    // the active panel to Settings instead (mirrors `engine_with_plugin_
+    // view`'s sidebar fixture, which does the same for the same reason).
+    engine.app_shell.show_panel(&quadraui::WidgetId::new(
+        crate::core::engine::sidebar::PANEL_SETTINGS,
+    ));
+
+    let before_tabs = engine.active_group().tabs.len();
+    assert!(
+        engine.plugin_run_command("Zq146OpenTab", ""),
+        "fixture plugin must register the Zq146OpenTab command"
+    );
+    assert_eq!(
+        engine.active_group().tabs.len(),
+        before_tabs + 1,
+        "vimcode.ui.open_view(..., {{location = \"tab\"}}) must open a new tab"
+    );
     (engine, dir)
 }
 
@@ -266,8 +336,16 @@ pub fn clicking_a_button_reaches_the_plugin_handler(driver: &mut impl Conformanc
 
 /// Scenario 3 — keyboard activation of the focused widget, same round trip.
 ///
-/// `j` walks to the button (skipping the two `label` rows and stopping on
+/// `Tab` walks to the button (skipping the two `label` rows and stopping on
 /// interactive ones), `Enter` activates it.
+///
+/// Field-to-field navigation is `Tab`/`Shift+Tab` rather than `j`/`k` because
+/// selection starts on the first interactive row — the `text` field — and
+/// since #1627 gave that field real text entry, `j`/`k` are now literal
+/// characters to type into it rather than navigation (typing them used to be
+/// this exact test's `j`/`j` walk, before #1627; see
+/// `plugin_view_typing_edits_a_focused_text_field` for the "j/k type into the
+/// field" side of that same change).
 pub fn keyboard_activation_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
     assert!(
         driver.screen_has(COUNT_0),
@@ -275,15 +353,110 @@ pub fn keyboard_activation_reaches_the_plugin_handler(driver: &mut impl Conforma
          were {:?}",
         painted(driver)
     );
-    // Selection starts on the first interactive row (the `text` row); one `j`
-    // reaches the toggle, a second reaches the button.
-    driver.type_char('j');
-    driver.type_char('j');
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
     driver.press_named(quadraui::NamedKey::Enter);
     assert!(
         driver.screen_has(COUNT_1),
         "Enter on the focused button row must reach the plugin's on_event \
          handler and repaint ({COUNT_1:?}); painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 4 (#1627) — typing into a focused `Text` field inserts
+/// characters and paints a caret; the plugin sees `TextChanged` per
+/// keystroke and `TextCommitted` on Enter with the typed value.
+///
+/// Navigates to [`ROW_EMPTY_TEXT_LABEL`]'s field (declared with an empty
+/// value) via three `Tab`s rather than typing into the already-focused
+/// `url` field — see that constant's doc for why growing
+/// [`ROW_TEXT_VALUE`] would risk tripping the sidebar's column-budget
+/// suppression instead of exercising #1627 at all.
+///
+/// Fails against a `develop` without #1627: the pre-#1627 `Text` field always
+/// painted with `cursor: None` (`plugin_view_to_form`'s doc, "Text *entry*
+/// ... is Phase 2"), so a focused field never showed a caret and typing did
+/// nothing to the painted value at all.
+pub fn typing_edits_the_focused_text_field(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(COUNT_0),
+        "precondition: the counter row must start at {COUNT_0:?}; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.type_char('!');
+    driver.type_char('?');
+    assert!(
+        driver.screen_has("!?"),
+        "typing '!?' into the focused (empty) text field must insert it \
+         into the painted value; painted runs were {:?}",
+        painted(driver)
+    );
+    assert!(
+        driver.screen_has("n2ZQ146"),
+        "each keystroke must reach the plugin's on_event handler as a \
+         TextChanged event, bumping the shared counter twice; painted runs \
+         were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        driver.screen_has("n3ZQ146"),
+        "Enter must commit the field (TextCommitted), bumping the counter a \
+         third time; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 5 (#1627) — a view opened via `vimcode.ui.open_view(...,
+/// {location = "tab"})` paints in the editor area, not the sidebar, and a
+/// click on its button reaches the plugin's `on_event` handler exactly the
+/// way a sidebar click does.
+///
+/// Fails against a `develop` without #1627: `vimcode.ui.open_view` doesn't
+/// exist yet, so [`engine_with_plugin_view_tab`]'s fixture command errors out
+/// before this scenario ever gets to run.
+pub fn tab_paints_and_click_reaches_the_plugin_handler(driver: &mut impl ConformanceDriver) {
+    assert_paints(
+        driver,
+        &[ROW_HEADER, ROW_BUTTON, COUNT_0],
+        "the editor-tab-hosted plugin view",
+    );
+    driver.click_text(ROW_BUTTON);
+    assert!(
+        driver.screen_has(COUNT_1),
+        "clicking {ROW_BUTTON:?} in the editor-tab-hosted view must reach the \
+         plugin's on_event handler; painted runs were {:?}",
+        painted(driver)
+    );
+}
+
+/// Scenario 6 (#1627) — closing an editor-tab-hosted plugin view's tab
+/// removes it, exactly like any other tab.
+///
+/// `Tab`, `Tab` moves focus off the initially-focused `Text` field onto the
+/// `Button` row first, so the following `:` falls through to real
+/// Command-mode entry instead of being typed literally into the field — see
+/// `Engine::handle_key`'s `#1627` guard (`keys.rs`) for why a focused text
+/// field would otherwise swallow it.
+pub fn closing_the_tab_removes_it(driver: &mut impl ConformanceDriver) {
+    assert!(
+        driver.screen_has(ROW_HEADER),
+        "precondition: the view must be painted before its tab is closed; \
+         painted runs were {:?}",
+        painted(driver)
+    );
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.press_named(quadraui::NamedKey::Tab);
+    driver.type_text(":tabclose");
+    driver.press_named(quadraui::NamedKey::Enter);
+    assert!(
+        !driver.screen_has(ROW_HEADER),
+        ":tabclose must remove the plugin-view tab; painted runs were {:?}",
         painted(driver)
     );
 }
@@ -313,6 +486,18 @@ mod tests {
         (h, dir)
     }
 
+    fn tui_tab() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::tui::testing::TuiDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab();
+        let mut h = crate::tui_main::testing::conformance_harness(engine, TUI_W, TUI_H);
+        h.driver.render();
+        (h, dir)
+    }
+
     #[test]
     fn plugin_view_declared_tree_is_painted_on_tui() {
         let (h, _dir) = tui();
@@ -331,6 +516,24 @@ mod tests {
         keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
     }
 
+    #[test]
+    fn plugin_view_typing_edits_the_focused_text_field_on_tui() {
+        let (mut h, _dir) = tui();
+        typing_edits_the_focused_text_field(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_tab_paints_and_click_reaches_the_handler_on_tui() {
+        let (mut h, _dir) = tui_tab();
+        tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[test]
+    fn plugin_view_closing_the_tab_removes_it_on_tui() {
+        let (mut h, _dir) = tui_tab();
+        closing_the_tab_removes_it(&mut h.driver);
+    }
+
     #[cfg(feature = "gui")]
     fn gtk() -> (
         crate::harness::ConformanceHarness<
@@ -339,6 +542,19 @@ mod tests {
         PathBuf,
     ) {
         let (engine, dir) = engine_with_plugin_view();
+        let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
+        h.driver.render();
+        (h, dir)
+    }
+
+    #[cfg(feature = "gui")]
+    fn gtk_tab() -> (
+        crate::harness::ConformanceHarness<
+            quadraui::gtk::testing::GtkDriver<impl quadraui::AppLogic>,
+        >,
+        PathBuf,
+    ) {
+        let (engine, dir) = engine_with_plugin_view_tab();
         let mut h = crate::gtk::testing::conformance_harness(engine, W, H);
         h.driver.render();
         (h, dir)
@@ -363,5 +579,26 @@ mod tests {
     fn plugin_view_keyboard_activation_reaches_the_handler_on_gtk() {
         let (mut h, _dir) = gtk();
         keyboard_activation_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_typing_edits_the_focused_text_field_on_gtk() {
+        let (mut h, _dir) = gtk();
+        typing_edits_the_focused_text_field(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_tab_paints_and_click_reaches_the_handler_on_gtk() {
+        let (mut h, _dir) = gtk_tab();
+        tab_paints_and_click_reaches_the_plugin_handler(&mut h.driver);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn plugin_view_closing_the_tab_removes_it_on_gtk() {
+        let (mut h, _dir) = gtk_tab();
+        closing_the_tab_removes_it(&mut h.driver);
     }
 }

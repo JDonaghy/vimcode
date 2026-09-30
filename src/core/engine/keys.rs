@@ -410,6 +410,50 @@ impl Engine {
             return EngineAction::None;
         }
 
+        // #1627: the active window may be hosting a `vimcode.ui.register_view`
+        // view as an editor-area tab (`Engine::open_plugin_view_tab`) rather
+        // than a text buffer — route keys through the same
+        // `handle_plugin_view_key` the sidebar uses (with its own selection/
+        // scroll state, `PluginViewHost::Tab`) instead of falling into
+        // Insert/Normal/Visual-mode buffer editing below. Gated on
+        // `!self.ext_panel_has_focus`: the sidebar already claimed every key
+        // above when it has focus, and only one of the two surfaces can hold
+        // keyboard focus at a time.
+        //
+        // Only a key the view actually claims is consumed here (mirrors
+        // `handle_ext_panel_key`'s own fallthrough for the sidebar) — while a
+        // `Text`/`Password`/`TextArea` field is focused that is *every* key
+        // (typing must never leak into buffer editing, #1627's own
+        // requirement), but with a `Button`/`Toggle`/no field focused, an
+        // unrecognised key (`:`, `gt`, `<C-w>`, …) falls through to ordinary
+        // vim dispatch below — the scratch buffer backing the tab is
+        // `read_only`, so nothing there can be corrupted, and this is what
+        // lets `:tabclose` (or any other window-management command) close a
+        // plugin-view tab exactly like any other tab.
+        //
+        // Gated on `Mode::Normal` too, not just `!ext_panel_has_focus`: once a
+        // fallthrough `:` above has switched into `Mode::Command` (or a
+        // fallthrough `/` into `Mode::Search`, or `i`/`a`/… into
+        // `Mode::Insert`), every subsequent keystroke belongs to *that*
+        // mode's own editor, not the view — without this a command like
+        // `:g/pat/d` would have its leading `g` swallowed as "jump to first
+        // field" instead of reaching the command line, since the active
+        // window is still the same plugin-view tab for the whole time the
+        // user is typing it.
+        if !self.ext_panel_has_focus && self.mode == Mode::Normal {
+            if let Some(view_name) = self.active_plugin_view_tab() {
+                if self.handle_plugin_view_key(
+                    &view_name,
+                    key_name,
+                    ctrl,
+                    unicode,
+                    PluginViewHost::Tab,
+                ) {
+                    return EngineAction::None;
+                }
+            }
+        }
+
         // Ctrl-S: save in any mode (does not change mode) — except right
         // after `<C-x>` in Insert mode, where `<C-x><C-s>` is the
         // spelling-suggestion completion sub-mode (`:h i_CTRL-X_CTRL-S`,
