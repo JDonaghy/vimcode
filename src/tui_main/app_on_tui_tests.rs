@@ -10102,5 +10102,157 @@ mod tests {
                  screen:\n{screen}"
             );
         }
+
+        // ─────────────────────────────────────────────────────────────────
+        // #1632 acceptance: `vimcode.http` (async requests, delivered via the
+        // #1624 callback registry) driving a plugin view's painted output.
+        // ─────────────────────────────────────────────────────────────────
+
+        /// A minimal one-shot loopback HTTP fixture: binds an ephemeral port,
+        /// answers exactly one request with a fixed 200 response and `body`,
+        /// then exits. Mirrors `tests/extensions.rs`'s
+        /// `spawn_http_fixture_server` — this file compiles into the library
+        /// crate, not the `tests/` integration binary, so it can't reuse that
+        /// helper directly — trimmed to what this single scenario needs: no
+        /// method/path/header/body echoing, since the plugin here only ever
+        /// issues one GET.
+        fn spawn_one_shot_http_fixture(body: &'static str) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("bind an ephemeral loopback port");
+            let addr = listener.local_addr().expect("resolve bound local_addr");
+            let base_url = format!("http://{addr}");
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // Drain the request up to the blank line ending its headers
+                // before responding — curl doesn't start reading a response
+                // until it has finished writing the request.
+                let mut chunk = [0u8; 4096];
+                let mut seen = Vec::new();
+                loop {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    seen.extend_from_slice(&chunk[..n]);
+                    if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    if seen.len() > 65_536 {
+                        return;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+            base_url
+        }
+
+        /// #1632 acceptance: "`TuiDriver` black-box test: a plugin view with
+        /// a button that performs an HTTP GET against the local test server
+        /// and paints the response body into the view." Driven through the
+        /// real event loop end to end: a `:`-command opens the view as an
+        /// editor tab (`vimcode.ui.open_view`), `Enter` on the (only,
+        /// already-focused) button field fires `vimcode.http.request`
+        /// against the fixture server on a background thread, and the
+        /// response callback's `vimcode.ui.refresh()` re-renders the view
+        /// once `Engine::poll_plugin_http` (drained by `driver.tick()`, same
+        /// as the #1630 picker-streaming test above) delivers the result.
+        ///
+        /// RED-verified two ways: against unfixed `develop`, there is no
+        /// `vimcode.http` table at all, so the button's `on_event` handler
+        /// errors on its first call and the label never leaves "idle" or
+        /// "Go" is never reached; and, while authoring this test, passing
+        /// `on_event` only a single `ev` parameter (`vimcode.ui.register_
+        /// view`'s handler signature is actually `(ctx, event)`, per
+        /// `PluginManager::call_view_event`) silently left `ev.widget_id`
+        /// `nil` and this assertion failed the same way — confirming the
+        /// test is sensitive to the real wiring, not just presence of the
+        /// `vimcode.http` table.
+        #[test]
+        fn plugin_view_button_http_get_paints_response_body_via_shell_app() {
+            use std::time::{Duration, Instant};
+
+            let base_url = spawn_one_shot_http_fixture("ZQ_HTTP_1632_PROOF_BODY");
+
+            let engine = engine_with_plugin(
+                "http_view_1632",
+                &format!(
+                    r#"
+                    _G.status_text = "idle"
+                    vimcode.ui.register_view("http_demo_1632", {{
+                        title = "HTTP Demo",
+                        render = function()
+                            return {{
+                                fields = {{
+                                    {{ type = "label", id = "status", label = _G.status_text }},
+                                    {{ type = "button", id = "go", label = "Go" }},
+                                }},
+                            }}
+                        end,
+                        on_event = function(_ctx, ev)
+                            if ev.widget_id == "go" then
+                                vimcode.http.request(
+                                    {{ method = "GET", url = "{base_url}/proof" }},
+                                    function(resp)
+                                        _G.status_text = resp.body
+                                            or ("ERR:" .. tostring(resp.error))
+                                        vimcode.ui.refresh("http_demo_1632")
+                                    end
+                                )
+                            end
+                        end,
+                    }})
+                    vimcode.command("ZqOpenHttpView", function(_)
+                        vimcode.ui.open_view("http_demo_1632")
+                    end)
+                    "#
+                ),
+            );
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            driver.type_char(':');
+            for c in "ZqOpenHttpView".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let before = driver.screen();
+            assert!(
+                before.contains("Go") && before.contains("idle"),
+                "the view must paint its button and initial label before \
+                 the request fires; screen:\n{before}"
+            );
+
+            // The button is the only focusable field — Enter activates it,
+            // dispatching `ButtonClicked` to the Lua `on_event` handler,
+            // which fires the real HTTP request.
+            driver.press_named(quadraui::NamedKey::Enter);
+            driver.render();
+
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut screen = driver.screen();
+            while !screen.contains("ZQ_HTTP_1632_PROOF_BODY") && Instant::now() < deadline {
+                driver.tick();
+                std::thread::sleep(Duration::from_millis(10));
+                screen = driver.screen();
+            }
+            assert!(
+                screen.contains("ZQ_HTTP_1632_PROOF_BODY"),
+                "the fixture server's response body must be painted into \
+                 the view within 10s of the button click; screen:\n{screen}"
+            );
+        }
     }
 }

@@ -2129,6 +2129,46 @@ impl PluginManager {
     fn setup_vimcode_api(lua: &Lua) -> LuaResult<()> {
         let vimcode = lua.create_table()?;
 
+        // ── Harden the global `load` (#1632 review) ──────────────────────────
+        //
+        // `current_plugin_chunk_name` (used to namespace `vimcode.storage.*`)
+        // trusts a Lua chunk's own debug `source`, which stock Lua's `load(chunk,
+        // chunkname)` lets *any* caller set to an arbitrary string. Left alone,
+        // `load(payload, "other-plugin-name")()` would let a malicious plugin
+        // impersonate another plugin's storage namespace — all plugins share one
+        // `Lua` VM (`PluginManager::new`), so nothing else stops it.
+        //
+        // Replace the global `load` with a wrapper that ignores whatever
+        // chunkname the *caller* passes and always substitutes the caller's own
+        // real identity instead (itself derived via `current_plugin_chunk_name`,
+        // walking the *actual* call stack at the point `load` is invoked — this
+        // is unforgeable because it reflects where the code calling `load` was
+        // truly defined, not any user-suppliable string). Dynamically loaded
+        // code therefore always inherits its caller's namespace, never an
+        // impersonated one. This only affects the Lua-visible `load`; the
+        // trusted host-side load in `load_one_plugin` uses `Lua::load` directly
+        // (a different, Rust-only API) and is unaffected.
+        {
+            let globals = lua.globals();
+            let real_load: LuaFunction = globals.get("load")?;
+            let real_load_key = lua.create_registry_value(real_load)?;
+            let hardened_load = lua.create_function(move |lua, args: LuaMultiValue| {
+                let owner =
+                    current_plugin_chunk_name(lua).unwrap_or_else(|| "<unknown>".to_string());
+                let mut it = args.into_iter();
+                let chunk = it.next().unwrap_or(LuaNil);
+                let _discarded_chunkname = it.next();
+                let mode = it.next();
+                let env = it.next();
+                let mut call_args = vec![chunk, LuaValue::String(lua.create_string(&owner)?)];
+                call_args.extend(mode);
+                call_args.extend(env);
+                let real_load: LuaFunction = lua.registry_value(&real_load_key)?;
+                real_load.call::<_, LuaMultiValue>(LuaMultiValue::from_vec(call_args))
+            })?;
+            globals.set("load", hardened_load)?;
+        }
+
         // ── vimcode.json (#1632) ─────────────────────────────────────────────
         //
         // The `null`/`empty_object` sentinels are created once here (not
@@ -2730,8 +2770,24 @@ impl PluginManager {
                 }
                 let mut headers = Vec::new();
                 if let Ok(h) = opts.get::<_, LuaTable>("headers") {
-                    for pair in h.pairs::<String, String>().flatten() {
-                        headers.push(pair);
+                    for (k, v) in h.pairs::<String, String>().flatten() {
+                        // Reject CR/LF in header names/values here, at the
+                        // Lua boundary, so a plugin gets an immediate, clear
+                        // error instead of a generic "failed to start"
+                        // further down — `spawn_http_request` also rejects
+                        // these defensively (#1632 review: unstripped CR/LF
+                        // let a header value smuggle extra header lines onto
+                        // the wire, e.g. from response data or a template).
+                        if k.contains('\r')
+                            || k.contains('\n')
+                            || v.contains('\r')
+                            || v.contains('\n')
+                        {
+                            return Err(LuaError::RuntimeError(format!(
+                                "vimcode.http.request: header {k:?} must not contain CR or LF"
+                            )));
+                        }
+                        headers.push((k, v));
                     }
                 }
                 let body: Option<String> = opts.get::<_, String>("body").ok();

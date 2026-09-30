@@ -2373,7 +2373,12 @@ impl Engine {
     /// (failed to spawn `curl` — the Lua binding surfaces that as a runtime
     /// error, matching `plugin_api_spawn`'s "failed to start" convention) or
     /// there is no live plugin manager.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Registers `on_response` in `pm`'s callback registry *before* spawning
+    /// `curl`, deregistering it again if the spawn fails — the reverse order
+    /// (spawn first, register only on success) leaked `on_response`'s
+    /// `LuaRegistryKey` slot on the "curl failed to start" path, since it was
+    /// dropped without ever reaching `remove_http_callback` (#1632 review).
     pub(crate) fn plugin_api_http_request(
         &mut self,
         method: String,
@@ -2391,8 +2396,14 @@ impl Engine {
             body,
             timeout_ms,
         };
-        let (child, rx) = execute::spawn_http_request(spec).ok()?;
         let id = pm.register_http_callback(on_response);
+        let (child, rx) = match execute::spawn_http_request(spec) {
+            Ok(pipes) => pipes,
+            Err(_) => {
+                pm.remove_http_callback(id);
+                return None;
+            }
+        };
         self.plugin_http_requests.insert(
             id,
             execute::PluginHttpHandle {
