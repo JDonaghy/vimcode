@@ -164,6 +164,16 @@ impl Engine {
     }
 
     /// Close the unified picker and clear all state.
+    ///
+    /// This does **not** fire a plugin picker's `on_cancel`/teardown by
+    /// itself — callers that dispatch a *confirmed* item (`picker_confirm`
+    /// and friends) call this first and then run their own
+    /// select/action-specific teardown, which still needs `PluginManager::
+    /// pickers[id]` alive to look up the callback and item `data`. A caller
+    /// that represents the user backing out without confirming anything
+    /// (Escape, GTK click-outside-to-dismiss) must use
+    /// [`Self::close_picker_cancelling_plugin`] instead so the plugin
+    /// registration isn't leaked (#1630 review).
     pub fn close_picker(&mut self) {
         self.picker_open = false;
         self.picker_query.clear();
@@ -175,6 +185,22 @@ impl Engine {
         self.breadcrumb_scoped_parent = None;
         self.breadcrumb_scoped_parent_line = None;
         self.picker_loading = false;
+    }
+
+    /// Close the picker the way a user-initiated "back out" gesture should:
+    /// if it's a `vimcode.picker.open` one, fire `on_cancel` and release its
+    /// `PluginManager` registration before returning — exactly what
+    /// `handle_picker_key`'s `Escape` arm used to do inline. Used by every
+    /// non-key path that dismisses the picker without confirming an item
+    /// (GTK's click-outside-to-dismiss, `render::PickerRoute::Dismiss`) so
+    /// that path doesn't leak the registration the way #1630's review found
+    /// it did when it called `close_picker()` directly.
+    pub fn close_picker_cancelling_plugin(&mut self) {
+        let plugin_id = self.plugin_picker_id();
+        self.close_picker();
+        if let Some(id) = plugin_id {
+            self.run_plugin_picker_cancel(id);
+        }
     }
 
     /// Rebuild the cached breadcrumb segments from the active group's state.
@@ -2310,13 +2336,8 @@ impl Engine {
         match key_name {
             "Escape" => {
                 // #1630: a `vimcode.picker.open` picker fires `on_cancel` on
-                // user-initiated cancel — read the id *before* `close_picker`
-                // clears `picker_open`/`picker_source` state it reads.
-                let plugin_id = self.plugin_picker_id();
-                self.close_picker();
-                if let Some(id) = plugin_id {
-                    self.run_plugin_picker_cancel(id);
-                }
+                // user-initiated cancel and releases its registration.
+                self.close_picker_cancelling_plugin();
                 EngineAction::None
             }
             "Return" => {

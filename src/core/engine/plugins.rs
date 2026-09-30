@@ -2279,10 +2279,28 @@ impl Engine {
         on_query: Option<mlua::RegistryKey>,
     ) -> Option<u64> {
         let pm = self.plugin_manager.clone()?;
+        // #1630 review: a plugin re-invoking `vimcode.picker.open` while a
+        // previous handle is still registered (the natural telescope-style
+        // pattern — a command re-run on every keypress) must not leak the
+        // old registration. `open_picker` below unconditionally clears
+        // `picker_all_items`/`picker_source` with no idea a plugin picker
+        // used to own them, so tear the old one down here first — same
+        // bookkeeping as an explicit `:close()`, just without firing
+        // `on_cancel` (this isn't a user cancel, it's a supersession).
+        if let Some(old_id) = self.plugin_picker_id() {
+            self.plugin_picker_teardown(old_id);
+        }
         let id = pm.register_picker(on_select, on_cancel, on_query);
         self.plugin_pickers.insert(id, std::rc::Rc::downgrade(&pm));
         self.open_picker(PickerSource::Custom(format!("plugin:{id}")));
-        self.picker_title = title;
+        // #1630 review: don't let a title-less `open()` call blank out
+        // `open_picker`'s own `format!("{:?}", source)` fallback with an
+        // empty header.
+        self.picker_title = if title.is_empty() {
+            "Picker".to_string()
+        } else {
+            title
+        };
         Some(id)
     }
 
@@ -2326,8 +2344,16 @@ impl Engine {
 
     /// Drop picker `id`'s bookkeeping on both sides: `Engine::plugin_
     /// pickers` and `PluginManager::pickers` (which releases every item's
-    /// stored `data`/preview with it). Called on select, on cancel, on an
-    /// explicit `:close()`, and when the owning plugin unloads.
+    /// stored `data`/preview with it). Called on select, on cancel
+    /// (including the non-Escape ways a picker can be dismissed —
+    /// `Engine::close_picker_cancelling_plugin`, used by GTK's
+    /// click-outside-to-dismiss), on an explicit `:close()`, when a fresh
+    /// `vimcode.picker.open` supersedes a still-registered handle (see
+    /// `plugin_api_picker_open` above), and when the owning plugin unloads.
+    /// Every path that ends a plugin picker's life routes through here or
+    /// through `run_plugin_picker_select`/`run_plugin_picker_cancel` (which
+    /// call this after firing their callback) — #1630 review found two
+    /// paths that didn't.
     fn plugin_picker_teardown(&mut self, id: u64) {
         self.plugin_pickers.remove(&id);
         if let Some(pm) = self.plugin_manager.clone() {
@@ -2423,9 +2449,10 @@ impl Engine {
         self.plugin_picker_teardown(id);
     }
 
-    /// The user pressed `Escape` on a plugin-owned picker — fire
-    /// `on_cancel`, then tear it down. Called from `Engine::
-    /// handle_picker_key`'s `Escape` arm, after `close_picker()`.
+    /// The user backed out of a plugin-owned picker without confirming an
+    /// item — fire `on_cancel`, then tear it down. Called from
+    /// `Engine::close_picker_cancelling_plugin` (Escape, and GTK's
+    /// click-outside-to-dismiss), after `close_picker()`.
     pub(crate) fn run_plugin_picker_cancel(&mut self, id: u64) {
         let ctx = self.make_plugin_ctx(true);
         if let Some(ctx) = self.with_plugin_dispatch(|pm| pm.call_picker_cancel(id, ctx)) {
@@ -2438,6 +2465,18 @@ impl Engine {
     /// `on_query` (a no-op if the picker declared none). Called from
     /// `Engine::picker_filter`. Does *not* tear the picker down; it stays
     /// open regardless of what (if anything) `on_query` does.
+    ///
+    /// **Reentrancy note (#1630 review):** this goes through
+    /// `with_plugin_dispatch`, which is a silent no-op while a dispatch is
+    /// already in flight (`plugin_dispatch_depth > 0`). If `:append`/
+    /// `:set_items` is called from *inside* an already-running plugin
+    /// callback — e.g. a `vimcode.loop.spawn` `on_stdout` handler calling
+    /// `handle:append(...)` for a live-grep-style source — the resulting
+    /// `picker_filter()` call here is dropped: the local fuzzy re-filter
+    /// still runs (so a static list still narrows correctly), but `on_query`
+    /// will not fire for that keystroke. A dynamic source that wants
+    /// `on_query` to reliably re-run per keystroke while it's also streaming
+    /// results from a nested callback should be aware of this gap.
     pub(crate) fn fire_plugin_picker_query(&mut self, id: u64) {
         let query = self.picker_query.clone();
         let ctx = self.make_plugin_ctx(true);

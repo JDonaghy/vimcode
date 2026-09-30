@@ -516,6 +516,15 @@ pub struct PluginManager {
     /// [`Self::register_picker`] handed out. `RefCell` for the same reason as
     /// `spawn_callbacks`: `set_items`/`append`/`close` reach here through the
     /// immediate API, with only `&PluginManager` available.
+    ///
+    /// Per-item `LuaRegistryKey`s (`PluginPickerItemEntry::data`) are dropped
+    /// via plain `HashMap::remove`/`clear` here, not an explicit
+    /// `lua.remove_registry_value`/`Lua::expire_registry_values()` call —
+    /// same pattern as `timer_callbacks`/`spawn_callbacks` above, so not a
+    /// regression, but pickers are the first surface where per-item counts
+    /// can run into the thousands (e.g. live-grep results), which will make
+    /// any latent registry-growth cost from that pattern far more visible
+    /// than it was for a handful of timer/spawn callbacks (#1630 review).
     pickers: RefCell<HashMap<u64, PluginPicker>>,
 }
 
@@ -568,6 +577,12 @@ pub(crate) struct PluginPickerItemSpec {
     pub display: String,
     pub filter_text: Option<String>,
     pub detail: Option<String>,
+    /// Parsed from the item table but currently a no-op: `PickerItem::icon`
+    /// has no rendering path in the unified picker at all yet (true for
+    /// every other `PickerItem` producer too, not something new here) — see
+    /// `render.rs`'s `PickerPanelItem`. Kept on the documented item shape so
+    /// a future patch can wire it in without an API break; a plugin author
+    /// who sets it today will just see it silently do nothing (#1630 review).
     pub icon: Option<String>,
     pub(crate) data: Option<LuaRegistryKey>,
     pub(crate) preview: Option<PluginPickerPreview>,
@@ -1370,6 +1385,17 @@ impl PluginManager {
     /// per-item `data`/preview map with it.
     pub(crate) fn remove_picker(&self, id: u64) {
         self.pickers.borrow_mut().remove(&id);
+    }
+
+    /// Number of live `vimcode.picker.open` registrations this manager
+    /// currently holds. Not used by any production code path — it exists so
+    /// black-box tests (`tests/extensions.rs`) can prove a picker's
+    /// registration was actually released rather than merely becoming
+    /// unreachable (the #1630 review's leak findings: `plugin_api_picker_
+    /// open` superseding a still-registered handle, and `close_picker()`
+    /// being called without plugin teardown on a non-Escape dismiss path).
+    pub fn picker_registration_count(&self) -> usize {
+        self.pickers.borrow().len()
     }
 
     /// Drop picker `id`'s current items without touching its callbacks —
