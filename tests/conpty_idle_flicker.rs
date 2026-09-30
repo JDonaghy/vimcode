@@ -28,9 +28,13 @@
 //! `windows-latest` runners execute natively) — so the whole file is
 //! `#[cfg(windows)]`-gated (reading the *target* triple, the same as every
 //! other `cfg(target_os = "windows")` gate in this repo — see
-//! `tests/windows_manifest.rs`'s note on target-vs-host `cfg`) and the dev-
-//! dependency above is target-gated the same way, so a plain Linux `cargo
-//! test` never resolves or builds any of this.
+//! `tests/windows_manifest.rs`'s `build_script_reads_target_cfg_not_host_cfg`
+//! test and its doc comment for the general target-vs-host `cfg` point,
+//! though that one is specifically about `build.rs` reading
+//! `CARGO_CFG_TARGET_OS` rather than `cfg!(target_os = "windows")`, not
+//! about `#[cfg(windows)]` gates like this file's) and the dev-dependency
+//! above is target-gated the same way, so a plain Linux `cargo test` never
+//! resolves or builds any of this.
 //!
 //! # What running this on real hardware (dell64) actually found
 //!
@@ -62,17 +66,79 @@
 //! stays in the repo as the permanent regression guard the issue asked for
 //! (and it does catch a real class of future bug: a genuine vimcode-side
 //! redraw storm reaching the wire, the (a) case), and as the evidence trail
-//! for why (a) was ruled out here. `git log`/the issue thread for #1634
-//! should be treated as still open on the (b) half.
+//! for why (a) was ruled out here.
 //!
-//! RED/GREEN note for reviewers: this file's two tests were run against
-//! `App::last_window_title`/`last_caret_shape` both reverted and restored,
-//! on real ConPTY/dell64, and passed identically in both configurations —
-//! see the paragraph above for what that does and does not prove. This is
-//! *not* the usual "RED before, GREEN after" shape most fixes in this repo
-//! ship (CLAUDE.md's black-box coverage rule); it is called out explicitly
-//! here rather than silently claimed, per that rule's own "state it, don't
-//! assume it" requirement.
+//! **#1634 must stay open when this lands.** Nothing in this PR confirms
+//! or fixes the operator-visible flicker itself — only the (a)-side
+//! diagnostic (ruled out, on this one reproduction) and an independently
+//! real write-dedup bug the investigation happened to turn up along the
+//! way. Closing #1634 off the back of this PR would repeat the exact
+//! "issue closed, bug still there, user believes it's fixed" failure mode
+//! CLAUDE.md's testing section calls out from the v0.11.0 `KNOWN_BUGS`
+//! incident. A follow-up issue for hypothesis (b) — SGR dim/bright
+//! handling under ConPTY, and/or a ConPTY-/terminal-emulator-side repaint
+//! of already-delivered content, investigated live (screen capture or an
+//! operator watching Windows Terminal, not a byte-stream test) — should
+//! be filed and linked from #1634 before it is closed.
+//!
+//! # Why this PR's actual code change (the dedup guards) has no
+//! `Backend`-call-count driver test
+//!
+//! The obviously-right black-box shape for the `App::last_window_title`/
+//! `last_caret_shape` guards — construct a counting/mock `Backend`, drive
+//! two ticks with no state change, assert `set_title`/`set_caret_shape`
+//! is called once instead of twice — is not achievable in this crate:
+//! `quadraui::Backend` is a **sealed trait** (`pub(crate) mod sealed` in
+//! `quadraui/src/backend.rs`), so an external crate cannot implement it at
+//! all; the one externally-constructible mock quadraui ships
+//! (`quadraui::testing::RecordingBackend`) does not override
+//! `Backend::window()` (default returns `None`, so the guarded code path
+//! never runs against it) or `Backend::set_caret_shape` (default is a
+//! silent no-op); and the one real `Backend` this crate can drive
+//! in-process (`quadraui::tui::TuiBackend`) writes both of these straight
+//! to real `std::io::stdout()` with zero interception point (see each
+//! method's own doc in `quadraui/src/tui/backend.rs` — `set_caret_shape`'s
+//! says outright "there is no real terminal under `TestBackend`"), which
+//! is exactly why *this* file has to be a real-ConPTY driver test rather
+//! than an in-process one in the first place.
+//!
+//! What this PR ships instead: `src/app.rs`'s `dedup_window_title`/
+//! `dedup_caret_shape` — the exact change-detection decision each write is
+//! gated on, pulled out into its own pure, `Backend`-free function — with
+//! a direct, Linux-runnable, RED/GREEN unit test
+//! (`app::window_title_dedup_tests`) that fails against the pre-#1634
+//! "write unconditionally" behaviour and passes with the guard restored
+//! (verified by hand: reverting each function's body to always return
+//! `true` makes both tests fail with the exact "must report the write
+//! should be skipped" assertion; restored before committing). See
+//! `dedup_window_title`'s own doc in `src/app.rs` for the full reasoning.
+//! That test proves the guard's *decision* is correct; it cannot prove
+//! what a real `Backend`/terminal does with that decision — this file
+//! (real ConPTY) and operator verification in real Windows Terminal
+//! remain the only things that can.
+//!
+//! RED/GREEN note for reviewers, on *this file's own* two ConPTY tests
+//! specifically (as opposed to the pure-function unit test above): they
+//! were run against `App::last_window_title`/`last_caret_shape` both
+//! reverted and restored, on real ConPTY/dell64, and passed identically in
+//! both configurations — see the "What running this on real hardware"
+//! section above for what that does and does not prove. That half of the
+//! coverage is *not* the usual "RED before, GREEN after" shape most fixes
+//! in this repo ship (CLAUDE.md's black-box coverage rule); it is called
+//! out explicitly here rather than silently claimed, per that rule's own
+//! "state it, don't assume it" requirement. The pure-function unit test
+//! above is the part of this PR's coverage that *does* follow the usual
+//! RED/GREEN shape.
+//!
+//! # CI
+//!
+//! Wired into `.github/workflows/ci.yml`'s `build-windows-tui` job as a
+//! scoped `cargo test --release --test conpty_idle_flicker
+//! --no-default-features` step (not a full `cargo test`, which that job
+//! deliberately never runs — see its own header comment) — so this file
+//! now actually executes, and can actually go red, on every PR and push
+//! to `develop`/`main`, on `windows-latest` GitHub runners rather than
+//! only ever being run by hand on real Windows hardware.
 #![cfg(windows)]
 
 use std::io::{Read, Write};

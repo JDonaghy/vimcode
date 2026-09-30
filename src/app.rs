@@ -1052,6 +1052,165 @@ fn app_icon_image_for_paint() -> quadraui::Image {
     crate::render::app_icon_image()
 }
 
+/// #1634: the change-detection decision `render::run_shared_tick_chores`
+/// gates its `WindowControl::set_title` call on — pulled out of that call
+/// site into its own pure, `Backend`-free function so the dedup guard
+/// itself (not just its call site) is directly unit-testable.
+///
+/// Returns `true` (and records `title` as the new baseline in `*last`)
+/// exactly when `title` differs from the last title this function was
+/// told got written; returns `false` (leaving `*last` untouched) when it
+/// is unchanged, so the caller must skip the write.
+///
+/// # Why a pure function, not a `Backend`-call-count driver test
+///
+/// The natural black-box shape for this fix — construct a counting/mock
+/// `Backend`, drive two ticks with no state change, assert `set_title` is
+/// called once instead of twice — is not achievable in this crate:
+///
+/// - `quadraui::Backend` is a **sealed trait** (`pub(crate) mod sealed`
+///   in `quadraui/src/backend.rs`, restated at the very top of the
+///   `Backend` trait's own doc). An external crate — vimcode included —
+///   cannot write `impl quadraui::Backend for MyMock` at all; the only
+///   externally-constructible full implementor quadraui ships is
+///   `quadraui::testing::RecordingBackend`, and that type does not
+///   override `Backend::window()` (its trait default returns `None`, so
+///   `run_shared_tick_chores`'s `if let Some(w) = backend.window()` body —
+///   the guard under test — would never even execute against it) or
+///   `Backend::set_caret_shape` (trait default is a no-op with no call
+///   recorded), so it cannot distinguish "guard present" from "guard
+///   absent" for either write this fix touches.
+/// - Even the one real `Backend` this crate *can* construct in-process
+///   (`quadraui::tui::TuiBackend`, via `quadraui::tui::testing::
+///   driver_with_shell`) offers no interception point for this specific
+///   pair of writes: `TuiBackend::set_title`/`set_caret_shape` both write
+///   straight to real `std::io::stdout()` with no `Terminal`/`Buffer`
+///   indirection and no test-mode guard of their own (see each method's
+///   own doc in `quadraui/src/tui/backend.rs`, and `set_caret_shape`'s in
+///   particular: "there is no real terminal under `TestBackend`") — which
+///   is exactly why `tests/conpty_idle_flicker.rs` exists as a *real*
+///   ConPTY driver test instead of an in-process one, and exactly why
+///   that file's own module doc says #1583's in-process idle-stability
+///   test "can only see bytes that flow through the `ratatui::Terminal`'s
+///   own `Write` sink."
+///
+/// This function is the closest available substitute: it isolates the
+/// *decision* `run_shared_tick_chores`/`App::tick_dispatch` make before
+/// ever touching a `Backend`, with zero I/O, so a regression in the guard
+/// itself — the actual code change this issue's fix iteration shipped —
+/// is a fast, Linux-runnable, RED/GREEN unit test
+/// (`window_title_dedup_tests`, below), independent of real Windows
+/// hardware. It cannot prove what happens downstream of the write (that
+/// remains `tests/conpty_idle_flicker.rs` and real-hardware/operator
+/// verification's job), only that the write is skipped exactly when it
+/// should be.
+pub(crate) fn dedup_window_title(last: &mut Option<String>, title: &str) -> bool {
+    if last.as_deref() == Some(title) {
+        false
+    } else {
+        *last = Some(title.to_string());
+        true
+    }
+}
+
+/// #1634: same guard, for `Backend::set_caret_shape` — see
+/// [`dedup_window_title`]'s doc for the full reasoning (including why a
+/// `Backend`-call-count driver test is not achievable in this crate).
+fn dedup_caret_shape(
+    last: &mut Option<quadraui::EditorCursorShape>,
+    shape: quadraui::EditorCursorShape,
+) -> bool {
+    if *last == Some(shape) {
+        false
+    } else {
+        *last = Some(shape);
+        true
+    }
+}
+
+#[cfg(test)]
+mod window_title_dedup_tests {
+    //! #1634: direct coverage for [`dedup_window_title`]/
+    //! [`dedup_caret_shape`] — see [`dedup_window_title`]'s own doc for why
+    //! these pure functions, rather than a `Backend`-call-count driver
+    //! test, are this fix's unit coverage.
+    //!
+    //! RED-verified: replacing either function's body with `true` (i.e.
+    //! reverting to the pre-#1634 "write unconditionally every tick"
+    //! behaviour) makes each module's second assertion below fail — the
+    //! repeated call with an unchanged value stops returning `false`.
+    //! Restored before committing.
+
+    use super::*;
+
+    #[test]
+    fn window_title_write_is_skipped_only_when_unchanged() {
+        let mut last: Option<String> = None;
+
+        assert!(
+            dedup_window_title(&mut last, "main.rs"),
+            "first call must report a write is needed (no prior baseline)"
+        );
+        assert_eq!(last.as_deref(), Some("main.rs"));
+
+        assert!(
+            !dedup_window_title(&mut last, "main.rs"),
+            "a second call with the identical title must report the write \
+             should be skipped — this is the exact #1634 regression: \
+             `run_shared_tick_chores` used to call `WindowControl::set_title` \
+             unconditionally on every idle tick even when the title never \
+             changed"
+        );
+        assert_eq!(
+            last.as_deref(),
+            Some("main.rs"),
+            "skipping the write must not disturb the cached baseline"
+        );
+
+        assert!(
+            dedup_window_title(&mut last, "right.rs"),
+            "a genuinely changed title must still report a write is needed"
+        );
+        assert_eq!(last.as_deref(), Some("right.rs"));
+
+        assert!(
+            !dedup_window_title(&mut last, "right.rs"),
+            "and immediately dedups again once the new value is the baseline"
+        );
+    }
+
+    #[test]
+    fn caret_shape_write_is_skipped_only_when_unchanged() {
+        let mut last: Option<quadraui::EditorCursorShape> = None;
+
+        assert!(
+            dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Block),
+            "first call must report a write is needed (no prior baseline)"
+        );
+        assert_eq!(last, Some(quadraui::EditorCursorShape::Block));
+
+        assert!(
+            !dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Block),
+            "a second call with the identical shape must report the write \
+             should be skipped — the exact #1634 regression for \
+             `Backend::set_caret_shape`: `App::tick_dispatch` used to call \
+             it unconditionally on every idle tick even when the caret \
+             shape never changed"
+        );
+
+        assert!(
+            dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Bar),
+            "a genuinely changed shape must still report a write is needed"
+        );
+        assert_eq!(last, Some(quadraui::EditorCursorShape::Bar));
+
+        assert!(
+            !dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Bar),
+            "and immediately dedups again once the new value is the baseline"
+        );
+    }
+}
+
 /// Create a new `App` instance.
 ///
 /// All widget-dependent setup (window handle) is deferred to
@@ -8632,9 +8791,11 @@ impl App {
             // to the real terminal on every idle poll cycle
             // (`quadraui::runtime::IDLE_POLL_CEILING`, ~250ms) for no reason
             // — real waste, independent of whether it's what the operator
-            // saw flicker.
-            if self.last_caret_shape != Some(shape) {
-                self.last_caret_shape = Some(shape);
+            // saw flicker. The decision itself is `dedup_caret_shape`, a
+            // free function so it's directly unit-tested without a
+            // `Backend` — see that function's own doc for why a
+            // `Backend`-call-count driver test isn't achievable here.
+            if dedup_caret_shape(&mut self.last_caret_shape, shape) {
                 backend.set_caret_shape(shape);
             }
         }

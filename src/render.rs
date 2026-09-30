@@ -6149,10 +6149,13 @@ pub(crate) fn run_shared_tick_chores(
         // (`TuiBackend::set_title` bypasses the `ratatui::Terminal`'s
         // buffered `Write` entirely) — invisible to #1583's in-process
         // idle-stability test, which only inspects the `TestBackend`/vt100
-        // sink `Terminal::draw` writes to.
-        if app.last_window_title.as_deref() != Some(win_title.as_str()) {
+        // sink `Terminal::draw` writes to. The decision itself is
+        // `crate::app::dedup_window_title`, a free function so it's
+        // directly unit-tested without a `Backend` — see that function's
+        // own doc for why a `Backend`-call-count driver test isn't
+        // achievable here.
+        if crate::app::dedup_window_title(&mut app.last_window_title, &win_title) {
             let _ = w.set_title(&win_title);
-            app.last_window_title = Some(win_title.clone());
         }
         // Refresh the session-restore maximized cache (#1529) unconditionally
         // — unlike size/position below, this is exactly the one moment those
