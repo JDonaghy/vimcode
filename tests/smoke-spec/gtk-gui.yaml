@@ -1,0 +1,85 @@
+# Tier-2 Linux/GTK-native smoke spec for vimcode#1646 (claude-coordinator
+# epic #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `gtk-native` (coord/gtk_native_driver.py) — launches the real
+# compiled `vimcode` GTK binary under a real (if headless) X11 display,
+# finds its real window, and probes it with real `xdotool` input
+# injection, the AT-SPI accessibility tree, and `xwd -id <windowid>`
+# captures. Needs a live `$DISPLAY` plus `xdotool`/`xwd`/the AT-SPI
+# GObject-introspection binding on whatever fleet host runs this — see
+# that driver module's own "headless by construction" note; this spec
+# does not start its own `Xvfb`. `coord` supplies the actual
+# `launch_command`/`cwd`; this file assumes that command opens a small,
+# real, non-empty text file (so the minimap-content check below has
+# something to show).
+#
+# Unlike macOS (`tests/smoke-spec/mac-gui.yaml`), GTK has no native menu
+# bar or native window-chrome buttons to lean on: `quadraui`'s
+# `GtkBackend::backend_caps()` does not declare `native_menu` (confirmed
+# via `src/gtk/testing.rs`'s own "GTK has no native context menu"
+# assertions), and vimcode calls `WindowControl::set_decorated(false)`
+# on its GTK window (`src/app.rs`) for the same client-side-decorations,
+# custom-painted-chrome reason Win-GUI does — "the same [drawn menu] row
+# GTK already ships" that the quadraui#1228 commit message (quoted in
+# `win-gui.yaml`) points at when describing what Win-GUI switched back
+# to. Every click/menu/dropdown check below is therefore gated the exact
+# same way Win-GUI's dropdown check is (not its hit-test-specific
+# #1232 bug — GTK was not reported broken there — but the shared,
+# lower-level docs/PENDING_QUADRAUI_ISSUES.md "No UIA/NSAccessibility/
+# AT-SPI provider wiring..." gap: nothing registers an `AtkObject`/AT-SPI
+# provider for any of vimcode's own drawn content on any platform).
+#
+# Pixel coordinates are first-approximation (same ~32px drawn-band-height
+# convention `win-gui.yaml` uses, since GTK paints the identical row), NOT
+# yet confirmed against a real running `vimcode` GTK window on a real
+# fleet host. The real run this issue's acceptance bar requires must
+# confirm or correct them.
+name: vimcode-gtk-gui
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 1500
+
+  # Gated on docs/PENDING_QUADRAUI_ISSUES.md's AT-provider-wiring entry —
+  # expected RED today, same reasoning as `win-gui.yaml`'s identical
+  # check (minus that file's additional #1232 hit-test gate, which is
+  # Win-GUI-specific).
+  - type: click
+    id: click-file-menu-item
+    x: 24
+    y: 16
+  - type: expect_a11y_within
+    id: file-dropdown-opens
+    role: "menu item"
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown
+    key: esc
+
+  # All-GUI-specs seed check: the minimap must show real content for a
+  # non-empty file. No coord native driver's current step vocabulary has
+  # a pixel-content assertion primitive — see `win-gui.yaml`'s identical
+  # comment for the full reasoning. Evidence-only.
+  - type: capture
+    id: minimap-content-evidence-only-not-yet-a-real-assertion
+
+  # All-GUI-specs seed check: the extension-install flow must reach a
+  # completed state within a budget. Same evidence-only caveat.
+  - type: capture
+    id: extension-install-completes-evidence-only-not-yet-a-real-assertion
+
+  - type: click
+    id: click-close-button
+    x: 978
+    y: 16
+  - type: expect_closed
+    id: close-button-actually-closes-window
+    timeout_ms: 5000
