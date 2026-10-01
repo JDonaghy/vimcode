@@ -92,6 +92,29 @@ jobs:
       run: |
         cargo test --no-default-features
 
+  # #1646: `tests/smoke-spec/*.yaml` are consumed by claude-coordinator's
+  # Tier-2 real-platform acceptance drivers (`coord/tui_pty_driver.py`,
+  # `coord/win_native_driver.py`, `coord/mac_native_driver.py`,
+  # `coord/gtk_native_driver.py`), which this repo does not vendor. This job
+  # only proves the specs still *parse* against those drivers' own loaders —
+  # it cannot run them (no pty/native OS to drive here) — so a future driver
+  # change that silently stops accepting a step shape this repo relies on is
+  # caught here instead of only discovered the next time someone runs a real
+  # acceptance pass. `scripts/validate_smoke_specs.py` does the importing;
+  # this step only installs its one dependency and runs it.
+  test-smoke-specs:
+    name: Validate Tier-2 smoke specs
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install code-coordinator
+      run: pip install --quiet code-coordinator
+
+    - name: Validate tests/smoke-spec/*.yaml against coord's real spec loaders
+      run: python3 scripts/validate_smoke_specs.py
+
   # #645: the job above compiles GTK OUT (`--no-default-features`), so a green
   # run there carries zero information about `src/gtk/`. This job is the lane
   # that actually compiles and tests the GTK backend. It runs headlessly — no
