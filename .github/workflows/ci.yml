@@ -109,8 +109,14 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    # Floor, not an exact pin: the four `parse_*_spec` entry points this job
+    # imports first shipped together in 0.5.551, and tracking the latest
+    # release above that floor is the whole point — a driver change that stops
+    # accepting a step shape these specs use should redden *this* lane, which
+    # is a required check (.github/branch-protection.json), rather than be
+    # discovered mid-acceptance-pass on fleet hardware.
     - name: Install code-coordinator
-      run: pip install --quiet code-coordinator
+      run: pip install --quiet 'code-coordinator>=0.5.551'
 
     - name: Validate tests/smoke-spec/*.yaml against coord's real spec loaders
       run: python3 scripts/validate_smoke_specs.py

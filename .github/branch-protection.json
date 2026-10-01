@@ -22,7 +22,10 @@
     "for exactly that reason: src/macos/ is compiled by no other job. #1554",
     "added the Windows GUI lane for the same reason: the Windows TUI lane",
     "builds vcd.exe with the win backend off, so nothing else links (or",
-    "launches) vimcode.exe for Windows before a release does.",
+    "launches) vimcode.exe for Windows before a release does. #1646 added the",
+    "smoke-spec lane: tests/smoke-spec/*.yaml are parsed by coord's own Tier-2",
+    "driver loaders, which no cargo job imports, so an unparseable spec would",
+    "otherwise only surface during a real acceptance pass on fleet hardware.",
     "",
     "Apply with:  scripts/apply-branch-protection.sh",
     "Audit with:  scripts/apply-branch-protection.sh --check"
@@ -33,7 +36,8 @@
     "Test (Linux, headless, GUI feature on)",
     "Test (macOS native, AppKit)",
     "Build (Windows TUI, vcd.exe)",
-    "Build (Windows GUI, vimcode.exe)"
+    "Build (Windows GUI, vimcode.exe)",
+    "Validate Tier-2 smoke specs"
   ],
 
   "branches": {
