@@ -309,7 +309,24 @@ win = ["quadraui/win"]
 # arm is untouched (`MacBackend` still declares it, unaffected by this
 # bump). See `src/win/mod.rs`/`src/win/backend.rs` for the doc-comment
 # corrections and the `WinDriver` test replacements this bump required.
-quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "d292a4c503470ee596164c6df9b9022ea899b464", features = ["tui", "terminal"] }
+#
+# #1647 bumps to `fc94f21` (quadraui `develop` HEAD, all CI checks green) to
+# pick up quadraui#1232: `WinBackend::draw_menu_bar`,
+# `draw_status_bar_interactive`, and `draw_command_center` now register a
+# `nc_hit_test` zone for each of their own clickable bounds right after
+# computing the real layout, mirroring how `AppShell::render` already
+# registers one per activity-bar item. Before this, every point in the
+# drawn title band (the menu row, vimcode's inline minimize/maximize/close,
+# and the command-centre search box) classified `HTCAPTION` in a live app —
+# confirmed on dell64 with real `SendInput`/`mouse_event` input, not
+# `PostMessage` (which bypasses `WM_NCHITTEST` and is how the bug went
+# unseen past #1199's original review) — swallowing the click before the
+# widget ever saw a `MouseDown`, even though the pure `nc_hit_test` unit
+# tests passed (they hand-registered the exclusion zone directly). No
+# vimcode-side change was needed to pick this up: `src/win/` never computed
+# its own hit zones, so there was nothing here to delete — the fix lives
+# entirely inside `WinBackend`'s own draw_* calls.
+quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "fc94f2136bf66139be4da04ce5f16d78736b55cf", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
 # `links = "gtk-4"`, so Cargo permits exactly one `gtk4-sys` in the whole
