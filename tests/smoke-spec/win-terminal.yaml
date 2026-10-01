@@ -20,31 +20,65 @@
 # carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — same
 # determinism precondition as `tests/smoke-spec/tui.yaml`.
 #
-# Pixel coordinates are first-approximation, NOT yet confirmed on real
-# Windows Terminal hardware (dell64): derived by assuming Windows Terminal's
-# default profile (Cascadia Mono, ~9px cell width x ~19px cell height) and a
-# ~40px top band (tab bar + title), i.e. `x = 8 + col * 9`, `y = 40 + row *
-# 19` for a cell at 0-indexed `(row, col)` — the same `(row, col)` activity-
-# bar/tree positions `tests/smoke-spec/tui.yaml` already uses and
+# Pixel coordinates: derived by assuming Windows Terminal's default profile
+# (Cascadia Mono, ~9px cell width x ~19px cell height) and a ~40px top band
+# (tab bar + title), i.e. `x = 8 + col * 9`, `y = 40 + row * 19` for a cell
+# at 0-indexed `(row, col)` — the same `(row, col)` activity-bar/tree
+# positions `tests/smoke-spec/tui.yaml` already uses and
 # `tests/conpty_activity_bar_click.rs` already verified on real ConPTY
 # (`ICON_COLUMN = 1`; rows 1-7 = Explorer/Search/Debug/Source Control/
-# Extensions/AI Assistant/Board). The real dell64 run this issue's
-# acceptance bar requires must confirm or correct both the cell-size
-# assumption and the resulting pixel values — record in the PR which ones
-# needed adjusting.
+# Extensions/AI Assistant/Board).
 #
-# Open question a real run must also settle, not just the coordinates: it
-# is not yet confirmed whether Windows Terminal's own UIA tree exposes
-# per-row terminal text as discrete named elements a simple role+name scan
-# (`_find_a11y_match`, shared by every native driver) can actually find, or
-# only as a single text/document-pattern element covering the whole buffer
-# (Windows Terminal/conhost's screen-reader support uses the UIA text
-# pattern, which is range-based, not a flat per-line element list). If the
-# real run shows `expect_menu_latency`/`expect_panel_switch` below can never
-# find a match for that structural reason rather than because of an actual
-# regression, that is itself a new, real finding worth recording (and is
-# outside vimcode's or quadraui's control either way — it is Windows
-# Terminal's own accessibility implementation).
+# CONFIRMED via a real run on dell64's attached Windows 11 host (WSL
+# interop, same methodology as `win-gui.yaml`'s header comment describes —
+# no `coord` Python environment on the Windows host itself, so this drove
+# the same real `wt.exe`/`SendInput`-equivalent/UIA primitives directly via
+# a PowerShell harness; see the PR for the script and raw output), real
+# `vcd.exe` cross-compiled from this branch, launched as `wt.exe -d
+# <workdir> vcd.exe sample.txt`:
+#
+#   idle-flicker-1634:                     FAIL — one of 50 consecutive
+#     100ms-apart whole-window captures differed at ~200ms into the 5s
+#     window (all others were byte-identical). This does NOT match the
+#     originally-reported ~1Hz (~1000ms) flicker cadence, and a single run
+#     cannot rule out capture-harness noise (GPU compositing, a stray
+#     repaint from `SetForegroundWindow`/`SendKeys` settling) vs. a real,
+#     faster artifact. Recorded as-observed rather than discarded or
+#     "fixed" by loosening the comparison; needs a repeat, longer-settled
+#     run to establish whether it reproduces before treating it as #1634
+#     evidence either way.
+#   explorer-row-context-menu-latency-1635:     FAIL — no UIA element with
+#     `ControlType.MenuItem` ever appeared within 2000ms after the
+#     right-click.
+#   activity-bar-*-panel-switch-1636 (all five):  FAIL — no UIA element
+#     named EXPLORER/SEARCH/DEBUG/SOURCE CONTROL/EXTENSIONS ever appeared
+#     within 5000ms after the click.
+#
+# The open structural question above this paragraph is now SETTLED, not
+# open: a full UIA tree dump of the real `wt.exe` window hosting `vcd.exe`
+# (two tabs, after `Ctrl+T`) returned exactly 10 named elements — all
+# window chrome (`tab item`/`text` "VimCode - sample.txt", `button` "Close
+# Tab", `split button` "New Tab", 4 scrollbar buttons, 1 scrollbar) plus
+# exactly ONE `terminal`-type element whose `Name` is fixed to the
+# executable's own path (`C:\...\vcd.exe`) — never per-row, per-panel, or
+# per-menu-item text content. `_find_a11y_match` (shared by every coord
+# native driver) matches on exactly that `Name` string, so
+# `expect_menu_latency`/`expect_panel_switch` as written here CANNOT
+# structurally detect #1635/#1636 being fixed OR still broken through this
+# driver's current UIA-by-name vocabulary, regardless of what `vcd.exe`
+# actually renders inside that one `terminal` element. This is a Windows
+# Terminal accessibility-implementation limitation (it exposes buffer
+# content only via the UIA *text pattern* on that single element, which
+# `win_native_driver.py` does not currently read), not a vimcode or
+# quadraui regression, and not something a spec-file change in this repo
+# can work around without "fixing" the check by weakening it (explicitly
+# against this issue's own guidance). The five steps below are left
+# unchanged — they still encode the correct intended regression check —
+# but are recorded here as structurally unable to pass OR meaningfully
+# fail until `win_native_driver.py` grows a text-pattern-aware read of the
+# `terminal` element's own buffer content (coordinator-repo work, the same
+# class of gap as the minimap/extension-install primitive noted in
+# `win-gui.yaml`).
 name: vimcode-win-terminal
 mode: terminal
 terminal_app: windows-terminal

@@ -6,23 +6,71 @@
 # probes it with real Win32/UIA calls (`WM_NCHITTEST`, `GetMenu`,
 # `SendInput`, the UI Automation tree). `coord` supplies the actual
 # `launch_command`/`cwd`; this file assumes that command opens a small,
-# real, non-empty text file (so the minimap-content check below has
-# something to show) with a settings.json carrying
+# real, non-empty text file (kept non-empty for parity with the other
+# Tier-2 specs and so a future minimap-content check — see this file's
+# "DELIBERATELY OMITTED" comment below — has something to show once one
+# exists) with a settings.json carrying
 # `{"lsp_enabled": false, "use_nerd_fonts": false}` for the same
 # determinism reasons `tests/conpty_activity_bar_click.rs`'s
 # `isolated_home()` sets those.
 #
-# Pixel coordinates below are first-approximation, derived from the drawn
-# title band's known `band_height = 32` DIP convention
-# (`quadraui/src/win/run.rs`) and vimcode's own fixed 7-item
-# File/Edit/View/Go/Run/Terminal/Help menu order (`src/render.rs`'s
-# `MENU_STRUCTURE`), evenly spaced across the left two-thirds of a
-# 1024-wide window, with three ~46px-wide caption buttons (minimize/
-# maximize/close, the standard Windows caption-button width) against the
-# right edge — NOT yet confirmed against a live, resized `vimcode.exe`
-# window on real Windows hardware (dell64). The acceptance bar for this
-# issue requires exactly that confirmation before merge; see the PR for
-# which of the coordinates below needed adjusting.
+# Pixel coordinates below are derived from the drawn title band's known
+# `band_height = 32` DIP convention (`quadraui/src/win/run.rs`) and
+# vimcode's own fixed 7-item File/Edit/View/Go/Run/Terminal/Help menu order
+# (`src/render.rs`'s `MENU_STRUCTURE`), evenly spaced across the left
+# two-thirds of a 1024-wide window, with three ~46px-wide caption buttons
+# (minimize/maximize/close, the standard Windows caption-button width)
+# against the right edge.
+#
+# CONFIRMED against a real, running `vimcode.exe` on real Windows hardware
+# (dell64's attached Windows 11 host, reached directly over WSL interop —
+# no `coord` Python environment on that host yet, so this run drove the
+# exact same real OS primitives `win_native_driver.py` itself wraps
+# (`WM_NCHITTEST` via `SendMessage`, `GetMenu`, real `SendInput`-equivalent
+# clicks, the UI Automation tree, `IsWindow`) directly via a PowerShell
+# harness, rather than through `coord`'s own Python driver code — see the
+# PR for the exact script and raw output). `cargo xwin build --release
+# --target x86_64-pc-windows-msvc --no-default-features --features win`
+# against this branch's pinned quadraui rev (`d292a4c`, i.e. BEFORE
+# quadraui#1232), run against a non-empty `sample.txt` with the same
+# `{"lsp_enabled": false, "use_nerd_fonts": false}` settings.json this
+# file's launch-command assumption already documented:
+#
+#   hit-test-file-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-edit-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-view-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-go-menu-item-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-run-menu-item-1232:         FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-terminal-menu-item-1232:    FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-help-menu-item-1232:        FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-minimize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-maximize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-close-button-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-empty-band-is-caption-1232: PASS got=HTCAPTION want=HTCAPTION
+#   no-native-win32-menu-1228:           PASS (GetMenu returned NULL)
+#   file-dropdown-opens-1232:            FAIL (no UIA element named "New
+#                                         Tab" appeared within 3000ms — the
+#                                         click at (24,16) is swallowed as
+#                                         a caption drag before it ever
+#                                         reaches the drawn menu, so this
+#                                         fails for quadraui#1232's reason
+#                                         alone; the separate UIA-wiring gap
+#                                         below it in this file could not
+#                                         even be isolated yet)
+#   close-button-actually-closes-window-1232: FAIL (window still existed
+#                                         after 5000ms — same #1232 cause:
+#                                         the close-button click at (978,16)
+#                                         is also classified HTCAPTION)
+#
+# None of these pixel coordinates needed adjustment — every one matched
+# this header's derivation on the first real run, including all 7 of the
+# 7 menu-row items (not just File/Help — the initial version of this file
+# sampled only those two; this run confirmed the remaining 5 land on the
+# same evenly-spaced x positions and are equally misclassified HTCAPTION
+# today). Every check gated on quadraui#1232 is confirmed RED exactly as
+# this file predicted; the one check NOT gated on it
+# (`no-native-win32-menu-1228`) is confirmed GREEN. Re-run once the
+# quadraui pin moves to `fc94f21` or later to confirm the flip to GREEN.
 #
 # quadraui pin check (Cargo.toml, as of this file's authoring): rev
 # `d292a4c` — `fix(quadraui): update stale install_menu_bar trait doc for
@@ -51,9 +99,38 @@ steps:
     ms: 1500
 
   # quadraui#1232 — before it lands, these are all misclassified HTCAPTION.
+  # All 7 of vimcode's fixed File/Edit/View/Go/Run/Terminal/Help menu-row
+  # items get their own step (not just the first/last), per #1646's own
+  # "each menu-row item" wording — confirmed real-hardware-identical
+  # (all HTCAPTION today) in this file's header comment above.
   - type: expect_hit
     id: hit-test-file-menu-item-1232
     x: 24
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-edit-menu-item-1232
+    x: 75
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-view-menu-item-1232
+    x: 126
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-go-menu-item-1232
+    x: 177
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-run-menu-item-1232
+    x: 228
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-terminal-menu-item-1232
+    x: 279
     y: 16
     ht: HTCLIENT
   - type: expect_hit
@@ -123,34 +200,52 @@ steps:
     id: dismiss-dropdown
     key: esc
 
-  # All-GUI-specs seed check: the minimap must show real content for a
-  # non-empty file (it painted blank on Windows). Neither `win-native`'s
-  # nor any other coord native driver's current step vocabulary has a
-  # pixel-content assertion primitive (`capture` attaches a `PrintWindow`
-  # image as evidence on a *failing* step only — it is not itself a
-  # pass/fail oracle, and there is no `expect_capture_nonblank`-shaped
-  # step). This step is therefore evidence-only, not a real assertion: it
-  # always "passes" (capture succeeding is not the same as the minimap
-  # being non-blank) and cannot currently fail against the reported bug.
-  # Recorded here rather than silently omitted so the gap is visible —
-  # closing it needs a new driver-side primitive in
-  # `coord/win_native_driver.py` (and its mac-native/gtk-native
-  # siblings), which is coordinator-repo work, not something this spec
-  # file (or vimcode/quadraui) can supply.
-  - type: capture
-    id: minimap-content-evidence-only-not-yet-a-real-assertion
-
-  # All-GUI-specs seed check: the extension-install flow must reach a
-  # completed state within a budget (it hung on both Windows and macOS).
-  # Same gap as the minimap check above — no UIA element exists for the
-  # extensions list's own install-state text (see the "No UIA/
-  # NSAccessibility/AT-SPI provider wiring" entry), and the window's own
-  # native title never reflects install progress
-  # (`src/app.rs`'s `sync_window_title` tracks the active file name only),
-  # so there is nothing in this driver's current vocabulary this step can
-  # poll for completion. Evidence-only, same caveat as above.
-  - type: capture
-    id: extension-install-completes-evidence-only-not-yet-a-real-assertion
+  # vimcode#1646's two "All GUI specs" seed checks — "the minimap shows
+  # content for a non-empty file" and "the extension-install flow reaches a
+  # completed state within a budget" — are DELIBERATELY OMITTED from this
+  # file rather than represented by a bare `capture` step.
+  #
+  # A bare `capture` step (confirmed against `win_native_driver.py`'s own
+  # `_REQUIRED_FIELDS`/step-execution code: `capture` takes a `PrintWindow`
+  # snapshot and attaches it to its OWN step result, pass or fail, but has
+  # no `expect_*` shape and therefore no condition that can ever fail) is
+  # not a real assertion — CLAUDE.md's "a test that cannot fail is not
+  # coverage" rule (#553) applies to it directly. A prior version of this
+  # file shipped exactly that placeholder; this revision removes it rather
+  # than keep a check that always "passes" on the books.
+  #
+  # Confirmed directly against `coord`'s real `win_native_driver.py`
+  # (installed `code-coordinator==0.5.551`, the same version pinned by this
+  # issue): its full step vocabulary is `launch`, `key`, `click`, `wait`,
+  # `capture`, `expect_menu`, `expect_hit`, `expect_a11y`/
+  # `expect_a11y_within`, `expect_closed`, plus the terminal-mode-only
+  # `expect_idle_stable`/`expect_menu_latency`/`expect_panel_switch`. None
+  # of these can observe "did the minimap paint non-blank pixels" or "did
+  # the extensions list reach an install-complete state" — the former needs
+  # a pixel-sampling primitive (e.g. an `expect_capture_nonblank`-shaped
+  # step comparing a sub-rectangle of a `PrintWindow` capture against a
+  # blank-color threshold), the latter needs either the same pixel
+  # primitive pointed at the extensions list, or a UIA/AX element exposing
+  # the install-state text — and vimcode has no AT-provider wiring for any
+  # of its own drawn content yet (`docs/PENDING_QUADRAUI_ISSUES.md`'s "No
+  # UIA/NSAccessibility/AT-SPI provider wiring..." entry).
+  #
+  # Per this issue's own review guidance: "needs either a real primitive
+  # added driver-side first ... or some other oracle, not a capture step
+  # that cannot go red." No such primitive exists in the installed driver
+  # and no other oracle is reachable from vimcode/quadraui alone, so these
+  # two seed checks are held back from every GUI spec (mirrored in
+  # `mac-gui.yaml`/`gtk-gui.yaml`) until one of:
+  #   (a) `coord`'s win/mac/gtk-native drivers grow a pixel-content or
+  #       install-state-aware primitive (coordinator-repo work — this repo
+  #       must not add it, same as it must not edit `coordinator.yml`), or
+  #   (b) vimcode/quadraui ship real AT-provider wiring for drawn content,
+  #       which would let `expect_a11y_within` cover the extension-install
+  #       case (the minimap would still need (a) — it has no text content
+  #       to expose via an accessible name).
+  # Track the follow-up primitive as a new claude-coordinator issue; this
+  # vimcode PR cannot itself open one (vimcode workers don't file issues in
+  # other repos).
 
   # quadraui#1232 again — the close button's click is swallowed the same
   # way the menu row's is.
