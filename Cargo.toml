@@ -326,6 +326,28 @@ win = ["quadraui/win"]
 # vimcode-side change was needed to pick this up: `src/win/` never computed
 # its own hit zones, so there was nothing here to delete — the fix lives
 # entirely inside `WinBackend`'s own draw_* calls.
+#
+# Real-input re-verification (fix round, 2026-10-01): built with `cargo xwin
+# build --release --target x86_64-pc-windows-msvc --no-default-features
+# --features win` under `RUSTFLAGS="-C target-feature=+crt-static"`, ran
+# `vimcode.exe --version` (reports `quadraui fc94f2136bf6, win`, confirming
+# the resolved rev), then launched the built `.exe` on dell64's own Windows
+# 11 host with an *unlocked, active* session (no `LogonUI`, `query session`
+# shows `Active`, `GetForegroundWindow()` non-null) and drove it with
+# `SetCursorPos` + `mouse_event` (never `PostMessage`, which bypasses
+# `WM_NCHITTEST`):
+# - `WM_NCHITTEST` at the drawn menu row (File…Help, the command-centre
+#   search box) returns `HTCLIENT`; the narrow inter-widget gaps return
+#   `HTCAPTION`.
+# - A real click on File opens its dropdown (New Tab/Open File…/Quit etc.).
+# - A real click on the maximize button flips `IsZoomed` false → true.
+# - A real drag from an `HTCAPTION` point in the menu row moves the window
+#   by exactly the drag delta (`GetWindowRect` before/after confirms it).
+# - A real click on the close button (`HTCLOSE` by `WM_NCHITTEST`) ends the
+#   process (`Get-Process` confirms exit).
+# Every PID launched for this was stopped only by exact PID after
+# confirming its image path was this build's `vimcode.exe`, never by image
+# name.
 quadraui = { git = "https://github.com/JDonaghy/quadraui.git", rev = "fc94f2136bf66139be4da04ce5f16d78736b55cf", features = ["tui", "terminal"] }
 # #896: gtk4/pangocairo/gio are ONE version family with quadraui's own
 # gtk4-rs dependency, not three independent bumps. `gtk4-sys` carries
