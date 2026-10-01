@@ -1,0 +1,188 @@
+# Tier-2 real-terminal smoke spec for vimcode#1646 (claude-coordinator epic
+# #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `tui-pty` (coord/tui_pty_driver.py) — launches the real `vcd`
+# binary under a real pty (`UnixPtyChild` on Linux/macOS, ConPTY on
+# Windows), sends real terminal byte sequences, and asserts on the resulting
+# VT screen. This is the TIER THIS REPO ALREADY HAS DIRECT, RUN-ON-REAL-
+# HARDWARE EXPERIENCE WITH: `tests/conpty_idle_flicker.rs` (#1634) and
+# `tests/conpty_activity_bar_click.rs` (#1636) exercise the identical idea
+# in Rust via `portable_pty` on real Windows ConPTY (dell64). This YAML file
+# is the cross-platform, coord-driven analogue of those two files, reusing
+# the same layout facts they already derived (see per-step comments below)
+# so the Linux/macOS run coord's `tui-pty` driver performs and the Windows
+# ConPTY run those Rust tests perform are checking the same thing two ways.
+#
+# `coord`'s driver supplies the actual `launch_command`/`cwd` (this file
+# only names the rendered-screen oracle) — the launch command this spec was
+# authored and real-pty-verified against opens vcd on a small, real,
+# non-empty text file (a handful of short lines) with LSP disabled and nerd
+# fonts off, e.g. `vcd sample.txt` with `HOME` pointed at a settings.json
+# carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — the same
+# determinism precondition `tests/conpty_activity_bar_click.rs`'s own
+# `isolated_home()` sets up, and for the same reason (nerd-fonts-off makes
+# the activity bar paint its single-ASCII-character fallback glyphs, which
+# is what pins `ICON_COLUMN`/the per-row markers below to fixed values
+# instead of a font-dependent one).
+#
+# Grid and row/column layout confirmed by a real run of this exact binary
+# under a real Linux pty, `cols: 100` x `rows: 30`, HOME pointed at a fresh
+# (no stale state) config dir: the activity bar is always the screen's
+# leftmost column (`x = 0` accent, `x = 1` icon glyph — exactly
+# `tests/conpty_activity_bar_click.rs`'s own `ICON_COLUMN = 1`), and with no
+# title/tab-bar row inserted above it, row 0 is the hamburger menu toggle,
+# rows 1-7 are Explorer/Search/Debug/Source Control(Git)/Extensions/AI
+# Assistant/Board in that fixed order (`src/render.rs`'s `fixed` array,
+# `build_activity_bar`), and the last row (here, row 29) is Settings.
+name: vimcode-tui-pty
+cols: 100
+rows: 30
+steps:
+  - type: launch
+    id: launch
+
+  # Precondition, not one of this file's own regression oracles: the first
+  # real frame must have painted (status bar's NORMAL mode indicator)
+  # before anything below can mean anything. Deliberately `expect_within`
+  # (poll for the real content), never `wait_idle` followed by a one-shot
+  # `expect_screen`: extension-registry refresh (`Engine::ext_refresh`,
+  # spawned unconditionally by the real `vcd` startup path, never by the
+  # deterministic `startup_without_session_restore` test entry point) does
+  # a real network fetch before the very first frame settles, and a child
+  # that has not yet sent *any* bytes trivially satisfies "quiet for 800ms"
+  # from the instant it launches — RED-verified by hand against this exact
+  # file with the `wait_idle`-then-`expect_screen` shape it used to have:
+  # `wait_idle` returned immediately (nothing had arrived yet to be
+  # "unquiet"), so `expect_screen` checked a genuinely blank screen and
+  # failed, and the *next* step (`expect_silent`) then saw real startup
+  # bytes still arriving and failed too — both false negatives from
+  # checking before the real paint, not real regressions. Polling for the
+  # actual expected text (mirroring
+  # `tests/conpty_activity_bar_click.rs`'s own
+  # `wait_for_screen_contains`/its module doc's explanation of the
+  # identical false-negative shape for a fixed quiet-window) sidesteps the
+  # question entirely: it succeeds the moment the real paint lands,
+  # however long that takes, up to a generous budget here (mirrors that
+  # same Rust test's `SETTLE_TIMEOUT = 15s`).
+  - type: expect_within
+    id: first-frame-painted
+    text: "NORMAL"
+    ms: 20000
+
+  # vimcode#1634 was specifically a Windows-Terminal *rendering* bug — a real
+  # ~1Hz foreground flicker with a genuinely silent underlying byte stream
+  # (confirmed in `tests/conpty_idle_flicker.rs`'s own module doc: the bug
+  # lives in the terminal emulator layer, which a real pty on Linux/macOS
+  # cannot reproduce — see `coord/tui_pty_driver.py`'s module doc, "What this
+  # tier does NOT see"). This step cannot catch #1634 itself. It guards the
+  # backend-neutral precondition #1634 depends on staying true everywhere:
+  # an idle `vcd` must emit zero repaint bytes, on every platform, not just
+  # the one the bug was filed against. Expected GREEN today — this is the
+  # control, not the reproduction.
+  - type: expect_silent
+    id: idle-truly-silent
+    seconds: 3
+
+  # vimcode#1636 ("clicking activity-bar icons does nothing") — real SGR
+  # mouse clicks at the icon column, exactly
+  # `tests/conpty_activity_bar_click.rs`'s own `send_sgr_click`, confirmed on
+  # real ConPTY hardware to require real input-decoding (not just in-process
+  # dispatch) to reproduce or clear.
+  #
+  # `expect_within` (poll for the real content), not `wait_idle` followed
+  # by a one-shot `expect_screen`, for the identical reason the startup
+  # check above now uses it: RED-verified by hand against this exact file
+  # with the `wait_idle`-then-`expect_screen` shape these three checks used
+  # to have — a click's response can take a moment to start streaming
+  # bytes, during which `wait_idle` trivially reads "quiet" and returns
+  # immediately, so `expect_screen` right after it can check the screen
+  # *before* the real repaint lands. A `wait_idle` still follows each
+  # successful `expect_within` (not before it) as deliberate pacing before
+  # the next click — this is safe precisely because the content it's
+  # pacing *after* has already been confirmed present, unlike the removed
+  # pre-check usage — and pays the same margin
+  # `tests/conpty_activity_bar_click.rs`'s own `DOUBLE_CLICK_MARGIN`
+  # (450ms) exists for: quadraui's `DoubleClickDetector` folds two clicks
+  # on the same activity-bar zone within its window into a `DoubleClick`,
+  # which has no "activate panel" handler (quadraui#1432).
+  - type: click
+    id: click-explorer-icon
+    row: 1
+    col: 1
+  - type: expect_within
+    id: activity-bar-explorer-switches-panel-1636
+    text: "EXPLORER"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-explorer-click
+    ms: 500
+    timeout_ms: 5000
+
+  - type: click
+    id: click-source-control-icon
+    row: 4
+    col: 1
+  - type: expect_within
+    id: activity-bar-source-control-switches-panel-1636
+    text: "SOURCE CONTROL"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-source-control-click
+    ms: 500
+    timeout_ms: 5000
+
+  - type: click
+    id: click-extensions-icon
+    row: 5
+    col: 1
+  - type: expect_within
+    id: activity-bar-extensions-switches-panel-1636
+    text: "EXTENSIONS"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-extensions-click
+    ms: 500
+    timeout_ms: 5000
+
+  # Re-select Explorer so its file tree (not the Extensions list) is the
+  # sidebar content the next step's right-click lands on.
+  - type: click
+    id: click-explorer-icon-again
+    row: 1
+    col: 1
+  - type: expect_within
+    id: activity-bar-explorer-reselect-1636
+    text: "EXPLORER"
+    ms: 5000
+  - type: wait_idle
+    id: settle-after-second-explorer-click
+    ms: 500
+    timeout_ms: 5000
+
+  # vimcode#1635 ("slow right-click context menus") — a real SGR right-click
+  # (button 2) on an Explorer row, confirmed by a real run of this exact
+  # binary under a real Linux pty to open the file-tree context menu
+  # ("New File...", "New Folder...", ...) in well under a second. `tui-pty`
+  # has no dedicated latency-measuring step (unlike `win-native`'s
+  # `expect_menu_latency`); `expect_within`'s own `ms` budget stands in as
+  # the latency bound here — a menu that needs the full budget to appear is
+  # exactly as much a regression as one that never appears at all.
+  - type: click
+    id: right-click-explorer-row
+    row: 3
+    col: 10
+    button: right
+  - type: expect_within
+    id: context-menu-opens-within-budget-1635
+    text: "New File"
+    ms: 1500
+
+  # Dismiss the still-open context menu. No explicit `:qa!` quit sequence
+  # follows — `coord/tui_pty_driver.py`'s own teardown (`PtyChild.close()`)
+  # terminates the child unconditionally once the spec finishes, the same
+  # way `tests/conpty_activity_bar_click.rs`'s own teardown falls back to
+  # `child.kill()` after a best-effort `:qa!` write.
+  - type: key
+    id: dismiss-context-menu
+    key: esc
+

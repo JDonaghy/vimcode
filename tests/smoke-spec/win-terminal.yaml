@@ -1,0 +1,152 @@
+# Tier-2 Windows-Terminal-hosted smoke spec for vimcode#1646 (claude-
+# coordinator epic #3482, v0.5.551's new real-platform acceptance drivers).
+#
+# Driver: `win-native`, `mode: terminal`, `terminal_app: windows-terminal`
+# (coord/win_native_driver.py) — launches the real `vcd.exe` TUI binary
+# *inside a real Windows Terminal window* (`wt.exe vcd.exe ...`) rather than
+# probing `vcd.exe`'s own console window directly, then probes the TERMINAL
+# HOST's window with real Win32/UIA/`PrintWindow` calls. This is deliberately
+# the tier below `tests/conpty_idle_flicker.rs`/`conpty_activity_bar_click.rs`
+# (which drive a raw ConPTY with no terminal emulator window at all): those
+# two Rust tests already proved vimcode#1634/#1635/#1636's underlying byte
+# stream is correct — idle really is silent, a right-click menu really does
+# paint in ~50µs, activity-bar clicks really do dispatch — while the
+# *operator* still saw flicker/lag/dead clicks in a real terminal **window**.
+# This spec is the tier that can actually see that gap: Windows Terminal's
+# own rendering/input-translation layer.
+#
+# `coord` supplies the actual launch command/cwd; this file assumes it opens
+# `vcd.exe` on a small, real, non-empty text file, with a settings.json
+# carrying `{"lsp_enabled": false, "use_nerd_fonts": false}` — same
+# determinism precondition as `tests/smoke-spec/tui.yaml`.
+#
+# Pixel coordinates are first-approximation, NOT yet confirmed on real
+# Windows Terminal hardware (dell64): derived by assuming Windows Terminal's
+# default profile (Cascadia Mono, ~9px cell width x ~19px cell height) and a
+# ~40px top band (tab bar + title), i.e. `x = 8 + col * 9`, `y = 40 + row *
+# 19` for a cell at 0-indexed `(row, col)` — the same `(row, col)` activity-
+# bar/tree positions `tests/smoke-spec/tui.yaml` already uses and
+# `tests/conpty_activity_bar_click.rs` already verified on real ConPTY
+# (`ICON_COLUMN = 1`; rows 1-7 = Explorer/Search/Debug/Source Control/
+# Extensions/AI Assistant/Board). The real dell64 run this issue's
+# acceptance bar requires must confirm or correct both the cell-size
+# assumption and the resulting pixel values — record in the PR which ones
+# needed adjusting.
+#
+# Open question a real run must also settle, not just the coordinates: it
+# is not yet confirmed whether Windows Terminal's own UIA tree exposes
+# per-row terminal text as discrete named elements a simple role+name scan
+# (`_find_a11y_match`, shared by every native driver) can actually find, or
+# only as a single text/document-pattern element covering the whole buffer
+# (Windows Terminal/conhost's screen-reader support uses the UIA text
+# pattern, which is range-based, not a flat per-line element list). If the
+# real run shows `expect_menu_latency`/`expect_panel_switch` below can never
+# find a match for that structural reason rather than because of an actual
+# regression, that is itself a new, real finding worth recording (and is
+# outside vimcode's or quadraui's control either way — it is Windows
+# Terminal's own accessibility implementation).
+name: vimcode-win-terminal
+mode: terminal
+terminal_app: windows-terminal
+width: 1024
+height: 768
+steps:
+  - type: launch
+    id: launch
+    timeout_ms: 15000
+
+  - type: wait
+    id: startup-settle
+    ms: 2000
+
+  # vimcode#1634: the ~1Hz foreground-flicker regression, reported against a
+  # real Windows Terminal window specifically (both
+  # `tests/conpty_idle_flicker.rs`'s raw-ConPTY byte stream AND this file's
+  # own `tests/smoke-spec/tui.yaml`'s `expect_silent` already confirmed the
+  # underlying byte stream is silent — this step is the one tier that can
+  # actually see Windows Terminal's own repaint behaviour, independent of
+  # what bytes `vcd.exe` sent it). "a horizontally stacked tab group open" —
+  # `Ctrl+T` opens vimcode's own second editor tab (`MENU_STRUCTURE`'s "New
+  # Tab", shortcut `Ctrl+T`), landing two tabs side by side in vimcode's own
+  # tab bar.
+  - type: key
+    id: open-second-tab
+    key: "ctrl+t"
+  - type: wait
+    id: settle-after-tab-open
+    ms: 500
+  - type: expect_idle_stable
+    id: idle-flicker-1634
+    ms: 5000
+    interval_ms: 100
+
+  # vimcode#1635: slow right-click context menus, reported against a real
+  # Windows Terminal window. `(row=3, col=10)` matches
+  # `tests/smoke-spec/tui.yaml`'s own right-click target (an Explorer-tree
+  # row) — real pixel point per this file's own cell-size assumption above.
+  # `role:` left unset here, which defers to `win_native_driver.py`'s own
+  # default (`"MenuItem"`) rather than this file picking a value — see
+  # `win-gui.yaml`'s own comment on why the real UIA `LocalizedControlType`
+  # string may need to be the two-word lowercase "menu item" instead; if
+  # the real dell64 run shows the driver's own default never matches, that
+  # is itself worth reporting back (it would affect every spec using this
+  # step, not just this one).
+  - type: expect_menu_latency
+    id: explorer-row-context-menu-latency-1635
+    x: 98
+    y: 97
+    button: right
+    max_ms: 2000
+
+  - type: key
+    id: dismiss-context-menu
+    key: esc
+
+  # vimcode#1636: activity-bar icon clicks doing nothing, reported against a
+  # real Windows Terminal window (the exact bug class
+  # `tests/conpty_activity_bar_click.rs` already proved does NOT reproduce at
+  # the raw-ConPTY input-decoding layer on real hardware when clicks are
+  # spaced apart — see that file's own module doc's "What this means for
+  # #1636 itself" section). This tier checks the remaining, untested layer:
+  # does the *terminal window* itself ever fail to deliver/translate the
+  # click at all. One step per activity-bar icon, each its own `id` so a
+  # single icon's regression doesn't hide behind the others passing.
+  - type: expect_panel_switch
+    id: activity-bar-explorer-panel-switch-1636
+    x: 17
+    y: 59
+    role: Text
+    name: EXPLORER
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-search-panel-switch-1636
+    x: 17
+    y: 78
+    role: Text
+    name: SEARCH
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-debug-panel-switch-1636
+    x: 17
+    y: 97
+    role: Text
+    name: DEBUG
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-source-control-panel-switch-1636
+    x: 17
+    y: 116
+    role: Text
+    name: "SOURCE CONTROL"
+    timeout_ms: 5000
+
+  - type: expect_panel_switch
+    id: activity-bar-extensions-panel-switch-1636
+    x: 17
+    y: 135
+    role: Text
+    name: EXTENSIONS
+    timeout_ms: 5000

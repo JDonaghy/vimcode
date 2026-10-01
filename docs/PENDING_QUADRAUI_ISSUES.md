@@ -993,3 +993,80 @@ platform-neutral caller invokes the trait method), per the
 Platform-Neutrality Rule. **Resolved by #1618** — see the struck-entry
 note above.
 
+---
+
+## No UIA/NSAccessibility/AT-SPI provider wiring exists for any backend's drawn primitives — `coord`'s new `win-native`/`mac-native`/`gtk-native` acceptance drivers' `expect_a11y`/`expect_a11y_within` steps can only ever see native window chrome, never vimcode's own content
+
+**Title:** `quadraui::a11y::A11yInfo` (#835) is data-field groundwork only —
+no backend registers an `IRawElementProviderSimple` (Win UIA), an
+`NSAccessibility` protocol implementation (macOS AX), or an `AtkObject`/
+AT-SPI provider for any drawn primitive (menu bar, activity bar, dropdown,
+toast, extensions list, …) on any platform
+
+**Body:**
+
+Found while writing `JDonaghy/vimcode#1646`'s Tier-2 `tests/smoke-spec/*.yaml`
+specs for coord's new real-platform drivers (`coord/win_native_driver.py`,
+`coord/mac_native_driver.py`, `coord/gtk_native_driver.py`). Those drivers'
+`expect_a11y`/`expect_a11y_within` steps walk the *real* OS accessibility
+tree (`IUIAutomation`/`AXUIElementCopyAttributeValue`/`gi.repository.Atspi`)
+— by design, they ask the real OS, not quadraui, "is there an accessible
+element here" (see each driver module's own docstring). That tree can only
+ever contain what the platform itself already knows about (the top-level
+HWND/NSWindow/GtkWindow, and — only where a backend still uses a *real*
+native widget, e.g. macOS's `NSMenu` menu bar — that widget's own native
+accessibility) plus whatever a backend explicitly registers a custom
+provider for. Grepping `quadraui/src` for `IRawElementProviderSimple`,
+`IAccessible`, `UiaRaiseAutomationEvent`, `NSAccessibility` (Win/mac) and
+reading `quadraui/src/a11y.rs` end to end (macOS and Linux have no
+equivalent module at all) confirms: zero backends register any such
+provider for any of quadraui's own drawn primitives. `a11y.rs`'s own module
+doc says this outright — `A11yInfo` is "data fields on every primitive"
+groundwork per `docs/UI_CRATE_DESIGN.md` decision #6, with "platform AT
+wiring (UI Automation / NSAccessibility / AT-SPI) deferred to v1.1", and
+"**No AT backend integration is attempted here**". `A11yInfo` is also not
+yet wired into any primitive's struct or the `Backend` trait (that module's
+own doc, "not wired into any primitive... in this change").
+
+Net effect on `#1646`'s specs: every `expect_a11y`/`expect_a11y_within` step
+that targets something vimcode itself draws — the File menu's dropdown
+items, an activity-bar icon's panel, an extensions-list row's install
+state, a toast's completion text — has nothing to find and fails, on every
+one of the three native-driver platforms, regardless of whether the
+*application* behaviour being probed is actually correct. This is a
+different, lower-level gap than any single numbered vimcode bug: it is why
+`#1646`'s win-gui/mac-gui/gtk-gui specs can only exercise *native* window
+chrome today (`expect_hit`, `expect_menu`, `expect_closed`, and — on
+macOS only, via the one remaining real `NSMenu` — the menu bar's own native
+accessibility) and must leave every a11y-tree assertion against vimcode's
+own drawn content marked expected-red in a comment pointing at this entry,
+rather than quietly weakening those steps to something that cannot fail.
+
+**Ask:** land real AT backend wiring for at least one drawn primitive per
+platform (the menu bar/dropdown is the highest-value target — it is the
+one every `#1646` spec's `expect_a11y_within` step already needs) —
+`IRawElementProviderSimple`/`UiaRaiseAutomationEvent` on Win-GUI,
+`NSAccessibility` role/attribute methods on an `NSView` subclass on macOS,
+and an `AtkObject`/`gtk_widget_get_accessible` provider (GTK4's own
+`GtkAccessible` interface) on GTK — each exposing at minimum a role, a
+name, and (for container-like primitives) a children list, keyed off the
+same `A11yInfo` fields `#835` already landed. `A11yInfo` would need to
+actually reach the `Backend` trait or a per-primitive paint call for any of
+this to have data to expose, which `a11y.rs`'s own doc already flags as
+the deliberately-deferred next step.
+
+**Test:** a `WinDriver`/`MacDriver`/`GtkDriver` scenario that opens a menu
+dropdown and asserts a real UIA/AX/AT-SPI client observes a `MenuItem`-role
+element with the expected name — needs each backend's real driver harness
+(`win_driver_tests`/`macos::mac_driver_tests`/GTK's own), not just the
+in-process `TuiDriver`-style text-screen assertions these backends already
+have, since the whole point is whether a real AT client sees anything.
+
+**Blocks:** `JDonaghy/vimcode#1646`'s win-gui/mac-gui/gtk-gui
+`expect_a11y`/`expect_a11y_within` seed checks for anything other than
+native window chrome. Leave `#1646` open behind this one per `GOALS.md`'s
+milestone-discipline rule — the smoke-spec files themselves are not
+blocked (they parse and run; their a11y-tree assertions are just
+expected-red until this lands), only the *green* state of those specific
+steps is.
+
