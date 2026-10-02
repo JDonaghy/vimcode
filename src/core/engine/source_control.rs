@@ -1517,16 +1517,23 @@ mod poll_sc_refresh_tests {
     //! (`ratatui-crossterm`'s `CrosstermBackend::draw`/`hide_cursor`, not
     //! this crate's code, so there is no in-crate seam to assert on the
     //! byte stream itself — `tests/smoke-spec/tui.yaml`'s
-    //! `idle-truly-silent` step, run under a real pty by `coord`'s
-    //! `tui-pty` driver, is the black-box oracle for *that* half; this
+    //! `idle-truly-silent` step, run under a real pty by the external
+    //! smoke-test harness, is the black-box oracle for *that* half; this
     //! module covers the pure decision feeding it, exactly the pattern
     //! `App::dedup_window_title`/`dedup_caret_shape` already established
     //! for #1634's sibling bug).
     //!
+    //! The driver-tier half of this fix's coverage lives in
+    //! `tui_main::app_on_tui_tests::tests::idle_stability_1650` — a
+    //! `TuiDriver` with the Explorer sidebar actually painted, asserting
+    //! the `Reaction` every idle tick returns across several of those 2s
+    //! boundaries is `Continue`, not `Redraw` (the redraw signal the
+    //! runner turns into the real `draw` call, i.e. into the escape
+    //! burst), plus that the painted screen text never changes.
+    //!
     //! RED-verified: reverting [`Engine::poll_sc_refresh`] to always
     //! `return true` on `Ok(..)` (the pre-fix behavior) makes
     //! `poll_sc_refresh_returns_false_when_snapshot_is_unchanged` fail.
-    use super::*;
     use crate::core::engine::Engine;
     use crate::core::git::{FileStatus, GitLogEntry, StatusKind, WorktreeEntry};
 
