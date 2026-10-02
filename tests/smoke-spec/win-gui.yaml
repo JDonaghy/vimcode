@@ -198,11 +198,21 @@ steps:
     ht: HTCLIENT
   - type: expect_hit
     id: hit-test-close-button-1232
-    # vimcode#1656 remeasured this against a real 4x-zoom crop of the
-    # painted glyph (`/tmp/crop-zoom-caption.png` in that issue's
-    # evidence) rather than this header's derived estimate — 994, not
-    # 978 — and confirmed FAIL (HTCAPTION) at that exact point too, so
-    # the gap isn't "the old estimate missed the button by a few px".
+    x: 978
+    y: 16
+    ht: HTCLIENT
+
+  # vimcode#1656 ADDS this step rather than touching the one above (this
+  # file is additive-only, #3509/#3487) — it remeasured the close button's
+  # real click centre against a real 4x-zoom crop of the painted glyph
+  # (`/tmp/crop-zoom-caption.png` in that issue's evidence) rather than
+  # this header's derived estimate: 994, not 978. Confirmed FAIL
+  # (HTCAPTION) at that exact point too, so the gap isn't "the old
+  # estimate missed the button by a few px" — the whole caption-button
+  # strip is misclassified, both the original derived estimate and this
+  # remeasured real centre.
+  - type: expect_hit
+    id: hit-test-close-button-remeasured-1656
     x: 994
     y: 16
     ht: HTCLIENT
@@ -307,13 +317,24 @@ steps:
   # `docs/PENDING_QUADRAUI_ISSUES.md` drafts: `WinBackend::
   # register_status_bar_segment_zones` registers the close button's
   # *bar-local* bounds as if they were absolute, so the real click still
-  # lands as HTCAPTION. Same remeasured real centre as
-  # `hit-test-close-button-1232` above (994, not this header's original
-  # 978 estimate).
+  # lands as HTCAPTION.
   - type: click
     id: click-close-button-1232
-    x: 994
+    x: 978
     y: 16
   - type: expect_closed
     id: close-button-actually-closes-window-1232
     timeout_ms: 5000
+
+  # vimcode#1656 does NOT add a second click/expect_closed pair at the
+  # remeasured 994 centre here: a hit-test is side-effect-free and safe to
+  # duplicate (see `hit-test-close-button-remeasured-1656` above), but a
+  # second real click is not — once this bug is fixed upstream and the
+  # first click above genuinely closes the window, a second click step
+  # targeting an already-closed window would error the driver rather than
+  # cleanly pass or fail. The hit-test sweep in this file's header comment
+  # already confirms x=978 (this existing step's own coordinate) sits
+  # inside the same misclassified HTCAPTION strip as the remeasured 994
+  # centre, so this one step is already this issue's real-click acceptance
+  # coverage without needing a duplicate.
+
