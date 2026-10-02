@@ -163,6 +163,16 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// green.
 const OBSERVE_WINDOW: Duration = Duration::from_secs(7);
 
+/// The idle observation window for
+/// [`idle_with_explorer_sidebar_open_produces_no_further_output`] (#1650).
+/// That bug's periodic burst only fires on the *second* and later 2-second
+/// `render::run_shared_tick_chores` auto-refresh ticks (the first one
+/// always applies real data against an empty cache and legitimately
+/// redraws — see `Engine::poll_sc_refresh`'s own doc), so this window is
+/// longer than [`OBSERVE_WINDOW`] to comfortably contain several of those
+/// 2-second ticks — #1650's own issue text asks for "≥10s".
+const OBSERVE_WINDOW_SIDEBAR: Duration = Duration::from_secs(12);
+
 /// Shared state the reader thread updates: every byte it has ever seen, and
 /// the instant of the most recent read.
 struct Captured {
@@ -399,6 +409,102 @@ fn idle_after_settle_produces_no_further_output() {
         "raw ConPTY output kept arriving during a {OBSERVE_WINDOW:?} idle \
          window with no user input (#1634): {} new byte(s) after settle. \
          Trailing bytes received in the window:\n{}",
+        byte_count_after.saturating_sub(byte_count_before),
+        escape_for_display(&snapshot_from(&captured, byte_count_before))
+    );
+}
+
+/// #1650: a sibling of [`idle_after_settle_produces_no_further_output`]
+/// covering the scenario that test's own `:vsplit`/`:split` layout does
+/// *not* exercise — the Explorer/Source Control sidebar open.
+///
+/// `render::run_shared_tick_chores` re-runs `Engine::sc_refresh_async`
+/// every 2 seconds while `engine.app_shell.sidebar_visible()` is true, to
+/// pick up external `git` changes (another shell running `git commit`,
+/// `git checkout`, …). Before this fix, `Engine::poll_sc_refresh` reported
+/// "redraw needed" unconditionally every time that refresh's background
+/// thread delivered a snapshot — even when the snapshot was byte-for-byte
+/// identical to the cached one, which is every single time in a quiescent
+/// repo. Confirmed on a real Linux pty (not ConPTY — see this file's own
+/// `#![cfg(windows)]` gate) by hand against this exact binary: reverting
+/// the fix reproduces the issue's own reported byte sequence,
+/// `\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?25l` (SGR fg/bg/underline-colour
+/// reset + SGR reset + hide-cursor — `ratatui-crossterm`'s
+/// `CrosstermBackend::draw`/`Terminal::flush`'s unconditional end-of-draw
+/// writes), repeating roughly every 2 seconds indefinitely once the
+/// sidebar is open; restoring the fix makes that same repro go silent.
+/// This test is the ConPTY-side sibling of that manual repro, run with the
+/// fix in place — see #1650's own PR description for the full RED/GREEN
+/// trail against the real Linux-pty repro, since (per this module's own
+/// "RED/GREEN note for reviewers" above) a `#![cfg(windows)]`-gated file
+/// cannot itself be RED-verified from a non-Windows session.
+///
+/// Opens the Explorer panel with a real SGR mouse click at the activity
+/// bar's Explorer icon — row 1, col 1 (0-based), matching
+/// `tests/smoke-spec/tui.yaml`'s own `click-explorer-icon` step and
+/// `tests/conpty_activity_bar_click.rs`'s `ICON_COLUMN` — then observes
+/// for [`OBSERVE_WINDOW_SIDEBAR`] (≥10s, per #1650's own acceptance
+/// criteria) rather than [`OBSERVE_WINDOW`], since the bug's periodic tick
+/// is 2s and this window needs several of them to elapse to be a
+/// meaningful check.
+#[test]
+fn idle_with_explorer_sidebar_open_produces_no_further_output() {
+    let home = isolated_home();
+    let main_rs = home.join("main.rs");
+    std::fs::write(&main_rs, comment_heavy_rust("SIDEBAR")).expect("write main.rs");
+
+    let (mut child, captured, mut writer, _master) = spawn_under_conpty(&main_rs, &home);
+
+    assert!(
+        wait_for_quiescence(&captured, QUIET_FOR, SETTLE_TIMEOUT),
+        "vcd.exe never went quiet after startup — output kept arriving \
+         continuously for {SETTLE_TIMEOUT:?}; last bytes:\n{}",
+        escape_for_display(&tail_snapshot(&captured, 400))
+    );
+
+    // Real SGR mouse press+release (button 0, 1-based col=2/row=2 — the
+    // activity bar's Explorer icon at 0-based row 1, col 1) to open the
+    // sidebar, exactly the byte shape a real terminal emulator sends and
+    // `tests/conpty_activity_bar_click.rs`'s own `send_sgr_click` already
+    // proved necessary to reproduce (#1636's "in-process dispatch isn't
+    // enough" finding applies equally here).
+    writer
+        .write_all(b"\x1b[<0;2;2M\x1b[<0;2;2m")
+        .expect("send SGR click on the Explorer activity-bar icon");
+    writer.flush().ok();
+
+    assert!(
+        wait_for_quiescence(&captured, QUIET_FOR, SETTLE_TIMEOUT),
+        "vcd.exe never went quiet after opening the Explorer sidebar — \
+         output kept arriving continuously for {SETTLE_TIMEOUT:?}; last \
+         bytes:\n{}",
+        escape_for_display(&tail_snapshot(&captured, 400))
+    );
+
+    let (byte_count_before, last_read_before) = {
+        let c = captured.lock().unwrap();
+        (c.bytes.len(), c.last_read_at)
+    };
+    std::thread::sleep(OBSERVE_WINDOW_SIDEBAR);
+    let (byte_count_after, last_read_after) = {
+        let c = captured.lock().unwrap();
+        (c.bytes.len(), c.last_read_at)
+    };
+
+    writer.write_all(b"\x1b:qa!\r").ok();
+    writer.flush().ok();
+    let _ = child.try_wait();
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(
+        last_read_before,
+        last_read_after,
+        "raw ConPTY output kept arriving during a {OBSERVE_WINDOW_SIDEBAR:?} \
+         idle window with the Explorer sidebar open and no user input \
+         (#1650): {} new byte(s) after settle. Trailing bytes received in \
+         the window:\n{}",
         byte_count_after.saturating_sub(byte_count_before),
         escape_for_display(&snapshot_from(&captured, byte_count_before))
     );

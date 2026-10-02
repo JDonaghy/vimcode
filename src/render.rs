@@ -6218,6 +6218,21 @@ pub(crate) fn run_shared_tick_chores(
     // hidden, the 2s timer is never reset, so it fires once (and resets)
     // the first tick after the sidebar is shown again, no matter how long
     // it was hidden for.
+    //
+    // #1650: kicking off `sc_refresh_async` here must NOT by itself set
+    // `needs_redraw` — spawning a background thread has no visible effect
+    // of its own, and this block runs every 2s indefinitely while the
+    // Explorer/Git sidebar is visible (the default startup state). This
+    // used to force a real `ratatui::Terminal::draw` call every single
+    // time regardless of whether `git status`/`log`/`worktree list`
+    // actually changed, and every one of those draws writes an invisible
+    // SGR-reset + cursor-hide escape burst (`ratatui-crossterm`'s
+    // `CrosstermBackend::draw`/`hide_cursor` do this unconditionally, even
+    // for a zero-cell diff) — exactly the non-silent idle byte stream
+    // `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught. The
+    // only thing that should trigger a redraw is `poll_sc_refresh`
+    // actually finding changed data (see its own doc), once the async
+    // fetch below completes.
     if engine.app_shell.sidebar_visible()
         && app.last_sc_refresh.elapsed() >= std::time::Duration::from_secs(2)
     {
@@ -6228,7 +6243,6 @@ pub(crate) fn run_shared_tick_chores(
         ) {
             engine.sc_refresh_async();
         }
-        needs_redraw = true;
     }
     if engine.poll_sc_refresh() {
         needs_redraw = true;
