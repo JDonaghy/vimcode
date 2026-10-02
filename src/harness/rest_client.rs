@@ -320,6 +320,17 @@ pub fn fill_url_send_and_paint_response<D: ConformanceDriver + DrivesIdle>(
          painted runs were {:?}",
         painted(driver)
     );
+    // #147 review (headers-list finding): the fixture server always answers
+    // with a `Content-Type` header (see `spawn_capturing_server`), so its
+    // presence on the Response view's paint is direct evidence `resp.headers`
+    // reached the view, not just the body.
+    assert!(
+        driver.screen_has("Content-Type"),
+        "the Response view must paint the response's headers list \
+         (MVP scope: \"headers list\"), not just status/body; painted \
+         runs were {:?}",
+        painted(driver)
+    );
 }
 
 /// #147 acceptance 2 — "add a header row and assert the server received
