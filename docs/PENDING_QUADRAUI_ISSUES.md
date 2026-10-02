@@ -1070,3 +1070,176 @@ blocked (they parse and run; their a11y-tree assertions are just
 expected-red until this lands), only the *green* state of those specific
 steps is.
 
+---
+
+## `WinBackend::register_status_bar_segment_zones` (quadraui#1232) registers each segment's *bar-local* bounds as if they were absolute window coordinates — the inline minimize/maximize/close buttons stay `HTCAPTION` whenever their `StatusBar` isn't painted at `rect.x == 0` (blocks vimcode#1656)
+
+**Title:** `crate::primitives::status_bar::StatusBar::layout`/`layout_padded`
+returns `hit_regions`/`visible_segments[].bounds` in bar-local (0-origin)
+coordinates by design — `WinBackend::draw_status_bar_interactive`'s #1232
+zone-registration fix (`register_status_bar_segment_zones`) feeds those
+bounds straight into `Backend::register_zone` uncorrected, unlike the
+sibling `register_menu_bar_item_zones`/`register_command_center_zones`
+helpers the same commit added, whose source primitives (`MenuBar::layout`,
+`CommandCenter::layout`) both bake the real `Rect`'s `x`/`y` into their
+returned bounds already
+
+**Body:**
+
+vimcode#1656 re-reports, at the pin *including* quadraui#1232's own fix
+commit (`fc94f2136bf66139be4da04ce5f16d78736b55cf`, confirmed to be the
+exact `rev` in this repo's `Cargo.toml` at investigation time), that a real
+`WM_NCHITTEST` sweep across the Win-GUI title band still classifies the
+drawn minimize/maximize/close buttons as `HTCAPTION` — swallowing a real
+click before it ever reaches the app as a `MouseDown` — while the File/
+Edit/.../Help menu-row items *and* the command-centre search box, painted
+into the exact same band by the exact same `App::render_content`/
+`paint_title_bar_band` call in the exact same frame, both now correctly
+read `HTCLIENT` and are genuinely clickable. This is the precise
+differential #1232's own commit message claimed to close for all three
+("status-bar segments (vimcode's inline minimize/maximize/close buttons)"
+named explicitly) — so the fix landed for two of the three widget kinds it
+names, not the third.
+
+Root-caused by reading the pinned rev (`fc94f21`) source, not just
+re-observing the symptom:
+
+1. `WinBackend::draw_status_bar_interactive` (`quadraui/src/win/backend.rs`)
+   paints via `crate::primitives::status_bar::native_surface_paint::paint`
+   and then calls `self.register_status_bar_segment_zones(&layout)` on the
+   `StatusBarLayout` that call returns — mirroring `draw_menu_bar`'s
+   `register_menu_bar_item_zones(&layout)` and `draw_command_center`'s
+   `register_command_center_zones(&cc.id, &layout)` exactly, same shape,
+   same place in the call sequence.
+2. `register_status_bar_segment_zones` (`quadraui/src/win/backend.rs`):
+   ```rust
+   fn register_status_bar_segment_zones(&mut self, layout: &StatusBarLayout) {
+       for (bounds, hit) in &layout.hit_regions {
+           if let StatusBarHit::Segment(id) = hit {
+               self.register_zone(id.clone(), *bounds);
+           }
+       }
+   }
+   ```
+   registers `*bounds` verbatim, with no translation by the `rect` that was
+   passed into `draw_status_bar_interactive`.
+3. But `StatusBar::layout`/`layout_padded`
+   (`quadraui/src/primitives/status_bar.rs`) — the function that actually
+   computes `hit_regions`/`visible_segments[].bounds` — takes only
+   `bar_width: f32, bar_height: f32` (no `x`/`y` at all), and every segment
+   rect it builds starts from a `cursor` that begins at `edge_inset` (left
+   group) or is derived from `bar_width` alone (right group):
+   `Rect::new(cursor, 0.0, w, bar_height)`. These bounds are **bar-local**,
+   origin `(0, 0)` at the bar's own top-left — by design, not oversight:
+   `native_surface_paint::paint` (same file) computes `bar_layout` this
+   way and then manually offsets *only the paint calls*,
+   `Rect::new(x + vs.bounds.x, y + vs.bounds.y, ...)`, before returning the
+   untranslated `bar_layout` as the function's result. `compose/
+   status_bar_interaction.rs`'s `StatusBarInteraction::hit_test` — the
+   generic, already-correct, cross-backend click-dispatch path every
+   backend (including GTK) uses for ordinary `MouseDown`/`MouseUp`
+   handling of a `StatusBar` — confirms this is the intended contract: it
+   explicitly subtracts `bar_rect.x`/`bar_rect.y` from the incoming
+   `position` (`let local_x = position.x - bar_rect.x`) *before* matching
+   against the stored `StatusBarLayout`, precisely because that layout's
+   bounds are bar-local.
+4. By contrast, `MenuBar::layout` and `CommandCenter::layout`
+   (`quadraui/src/primitives/command_center.rs`'s `layout`, e.g.
+   `let center_x = bounds.x + ...`) both take the *full* `Rect` and bake
+   its `x`/`y` into every returned bound directly — their layouts are
+   already absolute/window-space, which is exactly what
+   `register_menu_bar_item_zones`/`register_command_center_zones` (and
+   `WinBackend::nc_hit_test`'s `z.bounds.contains(point)` check, which
+   compares against real `WM_NCHITTEST` screen-turned-DIP coordinates)
+   correctly assume.
+
+Net: `register_status_bar_segment_zones` is the one helper of the three
+#1232 added that feeds a *bar-local* layout into an API that needs
+absolute bounds. For vimcode's window-controls bar — anchored near the
+window's right edge, e.g. `rect.x` on the order of 850px in a 1024px-wide
+window per vimcode#1656's own measurements — the registered zone for each
+button ends up roughly 850px to the left of the button's real screen
+position (in fact overlapping whatever vimcode happens to paint at the
+*left* edge of the band instead), so a real click at the button's real,
+remeasured centre finds no matching zone, `nc_hit_test` falls through to
+"covered only by `TITLE_BAR_DRAG_ZONE`" and answers `HTCAPTION`, and the
+OS consumes the click as a caption drag before vimcode ever sees it. The
+File/Edit/... menu items sit at a small `rect.x` (close to the window's
+left edge, after the app-icon slot) if `MenuBar::layout` had the same bug
+the resulting offset would be small enough to often still land inside a
+item's own hit box by luck — but it doesn't have the bug at all, it's
+already absolute. The command-centre search box is mid-window
+(`cc_rect.x` on the order of 160–400px per the existing `win-gui.yaml`
+fixture geometry) and, likewise, already absolute via `CommandCenter::
+layout`, so it also just works. Nothing about vimcode's own call site
+(`App::render_content`'s `backend.draw_status_bar_interactive(controls_rect,
+&controls_bar, ...)`, identical in shape to every other backend's call to
+the same trait method) is at fault — the bug is entirely inside
+`quadraui::win::backend`'s zone-registration helper misreading a
+documented-local-coordinate primitive as absolute.
+
+**Ask:** `register_status_bar_segment_zones` must translate each
+`bounds` by the same `rect.x`/`rect.y` that was passed into
+`draw_status_bar_interactive` before calling `register_zone` — i.e.
+`self.register_zone(id.clone(), Rect::new(rect.x + bounds.x, rect.y +
+bounds.y, bounds.width, bounds.height))`, threading `rect` through from
+the call site (it's already in scope at both of `draw_status_bar_
+interactive`'s two call sites to this helper). Add a unit test
+alongside `register_zone_records_the_zone`/
+`draw_status_bar_interactive_registers_its_own_segment_zones_inside_the_band`
+(`quadraui/src/win/backend.rs`'s existing test module) that calls
+`draw_status_bar_interactive` with a `rect.x` strictly greater than 0 (the
+existing test, read at the pinned rev, does not appear to cover a non-zero
+`rect.x`/`rect.y` — the exact gap that let this regression ship alongside
+the two working cases) and asserts the registered zone's `bounds.x`
+reflects that offset, not bar-local `0`.
+
+**Why both of #1232's own existing tests already use a non-zero `rect.x`
+and still didn't catch this:** read closely, neither actually probes the
+button's *real* absolute screen position — both derive their test point
+from the same (buggy, bar-local) layout the production code also
+mis-registers, so the bug is invisible to a self-referential check:
+- `draw_status_bar_interactive_registers_its_own_segment_zones_inside_the_band`
+  (`win/backend.rs`, `rect = Rect::new(600.0, 0.0, 200.0, 32.0)`) computes
+  its probe point as `close_rect.x + close_rect.width / 2.0` straight from
+  `layout.hit_regions` — never adding the `600.0` back in. If
+  `register_status_bar_segment_zones` is fixed to translate by `rect.x`/
+  `rect.y` as this entry's **Ask** requires, this *existing* test would
+  then need its own probe point fixed to `rect.x + close_rect.x +
+  close_rect.width / 2.0` or it would start failing for the opposite
+  reason (querying the old, now-stale bar-local point instead of the
+  corrected absolute one).
+- `win::run`'s `live_window_nchittest_tests` (`status_rect =
+  Rect::new(viewport.width - 40.0, 0.0, 40.0, band_height)`) does the same
+  thing: `close_button` is set from `status_layout.hit_regions`' raw
+  (bar-local) `r.x`/`r.y`, i.e. a point near the *left* edge of that
+  40px-wide sub-rect rather than near `viewport.width`. In this fixture
+  that mis-derived point likely lands inside the unrelated
+  `probe:bar:file` menu-bar zone (painted at `Rect::new(0, 0, 100,
+  band_height)`, and correctly absolute per `MenuBar::layout`) and so
+  reports "not `HTCAPTION`" anyway — passing for the wrong reason, with no
+  signal about the close button's real location at all.
+
+Both need the same fix as the production code: derive the expected
+absolute centre independently (`rect.x + bounds.x + bounds.width / 2.0`,
+`rect.y + bounds.y + bounds.height / 2.0`), not by reusing whatever
+`layout.hit_regions` already reports — otherwise a future regression of
+this exact shape (a primitive silently switching between local- and
+absolute-coordinate output) could ship past both tests again.
+
+**Test:** `tests/smoke-spec/win-gui.yaml`'s existing
+`hit-test-minimize-button-1232`/`hit-test-maximize-button-1232`/
+`hit-test-close-button-1232`/`close-button-actually-closes-window-1232`
+steps (added for vimcode#1646, already covering this exact scenario)
+serve as the Tier-2 acceptance check — re-run them once the quadraui pin
+moves past this fix; see that file's own updated header comment
+(vimcode#1656) for the real-hardware RED confirmation this entry is based
+on.
+
+**Blocks:** `JDonaghy/vimcode#1656`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available (`src/app.rs`'s call to
+`backend.draw_status_bar_interactive` is already identical in shape to
+every other backend's call to the same trait method; the bug is entirely
+inside `quadraui::win::backend`'s own zone-registration helper).
+

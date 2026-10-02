@@ -85,6 +85,50 @@
 # expected RED on today's develop, and expected GREEN once the pin moves
 # to `fc94f21` or later. Do not "fix" these by weakening the assertion —
 # bump the pin instead.
+#
+# UPDATE (vimcode#1656): the pin DID move to `fc94f2136bf66139be4da04ce5f16d78736b55cf`
+# (confirmed the exact `rev` in `Cargo.toml` at investigation time) and a
+# real-hardware re-run found the "flip to GREEN" prediction above only
+# half came true:
+#
+#   hit-test-file-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-edit-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-view-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-go-menu-item-1232:          PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-run-menu-item-1232:         PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-terminal-menu-item-1232:    PASS got=HTCLIENT want=HTCLIENT
+#   hit-test-help-menu-item-1232:        PASS got=HTCLIENT want=HTCLIENT
+#   file-dropdown-opens-1232:            PASS (File menu's dropdown opens
+#                                         and paints "New Tab")
+#   hit-test-minimize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-maximize-button-1232:       FAIL got=HTCAPTION want=HTCLIENT
+#   hit-test-close-button-1232:          FAIL got=HTCAPTION want=HTCLIENT
+#   close-button-actually-closes-window-1232: FAIL (window still existed
+#                                         after 5000ms — real click at the
+#                                         close icon's remeasured real
+#                                         centre is still swallowed as a
+#                                         caption drag)
+#   hit-test-empty-band-is-caption-1232: PASS got=HTCAPTION want=HTCAPTION
+#   no-native-win32-menu-1228:           PASS (GetMenu returned NULL)
+#
+# So the menu row and the command-centre search box (not a step in this
+# file today, but confirmed clickable by the same sweep — see
+# vimcode#1656's own evidence) are genuinely fixed; the three caption
+# buttons are not, despite #1232's own commit message naming them
+# explicitly ("status-bar segments (vimcode's inline minimize/maximize/
+# close buttons)"). Root-caused to a *different* bug than the one #1232
+# fixed for the other two widget kinds — `WinBackend::
+# register_status_bar_segment_zones` registers each button's *bar-local*
+# `StatusBarLayout` bounds as if they were already absolute window
+# coordinates, unlike the sibling `register_menu_bar_item_zones`/
+# `register_command_center_zones` helpers, whose source primitives already
+# return absolute bounds — see `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry (quadraui#1232 follow-up) for the full source-level trace. The
+# four `FAIL` steps above are this issue's own Tier-2 acceptance coverage
+# ("a Tier-2 smoke-spec step that fails first, covering this exact
+# behaviour") — do not mark them expected-green again until that entry is
+# filed and fixed upstream; re-run once the pin moves past the fix to
+# confirm the flip.
 name: vimcode-win-gui
 mode: window
 width: 1024
@@ -98,11 +142,15 @@ steps:
     id: startup-settle
     ms: 1500
 
-  # quadraui#1232 — before it lands, these are all misclassified HTCAPTION.
   # All 7 of vimcode's fixed File/Edit/View/Go/Run/Terminal/Help menu-row
   # items get their own step (not just the first/last), per #1646's own
-  # "each menu-row item" wording — confirmed real-hardware-identical
-  # (all HTCAPTION today) in this file's header comment above.
+  # "each menu-row item" wording — confirmed GREEN at the current pin
+  # (vimcode#1656's real-hardware re-run, this file's header comment
+  # above). The three caption-button steps right below are NOT gated on
+  # quadraui#1232 any more (that landed) — they're gated on the follow-up
+  # bug vimcode#1656 found and `docs/PENDING_QUADRAUI_ISSUES.md` drafts
+  # (`register_status_bar_segment_zones` registering bar-local, not
+  # absolute, bounds), confirmed still RED at the current pin.
   - type: expect_hit
     id: hit-test-file-menu-item-1232
     x: 24
@@ -150,7 +198,12 @@ steps:
     ht: HTCLIENT
   - type: expect_hit
     id: hit-test-close-button-1232
-    x: 978
+    # vimcode#1656 remeasured this against a real 4x-zoom crop of the
+    # painted glyph (`/tmp/crop-zoom-caption.png` in that issue's
+    # evidence) rather than this header's derived estimate — 994, not
+    # 978 — and confirmed FAIL (HTCAPTION) at that exact point too, so
+    # the gap isn't "the old estimate missed the button by a few px".
+    x: 994
     y: 16
     ht: HTCLIENT
 
@@ -170,15 +223,17 @@ steps:
     id: no-native-win32-menu-1228
     items: ["File"]
 
-  # Blocked on quadraui#1232 (the click never lands) AND on the separate,
-  # lower-level gap docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/
-  # NSAccessibility/AT-SPI provider wiring..." entry describes: vimcode
-  # paints its dropdown into the same HWND's client area rather than a
-  # separate child window, so even once #1232 lands, nothing registers a
-  # `MenuItem`-role UIA element for the drawn dropdown's own content.
-  # Expected RED on today's develop for both reasons; do not close this
-  # issue's "File opens its dropdown" acceptance item on #1232 landing
-  # alone — the UIA gap needs its own fix first.
+  # quadraui#1232 landed and the click itself now lands (vimcode#1656's
+  # real-hardware re-run confirmed: the dropdown genuinely opens and
+  # paints "New Tab" — see `/tmp/vimcode-filemenu.png` in that issue's
+  # evidence). What's still blocked is the separate, lower-level gap
+  # docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/NSAccessibility/AT-SPI
+  # provider wiring..." entry describes: vimcode paints its dropdown into
+  # the same HWND's client area rather than a separate child window, so
+  # nothing registers a `MenuItem`-role UIA element for the drawn
+  # dropdown's own content regardless of the click landing. The
+  # `expect_a11y_within` step below is therefore still expected RED, but
+  # for that UIA-wiring reason alone now, not for #1232's reason too.
   # `role:` here is UIA's `LocalizedControlType` string for a menu item,
   # which (per Microsoft's own default English localization) is the
   # two-word, lowercase "menu item", NOT "MenuItem" — `_find_a11y_match`
@@ -247,11 +302,17 @@ steps:
   # vimcode PR cannot itself open one (vimcode workers don't file issues in
   # other repos).
 
-  # quadraui#1232 again — the close button's click is swallowed the same
-  # way the menu row's is.
+  # NOT quadraui#1232 any more (that fixed the menu row's equivalent
+  # click) — this is the follow-up bug vimcode#1656 found and
+  # `docs/PENDING_QUADRAUI_ISSUES.md` drafts: `WinBackend::
+  # register_status_bar_segment_zones` registers the close button's
+  # *bar-local* bounds as if they were absolute, so the real click still
+  # lands as HTCAPTION. Same remeasured real centre as
+  # `hit-test-close-button-1232` above (994, not this header's original
+  # 978 estimate).
   - type: click
     id: click-close-button-1232
-    x: 978
+    x: 994
     y: 16
   - type: expect_closed
     id: close-button-actually-closes-window-1232
