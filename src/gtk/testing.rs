@@ -11870,6 +11870,120 @@ mod command_center {
              CommandCenter source while the drawn menu row is hidden"
         );
     }
+
+    /// #1657: `tests/smoke-spec/win-gui.yaml`'s hit-test pixel coordinates
+    /// were derived from a naive "7 menu items evenly spaced, caption
+    /// buttons flush right, with a big empty band in between" model that
+    /// never accounted for the Command Center (back/forward nav arrows +
+    /// search box, #676/#939) now painting between the menu row and the
+    /// caption buttons on a `window_chrome` backend. `WinBackend` and
+    /// `GtkBackend` both declare `BackendCaps::window_chrome` and run
+    /// through the *exact same* platform-neutral title-band composition
+    /// (`App::render_content`'s `presence.command_center` block,
+    /// `render::measure_title_bar_bands`, `render::
+    /// paint_command_center_rung`) — so this `GtkDriver` paint at the
+    /// smoke-spec's own `1024x768` window size is a faithful, headlessly
+    /// runnable stand-in for what a real Win32 `WM_NCHITTEST` round trip
+    /// sees, with only glyph metrics differing (Pango here vs DirectWrite
+    /// on real Win-GUI) — the Tier-1 shared conformance scenario #1657's
+    /// acceptance bar asks for, so a future title-band layout change
+    /// invalidates the smoke-spec's assumptions the same day a `cargo
+    /// test` run would catch it, not only at the next real-hardware
+    /// bugbash pass.
+    ///
+    /// Three assertions, matching the issue's own three findings exactly:
+    ///
+    /// 1. The stale `x=24` assumption for the File menu item lands in
+    ///    blank menu-row padding, left of the real label.
+    /// 2. The stale `x=886/932/978` assumptions for the three caption
+    ///    buttons all miss their real painted centres by a wide margin.
+    /// 3. The stale `x=620` "empty band, must stay HTCAPTION" assumption
+    ///    now lands *inside* the Command Center's search box — a real,
+    ///    registered `HTCLIENT` widget, not blank drag space.
+    ///
+    /// RED-verification: each of the three `assert!`s below was checked by
+    /// hand against this exact frame's real numbers (`File` bounds
+    /// `x=54..82`; caption-button centres `≈893.5/940/989.5`; search box
+    /// `x=517..797`) before this test was written — every one of the old
+    /// smoke-spec assumptions genuinely misses, confirming this is real
+    /// staleness and not a tautology that would pass against any layout.
+    #[test]
+    fn win_gui_smoke_spec_title_band_coordinates_are_stale_1657() {
+        let mut h = harness(engine_with_tab_history(), 1024, 768);
+        h.driver.render();
+
+        // Finding 1: File menu item.
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu label must paint");
+        assert!(
+            file.x > 24.0 + file.width,
+            "the smoke-spec's stale x=24 assumption must land in blank \
+             padding left of the real File label (got {file:?}) -- if \
+             this ever fires, the layout has moved again and the \
+             smoke-spec coordinates need re-deriving"
+        );
+
+        // Finding 2: the three caption buttons.
+        let controls_rect = h.title_bar_rect.get();
+        assert!(
+            controls_rect.width > 0.0,
+            "window controls must have painted a non-degenerate rect"
+        );
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let controls_bar = crate::render::window_controls_status_bar(&theme, false);
+        let status_layout = {
+            use quadraui::Backend as _;
+            h.driver
+                .backend()
+                .status_bar_layout(controls_rect, &controls_bar)
+        };
+        let button_center_x = |action: &str| -> f32 {
+            status_layout
+                .hit_regions
+                .iter()
+                .find_map(|(r, hit)| match hit {
+                    quadraui::StatusBarHit::Segment(id) if id.as_str() == action => {
+                        Some(controls_rect.x + r.x + r.width / 2.0)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{action} must have a registered hit region"))
+        };
+        for (stale_x, action, name) in [
+            (886.0_f32, crate::render::WINDOW_MINIMIZE_ACTION, "minimize"),
+            (932.0_f32, crate::render::WINDOW_MAXIMIZE_ACTION, "maximize"),
+            (978.0_f32, crate::render::WINDOW_CLOSE_ACTION, "close"),
+        ] {
+            let real_x = button_center_x(action);
+            assert!(
+                (stale_x - real_x).abs() > 5.0,
+                "the smoke-spec's stale x={stale_x} assumption for the \
+                 {name} button must miss its real painted centre \
+                 ({real_x}) by a meaningful margin"
+            );
+        }
+
+        // Finding 3: the "empty band" at x=620 is no longer empty.
+        let cc = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint on a window_chrome backend");
+        let search = cc
+            .search_bounds
+            .expect("the search box must have a painted bounds");
+        assert!(
+            search.x <= 620.0 && 620.0 < search.x + search.width,
+            "x=620 must now land inside the real search box ({search:?}) \
+             -- the same shift the issue reports from a real Win-GUI \
+             PrintWindow capture; the smoke-spec's old \"must stay \
+             HTCAPTION\" expectation at this x is therefore itself stale"
+        );
+    }
 }
 
 /// #699 Tier 2a (#701): the default theme's line-number and breadcrumb
