@@ -6491,6 +6491,140 @@ mod tests {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1650 — idle stability with the Explorer sidebar open
+    // ─────────────────────────────────────────────────────────────────────────
+    /// #1650: the sidebar-open sibling of [`idle_stability_1583`]. That
+    /// module's fixture has no sidebar, so it never crossed
+    /// `render::run_shared_tick_chores`'s *other* periodic timer: the 2-second
+    /// source-control auto-refresh, gated only on
+    /// `engine.app_shell.sidebar_visible()` — true in the default startup
+    /// state. Before this fix that block set `needs_redraw = true`
+    /// unconditionally on every kickoff, *and* `Engine::poll_sc_refresh`
+    /// reported "changed" unconditionally on every snapshot arrival, so an
+    /// idle `vcd` forced a real `ratatui::Terminal::draw` every ~2 seconds
+    /// forever — and `ratatui-crossterm`'s `CrosstermBackend::draw`/
+    /// `hide_cursor` emit an SGR-reset + cursor-hide escape burst on every
+    /// `draw` even for a zero-cell diff, which is the non-silent idle byte
+    /// stream `tests/smoke-spec/tui.yaml`'s `idle-truly-silent` step caught.
+    ///
+    /// Driver-tier, not state-tier: the assertions below read the
+    /// `Reaction` the driver's own tick returns (the signal the runner's
+    /// `needs_redraw` gate turns into a real `draw` call, i.e. into the
+    /// escape burst) plus the painted screen text, exactly the two signals
+    /// [`idle_stability_1583`] asserts on. Neither is "an engine field got
+    /// populated".
+    ///
+    /// RED-verified against unfixed `develop`: with *either* half of the fix
+    /// reverted — `needs_redraw = true` restored in
+    /// `render::run_shared_tick_chores`'s sidebar block, or
+    /// `Engine::poll_sc_refresh`'s `changed` computation replaced by a bare
+    /// `true` — [`idle_ticks_with_explorer_sidebar_open_do_not_repaint`]
+    /// fails with `an idle tick must not force a repaint` entries for the
+    /// ticks that land on the 2-second boundary. Both were reverted, observed
+    /// red, and restored before committing.
+    mod idle_stability_1650 {
+        use super::*;
+        use quadraui::Reaction;
+
+        /// Explorer sidebar open on a scratch directory containing one
+        /// marker file.
+        ///
+        /// Primes the source-control cache *synchronously*
+        /// (`Engine::sc_refresh`) before the harness is built, so the
+        /// snapshots the periodic `sc_refresh_async` delivers during the
+        /// observation window are identical to what is already cached from
+        /// the very first arrival — without this, the first arrival would
+        /// legitimately differ from an empty cache (and legitimately
+        /// repaint), and whether it did would depend on whether the
+        /// machine's temp dir happens to sit inside a git repo.
+        fn engine_with_explorer_sidebar_open(tag: &str) -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vimcode_test_1650_{tag}_{}_{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("marker.txt"), "hello").unwrap();
+
+            let mut engine = plain_engine();
+            engine.cwd = dir.clone();
+            engine.explorer_expanded.insert(dir.clone());
+            engine.explorer_rebuild_rows();
+            engine.session.explorer_visible = true;
+            // #1427: `session.explorer_visible` alone leaves the shadow
+            // `engine.app_shell`'s `sidebar_visible()` stale, and
+            // `render::sync_runner_sidebar_visibility` would then collapse
+            // the sidebar on the first dispatch — which would silently turn
+            // this test into a no-sidebar rerun of `idle_stability_1583`.
+            // The painted-sidebar precondition below is what keeps that
+            // honest.
+            engine.app_shell.show_panel(&quadraui::WidgetId::new(
+                crate::core::engine::sidebar::PANEL_EXPLORER,
+            ));
+            engine.sc_refresh();
+            engine
+        }
+
+        #[test]
+        fn idle_ticks_with_explorer_sidebar_open_do_not_repaint() {
+            let mut h = engine_with_explorer_sidebar_open("idle");
+            h.settings.lsp_enabled = false;
+            let mut h = harness(h);
+            let driver = &mut h.driver;
+
+            // Settle past the startup paint before asserting stability —
+            // same contract as `idle_stability_1583`'s own settle frame.
+            for _ in 0..3 {
+                driver.tick();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            let screen0 = driver.screen();
+            assert!(
+                driver.screen_contains("marker"),
+                "precondition: the Explorer sidebar must actually be painted, \
+                 otherwise this test silently degrades into a no-sidebar rerun \
+                 of `idle_stability_1583` and can never see #1650's 2s \
+                 source-control tick at all; screen:\n{screen0}"
+            );
+
+            // Observe across several 2-second `run_shared_tick_chores`
+            // source-control auto-refresh boundaries (#1650's own issue text
+            // asks for a ≥10s idle window on the real-pty side; 5.4s here is
+            // enough for two full kickoff→arrival→poll cycles, which is what
+            // the in-process decision needs to be exercised more than once).
+            let mut failures: Vec<String> = Vec::new();
+            for n in 0..18 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let reaction = driver.tick();
+                let screen_n = driver.screen();
+
+                if reaction != Reaction::Continue {
+                    failures.push(format!(
+                        "tick {n}: an idle tick must not force a repaint with the \
+                         Explorer sidebar open and nothing on disk changed (#1650: \
+                         `run_shared_tick_chores`'s 2s source-control refresh used \
+                         to set needs_redraw unconditionally, and \
+                         `Engine::poll_sc_refresh` used to report changed \
+                         unconditionally) — got {reaction:?}"
+                    ));
+                }
+                if screen_n != screen0 {
+                    failures.push(format!(
+                        "tick {n}: rendered text must not change with no input"
+                    ));
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "idle-stability violated:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
     /// #1397/#1577: the recommended-extension install offer, TUI half of
     /// the black-box coverage — GTK's twin is
     /// `crate::gtk::testing::issue_1577_ext_install_offer_toast`, which its
