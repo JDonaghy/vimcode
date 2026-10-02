@@ -1,0 +1,9 @@
+name = "rest-client"
+display_name = "REST Client"
+description = "Postman-like HTTP request builder and response viewer (#147)"
+version = "0.1.0"
+
+# Pure-Lua extension: no LSP/DAP server, no filetype activation. The whole
+# surface is `vimcode.ui.register_view` panels opened via the `:RestClient*`
+# commands below.
+scripts = ["rest_client.lua"]

@@ -145,6 +145,14 @@ pub mod plugin_panel;
 #[cfg(test)]
 pub mod plugin_view;
 
+/// #147: driver-tier black-box tests for the bundled
+/// `contrib/extensions/rest-client` extension — loads the real on-disk
+/// Lua (not a synthetic fixture) via the same `PluginManager` harvest
+/// [`plugin_view`] uses. See that module's own doc for why `#[cfg(test)]`
+/// is the right (narrower) gate here too.
+#[cfg(test)]
+pub mod rest_client;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
