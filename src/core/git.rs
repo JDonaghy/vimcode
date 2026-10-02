@@ -182,7 +182,7 @@ pub fn classify_xy(x: char, y: char) -> XyStatus {
 }
 
 /// Status of a single file from `git status --porcelain`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FileStatus {
     pub path: String,
     /// Status in the index (staged area). `None` = unmodified in index.
@@ -207,7 +207,7 @@ impl FileStatus {
 // ─── Source Control: worktrees ────────────────────────────────────────────────
 
 /// A single entry from `git worktree list --porcelain`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
     /// Branch name, or `None` if detached HEAD.
@@ -1946,7 +1946,7 @@ pub fn worktree_remove(dir: &Path, path: &str) -> Result<(), String> {
 }
 
 /// A single entry from `git log --oneline`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GitLogEntry {
     /// Short (abbreviated) commit hash.
     pub hash: String,
