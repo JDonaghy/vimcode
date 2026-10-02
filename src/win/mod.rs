@@ -869,4 +869,52 @@ mod win_driver_tests {
             h.driver.painted_texts()
         );
     }
+
+    // ── #1657: smoke-spec coordinate staleness, Win-GUI mirror ──────────
+    //
+    // `src/gtk/testing.rs`'s `win_gui_smoke_spec_title_band_coordinates_are_
+    // stale_1657` is the executable half of this Tier-1 conformance pair
+    // (GTK actually runs headlessly on any Linux dev box); this is the
+    // Win-GUI mirror, narrower in scope because `ConformanceHarness` (used
+    // here, unlike `crate::gtk::testing::Harness`) does not clone `App::
+    // title_bar_rect`, so the caption-button half of that test has no
+    // equivalent here. The two findings this CAN check —  the File menu
+    // item's real left edge, and the Command Center search box now
+    // covering the smoke-spec's old "empty band" x=620 — are both reached
+    // through `WinDriver::find_bounds` and `engine.command_center_layout`,
+    // exactly like the GTK twin. Only type-checked on this Linux worktree
+    // (`#[cfg_attr(target_os = "windows", test)]`, same as every other test
+    // in this module) — see the module-top `#1558` doc section for why it
+    // cannot yet be *executed*, on this host or on dell64.
+    #[cfg_attr(target_os = "windows", test)]
+    fn win_gui_smoke_spec_title_band_coordinates_are_stale_1657() {
+        let h = conformance_harness(plain_engine(), 1024, 768);
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu label must paint");
+        assert!(
+            file.x > 24.0 + file.width,
+            "the smoke-spec's stale x=24 assumption must land in blank \
+             padding left of the real File label (got {file:?})"
+        );
+
+        let cc = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint on a window_chrome backend");
+        let search = cc
+            .search_bounds
+            .expect("the search box must have a painted bounds");
+        assert!(
+            search.x <= 620.0 && 620.0 < search.x + search.width,
+            "x=620 must now land inside the real search box ({search:?}) \
+             -- the smoke-spec's old \"must stay HTCAPTION\" expectation \
+             at this x is therefore itself stale"
+        );
+    }
 }

@@ -138,6 +138,68 @@
 # new, additional step below; per #3509/#3487 this file is additive-only,
 # so nothing that already existed in this file on `develop` is deleted,
 # renamed, or loosened by vimcode#1656.
+#
+# ── #1657: the "evenly spaced, big empty band" model above was wrong ───
+#
+# The derivation two sections up never accounted for the Command Center
+# (back/forward nav arrows + search box, #676/#939) — it paints between
+# the menu row and the caption buttons on any `window_chrome` backend
+# (Win-GUI included, now that quadraui#1228/#1232 are both in the pin) and
+# was not live when this file's coordinates were first measured. A
+# bugbash lane re-running this file's own `expect_hit` steps at today's
+# pin (`fc94f2136bf66139be4da04ce5f16d78736b55cf`) found 6 of 7 menu items
+# and all 3 caption buttons FAIL, and a PrintWindow re-capture
+# (`/tmp/crop-zoom-left.png`, `/tmp/crop-zoom-mid.png`) found:
+#
+#   - the File label's real left edge sits at x≈55-88, not x=24 — the old
+#     value lands in blank menu-row padding to its left;
+#   - the three caption-button glyphs are centered ≈x=914/954/994, not
+#     x=886/932/978;
+#   - x=620 (the old "empty band, must stay HTCAPTION" assumption) now
+#     falls *inside* the Command Center's search box, a real `HTCLIENT`
+#     widget — not a bug, just a stale assumption about what's empty.
+#
+# Fixed here by: (a) re-deriving the 7 menu-row x positions from the real
+# shared title-band layout code (see below), (b) taking the caption-button
+# centers directly from the real-hardware remeasurement above, and (c)
+# flipping the old "empty band" step's expectation to `HTCLIENT` and
+# re-aiming it at the search box it now actually hits, since every pixel
+# in the Command Center's logical span that isn't blank padding around
+# the arrows/search box resolves to a real widget now
+# (`quadraui::CommandCenterLayout::hit_regions`,
+# `CommandCenterHit::Bar | Outside => continue` in `win::backend` — only
+# `Back`/`Forward`/`SearchBox` register as `HTCLIENT`).
+#
+# The 7 menu-item x positions below are NOT independently re-measured on
+# real Windows hardware beyond File (only File's real span was reported)
+# — they are re-derived from `src/gtk/testing.rs`'s
+# `win_gui_smoke_spec_title_band_coordinates_are_stale_1657` /
+# `src/win/mod.rs::win_driver_tests::
+# win_gui_smoke_spec_title_band_coordinates_are_stale_1657`, the Tier-1
+# shared conformance pair this fix added: both backends declare
+# `BackendCaps::window_chrome` and run the identical platform-neutral
+# title-band composition (`App::render_content`'s `presence.
+# command_center` block, `render::measure_title_bar_bands`), so the GTK
+# arm's real painted centers (File 68, Edit 114, View 165, Go 211, Run
+# 253, Terminal 319, Help 388, at this file's own 1024x768) are a faithful
+# *shape* for the real layout, even though glyph metrics (Pango vs
+# DirectWrite) mean the exact pixel values can still drift slightly on
+# real Win-GUI. A future bugbash pass should re-confirm these 6 against a
+# real PrintWindow capture the same way File and the caption buttons were
+# confirmed here, and tighten this comment once it has.
+#
+# UNRESOLVED: the bugbash report's own reproduction notes that even after
+# correcting the caption-button x values to 914/954/994, all three still
+# reported FAIL (still `HTCAPTION`, not `HTCLIENT`) on real hardware —
+# unlike the 6 corrected menu items, which all flipped to PASS. That is
+# *not* explained by stale coordinates alone and could not be
+# independently reproduced or ruled out from this fix's Linux worktree (no
+# attached Windows host here). Left as an open, UNVERIFIED finding rather
+# than silently fixed — do not read the corrected 914/954/994 values below
+# as a confirmed-working fix for the caption buttons specifically; treat
+# them as the best current coordinates pending a real-hardware re-run that
+# either confirms the flip to PASS or isolates a second, distinct
+# quadraui-level hit-test registration gap worth its own issue.
 name: vimcode-win-gui
 mode: window
 width: 1024
@@ -163,54 +225,70 @@ steps:
   # steps right below remain RED, now gated on the vimcode#1656 follow-up
   # bug (`docs/PENDING_QUADRAUI_ISSUES.md`) rather than on quadraui#1232
   # (which landed).
+  #
+  # #1657: x values below are re-derived per this file's own "#1657"
+  # header section — File's x comes from the real-hardware PrintWindow
+  # remeasurement (real span ≈55-88), the other six from the Tier-1
+  # GTK/Win-GUI conformance pair's shared-layout-code painted centers
+  # (UNVERIFIED on real Windows hardware beyond File — see that section).
   - type: expect_hit
-    id: hit-test-file-menu-item-1232
-    x: 24
+    id: hit-test-file-menu-item-1657
+    x: 70
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-edit-menu-item-1232
-    x: 75
+    id: hit-test-edit-menu-item-1657
+    x: 114
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-view-menu-item-1232
-    x: 126
+    id: hit-test-view-menu-item-1657
+    x: 165
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-go-menu-item-1232
-    x: 177
+    id: hit-test-go-menu-item-1657
+    x: 211
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-run-menu-item-1232
-    x: 228
+    id: hit-test-run-menu-item-1657
+    x: 253
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-terminal-menu-item-1232
-    x: 279
+    id: hit-test-terminal-menu-item-1657
+    x: 319
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-help-menu-item-1232
-    x: 330
+    id: hit-test-help-menu-item-1657
+    x: 388
+    y: 16
+    ht: HTCLIENT
+  # #1657: x values come straight from the real-hardware PrintWindow
+  # remeasurement in this file's header (≈914/954/994, not the old
+  # 886/932/978). UNRESOLVED per that same section: the bugbash report's
+  # reproduction found these three still FAIL (still HTCAPTION) even at
+  # these corrected x values, unlike the 7 menu items above which all
+  # flipped to PASS — not re-confirmed or ruled out from this fix (no
+  # attached Windows host in this worktree). Do not read a future green
+  # run of only these three as proof the coordinates were the whole
+  # story; do not read a future red run as a coordinate regression
+  # without first re-checking against a real PrintWindow capture.
+  - type: expect_hit
+    id: hit-test-minimize-button-1657
+    x: 914
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-minimize-button-1232
-    x: 886
+    id: hit-test-maximize-button-1657
+    x: 954
     y: 16
     ht: HTCLIENT
   - type: expect_hit
-    id: hit-test-maximize-button-1232
-    x: 932
-    y: 16
-    ht: HTCLIENT
-  - type: expect_hit
-    id: hit-test-close-button-1232
-    x: 978
+    id: hit-test-close-button-1657
+    x: 994
     y: 16
     ht: HTCLIENT
 
@@ -229,13 +307,22 @@ steps:
     y: 16
     ht: HTCLIENT
 
-  # The empty band between the menu row and the caption buttons — no widget
-  # is painted there, so it must stay the window's drag handle.
+  # #1657: x=620 — the old "empty band, must stay HTCAPTION" assumption —
+  # now lands inside the Command Center's search box (confirmed both by a
+  # real-hardware PrintWindow capture and by the Tier-1 GTK conformance
+  # test's painted `search_bounds`), a real, clickable widget. Flipped
+  # from HTCAPTION to HTCLIENT rather than hunting for a new "empty" x:
+  # per `quadraui::CommandCenterLayout::hit_regions`, only the
+  # back/forward arrows and the search box register as HTCLIENT inside
+  # the Command Center's span — the thin blank padding around them (if
+  # any survives on real Win-GUI's own font metrics) is too fragile a
+  # target to pin a coordinate to without a dedicated real-hardware
+  # remeasurement, which this fix's Linux worktree cannot perform.
   - type: expect_hit
-    id: hit-test-empty-band-is-caption-1232
+    id: hit-test-search-box-is-client-1657
     x: 620
     y: 16
-    ht: HTCAPTION
+    ht: HTCLIENT
 
   # #1629/quadraui#1228 (already in the pin, confirmed by the rev check
   # above): Win-GUI switched back to the same *drawn* menu row GTK/TUI
@@ -271,9 +358,14 @@ steps:
   # `MenuItem`-role UIA element regardless of the click landing. This step
   # is therefore still expected RED, but for the UIA-wiring reason alone
   # now, not for #1232's reason too. Left unmodified below.
+  #
+  # #1657: x corrected from the stale 24 to 70 (see this file's header) —
+  # the stale value landed in blank menu-row padding left of the real
+  # File label, so this click never reached the drawn menu even setting
+  # #1232 aside.
   - type: click
-    id: click-file-menu-item-1232
-    x: 24
+    id: click-file-menu-item-1657
+    x: 70
     y: 16
   - type: expect_a11y_within
     id: file-dropdown-opens-1232
@@ -353,9 +445,14 @@ steps:
   # misclassified HTCAPTION strip as the remeasured 994 centre, so this one
   # step is already this issue's real-click acceptance coverage without
   # needing a duplicate.
+  #
+  # #1657: x corrected from the stale 978 to 994
+  # (see this file's header) — still UNRESOLVED whether the corrected x
+  # alone makes the close button's click land; re-confirm on real
+  # hardware before reading a future PASS here as proof it does.
   - type: click
-    id: click-close-button-1232
-    x: 978
+    id: click-close-button-1657
+    x: 994
     y: 16
   - type: expect_closed
     id: close-button-actually-closes-window-1232
