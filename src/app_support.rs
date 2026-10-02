@@ -197,9 +197,9 @@ pub(crate) type StatusSegmentMap =
 /// [`render::tui_editor_text_layout`]'s doc for the same fact stated on the
 /// TUI side). Building the full `RenderedWindow` paint uses would mean
 /// re-rendering the buffer's visible text on every mouse motion just to
-/// throw it away — this builds the cheap subset instead. Every other field
-/// below is a throwaway needed only to satisfy `Editor`'s exhaustive
-/// struct-literal contract (`quadraui/tests/downstream_struct_literals.rs`).
+/// throw it away — this builds the cheap subset instead. Every field not
+/// set below (`lines`, `cursor`, `is_active`, …) stays at `Editor::new`'s
+/// empty default (quadraui#1108's `new`/`with_*` constructor trio).
 fn scrollbar_probe_editor(engine: &Engine, window_id: core::WindowId) -> Option<quadraui::Editor> {
     let window = engine.windows.get(&window_id)?;
     let buffer_state = engine.buffer_manager.get(window.buffer_id)?;
@@ -231,32 +231,19 @@ fn scrollbar_probe_editor(engine: &Engine, window_id: core::WindowId) -> Option<
     let gutter_char_width =
         render::calculate_gutter_cols(line_number_mode, total_lines, 0.0, has_git, has_bp);
 
-    Some(quadraui::Editor {
-        id: quadraui::WidgetId::new("scrollbar_probe"),
-        rect: quadraui::Rect::new(0.0, 0.0, 0.0, 0.0),
-        lines: Vec::new(),
-        cursor: None,
-        extra_cursors: Vec::new(),
-        selection: None,
-        extra_selections: Vec::new(),
-        yank_highlight: None,
-        scroll_top: window.view.scroll_top,
-        scroll_left: window.view.scroll_left,
-        total_lines,
-        max_col: buffer_state.max_col,
-        gutter_char_width,
-        is_active: false,
-        show_active_bg: false,
-        has_git_diff: false,
-        has_breakpoints: false,
-        diagnostic_gutter: HashMap::new(),
-        code_action_lines: std::collections::HashSet::new(),
-        bracket_match_positions: Vec::new(),
-        active_indent_col: None,
-        tabstop: engine.settings.tabstop.max(1) as usize,
-        cursorline: false,
-        lightbulb_glyph: '\0',
-    })
+    Some(
+        quadraui::Editor::new(
+            quadraui::WidgetId::new("scrollbar_probe"),
+            quadraui::Rect::new(0.0, 0.0, 0.0, 0.0),
+        )
+        .with_scroll_top(window.view.scroll_top)
+        .with_scroll_left(window.view.scroll_left)
+        .with_total_lines(total_lines)
+        .with_max_col(buffer_state.max_col)
+        .with_gutter_char_width(gutter_char_width)
+        .with_tabstop(engine.settings.tabstop.max(1) as usize)
+        .with_lightbulb_glyph('\0'),
+    )
 }
 
 /// This window's [`quadraui::Editor`] + [`quadraui::EditorLayout`], laid

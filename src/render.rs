@@ -13,12 +13,11 @@
 // and the tab-bar hit struct plus a syntax-highlight span shape (quadraui#822/
 // #823) that this file used. #1490 migrated every `draw_status_bar` call site
 // to `draw_status_bar_interactive`; #1491 migrated every tab-bar paint/measure
-// call site off the now-removed deprecated struct onto `TabBarLayout`.
-// `draw_toolbar`/`draw_sidebar_panel`/the syntax-span shape are still
-// deprecated and still used here — migrating those to the `_interactive`
-// hover/pressed API and its `MinimapSpan`-shaped replacement is unrelated,
-// cross-backend follow-up work, silenced with a narrow `allow` at each
-// remaining call site instead of a file-level one.
+// call site off the now-removed deprecated struct onto `TabBarLayout`. #1652
+// (quadraui#1108/#1109) finished the set: `draw_toolbar`/`draw_sidebar_panel`
+// now call their `_interactive` twins directly, and `raw_syntax_spans` is
+// `Vec<quadraui::MinimapSpan>` — no `quadraui`-only `#[allow(deprecated)]`
+// remains in this file.
 //
 // `dead_code` dropped by #1489: the ~600 lines it was silently covering
 // (two whole dead data pipelines plus five dead helpers) are gone; any new
@@ -12273,65 +12272,60 @@ pub fn debug_toolbar(engine: &Engine) -> quadraui::Toolbar {
         }
     };
 
-    Toolbar {
-        id: WidgetId::new("debug:toolbar"),
-        bg: None,
-        focused_index: None,
-        buttons: vec![
-            // 0: Continue — enabled when session active and stopped
-            action(
-                0,
-                "Continue",
-                icons::DBG_CONTINUE.fallback,
-                Some("F5"),
-                session && stopped,
-            ),
-            // 1: Pause — enabled when session active and running (not stopped)
-            action(
-                1,
-                "Pause",
-                icons::DBG_PAUSE.fallback,
-                Some("F6"),
-                session && !stopped,
-            ),
-            // 2: Stop — enabled when session active
-            action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
-            // 3: Restart — enabled when session active
-            action(
-                3,
-                "Restart",
-                icons::DBG_RESTART.fallback,
-                Some("^⇧F5"),
-                session,
-            ),
-            // Separator between restart and step controls
-            ToolbarButton::Separator,
-            // 4: Step Over — enabled when session active and stopped
-            action(
-                4,
-                "Step Over",
-                icons::DBG_STEP_OVER.fallback,
-                Some("F10"),
-                session && stopped,
-            ),
-            // 5: Step Into — enabled when session active and stopped
-            action(
-                5,
-                "Step Into",
-                icons::DBG_RESTART.fallback,
-                Some("F11"),
-                session && stopped,
-            ),
-            // 6: Step Out — enabled when session active and stopped
-            action(
-                6,
-                "Step Out",
-                icons::DBG_STEP_OUT.fallback,
-                Some("⇧F11"),
-                session && stopped,
-            ),
-        ],
-    }
+    Toolbar::new(WidgetId::new("debug:toolbar")).with_buttons(vec![
+        // 0: Continue — enabled when session active and stopped
+        action(
+            0,
+            "Continue",
+            icons::DBG_CONTINUE.fallback,
+            Some("F5"),
+            session && stopped,
+        ),
+        // 1: Pause — enabled when session active and running (not stopped)
+        action(
+            1,
+            "Pause",
+            icons::DBG_PAUSE.fallback,
+            Some("F6"),
+            session && !stopped,
+        ),
+        // 2: Stop — enabled when session active
+        action(2, "Stop", icons::DBG_STOP.fallback, Some("⇧F5"), session),
+        // 3: Restart — enabled when session active
+        action(
+            3,
+            "Restart",
+            icons::DBG_RESTART.fallback,
+            Some("^⇧F5"),
+            session,
+        ),
+        // Separator between restart and step controls
+        ToolbarButton::Separator,
+        // 4: Step Over — enabled when session active and stopped
+        action(
+            4,
+            "Step Over",
+            icons::DBG_STEP_OVER.fallback,
+            Some("F10"),
+            session && stopped,
+        ),
+        // 5: Step Into — enabled when session active and stopped
+        action(
+            5,
+            "Step Into",
+            icons::DBG_RESTART.fallback,
+            Some("F11"),
+            session && stopped,
+        ),
+        // 6: Step Out — enabled when session active and stopped
+        action(
+            6,
+            "Step Out",
+            icons::DBG_STEP_OUT.fallback,
+            Some("⇧F11"),
+            session && stopped,
+        ),
+    ])
 }
 
 /// Draw the debug action-button toolbar through backend `b` and cache its
@@ -12348,11 +12342,8 @@ pub fn draw_debug_toolbar(b: &mut dyn quadraui::Backend, engine: &Engine, rect: 
     let pressed = engine
         .debug_button_pressed
         .and_then(Engine::debug_button_id);
-    // `draw_toolbar` (quadraui#819) is deprecated in favour of an
-    // `_interactive`-style hover/pressed API this call doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let layout = b.draw_toolbar(rect, &bar, hovered.as_ref(), pressed.as_ref());
+    let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
+    let layout = b.draw_toolbar_interactive(rect, &bar, &interaction);
     engine.debug_toolbar_layout.replace(Some(layout));
 }
 
@@ -13740,11 +13731,7 @@ pub struct RenderedMinimap {
     /// (rather than one `RenderedMinimap::raw_spans` living beside an
     /// eagerly-aggregated `syntax_spans`) so there is exactly one place
     /// aggregation ever happens, not two that could silently drift.
-    // `SyntaxSpan` (quadraui#822) is deprecated in favour of a
-    // `MinimapSpan`-shaped replacement this field doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    pub raw_syntax_spans: Vec<quadraui::SyntaxSpan>,
+    pub raw_syntax_spans: Vec<quadraui::MinimapSpan>,
     /// Backend-resolved layout from this frame's [`draw_minimap_strip`] paint
     /// of this strip, if any (#1253) — read back by [`minimap_click_line`]
     /// and [`minimap_press`] instead of each re-deriving its own
@@ -13858,7 +13845,7 @@ pub(crate) fn scroll_gutter_width(scrollbar_reserve: f64, char_width: f64) -> f6
 /// window/buffer has gone away. All sampling (`sample_blocks`) and colour
 /// reduction (`aggregate_spans`) is quadraui's — this function only maps
 /// vimcode's tree-sitter byte-offset highlights into quadraui's
-/// `SyntaxSpan` input type.
+/// `MinimapSpan` input type.
 ///
 /// `editor_visible_rows` is the *editor pane's* own visible row count —
 /// deliberately a separate parameter from `rect`/`line_height` (which size
@@ -14112,10 +14099,7 @@ pub fn build_minimap_data(
     if bounds.len() < 2 {
         return None;
     }
-    // `SyntaxSpan` (quadraui#822) is deprecated — unrelated to #1491's
-    // tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let mut raw_spans: Vec<quadraui::SyntaxSpan> = Vec::new();
+    let mut raw_spans: Vec<quadraui::MinimapSpan> = Vec::new();
     for r in 0..bounds.len() - 1 {
         let indices: Vec<usize> = quadraui::primitives::minimap::block_sample_indices(
             bounds[r],
@@ -14174,8 +14158,7 @@ pub fn build_minimap_data(
                     continue;
                 }
                 let c = theme.scope_color(scope);
-                #[allow(deprecated)] // `SyntaxSpan` (quadraui#822); see module doc
-                raw_spans.push(quadraui::SyntaxSpan {
+                raw_spans.push(quadraui::MinimapSpan {
                     line_idx: r,
                     start_col,
                     end_col,
@@ -18000,23 +17983,18 @@ pub fn sc_button_toolbar(sc: &SourceControlData) -> quadraui::Toolbar {
     };
 
     let commit_enabled = !sc.commit_message.trim().is_empty();
-    Toolbar {
-        id: WidgetId::new("sc:buttons"),
-        bg: None,
-        focused_index: None,
-        buttons: vec![
-            action(
-                0,
-                "Commit",
-                icons::GIT_COMMIT.s(),
-                Some("c"),
-                commit_enabled,
-            ),
-            action(1, "", icons::GIT_PUSH.s(), None, true),
-            action(2, "", icons::GIT_PULL.s(), None, true),
-            action(3, "", icons::GIT_SYNC.s(), None, true),
-        ],
-    }
+    Toolbar::new(WidgetId::new("sc:buttons")).with_buttons(vec![
+        action(
+            0,
+            "Commit",
+            icons::GIT_COMMIT.s(),
+            Some("c"),
+            commit_enabled,
+        ),
+        action(1, "", icons::GIT_PUSH.s(), None, true),
+        action(2, "", icons::GIT_PULL.s(), None, true),
+        action(3, "", icons::GIT_SYNC.s(), None, true),
+    ])
 }
 
 /// Build the SC `SidebarPanel` — a `quadraui::SidebarPanel` wrapping the
@@ -18046,11 +18024,8 @@ pub fn draw_sc_sidebar_panel(
     let panel = sc_sidebar_panel(sc);
     let hovered = sc.button_hovered.and_then(Engine::sc_button_id);
     let pressed = sc.button_focused.and_then(Engine::sc_button_id);
-    // `draw_sidebar_panel` (quadraui#819) is deprecated in favour of an
-    // `_interactive`-style hover/pressed API this call doesn't use yet —
-    // unrelated to #1491's tab-bar migration; see this file's module doc.
-    #[allow(deprecated)]
-    let layout = b.draw_sidebar_panel(rect, &panel, hovered.as_ref(), pressed.as_ref());
+    let interaction = quadraui::InteractionState::from_parts(hovered, pressed);
+    let layout = b.draw_sidebar_panel_interactive(rect, &panel, &interaction);
     engine.sc_panel_layout.replace(Some(layout));
 }
 
@@ -18342,22 +18317,18 @@ pub fn sc_commit_message_to_text_input(sc: &SourceControlData) -> quadraui::Text
         sc.commit_message.split('\n').map(str::to_string).collect()
     };
 
-    TextInput {
-        id: WidgetId::new("sc:commit_input"),
-        lines,
-        cursor_line,
-        cursor_col,
-        // Only shown while not actively editing an empty message — matches
-        // the pre-migration behaviour of hiding the prompt text as soon as
-        // the cursor is live in an empty input.
-        placeholder: if sc.commit_input_active {
-            None
-        } else {
-            Some("Message (press c)".to_string())
-        },
-        scroll_offset: 0,
-        scroll_col: 0,
-        has_focus: sc.commit_input_active,
+    let input = TextInput::new(WidgetId::new("sc:commit_input"))
+        .with_lines(lines)
+        .with_cursor_line(cursor_line)
+        .with_cursor_col(cursor_col)
+        .with_has_focus(sc.commit_input_active);
+    // Only shown while not actively editing an empty message — matches the
+    // pre-migration behaviour of hiding the prompt text as soon as the
+    // cursor is live in an empty input.
+    if sc.commit_input_active {
+        input
+    } else {
+        input.with_placeholder("Message (press c)")
     }
 }
 
@@ -26340,49 +26311,62 @@ pub fn tui_editor_text_layout(rw: &RenderedWindow) -> (quadraui::Editor, quadrau
 /// per-window status line is **not** included — the caller paints
 /// it after calling `draw_editor` (status-line lift was Session 241).
 pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
-    quadraui::Editor {
-        id: quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
-        rect: quadraui::Rect::new(
-            rw.rect.x as f32,
-            rw.rect.y as f32,
-            rw.rect.width as f32,
-            rw.rect.height as f32,
-        ),
-        lines: rw.lines.iter().map(to_q_editor_line).collect(),
-        cursor: rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
-            pos: to_q_cursor_pos(pos),
-            shape: to_q_cursor_shape(shape),
-        }),
-        extra_cursors: rw
-            .extra_cursors
+    let rect = quadraui::Rect::new(
+        rw.rect.x as f32,
+        rw.rect.y as f32,
+        rw.rect.width as f32,
+        rw.rect.height as f32,
+    );
+    let mut editor = quadraui::Editor::new(
+        quadraui::WidgetId::new(format!("editor:{}", rw.window_id.0)),
+        rect,
+    )
+    .with_lines(rw.lines.iter().map(to_q_editor_line).collect())
+    .with_extra_cursors(
+        rw.extra_cursors
             .iter()
             .copied()
             .map(to_q_cursor_pos)
             .collect(),
-        selection: rw.selection.as_ref().map(to_q_selection),
-        extra_selections: rw.extra_selections.iter().map(to_q_selection).collect(),
-        yank_highlight: rw.yank_highlight.as_ref().map(to_q_selection),
-        scroll_top: rw.scroll_top,
-        scroll_left: rw.scroll_left,
-        total_lines: rw.total_lines,
-        max_col: rw.max_col,
-        gutter_char_width: rw.gutter_char_width,
-        is_active: rw.is_active,
-        show_active_bg: rw.show_active_bg,
-        has_git_diff: rw.has_git_diff,
-        has_breakpoints: rw.has_breakpoints,
-        diagnostic_gutter: rw
-            .diagnostic_gutter
+    )
+    .with_extra_selections(rw.extra_selections.iter().map(to_q_selection).collect())
+    .with_scroll_top(rw.scroll_top)
+    .with_scroll_left(rw.scroll_left)
+    .with_total_lines(rw.total_lines)
+    .with_max_col(rw.max_col)
+    .with_gutter_char_width(rw.gutter_char_width)
+    .with_is_active(rw.is_active)
+    .with_show_active_bg(rw.show_active_bg)
+    .with_has_git_diff(rw.has_git_diff)
+    .with_has_breakpoints(rw.has_breakpoints)
+    .with_diagnostic_gutter(
+        rw.diagnostic_gutter
             .iter()
             .map(|(&l, &s)| (l, to_q_severity(s)))
             .collect(),
-        code_action_lines: rw.code_action_lines.iter().copied().collect(),
-        bracket_match_positions: rw.bracket_match_positions.clone(),
-        active_indent_col: rw.active_indent_col,
-        tabstop: rw.tabstop,
-        cursorline: rw.cursorline,
-        lightbulb_glyph: crate::icons::LIGHTBULB.c(),
+    )
+    .with_code_action_lines(rw.code_action_lines.iter().copied().collect())
+    .with_bracket_match_positions(rw.bracket_match_positions.clone())
+    .with_tabstop(rw.tabstop)
+    .with_cursorline(rw.cursorline)
+    .with_lightbulb_glyph(crate::icons::LIGHTBULB.c());
+
+    if let Some(cursor) = rw.cursor.map(|(pos, shape)| quadraui::EditorCursor {
+        pos: to_q_cursor_pos(pos),
+        shape: to_q_cursor_shape(shape),
+    }) {
+        editor = editor.with_cursor(cursor);
     }
+    if let Some(selection) = rw.selection.as_ref().map(to_q_selection) {
+        editor = editor.with_selection(selection);
+    }
+    if let Some(yank_highlight) = rw.yank_highlight.as_ref().map(to_q_selection) {
+        editor = editor.with_yank_highlight(yank_highlight);
+    }
+    if let Some(active_indent_col) = rw.active_indent_col {
+        editor = editor.with_active_indent_col(active_indent_col);
+    }
+    editor
 }
 
 fn to_q_editor_line(rl: &RenderedLine) -> quadraui::EditorLine {
