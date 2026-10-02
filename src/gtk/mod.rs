@@ -443,6 +443,104 @@ mod chrome_paint_tests {
         0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64
     }
 
+    /// The sentinel fill the headless surface is primed with before the bar
+    /// paints — a color no theme uses, so "is this pixel part of the painted
+    /// bar?" is answerable per-pixel.
+    const SENTINEL: (u8, u8, u8) = (255, 0, 255);
+
+    /// Paint `render::window_controls_status_bar(theme, false)` into a fresh
+    /// `W` × `ROW_H` headless surface, asking for a bar `LINE_H` tall, and
+    /// return `(pixel bytes, stride, StatusBarLayout)`.
+    ///
+    /// The surface is primed with [`SENTINEL`] first, so every byte the bar
+    /// did *not* touch is identifiable afterwards — which is what lets both
+    /// callers below distinguish "painted the theme background" from "never
+    /// painted at all".
+    fn paint_window_controls_bar(theme: &Theme) -> (Vec<u8>, usize, quadraui::StatusBarLayout) {
+        // Concurrent Pango/Cairo text work from two test threads segfaults
+        // inside FreeType — see `src/test_paint.rs`.
+        let _paint = crate::test_paint::PaintGuard::acquire();
+        let bar = render::window_controls_status_bar(theme, false);
+
+        let mut surface =
+            ImageSurface::create(Format::ARgb32, W, ROW_H).expect("create ImageSurface");
+        let layout = {
+            let cr = Context::new(&surface).expect("Context::new");
+            let (r, g, b) = SENTINEL;
+            cr.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+            cr.paint().ok();
+
+            let pango_layout = pangocairo::functions::create_layout(&cr);
+            // #1652: `quadraui::gtk::draw_status_bar` (the positional free
+            // function this used to call directly) is deprecated in favor
+            // of `Backend::draw_status_bar_interactive` — go through a real
+            // `GtkBackend` the same way `click.rs`'s own headless paint
+            // tests do, rather than reaching for the shim.
+            //
+            // The bar's painted height comes from `rect.height` at the
+            // pinned quadraui rev (quadraui#1179 changed
+            // `GtkBackend::status_bar_paint_scaled` from
+            // `self.current_line_height` to `rect.height` so a caller
+            // handing it a rect taller than the line height no longer gets
+            // an unpainted strip). `set_current_line_height` is still set
+            // alongside `set_current_theme` — matching `click.rs`'s own
+            // headless-paint sequence — so the backend's per-frame line
+            // height agrees with the rect and this paint lands at `LINE_H`
+            // under *either* sourcing. `paints_the_bar_at_the_requested_line_height`
+            // below asserts that, so a future quadraui rev that reverts to
+            // the backend field (defaulting to 16px in `GtkBackend::new`)
+            // fails loudly instead of silently shrinking the bar.
+            use quadraui::Backend as _;
+            let mut backend = super::backend::GtkBackend::new();
+            backend.set_current_theme(render::to_quadraui_theme(theme));
+            backend.set_current_line_height(LINE_H);
+            backend.enter_frame_scope(&cr, &pango_layout, |b| {
+                b.draw_status_bar_interactive(
+                    quadraui::Rect::new(0.0, 0.0, W as f32, LINE_H as f32),
+                    &bar,
+                    &quadraui::InteractionState::new(),
+                )
+            })
+        };
+        surface.flush();
+        let stride = surface.stride() as usize;
+        let data = surface.data().expect("surface data").to_vec();
+        (data, stride, layout)
+    }
+
+    /// #1652: the painted bar must be exactly `LINE_H` tall.
+    ///
+    /// The migration off the deprecated `quadraui::gtk::draw_status_bar` free
+    /// function (which took `line_height` as a positional argument) onto
+    /// `Backend::draw_status_bar_interactive` (which takes it inside the
+    /// `Rect`) moved *where* the line height is passed. This asserts the
+    /// painted result is unchanged by that move: rows `0..LINE_H` are filled
+    /// and rows `LINE_H..ROW_H` are still untouched [`SENTINEL`]. A bar
+    /// painted at `GtkBackend::new`'s 16px default instead of the requested
+    /// 20px fails here on both halves.
+    #[test]
+    fn paints_the_bar_at_the_requested_line_height() {
+        let theme = Theme::from_name(&Theme::available_names()[0]);
+        let (data, stride, _layout) = paint_window_controls_bar(&theme);
+
+        let row_is_all_sentinel = |y: i32| (0..W).all(|x| pixel(&data, stride, x, y) == SENTINEL);
+
+        for y in 0..LINE_H as i32 {
+            assert!(
+                !row_is_all_sentinel(y),
+                "row {y} of the bar's requested {LINE_H}px height was never painted — \
+                 the bar is shorter than the rect it was given"
+            );
+        }
+        for y in LINE_H as i32..ROW_H {
+            assert!(
+                row_is_all_sentinel(y),
+                "row {y} is below the bar's requested {LINE_H}px height but got painted — \
+                 the bar is taller than the rect it was given"
+            );
+        }
+    }
+
     /// Paint `render::window_controls_status_bar(theme, false)` into a fresh
     /// headless surface and return the max luminance delta, against the
     /// bar's own background fill, found **within each button's own
@@ -468,39 +566,7 @@ mod chrome_paint_tests {
     /// background" check would pass in both cases, so this measures the
     /// actual perceptual gap instead.
     fn per_segment_contrast_deltas(theme: &Theme) -> Vec<(String, f64)> {
-        // Concurrent Pango/Cairo text work from two test threads segfaults
-        // inside FreeType — see `src/test_paint.rs`.
-        let _paint = crate::test_paint::PaintGuard::acquire();
-        let bar = render::window_controls_status_bar(theme, false);
-
-        let mut surface =
-            ImageSurface::create(Format::ARgb32, W, ROW_H).expect("create ImageSurface");
-        let layout = {
-            let cr = Context::new(&surface).expect("Context::new");
-            // Fill with a color that can't be confused with any themed fg/bg.
-            cr.set_source_rgb(1.0, 0.0, 1.0);
-            cr.paint().ok();
-
-            let pango_layout = pangocairo::functions::create_layout(&cr);
-            // #1652: `quadraui::gtk::draw_status_bar` (the positional free
-            // function this used to call directly) is deprecated in favor
-            // of `Backend::draw_status_bar_interactive` — go through a real
-            // `GtkBackend` the same way `click.rs`'s own headless paint
-            // tests do, rather than reaching for the shim.
-            use quadraui::Backend as _;
-            let mut backend = super::backend::GtkBackend::new();
-            backend.set_current_theme(render::to_quadraui_theme(theme));
-            backend.enter_frame_scope(&cr, &pango_layout, |b| {
-                b.draw_status_bar_interactive(
-                    quadraui::Rect::new(0.0, 0.0, W as f32, LINE_H as f32),
-                    &bar,
-                    &quadraui::InteractionState::new(),
-                )
-            })
-        };
-        surface.flush();
-        let stride = surface.stride() as usize;
-        let data = surface.data().expect("surface data");
+        let (data, stride, layout) = paint_window_controls_bar(theme);
 
         let bg = {
             let c = theme.tab_bar_bg;
@@ -529,7 +595,7 @@ mod chrome_paint_tests {
                 for y in 0..ROW_H {
                     for x in x0.max(0)..x1.min(W) {
                         let px = pixel(&data, stride, x, y);
-                        if px == (255, 0, 255) {
+                        if px == SENTINEL {
                             continue; // untouched sentinel fill — not part of the bar.
                         }
                         max_delta = max_delta.max((luminance(px) - bg_lum).abs());
