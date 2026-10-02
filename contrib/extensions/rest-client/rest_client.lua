@@ -67,12 +67,16 @@ local headers_rows = {}
 local params_rows = {}
 local status_text = "idle"
 local response_pretty = ""
+local response_headers = {}
 
 -- ── Helpers ──────────────────────────────────────────────────────────────
 
 -- `{{name}}` substitution against `env_vars`. An unknown variable is left
 -- verbatim (rather than silently becoming empty) so a typo is visible in
--- the request that actually went out.
+-- the request that actually went out. Names are restricted to `[%w_]`
+-- (alphanumeric/underscore, matching the Environment view's `name=value`
+-- parser below) — a name with a dot or dash is left verbatim rather than
+-- substituted; this restriction isn't surfaced anywhere user-visible.
 local function substitute(s)
     return (s:gsub("{{%s*([%w_]+)%s*}}", function(name)
         return env_vars[name] or ("{{" .. name .. "}}")
@@ -113,7 +117,35 @@ local function pretty_json(body)
             return encoded
         end
     end
+    -- Not valid JSON (XML, plain text, empty body, ...): the MVP only
+    -- pretty-prints JSON, so show the raw body unmodified rather than
+    -- guessing at another format.
     return body or ""
+end
+
+-- Renders the combined Response-viewer text: status/timing/size, the
+-- response headers list, and the pretty-printed body. A `register_view`
+-- is either a field stack or a single list/tree/table/text_view body
+-- (never both, see the file-header comment), so "headers list" from the
+-- MVP scope is folded into the same `text_view` as the body rather than
+-- a sibling view.
+local function response_view_text()
+    local names = {}
+    for name in pairs(response_headers) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+    local header_lines = {}
+    for _, name in ipairs(names) do
+        header_lines[#header_lines + 1] = "  " .. name .. ": " .. tostring(response_headers[name])
+    end
+    local headers_block = #header_lines > 0 and table.concat(header_lines, "\n") or "  (none)"
+
+    if response_pretty == "" and #names == 0 then
+        return "(no response yet)"
+    end
+
+    return "Status: " .. status_text .. "\n\nHeaders:\n" .. headers_block .. "\n\nBody:\n" .. response_pretty
 end
 
 local function refresh_all()
@@ -145,10 +177,12 @@ local function do_send()
         if resp.error then
             status_text = "ERROR: " .. tostring(resp.error)
             response_pretty = ""
+            response_headers = {}
         else
             local size = #(resp.body or "")
             status_text = string.format("%d · %dms · %dB", resp.status, resp.elapsed_ms or 0, size)
             response_pretty = pretty_json(resp.body)
+            response_headers = resp.headers or {}
             table.insert(history, 1, {
                 method = current.method,
                 url = url,
@@ -304,7 +338,7 @@ vimcode.ui.register_view("rest_client_response", {
     render = function()
         return {
             kind = "text_view",
-            text = response_pretty ~= "" and response_pretty or "(no response yet)",
+            text = response_view_text(),
             filetype = "json",
         }
     end,
