@@ -129,6 +129,15 @@
 # behaviour") — do not mark them expected-green again until that entry is
 # filed and fixed upstream; re-run once the pin moves past the fix to
 # confirm the flip.
+#
+# The three "FAIL got=HTCAPTION want=HTCLIENT" steps named above
+# (`hit-test-minimize-button-1232`, `hit-test-maximize-button-1232`,
+# `hit-test-close-button-1232`) and `close-button-actually-closes-window-1232`
+# are left completely unmodified below (same ids, same x/y, same
+# `expect_*` shape) — this UPDATE block only adds new context above and a
+# new, additional step below; per #3509/#3487 this file is additive-only,
+# so nothing that already existed in this file on `develop` is deleted,
+# renamed, or loosened by vimcode#1656.
 name: vimcode-win-gui
 mode: window
 width: 1024
@@ -142,15 +151,18 @@ steps:
     id: startup-settle
     ms: 1500
 
+  # quadraui#1232 — before it lands, these are all misclassified HTCAPTION.
   # All 7 of vimcode's fixed File/Edit/View/Go/Run/Terminal/Help menu-row
   # items get their own step (not just the first/last), per #1646's own
-  # "each menu-row item" wording — confirmed GREEN at the current pin
-  # (vimcode#1656's real-hardware re-run, this file's header comment
-  # above). The three caption-button steps right below are NOT gated on
-  # quadraui#1232 any more (that landed) — they're gated on the follow-up
-  # bug vimcode#1656 found and `docs/PENDING_QUADRAUI_ISSUES.md` drafts
-  # (`register_status_bar_segment_zones` registering bar-local, not
-  # absolute, bounds), confirmed still RED at the current pin.
+  # "each menu-row item" wording — confirmed real-hardware-identical
+  # (all HTCAPTION today) in this file's header comment above.
+  #
+  # UPDATE (vimcode#1656): confirmed GREEN at the current pin — see this
+  # file's "UPDATE (vimcode#1656)" header comment above for the full
+  # real-hardware re-run. Left unmodified here; the three caption-button
+  # steps right below remain RED, now gated on the vimcode#1656 follow-up
+  # bug (`docs/PENDING_QUADRAUI_ISSUES.md`) rather than on quadraui#1232
+  # (which landed).
   - type: expect_hit
     id: hit-test-file-menu-item-1232
     x: 24
@@ -233,17 +245,15 @@ steps:
     id: no-native-win32-menu-1228
     items: ["File"]
 
-  # quadraui#1232 landed and the click itself now lands (vimcode#1656's
-  # real-hardware re-run confirmed: the dropdown genuinely opens and
-  # paints "New Tab" — see `/tmp/vimcode-filemenu.png` in that issue's
-  # evidence). What's still blocked is the separate, lower-level gap
-  # docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/NSAccessibility/AT-SPI
-  # provider wiring..." entry describes: vimcode paints its dropdown into
-  # the same HWND's client area rather than a separate child window, so
-  # nothing registers a `MenuItem`-role UIA element for the drawn
-  # dropdown's own content regardless of the click landing. The
-  # `expect_a11y_within` step below is therefore still expected RED, but
-  # for that UIA-wiring reason alone now, not for #1232's reason too.
+  # Blocked on quadraui#1232 (the click never lands) AND on the separate,
+  # lower-level gap docs/PENDING_QUADRAUI_ISSUES.md's "No UIA/
+  # NSAccessibility/AT-SPI provider wiring..." entry describes: vimcode
+  # paints its dropdown into the same HWND's client area rather than a
+  # separate child window, so even once #1232 lands, nothing registers a
+  # `MenuItem`-role UIA element for the drawn dropdown's own content.
+  # Expected RED on today's develop for both reasons; do not close this
+  # issue's "File opens its dropdown" acceptance item on #1232 landing
+  # alone — the UIA gap needs its own fix first.
   # `role:` here is UIA's `LocalizedControlType` string for a menu item,
   # which (per Microsoft's own default English localization) is the
   # two-word, lowercase "menu item", NOT "MenuItem" — `_find_a11y_match`
@@ -251,6 +261,16 @@ steps:
   # match against the real OS string, so getting this wrong silently turns
   # a real check into one that can never pass even once the underlying bug
   # is fixed. The real dell64 run must confirm this exact string.
+  #
+  # UPDATE (vimcode#1656): quadraui#1232 landed and the click itself now
+  # lands (real-hardware re-run confirmed: the dropdown genuinely opens and
+  # paints "New Tab" — see `/tmp/vimcode-filemenu.png` in that issue's
+  # evidence). What's still blocked is the separate, lower-level UIA-wiring
+  # gap described above — vimcode paints its dropdown into the same HWND's
+  # client area rather than a separate child window, so nothing registers a
+  # `MenuItem`-role UIA element regardless of the click landing. This step
+  # is therefore still expected RED, but for the UIA-wiring reason alone
+  # now, not for #1232's reason too. Left unmodified below.
   - type: click
     id: click-file-menu-item-1232
     x: 24
@@ -312,12 +332,27 @@ steps:
   # vimcode PR cannot itself open one (vimcode workers don't file issues in
   # other repos).
 
-  # NOT quadraui#1232 any more (that fixed the menu row's equivalent
-  # click) — this is the follow-up bug vimcode#1656 found and
-  # `docs/PENDING_QUADRAUI_ISSUES.md` drafts: `WinBackend::
+  # quadraui#1232 again — the close button's click is swallowed the same
+  # way the menu row's is.
+  #
+  # UPDATE (vimcode#1656): NOT quadraui#1232 any more (that fixed the menu
+  # row's equivalent click) — this is the follow-up bug vimcode#1656 found
+  # and `docs/PENDING_QUADRAUI_ISSUES.md` drafts: `WinBackend::
   # register_status_bar_segment_zones` registers the close button's
   # *bar-local* bounds as if they were absolute, so the real click still
-  # lands as HTCAPTION.
+  # lands as HTCAPTION. Left unmodified below — still this issue's real-
+  # click acceptance coverage. vimcode#1656 does NOT add a second
+  # click/expect_closed pair at the remeasured 994 centre: a hit-test is
+  # side-effect-free and safe to duplicate (see
+  # `hit-test-close-button-remeasured-1656` above), but a second real click
+  # is not — once this bug is fixed upstream and the click below genuinely
+  # closes the window, a second click step targeting an already-closed
+  # window would error the driver rather than cleanly pass or fail. The
+  # hit-test sweep in this file's header comment already confirms x=978
+  # (this existing step's own coordinate) sits inside the same
+  # misclassified HTCAPTION strip as the remeasured 994 centre, so this one
+  # step is already this issue's real-click acceptance coverage without
+  # needing a duplicate.
   - type: click
     id: click-close-button-1232
     x: 978
@@ -325,16 +360,3 @@ steps:
   - type: expect_closed
     id: close-button-actually-closes-window-1232
     timeout_ms: 5000
-
-  # vimcode#1656 does NOT add a second click/expect_closed pair at the
-  # remeasured 994 centre here: a hit-test is side-effect-free and safe to
-  # duplicate (see `hit-test-close-button-remeasured-1656` above), but a
-  # second real click is not — once this bug is fixed upstream and the
-  # first click above genuinely closes the window, a second click step
-  # targeting an already-closed window would error the driver rather than
-  # cleanly pass or fail. The hit-test sweep in this file's header comment
-  # already confirms x=978 (this existing step's own coordinate) sits
-  # inside the same misclassified HTCAPTION strip as the remeasured 994
-  # centre, so this one step is already this issue's real-click acceptance
-  # coverage without needing a duplicate.
-
