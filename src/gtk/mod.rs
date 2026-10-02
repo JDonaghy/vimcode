@@ -455,11 +455,12 @@ mod chrome_paint_tests {
     /// coverage in the resolved UI font) contributed zero pixels. Per-segment
     /// measurement is the only version of this check that can fail on a
     /// single invisible button rather than needing all three to break at
-    /// once. Segment x-ranges come from the `StatusBarLayout` `draw_status_bar`
-    /// returns — the same hit-region data the real click handler resolves
-    /// against (`render::window_controls_status_bar`'s doc comment) — rather
-    /// than hardcoded pixel columns, so a future layout change can't
-    /// silently desync the test from what's actually painted.
+    /// once. Segment x-ranges come from the `StatusBarLayout`
+    /// `Backend::draw_status_bar_interactive` returns — the same hit-region
+    /// data the real click handler resolves against
+    /// (`render::window_controls_status_bar`'s doc comment) — rather than
+    /// hardcoded pixel columns, so a future layout change can't silently
+    /// desync the test from what's actually painted.
     ///
     /// A glyph that paints but has near-zero contrast against its own
     /// background (e.g. white-on-near-white) is exactly as invisible to a
@@ -481,18 +482,21 @@ mod chrome_paint_tests {
             cr.paint().ok();
 
             let pango_layout = pangocairo::functions::create_layout(&cr);
-            quadraui::gtk::draw_status_bar(
-                &cr,
-                &pango_layout,
-                0.0,
-                0.0,
-                W as f64,
-                LINE_H,
-                &bar,
-                &render::to_quadraui_theme(theme),
-                None,
-                None,
-            )
+            // #1652: `quadraui::gtk::draw_status_bar` (the positional free
+            // function this used to call directly) is deprecated in favor
+            // of `Backend::draw_status_bar_interactive` — go through a real
+            // `GtkBackend` the same way `click.rs`'s own headless paint
+            // tests do, rather than reaching for the shim.
+            use quadraui::Backend as _;
+            let mut backend = super::backend::GtkBackend::new();
+            backend.set_current_theme(render::to_quadraui_theme(theme));
+            backend.enter_frame_scope(&cr, &pango_layout, |b| {
+                b.draw_status_bar_interactive(
+                    quadraui::Rect::new(0.0, 0.0, W as f32, LINE_H as f32),
+                    &bar,
+                    &quadraui::InteractionState::new(),
+                )
+            })
         };
         surface.flush();
         let stride = surface.stride() as usize;
