@@ -21,6 +21,19 @@ Usage:
     # vendored in this repo.
     python3 scripts/gen_icon_font.py --source SymbolsNerdFont-Regular.ttf
 
+    # Adding glyphs to the *existing* subset (the usual case -- a new
+    # Icon::new call needs one more codepoint). Pass the currently-bundled
+    # font, copied somewhere outside data/fonts/ first so --output doesn't
+    # overwrite it mid-run, as --legacy-source: it already carries the
+    # three codepoints upstream dropped (see _merge_legacy_glyphs), so this
+    # avoids hunting down a nerd-fonts v2.1.0 release just to keep them.
+    # Match the bundled font's source release (`name` ID 5 reports it --
+    # 3.5.1 as of #1693) and the pre-existing glyph outlines come out
+    # byte-identical, leaving the diff to just the added codepoints.
+    cp data/fonts/vimcode-icons.ttf /tmp/legacy-vimcode-icons.ttf
+    python3 scripts/gen_icon_font.py --source SymbolsNerdFont-Regular.ttf \
+        --legacy-source /tmp/legacy-vimcode-icons.ttf
+
     # Verify (used by hand, or CI) that the bundled subset covers every nerd
     # codepoint referenced in src/icons.rs -- no source font needed. This is
     # a convenience CLI; the actual CI gate is the Rust test
@@ -86,7 +99,13 @@ def nerd_codepoints() -> list[int]:
 # the same mis-parse is mirrored on the Rust side). Update this constant
 # whenever `src/icons.rs` gains or loses an `Icon::new` call whose nerd
 # literal is >= U+E000.
-EXPECTED_NERD_CODEPOINT_COUNT = 112
+#
+# 114 since #1693 added the Explorer view-actions toolbar: two *new* nerd
+# codepoints (U+F066 `fa-compress` for Collapse All, U+F141
+# `fa-ellipsis_h` for the "..." overflow menu); the row's other three
+# buttons reuse codepoints already referenced elsewhere in icons.rs
+# (U+F15B, U+F07B, U+F021), and this count is de-duplicated.
+EXPECTED_NERD_CODEPOINT_COUNT = 114
 
 
 def _self_check() -> None:
