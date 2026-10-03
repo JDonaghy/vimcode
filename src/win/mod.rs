@@ -1710,6 +1710,32 @@ mod win_driver_tests {
     // bugbash round to notice. Source-level only, per this module's own
     // top-of-file #1558 disclaimer — type-checked here,
     // `#[cfg_attr(target_os = "windows", test)]`, run only on dell64.
+    //
+    // **Review follow-up (fix iteration 1):** this session also ruled out
+    // a second, more concrete hypothesis a prior pass hadn't checked — a
+    // transient "first frame paints before DirectWrite metrics are ready"
+    // race that would make `gutter_w = gutter_char_width as f32 *
+    // cell_width` collapse to `0.0` even though `gutter_char_width`
+    // itself is correct, matching the report's "text flush against the
+    // pane edge" symptom exactly. Ruled out by source:
+    // `WinBackend::new()` seeds `current_char_width: 8.0` /
+    // `current_line_height: 16.0` directly (`quadraui/src/win/
+    // backend.rs:768-769` at this pin) — never `0.0` — so there is no
+    // startup window, transient or otherwise, where `char_width() ==
+    // 0.0` on this backend; `set_current_char_width`/
+    // `set_current_line_height` only ever *replace* that non-zero seed
+    // with a real measured value, never with a zero one. This closes
+    // off the only other plausible *code* path (beyond the
+    // already-ruled-out ones in the paragraph above) that could produce
+    // the reported symptom without a Windows host, and still leaves the
+    // dell64-capture-environment explanation (stale binary / stray
+    // `:set nonumber`) as the only standing hypothesis. No Windows (or
+    // Windows-interop) host was reachable from this session either — a
+    // hard ceiling for any session run from a non-`dell64` fleet
+    // machine, not a shortfall particular to this pass — so that
+    // hypothesis still needs a `dell64` session to confirm or falsify
+    // on real hardware before this issue can honestly be called
+    // resolved either way.
     #[cfg_attr(target_os = "windows", test)]
     fn line_number_gutter_paints_and_insets_text_by_default_1691() {
         let mut engine = plain_engine();
