@@ -2351,4 +2351,134 @@ mod win_driver_tests {
             (inactive_px.r, inactive_px.g, inactive_px.b),
         );
     }
+
+    // ── #1694: "no breadcrumb bar under the tab strip" on Win-GUI ─────────
+    //
+    // Root-cause reading (this crate plus the pinned quadraui rev
+    // `ca7fcc83afad01ec3422f79366566f3a263b22bf`) found **no** backend-
+    // specific code anywhere in the pipeline vimcode#1694's own "where to
+    // look" section names, and no divergence between GTK (already proven,
+    // `crate::gtk::testing`'s `breadcrumb_segment_click_opens_the_dropdown_
+    // and_selection_dispatches` / `breadcrumb_row_adds_a_fixed_22px_not_a_
+    // whole_line_height`) and Win-GUI:
+    //
+    // - `render::breadcrumbs_to_quadraui_status_bar` / `render::
+    //   build_screen_layout_with_breadcrumb_row` / `render::
+    //   paint_breadcrumb_bars` (the `EditorOp::Breadcrumbs` rung's whole
+    //   body, called from `render::paint_editor_band_rungs`) are plain,
+    //   backend-neutral functions — no `cfg`, no "am I GTK?" branch.
+    // - `render::tab_bar_height_px`'s own doc says "Used by GTK and
+    //   Win-GUI backends"; it is the one function that decides whether the
+    //   tab strip's reserved band grows by `BREADCRUMB_ROW_HEIGHT_PX`
+    //   (22px) when `engine.settings.breadcrumbs` is on, and it has no
+    //   backend branch either.
+    // - `crate::win::run` — the *real*, non-test entry point, not just this
+    //   test module — constructs `App::new_portable(.., UnitProfile::px())`
+    //   (`src/win/mod.rs:576`), byte-identical to GTK's own `UnitProfile::
+    //   px()` construction.
+    // - `quadraui::win::backend::WinBackend::draw_status_bar_interactive`
+    //   (`win/backend.rs:2832`) routes through the same shared
+    //   `primitives::status_bar::native_surface_paint::paint` every
+    //   backend's `StatusBar` (breadcrumbs included) paints through once a
+    //   surface is attached — the identical call that already paints this
+    //   repo's own per-window status line visibly on Win-GUI (the "status
+    //   bar" row in vimcode#1694's own evidence table — present, just
+    //   mis-coloured, a separate report).
+    // - `Settings::breadcrumbs` defaults `true`
+    //   (`core::settings::default_breadcrumbs`), so #1694's own suggested
+    //   "confirm it's enabled first" alternative doesn't apply either.
+    //
+    // No vimcode-side or quadraui-side defect was found to fix — this
+    // scenario ships the missing Tier-1 coverage #1694's own Acceptance
+    // section asks for ("assert a row carrying the breadcrumbs widget id
+    // is painted between the tab strip and the first buffer line"), not a
+    // confirmed fix. Per this module's own top-of-file #1558 disclaimer,
+    // `WinDriver` cannot be *executed* off real Windows (`HeadlessSurface::
+    // new` always `Err`s there), so this is a source-level RED expectation
+    // rather than an observed one: reading every call site named above is
+    // what makes this mechanically certain to fail if a future change
+    // dropped the `EditorOp::Breadcrumbs` rung, or the `settings.
+    // breadcrumbs` gate, for this backend specifically — not an executed
+    // RED/GREEN flip. dell64 (this repo's real-Windows host, #1558) needs
+    // to confirm the flip directly; that confirmation is still outstanding.
+    //
+    // Geometry: a second, untouched scratch tab (`new_tab(None)`, never
+    // given a `file_path`) stays `"[No Name]"` in the tab strip
+    // (`BufferState::display_name`'s scratch-buffer branch) — a label
+    // guaranteed not to collide with the active tab's breadcrumb path
+    // segments or buffer text below, so its painted y anchors "the tab
+    // strip" unambiguously. The active tab's buffer then gets a synthetic,
+    // nonexistent nested path (`build_breadcrumbs_for_group` only ever
+    // manipulates `BufferState::file_path` as a string — see its own body —
+    // never touches disk, so the path need not exist, exactly like `crate::
+    // gtk::testing`'s own `engine_with_breadcrumb_path` fixture) plus one
+    // inserted marker line, so `find` can locate the breadcrumb's own
+    // segment text, the tab strip's text and the first buffer line's text
+    // as three distinct, unambiguous painted runs.
+    fn engine_with_nested_breadcrumb_tab() -> crate::core::Engine {
+        let mut engine = plain_engine();
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        engine.cwd = cwd.clone();
+
+        // Tab 0: left as the default scratch buffer, never made active
+        // again — its only job is to keep painting "[No Name]" in the tab
+        // strip as an unambiguous anchor for that row's y.
+        engine.new_tab(None);
+
+        // Tab 1 (now active): synthetic nested path, no disk I/O (see doc
+        // above) — segments "srcmarker-1694" / "nestedmarker-1694" /
+        // "leafmarker-1694.rs" appear nowhere else on screen.
+        let buf = engine.active_buffer_id();
+        if let Some(state) = engine.buffer_manager.get_mut(buf) {
+            state.file_path = Some(
+                cwd.join("srcmarker-1694")
+                    .join("nestedmarker-1694")
+                    .join("leafmarker-1694.rs"),
+            );
+        }
+        engine.buffer_mut().insert(0, "zzzfirstline-1694\n");
+        engine
+    }
+
+    #[cfg_attr(target_os = "windows", test)]
+    fn breadcrumb_bar_paints_between_tab_strip_and_first_buffer_line_1694() {
+        let engine = engine_with_nested_breadcrumb_tab();
+        assert!(
+            engine.settings.breadcrumbs,
+            "fixture assumes breadcrumbs are on by default \
+             (core::settings::default_breadcrumbs) — if this ever fails, \
+             #1694 is a defaults bug, not a paint bug, per the issue's own \
+             \"confirm it's enabled first\" instruction"
+        );
+
+        let mut h = conformance_harness(engine, 1400, 900);
+        h.driver.render();
+
+        let (_, tab_y) = h.driver.find("No Name").expect(
+            "sanity check on the fixture itself: the untouched scratch \
+             tab must still paint its \"[No Name]\" label in the tab strip",
+        );
+        let (_, breadcrumb_y) = h.driver.find("srcmarker-1694").expect(
+            "the breadcrumb bar's \"srcmarker-1694\" path segment must \
+             paint — vimcode#1694 (\"no breadcrumb bar under the tab \
+             strip\")",
+        );
+        let (_, editor_y) = h.driver.find("zzzfirstline-1694").expect(
+            "sanity check on the fixture itself: the first buffer line \
+             must paint",
+        );
+
+        assert!(
+            tab_y < breadcrumb_y,
+            "the breadcrumb row must paint below the tab strip: \
+             tab_y={tab_y}, breadcrumb_y={breadcrumb_y}"
+        );
+        assert!(
+            breadcrumb_y < editor_y,
+            "the breadcrumb row must paint strictly above the first \
+             buffer line, not flush against it (i.e. its row's vertical \
+             space must actually be reserved): breadcrumb_y={breadcrumb_y}, \
+             editor_y={editor_y}"
+        );
+    }
 }
