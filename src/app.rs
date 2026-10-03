@@ -1151,22 +1151,44 @@ fn dedup_caret_shape(
 /// frame: vimcode#1668's "panel opens blank and stays blank; typing
 /// `echo hello-vimcode` + Enter produces no visible output at all" report.
 ///
-/// A pure, `Backend`-free decision function rather than a `Backend`-
-/// call-count driver test — see [`dedup_window_title`]'s doc for exactly
-/// why that shape doesn't work in this crate (`quadraui::Backend` is
-/// sealed, and `quadraui::testing::RecordingBackend`, the one
-/// externally-constructible implementor, doesn't record
-/// `request_frame_in` calls either). A `WinDriver`-based scenario
-/// couldn't prove this even on real Windows regardless:
-/// `WinBackend::attach_headless` (what `WinDriver::new` uses) never sets
-/// `self.hwnd`, so `request_frame_in` degrades to its documented
-/// "no window to nudge yet" no-op through that harness. This isolates
-/// the decision `tick_dispatch` makes before ever touching a `Backend` —
-/// fast, Linux-runnable, RED/GREEN unit-testable
-/// (`terminal_poll_rearm_tests`, below), independent of real Windows
-/// hardware. It cannot prove the downstream `SetTimer`/`WM_TIMER` chain
-/// actually re-fires `tick` on a real Windows message loop — only that
-/// `tick_dispatch` asks for it whenever it should.
+/// A pure, `Backend`-free decision function, mirroring
+/// [`dedup_window_title`]'s shape, so the decision itself (not just its
+/// call site) is directly unit-testable
+/// (`terminal_poll_rearm_tests`, below) — fast, Linux-runnable, no
+/// `Backend` of any kind required.
+///
+/// # Driver-tier coverage lives alongside the TUI port, not here
+///
+/// [`dedup_window_title`]'s doc explains why a `Backend`-call-count
+/// driver test is unreachable via `quadraui::testing::RecordingBackend`
+/// (a sealed trait, and that mock's `request_frame_in` is a documented
+/// no-op) — that reasoning still holds here, for that one mock. It does
+/// **not** hold for every in-process `Backend`, though: the real
+/// `quadraui::tui::TuiBackend` a `quadraui::tui::testing::TuiDriver`
+/// wraps *does* record every `request_frame_in` call
+/// (`TuiBackend::frame_requests`/`pending_frame_delay`, quadraui#832,
+/// built for exactly this "prove an app's scheduling decision, not just
+/// its painted output" need). `tick_dispatch`'s terminal-pane re-arm
+/// above is platform-neutral code — gated only on
+/// `Engine::terminal_panes`, never on which concrete `Backend` is
+/// plugged in — so driving it through `TuiDriver::tick()` exercises the
+/// exact same decision Win-GUI's `WM_TIMER` loop depends on. See
+/// `src/tui_main/app_on_tui_tests.rs`'s `terminal_poll_rearm_1668`
+/// module for that black-box coverage (RED-verified against this
+/// function always returning `None`).
+///
+/// What that TUI-side driver test still cannot reach is `WinBackend`
+/// itself: `WinBackend::attach_headless` (what `WinDriver::new` uses)
+/// never sets `self.hwnd`, so `request_frame_in` degrades to its
+/// documented "no window to nudge yet" no-op through that harness, and
+/// there is no Windows-native equivalent of `TuiDriver::tick()` to drive
+/// a real `WM_TIMER` cycle headlessly either (see
+/// `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry). Between the pure-
+/// function unit test, the `TuiDriver`-based driver test, and that
+/// documented gap, what remains unverified by anything in this repo is
+/// only the one link this fix cannot touch: whether a real Win32
+/// `SetTimer`/`WM_TIMER` cycle actually re-fires `tick` on real Windows
+/// hardware — `tick_dispatch` asking for it is now covered twice over.
 pub(crate) fn terminal_poll_rearm_delay(
     any_terminal_pane_open: bool,
 ) -> Option<std::time::Duration> {
@@ -1262,12 +1284,17 @@ mod window_title_dedup_tests {
 
 #[cfg(test)]
 mod terminal_poll_rearm_tests {
-    //! #1668: direct coverage for [`terminal_poll_rearm_delay`] — see its
-    //! own doc for why this pure function, rather than a `Backend`-call-
-    //! count driver test (not achievable against the sealed
-    //! `quadraui::Backend` trait, nor via `WinDriver`'s headless
-    //! `attach_headless`, which never sets `WinBackend::hwnd`), is this
-    //! fix's unit coverage.
+    //! #1668: isolated unit coverage for [`terminal_poll_rearm_delay`]'s
+    //! decision in a vacuum — zero `Backend` of any kind, so it is fast
+    //! and trivially RED/GREEN. This is *not* this fix's only coverage:
+    //! see [`terminal_poll_rearm_delay`]'s own doc for why a real
+    //! `Backend`-call-count driver test is unreachable for
+    //! `quadraui::testing::RecordingBackend`/`WinDriver` specifically but
+    //! *is* reachable via `quadraui::tui::testing::TuiDriver` — that
+    //! black-box half lives in
+    //! `src/tui_main/app_on_tui_tests.rs`'s `terminal_poll_rearm_1668`
+    //! module, driving the real, shared `App::tick_dispatch` and
+    //! asserting on `TuiBackend::frame_requests`/`pending_frame_delay`.
     //!
     //! RED-verified: reverting `terminal_poll_rearm_delay` to always
     //! return `None` (the pre-#1668 behaviour — nothing ever re-arms a

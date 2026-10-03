@@ -739,16 +739,24 @@ mod win_backend_conformance {
 // re-arm, mirroring the existing `ai_streaming` one right above it) — not
 // here, because there is no `WinBackend`/`win::*` decision to make: the
 // gap was "nobody asked to be woken again", not "WinBackend painted the
-// wrong thing". See `src/app.rs::terminal_poll_rearm_tests` for the
-// RED/GREEN-verified unit coverage (a pure, `Backend`-free function test,
-// the same shape `dedup_window_title`'s doc establishes as this crate's
-// accepted substitute for a `Backend`-call-count driver test — sealed
-// trait, no mock) and `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for
-// the follow-up testing-infrastructure ask this investigation surfaced:
-// `WinDriver` (unlike `TuiDriver`/`MacDriver`) has no `.tick()` at all, and
-// its `attach_headless` never sets `WinBackend::hwnd`, so even a
-// `WinDriver`-based scenario here could not have observed this class of
-// scheduling bug on real Windows either.
+// wrong thing". Two layers of coverage back this fix: `src/app.rs::
+// terminal_poll_rearm_tests` unit-tests the decision in isolation (a
+// pure, `Backend`-free function test), and `src/tui_main/
+// app_on_tui_tests.rs`'s `terminal_poll_rearm_1668` module drives the
+// real, shared `App::tick_dispatch` through `quadraui::tui::testing::
+// TuiDriver::tick()` and asserts on `TuiBackend::frame_requests`/
+// `pending_frame_delay` (quadraui#832's real `Backend`-call-count
+// instrumentation) — a genuine driver-tier, black-box test of the exact
+// platform-neutral decision Win-GUI's own `WM_TIMER` loop depends on,
+// both RED-verified against this function always returning `None`. See
+// `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the one thing neither
+// of those two can reach: `WinBackend` itself. `WinDriver` (unlike
+// `TuiDriver`/`MacDriver`) has no `.tick()` at all, and its
+// `attach_headless` never sets `WinBackend::hwnd`, so a `WinDriver`-based
+// scenario could not have observed whether a real Win32
+// `SetTimer`/`WM_TIMER` round-trip actually re-fires `tick` on a live
+// Windows message loop — only real hardware (or that quadraui-side fix)
+// can close that last link.
 #[cfg(all(test, feature = "win"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {

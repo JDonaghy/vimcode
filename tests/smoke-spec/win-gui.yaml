@@ -248,6 +248,50 @@
 # opens its dropdown" — confirming it on real Windows hardware (not just
 # GTK's faithful-but-not-identical stand-in) remains this issue's own
 # open acceptance item.
+#
+# ── #1668: no Tier-2 step added for the blank embedded-terminal panel ──
+#
+# vimcode#1668's own acceptance line asks for "a Tier-1 shared conformance
+# scenario or a Tier-2 smoke-spec step that fails first, covering this
+# exact behaviour". This file deliberately gets neither a terminal-open
+# nor a terminal-content step for it, for the same structural reason this
+# file's own "DELIBERATELY OMITTED" comment below already documents for
+# the minimap/extension-install seed checks: confirmed directly against
+# this machine's installed `coord` (`win_native_driver.py`'s own
+# `_REQUIRED_FIELDS`, `coord --version` 0.5.567, newer than the 0.5.551
+# the minimap comment below checked — same result), the full `mode:
+# window` step vocabulary is `launch`, `key`, `click`, `wait`, `capture`,
+# `expect_menu`, `expect_hit`, `expect_a11y`/`expect_a11y_within`,
+# `expect_closed`. None of these can observe "did the terminal panel
+# paint a shell prompt/echoed command" — that needs a pixel-sampling
+# primitive this driver doesn't have (the same `expect_capture_nonblank`-
+# shaped gap the minimap comment names), since vimcode's embedded
+# terminal paints its own glyphs into the client area with no AT-provider
+# wiring behind them (same gap `file-dropdown-opens-1232`/`-1657` above
+# are gated on — confirmed still RED, not actually passing, per this
+# file's own "UPDATE (vimcode#1656)" comment on that step). A step that
+# can never go red regardless of whether the bug is fixed is not coverage
+# (CLAUDE.md's "a test that cannot fail is not coverage", #553) — adding
+# one here would not satisfy this issue's acceptance bar, only appear to.
+#
+# This issue's real acceptance coverage is instead the Tier-1 option the
+# same acceptance line offers: `src/tui_main/app_on_tui_tests.rs`'s
+# `terminal_poll_rearm_1668` module drives the real, shared
+# `App::tick_dispatch` through `quadraui::tui::testing::TuiDriver::tick()`
+# and asserts on `TuiBackend::frame_requests`/`pending_frame_delay`
+# (quadraui#832's real `Backend::request_frame_in` call-count/deadline
+# instrumentation) — a genuine driver-tier, black-box test of the exact
+# platform-neutral scheduling decision Win-GUI's own `WM_TIMER` loop
+# depends on, RED-verified against the pre-fix behaviour. See that
+# module's own doc, and `terminal_poll_rearm_delay`'s doc in `src/app.rs`,
+# for the full reasoning including the one link it cannot reach:
+# `WinBackend` itself, tracked in `docs/PENDING_QUADRAUI_ISSUES.md`'s new
+# entry. A future bugbash pass with real Windows hardware access could
+# still add a best-effort `click`-into-Terminal-menu `wait` sequence here
+# once (a) `coord` grows a pixel-content primitive, or (b) vimcode/
+# quadraui ship real AT-provider wiring for drawn content — tracked the
+# same way as the minimap/extension-install gap below, not duplicated
+# here.
 name: vimcode-win-gui
 mode: window
 width: 1024
