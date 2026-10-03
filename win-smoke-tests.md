@@ -27,6 +27,45 @@ Run these after pulling `develop` and building with `cargo build --features win-
 - [ ] **Preview tabs** — Single-click in explorer opens dimmed preview tab. Double-click opens permanent tab.
 - [ ] **Terminal resize** — Drag the terminal panel header to resize. Height persists.
 
+## Open real-hardware questions (dell64) — #1691
+
+**[#1691](https://github.com/JDonaghy/vimcode/issues/1691) — Win-GUI editor paints no
+line-number gutter, although #1543 made `number` the default.** This issue is **open and
+unfixed**: the reported symptom (buffer text flush against the editor pane's left edge, no
+line numbers, no inset) has never been reproduced from source, and no production code change
+has been made for it. Do **not** treat it as resolved.
+
+What *is* now proven, by tests that execute on every host (`cargo test --no-default-features
+--features win --lib win_gutter_contract_1691`, in `src/win/mod.rs`):
+
+- `render::calculate_gutter_cols` + `render::build_rendered_window` give a default-settings
+  engine a multi-cell gutter whose first line carries the digit `1`.
+- `render::to_q_editor` + `quadraui::Editor::layout` — the exact pair
+  `quadraui::win::editor::draw_editor` calls — then inset `text_bounds.x` past it by exactly
+  that many cells, and hand back a non-empty `gutter_bounds`.
+
+Both were RED-verified by injecting the reported defect at the two sites the issue names. So
+if the bug reproduces on real hardware, the cause is **not** in either of those rungs.
+
+That leaves exactly two things to check on dell64, in this order:
+
+- [ ] **Confirm the live `number` option first.** In the reproducing session run `:set
+      number?` and `:verbose set number?`, and print `~/.config/vimcode/settings.json` (or
+      the Windows equivalent) looking for a `"line_numbers"` key. Also run `vimcode.exe
+      --version` and confirm the build postdates #1543. A stale binary or a persisted
+      `nonumber` override reproduces the report exactly — see
+      `nonumber_collapses_the_gutter_and_leaves_text_nearly_flush_control_1691`, which pins
+      that geometry (1-cell gutter, no digits) for comparison. **If this is the cause, #1691
+      is not a paint bug at all** and should be re-scoped.
+- [ ] **Only if `number` is confirmed on and the build is current:** run the gated pixel
+      probe `win_driver_tests::line_number_gutter_paints_and_insets_text_by_default_1691`
+      (`cargo xwin test --no-default-features --features win --lib`, recipe in
+      `src/win/mod.rs`'s #1558 section). A failure there localises the bug to
+      `quadraui::win::editor::draw_editor`'s Direct2D/DirectWrite draw calls — the one rung
+      no non-Windows host can execute — which is a **quadraui** gap to be drafted into
+      `docs/PENDING_QUADRAUI_ISSUES.md` and filed, per CLAUDE.md's Platform-Neutrality Rule.
+      Capture a screenshot of the editor pane either way.
+
 ## Known Gaps (Not Expected to Work Yet)
 
 - **Mouse handlers for new popups** — The 6 new renderers draw correctly but clicking/scrolling/dismissing them with the mouse won't work yet. Keyboard dismiss (Escape, `q`) should work where the engine handles it.

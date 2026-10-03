@@ -661,6 +661,258 @@ mod win_backend_conformance {
     }
 }
 
+// ── #1691: Win-GUI paints no line-number gutter, despite #1543 making
+// `number` the default ──────────────────────────────────────────────────
+//
+// vimcode#1691 reports buffer text starting flush against the editor pane's
+// own left edge on Win-GUI — no gutter column, no line numbers, no left
+// inset. The issue names two suspects: `render.rs`'s `gutter_char_width`
+// computation (vimcode-side) and `quadraui::win::editor::draw_editor`'s
+// `if editor.gutter_char_width > 0` gate (quadraui-side).
+//
+// The Win-GUI gutter is produced by exactly three pieces of code, and the
+// split between them decides what this repo can and cannot test:
+//
+// 1. **vimcode, backend-neutral** — `render::calculate_gutter_cols` /
+//    `render::build_rendered_window` decide `gutter_char_width` and each
+//    line's `gutter_text`, and `render::to_q_editor` packs them into the
+//    `quadraui::Editor` that `App::paint_editor_windows_rung` pushes as a
+//    `Surface::Editor` for *every* GUI backend alike (`src/app.rs`).
+// 2. **quadraui, backend-neutral** — `Editor::layout_with_options`
+//    (`quadraui/src/primitives/editor.rs`) turns that into the geometry the
+//    rasteriser paints with: `gutter_w = gutter_char_width * cell_width`,
+//    `gutter_bounds`, and `text_bounds.x = viewport.x + gutter_w`. This is
+//    the function `win::editor::draw_editor` itself calls, and it is plain
+//    arithmetic with no WinAPI in it.
+// 3. **quadraui, Win-only** — `win::editor::draw_editor`'s Direct2D/
+//    DirectWrite `draw_text` calls into an `ID2D1RenderTarget`.
+//
+// Rungs 1 and 2 are the ones the issue actually points at, and both are
+// reachable from an ordinary Linux/macOS host under `cargo test
+// --no-default-features --features win` — `WinBackend`'s metric getters are
+// plain fields, not WinAPI calls (see this module's own "Why `feature =
+// "win"` alone" doc and `win_backend_conformance` above). So the module
+// below **executes**, on any host, against the real production functions
+// and `WinBackend`'s own `char_width()`/`line_height()`, rather than being
+// type-checked-only like `win_driver_tests`. It is the same posture
+// `win_ctrl_key_translation_tests_1674` below takes for #1674: drive as far
+// up the real pipeline as a non-Windows host can reach, and say precisely
+// where the reachable part stops.
+//
+// **RED-verified** (CLAUDE.md "Testing (CRITICAL)" rule 2 — "a test that
+// cannot fail is not coverage"). Two separate bugs were injected into the
+// production source at the two sites #1691 itself names, each run and then
+// reverted:
+//
+// 1. `render::calculate_gutter_cols`' `LineNumberMode::Absolute` arm made
+//    to return `1 + git + bp` (i.e. collapse to `None`'s bare fold
+//    column). → `default_settings_reserve_a_line_number_gutter_and_inset_
+//    the_text_column_1691` **FAILED** ("must reserve more than the bare
+//    one-column fold indicator … got 1").
+// 2. `render::format_gutter_with_fold` made to return
+//    `" ".repeat(gutter_char_width)` (gutter reserved but blank — the "no
+//    line numbers" half of the report). → the same test **FAILED** ("must
+//    carry its own line number, not blank padding … got \"     \"").
+//
+// The control test stayed **green** through both injections, so it is a
+// genuine control and not a second copy of the positive assertion. Both
+// injections were reverted; `git diff` touches no file but this one.
+//
+// The control also pins the geometry #1691 *reports* (1-cell gutter, no
+// digits, text one cell from the pane edge) against a `:set nonumber`
+// engine, so a dell64 reproduction can be attributed to a stray `nonumber`
+// override by comparing against that exact shape.
+//
+// **What this does NOT cover, and why #1691 stays open.** Rung 3 — the
+// actual Direct2D draw calls — needs a live Windows host; so does the
+// hypothesis #1691's own "Reproduction" section names first (that the
+// dell64 capture's binary predates #1543, or that session carried a stray
+// `:set nonumber`/`settings.json` override), which is an *environment*
+// question no source read can settle. Rungs 1 and 2 are now proven correct
+// by executable tests on every host, which is new information: it means a
+// reproduction on real hardware can only be rung 3 or the environment, and
+// narrows what a dell64 session has to check. `win-smoke-tests.md`'s
+// "Open real-hardware questions (dell64)" section carries that checklist.
+// This module is therefore *not* a fix for #1691 and must not be read as
+// one.
+#[cfg(all(test, feature = "win"))]
+mod win_gutter_contract_1691 {
+    use crate::core::{Engine, WindowRect};
+    use crate::render;
+
+    /// A default-settings engine with a 20-line buffer, plus the geometry
+    /// inputs Win-GUI's own backend reports.
+    ///
+    /// Returns `(gutter_cells, first_line_gutter_text, pane_x, text_x,
+    /// gutter_bounds_is_some, cell_width)` — every value read from a
+    /// production function, none recomputed by the test.
+    fn probe_gutter(line_numbers: crate::core::settings::LineNumberMode) -> GutterProbe {
+        use quadraui::Backend as _;
+
+        let backend = super::backend::WinBackend::new();
+        let cell_width = backend.char_width() as f64;
+        let line_height = backend.line_height() as f64;
+        let scrollbar_reserve = backend.scrollbar_reserve() as f64;
+        assert!(
+            cell_width > 0.0 && line_height > 0.0,
+            "WinBackend must report real text metrics before any gutter \
+             arithmetic means anything (got cell_width={cell_width}, \
+             line_height={line_height})"
+        );
+
+        let mut engine = Engine::new_for_test();
+        // `Engine::new_for_test` is hermetic (`Settings::default()`, no
+        // ambient `settings.json` read), so this asserts #1543's shipped
+        // default rather than a value the test itself installed.
+        assert_eq!(
+            Engine::new_for_test().settings.line_numbers,
+            crate::core::settings::LineNumberMode::Absolute,
+            "#1543 made `LineNumberMode::Absolute` the untouched default; \
+             #1691's premise depends on it"
+        );
+        engine.settings.line_numbers = line_numbers;
+        engine.buffer_mut().insert(
+            0,
+            &(1..=20)
+                .map(|n| format!("vimcodeline{n:02}\n"))
+                .collect::<String>(),
+        );
+
+        let theme = render::Theme::vscode_dark();
+        let bounds = WindowRect::new(0.0, 0.0, 1400.0, 900.0);
+        let tab_bar_h = render::tab_row_height_px(line_height);
+        let (rects, _) = engine.calculate_group_window_rects(bounds, tab_bar_h);
+        let layout = render::build_screen_layout(
+            &engine,
+            &theme,
+            &rects,
+            line_height,
+            cell_width,
+            true,
+            scrollbar_reserve,
+            render::gtk_minimap_sizing(),
+        );
+        let rw = layout
+            .windows
+            .first()
+            .expect("a single-group layout must paint exactly one window");
+
+        // Rung 2: the *same* `Editor` + `Editor::layout` call
+        // `quadraui::win::editor::draw_editor` makes — no second copy of
+        // the arithmetic lives in this test.
+        let editor = render::to_q_editor(rw);
+        let el = editor.layout(editor.rect, cell_width as f32, line_height as f32);
+
+        GutterProbe {
+            gutter_cells: rw.gutter_char_width,
+            first_gutter_text: rw.lines[0].gutter_text.clone(),
+            pane_x: editor.rect.x,
+            text_x: el.text_bounds.x,
+            has_gutter_bounds: el.gutter_bounds.is_some(),
+            cell_width: cell_width as f32,
+        }
+    }
+
+    struct GutterProbe {
+        gutter_cells: usize,
+        first_gutter_text: String,
+        pane_x: f32,
+        text_x: f32,
+        has_gutter_bounds: bool,
+        cell_width: f32,
+    }
+
+    /// #1691's "Ask", for the two rungs a non-Windows host can execute: a
+    /// fresh, untouched-settings engine must reserve a real line-number
+    /// gutter, put the line's own number in it, and inset the text column
+    /// past it by exactly that many cells.
+    #[test]
+    fn default_settings_reserve_a_line_number_gutter_and_inset_the_text_column_1691() {
+        let p = probe_gutter(crate::core::settings::LineNumberMode::Absolute);
+
+        // A 20-line buffer: 2 digits + 2 padding + 1 fold column = 5 cells
+        // (`render::calculate_gutter_cols`). Asserted as `> 1` rather than
+        // `== 5` so a future padding change doesn't false-alarm, but `> 1`
+        // is the load-bearing claim: `LineNumberMode::None` is exactly 1.
+        assert!(
+            p.gutter_cells > 1,
+            "a default-settings engine must reserve more than the bare \
+             one-column fold indicator — #1543 made `number` the default, \
+             so this must never read back as `LineNumberMode::None`'s \
+             1-column gutter (got {})",
+            p.gutter_cells
+        );
+        assert_eq!(
+            p.first_gutter_text.trim(),
+            "1",
+            "the first buffer line's gutter must carry its own line \
+             number, not blank padding — #1691 reports no line numbers at \
+             all (got {:?})",
+            p.first_gutter_text
+        );
+        assert!(
+            p.has_gutter_bounds,
+            "`Editor::layout` must hand the rasteriser a non-empty \
+             `gutter_bounds` — this is the value \
+             `quadraui::win::editor::draw_editor`'s `gutter_char_width > 0` \
+             gate and its right-alignment arithmetic both derive from"
+        );
+        let expected_inset = p.gutter_cells as f32 * p.cell_width;
+        assert!(
+            (p.text_x - (p.pane_x + expected_inset)).abs() < 0.01,
+            "the text column must begin exactly where the {}-cell gutter \
+             ends (pane x={} + {expected_inset}px = {}); #1691 reports text \
+             flush against the pane's own left edge instead (got text_x={})",
+            p.gutter_cells,
+            p.pane_x,
+            p.pane_x + expected_inset,
+            p.text_x
+        );
+        assert!(
+            p.text_x > p.pane_x,
+            "sanity restatement of #1691's exact symptom: text must not be \
+             flush against the pane edge (pane x={}, text x={})",
+            p.pane_x,
+            p.text_x
+        );
+    }
+
+    /// The falsifiability control for the test above (CLAUDE.md rule 2).
+    ///
+    /// Drives the identical probe against a `:set nonumber` engine and
+    /// pins the geometry #1691 *reports*: a 1-cell gutter carrying only the
+    /// fold indicator, no digits. Every assertion in the positive test
+    /// above fails against this state, which is what makes them coverage
+    /// rather than tautology — and it pins the one `LineNumberMode` that
+    /// could legitimately produce the reported symptom, so a dell64
+    /// reproduction can be attributed to a stray `nonumber` override by
+    /// comparing against this exact shape.
+    #[test]
+    fn nonumber_collapses_the_gutter_and_leaves_text_nearly_flush_control_1691() {
+        let p = probe_gutter(crate::core::settings::LineNumberMode::None);
+
+        assert_eq!(
+            p.gutter_cells, 1,
+            "`nonumber` keeps only the 1-column fold indicator"
+        );
+        assert_eq!(
+            p.first_gutter_text.trim(),
+            "",
+            "`nonumber` must paint no digits in the gutter (got {:?})",
+            p.first_gutter_text
+        );
+        assert!(
+            (p.text_x - (p.pane_x + p.cell_width)).abs() < 0.01,
+            "`nonumber`'s text column sits one fold-indicator cell from the \
+             pane edge — visually indistinguishable from #1691's \"flush\" \
+             report (pane x={}, text x={}, cell={})",
+            p.pane_x,
+            p.text_x,
+            p.cell_width
+        );
+    }
+}
+
 // ── #1674: Ctrl-modified shortcuts (Ctrl+`, Ctrl+B) never dispatched on
 // Win-GUI ────────────────────────────────────────────────────────────────
 //
@@ -1691,51 +1943,36 @@ mod win_driver_tests {
     // layout_with_options` cited above reads byte-for-byte consistent
     // with that same contract.
     //
-    // **Could not reproduce from source at the pinned rev** — unlike
-    // #1657/#1661/#1667/#1674/#1676 immediately above, each of which
-    // isolated a genuine, nameable quadraui gap, nothing in this call
-    // chain can be made to produce the reported symptom without an
-    // already-ruled-out precondition. No live, unlocked Windows host was
-    // reachable this session to confirm either way on real hardware. The
-    // most likely explanation left standing is the one the issue's own
-    // "Reproduction" section names first as the thing to rule out before
-    // chasing the frame path: the dell64 capture's vimcode binary
-    // predates #1543's default flip, or that session carried a stray
-    // `:set nonumber`/`settings.json` override — neither of which a
-    // source read from this worktree can confirm or rule out. Added here
-    // instead: a Win-GUI regression test for the contract as read at
-    // this pin, so a *future* quadraui bump that actually breaks this
-    // (the same shape #1667/#1676 found for other rasterisers) trips on
-    // real Windows the moment it lands, rather than needing a second
-    // bugbash round to notice. Source-level only, per this module's own
-    // top-of-file #1558 disclaimer — type-checked here,
-    // `#[cfg_attr(target_os = "windows", test)]`, run only on dell64.
-    //
-    // **Review follow-up (fix iteration 1):** this session also ruled out
-    // a second, more concrete hypothesis a prior pass hadn't checked — a
-    // transient "first frame paints before DirectWrite metrics are ready"
-    // race that would make `gutter_w = gutter_char_width as f32 *
-    // cell_width` collapse to `0.0` even though `gutter_char_width`
-    // itself is correct, matching the report's "text flush against the
-    // pane edge" symptom exactly. Ruled out by source:
+    // A `cell_width == 0.0` startup race was also ruled out:
     // `WinBackend::new()` seeds `current_char_width: 8.0` /
     // `current_line_height: 16.0` directly (`quadraui/src/win/
-    // backend.rs:768-769` at this pin) — never `0.0` — so there is no
-    // startup window, transient or otherwise, where `char_width() ==
-    // 0.0` on this backend; `set_current_char_width`/
-    // `set_current_line_height` only ever *replace* that non-zero seed
-    // with a real measured value, never with a zero one. This closes
-    // off the only other plausible *code* path (beyond the
-    // already-ruled-out ones in the paragraph above) that could produce
-    // the reported symptom without a Windows host, and still leaves the
-    // dell64-capture-environment explanation (stale binary / stray
-    // `:set nonumber`) as the only standing hypothesis. No Windows (or
-    // Windows-interop) host was reachable from this session either — a
-    // hard ceiling for any session run from a non-`dell64` fleet
-    // machine, not a shortfall particular to this pass — so that
-    // hypothesis still needs a `dell64` session to confirm or falsify
-    // on real hardware before this issue can honestly be called
-    // resolved either way.
+    // backend.rs:768-769` at this pin) — never `0.0` — and the setters
+    // only ever replace that non-zero seed with a real measured value.
+    //
+    // **Scope of this test, and why #1691 stays open.** This function is
+    // the *pixel* half of the probe and is `#[cfg_attr(target_os =
+    // "windows", test)]`, so it is type-checked here and executable only
+    // on dell64 (module-top #1558 disclaimer) — it has never been run,
+    // and cannot be the RED-before-fix evidence CLAUDE.md rule 2 asks
+    // for. The *arithmetic* half — everything in the call chain above
+    // except the Direct2D `draw_text` calls themselves — is covered by
+    // `super::win_gutter_contract_1691`, which **does execute on every
+    // host** (including this Linux/macOS worktree) against the same
+    // production functions and `WinBackend`'s own metrics, and which was
+    // RED-verified by injecting the reported defect at both sites #1691
+    // names. See that module's header for the injections and their
+    // observed failures.
+    //
+    // What remains genuinely unreachable from a non-Windows host is (a)
+    // the Direct2D/DirectWrite draw calls and (b) the *environment*
+    // hypothesis the issue's own "Reproduction" section names first —
+    // that the dell64 capture's binary predates #1543's default flip, or
+    // that session carried a stray `:set nonumber`/`settings.json`
+    // override. Neither is a source question. `win-smoke-tests.md`'s
+    // "Open real-hardware questions (dell64) — #1691" section carries the
+    // concrete checklist for whoever next has that hardware. Until one of
+    // those two comes back, #1691 is **reproduced-by-report only, not
+    // fixed**, and must stay open.
     #[cfg_attr(target_os = "windows", test)]
     fn line_number_gutter_paints_and_insets_text_by_default_1691() {
         let mut engine = plain_engine();
