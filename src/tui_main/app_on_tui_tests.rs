@@ -10484,4 +10484,299 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // #1653 — Native API P5: `vimcode.decor.*` painted output.
+    //
+    // Every scenario here calls `engine.decor`'s public methods directly
+    // (`DecorState::namespace`/`set_hl`/`set_mark` are all `pub`, same as
+    // `vimcode.decor.*`'s own `engine/plugins.rs` wrappers call) rather than
+    // round-tripping through a loaded Lua plugin — the thing under test is
+    // the paint path in `render.rs`, not the Lua binding (already covered
+    // by `tests/extensions.rs`'s namespace/shift/clear suite), so there's
+    // no need to stand up a `PluginManager` for these.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod issue_1653_decor_api {
+        use super::*;
+        use crate::core::buffer::{DecorOpts, HlGroupDef, VirtTextChunk, VirtTextPos};
+
+        /// A highlighted range (`hl_group`) must paint in the resolved
+        /// group's colour, not the default foreground.
+        ///
+        /// RED against unfixed `develop`: `Engine` has no `decor` field at
+        /// all there, so this doesn't compile — confirmed instead by
+        /// temporarily making `resolve_decor_style` ignore `hl_group` and
+        /// always return the theme default: the painted cell's `fg` then
+        /// reads back as the theme foreground, not `Rgb(255, 0, 255)`.
+        #[test]
+        fn decor_highlight_range_paints_in_group_color_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHIGHLIGHTME\n");
+            engine.decor.set_hl(
+                "ZqTestHl",
+                HlGroupDef {
+                    fg: Some("#ff00ff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_hl_test");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQHIGHLIGHTME".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqTestHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+            // Search for a substring starting two columns into the match
+            // (skipping "ZQ"), not the full "ZQHIGHLIGHTME" — the mark
+            // starts at column 0, same cell the Normal-mode block cursor
+            // sits on by default, which paints its own reverse-video style
+            // over whatever the span underneath says (see
+            // `quadraui::tui::editor`'s cursor-paint match).
+            let (x, y) = driver
+                .find("HIGHLIGHTME")
+                .expect("the marked line must paint");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the matched cell must exist");
+            assert_eq!(
+                style.fg,
+                quadraui::tui::testing::Color::Rgb(255, 0, 255),
+                "a cell inside the highlighted range must paint in the \
+                 resolved group colour"
+            );
+        }
+
+        /// Overlay virtual text replaces the glyphs already at its column,
+        /// same width — the original text underneath must not still show.
+        #[test]
+        fn decor_overlay_virt_text_paints_over_existing_text_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFOREXXXAFTERZQ\n");
+            let ns = engine.decor.namespace("zq_overlay");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                8, // the first "X" of "XXX"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "JJJ".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Overlay),
+                    ..Default::default()
+                },
+            );
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQBEFOREJJJAFTERZQ"),
+                "overlay virt text must replace the XXX span with JJJ; \
+                 screen:\n{screen}"
+            );
+            assert!(
+                !screen.contains("XXX"),
+                "the original text under an overlay must not still show; \
+                 screen:\n{screen}"
+            );
+        }
+
+        /// Inline virtual text inserts at its column, shifting later text on
+        /// the same line right — and the painted cursor column must follow,
+        /// even though the engine's own (buffer-coordinate) cursor column
+        /// never changes.
+        #[test]
+        fn decor_inline_virt_text_shifts_text_and_cursor_col_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHEADZQTAIL\n");
+            let ns = engine.decor.namespace("zq_inline");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                6, // right after "ZQHEAD", right before "ZQTAIL"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: ">>".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Inline),
+                    ..Default::default()
+                },
+            );
+            // Cursor sits in buffer coordinates at column 6 — the "Z" of
+            // "ZQTAIL" before any inline text exists.
+            engine.view_mut().cursor.col = 6;
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+            let screen = driver.screen();
+            assert!(
+                screen.contains("ZQHEAD>>ZQTAIL"),
+                "inline virt text must be inserted, shifting the following \
+                 text right; screen:\n{screen}"
+            );
+
+            let (tail_x, tail_y) = driver
+                .find("ZQTAIL")
+                .expect("the shifted tail text must paint");
+            // `terminal_cursor_position()` only reflects a Bar/Underline
+            // cursor (`Frame::set_cursor_position`) — Normal mode's Block
+            // cursor paints as a plain reverse-video cell instead (see
+            // `quadraui::tui::editor`'s cursor-paint match), so switch to
+            // Insert mode first. This doesn't move `view.cursor.col` (`i`
+            // inserts *before* the cursor), so the column this test cares
+            // about is unchanged.
+            driver.type_char('i');
+            let cursor_pos = driver
+                .terminal_cursor_position()
+                .expect("the editor cursor must have painted");
+            assert_eq!(
+                cursor_pos,
+                (tail_x as u16, tail_y as u16),
+                "the painted cursor column must shift right by the inline \
+                 text's length, landing back on the (now-shifted) \"Z\" of \
+                 ZQTAIL rather than on the \">>\" that pushed it there"
+            );
+        }
+
+        /// A `sign_text` mark paints its glyph in the gutter, left of the
+        /// line's own text.
+        #[test]
+        fn decor_sign_appears_in_gutter_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQLINEMARKER\n");
+            let ns = engine.decor.namespace("zq_sign");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    sign_text: Some("S".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+            let (line_x, line_y) = driver
+                .find("ZQLINEMARKER")
+                .expect("the signed line's text must paint");
+            let row = driver.styled_row(line_y as u16);
+            let gutter_chars: String = row[..(line_x as usize).min(row.len())]
+                .iter()
+                .map(|(ch, _)| *ch)
+                .collect();
+            assert!(
+                gutter_chars.contains('S'),
+                "the decor sign must paint somewhere in the gutter, left of \
+                 the line text; gutter cells: {gutter_chars:?}"
+            );
+        }
+
+        /// A mark-anchored highlight follows an insert *above* it: once a
+        /// new line is spliced in before the marked line (same `O` + Escape
+        /// sequence the plain vim-mark shift tests use), the highlight must
+        /// paint on the mark's *new* row, not its original one.
+        #[test]
+        fn decor_mark_anchored_highlight_follows_insert_above_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQKEEPCOLOR\nZQOTHERLINE\n");
+            engine.decor.set_hl(
+                "ZqFollowHl",
+                HlGroupDef {
+                    fg: Some("#00ffff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_follow");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQKEEPCOLOR".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqFollowHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            // "KEEPCOLOR", not "ZQKEEPCOLOR" — the mark starts at column 0,
+            // under the Normal-mode block cursor's default position, which
+            // paints its own reverse-video style (see the sibling highlight
+            // test's comment for why).
+            let (x0, y0) = driver
+                .find("KEEPCOLOR")
+                .expect("precondition: the marked line must paint before the edit");
+            let style0 = driver
+                .style_at(x0 as u16, y0 as u16)
+                .expect("precondition: the matched cell must exist");
+            assert_eq!(
+                style0.fg,
+                quadraui::tui::testing::Color::Rgb(0, 255, 255),
+                "precondition: the highlight must paint before the edit"
+            );
+
+            // `O` + Escape splices a new line in above row 0 — the exact
+            // sequence `test_mark_shifts_after_line_inserted_above`
+            // (`new_vim_features.rs`) uses to pin the equivalent vim-mark
+            // behaviour.
+            driver.type_char('O');
+            for c in "NEWTOPLINE".chars() {
+                driver.type_char(c);
+            }
+            driver.press_named(quadraui::NamedKey::Escape);
+
+            let screen = driver.screen();
+            assert!(
+                screen.contains("NEWTOPLINE") && screen.contains("ZQKEEPCOLOR"),
+                "precondition: the insert must have landed; screen:\n{screen}"
+            );
+
+            let (x1, y1) = driver
+                .find("ZQKEEPCOLOR")
+                .expect("the marked line must still paint after the edit");
+            assert!(
+                y1 > y0,
+                "precondition: ZQKEEPCOLOR must have moved down a row"
+            );
+            let style1 = driver
+                .style_at(x1 as u16, y1 as u16)
+                .expect("the matched cell must exist after the edit");
+            assert_eq!(
+                style1.fg,
+                quadraui::tui::testing::Color::Rgb(0, 255, 255),
+                "the highlight must have followed the mark to its new row, \
+                 not stayed pinned to the row it started on"
+            );
+        }
+    }
 }

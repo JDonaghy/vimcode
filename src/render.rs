@@ -23,7 +23,7 @@
 // (two whole dead data pipelines plus five dead helpers) are gone; any new
 // dead code in this file is a real warning again.
 
-use crate::core::buffer::Buffer;
+use crate::core::buffer::{Buffer, DecorMark, VirtTextPos};
 use crate::core::engine::sidebar::{
     HAMBURGER_PANEL_ID, PANEL_AI, PANEL_BOARD, PANEL_DEBUG, PANEL_EXTENSIONS, PANEL_GIT,
     PANEL_SEARCH, PANEL_SETTINGS,
@@ -23174,9 +23174,33 @@ fn build_rendered_window(
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let bp_lines: Vec<u64> = bp_infos.iter().map(|bp| bp.line).collect();
-    // Show the breakpoint column when any BP is set for this file, or a DAP
-    // session is active (so the column width stays stable during a session).
-    let has_bp = !bp_lines.is_empty() || engine.dap_session_active;
+
+    // #1653: plugin decoration marks (`vimcode.decor.*`) touching the
+    // viewport — fetched once per window per frame (not per visible line,
+    // and never a full-buffer scan: `DecorState::marks_touching` only walks
+    // its per-buffer `by_row` index up to `end_row`), then filtered to the
+    // exact line inside the per-line loop below. `+1` covers the one extra
+    // trailing row `approx_end_line` (below) also pads for.
+    let decor_viewport_end = (scroll_top + visible_lines + 1).min(total_lines.saturating_sub(1));
+    let decor_marks_near_viewport: Vec<&crate::core::buffer::DecorMark> = if total_lines > 0 {
+        engine
+            .decor
+            .marks_touching(window.buffer_id, scroll_top, decor_viewport_end)
+    } else {
+        Vec::new()
+    };
+    // Gutter sign glyphs (`sign_text`) reuse the breakpoint column rather
+    // than reserving a new one (see the `bp_part` composition below for the
+    // paint-time priority: DAP-current-line/breakpoint beats a decor sign,
+    // which beats blank) — so a buffer with decor signs but no real
+    // breakpoints still needs that column shown.
+    let has_decor_sign = decor_marks_near_viewport
+        .iter()
+        .any(|m| m.opts.sign_text.is_some());
+    // Show the breakpoint column when any BP is set for this file, a DAP
+    // session is active (so the column width stays stable during a
+    // session), or a decor sign needs it.
+    let has_bp = !bp_lines.is_empty() || engine.dap_session_active || has_decor_sign;
 
     // Stopped-line path for per-line comparison (try canonical, then raw).
     let dap_stop_path = engine.dap_current_line.as_ref().map(|(p, _)| p.as_str());
@@ -23309,6 +23333,14 @@ fn build_rendered_window(
 
     // Build rendered lines (fold-aware: skip hidden lines, jump over fold bodies)
     let mut lines = Vec::with_capacity(visible_lines);
+
+    // #1653: inline virtual text (`virt_text_pos = "inline"`) shifts later
+    // text on its line right — `(anchor_col, inserted_chars)` pairs per
+    // `line_idx`, consulted once the cursor's screen column is computed
+    // below (`view.cursor.col` itself stays in *buffer* coordinates; only
+    // the painted cursor cell needs to account for text inserted before it).
+    let mut inline_shifts: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
 
     // When aligned diff data exists, iterate through the aligned sequence
     // so padding lines appear at the correct visual positions.
@@ -23473,6 +23505,85 @@ fn build_rendered_window(
             )
         };
 
+        // #1653: apply plugin decorations anchored to this line — highlight
+        // spans first (merged into `spans` so the wrapped-line segmentation
+        // below slices them exactly like any syntax span), then overlay/
+        // inline virtual text, which mutates `line_str` + `spans` together
+        // so later text and its highlighting both reflect the splice.
+        let line_decor: Vec<&DecorMark> = decor_marks_near_viewport
+            .iter()
+            .filter(|m| m.row <= line_idx && m.end_row >= line_idx)
+            .copied()
+            .collect();
+        let mut spans = spans;
+        let mut line_str = line_str;
+        for m in &line_decor {
+            if let Some(hl) = &m.opts.hl_group {
+                if let Some((start_col, end_col)) =
+                    decor_highlight_cols(m, line_idx, line_str.chars().count())
+                {
+                    if end_col > start_col {
+                        let start_byte =
+                            quadraui::text_util::char_to_byte_idx(&line_str, start_col);
+                        let end_byte = quadraui::text_util::char_to_byte_idx(&line_str, end_col);
+                        spans.push(StyledSpan {
+                            start_byte,
+                            end_byte,
+                            style: resolve_decor_style(engine, theme, Some(hl.as_str())),
+                        });
+                    }
+                }
+            }
+        }
+        for m in &line_decor {
+            if m.row != line_idx || m.opts.virt_text.is_empty() {
+                continue;
+            }
+            let text: String = m.opts.virt_text.iter().map(|c| c.text.as_str()).collect();
+            if text.is_empty() {
+                continue;
+            }
+            let style = resolve_decor_style(engine, theme, m.opts.virt_text[0].hl_group.as_deref());
+            match m.opts.virt_text_pos {
+                Some(VirtTextPos::Overlay) => {
+                    let replace_chars = text.chars().count();
+                    splice_virt_text(
+                        &mut line_str,
+                        &mut spans,
+                        m.col,
+                        replace_chars,
+                        &text,
+                        style,
+                    );
+                }
+                Some(VirtTextPos::Inline) => {
+                    splice_virt_text(&mut line_str, &mut spans, m.col, 0, &text, style);
+                    inline_shifts
+                        .entry(line_idx)
+                        .or_default()
+                        .push((m.col, text.chars().count()));
+                }
+                Some(VirtTextPos::Eol) | None => {
+                    // Eol virtual text doesn't paint through `spans`/
+                    // `raw_text` — out of scope for this pass (not one of
+                    // #1653's required black-box scenarios); a mark with
+                    // `virt_text_pos = "eol"` is tracked and survives edits
+                    // like any other, it just has no paint path yet.
+                }
+            }
+        }
+        // A decor sign for this line's gutter slot (lowest priority — see
+        // `bp_part` below): the first mark with `sign_text` touching this
+        // line, truncated to its first character (the reused breakpoint
+        // column is one cell wide; see `has_decor_sign`'s doc comment
+        // above for why this reuses that column instead of a dedicated
+        // one).
+        let decor_sign_glyph: Option<String> = line_decor
+            .iter()
+            .find_map(|m| m.opts.sign_text.as_deref())
+            .and_then(|s| s.chars().next())
+            .map(|c| c.to_string());
+
         // Git diff status for this line, falling back to the #1515
         // ACP-turn overlay (`acp_turn_status`) where the real git diff has
         // nothing to say about it — a file already git-dirty before the
@@ -23536,7 +23647,11 @@ fn build_rendered_window(
                 } else if is_breakpoint {
                     "●" // breakpoint
                 } else {
-                    " "
+                    // #1653: a plugin decor sign shows in this column when
+                    // there's no real breakpoint/DAP marker on the line —
+                    // priority is DAP-current/breakpoint, then decor sign,
+                    // then blank.
+                    decor_sign_glyph.as_deref().unwrap_or(" ")
                 }
             } else {
                 ""
@@ -23928,8 +24043,23 @@ fn build_rendered_window(
                         _ => CursorShape::Block,
                     }
                 };
+                // #1653: inline virtual text anchored before the cursor's
+                // buffer column on this line shifted the painted text right
+                // by its character count — the cursor's painted column has
+                // to follow, even though `view.cursor.col` itself stays in
+                // buffer coordinates (untouched by any decoration).
+                let inline_shift: usize = inline_shifts
+                    .get(&l.line_idx)
+                    .map(|shifts| {
+                        shifts
+                            .iter()
+                            .filter(|&&(anchor, _)| anchor <= view.cursor.col)
+                            .map(|&(_, len)| len)
+                            .sum()
+                    })
+                    .unwrap_or(0);
                 // When wrapping, the cursor col is relative to the segment start.
-                let col = view.cursor.col.saturating_sub(l.segment_col_offset);
+                let col = (view.cursor.col + inline_shift).saturating_sub(l.segment_col_offset);
                 (CursorPos { view_line, col }, shape)
             })
     } else {
@@ -24618,6 +24748,105 @@ fn compute_search_matches_for_buffer(
         }
     }
     matches
+}
+
+// ─── Decoration paint helpers (#1653, Native API P5) ─────────────────────────
+//
+// Shared by both backends (called only from `build_rendered_window` above,
+// well before the GTK/TUI split) — per the Platform-Neutrality Rule, a
+// decoration's colours/splice land in `RenderedLine`'s existing `raw_text`/
+// `spans` here, not in new `src/gtk/` or `src/tui_main/` code.
+
+/// The `[start_col, end_col)` character range `m`'s highlight paints on
+/// `line_idx` — `None` when `m` doesn't touch `line_idx` at all (shouldn't
+/// happen for marks already filtered by `DecorState::marks_touching`, but
+/// keeps this usable standalone). Columns are clamped to `line_chars` (the
+/// line's current character count), since a range mark's `end_col` can
+/// point past the end of a line that's since gotten shorter.
+fn decor_highlight_cols(
+    m: &crate::core::buffer::DecorMark,
+    line_idx: usize,
+    line_chars: usize,
+) -> Option<(usize, usize)> {
+    if line_idx < m.row || line_idx > m.end_row {
+        return None;
+    }
+    let start = if line_idx == m.row {
+        m.col.min(line_chars)
+    } else {
+        0
+    };
+    let end = if line_idx == m.end_row {
+        m.end_col.min(line_chars)
+    } else {
+        line_chars
+    };
+    Some((start, end.max(start)))
+}
+
+/// Resolve a `vimcode.decor.set_hl` group name to paint-time colours/flags,
+/// falling back to the theme's default foreground when the group (or its
+/// `fg`) isn't registered — e.g. a group that only sets `bg` still gets a
+/// readable foreground instead of defaulting to black.
+fn resolve_decor_style(engine: &Engine, theme: &Theme, hl_group: Option<&str>) -> Style {
+    let def = hl_group.and_then(|g| engine.decor.resolve_hl(g));
+    let fg = def
+        .and_then(|d| d.fg.as_deref())
+        .and_then(|h| try_from_hex_over(h, theme.background))
+        .unwrap_or(theme.foreground);
+    let bg = def
+        .and_then(|d| d.bg.as_deref())
+        .and_then(|h| try_from_hex_over(h, theme.background));
+    Style {
+        fg,
+        bg,
+        bold: def.is_some_and(|d| d.bold),
+        italic: def.is_some_and(|d| d.italic),
+        font_scale: 1.0,
+    }
+}
+
+/// Splice `text` into `line_str` at character column `col`, replacing
+/// `replace_chars` existing characters (`0` for a pure insert — `inline`
+/// virtual text; the character count of `text` itself for a same-width swap
+/// — `overlay` virtual text). Spans entirely before the splice are left
+/// alone; ones entirely after shift by the resulting byte-length delta; any
+/// span that overlapped the replaced region is dropped outright (the text it
+/// styled no longer exists). Pushes one new span covering the spliced text
+/// in `style`.
+fn splice_virt_text(
+    line_str: &mut String,
+    spans: &mut Vec<StyledSpan>,
+    col: usize,
+    replace_chars: usize,
+    text: &str,
+    style: Style,
+) {
+    let char_count = line_str.chars().count();
+    let col = col.min(char_count);
+    let replace_chars = replace_chars.min(char_count - col);
+    let start_byte = quadraui::text_util::char_to_byte_idx(line_str, col);
+    let end_byte = quadraui::text_util::char_to_byte_idx(line_str, col + replace_chars);
+    let old_len = end_byte - start_byte;
+    let new_len = text.len();
+    let delta = new_len as isize - old_len as isize;
+    spans.retain_mut(|s| {
+        if s.end_byte <= start_byte {
+            true
+        } else if s.start_byte >= end_byte {
+            s.start_byte = (s.start_byte as isize + delta).max(0) as usize;
+            s.end_byte = (s.end_byte as isize + delta).max(0) as usize;
+            true
+        } else {
+            false
+        }
+    });
+    line_str.replace_range(start_byte..end_byte, text);
+    spans.push(StyledSpan {
+        start_byte,
+        end_byte: start_byte + new_len,
+        style,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]

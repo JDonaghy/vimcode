@@ -4490,6 +4490,15 @@ pub struct Engine {
     /// Receiver for async blame results (background thread).
     blame_rx: Option<std::sync::mpsc::Receiver<Vec<crate::core::git::BlameInfo>>>,
 
+    // --- Plugin decorations (#1653, Native API P5) ---
+    /// Namespaced extmarks, named highlight groups, virtual text and signs
+    /// registered through `vimcode.decor.*`. Lives alongside `line_annotations`
+    /// rather than replacing it — `annotate_line`/`clear_annotations` keep
+    /// their existing, unchanged implementation; this is the new, richer
+    /// mechanism plugins reach for `set_mark` onward. See
+    /// [`crate::core::buffer::DecorState`].
+    pub decor: crate::core::buffer::DecorState,
+
     // --- Async shell tasks (plugin background commands) ---
     /// Background shell tasks spawned by plugins via `vimcode.async_shell()`.
     /// Keyed by callback_event name (last-writer-wins: new request replaces
@@ -5505,6 +5514,7 @@ impl Engine {
             line_annotations: HashMap::new(),
             blame_annotations_active: false,
             blame_rx: None,
+            decor: crate::core::buffer::DecorState::default(),
             async_shell_tasks: HashMap::new(),
             async_shell_last_exit: HashMap::new(),
             async_shell_last_exit_order: VecDeque::new(),

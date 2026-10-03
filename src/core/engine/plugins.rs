@@ -1203,8 +1203,11 @@ impl Engine {
         } else {
             state.buffer.len_chars()
         };
+        let mut removed_lines = 0usize;
+        let mut inserted_lines = 0usize;
         if char_end > char_start {
             let old: String = state.buffer.content.slice(char_start..char_end).to_string();
+            removed_lines = old.matches('\n').count();
             state.record_delete(char_start, &old);
             state.buffer.delete_range(char_start, char_end);
         }
@@ -1214,12 +1217,24 @@ impl Engine {
                 text.push_str(line);
                 text.push('\n');
             }
+            inserted_lines = text.matches('\n').count();
             let insert_at = char_start.min(state.buffer.len_chars());
             state.record_insert(insert_at, &text);
             state.buffer.insert(insert_at, &text);
         }
         state.dirty = true;
         state.mark_syntax_stale();
+        // #1653: `set_lines` is a line-range splice — a delete of `[s, e)`
+        // followed by an insert of the new lines at `s` — so decoration
+        // marks shift exactly like the `d`/`O` paths in `engine/buffers.rs`,
+        // even though this immediate API bypasses `insert_with_undo`/
+        // `delete_with_undo` (it records undo directly above instead).
+        if removed_lines > 0 {
+            self.decor.shift_delete(buf, s, removed_lines);
+        }
+        if inserted_lines > 0 {
+            self.decor.shift_insert(buf, s, inserted_lines, true);
+        }
         self.clamp_cursors_to_buffer(buf);
     }
 
@@ -1371,6 +1386,93 @@ impl Engine {
         } else {
             len - 1
         }
+    }
+
+    // =========================================================================
+    // `vimcode.decor.*` (#1653, Native API P5) — namespaces, extmarks,
+    // highlights, virtual text and signs. Thin buffer/namespace-handle
+    // resolution wrappers around `Engine::decor` (a
+    // `crate::core::buffer::DecorState`); the Lua bindings in `plugin.rs`
+    // only convert Lua tables to/from the plain types declared there.
+    // =========================================================================
+
+    /// `vimcode.decor.namespace(name)` → namespace id.
+    pub(crate) fn plugin_api_decor_namespace(&mut self, name: &str) -> i64 {
+        self.decor.namespace(name).0 as i64
+    }
+
+    pub(crate) fn plugin_api_decor_set_hl(
+        &mut self,
+        name: &str,
+        def: crate::core::buffer::HlGroupDef,
+    ) {
+        self.decor.set_hl(name, def);
+    }
+
+    /// `vimcode.decor.set_mark(buf, ns, opts)` → mark id, or `None` when
+    /// `buf` doesn't name a live buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plugin_api_decor_set_mark(
+        &mut self,
+        buf: i64,
+        ns: i64,
+        row: usize,
+        col: usize,
+        end_row: Option<usize>,
+        end_col: Option<usize>,
+        opts: crate::core::buffer::DecorOpts,
+    ) -> Option<i64> {
+        let buf_id = self.plugin_api_resolve_buf(buf)?;
+        let ns_id = crate::core::buffer::NamespaceId(ns as u32);
+        Some(
+            self.decor
+                .set_mark(buf_id, ns_id, row, col, end_row, end_col, opts)
+                .0 as i64,
+        )
+    }
+
+    /// `vimcode.decor.get_mark(buf, ns, id)` → the mark, or `None` when the
+    /// handle is stale, `buf` is dead, or the mark belongs to a different
+    /// namespace (namespace isolation — see `DecorState::get_mark`).
+    pub(crate) fn plugin_api_decor_get_mark(
+        &self,
+        buf: i64,
+        ns: i64,
+        id: i64,
+    ) -> Option<crate::core::buffer::DecorMark> {
+        let buf_id = self.plugin_api_resolve_buf(buf)?;
+        let ns_id = crate::core::buffer::NamespaceId(ns as u32);
+        self.decor
+            .get_mark(buf_id, ns_id, crate::core::buffer::MarkId(id as u64))
+            .cloned()
+    }
+
+    /// `vimcode.decor.del_mark(buf, ns, id)` → bool.
+    pub(crate) fn plugin_api_decor_del_mark(&mut self, buf: i64, ns: i64, id: i64) -> bool {
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
+            return false;
+        };
+        let ns_id = crate::core::buffer::NamespaceId(ns as u32);
+        self.decor
+            .del_mark(buf_id, ns_id, crate::core::buffer::MarkId(id as u64))
+    }
+
+    /// `vimcode.decor.clear(ns, buf, start?, end?)` — `start`/`end` are
+    /// 0-indexed buffer rows with an exclusive `end`, same convention as
+    /// `vimcode.buffer.get_lines`/`set_lines`. `None` clears every mark in
+    /// `ns` regardless of position.
+    pub(crate) fn plugin_api_decor_clear(
+        &mut self,
+        ns: i64,
+        buf: i64,
+        range: Option<(usize, usize)>,
+    ) -> bool {
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
+            return false;
+        };
+        let ns_id = crate::core::buffer::NamespaceId(ns as u32);
+        self.decor.clear(buf_id, ns_id, range);
+        true
     }
 
     /// Open an undo group for `buf` unless the current dispatch already did.

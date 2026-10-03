@@ -7303,3 +7303,323 @@ fn storage_delete_and_keys_reflect_current_contents() {
         "the deleted key must no longer appear in keys()"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Native Extension API — Phase 5 (#1653): `vimcode.decor.*` — namespaces,
+// extmarks that follow edits, highlight ranges, virtual text, signs, named
+// highlight groups.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A mark anchored to a line must move with it when a whole line is spliced
+/// in above — the same rule real Vim's own marks follow (`O` splices the new
+/// blank line in at the cursor's own line, so a mark *on* that line moves
+/// too, not just marks strictly below it; see `test_mark_on_same_line_
+/// shifts_when_o_inserts_above` in `new_vim_features.rs`).
+///
+/// RED against unfixed `develop`: there is no `vimcode.decor` table at all
+/// there, so `SetupMark` errors out and the row never gets set up for `O` to
+/// shift in the first place — confirmed by temporarily reverting the
+/// `shift_marks_for_line_insert`/`shift_marks_for_line_delete` hooks into
+/// `self.decor` (buffers.rs) with the API otherwise intact: the mark then
+/// reads back `row=0` after `O`, not `row=1`.
+#[test]
+fn decor_mark_shifts_down_when_line_inserted_above_via_o() {
+    let mut e = engine_with_plugin(
+        "a\nb\nc\n",
+        "decor_shift_insert",
+        r#"
+        local ns = nil
+        local id = nil
+        vimcode.command("SetupMark", function(_)
+            ns = vimcode.decor.namespace("test_ns")
+            id = vimcode.decor.set_mark(0, ns, { row = 0, col = 0, hl_group = "Test" })
+            vimcode.message("ns=" .. ns .. " id=" .. id)
+        end)
+        vimcode.command("ReadMark", function(_)
+            local m = vimcode.decor.get_mark(0, ns, id)
+            if m == nil then
+                vimcode.message("nil")
+            else
+                vimcode.message("row=" .. m.row .. " col=" .. m.col)
+            end
+        end)
+        "#,
+    );
+    exec(&mut e, "SetupMark");
+    assert!(
+        e.message.starts_with("ns=") && e.message.contains("id="),
+        "set_mark must return a mark id: {}",
+        e.message
+    );
+
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=0 col=0",
+        "precondition: mark starts on row 0"
+    );
+
+    // `O` opens a new blank line above line 0, same as the vim-mark test.
+    press(&mut e, 'O');
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    assert_eq!(
+        get_lines(&e),
+        vec![
+            "x".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string()
+        ],
+        "precondition: O must have spliced a new line in above row 0"
+    );
+
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=1 col=0",
+        "the mark must have shifted down with the line it was anchored to"
+    );
+}
+
+/// A mark entirely inside a deleted range collapses (removed — `get_mark`
+/// reads back `nil`); one below the deleted range shifts up with it.
+#[test]
+fn decor_mark_collapses_on_delete_and_shifts_for_marks_below() {
+    let mut e = engine_with_plugin(
+        "a\nb\nc\nd\n",
+        "decor_shift_delete",
+        r#"
+        local ns = nil
+        local deleted_id = nil
+        local below_id = nil
+        vimcode.command("SetupMarks", function(_)
+            ns = vimcode.decor.namespace("test_ns")
+            deleted_id = vimcode.decor.set_mark(0, ns, { row = 1, col = 0 })
+            below_id = vimcode.decor.set_mark(0, ns, { row = 3, col = 0 })
+        end)
+        vimcode.command("ReadDeleted", function(_)
+            local m = vimcode.decor.get_mark(0, ns, deleted_id)
+            vimcode.message(m == nil and "nil" or ("row=" .. m.row))
+        end)
+        vimcode.command("ReadBelow", function(_)
+            local m = vimcode.decor.get_mark(0, ns, below_id)
+            vimcode.message(m == nil and "nil" or ("row=" .. m.row))
+        end)
+        "#,
+    );
+    exec(&mut e, "SetupMarks");
+
+    // `dd` on line "b" (row 1) deletes exactly the line the first mark
+    // anchors to.
+    press(&mut e, 'j'); // row 1, "b"
+    press(&mut e, 'd');
+    press(&mut e, 'd');
+    assert_eq!(
+        get_lines(&e),
+        vec!["a".to_string(), "c".to_string(), "d".to_string()],
+        "precondition: dd must have removed row 1 (\"b\")"
+    );
+
+    exec(&mut e, "ReadDeleted");
+    assert_eq!(
+        e.message, "nil",
+        "a mark whose entire range was deleted must collapse, not dangle on \
+         whatever line slid into its old slot"
+    );
+
+    exec(&mut e, "ReadBelow");
+    assert_eq!(
+        e.message, "row=2",
+        "a mark below the deleted line must shift up by the deleted line count"
+    );
+}
+
+/// A mark's position survives a full `u`/`<C-r>` round trip — undo restores
+/// it to where it was before the edit, redo re-applies the shift. Exercises
+/// `BufferState::undo`/`redo`'s full-text-snapshot swap, which has no
+/// per-edit line/count to shift by (unlike `O`/`dd`) — see
+/// `Engine::shift_decor_across_undo_nav`'s doc comment.
+#[test]
+fn decor_mark_position_survives_undo_redo_round_trip() {
+    let mut e = engine_with_plugin(
+        "a\nb\nc\n",
+        "decor_undo_redo",
+        r#"
+        local ns = nil
+        local id = nil
+        vimcode.command("SetupMark", function(_)
+            ns = vimcode.decor.namespace("test_ns")
+            id = vimcode.decor.set_mark(0, ns, { row = 2, col = 0 })
+        end)
+        vimcode.command("ReadMark", function(_)
+            local m = vimcode.decor.get_mark(0, ns, id)
+            vimcode.message(m == nil and "nil" or ("row=" .. m.row))
+        end)
+        "#,
+    );
+    exec(&mut e, "SetupMark");
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=2",
+        "precondition: mark starts on row 2 (\"c\")"
+    );
+
+    // Insert a new line above everything, same as the insert test above.
+    press(&mut e, 'O');
+    type_chars(&mut e, "x");
+    press_key(&mut e, "Escape");
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=3",
+        "precondition: the insert must have shifted the mark down"
+    );
+
+    // `u`: undo the insert — the mark must come back to row 2.
+    press(&mut e, 'u');
+    assert_eq!(
+        get_lines(&e),
+        vec!["a", "b", "c"],
+        "precondition: u must have undone the insert"
+    );
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=2",
+        "undo must relocate the mark back to its pre-insert row"
+    );
+
+    // `<C-r>`: redo the insert — the mark must shift down again.
+    ctrl(&mut e, 'r');
+    assert_eq!(
+        get_lines(&e),
+        vec!["x", "a", "b", "c"],
+        "precondition: redo must have re-applied the insert"
+    );
+    exec(&mut e, "ReadMark");
+    assert_eq!(
+        e.message, "row=3",
+        "redo must re-apply the shift the original insert caused"
+    );
+}
+
+/// `vimcode.decor.clear(ns, buf, start, end)` removes only marks in `ns`
+/// that touch the given row range, leaving marks in other namespaces (or
+/// outside the range) alone.
+#[test]
+fn decor_clear_respects_namespace_and_row_range() {
+    let mut e = engine_with_plugin(
+        "a\nb\nc\nd\ne\n",
+        "decor_clear",
+        r#"
+        local ns_a, ns_b = nil, nil
+        local a1, a2, b1 = nil, nil, nil
+        vimcode.command("Setup", function(_)
+            ns_a = vimcode.decor.namespace("plugin_a")
+            ns_b = vimcode.decor.namespace("plugin_b")
+            a1 = vimcode.decor.set_mark(0, ns_a, { row = 0, col = 0 })
+            a2 = vimcode.decor.set_mark(0, ns_a, { row = 4, col = 0 })
+            b1 = vimcode.decor.set_mark(0, ns_b, { row = 0, col = 0 })
+        end)
+        vimcode.command("ReadAll", function(_)
+            local function s(ns, id)
+                local m = vimcode.decor.get_mark(0, ns, id)
+                return m == nil and "nil" or "live"
+            end
+            vimcode.message("a1=" .. s(ns_a, a1) .. " a2=" .. s(ns_a, a2) .. " b1=" .. s(ns_b, b1))
+        end)
+        vimcode.command("ClearARange", function(_)
+            vimcode.decor.clear(ns_a, 0, 0, 1)
+        end)
+        "#,
+    );
+    exec(&mut e, "Setup");
+    exec(&mut e, "ReadAll");
+    assert_eq!(
+        e.message, "a1=live a2=live b1=live",
+        "precondition: all three marks exist"
+    );
+
+    // Clear namespace a's marks touching rows [0, 1) — only a1 qualifies.
+    exec(&mut e, "ClearARange");
+    exec(&mut e, "ReadAll");
+    assert_eq!(
+        e.message, "a1=nil a2=live b1=live",
+        "clear must remove only the namespace-a mark inside the row range, \
+         leaving namespace-a's out-of-range mark and namespace-b's mark alone \
+         (namespace isolation)"
+    );
+}
+
+/// Two different "plugins" (distinct namespaces) can set marks on the same
+/// buffer without seeing or disturbing each other's: `namespace()` is
+/// idempotent per name but distinct across names, and `get_mark`/`del_mark`
+/// with the wrong namespace fail rather than reaching across.
+#[test]
+fn decor_namespace_isolation_between_plugins() {
+    let mut e = engine_with_plugin(
+        "a\nb\n",
+        "decor_isolation",
+        r#"
+        vimcode.command("Run", function(_)
+            local ns1 = vimcode.decor.namespace("plugin_one")
+            local ns2 = vimcode.decor.namespace("plugin_two")
+            local ns1_again = vimcode.decor.namespace("plugin_one")
+            local id1 = vimcode.decor.set_mark(0, ns1, { row = 0, col = 0 })
+
+            -- plugin_two cannot read plugin_one's mark by id.
+            local cross_read = vimcode.decor.get_mark(0, ns2, id1)
+            -- ...nor delete it.
+            local cross_delete = vimcode.decor.del_mark(0, ns2, id1)
+            local still_alive = vimcode.decor.get_mark(0, ns1, id1)
+
+            vimcode.message(
+                "distinct=" .. tostring(ns1 ~= ns2)
+                .. " idempotent=" .. tostring(ns1 == ns1_again)
+                .. " cross_read=" .. tostring(cross_read)
+                .. " cross_delete=" .. tostring(cross_delete)
+                .. " still_alive=" .. tostring(still_alive ~= nil)
+            )
+        end)
+        "#,
+    );
+    exec(&mut e, "Run");
+    assert_eq!(
+        e.message,
+        "distinct=true idempotent=true cross_read=nil cross_delete=false still_alive=true",
+        "namespace() must mint distinct ids per name and be idempotent for \
+         repeats of the same name; a different namespace must not be able to \
+         read or delete another's mark"
+    );
+}
+
+/// `vimcode.buf.annotate_line`/`clear_annotations` (the legacy, per-line
+/// virtual-text mechanism #1653 explicitly leaves untouched) must keep
+/// behaving exactly as before now that `vimcode.decor.*` exists alongside
+/// it — same `engine.line_annotations` map, same 1-indexed line argument,
+/// same full-clear semantics.
+#[test]
+fn annotate_line_behaviour_is_unchanged_by_decor_api() {
+    let mut e = engine_with_plugin(
+        "one\ntwo\nthree\n",
+        "annotate_unchanged",
+        r#"
+        vimcode.command("Annotate", function(_)
+            vimcode.buf.annotate_line(2, "blame: Jane")
+        end)
+        vimcode.command("ClearAll", function(_)
+            vimcode.buf.clear_annotations()
+        end)
+        "#,
+    );
+    exec(&mut e, "Annotate");
+    assert_eq!(
+        e.line_annotations.get(&1).map(String::as_str),
+        Some("blame: Jane"),
+        "annotate_line(2, ...) must still set the 0-indexed line_annotations \
+         entry at index 1"
+    );
+
+    exec(&mut e, "ClearAll");
+    assert!(
+        e.line_annotations.is_empty(),
+        "clear_annotations must still wipe every entry"
+    );
+}
