@@ -3472,6 +3472,14 @@ impl Engine {
                 self.find_replace_show_replace = true;
                 EngineAction::None
             }
+            // ── Selection menu (#1697) ─────────────────────────────────────────
+            "select_all"
+            | "MoveLineUp"
+            | "MoveLineDown"
+            | "add_cursor_above"
+            | "add_cursor_below"
+            | "add_next_occurrence"
+            | "select_all_occurrences" => self.execute_selection_menu_action(cmd),
             "sidebar" => {
                 self.toggle_sidebar();
                 EngineAction::None

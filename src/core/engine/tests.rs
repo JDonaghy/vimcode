@@ -15971,6 +15971,66 @@ fn test_vscode_mode_ctrl_a_select_all() {
     assert_eq!(engine.view().cursor.line, 1);
 }
 
+/// #1697: the `Selection` menu's `select_all`/`move_line_up`/
+/// `move_line_down`/`add_cursor_above`/`add_cursor_below`/
+/// `add_next_occurrence`/`select_all_occurrences` actions are
+/// `execute_command` wiring onto the exact same logic the key dispatch
+/// above already runs — `execute_selection_menu_action`
+/// (`core/engine/vscode.rs`) is the single function both paths call, so
+/// these are a direct mirror of `test_vscode_mode_ctrl_a_select_all` using
+/// the menu's string-action entry point instead of a keystroke.
+#[test]
+fn test_selection_menu_select_all_action_matches_ctrl_a() {
+    let mut engine = make_vscode_engine("hello\nworld");
+    engine.update_syntax();
+    engine.execute_command("select_all");
+    assert!(engine.visual_anchor.is_some());
+    assert_eq!(engine.visual_anchor.unwrap().line, 0);
+    assert_eq!(engine.visual_anchor.unwrap().col, 0);
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.view().cursor.line, 1);
+}
+
+#[test]
+fn test_selection_menu_move_line_down_action_moves_current_line() {
+    let mut engine = make_vscode_engine("one\ntwo\nthree");
+    engine.update_syntax();
+    engine.execute_command("MoveLineDown");
+    assert_eq!(engine.buffer().to_string(), "two\none\nthree");
+}
+
+#[test]
+fn test_selection_menu_add_next_occurrence_action_selects_word_under_cursor() {
+    let mut engine = make_vscode_engine("foo bar foo baz foo");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0; // on "foo"
+    engine.execute_command("add_next_occurrence");
+    assert_eq!(engine.mode, Mode::Visual);
+    assert_eq!(engine.visual_anchor, Some(Cursor { line: 0, col: 0 }));
+    assert_eq!(engine.view().cursor.col, 2); // end of first "foo"
+}
+
+#[test]
+fn test_selection_menu_select_all_occurrences_action_adds_a_cursor_per_match() {
+    let mut engine = make_vscode_engine("foo bar foo baz foo");
+    engine.update_syntax();
+    engine.view_mut().cursor.col = 0; // on "foo"
+    engine.execute_command("select_all_occurrences");
+    assert_eq!(engine.mode, Mode::Visual);
+    // Two other occurrences of "foo" besides the primary selection.
+    assert_eq!(engine.view().extra_cursors.len(), 2);
+}
+
+#[test]
+fn test_selection_menu_add_cursor_below_action_adds_extra_cursor() {
+    let mut engine = make_vscode_engine("one\ntwo\nthree");
+    engine.update_syntax();
+    assert!(engine.view().extra_cursors.is_empty());
+    engine.execute_command("add_cursor_below");
+    assert_eq!(engine.view().extra_cursors.len(), 1);
+    assert_eq!(engine.view().extra_cursors[0].line, 1);
+}
+
 #[test]
 fn test_vscode_mode_escape_clears_selection() {
     let mut engine = make_vscode_engine("hello");

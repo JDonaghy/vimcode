@@ -321,6 +321,103 @@ impl Engine {
         };
     }
 
+    /// Alt+Shift+Up: add an extra cursor one line above the topmost existing
+    /// cursor, at the same column.
+    fn vscode_add_cursor_above(&mut self) {
+        let col = self.view().cursor.col;
+        let min_line = self
+            .view()
+            .extra_cursors
+            .iter()
+            .map(|c| c.line)
+            .min()
+            .unwrap_or(self.view().cursor.line)
+            .min(self.view().cursor.line);
+        if min_line > 0 {
+            self.add_cursor_at_pos(min_line - 1, col);
+            let n = self.view().extra_cursors.len() + 1;
+            self.message = format!("{n} cursors");
+        }
+    }
+
+    /// Alt+Shift+Down: add an extra cursor one line below the bottommost
+    /// existing cursor, at the same column.
+    fn vscode_add_cursor_below(&mut self) {
+        let col = self.view().cursor.col;
+        let max_line = self.buffer().len_lines().saturating_sub(1);
+        let max_cursor_line = self
+            .view()
+            .extra_cursors
+            .iter()
+            .map(|c| c.line)
+            .max()
+            .unwrap_or(self.view().cursor.line)
+            .max(self.view().cursor.line);
+        if max_cursor_line < max_line {
+            self.add_cursor_at_pos(max_cursor_line + 1, col);
+            let n = self.view().extra_cursors.len() + 1;
+            self.message = format!("{n} cursors");
+        }
+    }
+
+    /// Dispatch one of the `Selection` menu's commands (#1697). These are
+    /// `execute_command`/menu-bar string actions ("select_all",
+    /// "MoveLineUp", "MoveLineDown", "add_cursor_above",
+    /// "add_cursor_below", "add_next_occurrence",
+    /// "select_all_occurrences") that reach the exact same per-key logic
+    /// `handle_vscode_key` already runs for the equivalent keystroke
+    /// (Ctrl+A, Alt+Up/Down, Alt+Shift+Up/Down, Ctrl+D, Ctrl+Shift+L) —
+    /// this is wiring, not new editing behaviour. Mirrors the undo-group /
+    /// dirty / syntax bookkeeping `handle_vscode_key` performs around its
+    /// own key dispatch so menu activation behaves identically to pressing
+    /// the shortcut.
+    ///
+    /// `MoveLineUp`/`MoveLineDown` are deliberately PascalCase, not
+    /// `move_line_up`/`move_line_down`: `execute_command`'s
+    /// `is_ranged_ex_name` treats any lowercase action whose
+    /// underscore-delimited first word is `move` (or `delete`/`yank`/
+    /// `join`/`copy`/`put`/`retab`/`left`/`right`/`center`/`t`) as vim's
+    /// ranged `:move` ex-command and routes it to
+    /// `try_execute_ranged_command` *before* this function's match ever
+    /// runs — `move_line_down` silently parsed as `:move` with a garbage
+    /// address and no-op'd instead of moving the line (caught by this
+    /// issue's own `test_selection_menu_move_line_down_action_moves_current_line`,
+    /// observed red with the lowercase name). PascalCase skips that path
+    /// entirely, matching the existing convention for other menu actions
+    /// that need to dodge it (`EditorGroupSplit`, `MarkdownPreview`).
+    pub(crate) fn execute_selection_menu_action(&mut self, action: &str) -> EngineAction {
+        self.vscode_break_undo_group();
+        self.start_undo_group();
+        let mut changed = false;
+        match action {
+            "select_all" => self.vscode_select_all(),
+            "MoveLineUp" => self.vscode_move_line_up(&mut changed),
+            "MoveLineDown" => self.vscode_move_line_down(&mut changed),
+            "add_cursor_above" => self.vscode_add_cursor_above(),
+            "add_cursor_below" => self.vscode_add_cursor_below(),
+            "add_next_occurrence" => self.vscode_ctrl_d(),
+            "select_all_occurrences" => self.vscode_select_all_occurrences(),
+            _ => {}
+        }
+        if changed {
+            self.finish_undo_group();
+            self.set_dirty(true);
+            self.update_syntax();
+            let active_id = self.active_buffer_id();
+            self.preview_tab_promote(active_id);
+            self.lsp_dirty_buffers.insert(active_id, true);
+            self.swap_mark_dirty();
+            if !self.search_matches.is_empty() {
+                self.run_search();
+            }
+        }
+        self.ensure_cursor_visible();
+        self.sync_scroll_binds();
+        self.update_bracket_match();
+        self.fire_cursor_move_hook();
+        EngineAction::None
+    }
+
     // ── Word-level delete ────────────────────────────────────────────────────
 
     /// Ctrl-Delete: delete word forward from cursor.
@@ -982,39 +1079,8 @@ impl Engine {
             match key_name {
                 "Alt_Up" => self.vscode_move_line_up(&mut changed),
                 "Alt_Down" => self.vscode_move_line_down(&mut changed),
-                "Alt_Shift_Up" => {
-                    let col = self.view().cursor.col;
-                    let min_line = self
-                        .view()
-                        .extra_cursors
-                        .iter()
-                        .map(|c| c.line)
-                        .min()
-                        .unwrap_or(self.view().cursor.line)
-                        .min(self.view().cursor.line);
-                    if min_line > 0 {
-                        self.add_cursor_at_pos(min_line - 1, col);
-                        let n = self.view().extra_cursors.len() + 1;
-                        self.message = format!("{n} cursors");
-                    }
-                }
-                "Alt_Shift_Down" => {
-                    let col = self.view().cursor.col;
-                    let max_line = self.buffer().len_lines().saturating_sub(1);
-                    let max_cursor_line = self
-                        .view()
-                        .extra_cursors
-                        .iter()
-                        .map(|c| c.line)
-                        .max()
-                        .unwrap_or(self.view().cursor.line)
-                        .max(self.view().cursor.line);
-                    if max_cursor_line < max_line {
-                        self.add_cursor_at_pos(max_cursor_line + 1, col);
-                        let n = self.view().extra_cursors.len() + 1;
-                        self.message = format!("{n} cursors");
-                    }
-                }
+                "Alt_Shift_Up" => self.vscode_add_cursor_above(),
+                "Alt_Shift_Down" => self.vscode_add_cursor_below(),
                 "Alt_z" => {
                     self.settings.wrap = !self.settings.wrap;
                     self.message = format!(
