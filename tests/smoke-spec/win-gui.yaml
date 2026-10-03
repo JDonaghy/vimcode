@@ -159,18 +159,33 @@
 #     falls *inside* the Command Center's search box, a real `HTCLIENT`
 #     widget — not a bug, just a stale assumption about what's empty.
 #
-# Fixed here by: (a) re-deriving the 7 menu-row x positions from the real
-# shared title-band layout code (see below), (b) taking the caption-button
-# centers directly from the real-hardware remeasurement above, and (c)
-# flipping the old "empty band" step's expectation to `HTCLIENT` and
-# re-aiming it at the search box it now actually hits, since every pixel
-# in the Command Center's logical span that isn't blank padding around
-# the arrows/search box resolves to a real widget now
-# (`quadraui::CommandCenterLayout::hit_regions`,
-# `CommandCenterHit::Bar | Outside => continue` in `win::backend` — only
-# `Back`/`Forward`/`SearchBox` register as `HTCLIENT`).
+# This file is an additive-only Tier-2 lane entry point (#3509): a fix for
+# stale coordinates may NOT edit or delete the existing `-1232`-suffixed
+# steps below, even though some of their original assumptions no longer
+# hold — doing so would defeat `coord bugbash`'s regression ratchet
+# (#3487), which expects every fix to grow this spec, never shrink or
+# rewrite it. So this fix is purely additive:
 #
-# The 7 menu-item x positions below are NOT independently re-measured on
+#   - every `-1232` step below is byte-for-byte what it was before this
+#     issue — same id, same x/y, same expected `ht` — and is left exactly
+#     where real Win-GUI hardware (or, for the Command Center-affected
+#     ones, the layout shift this issue reports) leaves it;
+#   - a new, parallel `-1657` step is added beside each `-1232` step this
+#     issue's findings affect, carrying the corrected coordinate;
+#   - `hit-test-empty-band-is-caption-1232` (x=620, expects `HTCAPTION`)
+#     is now KNOWN to conflict with reality: the Command Center's search
+#     box occupies that x today, so this step is expected to flip from its
+#     historical PASS to FAIL once a real run executes it at the current
+#     pin. That is an intentional, accepted consequence of this file's
+#     additive-only policy, not an oversight — rewriting or deleting this
+#     step to make it agree with the new layout is exactly the kind of
+#     edit #3509 forbids. The new `hit-test-search-box-is-client-1657`
+#     step beside it carries the corrected, currently-true expectation.
+#     Deciding whether/when to retire `hit-test-empty-band-is-caption-1232`
+#     itself is a separate, deliberate call for a future issue — not a
+#     side effect of this stale-coordinate fix.
+#
+# The 7 menu-item `-1657` x positions are NOT independently re-measured on
 # real Windows hardware beyond File (only File's real span was reported)
 # — they are re-derived from `src/gtk/testing.rs`'s
 # `win_gui_smoke_spec_title_band_coordinates_are_stale_1657` /
@@ -226,11 +241,101 @@ steps:
   # bug (`docs/PENDING_QUADRAUI_ISSUES.md`) rather than on quadraui#1232
   # (which landed).
   #
-  # #1657: x values below are re-derived per this file's own "#1657"
-  # header section — File's x comes from the real-hardware PrintWindow
-  # remeasurement (real span ≈55-88), the other six from the Tier-1
-  # GTK/Win-GUI conformance pair's shared-layout-code painted centers
-  # (UNVERIFIED on real Windows hardware beyond File — see that section).
+  # #1657: these x values are now known stale (derived before the Command
+  # Center existed) but are left exactly as originally authored per this
+  # file's additive-only policy (see this file's "#1657" header section) —
+  # the corrected `-1657` steps below carry the current, real-hardware
+  # x values instead.
+  - type: expect_hit
+    id: hit-test-file-menu-item-1232
+    x: 24
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-edit-menu-item-1232
+    x: 75
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-view-menu-item-1232
+    x: 126
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-go-menu-item-1232
+    x: 177
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-run-menu-item-1232
+    x: 228
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-terminal-menu-item-1232
+    x: 279
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-help-menu-item-1232
+    x: 330
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-minimize-button-1232
+    x: 886
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-maximize-button-1232
+    x: 932
+    y: 16
+    ht: HTCLIENT
+  - type: expect_hit
+    id: hit-test-close-button-1232
+    x: 978
+    y: 16
+    ht: HTCLIENT
+
+  # vimcode#1656 ADDS this step rather than touching the one above (this
+  # file is additive-only, #3509/#3487) — it remeasured the close button's
+  # real click centre against a real 4x-zoom crop of the painted glyph
+  # (`/tmp/crop-zoom-caption.png` in that issue's evidence) rather than
+  # this header's derived estimate: 994, not 978. Confirmed FAIL
+  # (HTCAPTION) at that exact point too, so the gap isn't "the old
+  # estimate missed the button by a few px" — the whole caption-button
+  # strip is misclassified, both the original derived estimate and this
+  # remeasured real centre.
+  - type: expect_hit
+    id: hit-test-close-button-remeasured-1656
+    x: 994
+    y: 16
+    ht: HTCLIENT
+
+  # The empty band between the menu row and the caption buttons — no widget
+  # is painted there, so it must stay the window's drag handle.
+  #
+  # #1657: this assumption is now KNOWN stale — the Command Center's
+  # search box paints at this x today, so a real run is expected to FAIL
+  # this step (`got=HTCLIENT want=HTCAPTION`). Left unmodified per this
+  # file's additive-only policy; see this file's "#1657" header section
+  # for why, and see `hit-test-search-box-is-client-1657` below for the
+  # corrected, currently-true expectation at the same x.
+  - type: expect_hit
+    id: hit-test-empty-band-is-caption-1232
+    x: 620
+    y: 16
+    ht: HTCAPTION
+
+  # #1657: corrected, additive re-derivation of the ten `-1232` hit-test
+  # steps above, per this file's "#1657" header section. x values: File
+  # from the real-hardware PrintWindow remeasurement (real span ≈55-88);
+  # Edit/View/Go/Run/Terminal/Help from the Tier-1 GTK/Win-GUI conformance
+  # pair's shared-layout-code painted centers (UNVERIFIED on real Windows
+  # hardware beyond File); the three caption buttons from the real-hardware
+  # remeasurement (≈914/954/994) — UNRESOLVED whether these three alone
+  # fix the caption-button hit-test; see that section before reading a
+  # future PASS/FAIL here as conclusive.
   - type: expect_hit
     id: hit-test-file-menu-item-1657
     x: 70
@@ -266,16 +371,6 @@ steps:
     x: 388
     y: 16
     ht: HTCLIENT
-  # #1657: x values come straight from the real-hardware PrintWindow
-  # remeasurement in this file's header (≈914/954/994, not the old
-  # 886/932/978). UNRESOLVED per that same section: the bugbash report's
-  # reproduction found these three still FAIL (still HTCAPTION) even at
-  # these corrected x values, unlike the 7 menu items above which all
-  # flipped to PASS — not re-confirmed or ruled out from this fix (no
-  # attached Windows host in this worktree). Do not read a future green
-  # run of only these three as proof the coordinates were the whole
-  # story; do not read a future red run as a coordinate regression
-  # without first re-checking against a real PrintWindow capture.
   - type: expect_hit
     id: hit-test-minimize-button-1657
     x: 914
@@ -292,32 +387,18 @@ steps:
     y: 16
     ht: HTCLIENT
 
-  # vimcode#1656 ADDS this step rather than touching the one above (this
-  # file is additive-only, #3509/#3487) — it remeasured the close button's
-  # real click centre against a real 4x-zoom crop of the painted glyph
-  # (`/tmp/crop-zoom-caption.png` in that issue's evidence) rather than
-  # this header's derived estimate: 994, not 978. Confirmed FAIL
-  # (HTCAPTION) at that exact point too, so the gap isn't "the old
-  # estimate missed the button by a few px" — the whole caption-button
-  # strip is misclassified, both the original derived estimate and this
-  # remeasured real centre.
-  - type: expect_hit
-    id: hit-test-close-button-remeasured-1656
-    x: 994
-    y: 16
-    ht: HTCLIENT
-
-  # #1657: x=620 — the old "empty band, must stay HTCAPTION" assumption —
-  # now lands inside the Command Center's search box (confirmed both by a
-  # real-hardware PrintWindow capture and by the Tier-1 GTK conformance
-  # test's painted `search_bounds`), a real, clickable widget. Flipped
-  # from HTCAPTION to HTCLIENT rather than hunting for a new "empty" x:
-  # per `quadraui::CommandCenterLayout::hit_regions`, only the
-  # back/forward arrows and the search box register as HTCLIENT inside
-  # the Command Center's span — the thin blank padding around them (if
-  # any survives on real Win-GUI's own font metrics) is too fragile a
-  # target to pin a coordinate to without a dedicated real-hardware
-  # remeasurement, which this fix's Linux worktree cannot perform.
+  # #1657: x=620 — the old `-1232` "empty band, must stay HTCAPTION"
+  # assumption above — now lands inside the Command Center's search box
+  # (confirmed both by a real-hardware PrintWindow capture and by the
+  # Tier-1 GTK conformance test's painted `search_bounds`), a real,
+  # clickable widget. Added beside (not instead of) the old step per this
+  # file's additive-only policy: per
+  # `quadraui::CommandCenterLayout::hit_regions`, only the back/forward
+  # arrows and the search box register as HTCLIENT inside the Command
+  # Center's span — the thin blank padding around them (if any survives on
+  # real Win-GUI's own font metrics) is too fragile a target to pin a
+  # coordinate to without a dedicated real-hardware remeasurement, which
+  # this fix's Linux worktree cannot perform.
   - type: expect_hit
     id: hit-test-search-box-is-client-1657
     x: 620
@@ -358,14 +439,9 @@ steps:
   # `MenuItem`-role UIA element regardless of the click landing. This step
   # is therefore still expected RED, but for the UIA-wiring reason alone
   # now, not for #1232's reason too. Left unmodified below.
-  #
-  # #1657: x corrected from the stale 24 to 70 (see this file's header) —
-  # the stale value landed in blank menu-row padding left of the real
-  # File label, so this click never reached the drawn menu even setting
-  # #1232 aside.
   - type: click
-    id: click-file-menu-item-1657
-    x: 70
+    id: click-file-menu-item-1232
+    x: 24
     y: 16
   - type: expect_a11y_within
     id: file-dropdown-opens-1232
@@ -375,6 +451,25 @@ steps:
 
   - type: key
     id: dismiss-dropdown
+    key: esc
+
+  # #1657: corrected, additive re-run of the click-and-open sequence above
+  # at the real File label x (see this file's "#1657" header section) —
+  # the `-1232` click above never reaches the drawn menu even setting
+  # #1232 aside, since x=24 lands in blank menu-row padding left of the
+  # real label.
+  - type: click
+    id: click-file-menu-item-1657
+    x: 70
+    y: 16
+  - type: expect_a11y_within
+    id: file-dropdown-opens-1657
+    role: "menu item"
+    name: "New Tab"
+    timeout_ms: 3000
+
+  - type: key
+    id: dismiss-dropdown-1657
     key: esc
 
   # vimcode#1646's two "All GUI specs" seed checks — "the minimap shows
@@ -446,14 +541,34 @@ steps:
   # step is already this issue's real-click acceptance coverage without
   # needing a duplicate.
   #
-  # #1657: x corrected from the stale 978 to 994
-  # (see this file's header) — still UNRESOLVED whether the corrected x
-  # alone makes the close button's click land; re-confirm on real
-  # hardware before reading a future PASS here as proof it does.
+  # #1657 revisits that last call: it DOES add the second click/
+  # expect_closed pair at 994 below, because this issue's remeasurement
+  # makes x=978 a coordinate that is expected to *miss* the real button
+  # rather than hit a misclassified one — so the `-1232` pair above is
+  # expected to leave the window open, and the `-1657` pair is reached
+  # with a live window. If the upstream fix ever makes the `-1232` click
+  # genuinely close the window, the `-1657` pair below becomes the
+  # already-closed-window case #1656 warned about and should be revisited
+  # then (a deliberate future call, not a silent edit now).
+  - type: click
+    id: click-close-button-1232
+    x: 978
+    y: 16
+  - type: expect_closed
+    id: close-button-actually-closes-window-1232
+    timeout_ms: 5000
+
+  # #1657: corrected, additive re-run of the close-button click above at
+  # the real close-button x (see this file's "#1657" header section) —
+  # still UNRESOLVED whether the corrected x alone makes the click land;
+  # re-confirm on real hardware before reading a future PASS here as proof
+  # it does. Only reached if the `-1232` step above left the window open
+  # (its own expectation is that it will, since x=978 misses the real
+  # button).
   - type: click
     id: click-close-button-1657
     x: 994
     y: 16
   - type: expect_closed
-    id: close-button-actually-closes-window-1232
+    id: close-button-actually-closes-window-1657
     timeout_ms: 5000
