@@ -1031,6 +1031,92 @@ mod win_driver_tests {
         );
     }
 
+    // ── #1675: caption-button real click position is still HTCAPTION ───
+    //
+    // vimcode#1675 is a fresh bugbash re-report of vimcode#1656's own
+    // still-open finding (`docs/PENDING_QUADRAUI_ISSUES.md`'s
+    // "`WinBackend::register_status_bar_segment_zones` ... registers ...
+    // bar-local bounds as if they were already absolute" entry): a real
+    // click on the close button at (978,16) leaves the window open after
+    // 2000ms, and a real `WM_NCHITTEST` probe at all three caption-button
+    // positions still answers `HTCAPTION`. Confirmed still live by reading
+    // the *current* pin (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) source
+    // directly, not just re-citing the prior entry: `quadraui/src/win/
+    // status_bar.rs::win_status_bar_layout` calls `bar.layout_padded(rect.
+    // width, rect.height, ...)` with no `rect.x`/`rect.y` at all, and
+    // `quadraui/src/win/backend.rs::draw_status_bar_interactive` (both the
+    // DWrite-surface branch and this no-surface fallback) feeds that
+    // bar-local layout straight into `register_status_bar_segment_zones`,
+    // which registers each segment's `bounds` verbatim. The window-controls
+    // bar paints near the window's right edge (`rect.x` on the order of
+    // 850-980px in a 1024px-wide window), so the registered zone for e.g.
+    // `render::WINDOW_CLOSE_ACTION` ends up roughly that many pixels left
+    // of the button's real screen position -- a real click at the real
+    // position finds no matching (smaller-than-band) zone, and
+    // `WinBackend::nc_hit_test` falls through to `HTCAPTION`.
+    //
+    // This closes the specific Tier-1 coverage gap
+    // `win_gui_smoke_spec_title_band_coordinates_are_stale_1657`'s own doc
+    // names above ("the caption-button half of that test has no equivalent
+    // here, [since] `ConformanceHarness` ... does not clone `App::
+    // title_bar_rect`") by locating the close button's *real* painted
+    // position via `WinDriver::find` (CLAUDE.md's "locate targets, never
+    // hardcode coordinates" rule) instead of needing `title_bar_rect` at
+    // all -- the same technique `src/gtk/testing.rs`'s
+    // `click_titlebar_close_button` already uses for the GTK sibling.
+    //
+    // Asserts the *correct* expected behaviour (`HTCLIENT`, i.e.
+    // `Some(false)`) rather than asserting the bug persists -- this is a
+    // source-level RED confirmation, not an executed one, for the same
+    // `#1558` DLL-load-crash reason every other test in this module carries
+    // that disclaimer (`WinDriver::new`'s offscreen Direct2D surface
+    // creation panics unconditionally off real Windows, per that
+    // constructor's own doc, so this function is only type-checked here,
+    // never run) -- stated explicitly here rather than left to the
+    // inherited blanket disclaimer, exactly like `win_gui_blank_title_
+    // band_strip_is_caption_1661` below. Do not "fix" this by weakening the
+    // assertion to match the bug; this is a quadraui-side defect with no
+    // vimcode-side fix available (`App::render_content`'s call to
+    // `backend.draw_status_bar_interactive` for the window-controls bar is
+    // already identical in shape to its calls for the menu bar/command
+    // center, both of which work correctly) -- re-run once the pin moves
+    // past a fix to `register_status_bar_segment_zones` to confirm the
+    // flip to `Some(false)`.
+    #[cfg_attr(target_os = "windows", test)]
+    fn caption_button_real_click_position_is_misclassified_htcaption_1675() {
+        let h = conformance_harness(plain_engine(), 1024, 768);
+
+        let needle = format!("  {}  ", crate::icons::WINDOW_CLOSE.s());
+        let (x, y) = h.driver.find(&needle).unwrap_or_else(|| {
+            panic!(
+                "the inline close button must have painted its {needle:?} \
+                 label before a real click position can be probed; painted \
+                 runs this frame: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        assert!(
+            x > 512.0,
+            "sanity: the close button must paint in the right half of a \
+             1024-wide window, not near x=0 -- otherwise this probe isn't \
+             actually testing the bar-local-vs-absolute gap (got x={x})"
+        );
+
+        assert_eq!(
+            h.driver.backend().nc_hit_test(x, y),
+            Some(false),
+            "a real WM_NCHITTEST probe at the close button's own real \
+             painted centre ({x}, {y}) must answer HTCLIENT (Some(false)) \
+             so a real click reaches it as a MouseDown -- vimcode#1675/\
+             #1656 found this still answering HTCAPTION (Some(true)) \
+             because `WinBackend::register_status_bar_segment_zones` \
+             registers the button's bar-local layout bounds, not translated \
+             by the window-controls bar's real `rect.x`; see \
+             docs/PENDING_QUADRAUI_ISSUES.md's entry for the full trace"
+        );
+    }
+
     // ── #1661: blank title-band strip must stay HTCAPTION ───────────────
     //
     // vimcode#1661 (same real-hardware bugbash session as #1657 above)
