@@ -69,6 +69,14 @@ pub const PANEL_AI: &str = "panel:ai";
 /// `crate::core::tool_client`'s module doc for the placement rule
 /// (`src/core/` names no specific external provider) this satisfies.
 pub const PANEL_BOARD: &str = "panel:board";
+/// #1698: VS Code pins two items at the bottom of the activity bar —
+/// Accounts (sign-in identity) and Manage (this `Settings` gear). vimcode
+/// has no account/sign-in concept anywhere in the engine (no OAuth, no
+/// stored identity, no "signed in as" state) to back an Accounts item with,
+/// so deliberately adding none rather than inventing a UI element with
+/// nothing behind it — see that issue for the decision record. Revisit if
+/// vimcode ever grows a real account concept (e.g. a hosted-sync or
+/// extension-marketplace login).
 pub const PANEL_SETTINGS: &str = "bottom:settings";
 
 /// Activity-bar item id for the hamburger (menu) slot — keyboard index 0.
@@ -120,11 +128,16 @@ pub fn ext_panel_name_from_id(id: &str) -> Option<&str> {
 /// `PanelDefinition` list both iterate this rather than hand-transcribing the
 /// order twice — a reordering here is now a one-line change both call sites
 /// pick up, instead of a silent drift only a snapshot test would catch.
+///
+/// #1698: order matches VS Code's activity bar top-to-bottom (Explorer,
+/// Search, Source Control, Run and Debug, Extensions) — [`PANEL_GIT`] before
+/// [`PANEL_DEBUG`]. It used to be the other way around, with no VS Code
+/// counterpart for the swap.
 pub const FIXED_ACTIVITY_PANEL_IDS: [&str; 7] = [
     PANEL_EXPLORER,
     PANEL_SEARCH,
-    PANEL_DEBUG,
     PANEL_GIT,
+    PANEL_DEBUG,
     PANEL_EXTENSIONS,
     PANEL_AI,
     PANEL_BOARD,

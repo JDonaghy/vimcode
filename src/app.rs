@@ -1499,8 +1499,8 @@ impl App {
         Some(match id {
             "panel:explorer" => crate::icons::EXPLORER.s(),
             "panel:search" => crate::icons::SEARCH.s(),
-            "panel:debug" => crate::icons::DEBUG.s(),
-            "panel:git" => crate::icons::GIT_BRANCH.s(),
+            "panel:debug" => crate::icons::RUN_AND_DEBUG.s(),
+            "panel:git" => crate::icons::SOURCE_CONTROL.s(),
             "panel:extensions" => crate::icons::EXTENSIONS.s(),
             "panel:ai" => crate::icons::AI_CHAT.s(),
             "panel:board" => crate::icons::BOARD.s(),

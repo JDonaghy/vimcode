@@ -1094,11 +1094,16 @@ pub fn sidebar_ctrl_w_l_returns_focus_to_the_editor<D: ConformanceDriver + Drive
 /// something else entirely (panel-local navigation / a plain editor motion +
 /// line-join respectively), never switches the sidebar to a different
 /// panel. So Search -> `Ctrl-W h` (arm+toolbar-focus) -> `j` (select the
-/// next toolbar item, Debug) -> `l` (activate it) landing on the Debug
-/// panel's own painted content (case-insensitive `"debug"` — GTK's shared
-/// `App` titles this panel "RUN AND DEBUG", the pre-#1434 TUI shell's own independent
-/// `shell_config` titles it "Debug"; `"debug"` is a substring of both)
-/// proves the chord actually moved focus to the toolbar.
+/// next toolbar item, Source Control — #1698 reordered `FIXED_ACTIVITY_
+/// PANEL_IDS` so Source Control, not Debug, now immediately follows Search,
+/// matching VS Code's Explorer/Search/Source Control/Run and Debug
+/// sequence) -> `l` (activate it) landing on the Source Control panel's own
+/// painted content (case-insensitive `"control"` — both
+/// `sidebar::fixed_panel_title_tooltip`'s shared title table and the
+/// pre-#1434 TUI shell's own independent `shell_config` title this panel
+/// "SOURCE CONTROL"/"Source Control", painted as two separate text runs on
+/// `tui_prod`, hence the single-word needle) proves the chord actually
+/// moved focus to the toolbar.
 ///
 /// Deliberately not `q` (`ActivityBarKeyAction::Collapse`): that hits an
 /// unrelated, pre-existing gap confirmed by hand while developing this
@@ -1148,12 +1153,19 @@ pub fn sidebar_ctrl_w_h_moves_focus_to_the_activity_bar_toolbar<
     ConformanceDriver::type_char(driver, 'h');
     ConformanceDriver::type_char(driver, 'j');
     ConformanceDriver::type_char(driver, 'l');
+    // "control", not "source control": the header paints as two separate
+    // text runs ("SOURCE", "CONTROL" — one per styled span, same reason
+    // `GtkDriver::find`'s own doc warns against a needle that straddles a
+    // style change), so a two-word needle never matches a single run even
+    // though both words are on screen. "control" alone is still unique to
+    // this panel's header on this fixture.
     assert!(
-        screen_has_ci(driver, "debug"),
+        screen_has_ci(driver, "control"),
         "Ctrl-W h must move keyboard focus to the activity bar toolbar -- \
-         'j' then 'l' from there must move the toolbar cursor onto Debug \
-         (the next fixed panel after Search) and activate it, which a \
-         still-panel-focused or still-editor-focused 'j'/'l' would not do"
+         'j' then 'l' from there must move the toolbar cursor onto Source \
+         Control (the next fixed panel after Search) and activate it, \
+         which a still-panel-focused or still-editor-focused 'j'/'l' would \
+         not do"
     );
 }
 
