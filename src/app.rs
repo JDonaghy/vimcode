@@ -1128,6 +1128,55 @@ fn dedup_caret_shape(
     }
 }
 
+/// #1668: whether `App::tick_dispatch` must re-arm a future `tick` via
+/// `Backend::request_frame_in` so `Engine::poll_terminal` (reached via
+/// `poll_idle`, inside `handle_poll_tick`/`render::run_shared_tick_chores`)
+/// keeps draining a terminal pane's PTY output.
+///
+/// GTK/TUI/macOS call `tick` unconditionally every
+/// `quadraui::runtime::IDLE_POLL_CEILING` (250ms — see
+/// `quadraui::runner::ShellApp::tick`'s own per-backend table) regardless
+/// of whether anything asked to be woken, so a terminal pane's output
+/// drains on its own there even with no explicit re-arm. Win-GUI has
+/// **no** such fallback (same table: "Windows | none") — confirmed
+/// against the pinned rev: `quadraui::win::run::wndproc` only ever calls
+/// `AppLogic::tick` from its own `WM_TIMER` handler
+/// (`grep -n "tick(ws" quadraui/src/win/run.rs` has exactly one call
+/// site), and that timer only fires once something has called
+/// `Backend::request_frame_in` (`WinBackend::request_frame_in`'s
+/// `SetTimer`). Dispatching a keypress goes through `App::handle`/
+/// `dispatch_event`, never `tick` — so typing into an open terminal pane
+/// does not drain its output either. Without this re-arm, a Win-GUI
+/// terminal pane's shell output is never drained past the very first
+/// frame: vimcode#1668's "panel opens blank and stays blank; typing
+/// `echo hello-vimcode` + Enter produces no visible output at all" report.
+///
+/// A pure, `Backend`-free decision function rather than a `Backend`-
+/// call-count driver test — see [`dedup_window_title`]'s doc for exactly
+/// why that shape doesn't work in this crate (`quadraui::Backend` is
+/// sealed, and `quadraui::testing::RecordingBackend`, the one
+/// externally-constructible implementor, doesn't record
+/// `request_frame_in` calls either). A `WinDriver`-based scenario
+/// couldn't prove this even on real Windows regardless:
+/// `WinBackend::attach_headless` (what `WinDriver::new` uses) never sets
+/// `self.hwnd`, so `request_frame_in` degrades to its documented
+/// "no window to nudge yet" no-op through that harness. This isolates
+/// the decision `tick_dispatch` makes before ever touching a `Backend` —
+/// fast, Linux-runnable, RED/GREEN unit-testable
+/// (`terminal_poll_rearm_tests`, below), independent of real Windows
+/// hardware. It cannot prove the downstream `SetTimer`/`WM_TIMER` chain
+/// actually re-fires `tick` on a real Windows message loop — only that
+/// `tick_dispatch` asks for it whenever it should.
+pub(crate) fn terminal_poll_rearm_delay(
+    any_terminal_pane_open: bool,
+) -> Option<std::time::Duration> {
+    if any_terminal_pane_open {
+        Some(std::time::Duration::from_millis(100))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod window_title_dedup_tests {
     //! #1634: direct coverage for [`dedup_window_title`]/
@@ -1207,6 +1256,46 @@ mod window_title_dedup_tests {
         assert!(
             !dedup_caret_shape(&mut last, quadraui::EditorCursorShape::Bar),
             "and immediately dedups again once the new value is the baseline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_poll_rearm_tests {
+    //! #1668: direct coverage for [`terminal_poll_rearm_delay`] — see its
+    //! own doc for why this pure function, rather than a `Backend`-call-
+    //! count driver test (not achievable against the sealed
+    //! `quadraui::Backend` trait, nor via `WinDriver`'s headless
+    //! `attach_headless`, which never sets `WinBackend::hwnd`), is this
+    //! fix's unit coverage.
+    //!
+    //! RED-verified: reverting `terminal_poll_rearm_delay` to always
+    //! return `None` (the pre-#1668 behaviour — nothing ever re-arms a
+    //! tick for an open terminal pane) makes the first assertion below
+    //! fail. Restored before committing.
+
+    use super::*;
+
+    #[test]
+    fn rearm_is_requested_only_while_a_terminal_pane_is_open() {
+        assert_eq!(
+            terminal_poll_rearm_delay(true),
+            Some(std::time::Duration::from_millis(100)),
+            "with at least one open terminal pane, `tick_dispatch` must \
+             ask to be woken again soon so `Engine::poll_terminal` keeps \
+             draining the pane's PTY output — this is the exact #1668 \
+             regression on Win-GUI: `win::run`'s message loop only calls \
+             `tick` again when something explicitly asks via \
+             `Backend::request_frame_in`/`SetTimer`, so with no re-arm a \
+             terminal pane's shell output (prompt, echoed input, command \
+             output) is never drained past the very first frame"
+        );
+
+        assert_eq!(
+            terminal_poll_rearm_delay(false),
+            None,
+            "with no terminal pane open, there is nothing to keep polling \
+             for — must not request a wake-up"
         );
     }
 }
@@ -8881,6 +8970,18 @@ impl App {
             .any(|s| s.ai_streaming)
         {
             backend.request_frame_in(std::time::Duration::from_millis(100));
+        }
+
+        // #1668: while any terminal pane has a live PTY session, keep
+        // re-arming `tick` so `Engine::poll_terminal` keeps draining its
+        // output — see `terminal_poll_rearm_delay`'s own doc for why this
+        // matters specifically (and only) on Win-GUI, and why it's a
+        // harmless no-op re-arm on GTK/TUI/macOS (they already tick
+        // regardless, via their own `IDLE_POLL_CEILING` fallback).
+        if let Some(delay) =
+            terminal_poll_rearm_delay(!self.engine.borrow().terminal_panes.is_empty())
+        {
+            backend.request_frame_in(delay);
         }
 
         if self.draw_needed.get() {
