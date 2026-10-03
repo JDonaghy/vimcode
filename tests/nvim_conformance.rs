@@ -295,6 +295,27 @@ const RPC_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// to miss 250ms would fail the surrounding test suite on its own.
 const RPC_KEY_BARRIER: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long [`NvimRpc::settle_message`] waits for the command the probe's keys
+/// started to *finish*, before giving up and reporting whatever echo-area text
+/// has arrived so far.
+///
+/// Deliberately its own constant rather than either neighbour above:
+///
+/// * [`RPC_KEY_BARRIER`] (50ms) is far too short. It is sized for "has this
+///   keystroke been consumed", where timing out is a legitimate answer
+///   ("nvim is mid-command"); reading `last_message` right after one of those
+///   timeouts is exactly the truncation bug this constant exists to fix.
+/// * [`RPC_STALL_TIMEOUT`] (30s) is too long, because a message case *may*
+///   legitimately leave nvim part-way through a command, where no deferred
+///   request will ever be answered. Blocking the full stall timeout on one of
+///   those would make a correct case cost 30 seconds.
+///
+/// Five seconds is three orders of magnitude above the sub-millisecond a local
+/// nvim takes to format even the ~19KB `:digraphs` table, so no amount of load
+/// that leaves the rest of the suite viable can reach it; and a case that
+/// genuinely parks nvim mid-command costs five seconds once, not a hang.
+const MESSAGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Fold one `msg_show` UI notification into the echo-area text accumulated so
 /// far, honouring the event's own `append` flag.
 ///
@@ -396,6 +417,13 @@ struct NvimRpc {
     /// comment for the raw msgpack dumps that were read to confirm the
     /// shape).
     last_message: String,
+    /// How long [`NvimRpc::type_key`]'s post-keystroke barrier waits.
+    /// [`RPC_KEY_BARRIER`] for every real probe; a field rather than a
+    /// constant read so a harness self-test can force the worst case this
+    /// barrier has (`Duration::ZERO` — "the barrier always times out", which
+    /// is what a loaded machine produces intermittently) and prove
+    /// [`NvimRpc::settle_message`] still captures the whole message.
+    key_barrier: std::time::Duration,
 }
 
 impl NvimRpc {
@@ -478,6 +506,7 @@ impl NvimRpc {
             responses: std::collections::HashMap::new(),
             topline: 1,
             last_message: String::new(),
+            key_barrier: RPC_KEY_BARRIER,
         };
         let mut caps = vec![(Value::from("ext_linegrid"), Value::Boolean(true))];
         if capture_messages {
@@ -756,13 +785,51 @@ impl NvimRpc {
         if let Some(w0) = self.request_bounded(
             "nvim_eval",
             vec![Value::from("line('w0')")],
-            RPC_KEY_BARRIER,
+            self.key_barrier,
         )? {
             self.topline = w0
                 .as_i64()
                 .ok_or_else(|| format!("line('w0') was not an integer: {w0}"))?;
         }
         Ok(self.topline)
+    }
+
+    /// Block until the command the probe's keys started has **finished**, so
+    /// that every `msg_show` it emits has been folded into `last_message`
+    /// before a caller reads it.
+    ///
+    /// This is the fix for the intermittent `:digraphs` truncation [#1695's
+    /// test stage] hit, and it is a *different* bug from the `append`-flag one
+    /// [`fold_msg_show`] documents — that one dropped chunks that had already
+    /// arrived; this one read `last_message` before they arrived at all.
+    ///
+    /// [`type_key`](NvimRpc::type_key)'s barrier cannot stand in for this, by
+    /// design: it is bounded at [`RPC_KEY_BARRIER`] and *timing out is a
+    /// legitimate answer* there ("nvim is part-way through a command"), which
+    /// is precisely the state a key that starts a long listing leaves nvim in.
+    /// So for the suite's biggest message — the ~19KB `:digraphs` table, whose
+    /// formatting plus ~2,700-triple `msg_show` batch can exceed 50ms of
+    /// *wall clock* on a loaded box even though it is microseconds of CPU —
+    /// the last key's barrier expires mid-command, the probe reads a
+    /// half-arrived table, and the case reports as a digraph-table conformance
+    /// deviation. Green on an idle machine, red under a parallel run: the
+    /// worst possible failure mode, and one no amount of reading
+    /// `src/core/digraphs.rs` explains.
+    ///
+    /// Why one deferred request is enough, with no "has it stopped growing?"
+    /// polling: `nvim_eval` is served only from a safe point, i.e. after the
+    /// command returned to the main loop and the redraw carrying its final
+    /// `msg_show` ran — and frames are *ordered* on nvim's stdout, so by the
+    /// time this request's response is decoded, every notification nvim wrote
+    /// before it has already been read and folded by
+    /// [`await_response`](NvimRpc::await_response).
+    ///
+    /// Timing out is not an error, matching `type_key`'s posture: a case that
+    /// deliberately leaves nvim mid-command has no completed message to wait
+    /// for, and whatever was captured is still the right answer to compare.
+    fn settle_message(&mut self) -> Result<(), String> {
+        self.request_bounded("nvim_eval", vec![Value::from("1")], MESSAGE_SETTLE_TIMEOUT)?;
+        Ok(())
     }
 }
 
@@ -920,8 +987,31 @@ fn oracle_probe_message(
     keys: &str,
     setup: &str,
 ) -> Result<String, String> {
+    oracle_probe_message_with_barrier(
+        lines,
+        cursor_line_1,
+        cursor_col_1,
+        keys,
+        setup,
+        RPC_KEY_BARRIER,
+    )
+}
+
+/// [`oracle_probe_message`] with [`NvimRpc::key_barrier`] under the caller's
+/// control. Only the harness self-test that forces the barrier to always time
+/// out passes anything but [`RPC_KEY_BARRIER`] — see
+/// [`NvimRpc::settle_message`].
+fn oracle_probe_message_with_barrier(
+    lines: &[&str],
+    cursor_line_1: usize,
+    cursor_col_1: usize,
+    keys: &str,
+    setup: &str,
+    key_barrier: std::time::Duration,
+) -> Result<String, String> {
     let mut nvim =
         NvimRpc::spawn(true, None).ok_or_else(|| "could not spawn `nvim --embed`".to_string())?;
+    nvim.key_barrier = key_barrier;
     let mut lua = String::new();
     lua.push_str("vim.cmd('mapclear')\nvim.cmd('mapclear!')\n");
     lua.push_str("vim.o.inccommand = ''\n");
@@ -965,10 +1055,11 @@ fn oracle_probe_message(
     for key in nvim_key_tokens(keys) {
         nvim.type_key(&key)?;
     }
-    // `type_key`'s barrier (`nvim_eval "line('w0')"`) already proves the
-    // redraw that would carry a `msg_show` for the last key has happened, so
-    // no extra wait is needed here the way `request_pumped`'s hit-enter
-    // dismissal needs one elsewhere.
+    // `type_key`'s per-key barrier is bounded and *may legitimately time out*
+    // mid-command, so it does NOT prove the message is complete — which is how
+    // the ~19KB `:digraphs` table intermittently arrived truncated and read as
+    // a conformance deviation. `settle_message` is the barrier that does.
+    nvim.settle_message()?;
     Ok(nvim.last_message.clone())
 }
 
@@ -1759,6 +1850,69 @@ fn msg_show_missing_the_append_field_falls_back_to_replacing() {
     ];
     fold_msg_show(&mut last, &short);
     assert_eq!(last, "only");
+}
+
+/// The *other* half of the `:digraphs` truncation story, and the one
+/// [`fold_msg_show`]'s `append` fix did not cover: a chunk cannot be folded
+/// before it arrives, and nothing in the probe used to wait for it.
+///
+/// Driven against a real oracle with [`NvimRpc::key_barrier`] forced to
+/// `Duration::ZERO` — i.e. "`type_key`'s post-keystroke barrier always times
+/// out", which is a *deterministic* stand-in for what a loaded machine
+/// produces intermittently, and the exact state the `<CR>` that starts
+/// `:digraphs` leaves nvim in. Red against the unfixed probe: without
+/// [`NvimRpc::settle_message`] this captures an empty or part-formatted table
+/// (the pre-fix code read `last_message` straight after that timed-out
+/// barrier), which is reported as a digraph-table conformance deviation rather
+/// than as the transport fault it is.
+///
+/// Both probes are compared against each other rather than against a
+/// hardcoded table so that a future nvim's digraph list does not have to be
+/// re-captured here; the size floor is what stops two mutually-empty captures
+/// from passing.
+#[test]
+fn a_timed_out_key_barrier_still_captures_the_whole_digraphs_table() {
+    let Some(()) = oracle_available_for_unit_test() else {
+        return;
+    };
+
+    // Same fixture as `CASES_MESSAGE`'s own
+    // "msg:ex::digraphs lists the digraph table" case — the suite's largest
+    // message by an order of magnitude, hence the only one whose formatting
+    // can outlast a 50ms barrier.
+    let full = oracle_probe_message(&["hello"], 1, 1, ":digraphs<CR>", "")
+        .expect("oracle message probe failed");
+    assert!(
+        full.len() > 10_000,
+        "setup sanity: `:digraphs` must produce a listing-sized message for \
+         this test to be about truncation at all, got {} bytes",
+        full.len()
+    );
+
+    let forced = oracle_probe_message_with_barrier(
+        &["hello"],
+        1,
+        1,
+        ":digraphs<CR>",
+        "",
+        std::time::Duration::ZERO,
+    )
+    .expect("oracle message probe failed");
+
+    assert_eq!(
+        forced.len(),
+        full.len(),
+        "a timed-out per-key barrier must not truncate the capture: got {} \
+         bytes with the barrier forced to expire vs {} with the normal one. \
+         `oracle_probe_message` must wait for the *command* to finish \
+         (`settle_message`), not only for the last keystroke to be consumed.",
+        forced.len(),
+        full.len()
+    );
+    assert_eq!(
+        forced, full,
+        "the forced-timeout capture must be byte-identical to the normal one"
+    );
 }
 
 /// A mismatch on a listing-sized message must report a *bounded, readable*
