@@ -73,6 +73,18 @@ impl Engine {
         }
     }
 
+    /// Collapse every expanded directory except the workspace root (#1693,
+    /// the Explorer header toolbar's "Collapse All" button/overflow-menu
+    /// item). Mirrors VS Code's own Collapse All: the root row stays
+    /// expanded — its immediate children remain visible — only *nested*
+    /// expansions reset, so the whole tree doesn't vanish under one row.
+    pub fn explorer_collapse_all(&mut self) {
+        let root = self.cwd.clone();
+        self.explorer_expanded.clear();
+        self.explorer_expanded.insert(root);
+        self.explorer_rebuild_rows();
+    }
+
     /// Expand every ancestor of `target`, rebuild the flattened row list,
     /// select `target`'s row and scroll it into view.
     ///
@@ -562,6 +574,57 @@ impl Engine {
         }
         ExplorerKeyResult::Consumed
     }
+
+    /// Activate a view-actions toolbar button by index: 0=New File,
+    /// 1=New Folder, 2=Refresh, 3=Collapse All (#1693). Index 4 (the "..."
+    /// overflow button) is deliberately not handled here — unlike the
+    /// other four, it needs the click's pixel position to anchor the popup
+    /// (see `Engine::open_explorer_overflow_menu`), so the caller
+    /// (`render::explorer_toolbar_click_at`) opens it directly instead of
+    /// routing through this index-only dispatch.
+    pub fn explorer_activate_toolbar_action(&mut self, idx: usize) {
+        match idx {
+            0 => {
+                self.dispatch_explorer_crud(ExplorerAction::NewFile);
+            }
+            1 => {
+                self.dispatch_explorer_crud(ExplorerAction::NewFolder);
+            }
+            2 => self.explorer_needs_refresh = true,
+            3 => self.explorer_collapse_all(),
+            _ => {}
+        }
+    }
+}
+
+/// Stable `quadraui::WidgetId` strings for the Explorer header's
+/// view-actions toolbar row (#1693) — mirrors `source_control.rs`'s
+/// `SC_BUTTON_IDS` convention. Index 4 is the "..." overflow menu button;
+/// the acceptance bar for #1693 is that this id is reachable from the
+/// painted header, not that the menu it opens is exhaustive.
+pub const EXPLORER_TOOLBAR_ACTION_IDS: [&str; 5] = [
+    "explorer:new_file",
+    "explorer:new_folder",
+    "explorer:refresh",
+    "explorer:collapse_all",
+    "explorer:overflow",
+];
+
+impl Engine {
+    /// Stable `quadraui::WidgetId` for Explorer toolbar button `idx`, or
+    /// `None` if out of range.
+    pub fn explorer_toolbar_action_id(idx: usize) -> Option<quadraui::WidgetId> {
+        EXPLORER_TOOLBAR_ACTION_IDS
+            .get(idx)
+            .map(|s| quadraui::WidgetId::new(*s))
+    }
+
+    /// Inverse of [`Self::explorer_toolbar_action_id`].
+    pub fn explorer_toolbar_action_index(id: &quadraui::WidgetId) -> Option<usize> {
+        EXPLORER_TOOLBAR_ACTION_IDS
+            .iter()
+            .position(|s| *s == id.as_str())
+    }
 }
 
 pub fn build_explorer_rows(
@@ -1000,6 +1063,68 @@ mod explorer_exclude_tests {
             !names.contains(&".git"),
             "'.git' must stay hidden via explorer_exclude even with show_hidden true; \
              got {names:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1693 acceptance item 1: "the tree's first row is the workspace
+    /// name" — asserted directly against [`build_explorer_rows`] (every
+    /// backend's `explorer_rows` field comes from exactly this function,
+    /// via `Engine::explorer_rebuild_rows`), rather than relying on it
+    /// holding only incidentally through some other test. Backend-neutral
+    /// by construction, so it covers Win-GUI equally even though there is
+    /// no Win-GUI driver harness to paint through yet (`src/win/mod.rs`'s
+    /// own doc covers why).
+    #[test]
+    fn build_explorer_rows_first_row_is_the_workspace_root_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "vc1693_workspace_root_row_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sibling.txt"), b"").unwrap();
+
+        // Root collapsed (not in `expanded`): the workspace row must still
+        // be the one and only row, not an empty list.
+        let collapsed = build_explorer_rows(&dir, &HashSet::new(), false, false, &[]);
+        let expected_name = dir.file_name().unwrap().to_string_lossy().to_uppercase();
+        assert_eq!(
+            collapsed.len(),
+            1,
+            "a collapsed root must paint exactly one row (itself), not its \
+             children too; got {collapsed:?}"
+        );
+        assert_eq!(collapsed[0].depth, 0, "the workspace row is depth 0");
+        assert!(collapsed[0].is_dir, "the workspace row is a directory");
+        assert!(
+            !collapsed[0].is_expanded,
+            "a root not in `expanded` must paint as collapsed"
+        );
+        assert_eq!(
+            collapsed[0].name, expected_name,
+            "the workspace row's name must be the directory's own basename"
+        );
+
+        // Root expanded: still row 0, and real children now nest at depth 1.
+        let mut expanded = HashSet::new();
+        expanded.insert(dir.clone());
+        let rows = build_explorer_rows(&dir, &expanded, false, false, &[]);
+        assert_eq!(
+            rows[0].depth, 0,
+            "the workspace row stays row 0 once expanded"
+        );
+        assert_eq!(rows[0].name, expected_name);
+        assert!(rows[0].is_expanded);
+        assert!(
+            rows.iter().skip(1).all(|r| r.depth >= 1),
+            "every row below the workspace root must nest at least one \
+             level deeper; got {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.name == "sibling.txt" && r.depth == 1),
+            "the workspace root's direct child must nest at depth 1; got {rows:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

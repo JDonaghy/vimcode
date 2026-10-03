@@ -1612,6 +1612,14 @@ pub enum ContextMenuTarget {
     ExplorerDir {
         path: PathBuf,
     },
+    /// The Explorer header's "..." overflow menu (#1693) — opened from the
+    /// view-actions toolbar row, not a right-clicked row, so (unlike
+    /// [`Self::ExplorerFile`]/[`Self::ExplorerDir`]) it carries no target
+    /// path: every action it offers (New File, New Folder, Refresh,
+    /// Collapse All) is the same panel-level operation the toolbar's own
+    /// buttons run, fully resolved inside `Engine::context_menu_confirm`
+    /// with no backend follow-up needed.
+    ExplorerPanel,
     Editor,
     EditorActionMenu {
         group_id: GroupId,
@@ -3746,6 +3754,13 @@ pub struct Engine {
     pub explorer_tree_rect: std::cell::Cell<quadraui::Rect>,
     /// Cached viewport row count from last render frame.
     pub explorer_viewport_rows: std::cell::Cell<usize>,
+    /// Hit regions for the Explorer panel's view-actions toolbar row
+    /// (#1693: New File / New Folder / Refresh / Collapse All / "..."
+    /// overflow) — populated straight from `SidebarPanelBodyLayout::
+    /// status_bar_hit_regions`, not re-derived. Mirrors
+    /// `dap_sidebar_action_hits` (see that field's doc for the "paint
+    /// caches, click reads" contract this follows).
+    pub explorer_toolbar_hits: std::cell::RefCell<Vec<(quadraui::Rect, quadraui::StatusBarHit)>>,
     /// Whether the debug toolbar strip is shown (persistent for now; later: only during DAP session).
     pub debug_toolbar_visible: bool,
     /// Cached layout of the debug action-button `quadraui::Toolbar` from the
@@ -5345,6 +5360,7 @@ impl Engine {
             explorer_new_entry_pending: None,
             explorer_tree_rect: std::cell::Cell::new(quadraui::Rect::new(0.0, 0.0, 0.0, 0.0)),
             explorer_viewport_rows: std::cell::Cell::new(0),
+            explorer_toolbar_hits: std::cell::RefCell::new(Vec::new()),
             debug_toolbar_visible: false,
             debug_toolbar_layout: std::cell::RefCell::new(None),
             debug_button_hovered: None,

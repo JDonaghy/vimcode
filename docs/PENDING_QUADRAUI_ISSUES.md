@@ -2473,3 +2473,28 @@ different component (`MinimapLayout::scrollbar`, not the Explorer's
 so a future reader doesn't have to re-derive that these are siblings, not
 duplicates, of this entry.
 
+---
+
+## `TreeView`/`TreeRow` has no indent-guide primitive — every pixel backend's tree rasteriser only offsets rows by `indent`, it never paints the vertical rule VS Code draws per nesting level
+
+**Title:** `primitives::tree`'s indent math (`cursor_x = row_x + 2.0 + row.indent as f32 * indent_px`, `native_surface_paint::paint`) only ever moves the chevron/icon/label block to the right — there is no companion "draw a 1px vertical line at each ancestor's indent column" step anywhere in the primitive, `TreeStyle`, or any of the four backend rasterisers (`win::tree::draw_tree`, `gtk::tree`, `macos::tree`, `tui::tree` all delegate to the same shared `native_surface_paint::paint`/TUI equivalent). VS Code's Explorer draws a faint vertical guide for every ancestor level a deeply-nested row has; vimcode's tree has never drawn one, on any backend.
+
+**Body:**
+
+Surfaced by vimcode#1693 ("Explorer is missing VS Code's structure"), whose ask item 4 ("indent guides — a vertical rule per nesting level") is explicitly called out as "the Win-GUI counterpart of vimcode#38, which covers GTK" — i.e. this is not new information specific to Win-GUI, it is a gap in the shared primitive that happens to have two open vimcode-side tracking issues (GTK's #38, Win-GUI's #1693) because nothing in quadraui paints it on *any* backend yet.
+
+Confirmed at the pinned rev (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) by reading:
+- `quadraui/src/types.rs`'s `TreeStyle` — fields are `indent` (px/cells per level), `show_chevrons`, `chevron_expanded`/`chevron_collapsed`, `row_height`. No guide-colour, guide-width, or guide-on/off field exists to even opt into.
+- `quadraui/src/primitives/tree.rs` — the only place `row.indent` is read for paint is the `cursor_x = row_x + 2.0 + row.indent as f32 * indent_px` line that positions the chevron/icon/text block. Nothing between the row's left edge and that offset is painted at all (no fill, no line) — it is background colour showing through, by omission rather than by an explicit "no guide" choice.
+- `quadraui/src/win/tree.rs`, `gtk/tree.rs`, `macos/tree.rs` — none paint anything in that gap either; all three (and TUI's own tree rasteriser) delegate row content painting to the one shared `native_surface_paint::paint` fn this primitive's module doc describes, so the gap is provably identical across every backend, not independently missing four times.
+
+**Ask:**
+
+1. Add an opt-in indent-guide style to `TreeStyle` — e.g. `pub guide: Option<IndentGuideStyle>` where `IndentGuideStyle { color: Color, width: f32 }` (`None` default preserves today's no-guide behaviour for every existing caller, so this is additive, not breaking).
+2. When set, `native_surface_paint::paint` draws one vertical line per ancestor indent level (`0..row.indent`) at `row_x + 2.0 + level as f32 * indent_px + (indent_px / 2.0)` (centered in the level's column, roughly matching VS Code's own placement), spanning the row's full height, in `guide.color`/`guide.width`.
+3. TUI's tree rasteriser needs the character-grid equivalent — a single-cell vertical-bar glyph (`│`, U+2502) per ancestor column instead of a sub-cell line, since a terminal cell can't be subdivided (same "TUI ignores this, GUI backends use real sub-pixel geometry" split `TreeStyle::row_height`'s own doc already draws for a different field).
+
+**Test:** None added this round — this entry is a drafted gap report, not a landed fix; a conformance-style scenario asserting guide pixels appear at each ancestor's indent column (mirroring this file's other entries' "Test" sections, which describe characterizations added *alongside* a fix) is the natural shape once the `Ask` lands.
+
+**Blocks:** `JDonaghy/vimcode#38` (GTK) and `JDonaghy/vimcode#1693` (Win-GUI). Leave both open behind this one per `GOALS.md`'s milestone-discipline rule — there is no per-backend vimcode-side fix available; the gap is in `primitives::tree`/`TreeStyle`, shared by every backend.
+

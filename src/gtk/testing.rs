@@ -5903,6 +5903,133 @@ mod sidebar_panel_clicks {
         );
     }
 
+    /// #1693 acceptance item 3: the Explorer header must expose an
+    /// overflow-menu widget id, not just a bare "EXPLORER" title bar with
+    /// no actions. This is the "fails first against unfixed `develop`"
+    /// black-box test the issue asks for — before this PR there was no
+    /// `SidebarPanelChrome` row at all over the Explorer tree, so neither
+    /// the "..." glyph nor `explorer:overflow` painted/hit-tested, and
+    /// this assertion was RED against unfixed `develop` (confirmed by
+    /// temporarily reverting the `PANEL_EXPLORER` chrome arm back to
+    /// `SidebarPanelChrome::None` while writing this test).
+    #[test]
+    fn explorer_header_view_actions_row_exposes_an_overflow_menu_widget_id() {
+        let h = panel_harness(PANEL_EXPLORER);
+
+        assert!(
+            h.driver.screen_contains("\u{2026}"),
+            "the Explorer header's \"...\" overflow button must actually be \
+             painted, not just recorded in a layout cache; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        let overflow_id = quadraui::WidgetId::new("explorer:overflow");
+        let hits = h.engine.borrow().explorer_toolbar_hits.borrow().clone();
+        assert!(
+            hits.iter().any(|(_, hit)| matches!(
+                hit,
+                quadraui::StatusBarHit::Segment(id) if *id == overflow_id
+            )),
+            "the toolbar's painted hit regions (captured straight from \
+             SidebarPanelBodyLayout::status_bar_hit_regions, not re-derived) \
+             must include a segment whose widget id is \"explorer:overflow\": {hits:?}"
+        );
+    }
+
+    /// Clicking the Explorer header's "..." button must open a real popup
+    /// menu offering the same four operations as the toolbar's own
+    /// buttons (#1693) — `Engine::open_explorer_overflow_menu` through the
+    /// generic `engine.context_menu` paint path every other context menu
+    /// (editor / tab bar / explorer row) already uses.
+    #[test]
+    fn clicking_the_explorer_overflow_button_opens_a_menu_with_new_file_and_collapse_all() {
+        let mut h = panel_harness(PANEL_EXPLORER);
+        h.driver.render();
+        let (x, y) = h.driver.find("\u{2026}").unwrap_or_else(|| {
+            panic!(
+                "could not find the overflow button's \"...\" glyph; painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        h.driver.click(x, y);
+
+        assert!(
+            h.driver.screen_contains("New File..."),
+            "the overflow menu must offer \"New File...\"; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("Collapse Folders in Explorer"),
+            "the overflow menu must offer \"Collapse Folders in Explorer\"; \
+             painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    /// Clicking the Explorer header's "Collapse All" toolbar button must
+    /// collapse every expanded directory except the workspace root (#1693)
+    /// — asserted on painted content (a deeply nested file's row vanishes
+    /// from the screen), not on `explorer_expanded`'s size alone, per
+    /// `CLAUDE.md`'s "assert on rendered output" testing rule.
+    #[test]
+    fn clicking_explorer_collapse_all_collapses_nested_directories_but_keeps_the_root_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "vimcode_test_1693_collapse_all_{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("sub").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        let deep_file = nested.join("deepfile.txt");
+        std::fs::write(&deep_file, "marker\n").unwrap();
+
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(false);
+        engine.cwd = dir.clone();
+        engine
+            .app_shell
+            .show_panel(&quadraui::WidgetId::new(PANEL_EXPLORER));
+        engine.explorer_reveal_path(&deep_file);
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        assert!(
+            h.driver.screen_contains("deepfile.txt"),
+            "precondition: revealing the deep file must expand every \
+             ancestor so its row is actually painted; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+
+        // `explorer_toolbar_status_bar` pads every fallback glyph with a
+        // leading/trailing space (`" c "`), so searching for that padded
+        // form (rather than a bare `"c"`) can't accidentally match a `c`
+        // inside a painted file/directory name.
+        let (x, y) = h.driver.find(" c ").unwrap_or_else(|| {
+            panic!(
+                "could not find Collapse All's \" c \" fallback glyph; \
+                 painted texts: {:?}",
+                h.driver.painted_texts()
+            )
+        });
+
+        h.driver.click(x, y);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !h.driver.screen_contains("deepfile.txt"),
+            "Collapse All must collapse the nested directories so the deep \
+             file's row is no longer painted; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+        assert!(
+            h.driver.screen_contains("sub"),
+            "Collapse All must keep the workspace root expanded, so its \
+             immediate child \"sub\" stays visible; painted texts: {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
     /// An editor text-selection drag that wanders over the sidebar must still
     /// finalise in the editor: only a press that a panel *claimed* captures the
     /// rest of the gesture. Guards the `sidebar_pointer_captured` follow-through

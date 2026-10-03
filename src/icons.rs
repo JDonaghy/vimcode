@@ -142,6 +142,16 @@ pub const FILE_GENERIC: Icon = Icon::new("\u{f15b}", " "); // (space)
 pub const FILE_TEXT: Icon = Icon::new("\u{f0f6}", " "); // text file
 pub const TRASH: Icon = Icon::new("\u{f1f8}", "x"); // x
 
+// #1693: the Explorer header's view-actions row (New File / New Folder /
+// Refresh / Collapse All / "..." overflow) — mirrors VS Code's Explorer
+// toolbar. Fallback glyphs are deliberately distinct single characters so
+// a headless driver test can tell the buttons apart via `find_bounds`.
+pub const EXPLORER_NEW_FILE: Icon = Icon::new("\u{f15b}", "n"); // nf-fa-file_o
+pub const EXPLORER_NEW_FOLDER: Icon = Icon::new("\u{f07b}", "N"); // nf-fa-folder
+pub const EXPLORER_REFRESH: Icon = Icon::new("\u{f021}", "r"); // nf-fa-refresh
+pub const EXPLORER_COLLAPSE_ALL: Icon = Icon::new("\u{f066}", "c"); // nf-fa-compress
+pub const EXPLORER_OVERFLOW: Icon = Icon::new("\u{f141}", "\u{2026}"); // nf-fa-ellipsis_h / …
+
 // ─── File Type Icons ─────────────────────────────────────────────────────────
 
 pub const FILE_RUST: Icon = Icon::new("\u{e7a8}", "R");
