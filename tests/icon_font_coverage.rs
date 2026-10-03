@@ -261,6 +261,30 @@ fn sanity_known_codepoints_are_parsed_from_icons_rs() {
     );
 }
 
+#[test]
+fn bundled_font_covers_the_explorer_view_actions_glyphs() {
+    // #1693 named-regression anchor: the Explorer view-actions toolbar
+    // introduced the first two `Icon::new` codepoints that were *not*
+    // already in the bundled subset (U+F066 `fa-compress` for Collapse
+    // All, U+F141 `fa-ellipsis_h` for the "..." overflow menu), so the
+    // branch shipped a font that rendered both as tofu until the subset
+    // was regenerated. `bundled_font_covers_every_icon_codepoint` above
+    // catches this generically; this test names the two codepoints so the
+    // failure says *which* feature lost its glyphs rather than just
+    // printing a bare codepoint list.
+    let covered = font_covered_codepoints(FONT_BYTES);
+    for (cp, what) in [
+        (0xF066, "EXPLORER_COLLAPSE_ALL (nf-fa-compress)"),
+        (0xF141, "EXPLORER_OVERFLOW (nf-fa-ellipsis_h)"),
+    ] {
+        assert!(
+            covered.contains(&cp),
+            "data/fonts/vimcode-icons.ttf is missing U+{cp:04X}, used by \
+             {what} -- regenerate the subset with scripts/gen_icon_font.py"
+        );
+    }
+}
+
 // ─── #1540: no raw PUA literal outside icons.rs ─────────────────────────────
 
 /// Same PUA ranges the #1540 bug used: BMP Private Use Area, plus the
