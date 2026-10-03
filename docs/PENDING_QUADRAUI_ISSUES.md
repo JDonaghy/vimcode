@@ -1857,3 +1857,125 @@ vimcode-side fix available; `WinBackend` is a 1-line quadraui re-export
 (`src/win/backend.rs`), and every file named above lives in quadraui, not
 in this repo.
 
+---
+
+## `AppShell::build_activity_bar` hardcodes `active_accent: None`/`selection_bg: None` with no `Theme` in scope — the activity bar paints no active-view accent line on any backend, already tracked as quadraui#381 by the hardcoding comment itself (blocks vimcode#1689)
+
+**Title:** vimcode#1689 reports the Win-GUI activity bar painting no 2px
+left-edge accent strip beside the active (Explorer) icon, despite
+vimcode#1547 ("Activity bar: paint an active-view accent line") having
+closed with `render::build_activity_bar` setting
+`active_accent: Some(theme.activity_active_accent...)` and
+`win::activity_bar`'s own rasteriser documenting that it paints the strip
+"only when that field is `Some`". A column scan of the real on-screen
+activity bar's left edge over the Explorer row band, from the issue's own
+side-by-side capture, returns a single uniform colour — the bar's
+background, `#262633` — with zero accent pixels.
+
+**Root-caused by reading the real source at the pinned rev
+(`ca7fcc83afad01ec3422f79366566f3a263b22bf`), ruling out both halves the
+issue itself already names as "looking wired":**
+
+- **Not `render::build_activity_bar` (the function #1547 fixed).** It does
+  set `active_accent: Some(..)` from `theme.activity_active_accent`
+  exactly as intended (`src/render.rs:19440`, pinned down by that fix's own
+  regression test, `build_activity_bar_active_accent_uses_activity_active_
+  accent_not_cursor`) — **but that function has zero production callers.**
+  `grep -rn 'build_activity_bar(' src/` (the free function, not the
+  `AppShell` method of the same name) returns only its own definition, its
+  own test, and doc-comment cross-references — no call site in
+  `src/app.rs` or anywhere else in this crate ever invokes it. #1547's own
+  test file already says this outright: "as of #1434, `render::
+  build_activity_bar` itself has no production caller — `App` renders
+  through `quadraui::compose::app_shell::AppShell::build_activity_bar`
+  instead ... this test pins the adapter's own field-mapping correctness
+  so it's ready the moment such a hook lands ... it does not claim the
+  accent line paints in the shipped app today." #1547 closed on a function
+  nothing calls; this issue is that promise coming due.
+- **Not `win::activity_bar::draw_activity_bar`/the shared
+  `native_surface_paint::paint`.** Read directly
+  (`primitives/activity_bar.rs:656-659`): `if item.is_active { if let
+  Some(accent) = bar.active_accent { surface.surface_fill_rect(Rect::new(
+  0.0, y, 2.0, row_h), accent); } }` — correct, and already covered by that
+  module's own passing `paint_and_hit_test_round_trip` test (a hand-built
+  `ActivityBar { active_accent: Some(..), .. }` fixture paints the strip
+  fine). Every one of the three backends' rasterisers (`win`/`gtk`/`macos`)
+  shares this one `native_surface_paint::paint` function, so none of the
+  three has a backend-specific accent bug.
+- **The actual break: `AppShell::build_activity_bar`
+  (`compose/app_shell.rs:874-934`), which every real `App` on every
+  backend (GTK/macOS/TUI/Win-GUI) renders its activity bar through, not
+  `render::build_activity_bar`.** Its own doc comment admits the gap
+  outright, naming the issue number this entry now files: `active_accent:
+  None, // #658: AppShell has no Theme in scope here to source a colour
+  from (that wiring is #381's job), so the accent line is left unset
+  rather than hardcoded.` `selection_bg: None` sits right next to it, same
+  reason. So **every** real `App` render — not just Win-GUI — paints zero
+  accent pixels regardless of which panel is active; Win-GUI is just the
+  backend vimcode#1689 happened to observe and screenshot. Confirmed this
+  is not already superseded: `grep -rn 'active_accent' quadraui/src/
+  compose/` at the pinned rev shows `tab_group.rs:484` and
+  `bottom_panel.rs:413` carry the identical `None` hardcode for their own
+  analogous fields, so this is a systemic "`AppShell`/compose layer has no
+  `Theme` to source chrome colours from" gap, not unique to the activity
+  bar — but this entry scopes its ask to the activity bar, the one
+  vimcode#1689 reports.
+
+**Why vimcode can't fix this itself (Platform-Neutrality Rule):**
+`AppShell` and its `build_activity_bar` method are entirely inside
+quadraui (`quadraui::compose::app_shell`); `src/win/backend.rs` and
+`src/win/mod.rs` are 1-line re-exports (per this file's own established
+precedent for Win-GUI entries), and the two GTK/macOS/TUI runners call the
+exact same `AppShell::build_activity_bar` through quadraui's own
+`shell_adapter.rs` — there is no per-backend call site in this repo for
+any fix to attach to. `render::build_activity_bar` (#1547's own, orphaned
+function) cannot be wired back in without quadraui first giving `AppShell`
+either a `Theme` parameter or a way for the caller to override/post-process
+the `ActivityBar` it returns before it reaches `Backend::draw_activity_bar`.
+
+**Ask:** give `AppShell::build_activity_bar` a path to a theme-sourced
+`active_accent` (and ideally `selection_bg`) — e.g. an `AppShell::
+set_active_accent(Color)` / `set_selection_bg(Color)` setter the host
+calls once per frame (mirroring how `Backend::set_theme` already works),
+or a `&Theme` parameter threaded through `build_activity_bar` itself. Once
+either lands, this repo's own fix is small and already drafted: call
+`App::sync_per_frame_backend_state`'s existing per-frame sync point to
+push `theme.activity_active_accent`/`theme.cursor` through the new hook,
+and delete `render::build_activity_bar`'s now-redundant hand-rolled
+adapter (or repoint it to the real call site, whichever the landed API
+shape makes more natural) — no new per-backend code either way, matching
+the Platform-Neutrality Rule.
+
+**Also missing, same widget (secondary ask, lower priority):** VS Code
+additionally paints a rounded-rect background behind the active icon.
+`ActivityBarStyle::active_bg` (quadraui#658, the sidecar struct
+`win::activity_bar`'s own doc references) already exists for exactly this
+and `native_surface_paint::paint` already honours it when set — but
+`AppShell::render`'s own call site never passes a non-default
+`ActivityBarStyle` (its doc: "`AppShell` still calls the plain
+`draw_activity_bar`, which never paints a fill"). Worth wiring alongside
+the accent fix above, through whichever hook lands, once the primary ask
+is resolved.
+
+**Test:** `src/win/mod.rs::win_driver_tests::
+activity_bar_paints_active_accent_strip_on_the_open_panel_1689` (added
+alongside this entry) — a Tier-1 black-box scenario against the real
+`App`/`WinDriver` pipeline (not a hand-built `ActivityBar` fixture like
+the passing rasteriser-level test above): with `Engine::new_for_test()`'s
+default state (Explorer active, sidebar visible — no setup needed, this
+*is* the issue's own reported scenario), it pixel-probes the activity
+bar's left-edge column at the Explorer row's vertical centre and asserts
+it equals `theme.activity_active_accent`, and that the same column at the
+(inactive) Search row does not. Mechanically certain to fail against the
+pinned rev (every function in the root-cause above was read directly) and
+to pass once quadraui wires a theme-sourced `active_accent` through
+`AppShell::build_activity_bar` — but, per `src/win/mod.rs`'s own top-of-file
+#1558 disclaimer, could not be *executed* from this Linux worktree to
+observe that RED/GREEN flip directly; a source-level RED confirmation is
+stated explicitly in the test's own doc comment instead.
+
+**Blocks:** `JDonaghy/vimcode#1689`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available; every file in the root-cause above lives in
+quadraui, not in this repo.
+

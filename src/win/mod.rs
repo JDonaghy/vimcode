@@ -902,7 +902,7 @@ mod win_ctrl_key_translation_tests_1674 {
 #[cfg(all(test, feature = "win"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -983,6 +983,45 @@ mod win_driver_tests {
         let screen_layout = Rc::clone(&app.cached_screen_layout);
         let driver = driver_with_shell(app, config, width, height);
         ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
+    }
+
+    /// [`conformance_harness`], plus a live handle to `App::menu_row_rect`
+    /// (#552/#720) — needed by [`activity_bar_paints_active_accent_strip_
+    /// on_the_open_panel_1689`] below to locate the activity bar's own
+    /// y-origin (`menu_row_rect.y + menu_row_rect.height`, the bottom edge
+    /// of the reserved title-bar band the activity bar sits directly below)
+    /// without hardcoding chrome pixel geometry — mirrors `crate::gtk::
+    /// testing::Harness`'s identical `menu_row_rect` capture (that struct's
+    /// own doc: "so the headless test harness can... aim pixel probes at
+    /// the row the renderer actually used, instead of hardcoding chrome
+    /// coordinates"). `menu_row_rect` lives on the backend-neutral `App`
+    /// itself (`src/app.rs`), not behind any GTK-specific type, so this is
+    /// the same one-line `Rc::clone` capture as `conformance_harness_with_
+    /// screen_layout` above, just for a different field.
+    fn conformance_harness_with_menu_row_rect(
+        engine: Engine,
+        width: u32,
+        height: u32,
+    ) -> (
+        ConformanceHarness<quadraui::win::testing::WinDriver<impl quadraui::AppLogic>>,
+        Rc<Cell<quadraui::Rect>>,
+    ) {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
+        let menu_row_rect = Rc::clone(&app.menu_row_rect);
+        let driver = driver_with_shell(app, config, width, height);
+        (
+            ConformanceHarness::new(driver, engine, paint, cwd),
+            menu_row_rect,
+        )
     }
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -1735,6 +1774,132 @@ mod win_driver_tests {
             "the fuzzy-finder picker must actually paint, not just set \
              engine state; painted texts were {:?}",
             h.driver.painted_texts()
+        );
+    }
+
+    // ── #1689: activity bar paints no active-view accent line on Win-GUI ──
+    //
+    // Root-caused by reading the real source at the pinned rev
+    // (`ca7fcc83afad01ec3422f79366566f3a263b22bf`), ruling out both halves
+    // vimcode#1689 itself already names as "looking wired":
+    //
+    // - `render::build_activity_bar` (`src/render.rs:19440`) *does* set
+    //   `active_accent: Some(theme.activity_active_accent...)`, exactly as
+    //   #1547 intended — but that function has **zero production callers**
+    //   (see its own test's doc, `render.rs`'s
+    //   `build_activity_bar_active_accent_uses_activity_active_accent_not_
+    //   cursor`): every real `App` renders its activity bar through
+    //   `quadraui::compose::app_shell::AppShell::build_activity_bar`
+    //   instead (`quadraui/src/compose/app_shell.rs:874`), which this
+    //   repo's own `App` never overrides or post-processes — no call site
+    //   in `src/app.rs` ever constructs or touches a `quadraui::
+    //   ActivityBar` directly.
+    // - `win::activity_bar::draw_activity_bar`/`native_surface_paint::paint`
+    //   (`primitives/activity_bar.rs:656`) *does* paint the 2-DIP left-edge
+    //   strip whenever `item.is_active && bar.active_accent.is_some()` —
+    //   confirmed by that module's own
+    //   `paint_and_hit_test_round_trip` test, which passes today with a
+    //   hand-built `ActivityBar { active_accent: Some(..), .. }` fixture.
+    //
+    // The actual break is upstream of both: `AppShell::build_activity_bar`
+    // (`compose/app_shell.rs:932`) hardcodes `active_accent: None` (and
+    // `selection_bg: None`) unconditionally, with its own doc comment
+    // admitting it outright — `AppShell` has no `Theme` in scope to source
+    // a colour from, "that wiring is #381's job" — so every real `App`
+    // render, on every backend (GTK/macOS/TUI included, not just Win-GUI;
+    // this entry only probes Win-GUI per vimcode#1689's own scope), paints
+    // zero accent pixels regardless of which panel is active. Nothing in
+    // this vimcode repo can fix this — `AppShell` and its `build_
+    // activity_bar` are entirely inside quadraui, and `src/win/backend.rs`/
+    // this file are 1-line re-exports, per the Platform-Neutrality Rule.
+    // `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry drafts the upstream ask
+    // (thread a `&Theme` into `AppShell::build_activity_bar`, or let the
+    // caller post-process the returned `ActivityBar` — quadraui#381).
+    //
+    // Mechanically certain to fail against the pinned rev (every function
+    // named above was read directly) and to pass once quadraui wires a
+    // theme-sourced `active_accent` through `AppShell::build_activity_bar`
+    // — but, per this module's own top-of-file #1558 disclaimer, could not
+    // be *executed* from this Linux worktree to observe that RED/GREEN
+    // flip directly; this is a source-level RED confirmation, stated
+    // explicitly here rather than left to the inherited blanket
+    // disclaimer, exactly like `colorscheme_change_repaints_editor_and_
+    // explorer_sidebar_1667` above.
+    //
+    // Geometry: Explorer is `Engine::new_for_test()`'s default active panel
+    // (`quadraui::AppShell::new` defaults `active_panel: Some(0)`,
+    // `sidebar_visible: true`, and `FIXED_ACTIVITY_PANEL_IDS[0] ==
+    // PANEL_EXPLORER`), so no setup is needed to reach the exact scenario
+    // the issue reports ("the Explorer is the open view"). The activity
+    // bar's y-origin is read from the live `App::menu_row_rect` (via
+    // `conformance_harness_with_menu_row_rect`, not hardcoded) rather than
+    // assumed, since it depends on the real `title_bar_lh * line_height`
+    // product and DirectWrite's own font metrics. Each top item then
+    // occupies one fixed `quadraui::win::ACTIVITY_ROW_DIP`-tall band below
+    // that, in `FIXED_ACTIVITY_PANEL_IDS` order (Explorer first, Search
+    // second) — `ActivityBar::layout`'s own source confirms top items are
+    // placed `(i as f32) * item_height` in bar-local y, so index 0 starts
+    // at the bar's own top edge with no additional offset to account for.
+    #[cfg_attr(target_os = "windows", test)]
+    fn activity_bar_paints_active_accent_strip_on_the_open_panel_1689() {
+        let mut engine = plain_engine();
+        engine.settings.colorscheme = "vscode-dark".to_string();
+        let (mut h, menu_row_rect) = conformance_harness_with_menu_row_rect(engine, 1400, 900);
+        h.driver.render();
+
+        assert_eq!(
+            h.engine
+                .borrow()
+                .app_shell
+                .active_panel_id()
+                .map(|w| w.as_str().to_string()),
+            Some(crate::core::engine::sidebar::PANEL_EXPLORER.to_string()),
+            "precondition: Explorer must be the default active panel, or \
+             this scenario isn't the one vimcode#1689 reports"
+        );
+        assert!(
+            h.engine.borrow().app_shell.sidebar_visible(),
+            "precondition: the sidebar (and therefore the Explorer panel) \
+             must start visible"
+        );
+
+        let theme = crate::render::Theme::vscode_dark();
+        let accent = theme.activity_active_accent;
+        // `quadraui::win::ACTIVITY_ROW_DIP` (= `48.0`, VS-Code parity, same
+        // value as `quadraui::gtk::ACTIVITY_ROW_PX`) is gated
+        // `#[cfg(target_os = "windows")]` on the re-export path, unlike the
+        // rest of this module's symbols — unreachable from a plain
+        // `--features win` type-check on Linux, so inlined here with the
+        // cross-reference instead of imported.
+        let row_h: f32 = 48.0;
+        let ab_top = menu_row_rect.get().y + menu_row_rect.get().height;
+
+        // Explorer: top_items[0] -> bar-local y in [0, row_h).
+        let explorer_mid_y = (ab_top + row_h / 2.0) as u32;
+        // Search: top_items[1] -> bar-local y in [row_h, 2*row_h).
+        let search_mid_y = (ab_top + row_h + row_h / 2.0) as u32;
+
+        let active_px = h.driver.pixel(1, explorer_mid_y);
+        assert_eq!(
+            (active_px.r, active_px.g, active_px.b),
+            (accent.r, accent.g, accent.b),
+            "the open Explorer panel's row must paint a {:?} accent strip \
+             at the activity bar's left edge (x=1, y={explorer_mid_y}) — \
+             got {:?} instead (quadraui's `AppShell::build_activity_bar` \
+             hardcodes `active_accent: None`, see this test's own doc)",
+            accent,
+            (active_px.r, active_px.g, active_px.b),
+        );
+
+        let inactive_px = h.driver.pixel(1, search_mid_y);
+        assert_ne!(
+            (inactive_px.r, inactive_px.g, inactive_px.b),
+            (accent.r, accent.g, accent.b),
+            "the inactive Search row must NOT paint the accent colour at \
+             the same x=1 column (y={search_mid_y}) — got {:?}, which would \
+             mean the accent painted on every row rather than just the \
+             active one",
+            (inactive_px.r, inactive_px.g, inactive_px.b),
         );
     }
 }
