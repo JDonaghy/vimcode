@@ -231,6 +231,23 @@
 # `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — not a vimcode-side fix,
 # per the Platform-Neutrality Rule; this file's steps are this issue's own
 # Tier-2 acceptance coverage, additive per #3509/#3487, expected RED today.
+#
+# ── #1673: independent reconfirmation of #1657's stale x=24, no new bug ──
+#
+# A fresh bugbash reproduction (twice, with window focus explicitly
+# confirmed before the click) found the `-1232` click-and-open pair below
+# swallowed again despite a correct `HTCLIENT` hit-test — see the UPDATE
+# (vimcode#1673) note inline above that pair for the full account and
+# `src/win/mod.rs`'s new `#1673` doc section for the source + empirical
+# investigation (GTK-side empirical confirmation that x=24 genuinely
+# misses "File"'s real bounds while the real bounds open it fine, same
+# shared layout code both backends run). No new quadraui issue filed:
+# this is the same gap #1657 already diagnosed, not a second, distinct
+# defect. The `-1657` click/expect pair (x=70) a few steps below is this
+# file's live, forward-looking acceptance coverage for "clicking File
+# opens its dropdown" — confirming it on real Windows hardware (not just
+# GTK's faithful-but-not-identical stand-in) remains this issue's own
+# open acceptance item.
 name: vimcode-win-gui
 mode: window
 width: 1024
@@ -455,6 +472,28 @@ steps:
   # `MenuItem`-role UIA element regardless of the click landing. This step
   # is therefore still expected RED, but for the UIA-wiring reason alone
   # now, not for #1232's reason too. Left unmodified below.
+  #
+  # UPDATE (vimcode#1673): an independent bugbash reproduction — twice,
+  # with window focus explicitly confirmed (`GetForegroundWindow() ==
+  # target hwnd`) immediately before the click — found this exact click
+  # swallowed again: `WM_NCHITTEST` at (24,16) correctly reports
+  # `HTCLIENT`, but no dropdown paints and no UIA `New Tab` element ever
+  # appears (3000ms timeout). This is NOT a reopening of quadraui#1232
+  # (that hit-test classification is still confirmed correct) and no new
+  # quadraui-side defect was found for it — see `src/win/mod.rs`'s new
+  # `#1673` doc section for the full source + empirical investigation. It
+  # is the SAME gap vimcode#1657 already diagnosed from the opposite
+  # direction (a stale `expect_hit` sweep): x=24 is stale, landing in
+  # blank padding left of "File"'s real painted bounds at this window
+  # width, not on the label itself — the once-GREEN result the #1656
+  # UPDATE above recorded for this exact step no longer reflects the
+  # current title-band layout (the app-icon slot and/or Command Center
+  # have since shifted every menu-row item right of x=24). This step is
+  # therefore expected RED again, for #1657's reason, and the corrected
+  # `-1657` click/expect pair below (x=70) is this file's live acceptance
+  # coverage going forward — re-run it specifically to confirm the fix on
+  # real hardware; do not read a future flip back to GREEN on *this*
+  # x=24 step as evidence the stale-coordinate explanation was wrong.
   - type: click
     id: click-file-menu-item-1232
     x: 24

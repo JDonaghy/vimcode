@@ -14735,6 +14735,81 @@ mod app_icon {
             h.driver.painted_texts()
         );
     }
+
+    /// vimcode#1673 (bugbash finding): a real Win-GUI click at x=24, y=16
+    /// — the title band's historical menu-row-item coordinate, the exact
+    /// stale value `tests/smoke-spec/win-gui.yaml`'s original
+    /// `click-file-menu-item-1232` step still carries, and the exact
+    /// value vimcode#1673's own reproduction used — opens no dropdown.
+    /// vimcode#1657 already found the same gap from a different angle (a
+    /// stale `expect_hit` sweep): at this window's width, x=24 lands in
+    /// the blank padding left of "File"'s real painted bounds (the
+    /// app-icon slot, #720), not on the label itself. This test proves
+    /// the *consequence* of that finding end-to-end, through the real
+    /// click-to-dropdown path (`MenuSystem::handle`), on the one backend
+    /// (GTK) that can run it headlessly here — both backends share the
+    /// identical `window_chrome` title-band composition
+    /// (`App::render_content`'s `presence.command_center`/`menu_row`
+    /// blocks, and the shared `quadraui::MenuBar` layout algorithm), so
+    /// this is the same faithful platform-neutral stand-in #1657's own
+    /// Tier-1 pair already relies on. See `src/win/mod.rs`'s new `#1673`
+    /// doc section for the full write-up and why no new quadraui issue is
+    /// filed.
+    ///
+    /// Both assertions below were run against today's `develop` with no
+    /// code change on either side of them: clicking the stale x=24 opens
+    /// nothing (matching vimcode#1673's report exactly), while clicking
+    /// the *real* painted "File" bounds at the same window size opens it
+    /// fine (the same shape `clicking_file_after_the_app_icon_still_
+    /// opens_the_file_menu` above already proves GREEN) — together ruling
+    /// out a functional regression in the shared click-routing path and
+    /// pinning vimcode#1673's symptom entirely on the stale coordinate
+    /// vimcode#1657 already tracks, not a new defect.
+    #[test]
+    fn clicking_the_stale_1232_file_x_opens_nothing_but_the_real_bounds_do_1673() {
+        let mut h = harness(Engine::new_for_test(), 1024, 768);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "sanity: the File dropdown must be closed before either click"
+        );
+
+        // vimcode#1673's own reproduction coordinate — the stale,
+        // pre-#1657 value.
+        h.driver.click(24.0, 16.0);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "x=24 is blank padding left of the real \"File\" label at \
+             this window width (vimcode#1657) — it must NOT open the File \
+             dropdown, reproducing vimcode#1673's report exactly; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        assert!(
+            file.x > 24.0,
+            "fixture assumption: the real \"File\" label must paint \
+             strictly right of x=24 at this window width, or this test's \
+             own premise (x=24 misses it) doesn't hold; got {file:?}"
+        );
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "clicking the real, painted \"File\" label must open its \
+             dropdown — proving vimcode#1673's reported symptom is the \
+             stale x=24 coordinate alone, not a regression in the shared \
+             click-routing path; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
 }
 
 #[cfg(test)]

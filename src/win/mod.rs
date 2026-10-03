@@ -462,6 +462,83 @@
 //! (File/Edit/View/...) actually paints. Real-hardware re-verification
 //! that the drawn row opens File/Edit/View/... on dell64 is this issue's
 //! own acceptance item.
+//!
+//! # #1673: clicking File/Edit/.../Help on real hardware opens no
+//! # dropdown, despite `WM_NCHITTEST` correctly reporting `HTCLIENT` —
+//! # same root cause vimcode#1657 already found, not a new defect
+//!
+//! vimcode#1673 (a bugbash finding, reproduced twice independently with
+//! window focus explicitly confirmed before the click) reports that a
+//! real left-click at the menu row's historical `(24, 16)` position opens
+//! no dropdown on real Win-GUI hardware — no paint change, no UIA
+//! `MenuItem` element ever appears — even though a `WM_NCHITTEST` probe
+//! at the same point correctly returns `HTCLIENT` (confirming
+//! quadraui#1232, the `#1661`/`#1667` sections' pinned rev, is live).
+//!
+//! `(24, 16)` is not a coordinate this issue derived fresh — it is
+//! *exactly* `tests/smoke-spec/win-gui.yaml`'s original
+//! `click-file-menu-item-1232` step, which vimcode#1657 (see that
+//! issue's own section in this file's git history and this module's
+//! `win_gui_smoke_spec_title_band_coordinates_are_stale_1657` test) had
+//! already found to be stale: a real-hardware `PrintWindow` remeasurement
+//! found "File"'s true painted left edge sits at x≈55-88, not x=24 — the
+//! app-icon slot (#720) and the Command Center (#676/#939, added to the
+//! pin between the two issues) both push every menu-row item right of
+//! where this smoke-spec coordinate was originally derived. x=24 is blank
+//! padding left of the real label, not the label itself.
+//!
+//! Ruled out, by reading the shared code every backend's click routes
+//! through (`crate::app::App::handle_event`'s "Menu system intercept"
+//! block, `quadraui::MenuSystem::handle`) and by this module's own
+//! already-passing `window_chrome_backend_paints_the_drawn_menu_row`/
+//! `command_center_paints_on_a_window_chrome_backend` tests (#1629): the
+//! click-to-dropdown path itself is platform-neutral and already proven
+//! live on `WinBackend` up through "the menu row paints". The one
+//! Win-specific link in that chain — `win::events::win_button_down`'s
+//! device-pixel→DIP conversion, and `WinBackend::register_menu_bar_item_
+//! zones`/`nc_hit_test` registering the *same* `MenuBarLayout` bounds
+//! `MenuSystem::handle` hit-tests against — was read directly against the
+//! pinned rev and found consistent (both derive from the identical
+//! `layout.visible_items[i].bounds` the paint call computes, not two
+//! independently-computed rects the #720 bug class would need). No
+//! source-level defect distinct from #1657's already-tracked coordinate
+//! staleness was found.
+//!
+//! Confirmed empirically (not just by source reading) on the one backend
+//! this can run headlessly: `src/gtk/testing.rs::app_icon::clicking_the_
+//! stale_1232_file_x_opens_nothing_but_the_real_bounds_do_1673` clicks
+//! both x=24 (opens nothing, matching vimcode#1673's report exactly) and
+//! the real, dynamically-located "File" bounds (opens the dropdown fine)
+//! in the same test run, against today's `develop`, with no code change
+//! on either side — both backends share the identical `window_chrome`
+//! title-band composition and the identical `MenuBar` layout algorithm
+//! (`App::render_content`'s `presence.menu_row`/`presence.command_
+//! center` blocks), so GTK's result is a faithful stand-in for what the
+//! same click would do on `WinBackend`, per the same reasoning #1657's
+//! own Tier-1 pair already relies on.
+//!
+//! **No new quadraui issue is drafted for this one.** Unlike #1661/#1667,
+//! source + empirical review here did not surface a quadraui-side defect
+//! distinct from what #1657 already found and already tracks via its own
+//! corrected `-1657` smoke-spec steps (`click-file-menu-item-1657`/
+//! `file-dropdown-opens-1657`, already present in `tests/smoke-spec/
+//! win-gui.yaml` at the real, remeasured x=70). vimcode#1673's real value
+//! is independent, focus-safe reconfirmation that the *stale* x=24
+//! coordinate specifically is dead — useful regression evidence, but not
+//! evidence of a second, distinct bug on top of #1657's. Left open rather
+//! than closed from here: whether the `-1657` corrected coordinate
+//! genuinely opens the dropdown on *real* Win-GUI hardware (as opposed to
+//! GTK's faithful-but-not-identical stand-in above) is still an
+//! unconfirmed, real-hardware acceptance item — see
+//! `tests/smoke-spec/win-gui.yaml`'s own `-1657` section for the exact
+//! open question.
+//!
+//! Adds `clicking_the_stale_1232_file_x_opens_nothing_1673` to
+//! `win_driver_tests` below: the Win-GUI mirror of the GTK test named
+//! above, type-checked only on this Linux worktree (`#[cfg_attr(target_os
+//! = "windows", test)]`, same posture as every other test in that
+//! module) — see that module's own top-of-file #1558 disclaimer for why
+//! it cannot yet be *executed*, here or on dell64.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1113,6 +1190,66 @@ mod win_driver_tests {
              `theme.tab_bar_bg` on a runtime `:colorscheme` change, not \
              stay pinned to Win-GUI's hardcoded `Theme::default()` \
              (`win::tree::draw_tree`)"
+        );
+    }
+
+    // ── #1673: the stale x=24 menu-row coordinate opens nothing ────────
+    //
+    // Win-GUI mirror of `src/gtk/testing.rs::app_icon::clicking_the_
+    // stale_1232_file_x_opens_nothing_but_the_real_bounds_do_1673` — see
+    // this module's own top-of-file `#1673` doc section for the full
+    // investigation and why no new quadraui issue is drafted. Both
+    // backends share the identical `window_chrome` title-band
+    // composition and `MenuBar` layout algorithm, so the GTK twin (which
+    // *does* run headlessly here and was empirically confirmed against
+    // today's `develop`) is a faithful stand-in for this one; this
+    // function is, like every other test in this module, only
+    // type-checked on this Linux worktree
+    // (`#[cfg_attr(target_os = "windows", test)]`) and cannot yet be
+    // *executed*, here or on dell64 (module-top `#1558` disclaimer).
+    #[cfg_attr(target_os = "windows", test)]
+    fn clicking_the_stale_1232_file_x_opens_nothing_1673() {
+        let mut h = conformance_harness(plain_engine(), 1024, 768);
+
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "sanity: the File dropdown must be closed before either click"
+        );
+
+        // vimcode#1673's own reproduction coordinate — the stale,
+        // pre-#1657 value `tests/smoke-spec/win-gui.yaml`'s original
+        // `click-file-menu-item-1232` step still carries.
+        h.driver.click(24.0, 16.0);
+        h.driver.render();
+        assert!(
+            !h.driver.screen_contains("New Tab"),
+            "x=24 is blank padding left of the real \"File\" label at \
+             this window width (vimcode#1657) — it must NOT open the File \
+             dropdown, reproducing vimcode#1673's report exactly; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        let file = h
+            .driver
+            .find_bounds("File")
+            .expect("the File menu-bar header must paint");
+        assert!(
+            file.x > 24.0,
+            "fixture assumption: the real \"File\" label must paint \
+             strictly right of x=24 at this window width, or this test's \
+             own premise (x=24 misses it) doesn't hold; got {file:?}"
+        );
+        h.driver
+            .click(file.x + file.width / 2.0, file.y + file.height / 2.0);
+        h.driver.render();
+        assert!(
+            h.driver.screen_contains("New Tab"),
+            "clicking the real, painted \"File\" label must open its \
+             dropdown — proving vimcode#1673's reported symptom is the \
+             stale x=24 coordinate alone, not a regression in the shared \
+             click-routing path; painted texts were {:?}",
+            h.driver.painted_texts()
         );
     }
 }
