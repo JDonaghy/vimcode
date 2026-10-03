@@ -80,8 +80,8 @@ still-open question.
 
 What *is* now proven, by tests that execute on this host today (`cargo test
 --features gui --lib scrollbar_paint::explorer_sidebar_scrollbar`, in
-`src/gtk/testing.rs`) — on GTK, which shares every line of the implicated quadraui code with
-Win-GUI:
+`src/gtk/testing.rs`) — on GTK, which shares the double-paint and no-hidden-at-rest-state
+bugs (Root causes 1/2) with Win-GUI:
 
 - The scrollbar paints unconditionally, with no hover event synthesized — there is no
   hidden-at-rest state anywhere in the implicated code (`explorer_sidebar_scrollbar_paints_
@@ -93,8 +93,13 @@ Win-GUI:
 
 Both are characterizations of *today's* upstream behaviour (expected to start failing once
 quadraui's fix lands and the pin bumps), not a fix. What they rule out on dell64: a Win-GUI-
-specific divergence from GTK. What's left to check once quadraui ships a fix and the pin is
-bumped:
+specific divergence from GTK **on those two axes (double-paint width, hidden-at-rest alpha)**.
+They do **not** rule out a divergence on a third axis: `docs/PENDING_QUADRAUI_ISSUES.md`'s
+entry (Ask item 5) also found, by reading `win/tree.rs` directly, that Win-GUI's phantom band
+paints in `Theme::default()` rather than the live `self.current_theme` GTK/macOS both thread
+through — i.e. the two stacked bands on Win-GUI are mismatched on *theme*, not just width. No
+headless host can reproduce this one; it needs real hardware. What's left to check once
+quadraui ships a fix and the pin is bumped:
 
 - [ ] **Re-run the two GTK tests above** to confirm they now fail (the tripwire firing), then
       delete them per their own doc comments.
@@ -102,6 +107,13 @@ bumped:
       unhovered, and confirm no scrollbar-coloured pixels appear at the panel's right edge —
       then hover/scroll and confirm a single, thin (~10px) overlay fades in with one thumb,
       not two adjacent bands.
+- [ ] **Before any fix lands, with a non-default colorscheme active (e.g. `vscode-light` on
+      a dark base, or vice versa):** confirm whether the two stacked bands are visibly
+      different colours — one tracking the active colorscheme, one not. This is the
+      Ask-item-5 theme divergence; a positive sighting confirms it on real hardware, a
+      negative one (bands look same-themed) is worth a follow-up note since it would
+      contradict the source-level finding and should be re-checked against the exact pinned
+      rev in use.
 
 ## Known Gaps (Not Expected to Work Yet)
 
