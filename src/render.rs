@@ -19518,12 +19518,17 @@ pub fn build_activity_bar(
             "Search (Ctrl+Shift+F)",
             "activity:search",
         ),
-        (PANEL_DEBUG, icons::DEBUG.s(), "Debug", "activity:debug"),
         (
             PANEL_GIT,
-            icons::GIT_BRANCH.s(),
+            icons::SOURCE_CONTROL.s(),
             "Source Control",
             "activity:git",
+        ),
+        (
+            PANEL_DEBUG,
+            icons::RUN_AND_DEBUG.s(),
+            "Run and Debug",
+            "activity:debug",
         ),
         (
             PANEL_EXTENSIONS,

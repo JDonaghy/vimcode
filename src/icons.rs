@@ -94,7 +94,13 @@ impl Icon {
 // ─── Activity Bar ────────────────────────────────────────────────────────────
 
 pub const HAMBURGER: Icon = Icon::new("\u{f035c}", "\u{2630}"); // ☰
-pub const EXPLORER: Icon = Icon::new("\u{f07c}", "\u{229e}"); // ⊞
+
+// #1698: VS Code's Explorer activity-bar icon is literally `Codicon.files`
+// (`explorerViewIcon` in `explorerViewlet.ts`) — nf-cod-files, a two-page
+// "files" glyph — not an open-folder glyph. `\u{f07c}` (nf-fa-folder_open,
+// still available as `FOLDER_OPEN` below) was a plausible-looking but wrong
+// stand-in.
+pub const EXPLORER: Icon = Icon::new("\u{eaf0}", "\u{229e}"); // nf-cod-files
 
 // #950: GTK's `App::shell_config()` used to carry its own `SEARCH_COD`
 // (nf-cod-search, `\u{ea6d}`) instead of this constant, so the activity bar
@@ -104,8 +110,21 @@ pub const EXPLORER: Icon = Icon::new("\u{f07c}", "\u{229e}"); // ⊞
 // backends already shared for every other activity-bar icon.
 pub const SEARCH: Icon = Icon::new("\u{f002}", "/"); // /
 pub const DEBUG: Icon = Icon::new("\u{f188}", "!"); // !
+/// VS Code's Run & Debug activity-bar icon (`runViewIcon` in
+/// `debugIcons.ts`) is `Codicon.debugAlt` — a play triangle with a bug
+/// overlay — not the plain [`DEBUG`] bug glyph above, which stays in use for
+/// the debug sidebar's own "DEBUG" title bar (`render.rs`'s
+/// `debug_sidebar_status_bars`), a different context VS Code doesn't use
+/// `debug-alt` for either. #1698.
+pub const RUN_AND_DEBUG: Icon = Icon::new("\u{eb91}", "\u{25b6}"); // nf-cod-debug_alt
 pub const GIT_BRANCH: Icon = Icon::new("\u{e702}", "Y"); // Y (branch shape)
 pub const GIT_BRANCH_ALT: Icon = Icon::new("\u{e725}", "Y"); // nf-dev-git_branch alt
+/// VS Code's Source Control activity-bar icon (`sourceControlViewIcon` in
+/// `scm.contribution.ts`) is `Codicon.sourceControl` — a branch-fork glyph —
+/// not [`GIT_BRANCH`]/[`GIT_BRANCH_ALT`] (devicon glyphs used for the
+/// current-branch-name display elsewhere, e.g. the status bar's `"
+/// {branch} main"` segment). #1698.
+pub const SOURCE_CONTROL: Icon = Icon::new("\u{ea68}", "Y"); // nf-cod-source_control
 pub const EXTENSIONS: Icon = Icon::new("\u{eae6}", "#"); // #
 pub const EXTENSIONS_ALT: Icon = Icon::new("\u{eb85}", "#"); // nf-cod-extensions alt (TUI)
 pub const AI_CHAT: Icon = Icon::new("\u{f0e5}", ">"); // >

@@ -3881,6 +3881,67 @@ mod tests {
         );
     }
 
+    /// #1698: VS Code's activity bar paints, top to bottom, Explorer ·
+    /// Search · Source Control · Run and Debug · Extensions — vimcode had
+    /// Source Control and Run and Debug swapped (debug third, git fourth)
+    /// and the wrong glyphs for three of the five (an open-folder icon for
+    /// Explorer, the plain `fa-bug` glyph for Run and Debug, and the
+    /// diamond-shaped `nf-dev-git`/`e702` glyph for Source Control).
+    ///
+    /// Reads real painted output, not `PanelDefinition` state (#555): each
+    /// assertion locates a glyph via `GtkDriver::find`, which only reports
+    /// positions `GtkBackend::record_painted_text` recorded while actually
+    /// rasterising a Pango layout this frame, then checks the Y-coordinates
+    /// come back in top-to-bottom order. The icon glyphs doubling as search
+    /// needles (`icons::SOURCE_CONTROL`/`icons::RUN_AND_DEBUG`, nf-cod
+    /// `\u{ea68}`/`\u{eb91}`) are themselves new in this issue — on
+    /// unfixed `develop`, `App::resolve_builtin_panel_icon` never emits
+    /// either codepoint at all (`"panel:git"` painted the old `GIT_BRANCH`
+    /// diamond glyph, `"panel:debug"` painted the plain bug glyph), so
+    /// `find` returns `None` and the `expect` below panics before the
+    /// ordering check is even reached — verified by reverting
+    /// `src/app.rs`'s two changed match arms locally and re-running this
+    /// test, which failed exactly that way.
+    #[test]
+    fn activity_bar_paints_vscode_order_and_glyphs() {
+        let mut engine = Engine::new();
+        engine.settings.use_nerd_fonts = Some(true);
+        let mut h = harness(engine, 1400, 900);
+
+        let y = |needle: &str| -> f32 {
+            h.driver
+                .find(needle)
+                .unwrap_or_else(|| panic!("activity bar glyph {needle:?} not painted"))
+                .1
+        };
+
+        let explorer_y = y(crate::icons::EXPLORER.s());
+        let search_y = y(crate::icons::SEARCH.s());
+        let source_control_y = y(crate::icons::SOURCE_CONTROL.s());
+        let run_and_debug_y = y(crate::icons::RUN_AND_DEBUG.s());
+        let extensions_y = y(crate::icons::EXTENSIONS.s());
+
+        assert!(
+            explorer_y < search_y,
+            "Explorer ({explorer_y}) must paint above Search ({search_y})"
+        );
+        assert!(
+            search_y < source_control_y,
+            "Search ({search_y}) must paint above Source Control ({source_control_y})"
+        );
+        assert!(
+            source_control_y < run_and_debug_y,
+            "Source Control ({source_control_y}) must paint above Run and \
+             Debug ({run_and_debug_y}) — VS Code order, vimcode used to \
+             have these two swapped"
+        );
+        assert!(
+            run_and_debug_y < extensions_y,
+            "Run and Debug ({run_and_debug_y}) must paint above Extensions \
+             ({extensions_y})"
+        );
+    }
+
     /// #727: a natively-expressible dialog (no `DialogTable`, no text
     /// input — `quit_unsaved`, the "Unsaved Changes" confirm, is exactly
     /// this shape) must be presented via a real `PlatformServices::
