@@ -516,6 +516,21 @@ portable-pty = "=0.9.0"
 # no new crate version to the graph.
 vt100 = "=0.16.2"
 
+# #1701: `tests/pty_settings_header_delay.rs` — the real-pty regression test
+# for the "Settings sidebar header shows the previous panel's name for
+# ~0.4-0.9s after the click" bugbash report. Unix twin of the
+# `[target.'cfg(windows)'.dev-dependencies]` block above: a real pty (not
+# `quadraui::tui::testing::TuiDriver`'s synthetic-event dispatch, which
+# can't observe wall-clock repaint timing at all) is the only way to see
+# whether the *live* terminal byte stream lags behind the click the way the
+# bugbash explorer's timestamped reads did. Same versions, same
+# already-resolved-via-quadraui's-`terminal`-feature rationale as above —
+# this adds no new crate version to `Cargo.lock`, just a direct name this
+# platform's test code can reach them by.
+[target.'cfg(unix)'.dev-dependencies]
+portable-pty = "=0.9.0"
+vt100 = "=0.16.2"
+
 [build-dependencies]
 cc = "1.0"
 
