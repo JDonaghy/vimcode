@@ -1582,3 +1582,147 @@ based driver test above regardless of whether this lands. File this as a
 quadraui testing-infrastructure improvement, not a `JDonaghy/vimcode`
 blocker.
 
+---
+
+## Win-GUI never dispatches Ctrl-modified keyboard shortcuts (Ctrl+`, Ctrl+B) to the engine — root cause isolated to the native WM_KEYDOWN/WM_CHAR translation layer, open real-hardware question (blocks vimcode#1674)
+
+**Title:** A real-hardware bugbash (window focus independently confirmed —
+`GetForegroundWindow() == target hwnd` — immediately before each
+injection, reproduced via both `System.Windows.Forms.SendKeys` and raw
+`user32.dll` `keybd_event(VK_CONTROL + VK_OEM_3)`) found that neither
+Ctrl+` (open/toggle terminal) nor Ctrl+B (toggle sidebar) has any visible
+effect on Win-GUI, while unmodified keys (typing, Enter, Escape) and mouse
+clicks work fine in the same session — isolating the break to the Ctrl
+modifier specifically. One side effect: an "open terminal via menu, then
+type a command" sequence fell through to the editor's own Normal-mode vim
+parser and corrupted the open buffer, because no terminal ever opened to
+receive the keystrokes.
+
+**Body:**
+
+vimcode#1674 is a bugbash finding; investigated from this fix's Linux
+worktree (no attached Windows host) by reading every candidate dispatch
+site at the pinned rev
+(`ca7fcc83afad01ec3422f79366566f3a263b22bf`) and writing executing tests
+against quadraui's own public API where possible.
+
+Every shared, cross-backend site that "Ctrl+<key> reaches the engine"
+could plausibly break at reads correct, and is confirmed correct by
+source + test, not assumption:
+
+- `App::setup` (`src/app.rs`, vimcode) registers the same 15-entry
+  panel-accelerator table (`render::register_panel_accelerators`) on
+  every GUI backend identically — not a Win-GUI-only call site.
+- Accelerator matching itself
+  (`quadraui::backend_core::BackendCore::match_keypress`) is shared code:
+  `WinBackend::match_keypress`/`GtkBackend::match_keypress`
+  (`quadraui/src/{win,gtk}/backend.rs`) both delegate to it verbatim. A
+  bug here would also break GTK, which the issue confirms works.
+- `quadraui::win::events::wm_char_to_uievent` (the pure `WM_CHAR` →
+  `UiEvent` translator `win::run`'s live `wndproc` calls) correctly
+  recovers **both** reported chords when fed the payload Windows is
+  documented to deliver for each — confirmed by two tests added
+  alongside this entry
+  (`src/win/mod.rs::win_ctrl_key_translation_tests_1674`,
+  `ctrl_b_wm_char_recovers_the_base_letter_1674`/
+  `ctrl_backtick_wm_char_passes_through_with_ctrl_held_1674`) that
+  genuinely **execute** on an ordinary Linux host via `cargo test
+  --features win` (no Windows target, no cross toolchain — these are pure
+  functions):
+  - Ctrl+B: Windows' keyboard driver converts Ctrl+letter to its C0
+    control code (`0x02` for B) via `TranslateMessage`;
+    `wm_char_to_uievent('\x02', {ctrl:true}, _)` correctly recovers
+    `Key::Char('b')` with `ctrl == true`.
+  - Ctrl+`: backtick is not a control character, so the function never
+    even reaches its Ctrl-recovery branch — it passes the literal
+    backtick straight through with `ctrl` still set on `modifiers`,
+    which is already exactly the event
+    `Engine::handle_vscode_key`'s `"grave" | "\`"` arm
+    (`src/core/engine/vscode.rs`) needs. This corrects an earlier,
+    narrower theory from the same investigation session (that
+    `events::vk_to_named_key` having no `VK_OEM_3`/backtick entry meant
+    Ctrl+` had no delivery path at all) — `vk_to_named_key` genuinely has
+    no backtick entry, but that's immaterial once `wm_char_to_uievent` is
+    confirmed to handle the `WM_CHAR` path correctly on its own.
+
+**What remains genuinely unverified — and why no test anywhere in
+`vimcode` or `quadraui`'s own test suite can close it:** whether
+Windows' real `TranslateMessage`, running inside `win::run`'s live
+message loop, actually *generates* a `WM_CHAR` message at all for
+Ctrl+backtick (and, separately, whether `GetKeyState(VK_CONTROL)` reads
+`true` at the moment `win_key_modifiers()` samples it for Ctrl+B,
+specifically for the *injected* input methods this bugbash used — both
+`SendKeys` and `keybd_event` post synthetic input through the same system
+input queue real hardware uses, but neither test driver here constructs
+one). Win32 keyboard-input references consistently describe `WM_CHAR`
+generation for Ctrl held with a non-letter key as layout/driver-dependent,
+unlike the uniformly documented Ctrl+letter C0 conversion — but
+confirming or ruling that out needs a live Win32 message loop.
+`quadraui::win::testing::WinDriver` (the only Win-GUI test harness this
+repo or quadraui has) cannot reach it: `WinDriver::ctrl_char` constructs
+an already-decoded `UiEvent::KeyPressed` directly, bypassing
+`events.rs`/`run.rs`'s `WM_KEYDOWN`/`WM_CHAR` translation entirely by
+design — proven by
+`ctrl_accelerator_dispatch_reaches_engine_via_win_driver_1674` (added
+alongside this entry, same file), which re-runs an accelerator-bound
+Ctrl-chord through that exact synthetic path and — as expected — finds
+the shared pipeline downstream of translation sound. This is the same
+"last link only real hardware can close" shape the already-filed #1668
+entry above describes for `WinDriver`'s missing `.tick()`: a downstream
+crate found everything source review can check correct, but the
+test-harness primitive needed to observe the one remaining, genuinely
+OS-level fact doesn't exist in either repo yet.
+
+**Ask:** this needs real-Windows-hardware diagnostic logging, not a code
+change sight-unseen — instrument (or single-step) a live `vimcode.exe`
+built with `cargo xwin build --features win`, temporarily logging every
+`WM_KEYDOWN`/`WM_CHAR`/`WM_SYSKEYDOWN` the real `wndproc`
+(`quadraui/src/win/run.rs`) receives (message id, `wparam`, and
+`GetKeyState(VK_CONTROL)`'s live read) to a file, then reproducing
+exactly the bugbash's Ctrl+`/Ctrl+B injection. Two outcomes determine the
+actual fix:
+
+1. If `WM_CHAR` never arrives for Ctrl+backtick (or `WM_KEYDOWN`'s
+   `GetKeyState(VK_CONTROL)` read is `false` when it should be `true` for
+   Ctrl+B): the fix belongs in `win::run`'s `WM_KEYDOWN` handler — add a
+   keyboard-layout-aware fallback (e.g. `ToUnicode`/`MapVirtualKeyW` with
+   the Ctrl bit cleared from the keyboard-state buffer passed to
+   `ToUnicode`) that synthesizes a `Key::Char` event directly from
+   `WM_KEYDOWN` whenever Ctrl is held and `WM_CHAR` does not reliably
+   follow, rather than relying solely on `TranslateMessage`'s narrow,
+   letter-only C0-control-code behaviour.
+2. If the log shows the expected messages arriving with the expected
+   modifier state: the bug is not in translation at all, and the next
+   place to look is whether `win::run`'s live message loop is somehow
+   losing or misrouting the resulting `UiEvent::KeyPressed` before it
+   reaches `dispatch_event` — a possibility source review alone cannot
+   rule out without that same real log.
+
+**Test:** `src/win/mod.rs`'s new `win_ctrl_key_translation_tests_1674`
+module (`ctrl_b_wm_char_recovers_the_base_letter_1674`,
+`ctrl_backtick_wm_char_passes_through_with_ctrl_held_1674`) are genuinely
+**executing** Tier-1 coverage, confirmed GREEN today — they prove the
+translation *function* is not the fault, which is why this entry does not
+claim a reproducible code-level defect. `ctrl_accelerator_dispatch_
+reaches_engine_via_win_driver_1674` (`win_driver_tests`, same
+type-check-only posture every other test in that module has per #1558 —
+`WinDriver`'s `HeadlessSurface` always fails to construct off Windows) is
+the isolating half for the shared accelerator-dispatch pipeline, using
+Ctrl+P (a synchronous panel accelerator) rather than the issue's own
+Ctrl+B/Ctrl+` because those two specifically queue a `DeferredAction`
+only `tick()` drains, and `WinDriver` has no `.tick()` at all (same gap
+the already-filed #1668 entry above describes) — so neither reported
+chord's *end effect* is observable through any harness either repo ships
+today, only its upstream dispatch. `tests/smoke-spec/win-gui.yaml` gets no
+new step for the same reason #1668's own entry gives: no AT-provider
+wiring exists for vimcode's drawn sidebar/terminal-panel content, so no
+`expect_a11y`/`expect_hit`/`expect_menu` step could ever observe the
+panel actually toggling — a step that cannot fail is not coverage.
+
+**Blocks:** `JDonaghy/vimcode#1674`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available (every shared site this investigation could
+check is confirmed correct), and the remaining question is real-Windows
+diagnostic work this repo's Linux worktree cannot perform, not a known
+defect with a known fix.
+
