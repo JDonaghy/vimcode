@@ -1608,6 +1608,177 @@ mod win_driver_tests {
         );
     }
 
+    // ── #1691: no line-number gutter paints on Win-GUI despite #1543
+    // making `number` the default ───────────────────────────────────────
+    //
+    // vimcode#1691 reports buffer text starting flush against the editor
+    // pane's own left edge on Win-GUI — no gutter column, no line
+    // numbers, no left inset — which would contradict #1543's shipped
+    // default (`Settings::default().line_numbers ==
+    // LineNumberMode::Absolute`, `src/core/settings.rs:5729`) and this
+    // backend's own documented acceptance bar (`win::editor`'s module
+    // doc at the pinned rev: "line numbers ... implemented below").
+    //
+    // Traced the full pipeline the issue's own "Where it breaks" section
+    // points at, end to end, at the pinned rev
+    // (`ca7fcc83afad01ec3422f79366566f3a263b22bf`): vimcode's shared,
+    // backend-neutral `render::calculate_gutter_cols`/
+    // `render::build_rendered_window` (`src/render.rs`) through
+    // `render::to_q_editor` — the exact conversion
+    // `App::paint_editor_windows_rung` calls for every GUI backend alike
+    // (`src/app.rs`), GTK included — to `quadraui::win::editor::
+    // draw_editor`'s `if editor.gutter_char_width > 0` gate and
+    // `Editor::layout_with_options`'s `gutter_w = gutter_char_width *
+    // cell_width` arithmetic (`quadraui/src/primitives/editor.rs`). None
+    // of that chain is Win-specific, differs from GTK's identical call
+    // chain, or can legitimately produce `gutter_char_width == 0` for a
+    // real (non-placeholder) window: `calculate_gutter_cols` returns at
+    // least `1` (the bare fold-indicator column) even for
+    // `LineNumberMode::None`, and the only `RenderedWindow` construction
+    // site that hardcodes `0` (`render.rs`'s `empty()` closure, taken
+    // only when the window/buffer lookup fails or the pane hosts a
+    // plugin view) cannot be the frame the report's own capture shows,
+    // since that frame also painted real buffer text. A `cell_width ==
+    // 0` theory doesn't hold up either: `win::editor::paint_line_text`'s
+    // own `visible_cols` guard (sourced from the same
+    // `Editor::layout_with_options`) would make `end <= scroll_left`
+    // true and skip painting the line's text entirely when `cell_width`
+    // is `0.0` — contradicting the report's own readable, merely
+    // unindented text. GTK already carries a passing regression test for
+    // exactly this default
+    // (`crate::gtk::testing::vscode_dimming::
+    // fresh_engine_paints_absolute_line_numbers_by_default_on_gtk`), and
+    // every line of `win::editor::draw_editor`/`Editor::
+    // layout_with_options` cited above reads byte-for-byte consistent
+    // with that same contract.
+    //
+    // **Could not reproduce from source at the pinned rev** — unlike
+    // #1657/#1661/#1667/#1674/#1676 immediately above, each of which
+    // isolated a genuine, nameable quadraui gap, nothing in this call
+    // chain can be made to produce the reported symptom without an
+    // already-ruled-out precondition. No live, unlocked Windows host was
+    // reachable this session to confirm either way on real hardware. The
+    // most likely explanation left standing is the one the issue's own
+    // "Reproduction" section names first as the thing to rule out before
+    // chasing the frame path: the dell64 capture's vimcode binary
+    // predates #1543's default flip, or that session carried a stray
+    // `:set nonumber`/`settings.json` override — neither of which a
+    // source read from this worktree can confirm or rule out. Added here
+    // instead: a Win-GUI regression test for the contract as read at
+    // this pin, so a *future* quadraui bump that actually breaks this
+    // (the same shape #1667/#1676 found for other rasterisers) trips on
+    // real Windows the moment it lands, rather than needing a second
+    // bugbash round to notice. Source-level only, per this module's own
+    // top-of-file #1558 disclaimer — type-checked here,
+    // `#[cfg_attr(target_os = "windows", test)]`, run only on dell64.
+    #[cfg_attr(target_os = "windows", test)]
+    fn line_number_gutter_paints_and_insets_text_by_default_1691() {
+        let mut engine = plain_engine();
+        engine.settings.colorscheme = "vscode-dark".to_string();
+        // Deliberately NOT setting `engine.settings.line_numbers` — #1543
+        // made `LineNumberMode::Absolute` the untouched default, and this
+        // test is exactly about what a fresh, default-settings engine
+        // paints on this backend.
+        engine.buffer_mut().insert(
+            0,
+            &(1..=20)
+                .map(|n| format!("vimcodeline{n:02}\n"))
+                .collect::<String>(),
+        );
+
+        let mut h = conformance_harness_with_screen_layout(engine, 1400, 900);
+        h.driver.render();
+        // Second pass: see `colorscheme_change_repaints_editor_and_
+        // explorer_sidebar_1667`'s identical note above for why a frame
+        // painted before `App::sync_per_frame_backend_state` runs can lag
+        // by one.
+        h.driver.render();
+
+        let win = h.engine.borrow().active_window_id();
+        let (rect, gutter_cells) = {
+            let layout = h.screen_layout.borrow();
+            let l = layout
+                .as_ref()
+                .expect("a frame must have painted a screen layout");
+            let rw = l
+                .windows
+                .iter()
+                .find(|w| w.window_id == win)
+                .expect("the active pane must be in the painted layout");
+            (rw.rect, rw.gutter_char_width)
+        };
+        assert!(
+            gutter_cells > 1,
+            "test setup sanity: a fresh, untouched-settings engine must \
+             reserve more than the bare one-column fold indicator — #1543 \
+             made `number` the default, so this should never read back as \
+             `LineNumberMode::None`'s 1-column gutter (got {gutter_cells})"
+        );
+
+        use quadraui::Backend as _;
+        let cell_width = h.driver.backend().char_width();
+        let line_height = h.driver.backend().line_height();
+        assert!(
+            cell_width > 0.0,
+            "test setup sanity: the backend must report a real character \
+             width before this probe's gutter-width arithmetic means \
+             anything (got {cell_width})"
+        );
+        let expected_gutter_px = gutter_cells as f32 * cell_width;
+
+        // ── Buffer text must be inset past the gutter, not flush ───────
+        let probe = h
+            .driver
+            .find_bounds("vimcodeline01")
+            .expect("the first buffer line must paint inside the viewport");
+        assert!(
+            probe.x > rect.x as f32,
+            "buffer text must be inset past the gutter, not flush against \
+             the pane's own left edge — vimcode#1691's reported symptom; \
+             pane left edge is {}, first line painted at x={}",
+            rect.x,
+            probe.x
+        );
+        assert!(
+            (probe.x - (rect.x as f32 + expected_gutter_px)).abs() < cell_width,
+            "buffer text must begin right where the {gutter_cells}-column \
+             gutter ends (pane x={} + gutter {expected_gutter_px}px = {}), \
+             not at some other, unrelated offset; painted at x={}",
+            rect.x,
+            rect.x as f32 + expected_gutter_px,
+            probe.x
+        );
+
+        // ── Gutter glyph ink: a digit must actually be painted in the
+        //    leftmost column band, not just a reserved blank one ───────
+        fn luma(c: quadraui::Color) -> f64 {
+            0.2126 * c.r as f64 + 0.7152 * c.g as f64 + 0.0722 * c.b as f64
+        }
+        let theme = crate::render::Theme::vscode_dark();
+        let mut brightest = quadraui::Color::rgb(0, 0, 0);
+        let x0 = rect.x as i32;
+        let x1 = (rect.x as f32 + expected_gutter_px).round() as i32;
+        let y0 = rect.y as i32;
+        let y1 = (rect.y as f32 + line_height).round() as i32;
+        for x in x0..x1 {
+            for y in y0..y1 {
+                let p = h.driver.pixel(x.max(0) as u32, y.max(0) as u32);
+                if luma(p) > luma(brightest) {
+                    brightest = p;
+                }
+            }
+        }
+        assert_ne!(
+            (brightest.r, brightest.g, brightest.b),
+            (theme.background.r, theme.background.g, theme.background.b),
+            "the gutter column's brightest pixel must differ from the \
+             editor background — a line-number digit, not an empty \
+             reserved column; got {brightest:?} == theme.background \
+             ({:?})",
+            theme.background
+        );
+    }
+
     // ── #1673: the stale x=24 menu-row coordinate opens nothing ────────
     //
     // Win-GUI mirror of `src/gtk/testing.rs::app_icon::clicking_the_
