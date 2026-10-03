@@ -11404,8 +11404,13 @@ mod sticky_scroll {
 /// issue's side-by-side capture). `MENU_STRUCTURE` (`render.rs`) is the one
 /// shared static both backends paint their top-level row from, so this is a
 /// pure menu-definition fix with no backend-specific code; this GTK-side
-/// proof plus `tui_main::app_on_tui_tests`'s mirror covers both renderers
-/// off the same data.
+/// proof is paired with a TUI-side mirror driving the real `App` through
+/// `quadraui::tui::testing::TuiDriver` —
+/// `tui_main::app_on_tui_tests::tests::selection_menu::
+/// menu_bar_has_selection_between_edit_and_view_in_order` — so both
+/// renderers are proven off the same data rather than assumed from this
+/// test alone (the #587/#592 "state populated, only one backend painted it"
+/// class of gap this file's module docs already warn about).
 ///
 /// Verified RED against the pre-fix tree: with `Selection` absent from
 /// `MENU_STRUCTURE`, `find_bounds("Selection")` returns `None` and the
