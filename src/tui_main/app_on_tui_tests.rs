@@ -10832,4 +10832,138 @@ mod tests {
             );
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Native API P6 (#1654): `vimcode.syntax.*` read access, driven by a real
+    // Lua plugin keymap and asserted on **painted output** — the issue's own
+    // acceptance bar: "a plugin maps a key that selects the enclosing
+    // function via syntax.query, and the painted selection covers it."
+    //
+    // "Selects" here means painting a `vimcode.decor` highlight over the
+    // enclosing node's range (the mechanism #1653 already shipped for
+    // exactly this purpose) rather than entering real Visual mode — P6 is a
+    // read-only API, and `vimcode.decor.*` is the existing tool for turning
+    // a resolved range into painted output.
+    // ─────────────────────────────────────────────────────────────────────────
+    mod issue_1654_syntax_api {
+        use super::*;
+        use crate::core::buffer::HlGroupDef;
+        use crate::core::syntax::{Syntax, SyntaxLanguage};
+
+        /// An engine with one Lua plugin loaded from a temp dir. Mirrors
+        /// `live_plugin_api::engine_with_plugin` (private to that sibling
+        /// module, so not reusable directly here).
+        fn engine_with_plugin(unique: &str, code: &str) -> crate::core::Engine {
+            let dir = std::env::temp_dir().join(format!(
+                "vc_app_on_tui_syntax_api_{unique}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{unique}.lua")), code).unwrap();
+            let mut engine = plain_engine();
+            let mut mgr =
+                crate::core::plugin::PluginManager::new().expect("PluginManager::new must succeed");
+            mgr.load_plugins_dir(&dir, &[]);
+            assert!(
+                mgr.plugins[0].error.is_none(),
+                "plugin must load cleanly: {:?}",
+                mgr.plugins[0].error
+            );
+            engine.set_plugin_manager(mgr);
+            let _ = std::fs::remove_dir_all(&dir);
+            engine
+        }
+
+        /// RED-verified against unfixed `develop`: there is no
+        /// `vimcode.syntax` table there, so `<leader>f`'s callback errors on
+        /// its first line and no `ZqSelectFn`-coloured highlight ever gets
+        /// painted — confirmed by temporarily reverting `Syntax::node_at`
+        /// to always return `Err`, which leaves the keymap's `pcall`-free
+        /// call erroring the same way and the function body unhighlighted.
+        #[test]
+        fn syntax_node_at_selects_enclosing_function_paints_highlight_via_shell_app() {
+            let mut engine = engine_with_plugin(
+                "syntax_select_fn",
+                r#"
+                vimcode.keymap.set("n", "<leader>f", function()
+                    local buf = vimcode.buffer.current()
+                    local pos = vimcode.window.get_cursor(0)
+                    local node = vimcode.syntax.node_at(buf, pos.line - 1, pos.col - 1)
+                    if node.parent ~= nil then
+                        local ns = vimcode.decor.namespace("zq_select_fn")
+                        vimcode.decor.set_mark(buf, ns, {
+                            row = node.parent.range.start_row,
+                            col = node.parent.range.start_col,
+                            end_row = node.parent.range.end_row,
+                            end_col = node.parent.range.end_col,
+                            hl_group = "ZqSelectFn",
+                        })
+                    end
+                end)
+                "#,
+            );
+            engine.decor.set_hl(
+                "ZqSelectFn",
+                HlGroupDef {
+                    fg: Some("#ff00ff".to_string()),
+                    ..Default::default()
+                },
+            );
+            engine
+                .buffer_mut()
+                .insert(0, "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n");
+            engine.active_buffer_state_mut().syntax =
+                Some(Syntax::new_for_language(SyntaxLanguage::Rust));
+            engine.active_buffer_state_mut().update_syntax();
+            // Cursor on the function name `add` (row 0, byte col 3 — "fn ").
+            engine.view_mut().cursor = crate::core::cursor::Cursor { line: 0, col: 3 };
+
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.screen();
+            assert!(
+                before.contains("a + b"),
+                "precondition: the function body paints before the keymap fires; \
+                 screen:\n{before}"
+            );
+            let (bx, by) = driver
+                .find("a + b")
+                .expect("precondition: the function body must paint");
+            let before_style = driver
+                .style_at(bx as u16, by as u16)
+                .expect("precondition: the matched cell must exist");
+            assert_ne!(
+                before_style.fg,
+                quadraui::tui::testing::Color::Rgb(255, 0, 255),
+                "precondition: the body isn't highlighted before the keymap fires"
+            );
+
+            // Leader (default Space) + 'f'.
+            driver.type_char(' ');
+            driver.type_char('f');
+            driver.render();
+
+            // The `function_item` node spans every line of the function —
+            // including its body, two rows below the cursor's own line — so
+            // asserting the highlight reaches "a + b" proves the *whole*
+            // enclosing-function range painted, not just the name's own
+            // single-line range `node_at` would report without `.parent`.
+            let (x, y) = driver
+                .find("a + b")
+                .expect("the function body must still paint after the keymap fires");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the matched cell must exist");
+            assert_eq!(
+                style.fg,
+                quadraui::tui::testing::Color::Rgb(255, 0, 255),
+                "the enclosing function's full range — found via \
+                 vimcode.syntax.node_at's `.parent` — must paint in the \
+                 resolved highlight colour, proving the selection covers the \
+                 whole function body"
+            );
+        }
+    }
 }

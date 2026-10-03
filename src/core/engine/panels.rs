@@ -1071,6 +1071,20 @@ impl Engine {
         }
     }
 
+    /// Install `diagnostics` for `path`, replacing whatever was there, and
+    /// fire `DiagnosticChanged` (#1654 P6) with the path so a plugin
+    /// watching diagnostics (`vimcode.diagnostics.get`) can react without
+    /// polling. The single seam `poll_lsp`'s `LspEvent::Diagnostics` arm
+    /// goes through — kept as its own method (rather than inlined there) so
+    /// a test can inject a diagnostic set and observe the event fire
+    /// without needing a live `lsp_manager`.
+    pub fn set_diagnostics_for_path(&mut self, path: PathBuf, diagnostics: Vec<Diagnostic>) {
+        let path_str = path.to_string_lossy().to_string();
+        self.lsp_diagnostics.insert(path, diagnostics);
+        self.invalidate_explorer_indicators();
+        self.plugin_event("DiagnosticChanged", &path_str);
+    }
+
     /// Poll LSP for events. Called every frame from the UI event loop.
     /// Returns true if a redraw is needed.
     pub fn poll_lsp(&mut self) -> bool {
@@ -1165,8 +1179,7 @@ impl Engine {
                             })
                             .collect()
                     };
-                    self.lsp_diagnostics.insert(path, filtered);
-                    self.invalidate_explorer_indicators();
+                    self.set_diagnostics_for_path(path, filtered);
                 }
                 LspEvent::CompletionResponse {
                     request_id, items, ..

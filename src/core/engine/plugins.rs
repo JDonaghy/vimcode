@@ -1479,6 +1479,141 @@ impl Engine {
         true
     }
 
+    // =========================================================================
+    // Native API P6 (#1654) — read-only syntax tree / undo tree / diagnostics.
+    // Thin buffer-handle-resolution wrappers; the actual tree-sitter work
+    // lives on `crate::core::syntax::Syntax` (`node_at`/`query_captures`),
+    // the undo-tree work on `BufferState`/`UndoTree` (`buffer_manager.rs`),
+    // and diagnostics read straight off `Engine::lsp_diagnostics`.
+    // =========================================================================
+
+    /// `vimcode.syntax.node_at(buf, row, col)`. `Err` surfaces as a Lua
+    /// error (invalid buffer, no parser, or out-of-range position) — a
+    /// plugin calling this on a buffer with no tree-sitter grammar gets a
+    /// clear message rather than a silent `nil`.
+    pub(crate) fn plugin_api_syntax_node_at(
+        &self,
+        buf: i64,
+        row: usize,
+        col: usize,
+    ) -> Result<crate::core::syntax::SyntaxNodeInfo, String> {
+        let buf_id = self
+            .plugin_api_resolve_buf(buf)
+            .ok_or("vimcode.syntax.node_at: invalid buffer")?;
+        let state = self
+            .buffer_manager
+            .get(buf_id)
+            .ok_or("vimcode.syntax.node_at: invalid buffer")?;
+        let syn = state
+            .syntax
+            .as_ref()
+            .ok_or("vimcode.syntax.node_at: buffer has no parser for its language")?;
+        syn.node_at(row, col)
+    }
+
+    /// `vimcode.syntax.query(buf, query_string, range?)` → `(language,
+    /// captures)`. See [`Self::plugin_api_syntax_node_at`] for the error
+    /// cases.
+    pub(crate) fn plugin_api_syntax_query(
+        &self,
+        buf: i64,
+        query_source: &str,
+        range: Option<(usize, usize)>,
+    ) -> Result<(String, Vec<crate::core::syntax::SyntaxCaptureInfo>), String> {
+        let buf_id = self
+            .plugin_api_resolve_buf(buf)
+            .ok_or("vimcode.syntax.query: invalid buffer")?;
+        let state = self
+            .buffer_manager
+            .get(buf_id)
+            .ok_or("vimcode.syntax.query: invalid buffer")?;
+        let syn = state
+            .syntax
+            .as_ref()
+            .ok_or("vimcode.syntax.query: buffer has no parser for its language")?;
+        let text = state.buffer.to_string();
+        let captures = syn.query_captures(&text, query_source, range)?;
+        Ok((syn.language_id().to_string(), captures))
+    }
+
+    /// `vimcode.undo.tree(buf)` — every live undo-tree node for `buf`, in
+    /// `seq` order. Empty for an invalid buffer.
+    pub(crate) fn plugin_api_undo_tree(
+        &self,
+        buf: i64,
+    ) -> Vec<crate::core::buffer_manager::UndoTreeNode> {
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
+            return Vec::new();
+        };
+        let Some(state) = self.buffer_manager.get(buf_id) else {
+            return Vec::new();
+        };
+        state.undo_tree_for_plugin()
+    }
+
+    /// `vimcode.undo.jump(buf, seq)` → bool. The one mutation this read API
+    /// ships — see [`crate::core::buffer_manager::UndoTree::jump_to_seq`].
+    /// Mirrors the side effects `Engine::undo`/`redo` (`buffers.rs`) apply
+    /// for the active buffer, generalised to an arbitrary buffer handle:
+    /// every window currently showing `buf` gets the jumped-to cursor,
+    /// decoration marks shift across the full-text swap, and the buffer's
+    /// dirty/LSP-resync flags are refreshed.
+    pub(crate) fn plugin_api_undo_jump(&mut self, buf: i64, seq: usize) -> bool {
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf) else {
+            return false;
+        };
+        let Some(state) = self.buffer_manager.get(buf_id) else {
+            return false;
+        };
+        let old_text = state.buffer.to_string();
+        let Some(state) = self.buffer_manager.get_mut(buf_id) else {
+            return false;
+        };
+        let Some(cursor) = state.undo_jump(seq) else {
+            return false;
+        };
+        state.dirty = !state.is_at_saved_state();
+        let new_text = state.buffer.to_string();
+        self.decor
+            .shift_for_text_replace(buf_id, &old_text, &new_text);
+        self.lsp_dirty_buffers.insert(buf_id, true);
+        for win in self.windows.values_mut() {
+            if win.buffer_id == buf_id {
+                win.view.cursor = cursor;
+            }
+        }
+        self.clamp_cursors_to_buffer(buf_id);
+        true
+    }
+
+    /// `vimcode.diagnostics.get(buf?)` — diagnostics for `buf`, or the
+    /// active buffer when `buf` is omitted (matching this API's other
+    /// `handle.unwrap_or(0)` = "current" convention). Empty (not an error)
+    /// for an invalid buffer or one with no path to key `lsp_diagnostics`
+    /// by — a plugin polling a scratch buffer shouldn't have to special-case
+    /// it.
+    pub(crate) fn plugin_api_diagnostics_get(&self, buf: Option<i64>) -> Vec<Diagnostic> {
+        let Some(buf_id) = self.plugin_api_resolve_buf(buf.unwrap_or(0)) else {
+            return Vec::new();
+        };
+        let Some(path) = self.plugin_api_diagnostics_key(buf_id) else {
+            return Vec::new();
+        };
+        self.lsp_diagnostics.get(&path).cloned().unwrap_or_default()
+    }
+
+    /// The key `Engine::lsp_diagnostics` is stored under for `buf` — the
+    /// canonical path if one has been resolved, else the raw `file_path`.
+    /// Generalises `active_buffer_diagnostics_key` (`ext_panel.rs`) to an
+    /// arbitrary buffer handle.
+    fn plugin_api_diagnostics_key(&self, buf: BufferId) -> Option<PathBuf> {
+        let state = self.buffer_manager.get(buf)?;
+        state
+            .canonical_path
+            .clone()
+            .or_else(|| state.file_path.clone())
+    }
+
     /// Open an undo group for `buf` unless the current dispatch already did.
     fn begin_plugin_undo_group(&mut self, buf: BufferId) {
         if self.plugin_undo_groups.contains(&buf) {

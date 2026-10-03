@@ -7661,3 +7661,321 @@ fn annotate_line_behaviour_is_unchanged_by_decor_api() {
         "clear_annotations must still wipe every entry"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Native Extension API — Phase 6 (#1654): `vimcode.syntax.*` (read-only
+// tree-sitter node/query access over the engine's own highlighting parse),
+// `vimcode.undo.*` (undo-tree read + jump), `vimcode.diagnostics.*` (LSP
+// diagnostics read + `DiagnosticChanged`).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Install a tree-sitter parser for `lang` on the active buffer and parse
+/// its current text — the same two steps `BufferState::with_file` runs on a
+/// real file open, minus the filename-sniffing (these fixtures pick the
+/// language explicitly, so a throwaway temp path doesn't need a real
+/// `.rs`/`.lua` extension).
+fn setup_syntax(e: &mut vimcode_core::Engine, lang: vimcode_core::core::syntax::SyntaxLanguage) {
+    e.active_buffer_state_mut().syntax =
+        Some(vimcode_core::core::syntax::Syntax::new_for_language(lang));
+    e.active_buffer_state_mut().update_syntax();
+}
+
+/// RED against unfixed `develop`: there is no `vimcode.syntax` table there,
+/// so `ReadNode`'s callback errors on its first line and `e.message` is
+/// never set to the `type=...` string this asserts on.
+#[test]
+fn syntax_node_at_finds_function_identifier_in_rust_fixture() {
+    use vimcode_core::core::syntax::SyntaxLanguage;
+    let mut e = engine_with_plugin(
+        "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        "syntax_node_at_rust",
+        r#"
+        vimcode.command("ReadNode", function(_)
+            local node = vimcode.syntax.node_at(0, 0, 3)
+            vimcode.message(
+                "type=" .. node.type
+                .. " lang=" .. node.language
+                .. " parent=" .. tostring(node.parent and node.parent.type)
+            )
+        end)
+        "#,
+    );
+    setup_syntax(&mut e, SyntaxLanguage::Rust);
+
+    exec(&mut e, "ReadNode");
+    assert_eq!(
+        e.message, "type=identifier lang=rust parent=function_item",
+        "node_at(0, 0, 3) (byte col 3 = the 'a' of \"add\", right after \"fn \") \
+         must resolve the function name identifier, with its immediate \
+         parent being the enclosing function_item: {}",
+        e.message
+    );
+}
+
+/// Same shape as the Rust fixture above, for Lua — a different grammar, a
+/// different node-kind vocabulary (`function_declaration` instead of
+/// `function_item`), proving `node_at` isn't accidentally Rust-specific.
+#[test]
+fn syntax_node_at_finds_function_identifier_in_lua_fixture() {
+    use vimcode_core::core::syntax::SyntaxLanguage;
+    let mut e = engine_with_plugin(
+        "function add(a, b)\n  return a + b\nend\n",
+        "syntax_node_at_lua",
+        r#"
+        vimcode.command("ReadNode", function(_)
+            local node = vimcode.syntax.node_at(0, 0, 9)
+            vimcode.message(
+                "type=" .. node.type
+                .. " lang=" .. node.language
+                .. " parent=" .. tostring(node.parent and node.parent.type)
+            )
+        end)
+        "#,
+    );
+    setup_syntax(&mut e, SyntaxLanguage::Lua);
+
+    exec(&mut e, "ReadNode");
+    assert_eq!(
+        e.message, "type=identifier lang=lua parent=function_declaration",
+        "node_at(0, 0, 9) (byte col 9 = the 'a' of \"add\", right after \
+         \"function \") must resolve the function name identifier, with its \
+         immediate parent being the enclosing function_declaration: {}",
+        e.message
+    );
+}
+
+/// A buffer with no tree-sitter grammar (no `syntax` installed at all) must
+/// error clearly from `node_at`, not panic or silently return `nil`.
+///
+/// RED against unfixed `develop`: no `vimcode.syntax` table exists there at
+/// all, so this would already error — but with a *different* message
+/// ("attempt to index a nil value"), which would pass this test's
+/// `ok=false` half without ever exercising the "buffer has no parser"
+/// error path `plugin_api_syntax_node_at` is actually responsible for.
+/// Confirmed by temporarily making `Engine::plugin_api_syntax_node_at`
+/// return `Ok` with a dummy node regardless of `state.syntax`: the test then
+/// fails on the `err` half, not the `ok` half.
+#[test]
+fn syntax_node_at_errors_clearly_with_no_parser() {
+    let mut e = engine_with_plugin(
+        "plain text, no language set\n",
+        "syntax_node_at_no_parser",
+        r#"
+        vimcode.command("ReadNode", function(_)
+            local ok, err = pcall(function()
+                return vimcode.syntax.node_at(0, 0, 0)
+            end)
+            vimcode.message("ok=" .. tostring(ok) .. " err=" .. tostring(err))
+        end)
+        "#,
+    );
+    exec(&mut e, "ReadNode");
+    assert!(
+        e.message.contains("ok=false") && e.message.contains("no parser"),
+        "node_at on a buffer with no tree-sitter parser must error clearly: {}",
+        e.message
+    );
+}
+
+/// `vimcode.syntax.query` compiles and runs an ad hoc query against the
+/// buffer's language, independent of whatever built-in highlight query
+/// `Syntax` was constructed with.
+#[test]
+fn syntax_query_finds_function_name_captures_in_rust_fixture() {
+    use vimcode_core::core::syntax::SyntaxLanguage;
+    let mut e = engine_with_plugin(
+        "fn add() {}\nfn sub() {}\n",
+        "syntax_query_rust",
+        r#"
+        vimcode.command("RunQuery", function(_)
+            local caps = vimcode.syntax.query(0, "(function_item name: (identifier) @function)")
+            local names = {}
+            for _, c in ipairs(caps) do
+                table.insert(names, c.name .. ":" .. c.type .. ":" .. c.range.start_row)
+            end
+            vimcode.message(table.concat(names, ","))
+        end)
+        "#,
+    );
+    setup_syntax(&mut e, SyntaxLanguage::Rust);
+
+    exec(&mut e, "RunQuery");
+    assert_eq!(
+        e.message, "function:identifier:0,function:identifier:1",
+        "the query must capture both function names, one per row: {}",
+        e.message
+    );
+}
+
+/// `vimcode.undo.tree` shape after two edits, an undo, and a third edit
+/// that starts a new branch — the exact scenario the issue's acceptance
+/// bar names ("undo tree shape after edits + undo + new branch").
+///
+/// RED against unfixed `develop`: there is no `vimcode.undo` table there,
+/// so `ReadTree`'s callback errors on its first line.
+#[test]
+fn undo_tree_shows_shape_after_edits_undo_and_new_branch() {
+    let mut e = engine_with_plugin(
+        "a\n",
+        "undo_tree_shape",
+        r#"
+        vimcode.command("ReadTree", function(_)
+            local nodes = vimcode.undo.tree(0)
+            local parts = {}
+            for _, n in ipairs(nodes) do
+                table.insert(parts, n.seq .. ":" .. tostring(n.parent) .. ":" .. tostring(n.current))
+            end
+            vimcode.message(table.concat(parts, ","))
+        end)
+        "#,
+    );
+
+    // seq 1: "a" -> "ab"
+    press(&mut e, 'A');
+    type_chars(&mut e, "b");
+    press_key(&mut e, "Escape");
+    // seq 2: "ab" -> "abc"
+    press(&mut e, 'A');
+    type_chars(&mut e, "c");
+    press_key(&mut e, "Escape");
+    // Undo back to seq 1 ("ab"), abandoning seq 2's branch (still live, not
+    // pruned — just no longer on the active path).
+    e.undo();
+    // seq 3: a *new* branch off seq 1: "ab" -> "abd".
+    press(&mut e, 'A');
+    type_chars(&mut e, "d");
+    press_key(&mut e, "Escape");
+
+    exec(&mut e, "ReadTree");
+    assert_eq!(
+        e.message, "0:nil:false,1:0:false,2:1:false,3:1:true",
+        "must list the root, the live-but-abandoned seq-2 branch, and the \
+         new seq-3 branch (off seq-1, now current): {}",
+        e.message
+    );
+}
+
+/// `vimcode.undo.jump(buf, seq)` — the one mutation P6 ships — restores the
+/// exact text of the named `seq`, going through the existing undo tree
+/// rather than a bespoke buffer swap.
+///
+/// RED against unfixed `develop`: there is no `vimcode.undo` table there,
+/// so `JumpTo`'s callback errors and the buffer keeps reading "abd", not
+/// "ab".
+#[test]
+fn undo_jump_restores_text_of_a_named_seq() {
+    let mut e = engine_with_plugin(
+        "a\n",
+        "undo_jump",
+        r#"
+        vimcode.command("JumpTo1", function(_)
+            local ok = vimcode.undo.jump(0, 1)
+            vimcode.message("jumped=" .. tostring(ok))
+        end)
+        "#,
+    );
+
+    press(&mut e, 'A');
+    type_chars(&mut e, "b");
+    press_key(&mut e, "Escape");
+    press(&mut e, 'A');
+    type_chars(&mut e, "c");
+    press_key(&mut e, "Escape");
+    assert_eq!(get_lines(&e), vec!["abc".to_string()], "precondition");
+
+    exec(&mut e, "JumpTo1");
+    assert_eq!(e.message, "jumped=true");
+    assert_eq!(
+        get_lines(&e),
+        vec!["ab".to_string()],
+        "jump(0, 1) must restore seq 1's text (\"ab\"), not stay on seq 2"
+    );
+}
+
+/// `vimcode.diagnostics.get()` (no `buf` argument — defaults to the active
+/// buffer) reads back a diagnostic set installed via
+/// `Engine::set_diagnostics_for_path` — the same seam `poll_lsp`'s
+/// `LspEvent::Diagnostics` handling writes through in production, so this
+/// is "diagnostics read from an injected diagnostic set" without needing a
+/// live LSP server.
+///
+/// RED against unfixed `develop`: there is no `vimcode.diagnostics` table
+/// there, so `ReadDiags`'s callback errors and `e.message` never gets set.
+#[test]
+fn diagnostics_get_reads_an_injected_diagnostic_set() {
+    use vimcode_core::core::lsp::{Diagnostic, DiagnosticSeverity, LspPosition, LspRange};
+    let mut e = engine_with_plugin(
+        "line one\nline two\n",
+        "diagnostics_get",
+        r#"
+        vimcode.command("ReadDiags", function(_)
+            local diags = vimcode.diagnostics.get()
+            local d = diags[1]
+            vimcode.message(
+                "n=" .. #diags
+                .. " sev=" .. d.severity
+                .. " msg=" .. d.message
+                .. " row=" .. d.range.start_row
+                .. " col=" .. d.range.start_col
+            )
+        end)
+        "#,
+    );
+    let path = std::path::PathBuf::from("/tmp/vc_diag_test_1654.rs");
+    e.active_buffer_state_mut().file_path = Some(path.clone());
+    e.set_diagnostics_for_path(
+        path,
+        vec![Diagnostic {
+            range: LspRange {
+                start: LspPosition {
+                    line: 0,
+                    character: 2,
+                },
+                end: LspPosition {
+                    line: 0,
+                    character: 6,
+                },
+            },
+            severity: DiagnosticSeverity::Error,
+            message: "unexpected token".to_string(),
+            source: Some("rustc".to_string()),
+            code: Some("E0308".to_string()),
+        }],
+    );
+
+    exec(&mut e, "ReadDiags");
+    assert_eq!(
+        e.message, "n=1 sev=error msg=unexpected token row=0 col=2",
+        "vimcode.diagnostics.get() must read back the injected diagnostic: {}",
+        e.message
+    );
+}
+
+/// `DiagnosticChanged` fires with the changed path whenever diagnostics are
+/// installed for it, via the existing generic `vimcode.on` registration —
+/// no separate event-wiring API needed.
+///
+/// RED against unfixed `develop`: `Engine::set_diagnostics_for_path`
+/// doesn't exist there (only a direct `lsp_diagnostics.insert`), so there is
+/// no event to fire and `e.message` stays whatever it was before.
+#[test]
+fn diagnostic_changed_event_fires_when_diagnostics_are_installed() {
+    use vimcode_core::core::lsp::Diagnostic;
+    let mut e = engine_with_plugin(
+        "line one\n",
+        "diagnostic_changed",
+        r#"
+        vimcode.on("DiagnosticChanged", function(path)
+            vimcode.message("changed:" .. path)
+        end)
+        "#,
+    );
+    let path = std::path::PathBuf::from("/tmp/vc_diag_changed_1654.rs");
+    e.set_diagnostics_for_path(path.clone(), Vec::<Diagnostic>::new());
+
+    assert_eq!(
+        e.message,
+        format!("changed:{}", path.to_string_lossy()),
+        "DiagnosticChanged must fire with the path whose diagnostics changed"
+    );
+}

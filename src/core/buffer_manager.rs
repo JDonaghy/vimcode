@@ -533,6 +533,55 @@ impl UndoTree {
             .map(|i| &self.nodes[i])
             .collect()
     }
+
+    /// Live nodes, oldest first, in the shape `vimcode.undo.tree` (#1654 P6)
+    /// hands to a plugin: `parent` is the parent's **`seq`**, not its arena
+    /// index — a plugin has no business knowing this crate's arena layout,
+    /// and `seq` is the portable handle [`Self::jump_to_seq`] (and
+    /// `vimcode.undo.jump`) consumes.
+    pub fn tree_for_plugin(&self) -> Vec<UndoTreeNode> {
+        let current = self.current;
+        self.live_indices_sorted()
+            .into_iter()
+            .map(|i| {
+                let n = &self.nodes[i];
+                UndoTreeNode {
+                    seq: n.seq,
+                    parent: n.parent.map(|p| self.nodes[p].seq),
+                    time: n.timestamp,
+                    current: i == current,
+                }
+            })
+            .collect()
+    }
+
+    /// `vimcode.undo.jump(buf, seq)` (#1654 P6): go straight to the live
+    /// node carrying `seq`, unlike [`Self::older`]/[`Self::newer`] which
+    /// step one chronological position at a time. Lands on the node's
+    /// `cursor_after` — the same convention [`Self::redo`] uses for a node
+    /// reached by moving onto it directly rather than stepping through it.
+    /// `None` if no live node carries `seq`.
+    pub fn jump_to_seq(&mut self, seq: usize) -> Option<(String, Cursor)> {
+        let idx = self.nodes.iter().position(|n| !n.removed && n.seq == seq)?;
+        self.current = idx;
+        let n = &self.nodes[idx];
+        Some((n.text.clone(), n.cursor_after))
+    }
+}
+
+/// One undo-tree node as handed to a plugin by `vimcode.undo.tree` (#1654
+/// P6) — a flattened, arena-index-free view of [`UndoNode`]. See
+/// [`UndoTree::tree_for_plugin`].
+#[derive(Debug, Clone)]
+pub struct UndoTreeNode {
+    /// This node's own sequence number.
+    pub seq: usize,
+    /// The parent node's sequence number — `None` only for the root.
+    pub parent: Option<usize>,
+    /// Wall-clock time the node was created.
+    pub time: SystemTime,
+    /// Whether this is the node the buffer currently reflects.
+    pub current: bool,
 }
 
 /// Process-wide `'undolevels'`: the maximum number of live undo states kept
@@ -1209,6 +1258,21 @@ impl BufferState {
     /// like Vim's `:undolist`/`g-` status message.
     pub fn undo_position(&self) -> (usize, usize) {
         self.undo_tree.position()
+    }
+
+    /// `vimcode.undo.tree(buf)` (#1654 P6) — the full live undo tree, in
+    /// plugin-facing shape. See [`UndoTree::tree_for_plugin`].
+    pub fn undo_tree_for_plugin(&self) -> Vec<UndoTreeNode> {
+        self.undo_tree.tree_for_plugin()
+    }
+
+    /// `vimcode.undo.jump(buf, seq)` (#1654 P6) — the one mutation the P6
+    /// read API ships, and it goes entirely through the existing undo
+    /// machinery ([`UndoTree::jump_to_seq`]) rather than hand-rolling a
+    /// buffer swap.
+    pub fn undo_jump(&mut self, seq: usize) -> Option<Cursor> {
+        let result = self.undo_tree.jump_to_seq(seq);
+        self.apply_undo_nav_result(result)
     }
 
     /// `:undojoin` and the internal "these sub-command undo steps are one
