@@ -63,6 +63,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use super::buffer::{DecorOpts, HlGroupDef, VirtTextChunk, VirtTextPos};
 use super::engine::{
     expand_leader_tokens, parse_key_sequence, Engine, UserKeymap, UserKeymapAction,
 };
@@ -4416,8 +4417,186 @@ impl PluginManager {
         )?;
 
         vimcode.set("window", window)?;
+
+        // ── vimcode.decor (#1653, Native API P5) ─────────────────────────────
+        Self::setup_decor_api(lua, vimcode)?;
+
         Ok(())
     }
+
+    /// Install `vimcode.decor.*`: namespaces, namespaced extmarks (optionally
+    /// ranged), named highlight groups, and the virtual-text/sign options a
+    /// mark can carry. See `core::buffer`'s decoration types for the
+    /// underlying model and `Engine::plugin_api_decor_*` (in
+    /// `engine/plugins.rs`) for the handle-resolution logic these wrappers
+    /// stay thin over.
+    fn setup_decor_api(lua: &Lua, vimcode: &LuaTable) -> LuaResult<()> {
+        let decor = lua.create_table()?;
+
+        // vimcode.decor.namespace(name) → namespace id (idempotent by name).
+        decor.set(
+            "namespace",
+            lua.create_function(|_, name: String| {
+                live_engine("vimcode.decor.namespace", move |e| {
+                    e.plugin_api_decor_namespace(&name)
+                })
+            })?,
+        )?;
+
+        // vimcode.decor.set_hl(name, {fg=, bg=, bold=, italic=, underline=,
+        // link=}) — registers/updates a named highlight group. `fg`/`bg` are
+        // `"#rrggbb"`/`"#rrggbbaa"` strings; `link` names another group whose
+        // resolved colours are used instead (re-resolved on `ColorScheme`,
+        // not frozen at `set_hl` time).
+        decor.set(
+            "set_hl",
+            lua.create_function(|_, (name, opts): (String, LuaTable)| {
+                let def = lua_table_to_hl_def(&opts)?;
+                live_engine("vimcode.decor.set_hl", move |e| {
+                    e.plugin_api_decor_set_hl(&name, def);
+                })
+            })?,
+        )?;
+
+        // vimcode.decor.set_mark(buf, ns, {row, col, end_row?, end_col?,
+        // hl_group?, virt_text?, virt_text_pos?, sign_text?, sign_hl?}) →
+        // mark id, or `nil` when `buf` isn't a live buffer. `row`/`col` are
+        // 0-indexed, matching `vimcode.buffer.get_lines`/`set_lines`.
+        decor.set(
+            "set_mark",
+            lua.create_function(|_, (buf, ns, opts): (i64, i64, LuaTable)| {
+                let row: usize = opts.get::<_, Option<usize>>("row")?.unwrap_or(0);
+                let col: usize = opts.get::<_, Option<usize>>("col")?.unwrap_or(0);
+                let end_row: Option<usize> = opts.get("end_row")?;
+                let end_col: Option<usize> = opts.get("end_col")?;
+                let decor_opts = lua_table_to_decor_opts(&opts)?;
+                let id = live_engine("vimcode.decor.set_mark", move |e| {
+                    e.plugin_api_decor_set_mark(buf, ns, row, col, end_row, end_col, decor_opts)
+                })?;
+                Ok(id)
+            })?,
+        )?;
+
+        // vimcode.decor.get_mark(buf, ns, id) → table or nil. `nil` both for
+        // a stale id and for one belonging to a different namespace (a
+        // plugin can only read back its own marks).
+        decor.set(
+            "get_mark",
+            lua.create_function(|lua, (buf, ns, id): (i64, i64, i64)| {
+                let mark = live_engine("vimcode.decor.get_mark", move |e| {
+                    e.plugin_api_decor_get_mark(buf, ns, id)
+                })?;
+                match mark {
+                    Some(m) => {
+                        let t = lua.create_table()?;
+                        t.set("row", m.row)?;
+                        t.set("col", m.col)?;
+                        t.set("end_row", m.end_row)?;
+                        t.set("end_col", m.end_col)?;
+                        if let Some(hl) = &m.opts.hl_group {
+                            t.set("hl_group", hl.clone())?;
+                        }
+                        if let Some(st) = &m.opts.sign_text {
+                            t.set("sign_text", st.clone())?;
+                        }
+                        if let Some(sh) = &m.opts.sign_hl {
+                            t.set("sign_hl", sh.clone())?;
+                        }
+                        Ok(LuaValue::Table(t))
+                    }
+                    None => Ok(LuaValue::Nil),
+                }
+            })?,
+        )?;
+
+        // vimcode.decor.del_mark(buf, ns, id) → bool.
+        decor.set(
+            "del_mark",
+            lua.create_function(|_, (buf, ns, id): (i64, i64, i64)| {
+                live_engine("vimcode.decor.del_mark", move |e| {
+                    e.plugin_api_decor_del_mark(buf, ns, id)
+                })
+            })?,
+        )?;
+
+        // vimcode.decor.clear(ns, buf, start?, end?) — removes every mark in
+        // `ns` (optionally restricted to the 0-indexed, exclusive-`end` row
+        // range `[start, end)`) that `buf` is carrying. A plugin names only
+        // its own `ns`, so this can't touch another plugin's marks even
+        // though every namespace shares one per-buffer store.
+        decor.set(
+            "clear",
+            lua.create_function(
+                |_, (ns, buf, start, end): (i64, i64, Option<usize>, Option<usize>)| {
+                    let range = match (start, end) {
+                        (Some(s), Some(e)) => Some((s, e)),
+                        _ => None,
+                    };
+                    live_engine("vimcode.decor.clear", move |e| {
+                        e.plugin_api_decor_clear(ns, buf, range)
+                    })
+                },
+            )?,
+        )?;
+
+        vimcode.set("decor", decor)?;
+        Ok(())
+    }
+}
+
+/// Parse a `vimcode.decor.set_hl` options table into an [`HlGroupDef`].
+fn lua_table_to_hl_def(t: &LuaTable) -> LuaResult<HlGroupDef> {
+    Ok(HlGroupDef {
+        fg: t.get("fg")?,
+        bg: t.get("bg")?,
+        bold: t.get::<_, Option<bool>>("bold")?.unwrap_or(false),
+        italic: t.get::<_, Option<bool>>("italic")?.unwrap_or(false),
+        underline: t.get::<_, Option<bool>>("underline")?.unwrap_or(false),
+        link: t.get("link")?,
+    })
+}
+
+fn lua_parse_virt_text_pos(s: &str) -> Option<VirtTextPos> {
+    match s {
+        "eol" => Some(VirtTextPos::Eol),
+        "overlay" => Some(VirtTextPos::Overlay),
+        "inline" => Some(VirtTextPos::Inline),
+        _ => None,
+    }
+}
+
+/// Parse the subset of a `vimcode.decor.set_mark` options table that becomes
+/// a [`DecorOpts`] (the `row`/`col`/`end_row`/`end_col` anchor fields are
+/// read separately by the caller).
+fn lua_table_to_decor_opts(t: &LuaTable) -> LuaResult<DecorOpts> {
+    let hl_group: Option<String> = t.get("hl_group")?;
+    let sign_text: Option<String> = t.get("sign_text")?;
+    let sign_hl: Option<String> = t.get("sign_hl")?;
+    let mut virt_text = Vec::new();
+    if let Some(vt) = t.get::<_, Option<LuaTable>>("virt_text")? {
+        for i in 1..=vt.raw_len() {
+            if let Ok(chunk) = vt.get::<_, LuaTable>(i) {
+                let text: String = chunk
+                    .get::<_, Option<String>>(1)?
+                    .or(chunk.get::<_, Option<String>>("text")?)
+                    .unwrap_or_default();
+                let hl: Option<String> = chunk
+                    .get::<_, Option<String>>(2)?
+                    .or(chunk.get::<_, Option<String>>("hl_group")?);
+                virt_text.push(VirtTextChunk { text, hl_group: hl });
+            }
+        }
+    }
+    let virt_text_pos = t
+        .get::<_, Option<String>>("virt_text_pos")?
+        .and_then(|s| lua_parse_virt_text_pos(&s));
+    Ok(DecorOpts {
+        hl_group,
+        virt_text,
+        virt_text_pos,
+        sign_text,
+        sign_hl,
+    })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

@@ -207,6 +207,10 @@ impl Engine {
                 *line += line_count;
             }
         }
+        // #1653: plugin decoration marks (`vimcode.decor.set_mark`) follow
+        // the same full-line-insertion rule as the vim marks just above.
+        self.decor
+            .shift_insert(buffer_id, at_line, line_count, at_line_start);
     }
 
     /// Shift/remove marks for a full-line deletion covering `[at_line,
@@ -237,6 +241,8 @@ impl Engine {
                 *line -= line_count;
             }
         }
+        // #1653: same full-line-deletion rule for plugin decoration marks.
+        self.decor.shift_delete(buffer_id, at_line, line_count);
     }
 
     /// Read every local mark (active buffer) and global mark (pointing at
@@ -323,6 +329,7 @@ impl Engine {
 
     /// Perform undo on the active buffer. Returns true if undo was performed.
     pub fn undo(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         if let Some(cursor) = self.active_buffer_state_mut().undo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
@@ -331,6 +338,7 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            self.shift_decor_across_undo_nav(&old_text);
             true
         } else {
             self.message = "Already at oldest change".to_string();
@@ -340,6 +348,7 @@ impl Engine {
 
     /// Perform redo on the active buffer. Returns true if redo was performed.
     pub fn redo(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         if let Some(cursor) = self.active_buffer_state_mut().redo() {
             self.view_mut().cursor = cursor;
             self.clamp_cursor_col();
@@ -348,11 +357,28 @@ impl Engine {
             let active_id = self.active_buffer_id();
             self.lsp_dirty_buffers.insert(active_id, true);
             self.swap_mark_dirty();
+            self.shift_decor_across_undo_nav(&old_text);
             true
         } else {
             self.message = "Already at newest change".to_string();
             false
         }
+    }
+
+    /// Relocate `self.decor`'s marks across an undo-tree jump that replaced
+    /// the *entire* buffer text in one step (`undo`/`redo`/`g_earlier`/
+    /// `g_later`/`:earlier`/`:later` all swap a full `UndoNode::text`
+    /// snapshot rather than applying a per-edit insert/delete, so there's no
+    /// `shift_marks_for_line_insert`/`_delete`-style line/count to hook —
+    /// see `BufferState::undo`/`redo` in `buffer_manager.rs`). Called with
+    /// the buffer's text from *before* the jump; reads the text *after* off
+    /// `self.buffer()` directly, since by the time this runs the swap has
+    /// already happened.
+    fn shift_decor_across_undo_nav(&mut self, old_text: &str) {
+        let buffer_id = self.active_window().buffer_id;
+        let new_text = self.buffer().to_string();
+        self.decor
+            .shift_for_text_replace(buffer_id, old_text, &new_text);
     }
 
     /// Apply the side effects common to every undo-tree navigation that
@@ -374,9 +400,11 @@ impl Engine {
     /// plain `u`, this crosses into a branch a prior `u` + new edit
     /// abandoned (#1156).
     pub fn g_earlier(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         match self.active_buffer_state_mut().undo_older() {
             Some(cursor) => {
                 self.report_undo_nav(cursor, "g-");
+                self.shift_decor_across_undo_nav(&old_text);
                 true
             }
             None => false,
@@ -385,9 +413,11 @@ impl Engine {
 
     /// Navigate to a later buffer state chronologically (`g+`).
     pub fn g_later(&mut self) -> bool {
+        let old_text = self.buffer().to_string();
         match self.active_buffer_state_mut().undo_newer() {
             Some(cursor) => {
                 self.report_undo_nav(cursor, "g+");
+                self.shift_decor_across_undo_nav(&old_text);
                 true
             }
             None => false,
@@ -410,6 +440,7 @@ impl Engine {
     fn ex_earlier_later(&mut self, spec: &str, earlier: bool) -> Result<(), String> {
         let spec = spec.trim();
         let label = if earlier { "earlier" } else { "later" };
+        let old_text = self.buffer().to_string();
         if let Some(cutoff) = parse_undo_time_spec(spec) {
             let bs = self.active_buffer_state_mut();
             let result = if earlier {
@@ -418,7 +449,10 @@ impl Engine {
                 bs.undo_at_or_after(cutoff)
             };
             match result {
-                Some(cursor) => self.report_undo_nav(cursor, label),
+                Some(cursor) => {
+                    self.report_undo_nav(cursor, label);
+                    self.shift_decor_across_undo_nav(&old_text);
+                }
                 None => self.message = "Already at oldest change".to_string(),
             }
             return Ok(());
@@ -448,7 +482,10 @@ impl Engine {
             }
         }
         match last_cursor {
-            Some(cursor) => self.report_undo_nav(cursor, label),
+            Some(cursor) => {
+                self.report_undo_nav(cursor, label);
+                self.shift_decor_across_undo_nav(&old_text);
+            }
             None => {
                 self.message = if earlier {
                     "Already at oldest change".to_string()
