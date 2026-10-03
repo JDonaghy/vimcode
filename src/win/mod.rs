@@ -913,6 +913,74 @@ mod win_gutter_contract_1691 {
     }
 }
 
+// ── #1696: editor text not inset by the minimap strip; tab-strip
+// overflow-action toolbar clipped off the window's right edge ───────────
+//
+// vimcode#1696 (bugbash finding, real-hardware screenshot evidence on
+// dell64): with the minimap on and `'nowrap'` (vim's default), a long
+// buffer line paints glyphs under the minimap strip, which then overpaints
+// the last character or two; separately, the tab-strip's trailing `"⋯"`
+// overflow-action control renders as two dots rather than a full ellipse,
+// read as the glyph being clipped by the window's own right edge.
+//
+// Investigated against the shared `src/render.rs` frame-composition path
+// the issue itself names first (`#764`'s converged "editor band" — see
+// that file's own doc comment), **not** this module — both symptoms
+// root-cause to code (vimcode's own `to_q_editor`, and the pinned
+// `quadraui::primitives::tab_bar::TabBar::layout`) that every GUI/TUI
+// backend shares equally, not anything specific to `WinBackend`/`win::run`.
+// Nothing in `src/win/` changes for either half, matching this file's own
+// "no layout, hit-test, paint or dispatch decision" posture (its own
+// top-of-file doc comment).
+//
+// * **Minimap half:** `to_q_editor` (`src/render.rs`) builds
+//   `quadraui::Editor` with `rect = rw.rect` verbatim, never consulting
+//   `RenderedWindow.minimap_reserved_w` — by #1094's own design, so that
+//   quadraui's drawn v/h scrollbar (`EditorLayout::v_scrollbar_bounds`/
+//   `h_scrollbar_bounds`, anchored at `viewport.x + viewport.width`) lands
+//   past the strip at the pane's true right edge rather than immediately
+//   before it. Narrowing `to_q_editor`'s `rect` in vimcode alone would fix
+//   the text overlap but pull that scrollbar in to sit flush against the
+//   narrower text instead — reopening #1094 on GTK, TUI, *and* Win-GUI at
+//   once (all three now share this exact code path since `#1433`/`#1434`).
+//   Confirmed numerically, not just by reading the source:
+//   `render::tests::to_q_editor_does_not_narrow_the_viewport_for_the_
+//   minimap_strip_1696` (`src/render.rs`) is a backend-neutral test (no
+//   Windows/GTK display needed, runs on any host) that builds a
+//   `RenderedWindow` fixture with a non-zero `minimap_reserved_w`, runs it
+//   through the real `to_q_editor` + `quadraui::Editor::layout`, and
+//   passes today precisely because `EditorLayout::text_bounds` is *not*
+//   narrowed — pinning the gap as a concrete regression target for the
+//   missing quadraui capability (`Editor`/`EditorPaintOptions` needs a way
+//   to reserve trailing content width independently of where the
+//   scrollbar anchors) rather than a vimcode-side arithmetic bug.
+//
+// * **Tab-bar half:** `quadraui::primitives::tab_bar::TabBar::layout`
+//   positions every `right_segments` entry — including the trailing
+//   `tab:action_menu` `"⋯"` control `render::build_tab_bar_primitive`
+//   appends — flush against whatever `bar_width` the caller passes
+//   (`seg_x = bar_width - right_area_width`), with no outer-edge inset at
+//   all. `primitives::status_bar::PIXEL_EDGE_INSET` already solved this
+//   identical problem for the status bar (#1155); `TabBar` never grew the
+//   analogue. The width vimcode hands `TabBar::layout` is the real
+//   window's real content width — `#1561`'s own investigation (directly
+//   above/below in this file's history) already confirmed `WinBackend::
+//   attach_surface`/`resize_surface` derive the render target's pixel
+//   size from one un-split `GetClientRect`/`WM_SIZE` pair, no double-
+//   subtraction or DIP/physical mismatch — so this is not a `src/win/`
+//   sizing bug either.
+//
+// Both findings, their concrete `Ask`s, and why neither is fixable from
+// this repo alone (narrowing the caller-side rect/width either reopens
+// #1094 or desyncs the tab bar's background fill from its own segment
+// layout — the exact measure/paint-desync failure shape `#654`/`#703`
+// already exist to prevent) are written up in full in
+// `docs/PENDING_QUADRAUI_ISSUES.md`'s two matching #1696 entries.
+// `tests/smoke-spec/win-gui.yaml` carries a matching cross-reference next
+// to its existing "DELIBERATELY OMITTED" comment, since this issue's own
+// acceptance bar (pixel-content assertions) hits the identical
+// `win_native_driver.py` vocabulary gap that comment already names.
+
 // ── #1674: Ctrl-modified shortcuts (Ctrl+`, Ctrl+B) never dispatched on
 // Win-GUI ────────────────────────────────────────────────────────────────
 //

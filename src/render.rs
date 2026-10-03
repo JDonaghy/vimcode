@@ -32847,6 +32847,68 @@ mod tests {
         );
     }
 
+    /// vimcode#1696: `to_q_editor`'s `editor.rect` is `rw.rect` verbatim —
+    /// the *pane's* full-width rect, by #1094's own design (the minimap
+    /// strip and quadraui's own drawn v/h scrollbar both have to sit
+    /// somewhere inside that wide rect, past the narrower text; see that
+    /// function's own doc comment and `build_screen_layout_with_breadcrumb_
+    /// row`'s "#1094" section above). `RenderedWindow.minimap_reserved_w`
+    /// never reaches `editor.rect`, so nothing then re-narrows the viewport
+    /// `quadraui::Editor::layout` computes `EditorLayout::text_bounds` from
+    /// — the exact value both backends' rasterisers size their glyph-
+    /// drawing budget off (Win-GUI's `visible_cols`-bounded
+    /// `win::editor::paint_line_text`; GTK's Cairo clip set to
+    /// `text_bounds.width`). This test pins that gap numerically rather
+    /// than by reading the source, so it is a **concrete regression target**
+    /// for the missing quadraui capability `docs/PENDING_QUADRAUI_ISSUES.md`'s
+    /// matching #1696 entry asks for (a way to reserve trailing content
+    /// width independently of where the v/h scrollbar anchors): once that
+    /// lands and vimcode adopts it, `text_bounds`'s right edge below should
+    /// land at `rect.width - minimap_reserved_w`, not `rect.width` itself.
+    ///
+    /// Deliberately **not** "fixed" by narrowing `to_q_editor`'s `rect`
+    /// directly — doing so moves `EditorLayout::v_scrollbar_bounds`/
+    /// `h_scrollbar_bounds` (both anchored to `viewport.x + viewport.width`)
+    /// in to sit flush against the now-narrower text instead of past the
+    /// strip at the pane's true right edge, which is the exact regression
+    /// #1094's own fix (and `window_zone_hit_test_h_scrollbar_click_
+    /// accounts_for_the_minimap_strip` above) was written to prevent. A
+    /// correct fix needs `Editor`/`EditorPaintOptions` to let a caller
+    /// reserve extra trailing width for content layout alone, leaving the
+    /// scrollbar anchor at the full `viewport.width` untouched — which does
+    /// not exist upstream today (confirmed by reading `layout_with_options`
+    /// at the pinned rev: `text_w`/`visible_cols` and
+    /// `v_scrollbar_bounds`/`h_scrollbar_bounds` are both derived from the
+    /// one `viewport.width`, with no second parameter to decouple them).
+    #[test]
+    fn to_q_editor_does_not_narrow_the_viewport_for_the_minimap_strip_1696() {
+        let rect = WindowRect::new(0.0, 0.0, 40.0, 10.0);
+        let minimap_reserved_w = 10.0;
+        // `total_lines <= visible_lines` (height 10 / line_height 1.0) keeps
+        // `has_v_scrollbar` false, so `text_w` below reduces to plain
+        // `viewport.width - gutter_w` and isolates exactly the minimap gap
+        // this test is about — no scrollbar-width term to account for too.
+        let rw = fixture_window(rect, 0, 1, 1, 30, minimap_reserved_w);
+
+        let editor = to_q_editor(&rw);
+        let layout = editor.layout(editor.rect, 1.0, 1.0);
+
+        let minimap_left_edge = rect.width - minimap_reserved_w;
+        let text_right_edge = (layout.text_bounds.x + layout.text_bounds.width) as f64;
+        assert!(
+            text_right_edge > minimap_left_edge,
+            "expected today's (unfixed) `text_bounds` to reach past the \
+             minimap strip's own left edge ({minimap_left_edge}) — got \
+             text_bounds ending at {text_right_edge}. If this now fails, \
+             `to_q_editor`/`Editor::layout` has started narrowing for the \
+             minimap; update this test and the matching \
+             `docs/PENDING_QUADRAUI_ISSUES.md` #1696 entry rather than \
+             deleting either — see this test's own doc comment for why a \
+             naive `to_q_editor` narrowing would itself be a regression of \
+             #1094 and needs a new quadraui capability instead."
+        );
+    }
+
     /// #722 acceptance (narrowed by #989): below the point where
     /// `MINIMAP_TARGET_COLS_TUI` becomes affordable, the reserved width is
     /// still a proportion of the *pane's* width, so widening a genuinely

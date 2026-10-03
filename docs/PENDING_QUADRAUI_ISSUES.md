@@ -1979,3 +1979,262 @@ per `GOALS.md`'s milestone-discipline rule — there is no per-backend
 vimcode-side fix available; every file in the root-cause above lives in
 quadraui, not in this repo.
 
+---
+
+## `Editor`/`EditorPaintOptions` has no way to reserve trailing content width independently of where the v/h scrollbar anchors — the minimap strip can overlap unwrapped buffer text (blocks vimcode#1696, half 1)
+
+**Title:** `Editor::layout_with_options`'s `text_w`/`visible_cols` and its
+`v_scrollbar_bounds`/`h_scrollbar_bounds` are both derived from the one
+`viewport.width` parameter, with no second parameter letting a caller
+reserve *extra* trailing width for content layout alone while leaving the
+scrollbar anchored at the viewport's own right edge
+
+**Body:**
+
+vimcode#1696 reports (Win-GUI, but see below for why this is backend-
+neutral) that with the minimap on and `'nowrap'` (vim's default), a buffer
+line long enough to reach the pane's right edge paints glyphs that extend
+under the minimap strip, which then overpaints the last character or two —
+visually "losing" `e.` off the end of a Python docstring in the reporting
+screenshot.
+
+Root-caused by reading vimcode's own shared frame-composition code
+(`src/render.rs`, the `#764`-converged "editor band" path the issue itself
+names as the first place to check) side by side with the pinned quadraui
+rev's `primitives::editor::Editor::layout_with_options`. The **vimcode-side
+arithmetic that decides how many text columns a window gets is already
+exactly correct** — this is not a frame-composition bug:
+
+```rust
+// src/render.rs, build_screen_layout_with_breadcrumb_row (abbreviated)
+let minimap_w = raw_minimap_w + (scroll_gutter_width(scrollbar_reserve, char_width) - scrollbar_reserve);
+let rw = build_rendered_window(..., minimap_w); // -> render_viewport_cols below
+
+// build_rendered_window:
+let render_viewport_cols = ((rect.width - scrollbar_reserve - minimap_w) / char_width)
+    .floor() as usize - gutter_char_width;
+//   = (rect.width - raw_minimap_w - scroll_gutter_width) / char_width - gutter_char_width
+
+// the minimap strip itself (same function, `minimap: Vec<RenderedMinimap>`):
+WindowRect::new(r.x + r.width - gutter /* == scroll_gutter_width */ - raw_minimap_w, ...)
+```
+
+Algebraically, `render_viewport_cols`' right-hand boundary and the
+minimap's own `rect.x` are the *same* pixel position — confirmed by a new,
+backend-neutral unit test, `to_q_editor_does_not_narrow_the_viewport_for_
+the_minimap_strip_1696` (`src/render.rs`), which exercises the real
+production functions end to end (no hand-derived arithmetic duplicated in
+the test). So `render_viewport_cols`/`RenderedWindow.minimap_reserved_w`
+already name the exact column budget VS Code's own minimap-aware layout
+would use.
+
+**The gap is that nothing enforces that budget as an actual paint
+boundary when `'wrap'` is off** (vim's default, and the setting active in
+the reporting screenshot). `render_viewport_cols` is consumed in exactly
+one place when building a `RenderedLine` — the `wrap_on && line_char_len >
+render_viewport_cols` word-wrap branch in `build_rendered_window`
+(`src/render.rs`). The `else` branch (`!wrap_on`, i.e. every nowrap buffer)
+hands the *entire, untruncated* line to `RenderedLine::raw_text`, relying
+entirely on whatever the backend's own rasteriser does with
+`quadraui::Editor`'s `rect`/`EditorLayout::text_bounds` to visually bound
+it. And `render::to_q_editor` — the single, shared constructor both
+backends' paint (`crate::app::App::paint_editor_windows_rung`) and GTK's
+own click resolution (`gtk/click.rs`) call — builds that `Editor` with
+`rect = rw.rect` **verbatim**, never consulting
+`RenderedWindow.minimap_reserved_w` at all:
+
+```rust
+// src/render.rs, to_q_editor
+pub fn to_q_editor(rw: &RenderedWindow) -> quadraui::Editor {
+    let rect = quadraui::Rect::new(rw.rect.x as f32, rw.rect.y as f32,
+                                    rw.rect.width as f32, rw.rect.height as f32);
+    // ... rw.minimap_reserved_w is never read here.
+```
+
+This is deliberate, not an oversight introduced by this issue — it is
+`#1094`'s own shipped design: `RenderedWindow.rect` reaches the pane's
+*true* right edge on purpose, specifically so the strip can sit in the gap
+between the (logically) narrower text and that true edge, and so
+`quadraui`'s own drawn v/h scrollbar (`EditorLayout::v_scrollbar_bounds`/
+`h_scrollbar_bounds`, anchored at `viewport.x + viewport.width -
+v_scrollbar_w`) lands *past* the strip rather than immediately before it
+— exactly the VS-Code-shaped order (`text, strip, scroll column`) #1094's
+own doc comment states as the goal, and exactly what the existing,
+passing `window_zone_hit_test_h_scrollbar_click_accounts_for_the_minimap_
+strip` regression test pins.
+
+**Why this can't be fixed by narrowing `to_q_editor`'s `rect` in vimcode
+alone:** confirmed by reading `layout_with_options` at the pinned rev —
+`text_w`/`visible_cols` (what bounds glyph painting: Win-GUI's `win::
+editor::paint_line_text` slices to `[scroll_left, scroll_left +
+visible_cols)` with no further pixel clip to save an over-wide value;
+GTK's `paint_text_lines` relies on an earlier Cairo clip sized to
+`text_bounds.width`) and `v_scrollbar_bounds`/`h_scrollbar_bounds` are
+*both* derived from the one `viewport.width` argument — there is no second
+parameter to decouple "how much width content gets" from "where the
+scrollbar anchors". Narrowing the `rect`/`viewport` vimcode hands to
+`Editor::layout` by `minimap_reserved_w` would fix the text overlap but
+pull the v/h scrollbar in to sit flush against the (now-narrower) text,
+immediately *before* the strip rather than past it at the pane's true edge
+— reopening #1094 for all three pixel/cell backends at once (GTK, TUI, and
+Win-GUI all reach this same shared code since `#1433`/`#1434` folded
+`tui_main::run` onto the shared `crate::app::App`), not just the backend
+this issue happens to screenshot.
+
+**Ask:** give `Editor`/`EditorPaintOptions` a way to reserve additional
+trailing content width distinct from the scrollbar anchor — e.g. an
+`EditorPaintOptions::reserved_trailing_width: f32` (default `0.0`) that
+`layout_with_options` subtracts from `text_w`/`visible_cols` *before*
+computing them, while leaving `v_scrollbar_bounds`/`h_scrollbar_bounds`
+anchored at the untouched `viewport.width` exactly as today. Once that
+lands, vimcode's own fix is a one-line addition at `to_q_editor`'s call
+sites (`crate::app::App::paint_editor_windows_rung`, `render::
+editor_text_layout`/`tui_editor_text_layout`): pass `rw.minimap_reserved_w`
+through as `reserved_trailing_width`, no per-backend code required either
+side.
+
+**Why not fixed in vimcode instead:** the only vimcode-side lever
+available — narrowing `to_q_editor`'s `rect` — provably regresses #1094's
+scrollbar placement on every GUI/TUI backend at once (shown above from the
+pinned rev's own source, not a guess); shipping that trade silently would
+replace one reported bug with a different, previously-fixed one. The
+`docs/IRREDUCIBLE_SURFACE.md`/`CLAUDE.md` bar for a vimcode-side fix
+("compare against the quadraui example; if it needs new backend-specific
+code, stop") applies the other way here too: there is no backend-specific
+code to add on either side of this gap, which is exactly why it has to be
+quadraui's own `Editor` primitive that grows the missing parameter, not a
+`src/gtk/`/`src/win/`/`src/tui_main/` workaround.
+
+**Test:** `src/render.rs::render::tests::to_q_editor_does_not_narrow_the_
+viewport_for_the_minimap_strip_1696` (added alongside this entry) —
+backend-neutral, runs on any host today (no Windows/GTK display needed):
+builds a `RenderedWindow` fixture with a non-zero `minimap_reserved_w`,
+runs it through the real `to_q_editor` + `Editor::layout`, and asserts
+`EditorLayout::text_bounds`'s right edge lands past the minimap strip's
+own left edge — i.e. it is a **passing** test today that pins the
+*unfixed* behaviour as a concrete regression target, documented in the
+test's own doc comment as exactly that (mirroring how `docs/
+PENDING_QUADRAUI_ISSUES.md` entries elsewhere pin an upstream gap with a
+vimcode-side test that cannot itself observe the eventual fix).
+
+**Blocks:** `JDonaghy/vimcode#1696`, half 1 (the minimap-inset half; see
+the neighbouring entry below for the tab-bar-toolbar half). Leave that
+issue open behind both entries per `GOALS.md`'s milestone-discipline rule
+— there is no per-backend vimcode-side fix available for either half.
+
+---
+
+## `TabBar`'s right-aligned segments have no outer-edge inset, unlike `StatusBar`'s `PIXEL_EDGE_INSET` (#1155) — the tab-strip overflow-action glyph can sit flush against (or past) a borderless window's real right edge (blocks vimcode#1696, half 2)
+
+**Title:** `primitives::tab_bar::TabBar::layout`'s right-aligned-segment
+placement (`seg_x = bar_width - right_area_width`, continuing flush to
+`bar_width`) has no analogue of `primitives::status_bar::PIXEL_EDGE_INSET`
+— every right segment, including the trailing `tab:action_menu` `"⋯"`
+overflow control vimcode builds in `build_tab_bar_primitive`, is
+positioned with **zero** margin from whatever width the caller hands
+`layout`, unlike `StatusBar`, which (per issue #1155) already reserves
+`PIXEL_EDGE_INSET` (`10.0` DIP) inside its own layout on every "pixel"
+backend
+
+**Body:**
+
+vimcode#1696's second symptom: the tab-strip's trailing overflow control
+(the `"⋯"` U+22EF ellipsis `build_tab_bar_primitive` appends as the last
+`right_segments` entry) renders as two dots rather than a full ellipsis on
+Win-GUI, which reads as the glyph being clipped by the window's own right
+edge — VS Code's equivalent control sits inset with margin to spare.
+
+Root-caused by reading `src/render.rs`'s tab-bar composition
+(`build_tab_bar_primitive`/`build_screen_layout_with_breadcrumb_row`'s
+`GroupTabBar` builder, `src/app.rs`'s `paint_tab_bars_rung`) against the
+pinned rev's `primitives::tab_bar::TabBar::layout`. Exactly as with the
+neighbouring minimap entry above, **vimcode's own width input is not the
+bug**: `bounds`/`target.rect` for a group's tab bar is the same
+`main_content_bounds`-derived window-group rect every other editor-band
+surface uses, and `src/win/mod.rs`'s own `#1561` investigation (reading
+`WinBackend::attach_surface`/`resize_surface`) already confirmed the
+render target's reported size comes from one un-split `GetClientRect`/
+`WM_SIZE` pair with no double-subtraction or DIP/physical mismatch — so
+the width vimcode hands to the tab bar is the real window's real content
+width, not an inflated one.
+
+The gap is inside `TabBar::layout` itself (`quadraui/src/primitives/
+tab_bar.rs`, pinned rev `ca7fcc8`):
+
+```rust
+// ── Right-aligned segments ─────────────────────────────────────
+if segs_fit {
+    let mut seg_x = bar_width - right_area_width;
+    for (i, seg) in self.right_segments.iter().enumerate() {
+        let w = seg_widths[i];
+        let bounds = Rect::new(seg_x, 0.0, w, bar_height);
+        ...
+```
+
+`seg_x` starts at `bar_width - right_area_width` and the last segment (the
+`"⋯"` control, 3 cells wide per `build_tab_bar_primitive`) ends exactly at
+`bar_width` — flush against whatever width the caller passed, with no
+margin at all. Compare `primitives::status_bar.rs`, which already solved
+this identical problem for the status bar (issue #1155):
+
+```rust
+// quadraui/src/primitives/status_bar.rs
+pub const PIXEL_EDGE_INSET: f32 = 10.0;
+// ... StatusBar's own layout subtracts PIXEL_EDGE_INSET from both ends
+// before placing left/right segments, so "the ruler segment" (vimcode's
+// own render.rs comment: "quadraui#1155 gives pixel backends their own
+// outer edge inset — a manual trailing space here would double it")
+// never needs a caller-side workaround.
+```
+
+`TabBar` never grew the equivalent. On a GTK window (which typically has
+some native client-side-decoration/compositor margin outside the Cairo
+canvas even before any inset) a flush-to-`bar_width` placement may still
+read as "inset enough" by accident; on Win-GUI's borderless client area —
+confirmed by #1561's investigation to paint genuinely edge-to-edge, no
+extra margin — a flush placement puts the glyph's own bounding box right
+at the real window edge, with whatever margin the glyph happens to need
+beyond its nominal `width_cells * cell_width` box (e.g. a proportional
+DirectWrite rendering of `"⋯"` drawn wider than three monospace cells)
+landing partly off-window.
+
+**Why not fixed in vimcode instead:** the only caller-side lever —
+narrowing the `bounds`/`target.rect` vimcode hands to `TabBar::layout` —
+narrows the *whole* bar (tabs included, not just the trailing segment,
+since `layout` takes one `bar_width` for both) and, worse, is a different
+rect than the one the same call paints the tab-bar *background* with
+(`Backend::draw_tab_bar_icons_layout(target.rect, ...)` does both from one
+argument), so narrowing it would leave an unpainted sliver of raw
+background colour at the bar's true right edge — trading one visible
+defect for another, and only on the backend doing the narrowing (the
+opposite of the shared, one-geometry-computation discipline `#703`/`#764`
+already established for this exact file). A correct fix needs the inset
+*inside* `TabBar::layout` itself, the same place `StatusBar::layout`
+already carries it, so the background fill and the segment placement stay
+derived from the one call and never desync.
+
+**Ask:** add a `TabBar`-side outer-edge inset mirroring `StatusBar`'s
+`PIXEL_EDGE_INSET` — either reuse the same constant (promoted out of
+`primitives::status_bar` into a shared location both primitives import)
+or give `TabBar` its own, and have `layout` reserve it on the trailing
+(and, for symmetry with `StatusBar`, leading) edge before placing
+`right_segments`/tabs, the same way `StatusBar::layout` already does for
+its own segments.
+
+**Test:** no accompanying vimcode-side test for this half — unlike the
+neighbouring minimap entry, there is no vimcode-authored arithmetic to pin
+(the formula quoted above is read verbatim from `quadraui::primitives::
+tab_bar::TabBar::layout`, which this repo must not edit per the
+Platform-Neutrality Rule), and the acceptance bar's own pixel-level check
+("the tab-strip toolbar's right edge is strictly inside the window") is
+not expressible with the currently-installed `win_native_driver.py`
+step vocabulary either — see `tests/smoke-spec/win-gui.yaml`'s matching
+cross-reference, added alongside this entry, for why (same
+`expect_capture_nonblank`-shaped-primitive gap `#1676`'s entry already
+names).
+
+**Blocks:** `JDonaghy/vimcode#1696`, half 2 (the tab-bar-toolbar-inset
+half; see the neighbouring entry above for the minimap half). Leave that
+issue open behind both entries per `GOALS.md`'s milestone-discipline rule
+— there is no per-backend vimcode-side fix available for either half.
+
