@@ -1072,7 +1072,7 @@ steps is.
 
 ---
 
-## `WinBackend::register_status_bar_segment_zones` (quadraui#1232) registers each segment's *bar-local* bounds as if they were absolute window coordinates — the inline minimize/maximize/close buttons stay `HTCAPTION` whenever their `StatusBar` isn't painted at `rect.x == 0` (blocks vimcode#1656)
+## `WinBackend::register_status_bar_segment_zones` (quadraui#1232) registers each segment's *bar-local* bounds as if they were absolute window coordinates — the inline minimize/maximize/close buttons stay `HTCAPTION` whenever their `StatusBar` isn't painted at `rect.x == 0` (blocks vimcode#1656, vimcode#1675)
 
 **Title:** `crate::primitives::status_bar::StatusBar::layout`/`layout_padded`
 returns `hit_regions`/`visible_segments[].bounds` in bar-local (0-origin)
@@ -1236,9 +1236,36 @@ moves past this fix; see that file's own updated header comment
 (vimcode#1656) for the real-hardware RED confirmation this entry is based
 on.
 
-**Blocks:** `JDonaghy/vimcode#1656`. Leave that issue open behind this one
-per `GOALS.md`'s milestone-discipline rule — there is no per-backend
-vimcode-side fix available (`src/app.rs`'s call to
+**UPDATE (vimcode#1675):** an independent bugbash lane re-reported the
+identical symptom (real click on the close button at (978,16) leaves the
+window open after 2000ms; `WM_NCHITTEST` at all three caption-button
+positions still answers `HTCAPTION`) against the pin current at
+investigation time (`ca7fcc83afad01ec3422f79366566f3a263b22bf`, confirmed
+to be the exact `rev` in this repo's `Cargo.toml`). Re-confirmed by reading
+that exact rev's source directly (not just re-citing this entry):
+`quadraui/src/win/status_bar.rs::win_status_bar_layout` still calls
+`bar.layout_padded(rect.width, rect.height, ...)` with no `rect.x`/`rect.y`
+at all, and `quadraui/src/win/backend.rs::register_status_bar_segment_zones`
+still registers that bar-local `layout.hit_regions` `bounds` verbatim — the
+bug this entry describes is unchanged at the current pin. No new
+vimcode-side fix is available for the same reason stated in **Blocks**
+below; this update adds `JDonaghy/vimcode#1675`'s own Tier-1 acceptance
+coverage closing the gap `src/win/mod.rs::win_driver_tests::
+win_gui_smoke_spec_title_band_coordinates_are_stale_1657`'s own doc named
+("the caption-button half of that test has no equivalent here, since
+`ConformanceHarness` ... does not clone `App::title_bar_rect`") —
+`caption_button_real_click_position_is_misclassified_htcaption_1675`
+locates the close button's real painted position via `WinDriver::find`
+(no `title_bar_rect` needed) and asserts the correct expected
+`WinBackend::nc_hit_test` result (`Some(false)`, i.e. `HTCLIENT`) directly.
+Source-level RED confirmation only — see that test's own doc for why it
+cannot be *executed* even on real Windows hardware available to this
+fix (`WinDriver::new`'s offscreen Direct2D surface creation panics
+unconditionally off real Windows).
+
+**Blocks:** `JDonaghy/vimcode#1656`, `JDonaghy/vimcode#1675`. Leave both
+issues open behind this one per `GOALS.md`'s milestone-discipline rule —
+there is no per-backend vimcode-side fix available (`src/app.rs`'s call to
 `backend.draw_status_bar_interactive` is already identical in shape to
 every other backend's call to the same trait method; the bug is entirely
 inside `quadraui::win::backend`'s own zone-registration helper).

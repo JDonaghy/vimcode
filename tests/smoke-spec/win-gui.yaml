@@ -249,6 +249,32 @@
 # GTK's faithful-but-not-identical stand-in) remains this issue's own
 # open acceptance item.
 #
+# ── #1675: independent reconfirmation of the still-open #1656 defect ───
+#
+# A fresh bugbash reproduction (`WM_NCHITTEST` at (886,16)/(932,16)/(978,16)
+# — this file's original `-1232` caption-button coordinates — all still
+# answer `HTCAPTION`; a real click at (978,16) leaves the window open after
+# 2000ms, in two independent isolated runs) found the exact same defect
+# `docs/PENDING_QUADRAUI_ISSUES.md`'s "`WinBackend::register_status_bar_
+# segment_zones` ... registers ... bar-local bounds as if they were already
+# absolute" entry already describes, confirmed still live at the pin
+# current at investigation time
+# (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) by reading that exact rev's
+# source directly (see that doc entry's own `UPDATE (vimcode#1675)` note).
+# No new quadraui issue filed and no new steps added here: this is the same
+# upstream gap #1656 already diagnosed and this file's existing
+# `hit-test-minimize-button-1232`/`hit-test-maximize-button-1232`/
+# `hit-test-close-button-1232`/`close-button-actually-closes-window-1232`
+# (and their remeasured `-1656`/`-1657` siblings below) already serve as
+# this issue's own Tier-2 acceptance coverage per the additive-only policy
+# (#3509/#3487) — adding a byte-for-byte duplicate step at the same
+# coordinates would assert nothing new. `src/win/mod.rs::win_driver_tests::
+# caption_button_real_click_position_is_misclassified_htcaption_1675` adds
+# this issue's own Tier-1 shared-conformance-harness coverage instead,
+# closing the specific gap `win_gui_smoke_spec_title_band_coordinates_are_
+# stale_1657`'s own doc named ("the caption-button half of that test has no
+# equivalent here").
+#
 # ── #1668: no Tier-2 step added for the blank embedded-terminal panel ──
 #
 # vimcode#1668's own acceptance line asks for "a Tier-1 shared conformance
