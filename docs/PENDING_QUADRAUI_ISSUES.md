@@ -1243,3 +1243,101 @@ vimcode-side fix available (`src/app.rs`'s call to
 every other backend's call to the same trait method; the bug is entirely
 inside `quadraui::win::backend`'s own zone-registration helper).
 
+---
+
+## Win-GUI's title-band blank strip (between the menu row and the window-control buttons) hit-tests as `HTCLIENT` instead of `HTCAPTION` — the window has no mouse-draggable title-bar region at all (blocks vimcode#1661)
+
+**Title:** A real `WM_NCHITTEST` sweep across the Win-GUI title band, from
+just past the last (`Help`) menu label to just before the caption-button
+strip, reports `HTCLIENT` almost everywhere instead of `HTCAPTION` — the
+unoccupied part of vimcode's drawn title-bar row (no menu label, no
+Command Center widget, no caption button painted there) does not drag the
+window, unlike an ordinary custom-titlebar app.
+
+**Body:**
+
+vimcode#1661 (a bugbash finding, same real-hardware session as #1656/#1657)
+swept `WM_NCHITTEST` from x=350 to x=820 at y=16 — deliberately past the
+last menu label and before the caption-button region — and found
+`HTCLIENT` at every sampled point except one isolated x=540 result that
+correctly read `HTCAPTION` (likely an inter-widget gap, not the wide
+empty strip itself). Combined with the already-filed, still-open entry
+above (the inline minimize/maximize/close buttons wrongly stay
+`HTCAPTION`), the net effect is that the drawn title band has *no*
+draggable region at all: the parts that should be `HTCLIENT` (the caption
+buttons) are `HTCAPTION`, and the parts that should be `HTCAPTION` (this
+blank strip) are `HTCLIENT` — i.e. the assignment looks inverted/misplaced
+across the row, not simply incomplete.
+
+Source-level investigation (pinned rev `ca7fcc8`, `quadraui/src/win/
+backend.rs` + `quadraui/src/primitives/command_center.rs`) ruled out the
+two most obvious hypotheses rather than confirming a third:
+
+1. **Not a "`Bar`-zone never excluded" gap.** `WinBackend::
+   register_command_center_zones` (the #1232 helper covering this exact
+   strip) explicitly skips the Command Center's own container hit region:
+   `CommandCenterHit::Bar | CommandCenterHit::Outside => continue`. So the
+   Command Center's full reserved rect (`TitleBarBands::command_center` in
+   vimcode's own `render.rs`, spanning the entire menu-end→controls-start
+   strip) is never itself registered as an exclusion zone — a correctly
+   *sized* Command Center would already leave its own left/right padding
+   reporting `HTCAPTION` with no further quadraui change needed. This rules
+   out a registration-logic bug in the helper #1232 added.
+2. **Not the same "bar-local vs absolute" bug class as the entry above.**
+   `CommandCenter::layout` (`quadraui/src/primitives/command_center.rs`)
+   bakes `bounds.x`/`bounds.y` into every returned rect already
+   (`center_x = bounds.x + (bounds.width - content_width).max(0.0) / 2.0`)
+   — unlike the sibling `StatusBar::layout` bug the entry above describes.
+   A translation fix of that shape would not help here.
+
+**Leading (unverified) hypothesis:** the three registered Command Center
+sub-zones (`Back`, `Forward`, `SearchBox`) collectively span almost the
+entire reserved strip on real Win-GUI/DirectWrite hardware, leaving only
+the fixed, small `CommandCenterMeasure::GAP_PX` gaps between them
+unregistered — which is exactly the shape of the evidence (`HTCLIENT`
+nearly everywhere, one narrow `HTCAPTION` island at x=540 the issue's own
+reproduction guesses is "an inter-label gap"). If true, the root cause is
+a *measurement* bug — `CommandCenterMeasure::from_char_width`'s
+`char_width`/`height` inputs (`WinBackend::current_char_width`/
+`current_line_height`) resolving to a value scaled wrong for Win-GUI
+specifically (e.g. physical pixels vs. DIPs, or a DPI factor applied
+twice) — not a hit-test registration bug. This could not be confirmed or
+ruled out from this fix's Linux worktree: `CommandCenterMeasure`'s real
+width depends on live `DWrite` text measurement
+(`super::command_center::draw_command_center`), which has no non-Windows
+implementation to run and compare against the Pango-based estimate the
+#1657 Tier-1 test already cross-checks for the menu row.
+
+**Ask:** On real Windows hardware, instrument (or single-step) a live
+`vimcode.exe` to log the real `CommandCenterLayout` (`bounds`,
+`back_bounds`, `forward_bounds`, `search_bounds`) alongside the actual
+painted title band, and compare `search_bounds.width` against what
+`CommandCenterMeasure::from_char_width`'s Pango/GTK equivalent would
+produce for the same label at the same `current_char_width` — if the
+real Win-GUI value is far larger, the fix belongs in whatever converts
+font-metrics into `current_char_width`/`current_line_height` for
+`WinBackend` (DPI-scale handling, most likely), not in `nc_hit_test` or
+either zone-registration helper, both confirmed correct by source review
+above. Once the true cause is found, add a `win::backend` unit test
+(mirroring `draw_command_center_registers_its_own_zones_inside_the_band`)
+that constructs a Command Center whose container is deliberately wider
+than its content and asserts a point in the resulting *left* padding
+reads `Some(true)` — the existing test only probes a point to the left of
+the Command Center's container entirely, so it cannot catch a content
+block that over-fills its own container.
+
+**Test:** `tests/smoke-spec/win-gui.yaml`'s new `hit-test-blank-strip-*-
+1661` steps (added alongside this entry) serve as the Tier-2 acceptance
+check; `src/win/mod.rs::win_driver_tests::
+win_gui_blank_title_band_strip_is_caption_1661` is the Tier-1 companion
+(type-checked only on this worktree, same as every other test in that
+module — see its own doc for why it cannot yet be *executed* here or on
+dell64). Re-run both once a quadraui fix lands.
+
+**Blocks:** `JDonaghy/vimcode#1661`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available; both zone-registration helpers vimcode's call
+sites reach are confirmed correct by source review above, so the gap (if
+the leading hypothesis holds) is in Win-GUI's own text-measurement
+pipeline, not in anything `src/win/`, `src/app.rs`, or `render.rs` control.
+

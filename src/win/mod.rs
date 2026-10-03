@@ -917,4 +917,78 @@ mod win_driver_tests {
              at this x is therefore itself stale"
         );
     }
+
+    // ── #1661: blank title-band strip must stay HTCAPTION ───────────────
+    //
+    // vimcode#1661 (same real-hardware bugbash session as #1657 above)
+    // swept `WM_NCHITTEST` across the blank strip between the last menu
+    // label and the caption-button region and found `HTCLIENT` almost
+    // everywhere instead of `HTCAPTION` -- combined with the still-open
+    // caption-button finding (#1656, `docs/PENDING_QUADRAUI_ISSUES.md`),
+    // the drawn title band has no mouse-draggable region left at all. This
+    // probes the identical 1024x768 geometry `win_gui_smoke_spec_title_
+    // band_coordinates_are_stale_1657` already established, at a point
+    // inside the Command Center's own reserved container
+    // (`engine.command_center_layout().bounds`) but strictly left of its
+    // leftmost painted widget (the back-navigation arrow) -- real blank
+    // padding, not covered by any registered zone smaller than the
+    // title-bar band per `WinBackend::nc_hit_test`'s own doc.
+    //
+    // By source-level reasoning alone this point *should* already read
+    // `HTCAPTION`: `WinBackend::register_command_center_zones` never
+    // registers `CommandCenterHit::Bar` (the Command Center's own
+    // container), only `Back`/`Forward`/`SearchBox`, so a correctly-sized
+    // Command Center would leave this padding unregistered and therefore
+    // `HTCAPTION` by `nc_hit_test`'s own fallback -- see
+    // `docs/PENDING_QUADRAUI_ISSUES.md`'s new #1661 entry for the full
+    // ruling-out of that hypothesis (and of the sibling "bar-local vs
+    // absolute" bug class #1656 already found) in favour of a leading,
+    // unconfirmed hypothesis that real Win-GUI/DirectWrite text
+    // measurement sizes the Command Center's widgets wide enough to
+    // over-fill their own container. That hypothesis needs live `DWrite`
+    // measurement to confirm or rule out, which has no non-Windows
+    // implementation to run here -- same reason this function, like every
+    // other test in this module, is only type-checked on this Linux
+    // worktree (`#[cfg_attr(target_os = "windows", test)]`) and cannot yet
+    // be *executed*, here or on dell64 (see the module-top `#1558` doc
+    // section). RED-verification for this exact scenario is therefore the
+    // real-hardware sweep transcript vimcode#1661 itself reports, not an
+    // executed run of this function -- stated explicitly here rather than
+    // left to the inherited blanket disclaimer.
+    #[cfg_attr(target_os = "windows", test)]
+    fn win_gui_blank_title_band_strip_is_caption_1661() {
+        let h = conformance_harness(plain_engine(), 1024, 768);
+
+        let cc = h
+            .engine
+            .borrow()
+            .command_center_layout
+            .borrow()
+            .clone()
+            .expect("the Command Center must paint on a window_chrome backend");
+        let back = cc
+            .back_bounds
+            .expect("the back-navigation arrow must have painted bounds");
+
+        // A point inside the Command Center's own reserved container, but
+        // strictly left of its leftmost painted widget -- real blank
+        // padding, the exact shape of strip vimcode#1661 reports.
+        let probe_x = (cc.bounds.x + back.x) / 2.0;
+        assert!(
+            probe_x < back.x,
+            "fixture assumption: the Command Center must leave blank \
+             padding left of its back-navigation arrow (cc={cc:?}, \
+             back={back:?})"
+        );
+
+        assert_eq!(
+            h.driver.backend().nc_hit_test(probe_x, 16.0),
+            Some(true),
+            "blank title-band padding at x={probe_x} (inside the Command \
+             Center's own container, left of its back arrow) must report \
+             HTCAPTION so the OS treats it as the window's drag handle; \
+             vimcode#1661 found this reporting HTCLIENT on real hardware \
+             instead"
+        );
+    }
 }

@@ -215,6 +215,22 @@
 # them as the best current coordinates pending a real-hardware re-run that
 # either confirms the flip to PASS or isolates a second, distinct
 # quadraui-level hit-test registration gap worth its own issue.
+#
+# ── #1661: the blank strip between the menu row and the caption buttons ──
+#
+# A real `WM_NCHITTEST` sweep from x=350 to x=820 at y=16 — past the last
+# (`Help`) menu label and before the caption-button strip — found
+# `HTCLIENT` at every sampled point except one isolated x=540 result that
+# correctly read `HTCAPTION` (likely an inter-widget gap, not the wide
+# empty strip itself; see this session's own transcript, quoted verbatim
+# in vimcode#1661). Combined with the still-open caption-button finding
+# above, the drawn title band has no mouse-draggable region at all: the
+# parts that should be `HTCLIENT` (the caption buttons) are `HTCAPTION`,
+# and the parts that should be `HTCAPTION` (this blank strip) are
+# `HTCLIENT`. Root-caused (so far as source review alone can) in
+# `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry — not a vimcode-side fix,
+# per the Platform-Neutrality Rule; this file's steps are this issue's own
+# Tier-2 acceptance coverage, additive per #3509/#3487, expected RED today.
 name: vimcode-win-gui
 mode: window
 width: 1024
@@ -572,3 +588,43 @@ steps:
   - type: expect_closed
     id: close-button-actually-closes-window-1657
     timeout_ms: 5000
+
+  # #1661: the blank strip between the last menu label and the
+  # caption-button region — see this file's "#1661" header section for the
+  # full real-hardware sweep this is derived from. A representative
+  # subsample of the swept x=350..820 range (deliberately excluding x=540,
+  # the one point the sweep found already correct — see the header
+  # section), evenly spaced the same way the menu-row `-1232`/`-1657`
+  # steps above are. Expected RED today: the real sweep found `HTCLIENT`
+  # at every one of these x values instead of the `HTCAPTION` a
+  # mouse-draggable title bar needs.
+  - type: expect_hit
+    id: hit-test-blank-strip-a-1661
+    x: 350
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-b-1661
+    x: 450
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-c-1661
+    x: 600
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-d-1661
+    x: 700
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-e-1661
+    x: 750
+    y: 16
+    ht: HTCAPTION
+  - type: expect_hit
+    id: hit-test-blank-strip-f-1661
+    x: 820
+    y: 16
+    ht: HTCAPTION
