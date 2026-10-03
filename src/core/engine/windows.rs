@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::settings::ExplorerAction;
 
 /// A window's own `View::viewport_lines`/`viewport_cols` are content-space —
 /// chrome (each window's own status line) already subtracted, per
@@ -1621,6 +1622,56 @@ impl Engine {
         });
     }
 
+    /// Open the Explorer header's "..." overflow menu (#1693) — the
+    /// dropdown twin of the view-actions toolbar row's own four buttons
+    /// (New File / New Folder / Refresh Explorer / Collapse Folders in
+    /// Explorer), triggered from the overflow button rather than a
+    /// right-clicked row. `x`/`y` are the button's position in character
+    /// cells (mirrors `open_editor_action_menu`'s contract) and
+    /// `trigger_height` the button row's height in `line_height` units, so
+    /// the popup opens flush below the button rather than anchored to the
+    /// cursor.
+    pub fn open_explorer_overflow_menu(&mut self, x: u16, y: u16, trigger_height: f32) {
+        let items = vec![
+            ContextMenuItem {
+                label: "New File...".into(),
+                action: "new_file".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "New Folder...".into(),
+                action: "new_folder".into(),
+                shortcut: String::new(),
+                separator_after: true,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Refresh Explorer".into(),
+                action: "refresh_explorer".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+            ContextMenuItem {
+                label: "Collapse Folders in Explorer".into(),
+                action: "collapse_all".into(),
+                shortcut: String::new(),
+                separator_after: false,
+                enabled: true,
+            },
+        ];
+        self.context_menu = Some(ContextMenuState {
+            target: ContextMenuTarget::ExplorerPanel,
+            items,
+            selected: 0,
+            screen_x: x,
+            screen_y: y,
+            trigger_height,
+        });
+    }
+
     /// Open a context menu for the editor area (right-click on buffer text).
     pub fn open_editor_context_menu(&mut self, x: u16, y: u16) {
         let has_file = self.file_path().is_some();
@@ -1888,6 +1939,26 @@ impl Engine {
                     _ => {}
                 }
             }
+            // #1693: unlike the per-row menu above, every action here is
+            // fully resolved in-engine — there is no right-clicked row to
+            // set as the selection first, so `dispatch_explorer_crud`'s own
+            // "fall back to the current selection, or `cwd`" behaviour is
+            // already correct with no backend plumbing needed.
+            ContextMenuTarget::ExplorerPanel => match action.as_str() {
+                "new_file" => {
+                    self.dispatch_explorer_crud(ExplorerAction::NewFile);
+                }
+                "new_folder" => {
+                    self.dispatch_explorer_crud(ExplorerAction::NewFolder);
+                }
+                "refresh_explorer" => {
+                    self.explorer_needs_refresh = true;
+                }
+                "collapse_all" => {
+                    self.explorer_collapse_all();
+                }
+                _ => {}
+            },
             ContextMenuTarget::Editor => match action.as_str() {
                 "goto_definition" => {
                     self.lsp_request_definition();

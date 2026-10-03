@@ -3785,9 +3785,20 @@ impl App {
                 // `Engine` can be the body directly instead of the
                 // hand-copied `render::paint_sidebar_panel_chrome` split
                 // #1242 needed before #1059 existed.
+                // #1693: `StatusBars` reserves one row above the tree for
+                // the view-actions toolbar (New File / New Folder /
+                // Refresh / Collapse All / "..." overflow) — the same
+                // `SidebarPanelChrome` variant the Debug sidebar's title/
+                // action bars already use (`debug_sidebar_chrome`, just
+                // below). `body_rect` (what the closure receives) is
+                // already narrowed below the chrome row, so
+                // `explorer_tree_rect`/`explorer_viewport_rows` need no
+                // change to account for it.
                 let panel = render::SidebarPanelBody {
                     background: None,
-                    chrome: render::SidebarPanelChrome::None,
+                    chrome: render::SidebarPanelChrome::StatusBars(vec![
+                        render::explorer_toolbar_status_bar(theme),
+                    ]),
                     scrollbar_gutter: None,
                 };
                 render::populate_explorer_tree_controller(engine, theme);
@@ -3797,11 +3808,14 @@ impl App {
                 // re-apply them and resolve the correct row. (#540)
                 self.cached_explorer_metrics
                     .set((backend.line_height() as f64, backend.char_width() as f64));
-                panel.render_with(backend, q_sb, |backend, body_rect| {
+                let layout = panel.render_with(backend, q_sb, |backend, body_rect| {
                     engine.explorer_tree_rect.set(body_rect);
                     engine.explorer_viewport_rows.set(body_rect.height as usize);
                     engine.explorer_tree.borrow().render(backend, body_rect);
                 });
+                engine
+                    .explorer_toolbar_hits
+                    .replace(layout.status_bar_hit_regions);
             }
             PANEL_SEARCH => {
                 // #1065: `search_sidebar_system` never had `set_backend_info`
@@ -6789,6 +6803,54 @@ impl App {
         self.draw_needed.set(true);
     }
 
+    /// Resolve a press against the Explorer header's view-actions toolbar
+    /// row (#1693) — mirrors `Self::route_debug_sidebar_event`'s
+    /// chrome-band check for the Debug sidebar's own title/action bars.
+    /// `render::explorer_toolbar_hit_at` does the engine-only hit-test
+    /// (button index); this wrapper adds the one thing it can't do without
+    /// a `Backend` handle — converting `pos` to the character-cell
+    /// coordinates `Engine::open_explorer_overflow_menu` needs to anchor
+    /// the "..." popup, using `self.cached_explorer_metrics` (the same
+    /// paint-time metrics `explorer_ui_event` re-applies for its own
+    /// hit-test, #540).
+    ///
+    /// Returns `false` (and does nothing) when `pos` doesn't land on a
+    /// toolbar segment, so the caller falls through to the tree's own
+    /// click routing.
+    fn route_explorer_toolbar_click(&mut self, pos: quadraui::Point) -> bool {
+        let idx = {
+            let engine = self.engine.borrow();
+            render::explorer_toolbar_hit_at(&engine, pos)
+        };
+        let Some(idx) = idx else {
+            return false;
+        };
+        let mut engine = self.engine.borrow_mut();
+        if idx == 4 {
+            let (line_height, char_width) = self.cached_explorer_metrics.get();
+            let col = (pos.x as f64 / char_width.max(1.0)) as u16;
+            let row = (pos.y as f64 / line_height.max(1.0)) as u16;
+            engine.open_explorer_overflow_menu(col, row, 1.0);
+        } else {
+            engine.explorer_activate_toolbar_action(idx);
+        }
+        // "Refresh" (idx 2) sets this immediately rather than waiting for
+        // the next idle poll tick — same immediacy
+        // `apply_context_menu_route`/`dispatch_context_menu_key` already
+        // give a context-menu-driven explorer action.
+        let needs_refresh = engine.explorer_needs_refresh;
+        if needs_refresh {
+            engine.explorer_needs_refresh = false;
+        }
+        drop(engine);
+        if needs_refresh {
+            self.refresh_file_tree();
+        }
+        self.queue_explorer_draw();
+        self.draw_needed.set(true);
+        true
+    }
+
     /// `UiEvent` (scroll, mouse) over the explorer panel — routed through
     /// `TreeController::handle` for scrollbar interaction.
     /// Sidebar routing for the Explorer panel (#540/#754).
@@ -7133,7 +7195,16 @@ impl App {
 
         let consumed = match &owner {
             render::SidebarOwner::Explorer => {
-                self.explorer_ui_event(event.clone());
+                // #1693: the view-actions toolbar row sits above the tree
+                // (`paint_sidebar_panel_rung`'s `PANEL_EXPLORER` arm), so a
+                // press is checked against it first — mirrors
+                // `Self::route_debug_sidebar_event`'s chrome-band check.
+                // Only a genuine press/release (`starts_interaction`) can
+                // open the overflow menu or run an action; a drag
+                // follow-through always falls to the tree.
+                if !starts_interaction || !self.route_explorer_toolbar_click(pos) {
+                    self.explorer_ui_event(event.clone());
+                }
                 true
             }
             render::SidebarOwner::Search => {

@@ -12480,6 +12480,72 @@ fn debug_sidebar_status_bars(
     (title, action)
 }
 
+/// Build the Explorer header's view-actions toolbar row (#1693): New File,
+/// New Folder, Refresh, Collapse All, and a "..." overflow menu — mirrors
+/// VS Code's Explorer view-actions row. Returned as `SidebarPanelChrome::
+/// StatusBars(vec![...])`'s single bar so `paint_sidebar_panel_rung`'s
+/// `PANEL_EXPLORER` arm can thread it through the same composer the Debug
+/// sidebar's title/action bars (`debug_sidebar_chrome`) and the SC panel's
+/// own toolbar (`sc_sidebar_panel`) already use — no new paint/hit-test
+/// mechanism, just a new row through an existing one.
+///
+/// Unlike `debug_sidebar_status_bars`'s title bar, this carries no title
+/// text of its own: the shell's own sidebar header already titles this
+/// panel "EXPLORER" (`sidebar.rs`'s `fixed_panel_title_tooltip`), and a
+/// second title row here would be the exact double-header shape
+/// `sc_sidebar_panel`'s doc warns against (#1256).
+pub fn explorer_toolbar_status_bar(theme: &Theme) -> quadraui::StatusBar {
+    let bg = theme.status_bg;
+    let fg = theme.status_fg;
+    let button = |idx: usize, icon: &icons::Icon| quadraui::StatusBarSegment {
+        text: format!(" {} ", icon.s()),
+        fg,
+        bg,
+        bold: false,
+        action_id: Engine::explorer_toolbar_action_id(idx),
+    };
+    quadraui::StatusBar {
+        id: quadraui::WidgetId::new("explorer:toolbar"),
+        left_segments: Vec::new(),
+        right_segments: vec![
+            button(0, &icons::EXPLORER_NEW_FILE),
+            button(1, &icons::EXPLORER_NEW_FOLDER),
+            button(2, &icons::EXPLORER_REFRESH),
+            button(3, &icons::EXPLORER_COLLAPSE_ALL),
+            button(4, &icons::EXPLORER_OVERFLOW),
+        ],
+    }
+}
+
+/// Resolve a press against the Explorer header's view-actions toolbar row
+/// (#1693), given `pos` in the same absolute space `SidebarPanelBody::
+/// render_with` painted the chrome into — the same contract
+/// `dap_sidebar_action_click_at` follows for the Debug sidebar's own
+/// chrome row (see that function's doc). `engine.explorer_toolbar_hits` is
+/// populated straight from `SidebarPanelBodyLayout::status_bar_hit_regions`
+/// at paint time, so there is no per-backend translation step.
+///
+/// Button 4 (the "..." overflow menu) is handled by the caller instead of
+/// dispatched through `Engine::explorer_activate_toolbar_action` — opening
+/// the popup needs the click's own cell-space position and the toolbar
+/// row's trigger height, neither of which this engine-only function has
+/// (`App::try_route_sidebar_mouse_event`'s Explorer arm has both). Returns
+/// the matched button index, or `None` when `pos` doesn't land on a toolbar
+/// segment at all (the caller falls through to the tree's own click
+/// routing in that case).
+pub fn explorer_toolbar_hit_at(engine: &Engine, pos: quadraui::Point) -> Option<usize> {
+    let hits = engine.explorer_toolbar_hits.borrow();
+    hits.iter().find_map(|(rect, hit)| {
+        if !rect.contains(pos) {
+            return None;
+        }
+        match hit {
+            quadraui::StatusBarHit::Segment(id) => Engine::explorer_toolbar_action_index(id),
+            _ => None,
+        }
+    })
+}
+
 /// `action_id` for each inline window-control button drawn by
 /// [`window_controls_status_bar`]. Shared with the GTK click handler so the
 /// two sides can't drift.
