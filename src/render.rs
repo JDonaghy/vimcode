@@ -12818,6 +12818,100 @@ pub static MENU_STRUCTURE: &[(&str, char, &[MenuItemData])] = &[
         ],
     ),
     (
+        // VS Code's menu bar is File · Edit · Selection · View · Go · Run ·
+        // Terminal · Help (#1697) — `Selection` sits here, between `Edit`
+        // and `View`. Only entries with a backing engine command are
+        // listed; VS Code's Expand/Shrink Selection, Copy Line Up/Down,
+        // Duplicate Selection, Add Cursors to Line Ends, Add Previous
+        // Occurrence and Column Selection Mode have no vimcode equivalent
+        // yet and are deliberately left out rather than wired to dead
+        // actions.
+        "Selection",
+        's',
+        &[
+            MenuItemData {
+                label: "Select All",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+A",
+                action: "select_all",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Move Line Up",
+                shortcut: "",
+                vscode_shortcut: "Alt+Up",
+                action: "MoveLineUp",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Move Line Down",
+                shortcut: "",
+                vscode_shortcut: "Alt+Down",
+                action: "MoveLineDown",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Add Cursor Above",
+                shortcut: "",
+                vscode_shortcut: "Alt+Shift+Up",
+                action: "add_cursor_above",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Add Cursor Below",
+                shortcut: "",
+                vscode_shortcut: "Alt+Shift+Down",
+                action: "add_cursor_below",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "",
+                shortcut: "",
+                vscode_shortcut: "",
+                action: "",
+                enabled: false,
+                separator: true,
+            },
+            MenuItemData {
+                label: "Add Next Occurrence",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+D",
+                action: "add_next_occurrence",
+                enabled: true,
+                separator: false,
+            },
+            MenuItemData {
+                label: "Select All Occurrences",
+                shortcut: "",
+                vscode_shortcut: "Ctrl+Shift+L",
+                action: "select_all_occurrences",
+                enabled: true,
+                separator: false,
+            },
+        ],
+    ),
+    (
         "View",
         'v',
         &[

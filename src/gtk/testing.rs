@@ -11398,6 +11398,59 @@ mod sticky_scroll {
     }
 }
 
+/// #1697: VS Code's menu bar is `File · Edit · Selection · View · Go · Run ·
+/// Terminal · Help` — vimcode's dropped `Selection` entirely, the only
+/// mismatch against an otherwise label-for-label identical bar (see the
+/// issue's side-by-side capture). `MENU_STRUCTURE` (`render.rs`) is the one
+/// shared static both backends paint their top-level row from, so this is a
+/// pure menu-definition fix with no backend-specific code; this GTK-side
+/// proof plus `tui_main::app_on_tui_tests`'s mirror covers both renderers
+/// off the same data.
+///
+/// Verified RED against the pre-fix tree: with `Selection` absent from
+/// `MENU_STRUCTURE`, `find_bounds("Selection")` returns `None` and the
+/// `expect` below panics.
+#[cfg(test)]
+mod selection_menu {
+    use super::*;
+
+    #[test]
+    fn menu_bar_has_selection_between_edit_and_view_in_order() {
+        let engine = Engine::new_for_test();
+        let mut h = harness(engine, 1400, 900);
+        h.driver.render();
+
+        let labels = [
+            "File",
+            "Edit",
+            "Selection",
+            "View",
+            "Go",
+            "Run",
+            "Terminal",
+            "Help",
+        ];
+        let mut xs = Vec::with_capacity(labels.len());
+        for label in labels {
+            let bounds = h
+                .driver
+                .find_bounds(label)
+                .unwrap_or_else(|| panic!("top-level menu label {label:?} must paint"));
+            xs.push((label, bounds.x));
+        }
+        for i in 1..xs.len() {
+            let (prev_label, prev_x) = xs[i - 1];
+            let (label, x) = xs[i];
+            assert!(
+                x > prev_x,
+                "menu bar labels must paint left-to-right in VS Code's order \
+                 (File, Edit, Selection, View, Go, Run, Terminal, Help); \
+                 {label:?} at x={x} did not paint after {prev_label:?} at x={prev_x}"
+            );
+        }
+    }
+}
+
 /// Black-box paint + click-routing proof for the VS Code-style Command
 /// Center (`◀ ▶` nav arrows + centered `🔍 <project>` search box) dropped by
 /// the #540 Relm4->ShellApp cutover and never re-wired (#676).
