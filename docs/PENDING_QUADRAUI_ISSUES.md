@@ -1341,3 +1341,112 @@ sites reach are confirmed correct by source review above, so the gap (if
 the leading hypothesis holds) is in Win-GUI's own text-measurement
 pipeline, not in anything `src/win/`, `src/app.rs`, or `render.rs` control.
 
+---
+
+## Seven Win-GUI rasterisers still paint a hardcoded `Theme::default()` instead of the live `self.current_theme` — a runtime `:colorscheme` change only repaints the minimap (blocks vimcode#1667)
+
+**Title:** `:colorscheme vscode-light` on Win-GUI repaints the minimap alone;
+the menu bar/tab bar/editor/status bar/Explorer sidebar stay on the
+previous theme — reported in vimcode#1667 with a before/after screenshot
+pair (minimap flips, everything else doesn't) and confirmed reversible
+(switching back to `vscode-dark` restores the minimap, ruling out a one-off
+capture glitch).
+
+Root-caused by reading every Win-GUI rasteriser's real source at the
+pinned rev (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) and diffing against
+`GtkBackend`'s/`MacBackend`'s equivalents at the same rev — not reproduced
+on real hardware (no Windows host in this session; see `src/win/mod.rs`'s
+top-of-file `#1558` doc section for why this repo's Win-GUI tests can only
+be read, not executed, from here or from dell64 today).
+
+`Backend::set_theme` (quadraui's trait method) is wired correctly:
+`App::sync_per_frame_backend_state` (backend-neutral, `src/app.rs`,
+vimcode) calls it every frame with vimcode's own resolved theme, and
+`WinBackend::set_theme`/`theme()` (`win/backend.rs`) store/return it
+faithfully via `self.current_theme`. Nine Win-GUI rasterisers already read
+that live field correctly, matching `GtkBackend`/`MacBackend`:
+`draw_minimap`, `draw_menu_bar`, `draw_activity_bar`,
+`draw_status_bar_interactive`, `draw_completions`, `draw_find_replace`,
+`draw_scrollbar`, `draw_drop_overlay`, `draw_context_menu` (several of
+these were quadraui#789's own fix, per that issue's commit message naming
+exactly this set). That's why the minimap alone visibly reacted to
+`:colorscheme` in the bug report's screenshot.
+
+Seven more never got that fix and still construct a fresh
+`Theme::default()` — several with an explicit comment admitting the gap
+outright:
+
+- `win::editor::draw_editor` (`editor.rs:68`) — editor background/
+  foreground/cursorline/selection/diagnostics/cursor colours. No theme
+  parameter reaches this function at all (`WinBackend::draw_editor` calls
+  it with only `cell_width`/`line_height`). Module doc: "colours come from
+  `Theme::default()` rather than a live `WinBackend` theme field."
+- `win::tab_bar::paint_tab_bar_icons_from_layout` (`tab_bar.rs:285`) — the
+  whole tab-row background fill (`theme.tab_bar_bg`) plus every tab's
+  active/inactive fill and label colour. Reached from
+  `WinBackend::draw_tab_bar_icons` with no theme argument at all (same gap
+  shape as `draw_editor`).
+- `win::tree::draw_tree` (`tree.rs:103`) — the Explorer sidebar's own
+  content rasteriser; its documented "Visual contract" names
+  `Theme::tab_bar_bg` for the background fill and `header_bg`/
+  `selected_bg`/`inactive_selected_bg`/`muted_fg`/`error_fg`/`warning_fg`
+  for rows. `WinBackend::draw_tree` calls it with no theme argument.
+- `WinBackend::draw_panel` (`backend.rs:4042`) — explicit comment:
+  "`Theme::default()`, not `self.current_theme` — preserves the pre-#859
+  `win::panel::draw_panel` behaviour exactly ... `WinBackend` has no live
+  theme wired through to panel chrome yet." Paints the bottom/Terminal
+  panel's title-bar background (`theme.separator`) and body chrome.
+- `WinBackend::draw_sidebar_panel_interactive` (`backend.rs:4381`) —
+  explicit comment: "preserves the pre-#862 ... behaviour exactly (it
+  delegated to `win::toolbar::draw_toolbar`, which has never taken a live
+  theme ...)." Paints a sidebar panel's own toolbar header
+  (`bar.bg.unwrap_or(theme.header_bg)` when the panel sets no explicit
+  `bar.bg`).
+- `WinBackend::draw_split` (`backend.rs:3829`) — explicit comment,
+  identical shape: "`WinBackend` has no live theme wired through to split
+  chrome yet." Paints window-split divider chrome.
+- `WinBackend::draw_split_tree` (`backend.rs:3870`) — same explicit comment
+  shape, for the split-tree container chrome.
+
+**Ask:** wire `self.current_theme` through all seven, mirroring whatever
+quadraui#789 (or its sibling fixes) did for the nine already-correct
+rasterisers above — `draw_editor`/`draw_tree`/`paint_tab_bar_icons_from_
+layout` need a `theme: &Theme` parameter threaded from their `WinBackend`
+call site (`self.current_theme`), the same shape `draw_menu_bar`/
+`draw_activity_bar` already take; `draw_panel`/`draw_sidebar_panel_
+interactive`/`draw_split`/`draw_split_tree` just need their local
+`let theme = crate::theme::Theme::default();` line (and its "has no live
+theme wired through yet" comment) replaced with `let theme =
+self.current_theme;`, the same one-line change `draw_find_replace`/
+`draw_scrollbar`/`draw_drop_overlay` already show as the fixed shape right
+next to them in the same file.
+
+**Test:** `src/win/mod.rs::win_driver_tests::
+colorscheme_change_repaints_editor_and_explorer_sidebar_1667` (added
+alongside this entry) is the Tier-1 acceptance check — pixel-probes
+`draw_editor`'s background and `draw_tree`'s Explorer sidebar background
+against `vscode-light`'s resolved theme (`#ffffff`/`#ececec`, both far
+from quadraui's own dark `Theme::default()`, `rgb(20, 22, 30)`, so either
+backend reading the wrong theme is pixel-exact, no tolerance needed). Only
+type-checked here (`#[cfg_attr(target_os = "windows", test)]`, same as
+every other test in that module) — see the module-top `#1558` doc section
+for why it cannot yet be *executed*, on this host or on dell64; this is a
+source-level RED confirmation (every line cited above was read directly at
+the pinned rev), not an executed one. `tests/smoke-spec/win-gui.yaml` gets
+no new step for this — its own "DELIBERATELY OMITTED" section already
+rules out a pixel-content check with today's `win_native_driver.py` step
+vocabulary (no `expect_capture_nonblank`-shaped primitive exists yet); that
+gap is coordinator-repo work, not something this vimcode PR can add. Covers
+only two of the seven (the pair the bug report's own screenshot calls out
+most directly, "editor background/text" and "Explorer sidebar") — the
+other five (tab bar, Terminal panel, sidebar-panel toolbar, split/
+split-tree dividers) have no equivalent probe yet; a follow-up can extend
+this test once the fix lands and real-hardware geometry for those can be
+confirmed, mirroring how `#1657`/`#1661` grew this same file incrementally.
+
+**Blocks:** `JDonaghy/vimcode#1667`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available; `WinBackend` is a 1-line quadraui re-export
+(`src/win/backend.rs`) and every file named above lives in quadraui, not
+in this repo.
+

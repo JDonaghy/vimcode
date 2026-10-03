@@ -991,4 +991,128 @@ mod win_driver_tests {
              instead"
         );
     }
+
+    // ── #1667: `:colorscheme` only repaints the minimap on Win-GUI ──────
+    //
+    // Root-caused by reading (not running — see this module's own #1558
+    // disclaimer) every Win-GUI rasteriser's real source at the pinned
+    // rev: `WinBackend::draw_minimap`/`draw_menu_bar`/
+    // `draw_activity_bar`/`draw_status_bar_interactive`/
+    // `draw_completions`/`draw_find_replace`/`draw_scrollbar`/
+    // `draw_drop_overlay`/`draw_context_menu` all paint with
+    // `&self.current_theme` — the live field `Backend::set_theme` writes
+    // every frame (`App::sync_per_frame_backend_state`, backend-neutral,
+    // `src/app.rs`) — exactly like `GtkBackend`/`MacBackend`'s equivalents.
+    // But `super::editor::draw_editor` (editor.rs:68),
+    // `super::tab_bar::paint_tab_bar_icons_from_layout` (tab_bar.rs:285,
+    // reached with no theme argument at all from
+    // `WinBackend::draw_tab_bar_icons`), `super::tree::draw_tree`
+    // (tree.rs:103, the Explorer sidebar's own rasteriser),
+    // `WinBackend::draw_panel` (backend.rs:4042), `WinBackend::
+    // draw_sidebar_panel_interactive` (backend.rs:4381),
+    // `WinBackend::draw_split` (backend.rs:3829) and `WinBackend::
+    // draw_split_tree` (backend.rs:3870) each still construct a fresh
+    // `Theme::default()` instead — several with an explicit "preserves
+    // the pre-#8xx behaviour exactly ... has no live theme wired through
+    // yet" comment admitting the gap outright. `GtkBackend`/`MacBackend`'s
+    // equivalents of all seven already read `self.current_theme` (checked
+    // directly against both files at the same pin). This is why the
+    // bug's own screenshot evidence shows the minimap alone flipping to
+    // `vscode-light` while the menu bar/activity bar/tab bar/editor/
+    // status bar/Explorer sidebar stay dark: the minimap is one of the
+    // nine already-wired rasterisers, the editor and Explorer tree are
+    // two of the seven that are not. `docs/PENDING_QUADRAUI_ISSUES.md`'s
+    // new entry drafts the upstream ask for all seven; nothing in this
+    // vimcode repo can fix this directly, per the Platform-Neutrality
+    // Rule — `WinBackend` is a 1-line quadraui re-export
+    // (`src/win/backend.rs`), and every file named above lives in
+    // quadraui, not here.
+    //
+    // Probes two of the seven (`draw_editor`'s `theme.background`,
+    // `draw_tree`'s `theme.tab_bar_bg`) — the pair this issue's own
+    // screenshot evidence calls out most directly ("editor background/
+    // text" and "Explorer sidebar") — rather than all seven, to keep this
+    // probe's geometry assumptions (where is a safe, glyph-free pixel to
+    // sample) to the two cases this module can locate via `find_bounds`
+    // with no extra fixture plumbing. `vscode-light`'s `background`
+    // (`#ffffff`) and `tab_bar_bg` (`#ececec`) are both far from
+    // quadraui's own dark `Theme::default()` (`rgb(20, 22, 30)` for
+    // both), so either backend reading the wrong theme is unambiguous
+    // pixel-exact, no tolerance needed.
+    //
+    // Mechanically certain to fail against the pinned rev (every
+    // function named above is read directly, not inferred) and to pass
+    // once quadraui wires `self.current_theme` through all seven — but,
+    // per this module's own top-of-file #1558 disclaimer, could not be
+    // *executed* from this Linux worktree (or on dell64) to observe that
+    // RED/GREEN flip directly; this is a source-level RED confirmation,
+    // stated explicitly here rather than left to the inherited blanket
+    // disclaimer, exactly like `win_gui_blank_title_band_strip_is_caption_1661`
+    // above.
+    #[cfg_attr(target_os = "windows", test)]
+    fn colorscheme_change_repaints_editor_and_explorer_sidebar_1667() {
+        let mut engine = plain_engine();
+        engine.settings.colorscheme = "vscode-light".to_string();
+        // A leading blank line puts a glyph-free row directly above the
+        // distinctive probe line below, so a pixel sampled there is
+        // guaranteed pure editor background, not anti-aliased glyph
+        // fringe. No digits/underscores (would risk a separate
+        // syntax-highlight span splitting `find_bounds`'s match) — moot
+        // here anyway (an unnamed scratch buffer has no language, so no
+        // highlighting), but kept plain for robustness.
+        engine
+            .buffer_mut()
+            .insert(0, "\nvimcodeprobelineforcolorschemerepaint\n");
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.session.explorer_visible = true;
+
+        let mut h = conformance_harness(engine, 1400, 900);
+        // A second render pass: `App::sync_per_frame_backend_state` pushes
+        // the live theme onto the backend at the *start* of
+        // `render_content`, so a widget painted *before* that call on the
+        // very first frame can lag by one paint (the GTK/macOS
+        // `sidebar_header_paints_...` tests document the identical
+        // ordering note for the sidebar header specifically) — this keeps
+        // both probes robust to that ordering rather than coupling them
+        // to an unrelated, already-settled claim.
+        h.driver.render();
+
+        let theme = crate::render::Theme::vscode_light();
+
+        // ── `win::editor::draw_editor`'s background ──────────────────
+        let probe_line = h
+            .driver
+            .find_bounds("vimcodeprobelineforcolorschemerepaint")
+            .expect("the probe line must paint inside the editor viewport");
+        let editor_px = h
+            .driver
+            .pixel(probe_line.x as u32, (probe_line.y - 5.0).max(0.0) as u32);
+        assert_eq!(
+            (editor_px.r, editor_px.g, editor_px.b),
+            (theme.background.r, theme.background.g, theme.background.b),
+            "editor background must repaint from `theme.background` on a \
+             runtime `:colorscheme` change, not stay pinned to Win-GUI's \
+             hardcoded `Theme::default()` (`win::editor::draw_editor`)"
+        );
+
+        // ── `win::tree::draw_tree`'s Explorer sidebar background ──────
+        let header = h
+            .driver
+            .find_bounds("EXPLORER")
+            .expect("the Explorer sidebar header must paint its panel title");
+        let tree_px = h.driver.pixel(
+            header.x as u32 + 10,
+            (header.y + header.height + 20.0) as u32,
+        );
+        assert_eq!(
+            (tree_px.r, tree_px.g, tree_px.b),
+            (theme.tab_bar_bg.r, theme.tab_bar_bg.g, theme.tab_bar_bg.b),
+            "the Explorer sidebar tree must repaint its background from \
+             `theme.tab_bar_bg` on a runtime `:colorscheme` change, not \
+             stay pinned to Win-GUI's hardcoded `Theme::default()` \
+             (`win::tree::draw_tree`)"
+        );
+    }
 }
