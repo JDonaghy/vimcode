@@ -1450,3 +1450,97 @@ vimcode-side fix available; `WinBackend` is a 1-line quadraui re-export
 (`src/win/backend.rs`) and every file named above lives in quadraui, not
 in this repo.
 
+---
+
+## `WinDriver` has no `.tick()` (unlike `TuiDriver`/`MacDriver`), and its own `attach_headless` never sets `WinBackend::hwnd` — `tick`/`request_frame_in` scheduling bugs on Win-GUI can't be driver-tested even on real Windows (found fixing vimcode#1668)
+
+**Title:** vimcode#1668 (Win-GUI's embedded terminal panel paints completely
+blank — no shell prompt, no echoed input, no output, ever, even after
+settling and typing) root-caused to a genuine, fixable-in-vimcode
+scheduling gap, not a quadraui rasteriser bug: `quadraui::runner::
+ShellApp::tick`'s own doc table says Windows has **no** unconditional
+idle-poll fallback (unlike TUI/GTK/macOS's 250ms `IDLE_POLL_CEILING`) —
+`tick` only runs again once something calls `Backend::request_frame_in`.
+Confirmed directly against the pinned rev: `quadraui::win::run::wndproc`
+calls `AppLogic::tick` from exactly one place, its own `WM_TIMER` handler
+(`grep -n "tick(ws" quadraui/src/win/run.rs`), and that timer is armed
+only by `WinBackend::request_frame_in`'s `SetTimer` call — dispatching a
+keypress (`App::handle`/`dispatch_event`) never reaches `tick` at all.
+vimcode's own `App::tick_dispatch` (`src/app.rs`) only ever re-armed
+`request_frame_in` for one case (an in-flight ACP/AI turn); opening a
+terminal panel armed nothing, so `Engine::poll_terminal` (which drains the
+PTY session's output) never ran again past the very first frame on
+Win-GUI — exactly the reported "blank immediately, blank after 2.5s,
+still blank after typing `echo hello-vimcode` + Enter and another 2.5s"
+symptom. **Fixed in this repo**, in the one shared, backend-neutral
+`App::tick_dispatch` (not a per-backend file): a new
+`terminal_poll_rearm_delay` pure function now makes `tick_dispatch`
+re-arm `request_frame_in` at 100ms cadence whenever `Engine::
+terminal_panes` is non-empty, mirroring the existing `ai_streaming`
+re-arm immediately above it. Harmless on GTK/TUI/macOS (they already
+tick regardless, via their own `IDLE_POLL_CEILING` fallback) — this is
+pure, additive, Win-GUI-targeted scheduling, not a feature decision in a
+backend directory.
+
+**The testing gap this entry is actually about:** proving the fix via a
+driver-level, rendered-output test (this repo's own black-box coverage
+bar) is not achievable against `WinDriver` as it exists today, for two
+independent reasons:
+
+1. `quadraui::tui::testing::TuiDriver` and `quadraui::macos::testing::
+   MacDriver` both expose a `pub fn tick(&mut self) -> Reaction` a test
+   can call directly to deterministically advance the app's idle-poll
+   logic. `quadraui::win::testing::WinDriver` has no such method at all
+   (`grep -n "pub fn tick" quadraui/src/{tui,macos,win}/testing.rs` finds
+   it in the first two, not the third) — there is no way to drive
+   `AppLogic::tick` through `WinDriver` short of its own `.render()`/
+   `.dispatch()`, neither of which calls it.
+2. Even if `WinDriver` grew a `.tick()`, `WinBackend::request_frame_in`
+   is a documented no-op whenever `self.hwnd` is `None` ("a
+   `request_frame_in` call with no window is simply lost") — and
+   `WinDriver::new`'s `WinBackend::attach_headless` call never sets
+   `self.hwnd` (only `GtkDriver`'s/`MacDriver`'s backend-attach
+   equivalents wire a real/fake window handle their scheduling can act
+   on). So a `WinDriver`-based scenario could call `.tick()` and still
+   never observe whether a real Win32 `WM_TIMER`/`SetTimer` round-trip
+   would have re-fired `tick` on a live message loop — the one thing
+   this bug class is actually about.
+
+Same root shape as this file's two already-filed, now-struck "TUI test
+drivers can't observe X" entries (quadraui#1060, quadraui#1063) — a
+downstream crate (`vimcode`) found a real scheduling/timing bug whose fix
+it could ship, but whose *regression coverage* needs a test-harness
+primitive quadraui doesn't expose yet.
+
+**Ask:**
+1. Give `WinDriver` a `pub fn tick(&mut self) -> Reaction` mirroring
+   `TuiDriver`'s/`MacDriver`'s (calls `AppLogic::tick`, applies the
+   returned `Reaction` the same way `.dispatch()` already does via
+   `apply_outcome`).
+2. Either have `WinDriver::new`/`attach_headless` set a real or
+   synthetic non-`None` `self.hwnd` so `request_frame_in` isn't a silent
+   no-op under test, or add a test-only hook (e.g. a `requested_frame_in()
+   -> Option<Duration>` accessor on `WinBackend`, gated the same way
+   `set_painted_text_recording`/`text_runs` already are) that records the
+   delay a `request_frame_in` call asked for without needing a live HWND
+   at all — whichever shape matches how `GtkBackend`'s/`MacBackend`'s
+   `testing` modules solved the analogous problem, if they already have.
+
+**Test:** `src/app.rs::terminal_poll_rearm_tests::
+rearm_is_requested_only_while_a_terminal_pane_is_open` (added alongside
+this entry) is vimcode#1668's actual acceptance coverage — a pure,
+`Backend`-free unit test of `terminal_poll_rearm_delay`, the exact shape
+`dedup_window_title`'s own doc comment already established as this
+crate's accepted substitute when `quadraui::Backend`'s sealed-trait
+status rules out a `Backend`-call-count driver test (RED-verified:
+reverting the function to always return `None` makes the test's first
+assertion fail; restored before committing). This quadraui-side entry is
+the follow-up for making that coverage a real rendered-output driver test
+instead, once `WinDriver` can support one — it does not block vimcode#1668
+itself, which ships its fix in this same PR.
+
+**Blocks:** nothing in `JDonaghy/vimcode` directly — `JDonaghy/vimcode#1668`
+is fixed and covered by the pure-function unit test above regardless of
+whether this lands. File this as a quadraui testing-infrastructure
+improvement, not a `JDonaghy/vimcode` blocker.
+

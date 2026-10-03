@@ -721,6 +721,34 @@ mod win_backend_conformance {
 // Mac mini respectively) against the identical vimcode-side mutation — see
 // `src/macos/mod.rs`'s copy of this scenario for that note. Win-GUI needs the
 // test-binary crash above fixed first.
+//
+// ── #1668: embedded terminal panel blank on Win-GUI — fixed outside this
+// module ──────────────────────────────────────────────────────────────────
+//
+// vimcode#1668 ("Terminal > New Terminal shows a blank panel forever, no
+// prompt, no echoed input, typing produces nothing") root-caused to a
+// genuine, fixable-in-vimcode scheduling gap rather than a quadraui
+// rasteriser defect like #1657/#1661/#1667 above: `quadraui::runner::
+// ShellApp::tick`'s own doc says Win-GUI has no unconditional idle-poll
+// fallback (unlike TUI/GTK/macOS's 250ms `IDLE_POLL_CEILING`), and nothing
+// in `App::tick_dispatch` (`src/app.rs`) was re-arming a wake-up for an
+// open terminal pane — so `Engine::poll_terminal` (the PTY output drain)
+// never ran again past the very first frame on this backend specifically.
+// Fixed in the one shared, backend-neutral call site this bug needed
+// (`src/app.rs::App::tick_dispatch`'s new `terminal_poll_rearm_delay`
+// re-arm, mirroring the existing `ai_streaming` one right above it) — not
+// here, because there is no `WinBackend`/`win::*` decision to make: the
+// gap was "nobody asked to be woken again", not "WinBackend painted the
+// wrong thing". See `src/app.rs::terminal_poll_rearm_tests` for the
+// RED/GREEN-verified unit coverage (a pure, `Backend`-free function test,
+// the same shape `dedup_window_title`'s doc establishes as this crate's
+// accepted substitute for a `Backend`-call-count driver test — sealed
+// trait, no mock) and `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for
+// the follow-up testing-infrastructure ask this investigation surfaced:
+// `WinDriver` (unlike `TuiDriver`/`MacDriver`) has no `.tick()` at all, and
+// its `attach_headless` never sets `WinBackend::hwnd`, so even a
+// `WinDriver`-based scenario here could not have observed this class of
+// scheduling bug on real Windows either.
 #[cfg(all(test, feature = "win"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod win_driver_tests {
