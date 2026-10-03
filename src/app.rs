@@ -3658,6 +3658,36 @@ impl App {
                 status,
                 quadraui::WidgetId::new(format!("status:{}", rw.window_id.0)),
             );
+            // #1690: with exactly one window (no `:split`/`:vsplit`), paint
+            // a plain backdrop fill edge-to-edge across the real window/
+            // terminal width *before* the real (window-bounded) bar below —
+            // VS Code's status bar runs under the activity bar and sidebar
+            // too, not just the editor pane (see the issue's side-by-side
+            // pixel sampling). `AppShell::render` paints the sidebar/
+            // activity bar *before* `render_content` ever runs (see
+            // `shell_adapter::render`), so this backdrop, painted here,
+            // after, simply draws over their bottom edge, capping them —
+            // with no `AppShellLayout`/sidebar-height change needed. See
+            // `render::paint_status_backdrop`'s doc for why this is a
+            // separate, content-free paint rather than widening `sb_rect`
+            // itself. With two or more windows there is no single
+            // VS-Code-shaped bar to backdrop this way — each split keeps
+            // its own, Vim-style, window-bounded status line, unchanged.
+            if screen.windows.len() == 1 {
+                let real_bg = win_bar
+                    .left_segments
+                    .first()
+                    .or(win_bar.right_segments.first())
+                    .map(|s| s.bg);
+                let backdrop_rect =
+                    quadraui::Rect::new(0.0, bar_y as f32, backend.viewport().width, lh as f32);
+                render::paint_status_backdrop(
+                    backend,
+                    &format!("status-backdrop:{}", rw.window_id.0),
+                    backdrop_rect,
+                    real_bg,
+                );
+            }
             // #672: recover segment hit zones the same way the dead
             // `draw.rs::draw_window_status_bar` did, so `pixel_to_click_target`'s
             // `WindowZone::StatusBar` arm has a real `status_segment_map` entry
@@ -4869,6 +4899,30 @@ impl App {
                         separated_status_y as f32,
                         main.width,
                         el.separated_status_h as f32,
+                    );
+                    // #1690: backdrop fill, full window/terminal width (not
+                    // `main.width` — main-content-column-only), painted
+                    // *before* the real, window-bounded bar below — see
+                    // `render::paint_status_backdrop`'s doc (the same
+                    // helper `paint_editor_windows_rung`'s single-window
+                    // case uses) for why this is a separate, content-free
+                    // paint rather than widening `sb_rect` itself.
+                    let real_bg = status
+                        .left_segments
+                        .first()
+                        .or(status.right_segments.first())
+                        .map(|s| quadraui::Color::rgb(s.bg.r, s.bg.g, s.bg.b));
+                    let backdrop_rect = quadraui::Rect::new(
+                        0.0,
+                        separated_status_y as f32,
+                        backend.viewport().width,
+                        el.separated_status_h as f32,
+                    );
+                    render::paint_status_backdrop(
+                        backend,
+                        "status-backdrop:separated",
+                        backdrop_rect,
+                        real_bg,
                     );
                     // #672: segment hit-zone recovery keyed by
                     // `active_window_id` — the separated line shows the active

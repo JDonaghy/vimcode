@@ -5517,14 +5517,24 @@ mod issue_1256_sidebar_chrome {
 /// gap inventory re-checked that claim by actually running the `tui` arm
 /// (rather than trusting the comment) and it no longer reproduces — the
 /// precondition (`screen_has("Ln 1,")`) and the rest of
-/// [`activity_bar_click_focuses_search_panel`]'s body all pass cleanly at
-/// this scenario's `(800, 480)` size. Whatever regressed the by-hand
-/// observation has since been fixed elsewhere (most likely #700's move to
-/// fixed-pixel `TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` no longer
-/// scaling with `line_height`, so the huge `lh` a `TuiBackend` used to
-/// report no longer inflates the reserved chrome past the viewport) —
-/// registering the `tui` arm plain (no `KNOWN_BUGS` gate) is itself the
-/// record that this gap has closed.
+/// [`activity_bar_click_focuses_search_panel`]'s body all pass cleanly.
+/// Whatever regressed the by-hand observation has since been fixed
+/// elsewhere (most likely #700's move to fixed-pixel
+/// `TAB_ROW_HEIGHT_PX`/`BREADCRUMB_ROW_HEIGHT_PX` no longer scaling with
+/// `line_height`, so the huge `lh` a `TuiBackend` used to report no longer
+/// inflates the reserved chrome past the viewport) — registering the `tui`
+/// arm plain (no `KNOWN_BUGS` gate) is itself the record that this gap has
+/// closed.
+///
+/// Width bumped `800` -> `1600` (#1690): the ruler (`Ln N, Col N`) this
+/// scenario's precondition and both post-click assertions all read moved
+/// to the front of the right-side priority-drop order (VS Code parity —
+/// it is now the *leftmost* segment of the right group, not the protected
+/// right-most one), so the `gtk` arm's real pixel geometry — sidebar +
+/// activity bar default-visible chrome subtracted from `800`px — no
+/// longer leaves it room. `1600` is shared with `tui`/`tui_prod` too (one
+/// `size` for all three arms), but a wider cell-grid terminal changes
+/// nothing either of those already-passing arms assert on.
 #[cfg(test)]
 mod issue_1360_activity_bar_click_focuses_panel {
     fn engine_fixture() -> crate::core::Engine {
@@ -5542,7 +5552,7 @@ mod issue_1360_activity_bar_click_focuses_panel {
         label: activity_bar_click_focuses_search_panel_proof,
         backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
-        size: (800, 480),
+        size: (1600, 480),
         body: |driver| {
             crate::harness::activity_bar_click_focuses_search_panel(driver);
         },
@@ -5694,6 +5704,12 @@ mod issue_1426_app_on_tui_rows_match_shipped_tui {
 /// `activity_bar_click_focuses_search_panel` above running clean there in
 /// spirit) but is still pinned to `[gtk, tui_prod]` for symmetry with its
 /// sibling.
+///
+/// The `l` proof's width is bumped `800` -> `1600` (#1690), same
+/// `Ln N, Col N`-priority-drop rationale as
+/// `issue_1360_activity_bar_click_focuses_panel`'s own note — the `h`
+/// proof below does not read that segment, so its `(800, 480)` is
+/// untouched.
 #[cfg(test)]
 mod issue_406_sidebar_ctrl_w_navigates {
     fn engine_fixture() -> crate::core::Engine {
@@ -5711,7 +5727,7 @@ mod issue_406_sidebar_ctrl_w_navigates {
         label: sidebar_ctrl_w_l_returns_focus_to_the_editor_proof,
         backends: [gtk, tui, tui_prod],
         engine: engine_fixture(),
-        size: (800, 480),
+        size: (1600, 480),
         body: |driver| {
             crate::harness::sidebar_ctrl_w_l_returns_focus_to_the_editor(driver);
         },
