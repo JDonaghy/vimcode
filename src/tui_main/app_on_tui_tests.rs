@@ -691,6 +691,80 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // Menu bar: Selection menu (#1697)
+    // ─────────────────────────────────────────────────────────────────────────
+    mod selection_menu {
+        use super::*;
+
+        /// #1697: VS Code's menu bar is `File · Edit · Selection · View · Go ·
+        /// Run · Terminal · Help` — vimcode's dropped `Selection` entirely.
+        /// `MENU_STRUCTURE` (`render.rs`) is the one shared static both
+        /// backends paint their top-level row from, so this is a pure
+        /// menu-definition fix with no backend-specific code; this is the TUI
+        /// twin of `gtk::testing::selection_menu::
+        /// menu_bar_has_selection_between_edit_and_view_in_order`, driving the
+        /// real `App` through [`quadraui::tui::testing::TuiDriver`] rather
+        /// than GTK's Cairo paint path, off the same `MENU_STRUCTURE` data —
+        /// per #587/#592, painted-on-one-backend-only is exactly the gap a
+        /// shared-data argument alone cannot rule out, so this exists
+        /// alongside the GTK test rather than instead of it.
+        ///
+        /// Verified RED against the pre-fix tree: with `Selection` absent
+        /// from `MENU_STRUCTURE`, `find_bounds("Selection")` returns `None`
+        /// and the `expect` below panics.
+        #[test]
+        fn menu_bar_has_selection_between_edit_and_view_in_order() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            // The menu bar starts hidden on TUI (same as `activity_bar`'s
+            // hamburger-reveal tests above) — reveal it the same way, via a
+            // real click through `App`'s dispatch path, before any top-level
+            // label can paint.
+            let (hx, hy) = driver
+                .find(crate::icons::HAMBURGER.s())
+                .expect("hamburger icon must paint on the activity bar");
+            driver.click(hx, hy);
+            assert!(
+                driver.screen_has("File"),
+                "hamburger click must reveal the menu bar before the \
+                 top-level labels below can be located; screen:\n{}",
+                driver.screen()
+            );
+
+            let labels = [
+                "File",
+                "Edit",
+                "Selection",
+                "View",
+                "Go",
+                "Run",
+                "Terminal",
+                "Help",
+            ];
+            let mut xs = Vec::with_capacity(labels.len());
+            for label in labels {
+                let bounds = driver
+                    .find_bounds(label)
+                    .unwrap_or_else(|| panic!("top-level menu label {label:?} must paint"));
+                xs.push((label, bounds.x));
+            }
+            for i in 1..xs.len() {
+                let (prev_label, prev_x) = xs[i - 1];
+                let (label, x) = xs[i];
+                assert!(
+                    x > prev_x,
+                    "menu bar labels must paint left-to-right in VS Code's \
+                     order (File, Edit, Selection, View, Go, Run, Terminal, \
+                     Help); {label:?} at x={x} did not paint after \
+                     {prev_label:?} at x={prev_x}; screen:\n{}",
+                    driver.screen()
+                );
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Sidebar panels
     // ─────────────────────────────────────────────────────────────────────────
     mod sidebar_panels {
@@ -3025,7 +3099,7 @@ mod tests {
 
             // Baseline count, not `!screen_has("Terminal")` — `App`
             // always paints a permanent "Terminal" top-level menu item
-            // (`File Edit View Go Run Terminal Help`), so a bare
+            // (`File Edit Selection View Go Run Terminal Help`), so a bare
             // presence check is true before any terminal ever opens.
             // Same gotcha `crate::harness`'s own
             // `context_menu_open_terminal_opens_terminal_tab` doc
