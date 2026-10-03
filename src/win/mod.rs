@@ -661,6 +661,148 @@ mod win_backend_conformance {
     }
 }
 
+// ── #1674: Ctrl-modified shortcuts (Ctrl+`, Ctrl+B) never dispatched on
+// Win-GUI ────────────────────────────────────────────────────────────────
+//
+// vimcode#1674 (bugbash finding, real-hardware-confirmed: window focus
+// established via an actual mouse click, `GetForegroundWindow() == target
+// hwnd` verified before each injection, reproduced via both `SendKeys` and
+// raw `keybd_event(VK_CONTROL + VK_OEM_3)`) reports that neither Ctrl+`
+// (open/toggle terminal) nor Ctrl+B (toggle sidebar) has any visible
+// effect, while unmodified keys (typing, Enter, Escape) and mouse clicks
+// work fine in the same session — isolating the break to the Ctrl
+// modifier specifically.
+//
+// Like a backend trait method, "Ctrl+<key> reaches the engine" is not a
+// `src/win/` decision: `App::setup` (`src/app.rs`) registers the same
+// 15-entry panel-accelerator table (`render::register_panel_accelerators`)
+// on every GUI backend identically, `Engine::handle_vscode_key`
+// (`src/core/engine/vscode.rs`) is the one shared handler for the raw
+// fallback path, and the accelerator-matching itself
+// (`quadraui::backend_core::BackendCore::match_keypress`) is shared code
+// `WinBackend::match_keypress`/`GtkBackend::match_keypress` both delegate
+// to verbatim. None of that is a plausible site for a Win-GUI-only
+// regression. The one layer none of that shared code can reach is
+// upstream of all of it: the raw `WM_KEYDOWN`/`WM_CHAR` →
+// `quadraui::UiEvent` translation (`quadraui::win::events`), which is the
+// one thing genuinely different between backends — GTK's GDK and the
+// TUI's crossterm each hand over an already-fully-resolved key+modifier
+// pair; Win32 does not.
+//
+// Source-level investigation (pinned rev
+// `ca7fcc83afad01ec3422f79366566f3a263b22bf`, `quadraui/src/win/events.rs`
+// + `run.rs`), backed by **executing** (not just type-checked) tests
+// against quadraui's own public `win::events` API below, found that
+// `events::wm_char_to_uievent` — the pure `WM_CHAR` → `UiEvent` translator
+// — correctly recovers *both* chords when fed the payload Windows is
+// documented to deliver for each:
+//
+// - Ctrl+B: Windows' keyboard driver converts Ctrl+letter to its C0
+//   control code (`0x02` for B) via `TranslateMessage`, and
+//   `ctrl_b_wm_char_recovers_the_base_letter_1674` confirms
+//   `wm_char_to_uievent('\x02', {ctrl:true}, _)` correctly recovers
+//   `Key::Char('b')` with `ctrl == true` — the exact recovery GTK's/the
+//   TUI's own translators perform for the same chord.
+// - Ctrl+`: backtick is *not* a control character (`'`'.is_control() ==
+//   false`), so `wm_char_to_uievent` never even reaches its Ctrl-recovery
+//   branch for it — it falls straight to the final, unconditional
+//   `Some(KeyPressed { key: Char(c), modifiers, .. })` arm.
+//   `ctrl_backtick_wm_char_passes_through_with_ctrl_held_1674` confirms
+//   `wm_char_to_uievent('\u{60}', {ctrl:true}, _)` already produces exactly
+//   the `KeyPressed(Char('`'), ctrl: true)` event
+//   `Engine::handle_vscode_key`'s `"grave" | "\`"` arm needs.
+//
+// So **the translation function itself is not at fault for either
+// chord** — this corrects an earlier, narrower theory in this same
+// investigation (that `events::vk_to_named_key` having no `VK_OEM_3`
+// entry meant Ctrl+` had no delivery path at all): `vk_to_named_key`
+// genuinely has no backtick entry, but that's immaterial once
+// `wm_char_to_uievent` is confirmed to handle the `WM_CHAR` path
+// correctly on its own.
+//
+// What neither this file nor any test it can run addresses is the one
+// remaining, genuinely OS-level question: **does Windows' real
+// `TranslateMessage` actually generate a `WM_CHAR` message at all for
+// Ctrl+backtick** (and, for Ctrl+B, does `GetKeyState(VK_CONTROL)` read
+// `true` at the moment `win_key_modifiers()` samples it during injected —
+// not physically typed — input)? Win32 keyboard-input references
+// consistently describe `WM_CHAR` generation for Ctrl held with a
+// non-letter key as layout/driver-dependent, unlike the uniformly
+// documented Ctrl+letter C0 conversion — but confirming (or ruling out)
+// that this is the actual cause needs a live Windows message loop, which
+// no test in `quadraui::win::testing` (`WinDriver` synthesizes an
+// already-decoded `UiEvent` directly, bypassing `events.rs`/`run.rs`
+// entirely — see `ctrl_accelerator_dispatch_reaches_engine_via_
+// win_driver_1674` below) or in this repo can observe — the same "last
+// link only real hardware can close" shape `docs/PENDING_QUADRAUI_
+// ISSUES.md`'s #1668 entry already describes for `WinDriver`'s missing
+// `.tick()`. See that doc's new entry for this issue for the concrete
+// real-hardware diagnostic this needs next.
+#[cfg(all(test, feature = "win"))]
+mod win_ctrl_key_translation_tests_1674 {
+    use quadraui::win::events::wm_char_to_uievent;
+    use quadraui::{Key, Modifiers, UiEvent};
+
+    /// Windows' keyboard driver converts Ctrl+letter to its C0 control
+    /// code (`0x02` for B) via `TranslateMessage` — this confirms
+    /// `wm_char_to_uievent` correctly recovers that back to
+    /// `Key::Char('b')` with `ctrl` held, exactly as GTK's/the TUI's own
+    /// translators already do for the issue's own confirmed-working
+    /// backends. Genuinely executes on Linux: `wm_char_to_uievent` is a
+    /// pure function, no WinAPI call.
+    #[test]
+    fn ctrl_b_wm_char_recovers_the_base_letter_1674() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        // `0x02` (STX) is the C0 control code Windows' keyboard driver
+        // produces for Ctrl+B via `TranslateMessage`.
+        let event = wm_char_to_uievent('\u{2}', ctrl, false);
+        assert_eq!(
+            event,
+            Some(UiEvent::KeyPressed {
+                key: Key::Char('b'),
+                modifiers: ctrl,
+                repeat: false,
+            }),
+            "wm_char_to_uievent must recover Ctrl+B's C0 control code \
+             (0x02) back to Key::Char('b') with ctrl held, exactly as GTK's/ \
+             the TUI's own translators already do for the issue's own \
+             confirmed-working backends"
+        );
+    }
+
+    /// Backtick is not a control character, so `wm_char_to_uievent` never
+    /// reaches its Ctrl-recovery branch for it at all — it passes the
+    /// literal `'`'` straight through with `ctrl` still set on
+    /// `modifiers`, which is exactly the `KeyPressed(Char('`'), ctrl:
+    /// true)` event `Engine::handle_vscode_key`'s `"grave" | "\`"` arm
+    /// needs. Demonstrates that *if* Windows delivers `WM_CHAR('`', ...)`
+    /// while Ctrl is held, the translation is already correct — the open
+    /// question this entry's doc comment narrows to is purely whether
+    /// Windows actually generates that message, not anything in this
+    /// function.
+    #[test]
+    fn ctrl_backtick_wm_char_passes_through_with_ctrl_held_1674() {
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        let event = wm_char_to_uievent('`', ctrl, false);
+        assert_eq!(
+            event,
+            Some(UiEvent::KeyPressed {
+                key: Key::Char('`'),
+                modifiers: ctrl,
+                repeat: false,
+            }),
+            "wm_char_to_uievent must pass a non-control character like \
+             backtick straight through with ctrl still set on modifiers"
+        );
+    }
+}
+
 // ── #928: `crate::harness::ConformanceHarness` on `WinDriver` ──────────────
 //
 // #928's AC2 ("`cargo check --no-default-features --features win`
@@ -1371,6 +1513,76 @@ mod win_driver_tests {
              dropdown — proving vimcode#1673's reported symptom is the \
              stale x=24 coordinate alone, not a regression in the shared \
              click-routing path; painted texts were {:?}",
+            h.driver.painted_texts()
+        );
+    }
+
+    // ── #1674: isolating half — a Ctrl-modified accelerator through the
+    // shared dispatch pipeline, native Win32 translation skipped ────────
+    //
+    // See this module's top-level `#1674` doc section. `WinDriver::
+    // ctrl_char` constructs the already-decoded `UiEvent::KeyPressed {
+    // key: Char(c), modifiers: { ctrl: true, .. } }` directly and feeds it
+    // through the real, shared `dispatch_event`/`preprocess_event`
+    // pipeline — accelerator matching
+    // (`quadraui::backend_core::BackendCore::match_keypress`,
+    // `WinBackend::match_keypress` delegates to it verbatim, same as
+    // `GtkBackend`) through to `App::handle`'s `UiEvent::Accelerator` arm
+    // — everything downstream of the raw `WM_KEYDOWN`/`WM_CHAR` →
+    // `UiEvent` translation this entry's doc section narrows the open
+    // question to.
+    //
+    // This deliberately dispatches Ctrl+P (`render::ACC_FUZZY_FINDER`,
+    // `PanelAccelerator::FuzzyFinder`), not Ctrl+B
+    // (`PanelAccelerator::ToggleSidebar`, this issue's own reported
+    // chord): `ToggleSidebar`/`OpenTerminal` are two of the five
+    // `dispatch_panel_accelerator` actions that only *queue* a
+    // `DeferredAction`, applied by `App::tick_dispatch` on the next
+    // `tick()` (see `render.rs`'s own doc on that five-action split) —
+    // and `WinDriver` has no `.tick()` at all (confirmed: no `pub fn
+    // tick` in `quadraui/src/win/testing.rs`, unlike `TuiDriver`/
+    // `MacDriver`), the exact same gap `docs/PENDING_QUADRAUI_ISSUES.md`'s
+    // #1668 entry already documents. So the *specific* chords this issue
+    // reports cannot be driven to a visible result through `WinDriver`
+    // today regardless of this bug. `FuzzyFinder` is one of the nine
+    // synchronous actions `dispatch_panel_accelerator` applies directly to
+    // `Engine` with no queue involved — reachable without `.tick()` — and
+    // goes through the identical accelerator-match → `App::handle` steps
+    // `ToggleSidebar`/`OpenTerminal` would, so a pass here is still real
+    // evidence that the shared pipeline those two chords also depend on is
+    // sound on Win-GUI once an already-decoded event reaches it. Expected
+    // to pass: if it ever fails, the bug has moved into shared code this
+    // repo owns, and this entry's doc-section conclusion needs
+    // revisiting. Only type-checked on this Linux worktree
+    // (`#[cfg_attr(target_os = "windows", test)]`, same #1558 disclaimer
+    // as every other test in this module).
+    #[cfg_attr(target_os = "windows", test)]
+    fn ctrl_accelerator_dispatch_reaches_engine_via_win_driver_1674() {
+        let mut h = conformance_harness(plain_engine(), 1024, 768);
+        h.driver.render();
+
+        assert!(
+            !h.driver.screen_contains("Go to File"),
+            "precondition: the fuzzy-finder picker starts closed; painted \
+             texts were {:?}",
+            h.driver.painted_texts()
+        );
+
+        h.driver.ctrl_char('p');
+        h.driver.render();
+
+        assert_eq!(
+            h.engine.borrow().picker_source,
+            crate::core::engine::PickerSource::Files,
+            "Ctrl+P, fed through WinDriver::ctrl_char (the real, shared \
+             accelerator-match -> App::handle pipeline, native \
+             WM_KEYDOWN/WM_CHAR translation skipped), must resolve to \
+             render::ACC_FUZZY_FINDER and open the Files picker"
+        );
+        assert!(
+            h.driver.screen_contains("Go to File"),
+            "the fuzzy-finder picker must actually paint, not just set \
+             engine state; painted texts were {:?}",
             h.driver.painted_texts()
         );
     }

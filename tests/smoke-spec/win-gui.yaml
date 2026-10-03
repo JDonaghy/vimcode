@@ -318,6 +318,29 @@
 # quadraui ship real AT-provider wiring for drawn content — tracked the
 # same way as the minimap/extension-install gap below, not duplicated
 # here.
+#
+# ── #1674: no Tier-2 step added for Ctrl+`/Ctrl+B dispatch ─────────────
+#
+# vimcode#1674 reports neither Ctrl+` (toggle terminal) nor Ctrl+B (toggle
+# sidebar) has any visible effect on Win-GUI. Same structural reason as
+# #1668 immediately above: even a `key` step that injects the real
+# `WM_KEYDOWN`/`WM_CHAR`/`GetKeyState` sequence this bug is actually about
+# could only confirm the chord did or didn't work by observing the
+# sidebar/terminal panel's painted content changing, and no AT-provider
+# wiring exists for either (same gap #1668's own entry names) — an
+# `expect_a11y`/`expect_hit`/`expect_menu` step has nothing it could ever
+# observe toggling. This issue's real acceptance coverage is the Tier-1
+# option the same acceptance line offers:
+# `src/win/mod.rs::win_ctrl_key_translation_tests_1674` (two genuinely
+# *executing* tests against quadraui's own public `win::events` API,
+# confirming the `WM_CHAR` → `UiEvent` translation is correct for both
+# chords given the payload Windows is documented to deliver) plus
+# `win_driver_tests::ctrl_accelerator_dispatch_reaches_engine_via_
+# win_driver_1674` (isolating the shared accelerator-dispatch pipeline
+# downstream of that translation). See `docs/PENDING_QUADRAUI_ISSUES.md`'s
+# new entry for this issue for the full root-cause investigation and the
+# one open, real-hardware-only question neither of those tests — nor any
+# step this file's vocabulary could add — can close.
 name: vimcode-win-gui
 mode: window
 width: 1024
