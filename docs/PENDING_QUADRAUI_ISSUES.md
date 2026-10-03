@@ -1519,28 +1519,39 @@ primitive quadraui doesn't expose yet.
    `apply_outcome`).
 2. Either have `WinDriver::new`/`attach_headless` set a real or
    synthetic non-`None` `self.hwnd` so `request_frame_in` isn't a silent
-   no-op under test, or add a test-only hook (e.g. a `requested_frame_in()
-   -> Option<Duration>` accessor on `WinBackend`, gated the same way
-   `set_painted_text_recording`/`text_runs` already are) that records the
-   delay a `request_frame_in` call asked for without needing a live HWND
-   at all — whichever shape matches how `GtkBackend`'s/`MacBackend`'s
-   `testing` modules solved the analogous problem, if they already have.
+   no-op under test, or give `WinBackend` its own `frame_requests()`/
+   `pending_frame_delay()` pair mirroring `TuiBackend`'s (quadraui#832,
+   `quadraui/src/tui/backend.rs`) — a test-only call-count/deadline
+   accessor that records what a `request_frame_in` call asked for without
+   needing a live HWND at all. `TuiBackend` is the one existing precedent
+   for this exact shape; `MacBackend` doesn't have it either (confirmed:
+   no `frame_requests`/`pending_frame_delay` anywhere under
+   `quadraui/src/macos/`), so this would be the second backend to grow it,
+   not a novel pattern.
 
-**Test:** `src/app.rs::terminal_poll_rearm_tests::
-rearm_is_requested_only_while_a_terminal_pane_is_open` (added alongside
-this entry) is vimcode#1668's actual acceptance coverage — a pure,
-`Backend`-free unit test of `terminal_poll_rearm_delay`, the exact shape
-`dedup_window_title`'s own doc comment already established as this
-crate's accepted substitute when `quadraui::Backend`'s sealed-trait
-status rules out a `Backend`-call-count driver test (RED-verified:
-reverting the function to always return `None` makes the test's first
-assertion fail; restored before committing). This quadraui-side entry is
-the follow-up for making that coverage a real rendered-output driver test
-instead, once `WinDriver` can support one — it does not block vimcode#1668
-itself, which ships its fix in this same PR.
+**Test:** this review iteration added real driver-tier coverage for the
+*shared* half of this fix — `src/tui_main/app_on_tui_tests.rs`'s
+`terminal_poll_rearm_1668` module drives the real, production
+`App::tick_dispatch` through `quadraui::tui::testing::TuiDriver::tick()`
+and asserts on `TuiBackend::frame_requests`/`pending_frame_delay`
+(quadraui#832's existing `Backend`-call-count instrumentation — it turns
+out `quadraui::Backend` being sealed does *not* rule this out in general,
+only for `quadraui::testing::RecordingBackend` specifically, whose
+`request_frame_in` is a no-op; the real `TuiBackend` a `TuiDriver` wraps
+already records every call). RED-verified against
+`terminal_poll_rearm_delay` always returning `None`. `src/app.rs::
+terminal_poll_rearm_tests::rearm_is_requested_only_while_a_terminal_pane_is_open`
+remains alongside it as the isolated pure-function unit test. Together
+these two fully cover the platform-neutral decision `tick_dispatch`
+makes. What neither can reach — and what this entry is actually about —
+is `WinBackend` itself: whether a real Win32 `SetTimer`/`WM_TIMER`
+round-trip actually re-fires `tick` on a live Windows message loop. That
+is the one link this fix's testing cannot close without the `WinDriver`
+work asked for above.
 
 **Blocks:** nothing in `JDonaghy/vimcode` directly — `JDonaghy/vimcode#1668`
-is fixed and covered by the pure-function unit test above regardless of
-whether this lands. File this as a quadraui testing-infrastructure
-improvement, not a `JDonaghy/vimcode` blocker.
+is fixed and covered by the pure-function unit test plus the `TuiDriver`-
+based driver test above regardless of whether this lands. File this as a
+quadraui testing-infrastructure improvement, not a `JDonaghy/vimcode`
+blocker.
 

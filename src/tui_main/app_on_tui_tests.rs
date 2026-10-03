@@ -3112,6 +3112,118 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // #1668: Win-GUI's embedded terminal panel renders completely blank
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Driver-tier, black-box coverage for #1668's review request: the
+    /// fix's own `terminal_poll_rearm_tests` (in `src/app.rs`) only unit-
+    /// tests `terminal_poll_rearm_delay` — a pure, `Backend`-free decision
+    /// function — in isolation; it never drives a real `Backend` through
+    /// `App::tick_dispatch`. This module closes that gap for the one
+    /// `Backend` this crate *can* construct in-process
+    /// (`quadraui::tui::testing::TuiDriver`, via
+    /// [`crate::tui_main::testing::conformance_harness`]) by driving the
+    /// exact, shared `AppLogic::tick` entry point every backend's run loop
+    /// calls — Win-GUI included, since `App::tick_dispatch` is
+    /// platform-neutral code gated only on `Engine::terminal_panes`, not on
+    /// which `Backend` happens to be plugged in — and asserting on
+    /// `TuiBackend::frame_requests`/`pending_frame_delay`
+    /// (`quadraui`#832's real `Backend::request_frame_in` call-count/
+    /// deadline instrumentation, built specifically so an app's
+    /// *scheduling* decision is observable from a headless test even
+    /// though it leaves no trace in the painted screen: TUI/GTK/macOS
+    /// repaint on their own `IDLE_POLL_CEILING` regardless of whether
+    /// anything re-armed a tick, so a screen-only assertion could not
+    /// distinguish the fixed and broken behaviour here).
+    ///
+    /// This is a genuine `Backend`-call-count driver test — the shape
+    /// `terminal_poll_rearm_delay`'s own doc says isn't achievable via
+    /// `quadraui::testing::RecordingBackend` (whose `request_frame_in` is a
+    /// documented no-op) or a sealed, externally-mocked `Backend`. It *is*
+    /// achievable via the real `TuiBackend` `TuiDriver` wraps, which is
+    /// exactly what quadraui#832 added `frame_requests`/
+    /// `pending_frame_delay` for. It cannot reach `WinBackend` itself
+    /// (`WinDriver::attach_headless` never sets `hwnd`, so
+    /// `request_frame_in` degrades to a no-op there regardless — see
+    /// `terminal_poll_rearm_delay`'s doc) — only the shared decision code
+    /// both backends run.
+    ///
+    /// RED-verified: temporarily reverting `terminal_poll_rearm_delay`'s
+    /// body to always return `None` (the pre-#1668 behaviour) makes
+    /// `terminal_pane_open_rearms_tick_via_shell_app`'s first assertion
+    /// fail (`frame_requests()` stays at its pre-tick baseline instead of
+    /// advancing by one); restored before committing.
+    mod terminal_poll_rearm_1668 {
+        use super::*;
+
+        #[test]
+        fn terminal_pane_open_rearms_tick_via_shell_app() {
+            let mut engine = plain_engine();
+            engine.terminal_new_tab(80, 10);
+            let mut h = harness_no_sidebar(engine);
+            let driver = &mut h.driver;
+
+            let before = driver.backend().frame_requests();
+            driver.tick();
+            let after = driver.backend().frame_requests();
+
+            assert_eq!(
+                after,
+                before + 1,
+                "App::tick_dispatch must re-arm a future tick (via \
+                 Backend::request_frame_in) while a terminal pane is open \
+                 — this is #1668's own root cause on Win-GUI, which (unlike \
+                 TUI/GTK/macOS) has no unconditional idle-poll fallback: \
+                 without this re-arm, Engine::poll_terminal never drains \
+                 the PTY again past the first frame and the embedded \
+                 terminal panel stays blank forever, exactly as the \
+                 bugbash report observed (before={before}, after={after})"
+            );
+            // `pending_frame_delay` reports *time remaining* until the
+            // deadline, not the raw requested duration — it is derived from
+            // `Instant::now()` at read time (`FrameScheduler::pending_delay`),
+            // so it is always a hair under the requested 100ms by however
+            // long this test itself took to reach this line. A tight
+            // tolerance (80ms..=100ms) still clearly distinguishes this from
+            // the coarse 250ms `IDLE_POLL_CEILING` fallback other backends
+            // can lean on but Win-GUI cannot, without being flaky on a
+            // loaded CI box.
+            let delay = driver
+                .backend()
+                .pending_frame_delay()
+                .expect("a frame must be scheduled after the re-arm above");
+            assert!(
+                delay <= std::time::Duration::from_millis(100)
+                    && delay >= std::time::Duration::from_millis(80),
+                "the re-armed tick must fire at the fast (~100ms) cadence \
+                 `terminal_poll_rearm_delay` returns — mirroring the \
+                 existing ai_streaming re-arm's own cadence — not the \
+                 coarse 250ms IDLE_POLL_CEILING fallback other backends \
+                 can lean on but Win-GUI cannot; got {delay:?}"
+            );
+        }
+
+        #[test]
+        fn no_terminal_pane_does_not_rearm_tick_via_shell_app() {
+            let mut h = harness_no_sidebar(plain_engine());
+            let driver = &mut h.driver;
+
+            let before = driver.backend().frame_requests();
+            driver.tick();
+            let after = driver.backend().frame_requests();
+
+            assert_eq!(
+                after, before,
+                "with no terminal pane open, tick_dispatch must not \
+                 unconditionally re-arm a future tick — the re-arm is \
+                 gated on Engine::terminal_panes being non-empty, not \
+                 unconditional (an unconditional re-arm would reintroduce \
+                 a perpetual 100ms busy-poll on every Win-GUI session, \
+                 terminal or not)"
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Dialogs (#1431 tranche 2)
     // ─────────────────────────────────────────────────────────────────────────
     mod dialogs {
