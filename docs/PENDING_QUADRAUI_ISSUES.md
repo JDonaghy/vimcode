@@ -1726,3 +1726,134 @@ check is confirmed correct), and the remaining question is real-Windows
 diagnostic work this repo's Linux worktree cannot perform, not a known
 defect with a known fix.
 
+---
+
+## `WinBackend::draw_minimap`'s "surface not attached yet" fallback has no theme-background guard — the minimap strip can show raw OS white instead of the active theme (blocks vimcode#1676), and `WinDriver`/`WinBackend` expose no way to drive that state from a downstream crate's test
+
+**Title:** vimcode#1676 reports the editor minimap's ~96px-wide strip
+painting as a flat, almost-blank white rectangle regardless of the active
+theme (reproduced on both `vscode-dark` and `vscode-light`) — present
+immediately on launch in most runs, and reproducible after a window resize
+in every run. Not reproduced on real hardware this session (no live,
+unlocked Windows host reachable from here — same posture every other entry
+in this file states; dell64's own blockers are documented at this file's
+`WinBackend::install_menu_bar_now` and title-band entries above).
+
+**Root-caused by reading the real source at the pinned rev
+(`ca7fcc83afad01ec3422f79366566f3a263b22bf`), ruling out the obvious
+candidates first:**
+
+- **Not a theme-wiring bug like the entry above (`blocks vimcode#1667`).**
+  `win::minimap::draw_minimap_scaled` already fills `rect` with
+  `theme.background` as its very first paint call, and `WinBackend::
+  draw_minimap` already passes `&self.current_theme` — confirmed one of
+  the nine Win-GUI rasterisers that entry names as *already* correctly
+  wired, not one of the seven still hardcoding `Theme::default()`. So
+  whenever this rasteriser actually runs, it paints the right colour;
+  `Theme::default()`'s own background (`rgb(20, 22, 30)`, dark) isn't white
+  either way, ruling out a stray default-theme fallback as the source of
+  the reported white.
+- **Not a vimcode-side geometry/unit bug.** The minimap's sizing/rect
+  policy (`UnitProfile::px`, `render::gtk_minimap_sizing`,
+  `render::minimap_strip_rect`, `render::draw_minimap_strip`) is one
+  shared, backend-neutral code path GTK/macOS/Win-GUI all paint through —
+  its own doc comments only ever distinguish "pixels" (GTK/macOS/Win) vs
+  "cells" (TUI), never a Win-GUI-specific unit. Nothing in `src/render.rs`
+  treats Win-GUI differently from GTK/macOS here.
+- **A real, if narrow, gap found instead:** `Backend::draw_minimap`
+  returns [`MinimapPaintResult`], whose `painted: bool` field is `false`
+  exactly when `WinBackend` has no live Direct2D surface attached yet —
+  confirmed as a real, reachable, already-tested state in quadraui's own
+  `win::backend` test suite
+  (`draw_minimap_with_no_surface_reports_unpainted_and_agrees_with_
+  minimap_layout`), not a hypothetical. `WinBackend` can genuinely be in
+  that state at paint time for two confirmed-in-source reasons: (1) Windows
+  fires an initial `WM_SIZE` synchronously from inside `CreateWindowExW`,
+  before `win::run`'s own code has a `HWND` to call `attach_surface` with
+  (`resize_surface`'s own doc comment states this explicitly), and (2) an
+  `EndDraw` failure (device loss / RDP session change) drops `self.surface`
+  back to `None` in `end_frame`, recovered lazily by the next `WM_PAINT`'s
+  `ensure_surface()` call, not immediately. `WinBackend::begin_frame`'s own
+  `Clear()` call — the thing that paints the *entire* render target to the
+  live theme's background every frame — is gated on that exact same
+  `self.surface.is_some()` check, so a frame landing inside either window
+  paints **nothing** anywhere, including the minimap strip, and the
+  on-screen result for whatever the OS/DWM shows for an as-yet-uncomposited
+  client-area pixel is its own default backing colour — white, not any
+  theme's background. `src/render.rs::draw_minimap_strip` (vimcode's own
+  shared, backend-neutral call site) never inspects
+  `MinimapPaintResult::painted` at all — `let layout =
+  backend.draw_minimap(rect, &minimap).layout;` discards it unconditionally
+  — so nothing anywhere in this codebase or quadraui's own `win::run`
+  retries or papers over an unpainted frame once it's shown. GTK/TUI/macOS
+  backends never produce `painted: false` in normal operation (their
+  rasterisers always have a live surface by the time any `draw_*` call
+  runs), which is why this gap has stayed latent until Win-GUI exposed it.
+
+**Why this matches the report's own timing clues (not proven on real
+hardware, but consistent):** "present immediately on launch in most runs"
+matches the synchronous first-`WM_SIZE`-before-`HWND` window above; "every
+run after a resize" matches an `EndDraw` failure during the resize's
+render-target `Resize()` call; the session-restore correlation ("one early
+launch in a brand-new workspace... did not show it") is consistent with
+more synchronous startup work (restoring persisted panes/splits/cursor
+state) before the first paint giving this race more time to land inside
+one of those two windows, without proving it.
+
+**Ask:** make `WinBackend` never show a client-area pixel the current
+theme hasn't painted, by either (a) not presenting/showing the window until
+the first `EndDraw` succeeds (the standard mitigation for this exact
+Win32/Direct2D "first-frame white flash" class of bug — `win::run` already
+tracks the window's `HWND` and visibility separately from `WinBackend`'s
+surface state, so this is `win::run`/`win::backend` work, not a 1-3 line
+`src/win/mod.rs` wiring fix — that file is a 1-line quadraui re-export, per
+its own module doc), or (b) give `Backend::draw_minimap` (and ideally every
+other `draw_*` method with the same "surface not attached" fallback shape)
+a theme-background-coloured fallback paint even when `painted` comes back
+`false`, so a transiently-unattached surface never shows raw OS white for
+*any* widget, minimap included.
+
+**The testing gap this entry is actually about — same shape as this file's
+`WinDriver` has no `.tick()` entry above:** proving either fix via a real,
+driver-tier, rendered-output test is not achievable from a downstream
+crate today. `WinBackend::surface`/`ensure_surface`/`resize_surface` are
+all `pub(crate)` to quadraui itself; nothing in `quadraui::win::testing`
+(`WinDriver::new`, `.attach_headless`, `HeadlessSurface`) exposes a way to
+force a `WinBackend` under test back into the "no surface attached" state
+`draw_minimap_with_no_surface_reports_unpainted_and_agrees_with_
+minimap_layout` already proves exists — that test lives inside quadraui
+and can reach the state directly (same crate, same module); a `vimcode`
+test cannot construct it at all, on any OS, because the relevant
+constructor/fields are private across the crate boundary.
+
+**Test:** no RED-verifiable Tier-1 scenario could be added for the actual
+reported defect, for the reason above — not "could not be executed off
+Windows" (this file's usual disclaimer), but "cannot be *constructed* from
+this crate regardless of host OS." `src/win/mod.rs::win_driver_tests::
+minimap_strip_background_matches_theme_once_a_surface_is_attached_1676`
+(added alongside this entry) instead locks down the one piece of this
+contract a downstream crate *can* drive today — the happy path, through
+the normal `conformance_harness` (which always attaches a surface eagerly
+via `attach_headless`) — as a regression guard for whichever fix lands
+upstream, and documents in its own comment exactly why it cannot be the
+regression test for the reported bug. `tests/smoke-spec/win-gui.yaml` gets
+a cross-reference into its existing "DELIBERATELY OMITTED" minimap-content
+comment (additive-only, no steps changed) rather than a new step — the
+same `expect_capture_nonblank`-shaped primitive gap that comment already
+names for "the minimap shows content" applies equally to "the minimap
+shows the right *background*", and is coordinator-repo work, not something
+this vimcode PR can add.
+
+**Ask (testing infrastructure, additional to the production ask above):**
+give `quadraui::win::testing` a way to simulate the unattached/dropped-
+surface state from a downstream crate — e.g. a `WinDriver`/`WinBackend`
+test-only `drop_surface()` or `simulate_end_draw_failure()` — mirroring
+this file's `WinDriver` has no `.tick()` entry's own ask shape (a
+test-harness primitive gap, not a production-code gap).
+
+**Blocks:** `JDonaghy/vimcode#1676`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available; `WinBackend` is a 1-line quadraui re-export
+(`src/win/backend.rs`), and every file named above lives in quadraui, not
+in this repo.
+

@@ -957,6 +957,34 @@ mod win_driver_tests {
         ConformanceHarness::new(driver, engine, paint, cwd)
     }
 
+    /// [`conformance_harness`], plus a live [`crate::harness::
+    /// ConformanceHarness::screen_layout`] handle (#987) — needed by any
+    /// scenario that must locate a *window's* own painted rect (e.g. the
+    /// minimap strip, #1676) rather than a text run's. Mirrors
+    /// `crate::gtk::testing::conformance_harness`'s identical shape; the
+    /// plain [`conformance_harness`] above leaves this field empty
+    /// (`None`) because every scenario added before #1676 only ever
+    /// needed `find_bounds`/`screen_contains` against painted text.
+    fn conformance_harness_with_screen_layout(
+        engine: Engine,
+        width: u32,
+        height: u32,
+    ) -> ConformanceHarness<quadraui::win::testing::WinDriver<impl quadraui::AppLogic>> {
+        let paint = crate::test_paint::PaintGuard::acquire();
+        let cwd = crate::test_cwd::CwdReadGuard::acquire();
+        let engine = Rc::new(RefCell::new(engine));
+        let backend: Rc<RefCell<Box<dyn quadraui::Backend>>> =
+            Rc::new(RefCell::new(Box::new(super::backend::WinBackend::new())));
+        let (app, config) = crate::harness::build_app_and_config(
+            Rc::clone(&engine),
+            backend,
+            crate::render::UnitProfile::px(),
+        );
+        let screen_layout = Rc::clone(&app.cached_screen_layout);
+        let driver = driver_with_shell(app, config, width, height);
+        ConformanceHarness::new_with_screen_layout(driver, engine, screen_layout, paint, cwd)
+    }
+
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "vimcode_test_928_win_conformance_{tag}_{:?}",
@@ -1454,6 +1482,129 @@ mod win_driver_tests {
              `theme.tab_bar_bg` on a runtime `:colorscheme` change, not \
              stay pinned to Win-GUI's hardcoded `Theme::default()` \
              (`win::tree::draw_tree`)"
+        );
+    }
+
+    // ── #1676: the minimap strip can show raw OS white instead of the
+    // active theme ──────────────────────────────────────────────────────
+    //
+    // vimcode#1676 reports the minimap's ~96px-wide strip painting as a
+    // flat, almost-blank white rectangle regardless of the active theme —
+    // present immediately on launch in most runs, and reproducible after
+    // a window resize in every run. Root-caused (not reproduced on real
+    // hardware — no live, unlocked Windows host reachable from this
+    // session) to a gap in `WinBackend::draw_minimap`'s own, already-
+    // tested "no surface attached yet" fallback: `Backend::draw_minimap`
+    // can legitimately return `MinimapPaintResult { painted: false, .. }`
+    // whenever `WinBackend` has no live Direct2D surface yet (the
+    // synchronous first `WM_SIZE` Windows fires from inside
+    // `CreateWindowExW`, or an `EndDraw` failure — device loss / RDP
+    // session change — dropping the surface until the next `WM_PAINT`'s
+    // `ensure_surface()` call recovers it). `WinBackend::begin_frame`'s
+    // own `Clear()` call (the thing that paints the *entire* render
+    // target to `theme.background` every frame) is gated on that exact
+    // same "surface attached" check, so a frame landing in either window
+    // paints nothing at all — and the on-screen result for a client-area
+    // pixel Direct2D has never actually Present-ed is the OS/DWM's own
+    // default backing colour, white, not any theme's background. Neither
+    // `src/render.rs::draw_minimap_strip` (this repo's own shared,
+    // backend-neutral call site) nor quadraui's `win::run` ever inspects
+    // `MinimapPaintResult::painted` to retry or paper over that frame.
+    // Full analysis in `docs/PENDING_QUADRAUI_ISSUES.md`'s matching entry.
+    //
+    // No vimcode-side fix is available per the Platform-Neutrality Rule —
+    // this file is a 1-line quadraui re-export (this module's own
+    // top-of-file doc), and every function named above lives in
+    // `quadraui::win::backend`/`quadraui::win::run`, not here.
+    //
+    // **What this test can and cannot prove:** the triggering state
+    // itself (`WinBackend` with no surface attached, mid-session) has no
+    // public or `pub(crate)`-to-vimcode entry point — `WinBackend::
+    // surface`/`ensure_surface`/`resize_surface` are `pub(crate)` *to
+    // quadraui*, and `quadraui::win::testing::WinDriver::new`/
+    // `.attach_headless` always attaches a surface eagerly, with no
+    // "drop it again" hook exposed to a downstream crate's test. So this
+    // cannot be the RED-then-GREEN regression test for the actual
+    // reported defect — doing that needs a quadraui-side test-harness
+    // primitive this file's own `docs/PENDING_QUADRAUI_ISSUES.md` entry
+    // asks for (mirroring the "`WinDriver` has no `.tick()`" entry's own
+    // shape immediately above it in that file). What it proves instead:
+    // the one piece of this contract reachable from here today — that
+    // once a surface *is* attached (every `WinDriver`-backed scenario in
+    // this module, including this one), the minimap strip paints
+    // `theme.background`, matching the live theme, and is never left
+    // showing raw white — a regression guard for whichever fix lands
+    // upstream, RED-verifiable in principle by reverting `win::minimap::
+    // draw_minimap_scaled`'s `fill_rect(target, rect, theme.background)`
+    // call, though that revert could not be exercised from this Linux
+    // worktree either (module-top `#1558` disclaimer: only type-checked
+    // here, `#[cfg_attr(target_os = "windows", test)]`, same as every
+    // other test in this module).
+    #[cfg_attr(target_os = "windows", test)]
+    fn minimap_strip_background_matches_theme_once_a_surface_is_attached_1676() {
+        let mut engine = plain_engine();
+        // vscode-dark (the default) keeps `theme.background` far from
+        // white (`rgb(255, 255, 255)`) — the exact colour vimcode#1676
+        // reports — so a regression that ever left this probe unpainted
+        // would be pixel-exact wrong here, no tolerance needed; using
+        // vscode-*light* instead would make "painted white" and "hit the
+        // bug" indistinguishable, defeating the point of this probe.
+        engine.settings.colorscheme = "vscode-dark".to_string();
+        // Every inserted line is blank: `win::minimap::paint_row_blocks`
+        // skips whitespace columns entirely and `paint_row_glyphs` draws
+        // an empty string either way, so no row in the strip ever paints
+        // over the `Clear()`'d background — any probe pixel inside the
+        // strip's bounds is purely `theme.background`, regardless of
+        // which of the two render modes `minimap_scale` resolves to.
+        engine.buffer_mut().insert(0, &"\n".repeat(200));
+
+        let mut h = conformance_harness_with_screen_layout(engine, 1400, 900);
+        // See `colorscheme_change_repaints_editor_and_explorer_sidebar_1667`'s
+        // identical note above: `App::sync_per_frame_backend_state` pushes
+        // the live theme onto the backend at the *start* of
+        // `render_content`, so a widget painted before that call on the
+        // very first frame can lag by one paint — a second render pass
+        // keeps this probe robust to that ordering.
+        h.driver.render();
+
+        let win = h.engine.borrow().active_window_id();
+        let strip = {
+            let layout = h.screen_layout.borrow();
+            let l = layout
+                .as_ref()
+                .expect("a frame must have painted a screen layout");
+            l.minimap
+                .iter()
+                .find(|m| m.window_id == win)
+                .expect("the minimap must be present for the active pane")
+                .rect
+        };
+        assert!(
+            strip.width > 0.0 && strip.height > 0.0,
+            "fixture assumption: the minimap must actually be visible at \
+             this window width, or this probe's premise doesn't hold; got \
+             {strip:?}"
+        );
+
+        let theme = crate::render::Theme::vscode_dark();
+        let probe_x = (strip.x + 2.0) as u32;
+        let probe_y = (strip.y + strip.height / 2.0) as u32;
+        let px = h.driver.pixel(probe_x, probe_y);
+        assert_eq!(
+            (px.r, px.g, px.b),
+            (theme.background.r, theme.background.g, theme.background.b),
+            "the minimap strip must paint `theme.background`, not raw OS \
+             white — vimcode#1676's reported symptom (see this test's own \
+             doc comment above, and `docs/PENDING_QUADRAUI_ISSUES.md`'s \
+             matching entry, for why this scenario alone cannot reproduce \
+             the actual reported defect); got {px:?}"
+        );
+        assert_ne!(
+            (px.r, px.g, px.b),
+            (255, 255, 255),
+            "sanity: vscode-dark's own background must not itself be \
+             white, or this probe can't distinguish a correct paint from \
+             vimcode#1676's reported bug"
         );
     }
 
