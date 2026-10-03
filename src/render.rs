@@ -16832,7 +16832,18 @@ impl Theme {
 
     /// Return the foreground colour for a Tree-sitter scope name.
     pub fn scope_color(&self, scope: &str) -> Color {
-        match scope {
+        self.scope_color_opt(scope).unwrap_or(self.default_fg)
+    }
+
+    /// Same scope-name -> colour mapping as [`scope_color`](Self::scope_color),
+    /// but `None` for a name this theme doesn't recognise instead of
+    /// silently falling back to `default_fg`. Lets a caller (e.g. #1653's
+    /// `vimcode.decor.set_hl` `link` resolution in `resolve_decor_style`)
+    /// tell "this is a real theme role" apart from "unknown name, use the
+    /// default foreground" — `scope_color` can't make that distinction once
+    /// it's collapsed to a concrete `Color`.
+    pub fn scope_color_opt(&self, scope: &str) -> Option<Color> {
+        Some(match scope {
             "keyword" => self.keyword,
             "keyword.control" => self.control_flow,
             "operator" => self.operator,
@@ -16855,8 +16866,8 @@ impl Theme {
             "module" | "namespace" => self.module,
             "parameter" => self.parameter,
             "property" | "field" => self.property,
-            _ => self.default_fg,
-        }
+            _ => return None,
+        })
     }
 
     /// Map an LSP semantic token type + modifiers to a style.
@@ -23517,6 +23528,14 @@ fn build_rendered_window(
             .collect();
         let mut spans = spans;
         let mut line_str = line_str;
+        // #1653 review: LSP diagnostics/spell-check ranges below are
+        // computed from UTF-16/byte offsets measured against the buffer's
+        // real text, *before* any decor splice below mutates `line_str` —
+        // reusing the (possibly already-spliced) `line_str` there would
+        // land those ranges on the wrong columns on a line that also has
+        // an inline/overlay decoration. Snapshot the pre-splice text now,
+        // while it's still guaranteed to match those ranges.
+        let line_str_pre_decor = line_str.clone();
         for m in &line_decor {
             if let Some(hl) = &m.opts.hl_group {
                 if let Some((start_col, end_col)) =
@@ -23535,33 +23554,56 @@ fn build_rendered_window(
                 }
             }
         }
-        for m in &line_decor {
-            if m.row != line_idx || m.opts.virt_text.is_empty() {
-                continue;
-            }
+        // #1653 review: process left-to-right by anchor column, tracking
+        // how many characters earlier *inline* splices on this same line
+        // have already inserted (`col_shift`) — `m.col` is a buffer column,
+        // fixed at `set_mark` time, but `line_str` keeps growing as each
+        // earlier inline splice runs, so a second mark's splice point has
+        // to be adjusted by however much text landed before it, or it (and
+        // everything after it) lands `col_shift` characters too early.
+        // Overlay splices don't need to bump `col_shift` themselves since
+        // they replace exactly as many characters as they insert (net-zero
+        // width change) — only `Inline` grows the line.
+        let mut virt_text_marks: Vec<&DecorMark> = line_decor
+            .iter()
+            .filter(|m| m.row == line_idx && !m.opts.virt_text.is_empty())
+            .copied()
+            .collect();
+        virt_text_marks.sort_by_key(|m| m.col);
+        let mut col_shift: usize = 0;
+        for m in virt_text_marks {
             let text: String = m.opts.virt_text.iter().map(|c| c.text.as_str()).collect();
             if text.is_empty() {
                 continue;
             }
-            let style = resolve_decor_style(engine, theme, m.opts.virt_text[0].hl_group.as_deref());
+            let first_chunk_hl = m.opts.virt_text[0].hl_group.as_deref();
+            let style = resolve_decor_style(engine, theme, first_chunk_hl);
+            let splice_col = m.col + col_shift;
             match m.opts.virt_text_pos {
                 Some(VirtTextPos::Overlay) => {
                     let replace_chars = text.chars().count();
                     splice_virt_text(
                         &mut line_str,
                         &mut spans,
-                        m.col,
+                        splice_col,
                         replace_chars,
                         &text,
                         style,
                     );
                 }
                 Some(VirtTextPos::Inline) => {
-                    splice_virt_text(&mut line_str, &mut spans, m.col, 0, &text, style);
+                    splice_virt_text(&mut line_str, &mut spans, splice_col, 0, &text, style);
+                    let inserted = text.chars().count();
+                    col_shift += inserted;
+                    // `inline_shifts` drives the painted-cursor-column
+                    // correction (below), which compares against
+                    // `view.cursor.col` — a buffer column — so the anchor
+                    // recorded here must stay in buffer-column space
+                    // (`m.col`, not `splice_col`).
                     inline_shifts
                         .entry(line_idx)
                         .or_default()
-                        .push((m.col, text.chars().count()));
+                        .push((m.col, inserted));
                 }
                 Some(VirtTextPos::Eol) | None => {
                     // Eol virtual text doesn't paint through `spans`/
@@ -23574,10 +23616,31 @@ fn build_rendered_window(
         }
         // A decor sign for this line's gutter slot (lowest priority — see
         // `bp_part` below): the first mark with `sign_text` touching this
-        // line, truncated to its first character (the reused breakpoint
-        // column is one cell wide; see `has_decor_sign`'s doc comment
-        // above for why this reuses that column instead of a dedicated
-        // one).
+        // line, truncated to its first character.
+        //
+        // #1653's own scope text asks for "1-2 display cells" of sign_text
+        // plus `sign_hl`, but neither half of that can actually paint
+        // through this column today, and the reason is a *quadraui*
+        // limitation, not a vimcode one: both backends' gutter rasterisers
+        // hardcode the breakpoint/sign slot at exactly one character —
+        // quadraui's `gtk/editor.rs::paint_gutter_row_number` does
+        // `rl.gutter_text.chars().take(1)` for the bp glyph and then
+        // advances its own `char_offset` by a bare `1` before reading the
+        // git column; `tui/editor.rs`'s gutter loop computes `git_offset =
+        // bp_offset + 1` the same fixed way. Handing either backend a
+        // 2-character `gutter_text` here would not render a wider sign —
+        // it would misalign the git/line-number columns after it, since
+        // neither rasteriser's `+1` is driven by any width this crate
+        // controls. Likewise, colouring just the sign glyph with `sign_hl`
+        // would need a per-glyph colour channel on quadraui's `EditorLine`
+        // that doesn't exist (`gutter_text` is one plain `String`, painted
+        // in one colour chosen from `is_breakpoint`/`is_dap_current`/
+        // `git_diff`). Per the platform-neutrality rule this needs
+        // quadraui-side infra first (a real `bp_col_width`/per-glyph-colour
+        // API) rather than a per-backend workaround here — tracked for a
+        // quadraui issue; until it lands, `sign_text` is truncated to 1
+        // character and `sign_hl` is parsed/stored (round-trips through
+        // `get_mark`) but has no paint effect.
         let decor_sign_glyph: Option<String> = line_decor
             .iter()
             .find_map(|m| m.opts.sign_text.as_deref())
@@ -23674,13 +23737,21 @@ fn build_rendered_window(
             diags
                 .iter()
                 .map(|d| {
-                    // Reuse line_str already computed above — avoids redundant rope lookup.
-                    let start_col =
-                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.start.character);
+                    // #1653 review: must use the pre-decor-splice text —
+                    // `d.range` is measured against the buffer's real
+                    // content, not whatever `line_str` looks like after an
+                    // inline/overlay virtual-text splice shifted its bytes.
+                    let start_col = crate::core::lsp::utf16_offset_to_char(
+                        &line_str_pre_decor,
+                        d.range.start.character,
+                    );
                     let end_col = if d.range.end.line as usize == line_idx {
-                        crate::core::lsp::utf16_offset_to_char(&line_str, d.range.end.character)
+                        crate::core::lsp::utf16_offset_to_char(
+                            &line_str_pre_decor,
+                            d.range.end.character,
+                        )
                     } else {
-                        line_str.len()
+                        line_str_pre_decor.len()
                     };
                     DiagnosticMark {
                         start_col,
@@ -23703,9 +23774,12 @@ fn build_rendered_window(
                     .and_then(|p| p.to_str())
                     .and_then(crate::core::syntax::SyntaxLanguage::from_path);
                 let line_start_byte = buffer.content.line_to_byte(line_idx);
+                // #1653 review: same pre-splice-text rationale as the
+                // diagnostics block above — spell errors are columns into
+                // the buffer's real line text.
                 crate::core::spell::check_line(
                     checker,
-                    &line_str,
+                    &line_str_pre_decor,
                     &buffer_state.highlights,
                     line_start_byte,
                     syntax_lang,
@@ -24788,11 +24862,25 @@ fn decor_highlight_cols(
 /// falling back to the theme's default foreground when the group (or its
 /// `fg`) isn't registered — e.g. a group that only sets `bg` still gets a
 /// readable foreground instead of defaulting to black.
+///
+/// #1653 scope item 6: a group's `link` is first chased one hop against
+/// other *plugin* groups by `DecorState::resolve_hl` (unchanged); when the
+/// link target isn't a registered plugin group at all, it's treated as a
+/// `Theme` role name instead (`Theme::scope_color_opt`, matched
+/// case-insensitively against Neovim's own built-in group spelling, e.g.
+/// `link = "Comment"`) — resolved fresh on every call rather than frozen at
+/// `set_hl` time, so it keeps tracking the live theme across `ColorScheme`
+/// switches, same as every other colour here.
 fn resolve_decor_style(engine: &Engine, theme: &Theme, hl_group: Option<&str>) -> Style {
     let def = hl_group.and_then(|g| engine.decor.resolve_hl(g));
+    let theme_role_fg = def
+        .and_then(|d| d.link.as_deref())
+        .filter(|link| !engine.decor.highlight_groups.contains_key(*link))
+        .and_then(|link| theme.scope_color_opt(&link.to_ascii_lowercase()));
     let fg = def
         .and_then(|d| d.fg.as_deref())
         .and_then(|h| try_from_hex_over(h, theme.background))
+        .or(theme_role_fg)
         .unwrap_or(theme.foreground);
     let bg = def
         .and_then(|d| d.bg.as_deref())

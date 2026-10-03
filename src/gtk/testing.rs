@@ -22597,4 +22597,369 @@ mod issue_1513_at_dir_and_at_symbol_mentions {
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
+
+    /// #1653 review: the GTK twin of `tui_main::app_on_tui_tests::tests::
+    /// issue_1653_decor_api` — the issue's own acceptance list names both
+    /// `TuiDriver` *and* `GtkDriver` black-box coverage explicitly, and
+    /// CLAUDE.md's multi-backend rule requires both backends be covered
+    /// for any surface both backends render. The decoration *data* is
+    /// built once in `render.rs` (shared), but whether GTK's own
+    /// `to_q_editor_line`/quadraui-paint path actually turns that data
+    /// into pixels is exactly the class of bug #587/#592 found
+    /// (`ScreenLayout.picker` populated on GTK for months while nothing
+    /// painted it) — a TUI-only test cannot catch a GTK-only regression
+    /// here, so this module exists alongside it rather than instead of
+    /// it.
+    ///
+    /// Every editor text line paints through exactly one
+    /// `pangocairo::show_layout(cr, layout)` call with `layout`'s text
+    /// set to the *whole* `rl.raw_text` (`quadraui::gtk::editor::
+    /// paint_line_text_ghost_and_annotation`), so `GtkDriver::find_bounds`
+    /// on any substring of a line returns that *whole line's* painted
+    /// bounds, not a sub-rect around the match — unlike `TuiDriver`'s
+    /// character grid. Every test below accounts for this by computing a
+    /// column's pixel center as `bounds.x + (col as f32 + 0.5) *
+    /// char_width` off the line's own bounds, the same technique
+    /// `command_line_selection::col_center` (above) already uses for the
+    /// command line.
+    mod issue_1653_decor_api_gtk {
+        use super::*;
+        use crate::core::buffer::{DecorOpts, HlGroupDef, VirtTextChunk, VirtTextPos};
+        use quadraui::Backend as _;
+
+        /// The plainest possible fixture — mirrors `app_on_tui_tests`'
+        /// `plain_engine` (nerd fonts off: icon glyphs are irrelevant to
+        /// what these tests assert on), plus `hide_sidebar()`/
+        /// `explorer_visible = false` (the established pattern elsewhere
+        /// in this file, e.g. the font-size-settle test above) — the
+        /// Explorer sidebar is visible by default and, confirmed by hand
+        /// while writing this module, its ~440px column shifts where
+        /// every subsequent `find_bounds` lands, which is exactly the
+        /// kind of hardcoded-position assumption CLAUDE.md's "locate
+        /// targets, never hardcode coordinates" rule exists to avoid.
+        fn plain_engine() -> Engine {
+            let mut engine = Engine::new_for_test();
+            engine.settings.use_nerd_fonts = Some(false);
+            engine.app_shell.hide_sidebar();
+            engine.session.explorer_visible = false;
+            engine
+        }
+
+        /// [`harness`] plus the two extra settle frames `hide_sidebar()`'s
+        /// own doc elsewhere in this file calls for (its flip "takes a
+        /// frame to reach the painted layout") — every test below needs
+        /// `find_bounds`/`col_strip` to see the *settled* (sidebar-hidden)
+        /// layout, not the first, still-transitioning frame.
+        fn settled_harness(engine: Engine) -> Harness<impl AppLogic> {
+            let mut h = harness(engine, 1200, 800);
+            h.driver.render();
+            h.driver.render();
+            h
+        }
+
+        /// True for a pixel within ±10 per channel of `target` — same
+        /// tolerance (and same AA rationale) as `mod tests`'s own
+        /// `pixel_near` helper, redefined locally here since that one is
+        /// private to its own (sibling, not ancestor) module.
+        fn pixel_near((r, g, b): (u8, u8, u8), target: (u8, u8, u8)) -> bool {
+            let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 10;
+            near(r, target.0) && near(g, target.1) && near(b, target.2)
+        }
+
+        /// Every pixel inside character column `col` (0-based) on the
+        /// line whose painted bounds are `line_bounds` — a full vertical
+        /// strip rather than one coordinate, because `line_bounds`'s
+        /// `height` (from `pango::Layout::pixel_size`, the *logical*
+        /// extent, confirmed by hand to run noticeably taller than the
+        /// glyphs' own ink) is not vertically centred on the glyphs
+        /// themselves, so a single `height / 2.0` midpoint sample can
+        /// land in the leading/trailing blank padding rather than on ink.
+        /// Scanning the whole column (same "scan every pixel inside the
+        /// bounds" approach `explorer_file_icon_paints_in_the_tab_bar_s_
+        /// filetype_colour` above uses for a glyph) sidesteps needing to
+        /// know exactly where the ink sits within the logical box.
+        fn col_strip<A: AppLogic>(
+            h: &mut Harness<A>,
+            line_bounds: quadraui::Rect,
+            col: usize,
+        ) -> Vec<(u8, u8, u8)> {
+            let char_w = h.driver.backend().char_width();
+            let x0 = (line_bounds.x + col as f32 * char_w).round() as i32;
+            let x1 = (line_bounds.x + (col as f32 + 1.0) * char_w).round() as i32;
+            let mut px = Vec::new();
+            for x in x0..x1 {
+                for y in (line_bounds.y as i32)..((line_bounds.y + line_bounds.height) as i32) {
+                    px.push(h.driver.pixel(x, y));
+                }
+            }
+            px
+        }
+
+        /// A highlighted range (`hl_group`) must paint in the resolved
+        /// group's colour, not the theme default foreground.
+        #[test]
+        fn decor_highlight_range_paints_in_group_color_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHIGHLIGHTME\n");
+            engine.decor.set_hl(
+                "ZqTestHl",
+                HlGroupDef {
+                    fg: Some("#ff00ff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_hl_test");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQHIGHLIGHTME".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqTestHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = settled_harness(engine);
+            let bounds = h
+                .driver
+                .find_bounds("HIGHLIGHTME")
+                .expect("the marked line must paint");
+            // Column 5 ("I" of "HIGHLIGHTME", i.e. char index 2 + 3 into
+            // "ZQHIGHLIGHTME") — inside the highlighted range, clear of
+            // the Normal-mode block cursor's default column 0.
+            let strip = col_strip(&mut h, bounds, 5);
+            assert!(
+                strip.iter().copied().any(|p| pixel_near(p, (255, 0, 255))),
+                "a pixel inside the highlighted range must paint in the \
+                 resolved group colour #ff00ff; sampled column: {strip:?}"
+            );
+        }
+
+        /// Overlay virtual text replaces the glyphs already at its
+        /// column, same width — the original text underneath must not
+        /// still show.
+        #[test]
+        fn decor_overlay_virt_text_paints_over_existing_text_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQBEFOREXXXAFTERZQ\n");
+            let ns = engine.decor.namespace("zq_overlay");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                8, // the first "X" of "XXX"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: "JJJ".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Overlay),
+                    ..Default::default()
+                },
+            );
+
+            let h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQBEFOREJJJAFTERZQ"),
+                "overlay virt text must replace the XXX span with JJJ; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+            assert!(
+                !h.driver.screen_contains("XXX"),
+                "the original text under an overlay must not still show; \
+                 painted: {:?}",
+                h.driver.painted_texts()
+            );
+        }
+
+        /// Inline virtual text inserts at its column, shifting later text
+        /// on the same line right — and the painted cursor column must
+        /// follow, even though the engine's own (buffer-coordinate)
+        /// cursor column never changes.
+        ///
+        /// The cursor check compares, within a *single* painted frame
+        /// (no mode switch, no second render — dispatching any event here
+        /// turned out to have its own confounds, e.g. the first-ever key
+        /// event settling the sidebar's default-open state, confirmed by
+        /// hand while writing this test), two renderings of the exact
+        /// same glyph: the leading "Z" of "ZQHEAD" (column 0 — the cursor
+        /// can only ever land on column 6, buggy/unshifted, or column 8,
+        /// correct/shifted, so column 0 is cursor-free in *either* case,
+        /// a clean reference) against the "Z" of "ZQTAIL" (column 8,
+        /// cursor-free only if the shift is missing). Both are the same
+        /// character in the same plain foreground colour with no
+        /// highlighting on this line, so any pixel difference between
+        /// the two strips can only be the cursor overlay — proving it
+        /// landed on column 8, not column 6.
+        #[test]
+        fn decor_inline_virt_text_shifts_text_and_cursor_col_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQHEADZQTAIL\n");
+            let ns = engine.decor.namespace("zq_inline");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                6, // right after "ZQHEAD", right before "ZQTAIL"
+                None,
+                None,
+                DecorOpts {
+                    virt_text: vec![VirtTextChunk {
+                        text: ">>".to_string(),
+                        hl_group: None,
+                    }],
+                    virt_text_pos: Some(VirtTextPos::Inline),
+                    ..Default::default()
+                },
+            );
+            // Cursor sits in buffer coordinates at column 6 — the "Z" of
+            // "ZQTAIL" before any inline text exists.
+            engine.view_mut().cursor.col = 6;
+
+            let mut h = settled_harness(engine);
+            assert!(
+                h.driver.screen_contains("ZQHEAD>>ZQTAIL"),
+                "inline virt text must be inserted, shifting the following \
+                 text right; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let bounds = h.driver.find_bounds("ZQHEAD").expect("the line must paint");
+            // "ZQHEAD>>ZQTAIL": Z0 Q1 H2 E3 A4 D5 >6 >7 Z8 — column 0 is
+            // the leading "Z" of "ZQHEAD" (always cursor-free, the
+            // reference); column 8 is the shifted "Z" of "ZQTAIL", where
+            // the cursor must now sit.
+            let reference_z = col_strip(&mut h, bounds, 0);
+            let shifted_z = col_strip(&mut h, bounds, 8);
+            assert_ne!(
+                reference_z, shifted_z,
+                "the \"Z\" at column 8 (ZQTAIL's, post-shift) must paint \
+                 differently from the cursor-free \"Z\" at column 0 \
+                 (ZQHEAD's) — proving the cursor followed the inline \
+                 shift to column 8 rather than staying on column 6's \
+                 original (now \">\") position"
+            );
+        }
+
+        /// A `sign_text` mark paints its glyph in the gutter, left of the
+        /// line's own text.
+        #[test]
+        fn decor_sign_appears_in_gutter_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQLINEMARKER\n");
+            let ns = engine.decor.namespace("zq_sign");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                None,
+                DecorOpts {
+                    sign_text: Some("@".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let h = settled_harness(engine);
+            let sign_bounds = h
+                .driver
+                .find_bounds("@")
+                .expect("the decor sign glyph must paint in the gutter");
+            let line_bounds = h
+                .driver
+                .find_bounds("ZQLINEMARKER")
+                .expect("the signed line's text must paint");
+            assert!(
+                sign_bounds.x < line_bounds.x,
+                "the decor sign must paint left of the line's own text \
+                 (in the gutter), not inside it; sign_bounds={sign_bounds:?} \
+                 line_bounds={line_bounds:?}"
+            );
+        }
+
+        /// A mark-anchored highlight follows an insert *above* it: once a
+        /// new line is spliced in before the marked line (`O` + Escape),
+        /// the highlight must paint on the mark's *new* row, not its
+        /// original one.
+        #[test]
+        fn decor_mark_anchored_highlight_follows_insert_above_via_gtk_driver() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQKEEPCOLOR\nZQOTHERLINE\n");
+            engine.decor.set_hl(
+                "ZqFollowHl",
+                HlGroupDef {
+                    fg: Some("#00ffff".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_follow");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQKEEPCOLOR".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqFollowHl".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let mut h = settled_harness(engine);
+            // Column 4 — inside "KEEPCOLOR", clear of the Normal-mode
+            // block cursor's default column 0.
+            let bounds0 = h
+                .driver
+                .find_bounds("ZQKEEPCOLOR")
+                .expect("precondition: the marked line must paint before the edit");
+            let strip0 = col_strip(&mut h, bounds0, 4);
+            assert!(
+                strip0.iter().copied().any(|p| pixel_near(p, (0, 255, 255))),
+                "precondition: the highlight must paint before the edit; \
+                 sampled column: {strip0:?}"
+            );
+
+            // `O` + Escape splices a new line in above row 0.
+            h.driver.type_char('O');
+            for c in "NEWTOPLINE".chars() {
+                h.driver.type_char(c);
+            }
+            h.driver.press_named(quadraui::NamedKey::Escape);
+
+            assert!(
+                h.driver.screen_contains("NEWTOPLINE") && h.driver.screen_contains("ZQKEEPCOLOR"),
+                "precondition: the insert must have landed; painted: {:?}",
+                h.driver.painted_texts()
+            );
+
+            let bounds1 = h
+                .driver
+                .find_bounds("ZQKEEPCOLOR")
+                .expect("the marked line must still paint after the edit");
+            assert!(
+                bounds1.y > bounds0.y,
+                "precondition: ZQKEEPCOLOR must have moved down a row"
+            );
+            let strip1 = col_strip(&mut h, bounds1, 4);
+            assert!(
+                strip1.iter().copied().any(|p| pixel_near(p, (0, 255, 255))),
+                "the highlight must have followed the mark to its new row, \
+                 not stayed pinned to the row it started on; sampled \
+                 column: {strip1:?}"
+            );
+        }
+    }
 }

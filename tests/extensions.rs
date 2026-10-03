@@ -7500,7 +7500,7 @@ fn decor_mark_position_survives_undo_redo_round_trip() {
     );
 }
 
-/// `vimcode.decor.clear(ns, buf, start, end)` removes only marks in `ns`
+/// `vimcode.decor.clear(buf, ns, start, end)` removes only marks in `ns`
 /// that touch the given row range, leaving marks in other namespaces (or
 /// outside the range) alone.
 #[test]
@@ -7526,7 +7526,7 @@ fn decor_clear_respects_namespace_and_row_range() {
             vimcode.message("a1=" .. s(ns_a, a1) .. " a2=" .. s(ns_a, a2) .. " b1=" .. s(ns_b, b1))
         end)
         vimcode.command("ClearARange", function(_)
-            vimcode.decor.clear(ns_a, 0, 0, 1)
+            vimcode.decor.clear(0, ns_a, 0, 1)
         end)
         "#,
     );
@@ -7587,6 +7587,44 @@ fn decor_namespace_isolation_between_plugins() {
         "namespace() must mint distinct ids per name and be idempotent for \
          repeats of the same name; a different namespace must not be able to \
          read or delete another's mark"
+    );
+}
+
+/// #1653 review: `get_mark`'s returned table must include `virt_text`/
+/// `virt_text_pos` — before this fix it only returned `hl_group`/
+/// `sign_text`/`sign_hl`, so a mark carrying virtual text couldn't be
+/// read back at all, let alone round-tripped into another `set_mark`
+/// call. RED against unfixed `develop`: `m.virt_text` reads back `nil`
+/// and `#m.virt_text` errors (`attempt to get length of a nil value`)
+/// instead of the chunk's text/hl_group below.
+#[test]
+fn decor_get_mark_round_trips_virt_text() {
+    let mut e = engine_with_plugin(
+        "a\n",
+        "decor_get_mark_virt_text",
+        r#"
+        vimcode.command("Run", function(_)
+            local ns = vimcode.decor.namespace("virt_text_roundtrip")
+            local id = vimcode.decor.set_mark(0, ns, {
+                row = 0, col = 0,
+                virt_text = {{ text = "hint", hl_group = "Comment" }},
+                virt_text_pos = "overlay",
+            })
+            local m = vimcode.decor.get_mark(0, ns, id)
+            vimcode.message(
+                "pos=" .. tostring(m.virt_text_pos)
+                .. " n=" .. tostring(#m.virt_text)
+                .. " text=" .. tostring(m.virt_text[1].text)
+                .. " hl=" .. tostring(m.virt_text[1].hl_group)
+            )
+        end)
+        "#,
+    );
+    exec(&mut e, "Run");
+    assert_eq!(
+        e.message, "pos=overlay n=1 text=hint hl=Comment",
+        "get_mark must return virt_text/virt_text_pos in the same shape \
+         set_mark accepts them in"
     );
 }
 

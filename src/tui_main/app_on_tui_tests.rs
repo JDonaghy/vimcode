@@ -10556,6 +10556,59 @@ mod tests {
             );
         }
 
+        /// #1653 scope item 6, review: a plugin group that `link`s to a
+        /// name which isn't itself a registered plugin group must be
+        /// resolved against the active `Theme`'s matching role instead of
+        /// silently falling through to the default foreground — e.g.
+        /// `link = "Comment"` tracks `theme.comment` (here `onedark`'s
+        /// `#5c6370`, i.e. `Rgb(92, 99, 112)` — `plain_engine()` never
+        /// overrides `colorscheme`, so this is `Settings::default()`'s
+        /// own theme). RED against unfixed `develop`:
+        /// `resolve_decor_style` only chased `link` through other
+        /// registered plugin groups, so an unresolved link here painted
+        /// the plain theme foreground (`Rgb(229, 229, 229)`), not the
+        /// comment colour.
+        #[test]
+        fn decor_set_hl_link_resolves_against_theme_role_via_app_on_tui() {
+            let mut engine = plain_engine();
+            engine.buffer_mut().insert(0, "ZQLINKEDHL\n");
+            engine.decor.set_hl(
+                "ZqLinksToComment",
+                HlGroupDef {
+                    link: Some("Comment".to_string()),
+                    ..Default::default()
+                },
+            );
+            let ns = engine.decor.namespace("zq_link_test");
+            let buf_id = engine.active_buffer_id();
+            engine.decor.set_mark(
+                buf_id,
+                ns,
+                0,
+                0,
+                None,
+                Some("ZQLINKEDHL".chars().count()),
+                DecorOpts {
+                    hl_group: Some("ZqLinksToComment".to_string()),
+                    ..Default::default()
+                },
+            );
+
+            let h = harness_no_sidebar(engine);
+            let driver = &h.driver;
+            let (x, y) = driver.find("LINKEDHL").expect("the marked line must paint");
+            let style = driver
+                .style_at(x as u16, y as u16)
+                .expect("the matched cell must exist");
+            assert_eq!(
+                style.fg,
+                quadraui::tui::testing::Color::Rgb(92, 99, 112),
+                "a group whose `link` isn't a registered plugin group must \
+                 resolve against the matching `Theme` role (onedark's \
+                 `comment`), not fall through to the default foreground"
+            );
+        }
+
         /// Overlay virtual text replaces the glyphs already at its column,
         /// same width — the original text underneath must not still show.
         #[test]
