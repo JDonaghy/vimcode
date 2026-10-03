@@ -15831,6 +15831,161 @@ mod scrollbar_paint {
             cols_without_reserve - viewport_cols
         );
     }
+
+    // ── #1695: Explorer sidebar scrollbar — upstream quadraui bug ──────────
+    //
+    // Not a vimcode-side fix (Platform-Neutrality Rule): see
+    // `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry and `src/win/mod.rs`'s
+    // `#1695` doc section for the full root-cause write-up. The two tests
+    // below are executable, GREEN evidence of *current* upstream behaviour,
+    // driven through vimcode's real Explorer paint path — tripwires, not
+    // locks: both are expected to start failing the day quadraui's fix
+    // lands and the pin is bumped, at which point they (and this comment)
+    // should be deleted, not patched to match.
+
+    /// A directory listing with far more rows than any plausible viewport,
+    /// so the Explorer's `TreeController` always needs a scrollbar.
+    fn engine_with_overflowing_explorer() -> Engine {
+        let mut engine = Engine::new_for_test();
+        engine.session.explorer_visible = true;
+        engine.app_shell.show_panel(&quadraui::WidgetId::new(
+            crate::core::engine::sidebar::PANEL_EXPLORER,
+        ));
+        engine.explorer_rows = (0..200)
+            .map(|i| crate::core::engine::ExplorerRow {
+                depth: 0,
+                name: format!("file_{i:03}.rs"),
+                path: std::path::PathBuf::from(format!("file_{i:03}.rs")),
+                is_dir: false,
+                is_expanded: false,
+            })
+            .collect();
+        engine
+    }
+
+    /// #1695's first complaint: the sidebar scrollbar is painted even when
+    /// the tree is scrollable but **not hovered** — VS Code's overlay stays
+    /// fully transparent at rest. `TreeController::build_scrollbar` never
+    /// sets `Scrollbar::hovered`, and `primitives::scrollbar::native_
+    /// surface_paint::paint`'s track alpha floor is 0.20 regardless of
+    /// hover state (both read directly off the pinned quadraui rev — see
+    /// the doc section cited above), so there is no event this test could
+    /// synthesize that would make the column read as empty today.
+    #[test]
+    fn explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695() {
+        let mut h = harness(engine_with_overflowing_explorer(), 1400, 900);
+        h.driver.render();
+
+        let body_rect = h.engine.borrow().explorer_tree_rect.get();
+        assert!(
+            body_rect.width > 0.0 && body_rect.height > 0.0,
+            "the Explorer panel must have painted a non-empty body rect \
+             before this test's probe means anything"
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = theme.tab_bar_bg;
+            (c.r, c.g, c.b)
+        };
+
+        // A thin strip hugging the panel's right edge — inside the
+        // scrollbar column under *any* width this bug could produce
+        // (today's wide one or VS Code's thin ~10px target alike).
+        const PROBE_W: f32 = 6.0;
+        let strip = quadraui::Rect::new(
+            body_rect.x + body_rect.width - PROBE_W,
+            body_rect.y + 2.0,
+            PROBE_W,
+            (body_rect.height - 4.0).max(0.0),
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, strip, bg),
+            "the Explorer sidebar's scrollbar must paint something at its \
+             right edge while the tree overflows its viewport (200 \
+             synthetic rows) -- this assertion documents today's bug \
+             (#1695: a VS-Code-style overlay would paint nothing here at \
+             rest) and must flip to the opposite assertion once quadraui's \
+             fix lands, not be deleted silently"
+        );
+    }
+
+    /// #1695's "two differently-lit segments" observation, root-caused:
+    /// `TreeController::render` narrows `rect` into `(tree_rect, sb_rect)`
+    /// via `split_rect`, then paints the real scrollbar explicitly into
+    /// `sb_rect` (width = `backend.line_height()`, `TreeController::
+    /// scrollbar_track_width`'s fallback since vimcode never calls
+    /// `set_scrollbar_width`) — but it ALSO calls
+    /// `backend.draw_tree(tree_rect, &tree)` first, and `tree`
+    /// (`build_tree_view`) still carries every row, untruncated. The shared
+    /// rasteriser underneath `draw_tree` (`primitives::tree::native_
+    /// surface_paint::paint`) *unconditionally* re-derives and paints its
+    /// OWN vertical scrollbar whenever the (untruncated) row count
+    /// overflows the rect it was handed — even though that rect
+    /// (`tree_rect`) already excludes the column `TreeController` itself
+    /// reserved and is about to paint a second time. The two scrollbars use
+    /// different width formulas (the real one: `backend.line_height()`; the
+    /// phantom inner one: `layout_metrics::tree_row_pitch`, ~1.4x that), so
+    /// they paint as two adjacent, differently-sized bands immediately next
+    /// to each other — not one double-wide thumb, and not a rendering
+    /// artifact of this test.
+    ///
+    /// Proven here by probing the band the phantom inner scrollbar alone
+    /// would occupy (to the *left* of the real, explicit one) and showing
+    /// it also paints — which a single, correctly-suppressed scrollbar
+    /// could never do.
+    #[test]
+    fn explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_1695() {
+        let mut h = harness(engine_with_overflowing_explorer(), 1400, 900);
+        h.driver.render();
+
+        let body_rect = h.engine.borrow().explorer_tree_rect.get();
+        let lh = h
+            .painted_line_height()
+            .expect("render_content must publish the painted line height");
+        // Mirrors `quadraui::primitives::layout_metrics::tree_row_pitch`'s
+        // formula for a default `TreeStyle` (`row_height: None`, true for
+        // every synthetic row this fixture builds): `(line_height *
+        // 1.4).round()`.
+        let item_h = (lh * 1.4).round();
+        let outer_w = lh; // `TreeController::scrollbar_track_width`'s fallback
+
+        assert!(
+            body_rect.width as f64 > outer_w + item_h + 20.0,
+            "setup sanity: the sidebar must be far wider than both \
+             scrollbar bands combined, or this probe can't tell them apart \
+             from the tree content itself (body_width={}, outer_w={outer_w}, \
+             item_h={item_h})",
+            body_rect.width
+        );
+
+        let theme = crate::render::Theme::from_name(&h.engine.borrow().settings.colorscheme);
+        let bg = {
+            let c = theme.tab_bar_bg;
+            (c.r, c.g, c.b)
+        };
+
+        let right = (body_rect.x + body_rect.width) as f64;
+        // The phantom inner band: `tree_rect`'s own right-edge column,
+        // immediately left of the real, explicit scrollbar.
+        const MARGIN: f64 = 2.0;
+        let phantom = quadraui::Rect::new(
+            (right - outer_w - item_h + MARGIN) as f32,
+            body_rect.y + 2.0,
+            (item_h - 2.0 * MARGIN).max(1.0) as f32,
+            (body_rect.height - 4.0).max(0.0),
+        );
+        assert!(
+            region_has_non_background_pixel(&mut h.driver, phantom, bg),
+            "a second, phantom scrollbar-shaped band must paint immediately \
+             left of the real one (#1695's 'two differently-lit segments') \
+             -- `TreeController::render`'s own `backend.draw_tree(tree_rect, \
+             &tree)` call re-paints a scrollbar `TreeController` already \
+             owns explicitly, because `tree` still carries every \
+             untruncated row and the shared rasteriser never checks for a \
+             caller-owned column to suppress itself against"
+        );
+    }
 }
 
 #[cfg(test)]

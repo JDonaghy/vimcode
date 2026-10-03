@@ -2238,3 +2238,176 @@ half; see the neighbouring entry above for the minimap half). Leave that
 issue open behind both entries per `GOALS.md`'s milestone-discipline rule
 — there is no per-backend vimcode-side fix available for either half.
 
+---
+
+## `TreeController::render` double-paints its vertical scrollbar — one real, one phantom, different widths, immediately adjacent — and neither is VS Code's thin hidden-at-rest overlay (blocks vimcode#1695)
+
+**Title:** vimcode#1695 reports the Win-GUI Explorer sidebar scrollbar as a
+wide (~14-28px), always-visible, light-grey bar with what looks like "a
+thumb and a second overlapping rect rather than one thumb on one track" —
+compared to VS Code's thin (~10px) overlay that is fully transparent at
+rest and fades in on hover/scroll. Root-caused by reading `TreeController`
+(`compose/tree_controller.rs`) and `primitives::tree`/`primitives::
+scrollbar` directly at the pinned rev
+(`ca7fcc83afad01ec3422f79366566f3a263b22bf`) — not reproduced on Win-GUI
+hardware (no Windows host in this session), but reproduced **executably,
+pixel-for-pixel, on GTK**, which shares every line of code named below
+with Win-GUI and macOS (`GtkBackend::tree_vscrollbar`/`draw_tree`,
+`MacBackend::tree_vscrollbar`/`draw_tree`, and `WinBackend::
+tree_vscrollbar`/`draw_tree` all delegate to the same `TreeView::
+vscrollbar`/`primitives::tree::native_surface_paint::paint` this entry
+names — confirmed by reading all three `Backend` impls side by side). The
+GTK reproduction is vimcode's own new `src/gtk/testing.rs::scrollbar_paint::
+explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695` and
+`::explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_1695`
+— both pass **today**, against the pinned rev, proving the two findings
+below are real and not speculation from reading source alone.
+
+**Root cause 1 (the "two differently-lit segments" bug — not by design):**
+`TreeController::render` —
+
+```rust
+// quadraui/src/compose/tree_controller.rs
+pub fn render(&self, backend: &mut dyn Backend, rect: Rect) {
+    let (tree_rect, sb_rect) = self.split_rect(backend, rect);
+    let tree = self.build_tree_view(tree_rect);
+    backend.draw_tree(tree_rect, &tree);
+    if let Some(sb_rect) = sb_rect {
+        let sb = self.build_scrollbar(backend, sb_rect);
+        backend.draw_scrollbar(sb_rect, &sb);
+    }
+}
+```
+
+`split_rect` narrows `rect` into `tree_rect` (content) and `sb_rect` (the
+scrollbar column `TreeController` owns and paints explicitly, second).
+But `build_tree_view(tree_rect)` returns a `TreeView` whose `rows` is
+`self.rows.clone()` — **every** row, untruncated; `tree_rect`'s *width*
+shrank, but its row *count* did not change, and nothing in `build_tree_
+view` or the `TreeView` it returns records "a caller already reserved a
+scrollbar column, don't paint your own." The shared rasteriser underneath
+`backend.draw_tree(tree_rect, &tree)` —
+`primitives::tree::native_surface_paint::paint` — ends with:
+
+```rust
+// quadraui/src/primitives/tree.rs, `paint`
+if let Some(vsb) = tree.vscrollbar(area, item_height) {
+    crate::primitives::scrollbar::native_surface_paint::paint(&vsb, surface, theme);
+}
+```
+
+`area` here is `tree_rect` — already narrowed — but `tree.rows.len()` is
+still the *original*, untruncated count, so `TreeView::vscrollbar`'s own
+overflow check (`total > visible`, driven by *height*, which `split_rect`
+never touched) still finds overflow and paints a **second** scrollbar, at
+`tree_rect`'s own right edge:
+
+```rust
+// quadraui/src/primitives/tree.rs, `TreeView::vscrollbar`
+let track = Rect::new(area.x + area.width - row_height, area.y, row_height, area.height);
+```
+
+The two scrollbars use **different width formulas** — the real,
+explicit one (`TreeController::scrollbar_track_width`) falls back to
+`backend.line_height()`; the phantom inner one derives its width from
+`layout_metrics::tree_row_pitch(tree, line_height)`, i.e. `(line_height *
+1.4).round()`, ~40% wider. They paint immediately adjacent to each other
+(the phantom's right edge is exactly the real one's left edge), each with
+its own track/thumb compositing (a brighter thumb band over a dimmer
+track band — see Root cause 2) — which is exactly vimcode#1695's "two
+differently-lit segments... a thumb and a second overlapping rect" and
+exactly accounts for its reported ~14-28px combined width (neither single
+scrollbar is that wide on its own; the *sum* of `line_height` +
+`(line_height * 1.4).round()` is).
+
+**Root cause 2 (always-visible, no overlay, no hover reveal):**
+`primitives::scrollbar::native_surface_paint::paint`'s track alpha is
+
+```rust
+let track_alpha = if scrollbar.hovered || scrollbar.dragging { 0.35 } else { 0.20 };
+```
+
+— never `0.0`. There is no "fully transparent at rest" state at all, for
+either scrollbar instance above. Compounding this, `TreeController::
+build_scrollbar` never sets `Scrollbar::hovered`:
+
+```rust
+// quadraui/src/compose/tree_controller.rs, `build_scrollbar`
+let mut sb = Scrollbar::vertical(..., sb_rect, ..., min_thumb);
+sb.dragging = is_dragging;   // `hovered` is left at its `Default` (`false`)
+```
+
+`TreeController::handle`'s `MouseMoved` arm exists but never threads a
+"cursor is over `sb_rect`" fact into the next `render()` call — there is
+no state on `TreeController` to carry it, and `render(&self, ...)` takes
+`&self`, not `&mut self`, so it could not update one even if it tried.
+VS Code's overlay-on-hover/scroll behaviour needs genuinely new state
+(something like `TreeController::set_scrollbar_hover(bool)` /
+`note_recent_scroll()`, read by `build_scrollbar`), not a config knob —
+this is new quadraui API surface, not a value a downstream caller can
+already reach.
+
+**Resolving the issue's own open question:** the "two stacked segments"
+*is* a real second-scrollbar-paint bug (Root cause 1), not the intended
+thumb-over-track compositing (which *also* exists, per Root cause 2, and
+independently produces a lighter-band-over-darker-band look *within* each
+single scrollbar — so the visual is actually two compositing effects
+stacked on top of each other: two adjacent bands, each itself a
+track-dimmed / thumb-brightened composite). Both are described above so a
+fix doesn't have to re-derive this.
+
+**Ask:**
+1. Stop the double paint: give `TreeController::render` a way to tell
+   `backend.draw_tree` "don't self-paint a scrollbar, I'm handling it" —
+   e.g. a `TreeView::style` flag (mirroring `TreeStyle::row_height`'s
+   existing shape) that `primitives::tree::native_surface_paint::paint`
+   checks before its own `tree.vscrollbar(...)` call, set by
+   `TreeController::build_tree_view`. (`ListView`'s `ListController`, if
+   one exists with the same split-rect shape, should be audited for the
+   identical bug — not confirmed here, out of this issue's scope.)
+2. Give `TreeController`/the `Scrollbar` primitive a real hidden-at-rest
+   state: `track_alpha`/`thumb_alpha` reaching `0.0` when neither hovered
+   nor dragging nor recently scrolled, with the reveal fading in exactly
+   as the issue asks. Needs new `TreeController` state (hover tracking
+   from `MouseMoved`, a "recently scrolled" timer or frame-counted decay)
+   plumbed into `build_scrollbar`.
+3. Make the overlay actually overlay: `split_rect` currently *reserves* a
+   column (shrinks `tree_rect`) rather than painting over the full-width
+   tree content VS Code does. Matching VS Code exactly means `tree_rect`
+   should stay full-width and the scrollbar should paint on top of it
+   (respecting whatever hidden-at-rest state #2 adds) — a bigger, options-B
+   change than #1/#2; worth scoping as a follow-up once those land, rather
+   than blocking them on it.
+4. Independently, consider whether the default track width (`backend.
+   line_height()`, easily 20px+) should instead default toward something
+   closer to VS Code's ~10px — `TreeController::set_scrollbar_width`
+   already exists as an opt-in override today, so this item alone could
+   be satisfied without a quadraui change (a downstream caller can already
+   call it) — included here only because the *default* shaping every
+   caller's first impression is still `line_height()`-wide.
+
+**Test:** `src/gtk/testing.rs::scrollbar_paint::
+explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695` and
+`::explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_1695`
+(added alongside this entry, both passing today) are executable,
+GREEN characterizations of the current (buggy) behaviour above, driven
+through vimcode's real Explorer paint path
+(`App::paint_sidebar_panel_rung` → `populate_explorer_tree_controller` →
+`TreeController::render`) on GTK — chosen over a Win-GUI-only test
+because GTK can actually execute headlessly on every CI host, and the bug
+is proven shared code, not backend-specific. Both are tripwires, not
+locks: they are expected to start failing once quadraui ships Root cause
+1/2's fix and the pin is bumped, at which point they document their own
+deletion in their doc comments rather than needing to be patched to
+match a new "correct" geometry.
+
+**Blocks:** `JDonaghy/vimcode#1695`. Leave that issue open behind this one
+per `GOALS.md`'s milestone-discipline rule — there is no per-backend
+vimcode-side fix available for Root causes 1/2; every file named above
+lives in quadraui, not in this repo. Item 4 of the Ask is the one
+exception (a caller-side `set_scrollbar_width` call vimcode itself could
+make) but was left bundled here rather than split into a separate
+vimcode-side PR, since shipping it alone would only mask part of Root
+cause 1's double-paint (the phantom band would merely get narrower, not
+disappear) and could read as "fixed" when it is not.
+

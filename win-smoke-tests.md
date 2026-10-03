@@ -66,9 +66,48 @@ That leaves exactly two things to check on dell64, in this order:
       `docs/PENDING_QUADRAUI_ISSUES.md` and filed, per CLAUDE.md's Platform-Neutrality Rule.
       Capture a screenshot of the editor pane either way.
 
+## Open real-hardware questions (dell64) — #1695
+
+**[#1695](https://github.com/JDonaghy/vimcode/issues/1695) — Explorer sidebar scrollbar is
+a wide, always-visible bar with a doubled thumb, instead of VS Code's thin auto-hiding
+overlay.** This issue is **open and unfixed**: no vimcode-side production code change has
+been made for it, and none is available — the root cause is entirely inside quadraui's
+`TreeController`/`primitives::tree`/`primitives::scrollbar` (see `docs/
+PENDING_QUADRAUI_ISSUES.md`'s new entry and `src/win/mod.rs`'s `#1695` doc section for the
+full write-up). Do **not** treat it as resolved, and the stale "Scrollbar visibility" bullet
+under "Known Gaps" below should be read as superseded by this section, not as a separate,
+still-open question.
+
+What *is* now proven, by tests that execute on this host today (`cargo test
+--features gui --lib scrollbar_paint::explorer_sidebar_scrollbar`, in
+`src/gtk/testing.rs`) — on GTK, which shares every line of the implicated quadraui code with
+Win-GUI:
+
+- The scrollbar paints unconditionally, with no hover event synthesized — there is no
+  hidden-at-rest state anywhere in the implicated code (`explorer_sidebar_scrollbar_paints_
+  unconditionally_at_rest_1695`).
+- A second, phantom scrollbar-shaped band paints immediately left of the real one, at the
+  width the root-cause write-up predicts — a genuine double-paint, not intended thumb-over-
+  track compositing (`explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_
+  1695`).
+
+Both are characterizations of *today's* upstream behaviour (expected to start failing once
+quadraui's fix lands and the pin bumps), not a fix. What they rule out on dell64: a Win-GUI-
+specific divergence from GTK. What's left to check once quadraui ships a fix and the pin is
+bumped:
+
+- [ ] **Re-run the two GTK tests above** to confirm they now fail (the tripwire firing), then
+      delete them per their own doc comments.
+- [ ] **Capture a fresh screenshot of the Explorer sidebar on dell64**, scrollable but
+      unhovered, and confirm no scrollbar-coloured pixels appear at the panel's right edge —
+      then hover/scroll and confirm a single, thin (~10px) overlay fades in with one thumb,
+      not two adjacent bands.
+
 ## Known Gaps (Not Expected to Work Yet)
 
 - **Mouse handlers for new popups** — The 6 new renderers draw correctly but clicking/scrolling/dismissing them with the mouse won't work yet. Keyboard dismiss (Escape, `q`) should work where the engine handles it.
 - **Tab drag-and-drop** — Tabs cannot be reordered or moved between groups by dragging.
 - **Terminal split** — No horizontal terminal split button or drag handler.
-- **Scrollbar visibility** — May have color/contrast issues. Code exists but rendering may be invisible.
+- **Scrollbar visibility** — Superseded by "Open real-hardware questions (dell64) — #1695"
+  above: the sidebar scrollbar is not invisible, it is the opposite (always-visible, doubled)
+  — see that section for the real root cause.

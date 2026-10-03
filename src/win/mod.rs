@@ -539,6 +539,71 @@
 //! = "windows", test)]`, same posture as every other test in that
 //! module) — see that module's own top-of-file #1558 disclaimer for why
 //! it cannot yet be *executed*, here or on dell64.
+//!
+//! # #1695: Explorer sidebar scrollbar is wide/always-visible with a
+//! # doubled thumb — a quadraui `TreeController` bug, reproduced on GTK
+//!
+//! vimcode#1695 reports the Win-GUI Explorer sidebar's vertical scrollbar
+//! as a wide (~14-28px), always-visible, light-grey bar — unlike VS
+//! Code's thin (~10px), hidden-at-rest overlay — with "two differently-lit
+//! segments... a thumb and a second overlapping rect rather than one
+//! thumb on one track".
+//!
+//! `WinBackend` is a 1-line quadraui re-export (this module's `backend.rs`
+//! doc), and `WinBackend::tree_vscrollbar`/`draw_tree` delegate to exactly
+//! the same quadraui code every other pixel backend does
+//! (`TreeController::render` → `primitives::tree::native_surface_paint::
+//! paint` / `primitives::scrollbar::native_surface_paint::paint`) — so
+//! this has no Win-specific code for a vimcode PR to change, per the
+//! Platform-Neutrality Rule. Read directly against the pinned rev
+//! (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) and reproduced
+//! **executably, not just by source reading** — on GTK, which runs
+//! headlessly on every host, including this one, and shares every line
+//! of the implicated code with Win-GUI (confirmed by reading all three
+//! `Backend` impls' `tree_vscrollbar`/`draw_tree` side by side: identical
+//! delegation to `TreeView::vscrollbar` / `primitives::tree::paint`).
+//!
+//! Two real findings, not one:
+//!
+//! 1. **The "two differently-lit segments" is a genuine double-paint, not
+//!    intended compositing.** `TreeController::render` narrows its `rect`
+//!    into `(tree_rect, sb_rect)`, paints the real scrollbar explicitly
+//!    into `sb_rect` — but first calls `backend.draw_tree(tree_rect,
+//!    &tree)` with a `tree` whose `rows` are still the *full*, untruncated
+//!    list. The shared rasteriser underneath `draw_tree` unconditionally
+//!    re-derives and paints its *own* scrollbar whenever that untruncated
+//!    row count overflows `tree_rect`'s height (which narrowing never
+//!    changed) — a second, phantom scrollbar immediately left of the real
+//!    one, at a *different* width (`backend.line_height()` for the real
+//!    one vs. `layout_metrics::tree_row_pitch`'s `~1.4x` that for the
+//!    phantom). Together they explain both the doubled-segment look and
+//!    the reported ~14-28px combined width (neither alone is that wide).
+//! 2. **No hidden-at-rest state exists at all.** `primitives::scrollbar::
+//!    native_surface_paint::paint`'s track alpha is `0.20` even when
+//!    neither hovered nor dragging — never `0.0` — and `TreeController::
+//!    build_scrollbar` never sets `Scrollbar::hovered` in the first place
+//!    (no state exists on `TreeController` to carry a "cursor is over the
+//!    scrollbar" fact from `handle`'s `MouseMoved` arm into the next
+//!    `render()` call). VS Code's fade-in-on-hover/scroll overlay needs
+//!    new quadraui API surface, not a config value a caller can already
+//!    reach.
+//!
+//! Proven real, not just plausible from reading source, by two new GTK
+//! tests that **pass today** against the pinned rev: `src/gtk/testing.rs::
+//! scrollbar_paint::explorer_sidebar_scrollbar_paints_unconditionally_at_
+//! rest_1695` (finding 2 — scrollbar-colored pixels appear at the panel's
+//! right edge with no hover event synthesized) and `::explorer_sidebar_
+//! scrollbar_double_paints_an_adjacent_phantom_band_1695` (finding 1 — a
+//! second band, sized and positioned exactly as the root-cause above
+//! predicts, also paints). Both drive vimcode's real Explorer paint path
+//! (`App::paint_sidebar_panel_rung` → `populate_explorer_tree_controller`
+//! → `TreeController::render`), not a hand-built fixture.
+//!
+//! **No code changes here.** Every file implicated above
+//! (`compose/tree_controller.rs`, `primitives/tree.rs`, `primitives/
+//! scrollbar.rs`) lives in quadraui, not in this repo — see `docs/
+//! PENDING_QUADRAUI_ISSUES.md`'s new entry for the full write-up and the
+//! drafted Ask. vimcode#1695 stays open behind it.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
