@@ -6778,11 +6778,20 @@ mod tests {
 
             // Observe across several 2-second `run_shared_tick_chores`
             // source-control auto-refresh boundaries (#1650's own issue text
-            // asks for a ≥10s idle window on the real-pty side; 5.4s here is
-            // enough for two full kickoff→arrival→poll cycles, which is what
-            // the in-process decision needs to be exercised more than once).
+            // asks for a ≥10s idle window on the real-pty side). #1702's
+            // real-pty bugbash run caught the exact pre-#1650 symptom —
+            // paired SGR-reset/hide-cursor bursts repeating every ~2.007s —
+            // persisting for "10+ seconds straight" before 9+ follow-up
+            // attempts (including fully isolated fresh-HOME runs) failed to
+            // reproduce it again; root cause was never pinned down beyond
+            // "matches the exact mechanism #1650 already fixed here"
+            // (confirmed by re-reading this function and `poll_sc_refresh`:
+            // neither has regressed since). 40 ticks * 300ms ≈ 12s covers
+            // six full 2s cycles, comfortably past #1702's observed window,
+            // in case a cycle-count-dependent drift exists that the
+            // original 5.4s/two-cycle window couldn't see.
             let mut failures: Vec<String> = Vec::new();
-            for n in 0..18 {
+            for n in 0..40 {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 let reaction = driver.tick();
                 let screen_n = driver.screen();
