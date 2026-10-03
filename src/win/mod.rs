@@ -541,7 +541,9 @@
 //! it cannot yet be *executed*, here or on dell64.
 //!
 //! # #1695: Explorer sidebar scrollbar is wide/always-visible with a
-//! # doubled thumb — a quadraui `TreeController` bug, reproduced on GTK
+//! # doubled thumb — a quadraui `TreeController` bug (double-paint and
+//! # no-hidden-at-rest-state shared with GTK/macOS, plus a Win-GUI-only
+//! # mis-themed phantom band)
 //!
 //! vimcode#1695 reports the Win-GUI Explorer sidebar's vertical scrollbar
 //! as a wide (~14-28px), always-visible, light-grey bar — unlike VS
@@ -554,16 +556,33 @@
 //! the same quadraui code every other pixel backend does
 //! (`TreeController::render` → `primitives::tree::native_surface_paint::
 //! paint` / `primitives::scrollbar::native_surface_paint::paint`) — so
-//! this has no Win-specific code for a vimcode PR to change, per the
+//! the double-paint and no-hidden-at-rest-state bugs below have no
+//! Win-specific code for a vimcode PR to change, per the
 //! Platform-Neutrality Rule. Read directly against the pinned rev
 //! (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) and reproduced
 //! **executably, not just by source reading** — on GTK, which runs
-//! headlessly on every host, including this one, and shares every line
-//! of the implicated code with Win-GUI (confirmed by reading all three
-//! `Backend` impls' `tree_vscrollbar`/`draw_tree` side by side: identical
-//! delegation to `TreeView::vscrollbar` / `primitives::tree::paint`).
+//! headlessly on every host, including this one, and shares those two
+//! bugs with Win-GUI (confirmed by reading all three `Backend` impls'
+//! `tree_vscrollbar`/`draw_tree` side by side: identical delegation to
+//! `TreeView::vscrollbar` / `primitives::tree::paint`).
 //!
-//! Two real findings, not one:
+//! **One dimension does NOT match GTK: the phantom band's theme.**
+//! `quadraui::win::tree::draw_tree` hardcodes `let theme =
+//! Theme::default();` and never reads `WinBackend::current_theme` —
+//! unlike `GtkBackend::draw_tree`/`MacBackend::draw_tree`, which both
+//! thread `self.current_theme` through. Since the phantom inner
+//! scrollbar (finding 1 below) paints from *inside* `draw_tree`, it
+//! renders in quadraui's library-default colours on Win-GUI, not the
+//! user's active theme — while the real, explicit outer scrollbar
+//! (`WinBackend::draw_scrollbar`) correctly reads `self.current_theme`.
+//! So on real Win-GUI hardware the two stacked bands are mismatched on
+//! *theme*, not just width — a genuine, Win-GUI-specific divergence from
+//! GTK/macOS (whose `draw_tree` threads the live theme through for both
+//! bands). See `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry, Ask item 5,
+//! for the drafted fix (the same one-line `self.current_theme` shape
+//! `WinBackend::draw_scrollbar` already uses).
+//!
+//! Three real findings, not one:
 //!
 //! 1. **The "two differently-lit segments" is a genuine double-paint, not
 //!    intended compositing.** `TreeController::render` narrows its `rect`
@@ -578,6 +597,7 @@
 //!    one vs. `layout_metrics::tree_row_pitch`'s `~1.4x` that for the
 //!    phantom). Together they explain both the doubled-segment look and
 //!    the reported ~14-28px combined width (neither alone is that wide).
+//!    Shared with GTK/macOS.
 //! 2. **No hidden-at-rest state exists at all.** `primitives::scrollbar::
 //!    native_surface_paint::paint`'s track alpha is `0.20` even when
 //!    neither hovered nor dragging — never `0.0` — and `TreeController::
@@ -586,24 +606,37 @@
 //!    scrollbar" fact from `handle`'s `MouseMoved` arm into the next
 //!    `render()` call). VS Code's fade-in-on-hover/scroll overlay needs
 //!    new quadraui API surface, not a config value a caller can already
-//!    reach.
+//!    reach. Shared with GTK/macOS.
+//! 3. **Win-GUI-only: the phantom band is mis-themed.** As described
+//!    above, `win::tree::draw_tree` paints the phantom scrollbar from
+//!    finding 1 using `Theme::default()` rather than
+//!    `WinBackend::current_theme` — a divergence from GTK/macOS, where
+//!    both bands are same-themed. Not reproducible on this host (no
+//!    Windows hardware); confirmed by reading `win/tree.rs` and
+//!    `win/backend.rs` directly against the pinned rev.
 //!
-//! Proven real, not just plausible from reading source, by two new GTK
-//! tests that **pass today** against the pinned rev: `src/gtk/testing.rs::
-//! scrollbar_paint::explorer_sidebar_scrollbar_paints_unconditionally_at_
+//! Findings 1 and 2 are proven real, not just plausible from reading
+//! source, by two new GTK tests that **pass today** against the pinned
+//! rev: `src/gtk/testing.rs::scrollbar_paint::
+//! explorer_sidebar_scrollbar_paints_unconditionally_at_
 //! rest_1695` (finding 2 — scrollbar-colored pixels appear at the panel's
 //! right edge with no hover event synthesized) and `::explorer_sidebar_
 //! scrollbar_double_paints_an_adjacent_phantom_band_1695` (finding 1 — a
 //! second band, sized and positioned exactly as the root-cause above
 //! predicts, also paints). Both drive vimcode's real Explorer paint path
 //! (`App::paint_sidebar_panel_rung` → `populate_explorer_tree_controller`
-//! → `TreeController::render`), not a hand-built fixture.
+//! → `TreeController::render`), not a hand-built fixture. Finding 3 has
+//! no GTK characterization — GTK's `draw_tree` already threads
+//! `current_theme` through correctly, so there is nothing buggy to
+//! reproduce there; it remains source-verified only, pending real
+//! Win-GUI hardware or a Windows-only headless harness.
 //!
 //! **No code changes here.** Every file implicated above
-//! (`compose/tree_controller.rs`, `primitives/tree.rs`, `primitives/
-//! scrollbar.rs`) lives in quadraui, not in this repo — see `docs/
-//! PENDING_QUADRAUI_ISSUES.md`'s new entry for the full write-up and the
-//! drafted Ask. vimcode#1695 stays open behind it.
+//! (`compose/tree_controller.rs`, `primitives/tree.rs`,
+//! `primitives/scrollbar.rs`, `win/tree.rs`) lives in quadraui, not in
+//! this repo — see `docs/PENDING_QUADRAUI_ISSUES.md`'s new entry for the
+//! full write-up and the drafted Ask (including Ask item 5, which closes
+//! finding 3). vimcode#1695 stays open behind it.
 
 use std::path::PathBuf;
 use std::process::ExitCode;

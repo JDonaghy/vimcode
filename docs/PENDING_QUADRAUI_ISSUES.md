@@ -2250,18 +2250,50 @@ rest and fades in on hover/scroll. Root-caused by reading `TreeController`
 (`compose/tree_controller.rs`) and `primitives::tree`/`primitives::
 scrollbar` directly at the pinned rev
 (`ca7fcc83afad01ec3422f79366566f3a263b22bf`) — not reproduced on Win-GUI
-hardware (no Windows host in this session), but reproduced **executably,
-pixel-for-pixel, on GTK**, which shares every line of code named below
-with Win-GUI and macOS (`GtkBackend::tree_vscrollbar`/`draw_tree`,
-`MacBackend::tree_vscrollbar`/`draw_tree`, and `WinBackend::
-tree_vscrollbar`/`draw_tree` all delegate to the same `TreeView::
-vscrollbar`/`primitives::tree::native_surface_paint::paint` this entry
-names — confirmed by reading all three `Backend` impls side by side). The
-GTK reproduction is vimcode's own new `src/gtk/testing.rs::scrollbar_paint::
+hardware (no Windows host in this session), but reproduced **executably on
+GTK**, which shares the double-paint and no-hidden-at-rest-state bugs
+(Root causes 1 and 2 below) with Win-GUI and macOS
+(`GtkBackend::tree_vscrollbar`/`draw_tree`, `MacBackend::
+tree_vscrollbar`/`draw_tree`, and `WinBackend::tree_vscrollbar`/`draw_tree`
+all delegate to the same `TreeView::vscrollbar`/`primitives::
+tree::native_surface_paint::paint` this entry names — confirmed by reading
+all three `Backend` impls side by side). The GTK reproduction is
+vimcode's own new `src/gtk/testing.rs::scrollbar_paint::
 explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695` and
 `::explorer_sidebar_scrollbar_double_paints_an_adjacent_phantom_band_1695`
 — both pass **today**, against the pinned rev, proving the two findings
 below are real and not speculation from reading source alone.
+
+**This is GTK-parity, not pixel-for-pixel parity — one axis genuinely
+diverges.** `quadraui/src/win/tree.rs`'s `draw_tree` hardcodes
+`let theme = Theme::default();` and never reads `WinBackend::
+current_theme`, unlike `GtkBackend::draw_tree`
+(`gtk/backend.rs:2266`, passes `&self.current_theme` into
+`crate::gtk::draw_tree`) and `MacBackend::draw_tree`
+(`macos/backend.rs:1928`, `let theme = self.current_theme;` then passed
+into `super::tree::draw_tree`), both of which thread the live theme
+through. Because the phantom inner scrollbar (Root cause 1) is painted
+from *inside* that same `draw_tree` call, it renders in quadraui's
+hardcoded default theme colours on Win-GUI, not the user's active theme —
+while the real, explicit outer scrollbar
+(`WinBackend::draw_scrollbar`, `win/backend.rs:3739-3744`) correctly
+reads `self.current_theme`. So on real Win-GUI hardware the two stacked
+bands this issue reports are not just two different *widths* (as Root
+cause 1 below describes) but also two different *theme sources* — one
+tracking the user's active colorscheme, one stuck on quadraui's library
+default — which plausibly explains "two differently-lit segments" at
+least as directly as the track/thumb alpha compositing in Root cause 2
+does. This half of the symptom is **Win-GUI-specific**: GTK's and
+macOS's `draw_tree` both thread `current_theme` through, so their two-band
+reproduction is same-themed throughout and does not exhibit it. A fix
+for Root causes 1/2 alone (stopping the double-paint, adding hidden-at-
+rest state) would still leave Win-GUI's inner band mis-themed relative to
+GTK/macOS unless this is fixed too — see Ask item 5 below. (This
+divergence is a corollary of the broader "seven Win-GUI rasterisers paint
+`Theme::default()` instead of `self.current_theme`" entry elsewhere in
+this file, which already lists `WinBackend::draw_tree` among the seven;
+this entry's Ask item 5 below is scoped to this one call site so a fix
+for #1695 doesn't have to wait on that broader entry landing first.)
 
 **Root cause 1 (the "two differently-lit segments" bug — not by design):**
 `TreeController::render` —
@@ -2353,8 +2385,13 @@ thumb-over-track compositing (which *also* exists, per Root cause 2, and
 independently produces a lighter-band-over-darker-band look *within* each
 single scrollbar — so the visual is actually two compositing effects
 stacked on top of each other: two adjacent bands, each itself a
-track-dimmed / thumb-brightened composite). Both are described above so a
-fix doesn't have to re-derive this.
+track-dimmed / thumb-brightened composite). On Win-GUI specifically, the
+issue's own "Check GTK/macOS before assuming this is Win-GUI-only" ask
+has a mixed answer: the double-paint and no-hidden-at-rest-state bugs
+(causes 1/2) are confirmed shared with GTK/macOS (reproduced there, see
+above), but the two bands' *theme sourcing* is not — see the "GTK-parity,
+not pixel-for-pixel" paragraph above and Ask item 5. All three are
+described above so a fix doesn't have to re-derive any of this.
 
 **Ask:**
 1. Stop the double paint: give `TreeController::render` a way to tell
@@ -2385,6 +2422,17 @@ fix doesn't have to re-derive this.
    be satisfied without a quadraui change (a downstream caller can already
    call it) — included here only because the *default* shaping every
    caller's first impression is still `line_height()`-wide.
+5. **Win-GUI-specific:** thread `self.current_theme` through
+   `WinBackend::draw_tree` → `win::tree::draw_tree` (replace its hardcoded
+   `let theme = Theme::default();`), the same one-line shape
+   `WinBackend::draw_scrollbar` already uses. Without this, fixing #1/#2
+   above leaves Win-GUI's tree-embedded scrollbar painting in the wrong
+   theme even after the double-paint and hidden-at-rest gaps are closed —
+   a Win-GUI-only divergence from GTK/macOS that Root causes 1/2 alone
+   don't cover. (Tracked more broadly, alongside six other Win-GUI call
+   sites with the identical `Theme::default()` gap, by this file's
+   separate "Seven Win-GUI rasterisers still paint a hardcoded
+   `Theme::default()`" entry — either entry's fix closes this item.)
 
 **Test:** `src/gtk/testing.rs::scrollbar_paint::
 explorer_sidebar_scrollbar_paints_unconditionally_at_rest_1695` and
@@ -2399,15 +2447,29 @@ is proven shared code, not backend-specific. Both are tripwires, not
 locks: they are expected to start failing once quadraui ships Root cause
 1/2's fix and the pin is bumped, at which point they document their own
 deletion in their doc comments rather than needing to be patched to
-match a new "correct" geometry.
+match a new "correct" geometry. Neither GTK test covers the theme-
+divergence item (Ask item 5) — GTK's `draw_tree` already threads
+`current_theme` through, so there is nothing to characterize there; that
+item is Win-GUI-only and has no headless-host reproduction available in
+this session (confirmed only by reading `win/tree.rs` and `win/
+backend.rs` directly against the pinned rev).
 
 **Blocks:** `JDonaghy/vimcode#1695`. Leave that issue open behind this one
 per `GOALS.md`'s milestone-discipline rule — there is no per-backend
-vimcode-side fix available for Root causes 1/2; every file named above
-lives in quadraui, not in this repo. Item 4 of the Ask is the one
-exception (a caller-side `set_scrollbar_width` call vimcode itself could
-make) but was left bundled here rather than split into a separate
-vimcode-side PR, since shipping it alone would only mask part of Root
-cause 1's double-paint (the phantom band would merely get narrower, not
-disappear) and could read as "fixed" when it is not.
+vimcode-side fix available for Root causes 1/2 or Ask item 5's theme
+divergence; every file named above lives in quadraui, not in this repo.
+Item 4 of the Ask is the one exception (a caller-side
+`set_scrollbar_width` call vimcode itself could make) but was left
+bundled here rather than split into a separate vimcode-side PR, since
+shipping it alone would only mask part of Root cause 1's double-paint
+(the phantom band would merely get narrower, not disappear) and could
+read as "fixed" when it is not.
+
+**Related:** vimcode#1695's own "Related" section also names vimcode#723
+(minimap scrollbar discarded) and vimcode#1094 as siblings — "together
+they decide what the editor pane's right edge looks like." Both are a
+different component (`MinimapLayout::scrollbar`, not the Explorer's
+`TreeController` this entry covers) and are out of scope here; noted only
+so a future reader doesn't have to re-derive that these are siblings, not
+duplicates, of this entry.
 
